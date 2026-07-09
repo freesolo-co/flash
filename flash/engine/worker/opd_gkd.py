@@ -63,11 +63,13 @@ def _rollout_terminated(completion_ids, stop_text, eos_ids, stop_sequences) -> b
 
     HF ``generate`` halts on four conditions — EOS, a ``stop_strings`` match, the ``max_new_tokens``
     cap, or the ``gen_cfg.max_time`` wall-clock bound — and only the first two are natural completions.
-    A cap hit OR a max_time cut leaves the output cut off mid-JSON. OPD cannot supervise the stop token
-    (the teacher's and student's EOS differ and are both zero-width in the text-span alignment, so EOS
-    gets no gradient), so distilling such a fragment reinforces non-terminating output that reverse-KL
-    can never teach the student to end — a driver of the eval's unterminated-JSON parse failures. The
-    caller skips anything that isn't terminated (codex[bot]).
+    A cap hit OR a max_time cut leaves the output cut off mid-JSON — INCOMPLETE content we refuse to
+    distil, so the caller skips anything that isn't terminated (codex[bot]). The reverse-KL itself
+    cannot supervise the stop token either (the teacher's and student's EOS differ and are both
+    zero-width in the text-span alignment, so EOS is in no group), which is why distillation toward a
+    verbose teacher erodes termination — a driver of the eval's unterminated-JSON parse failures; that
+    gap is closed separately by ``opd._eos_reinforce_term``, which behaviour-clones the stop token on
+    the rollouts that DID terminate (the ones this function keeps).
 
     ``eos_ids`` is the FULL set of generation-halting ids (see ``_generation_eos_ids``), NOT a single
     id: a model whose ``generation_config.eos_token_id`` is a list stops on any member, so a completion

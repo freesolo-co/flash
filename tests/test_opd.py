@@ -8,6 +8,7 @@ CI, which has the training stack).
 from __future__ import annotations
 
 import json
+import math
 import sys
 import types
 from types import SimpleNamespace
@@ -2386,6 +2387,81 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     assert 141 < need <= 180
 
 
+def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
+    """L5 regression: OPD's colocated vLLM rollout reserves an fp8 KV cache on cc >= 8.9 hardware
+    (worker/opd_vllm.py), but model_required_vram_gb sized that KV as bf16 — DOUBLE the real bytes —
+    so a full-context (4096) group_size=1 35B OPD run that actually fits a 180 GB B200 was rejected
+    ('no validated GPU has >= 185 GB VRAM'). Size the KV fp8 once the run is provably modern-card-only,
+    so the B200-fitting config is admitted."""
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
+    from flash.providers.allocator import vram_headroom
+    from flash.providers.base import cheapest_gpu
+
+    moe = "Qwen/Qwen3.6-35B-A3B"
+    info = MODELS[moe]
+    train = {
+        "max_context_tokens": 4096,
+        "max_completion_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 1,
+        "lora_rank": 32,
+    }
+    need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
+    assert need <= 180
+    assert cheapest_gpu(need) == "B200"
+    # Prove the fp8 KV sizing is what flips it: the bf16-KV estimate * headroom overflows the B200,
+    # the fp8-KV estimate clears it (same shape as the GRPO resident-fit fp8 test).
+    kw = {
+        "seq_len": 4096,
+        "max_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 1,
+        "lora_rank": 32,
+        "vocab": vocab_size_for(moe),
+        "active_params_b": info.active_params_b,
+    }
+    fp8 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=True, **kw)
+    bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
+    assert fp8 < bf16
+    hr = vram_headroom()
+    assert fp8 * hr <= 180 < bf16 * hr
+
+
+def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
+    """The fp8-KV discount must apply only when a run can ONLY land on a modern (cc >= 8.9) card. A
+    smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
+    route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
+    from flash.engine.vram import model_required_vram_gb
+    from flash.providers.base import cheapest_gpu, max_non_fp8_kv_vram_gb, supports_fp8_kv
+
+    train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+    need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
+    assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
+    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+
+
+def test_opd_oversized_reject_names_the_knobs_to_shrink():
+    """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
+    OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
+    knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    train = {
+        "max_context_tokens": 4096,
+        "max_completion_tokens": 2048,
+        "batch_size": 8,
+        "group_size": 4,
+    }
+    with pytest.raises(UnsupportedGpuError) as exc:
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
+    msg = str(exc.value)
+    assert "resident-only" in msg
+    assert "group_size" in msg
+    assert "batch_size" in msg
+    assert "max_completion_tokens" in msg
+
+
 def test_opd_vram_budgets_dense_logit_backward_buffers():
     """Regression (codex[bot], vram.py): OPD's loss has no fused CE and, at the loss BACKWARD peak, holds
     the fp32 completion rows + their fp32 gradient AND the bf16 full-sequence logits + their bf16
@@ -3132,6 +3208,43 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
+def test_resolve_opd_knobs_eos_loss_coef_override(monkeypatch):
+    """[train].opd_eos_loss_coef overrides the recipe default; UNSET falls back to it; an explicit 0
+    (disable) SURVIVES — unlike kl_penalty_coef, 0 is a valid value here (turn EOS reinforcement off)."""
+    from flash.engine.recipe import RECIPE
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _resolve(**train):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(**train)), THINKING=False),
+        )
+        return opd_mod._resolve_opd_knobs().eos_loss_coef
+
+    assert _resolve() == RECIPE.opd.eos_loss_coef  # unset -> recipe default
+    assert _resolve(opd_eos_loss_coef=1.5) == 1.5  # override
+    assert _resolve(opd_eos_loss_coef=0.0) == 0.0  # explicit disable survives
+    assert _resolve(opd_eos_loss_coef=-3.0) == 0.0  # clamped non-negative
+
+
+def test_train_spec_parses_opd_eos_loss_coef():
+    """The [train].opd_eos_loss_coef knob parses and round-trips; omitted -> None (recipe default)."""
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"algorithm": "opd", "train": {"opd_eos_loss_coef": 1.25}})
+    assert spec.train.opd_eos_loss_coef == 1.25
+    assert JobSpec.from_dict(spec.to_dict()).train.opd_eos_loss_coef == 1.25
+    assert JobSpec.from_dict({"algorithm": "opd", "train": {}}).train.opd_eos_loss_coef is None
+
+
 def test_opd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).
@@ -3235,6 +3348,9 @@ class _TinyLM:
 
     def parameters(self):
         return [self.w]
+
+    def train(self, mode=True):  # _resolve_samples_batched flips the model into train mode
+        return self
 
 
 def test_opd_loss_backpropagates_over_grouped_spans():
@@ -3372,6 +3488,123 @@ def test_resolve_samples_batched_uses_full_logits():
     assert out[0].loss is not None
     assert "logits_to_keep" not in model.calls[0]
     assert model._flash_opd_full_logits_batches == 1
+
+
+def test_eos_reinforce_term_pushes_up_terminal_eos_when_kept_in_ids():
+    """Case 1 (vLLM/HF kept the eos in the sampled ids): _eos_reinforce_term behaviour-clones the
+    terminal stop the zero-width alignment drops — a cross-entropy on the eos's OWN predictive row that
+    (under gradient descent) raises log P(eos) and lowers the rest. Only that one row is touched."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    V, eos = 6, 5
+    prompt_len, student_ids = 1, [2, eos]  # one content token, then the sampled eos
+    sample_logits = torch.zeros(prompt_len + len(student_ids), V, requires_grad=True)
+    out = opd_mod._eos_reinforce_term(
+        sample_logits, prompt_len, student_ids, frozenset({eos}), eos, (), 0.5
+    )
+    assert out is not None
+    term, logp = out
+    assert term.requires_grad
+    # uniform logits -> log P(eos) == log(1/V); term == -coef * logp
+    assert logp == pytest.approx(-math.log(V), abs=1e-5)
+    assert float(term.detach()) == pytest.approx(-0.5 * logp, abs=1e-6)
+    term.backward()
+    g = sample_logits.grad
+    # eos predicted by row prompt_len-1+comp_len-1 == 1; rows 0 and 2 untouched.
+    assert g[0].abs().sum() == 0
+    assert g[2].abs().sum() == 0
+    assert g[1, eos] < 0  # negative grad -> descent RAISES the eos logit
+    others = [i for i in range(V) if i != eos]
+    assert bool((g[1, others] > 0).all())
+
+
+def test_eos_reinforce_term_targets_post_content_row_when_eos_stripped():
+    """Case 2 (vLLM stripped the eos, no stop_sequences): reinforce the FIRST post-content row toward
+    the primary eos — the forward's last real position, which already predicts the next token."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    V, eos = 6, 5
+    prompt_len, student_ids = 1, [2, 3]  # content only
+    sample_logits = torch.zeros(prompt_len + len(student_ids), V, requires_grad=True)
+    out = opd_mod._eos_reinforce_term(
+        sample_logits, prompt_len, student_ids, frozenset({eos}), eos, (), 1.0
+    )
+    assert out is not None
+    out[0].backward()
+    g = sample_logits.grad
+    # post-content row == prompt_len-1+comp_len == 2; earlier rows untouched.
+    assert g[0].abs().sum() == 0
+    assert g[1].abs().sum() == 0
+    assert g[2, eos] < 0
+
+
+def test_eos_reinforce_term_returns_none_when_not_applicable():
+    """No stop token to reinforce: stop-string termination (delimiter is ordinary text the reverse-KL
+    already trains), disabled (coef 0), no eos defined, or an empty completion."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    V, eos = 6, 5
+    logits = torch.zeros(3, V, requires_grad=True)
+    # stop-string env, content-only ids -> the delimiter terminated it, not eos.
+    assert opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset({eos}), eos, ("</a>",), 1.0) is None
+    # disabled
+    assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, (), 0.0) is None
+    # no eos defined + content-only -> nothing to target
+    assert opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset(), None, (), 1.0) is None
+    # empty completion
+    assert opd_mod._eos_reinforce_term(logits, 1, [], frozenset({eos}), eos, (), 1.0) is None
+    # a trailing eos is reinforced EVEN with stop_sequences (it ended on eos, not the delimiter)
+    assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, ("</a>",), 1.0) is not None
+
+
+def test_resolve_samples_batched_reinforces_terminal_eos():
+    """End-to-end through the batched loss: with eos_loss_coef>0 the terminal-eos row gets a gradient
+    the reverse-KL (content-only) never provides, and eos_logprob is recorded; with coef 0 that row
+    stays ungraded and eos_logprob is None (identical to pre-fix behaviour)."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    eos = 5
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = eos
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a"}.get(int(i), "") for i in ids)  # eos -> "" (zero-width)
+
+    def _samples():
+        # eos stripped from the sampled ids (Case 2): content 'a' only; the teacher aligns that span.
+        return [
+            (
+                opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+                opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+                [1],  # prompt_ids -> prompt_len 1; post-content (eos) row index == 1
+            )
+        ]
+
+    model_on = _TinyLM(torch, T=3, V=8)
+    knobs_on = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.5, stop_sequences=())
+    out_on = opd_mod._resolve_samples_batched(
+        model_on, _Tok(), "cpu", _samples(), knobs_on, microbatch=1
+    )
+    assert out_on[0].loss is not None
+    assert out_on[0].eos_logprob is not None
+    out_on[0].loss.backward()
+    assert model_on.w.grad[1, eos] < 0  # eos row pushed up
+    assert model_on.w.grad[1].abs().sum() > 0
+
+    model_off = _TinyLM(torch, T=3, V=8)
+    knobs_off = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.0, stop_sequences=())
+    out_off = opd_mod._resolve_samples_batched(
+        model_off, _Tok(), "cpu", _samples(), knobs_off, microbatch=1
+    )
+    assert out_off[0].eos_logprob is None
+    out_off[0].loss.backward()
+    assert model_off.w.grad[1].abs().sum() == 0  # no eos term -> post-content row ungraded
 
 
 def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
