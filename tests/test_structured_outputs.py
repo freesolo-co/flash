@@ -136,6 +136,8 @@ def test_explicit_off_forms_are_unset():
         ({"json": 42}, "schema table"),
         ({"json": "{not json"}, "not valid JSON"),
         ({"type": "json_schema", "schema": _SCHEMA}, "unknown key"),
+        ({"disable_any_whitespace": True}, "without a constraint"),
+        ({"whitespace_pattern": r"[\n ]?"}, "without a constraint"),
         ({"json": _SCHEMA, "disable_any_whitespace": "yes"}, "boolean"),
         ({"json": _SCHEMA, "whitespace_pattern": 1}, "whitespace_pattern"),
         ("{not json", "unparseable"),
