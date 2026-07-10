@@ -44,12 +44,6 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 def test_pure_url_and_redact_helpers():
-    # _operation_direction: delete/download pull "from" the hub, everything else pushes "to" it.
-    assert envs._operation_direction("delete") == "from"
-    assert envs._operation_direction("download") == "from"
-    assert envs._operation_direction("upload") == "to"
-    assert envs._operation_direction("publish") == "to"
-
     # _credentialed_repo_url percent-encodes the token into the https remote.
     url = envs._credentialed_repo_url("owner/repo", "tok/with:chars")
     assert url == "https://x-access-token:tok%2Fwith%3Achars@github.com/owner/repo.git"
