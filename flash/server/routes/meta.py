@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from flash import __version__
 from flash.catalog import public_model_rows
 from flash.server._deps import require_key
+from flash.server.auth import _IDENTITY_PASSTHROUGH_FIELDS
 
 router = APIRouter()
 
@@ -30,16 +31,7 @@ def me(key: Annotated[dict, Depends(require_key)]):
         "kind": "internal" if key.get("auth_kind") == "internal" else "freesolo_api_key",
         "key_prefix": key["key_prefix"],
     }
-    for field in (
-        "email",
-        "user_id",
-        "org_id",
-        "org_slug",
-        "org_name",
-        "api_key_id",
-        "training_agent_job_id",
-        "project_id",
-    ):
+    for field in ("email", *_IDENTITY_PASSTHROUGH_FIELDS):
         if key.get(field):
             payload[field] = key[field]
     return payload
