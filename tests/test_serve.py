@@ -314,13 +314,13 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     )
     assert seen["url"] == "https://serve.example/adapters"
     assert seen["json"] == {
-        "adapterId": "flash-7-abcd",
-        "repoId": "org/repo",
-        "baseModel": "Qwen/Qwen3.5-0.8B",
+        "adapter_id": "flash-7-abcd",
+        "repo_id": "org/repo",
+        "base_model": "Qwen/Qwen3.5-0.8B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
         # flash always uploads adapters to HF *dataset* repos, so serving must be told to
         # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
-        "repoType": "dataset",
+        "repo_type": "dataset",
         "status": "ready",
         # Per-adapter thinking default carried so serving can apply it as enable_thinking when a
         # raw chat caller omits chat_template_kwargs (deploy_adapter defaults thinking=False).
@@ -335,7 +335,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
 
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
-    """When the deploying org is known, registration carries `orgId` so serving can persist
+    """When the deploying org is known, registration carries `org_id` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
     import flash.serve.deploy as d
 
@@ -368,7 +368,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         adapter_prefix="sft/flash-7-abcd/seed0",
         org_id="org-xyz",
     )
-    assert seen["json"]["orgId"] == "org-xyz"
+    assert seen["json"]["org_id"] == "org-xyz"
 
     # No org -> the key is omitted entirely (registration shape unchanged for older callers).
     d.deploy_adapter(
@@ -377,7 +377,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
     )
-    assert "orgId" not in seen["json"]
+    assert "org_id" not in seen["json"]
 
 
 def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_registry):
