@@ -597,6 +597,9 @@ def run_opd():
     # Rollouts skipped for hitting the cap without EOS (mid-output truncations we refuse to distil),
     # and a running mean of alignment granularity — both surfaced in train_meta for diagnosis.
     truncated_rollouts = 0
+    # EMA of the per-rollout truncation rate — the runaway signal that scales terminal-EOS reinforcement
+    # (see _runaway_eos_scale). Starts at 0 (assume the student stops fine); rises if rollouts run away.
+    trunc_ema = 0.0
     granularity_sum = 0.0
     granularity_n = 0
     # Running mean of the reinforced terminal log P(eos): should RISE over a run as the student learns
@@ -666,7 +669,7 @@ def run_opd():
         advanced by the caller once per generated rollout so its timing is unchanged."""
         nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
-        nonlocal eos_logprob_sum, eos_logprob_n
+        nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -675,6 +678,9 @@ def run_opd():
             teacher_error += 1
         if r.truncated:
             truncated_rollouts += 1
+        # Update the runaway EMA once per accounted rollout (truncated or not) so terminal-EOS
+        # reinforcement tracks the student's live termination health (see _runaway_eos_scale).
+        trunc_ema += (1.0 - _EOS_TRUNC_EMA_DECAY) * ((1.0 if r.truncated else 0.0) - trunc_ema)
         if r.loss is None:
             reason = _sample_skip_reason(r)
             skip_counts[reason] += 1
@@ -820,6 +826,7 @@ def run_opd():
                         knobs,
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
+                        runaway_rate=trunc_ema,
                     )
                     opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
                     opd_phase_counts["loss_batches"] += 1
@@ -1581,6 +1588,33 @@ def _eos_reinforce_term(
     return (-float(eos_coef)) * logp, float(logp.detach())
 
 
+# Terminal-EOS reinforcement is a PROPORTIONAL CONTROLLER, not a constant push. #482 added the EOS
+# behaviour-cloning term on every distilled (cleanly-terminated) rollout unconditionally; because it
+# raises the SHARED eos output logit — which governs P(eos) at EVERY position, not just the terminal
+# one — and the terminal-row "self-limit" (vanishing gradient as P(eos)->1) never engages while P(eos)
+# plateaus below 1, it ratchets the eos logit up over a long run until the student emits eos FIRST:
+# empty completions -> finish_reason='stop' -> empty serve (the very bug #458 fixed, reintroduced by
+# #482's mechanism). Seen at 500-ex scale: 342 reinforced samples "correcting" only 5 truncated
+# rollouts, then an all-empty collapse by step ~55/63. Fix: scale the coef by how much the student is
+# CURRENTLY failing to terminate (an EMA of the per-rollout truncation rate), so a run that stops
+# reliably gets ~zero EOS push and cannot ratchet, while genuine runaway still drives full reinforcement.
+_EOS_RUNAWAY_LO = 0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
+_EOS_RUNAWAY_HI = 0.15  # truncation rate >= this: full opd_eos_loss_coef (clear runaway to correct)
+_EOS_TRUNC_EMA_DECAY = 0.97  # per-rollout EMA (~30-rollout window): responsive yet smoothed
+
+
+def _runaway_eos_scale(runaway_rate: float) -> float:
+    """Fraction of ``opd_eos_loss_coef`` to apply given the CURRENT runaway rate (EMA of per-rollout
+    truncation). 0 while the student terminates reliably (rate <= _EOS_RUNAWAY_LO) so the terminal-EOS
+    reinforcement cannot ratchet the shared eos logit into an empty-collapse; ramps linearly to full by
+    _EOS_RUNAWAY_HI. Reinforce EXACTLY in proportion to the runaway the term exists to correct."""
+    if runaway_rate <= _EOS_RUNAWAY_LO:
+        return 0.0
+    if runaway_rate >= _EOS_RUNAWAY_HI:
+        return 1.0
+    return (runaway_rate - _EOS_RUNAWAY_LO) / (_EOS_RUNAWAY_HI - _EOS_RUNAWAY_LO)
+
+
 def _resolve_samples_batched(
     model,
     tok,
@@ -1590,6 +1624,7 @@ def _resolve_samples_batched(
     microbatch: int,
     *,
     backward_scale: float | None = None,
+    runaway_rate: float = 1.0,
 ) -> list[SampleResult]:
     import torch
 
@@ -1601,6 +1636,11 @@ def _resolve_samples_batched(
     # don't change across the chunk. getattr defaults keep bare test stand-ins (SimpleNamespace knobs)
     # and eos-less fake tokenizers working with reinforcement OFF.
     eos_coef = float(getattr(knobs, "eos_loss_coef", 0.0) or 0.0)
+    # Controller: reinforce the terminal EOS only in proportion to the student's CURRENT failure to
+    # terminate (see _runaway_eos_scale). A cleanly-terminating run -> ~0 push -> the shared eos logit
+    # can't ratchet into an empty-collapse; genuine runaway still drives full reinforcement. Default
+    # runaway_rate=1.0 keeps bare callers (tests) at full strength = pre-controller behaviour.
+    eos_coef *= _runaway_eos_scale(runaway_rate)
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
     eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
