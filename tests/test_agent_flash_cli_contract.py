@@ -85,11 +85,13 @@ def test_unknown_subcommand_is_rejected() -> None:
     assert excinfo.value.code == 2
 
 
-def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
-    """`flash train --dry-run` is the fully-local path the agent uses to validate a
-    config without a server/GPU. The agent reads `run_id` + `state` from the JSON it
-    prints (see codex/outputs.py run_id field), so this asserts those keys exist with
-    a real run id and a `dry_run` state — fully offline.
+def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatch) -> None:
+    """`flash train --dry-run` is the path the agent uses to validate a config without a
+    GPU. Dry-run now routes through the server (`create_run(dry_run=True)`) so it runs the
+    real submit-time preflights, but the JSON contract the agent consumes is unchanged: it
+    reads `run_id` + `state` from the printed payload (see codex/outputs.py run_id field),
+    so this asserts those keys exist with a real run id and a `dry_run` state, and that the
+    CLI passed `dry_run=True` (never allocating a GPU).
     """
     config = tmp_path / "rl.toml"
     config.write_text(
@@ -104,8 +106,21 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
         "[gpu]\n"
         'type = "RTX 5090"\n'
     )
+
+    seen: dict = {}
+
+    class _FakeClient:
+        def create_run(self, spec, runtime_secrets=None, dry_run=False):
+            seen["dry_run"] = dry_run
+            seen["runtime_secrets"] = runtime_secrets
+            return {"run_id": new_run_id(), "state": "dry_run", "spec": spec}
+
+    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())
+
     rc = main(["train", str(config), "--dry-run"])
     assert rc == 0
+    # The CLI must route the dry-run through the server as a dry-run — never as a real submit.
+    assert seen["dry_run"] is True
     out = capsys.readouterr().out
     import json
 
