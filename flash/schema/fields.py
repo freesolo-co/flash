@@ -164,6 +164,16 @@ def _so_canonical(value: Any) -> dict | None:
         raise _so_error(f"sets the same constraint twice via aliases: {sorted(value)}")
     constraints = [k for k in _SO_CONSTRAINT_KEYS if folded.get(k) is not None]
     if not constraints:
+        # A stray backend option (disable_any_whitespace / whitespace_pattern / ...) with no
+        # constraint is a misconfiguration, not a schema: reject it here rather than wrapping it
+        # into a vacuous {"json": {...}} that silently swallows the option (mirrors the worker's
+        # own "no constraint" guard in parse_structured_outputs).
+        stray_options = sorted(k for k in folded if k in _SO_OPTION_KEYS)
+        if stray_options:
+            raise _so_error(
+                f"sets backend option(s) {', '.join(stray_options)} without a constraint; "
+                f"options only apply alongside one of {', '.join(_SO_CONSTRAINT_KEYS)}"
+            )
         # No constraint key at all: the whole table is an inline JSON schema (its own
         # "type"/"properties" keys are schema vocabulary, not ours).
         return {"json": value}
