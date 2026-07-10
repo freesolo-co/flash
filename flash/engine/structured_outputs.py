@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 
-_CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
+# The vLLM StructuredOutputsParams constraint fields Flash supports. Single source of truth: the
+# schema-time normalizer (schema/fields.py) imports this so the two layers can never drift.
+CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
 
 
 def parse_structured_outputs(spec_json: str | None) -> dict | None:
@@ -27,14 +29,14 @@ def parse_structured_outputs(spec_json: str | None) -> dict | None:
         spec = json.loads(spec_json)
     except ValueError as exc:
         raise ValueError(f"corrupt train.structured_outputs payload: {spec_json!r} ({exc})") from exc
-    if not isinstance(spec, dict) or not any(spec.get(k) is not None for k in _CONSTRAINT_KEYS):
+    if not isinstance(spec, dict) or not any(spec.get(k) is not None for k in CONSTRAINT_KEYS):
         raise ValueError(f"corrupt train.structured_outputs payload (no constraint): {spec_json!r}")
     return spec
 
 
 def describe_structured_outputs(spec: dict) -> str:
     """One-line summary for worker logs, e.g. ``json (3 schema keys)`` or ``choice (4 options)``."""
-    for kind in _CONSTRAINT_KEYS:
+    for kind in CONSTRAINT_KEYS:
         val = spec.get(kind)
         if val is None:
             continue
@@ -45,4 +47,6 @@ def describe_structured_outputs(spec: dict) -> str:
         if kind == "json_object":
             return "json_object"
         return kind
+    # Defensive default: validated specs always carry a constraint key (parse_structured_outputs
+    # guarantees it), so this is unreachable in practice — it just keeps the return type total.
     return "unconstrained"

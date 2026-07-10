@@ -6,6 +6,7 @@ import json
 import math
 from typing import Any
 
+from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
 from flash.spec import WandbSpec
 
@@ -83,8 +84,8 @@ class ConfigError(ValueError):
     pass
 
 
-# vLLM StructuredOutputsParams surface (0.19.x): exactly one constraint field plus options.
-_SO_CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
+# vLLM StructuredOutputsParams surface: exactly one constraint field (_SO_CONSTRAINT_KEYS, imported
+# above from flash.engine.structured_outputs as the single source of truth) plus these options.
 # vLLM also offers grammar/structural_tag, but Flash does not support them; reject explicitly so a
 # `{"grammar": ...}` table isn't silently swallowed by the bare-JSON-schema fallback below.
 _SO_REMOVED_KEYS = frozenset({"grammar", "structural_tag"})

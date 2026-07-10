@@ -454,10 +454,17 @@ def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
     when logprobs are unavailable (unconstrained rollouts request none) -> the OPD loss runs
     unmasked, exactly as before.
     """
-    if lps is None or len(lps) < n_tokens:
+    if lps is None:
         return ()
     forced: list[bool] = []
     for i in range(n_tokens):
+        # vLLM emits one logprob row per generated token, in order. If it ever returns fewer rows
+        # than tokens (a wiring anomaly -- logprobs>=2 is always requested when constrained), mask
+        # the prefix we can see and leave the unverifiable tail UNMASKED, rather than dropping the
+        # whole sample's mask and silently re-admitting the forced-position teacher signal.
+        if i >= len(lps):
+            forced.append(False)
+            continue
         legal = sum(
             1
             for lp in lps[i].values()

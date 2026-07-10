@@ -641,11 +641,13 @@ def test_forced_from_logprobs_counts_finite_entries_not_dict_length():
     assert _forced_from_logprobs(lps, 3) == (True, True, False)
 
 
-def test_forced_from_logprobs_empty_when_logprobs_missing_or_short():
+def test_forced_from_logprobs_none_is_empty_short_masks_visible_prefix():
     from flash.engine.worker.opd_vllm import _forced_from_logprobs
 
-    assert _forced_from_logprobs(None, 3) == ()
-    assert _forced_from_logprobs([{1: _lp(0.0)}], 3) == ()  # fewer logprob rows than tokens
+    assert _forced_from_logprobs(None, 3) == ()  # unconstrained: no logprobs -> no mask
+    # Fewer logprob rows than tokens (anomaly): mask the visible prefix, leave the tail unmasked
+    # rather than abandoning the whole sample's mask.
+    assert _forced_from_logprobs([{1: _lp(0.0)}], 3) == (True, False, False)
 
 
 def test_normalize_output_marks_grammar_forced_positions():
