@@ -71,6 +71,19 @@ def test_bare_json_schema_table_is_a_json_constraint():
     assert _canonical(_SCHEMA) == {"json": _SCHEMA}
 
 
+def test_enum_schema_is_a_json_constraint():
+    # An enum inside the schema (the common "one of these values" case) is ordinary schema content:
+    # it rides through untouched as a json constraint for vLLM/xgrammar to enforce at decode time.
+    enum_schema = {
+        "type": "object",
+        "properties": {"color": {"type": "string", "enum": ["red", "green", "blue"]}},
+        "required": ["color"],
+    }
+    assert _canonical(enum_schema) == {"json": enum_schema}
+    # A bare enum ({"enum": [...]}) is itself a valid JSON Schema (no constraint keys -> raw schema).
+    assert _canonical({"enum": ["yes", "no"]}) == {"json": {"enum": ["yes", "no"]}}
+
+
 def test_former_openai_json_object_is_now_a_raw_schema():
     # {"type": "json_object"} is no longer an OpenAI mode; with no constraint keys it is a raw schema.
     assert _canonical({"type": "json_object"}) == {"json": {"type": "json_object"}}
