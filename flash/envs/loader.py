@@ -55,8 +55,6 @@ _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _TAR_METADATA_TYPES = TAR_METADATA_TYPES
-_CANONICAL_INPUT_KEY = "input"
-_CANONICAL_OUTPUT_KEY = "output"
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -177,8 +175,6 @@ def _normalize_env_path(path: str | None) -> str:
     raw = raw.replace("\\", "/")
     if raw.startswith("/"):
         raise ValueError(f"unsafe environment path: {path!r}")
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
     parts = [part for part in raw.split("/") if part]
     if not parts:
         return _DEFAULT_ENVIRONMENT_PATH
@@ -778,7 +774,6 @@ def _import_freesolo_environment_tools():
         from freesolo.environments import (
             EnvironmentEpisode,
             EnvironmentMultiTurn,
-            EnvironmentSingleTurn,
             EnvironmentTurn,
             load_environment,
         )
@@ -786,7 +781,6 @@ def _import_freesolo_environment_tools():
         return {
             "EnvironmentEpisode": EnvironmentEpisode,
             "EnvironmentMultiTurn": EnvironmentMultiTurn,
-            "EnvironmentSingleTurn": EnvironmentSingleTurn,
             "EnvironmentTurn": EnvironmentTurn,
             "load_environment": load_environment,
             "load_task_examples": load_task_examples,

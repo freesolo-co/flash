@@ -1462,21 +1462,13 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     return (coeff_vec * sp_sel).mean()
 
 
-def _forward_logits(
-    model, input_ids, attention_mask=None, *, position_ids=None, logits_to_keep=None
-):
+def _forward_logits(model, input_ids, attention_mask=None):
     kwargs = {}
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
-    if position_ids is not None:
-        kwargs["position_ids"] = position_ids
-    if logits_to_keep is not None:
-        kwargs["logits_to_keep"] = logits_to_keep
     try:
         return model(input_ids, **kwargs).logits
     except TypeError:
-        if position_ids is not None or logits_to_keep is not None:
-            raise
         if attention_mask is not None:
             return model(input_ids).logits
         raise

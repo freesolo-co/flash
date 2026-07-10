@@ -383,8 +383,6 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
 
 
 def cmd_env_push(args) -> int:
-    import tempfile
-
     env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
     if not env_name:
         return _err("env name required: pass `--name <name>`")
