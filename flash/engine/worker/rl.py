@@ -9,6 +9,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import on_policy_steps
+from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -487,8 +488,21 @@ def run_rl():
     else:
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
+    _gen_kwargs: dict = {}
     if _t and _t.stop_sequences:
-        grpo_kwargs["generation_kwargs"] = {"stop": list(_t.stop_sequences)}
+        _gen_kwargs["stop"] = list(_t.stop_sequences)
+    # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
+    # into StructuredOutputsParams itself, so GRPOConfig (and its wandb/config serialization)
+    # never holds a vLLM object.
+    _so_spec = parse_structured_outputs(getattr(_t, "structured_outputs", "") if _t else "")
+    if _so_spec:
+        _gen_kwargs["structured_outputs"] = _so_spec
+        print(
+            f"[rl] structured outputs: every rollout turn constrained to "
+            f"{describe_structured_outputs(_so_spec)}"
+        )
+    if _gen_kwargs:
+        grpo_kwargs["generation_kwargs"] = _gen_kwargs
     # TRL has no advantage-value clip knob (it clips the importance ratio); just note the request.
     if _adv_clip > 0:
         print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
@@ -558,6 +572,7 @@ def run_rl():
             stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
             thinking=_w.THINKING,
             engine_max_len=vllm_max_len,
+            structured_outputs=_so_spec,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
     # GRPOTrainer.__init__ blocks 10-20 min on first use (vLLM build + FA2 compile); the side-thread

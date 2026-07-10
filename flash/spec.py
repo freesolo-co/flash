@@ -126,6 +126,9 @@ class TrainSpec:
     # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
     opd_eos_loss_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
+    # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
+    # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
+    structured_outputs: str = ""
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,7 @@ class JobSpec:
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
+                structured_outputs=str(train.get("structured_outputs") or ""),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
