@@ -245,7 +245,7 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, sample_result=None, output
         )
 
         def _resolve_samples_batched(
-            model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+            model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
         ):
             out = [
                 sample_result(
@@ -992,10 +992,10 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     real_resolve_samples_batched = opd_mod._resolve_samples_batched
 
     def _spy_resolve_samples_batched(
-        model, tok_, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale
+            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -1224,7 +1224,7 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
         return opd_mod._ScoreResult(teacher_toks=[idx], status="ok")
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = []
         for _gen, score, _prompt_ids in samples:
@@ -1294,7 +1294,7 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
         return opd_mod._ScoreResult(teacher_toks=[], status="ok")
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = [
             opd_mod.SampleResult(
@@ -1350,7 +1350,7 @@ def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
         return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = [
             opd_mod.SampleResult(
@@ -3436,6 +3436,82 @@ def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
     assert model.grad_seen_before_forward == [False, True]
     assert model.w.grad is not None
     assert model.w.grad.abs().sum() > 0
+
+
+def test_runaway_eos_scale_maps_truncation_to_coef_fraction():
+    """The terminal-EOS reinforcement (#482) is a PROPORTIONAL controller: it must apply the coef only
+    in proportion to how much the student is CURRENTLY failing to terminate (the truncation-rate EMA).
+    Zero while the student stops reliably (<= LO) so the shared eos logit can't ratchet into an
+    empty-collapse; full once runaway is clear (>= HI); a linear ramp between."""
+    from flash.engine.worker.opd import (
+        _EOS_RUNAWAY_HI,
+        _EOS_RUNAWAY_LO,
+        _runaway_eos_scale,
+    )
+
+    assert _runaway_eos_scale(0.0) == 0.0  # no truncation -> no push (this is what prevents collapse)
+    assert _runaway_eos_scale(_EOS_RUNAWAY_LO) == 0.0  # boundary: still off
+    assert _runaway_eos_scale(_EOS_RUNAWAY_HI) == 1.0  # clear runaway -> full coef
+    assert _runaway_eos_scale(1.0) == 1.0  # saturates (never exceeds 1x)
+    mid = _runaway_eos_scale((_EOS_RUNAWAY_LO + _EOS_RUNAWAY_HI) / 2)
+    assert abs(mid - 0.5) < 1e-9  # linear ramp midpoint
+    # Monotonic non-decreasing across the ramp.
+    lo_ramp = _runaway_eos_scale(_EOS_RUNAWAY_LO + 0.01)
+    hi_ramp = _runaway_eos_scale(_EOS_RUNAWAY_HI - 0.01)
+    assert 0.0 < lo_ramp < hi_ramp < 1.0
+
+
+def test_resolve_samples_batched_gates_eos_reinforcement_by_runaway_rate(monkeypatch):
+    """End-to-end: _resolve_samples_batched scales opd_eos_loss_coef by the runaway rate before the
+    terminal-EOS term fires. A low rate (student terminates fine) zeroes the coef so the term is never
+    invoked — no ratchet, no empty-collapse (the 500-ex regression). A high rate applies it at full
+    strength so genuine runaway is still corrected."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    seen_coefs = []
+    real_term = opd_mod._eos_reinforce_term
+
+    def _spy_term(sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef):
+        seen_coefs.append(eos_coef)
+        return real_term(
+            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef
+        )
+
+    monkeypatch.setattr(opd_mod, "_eos_reinforce_term", _spy_term)
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 3
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    def _samples():
+        return [
+            (
+                opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+                opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+                [1],
+            )
+        ]
+
+    knobs = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.5, stop_sequences=())
+
+    # Low runaway: coef scaled to 0 -> `if eos_coef > 0` guards the term out entirely -> no ratchet.
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1, runaway_rate=0.0
+    )
+    assert seen_coefs == []
+
+    # Clear runaway: full opd_eos_loss_coef reaches the term.
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1, runaway_rate=0.5
+    )
+    assert seen_coefs
+    assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
 
 
 def test_resolve_samples_batched_uses_full_logits():
