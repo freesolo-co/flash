@@ -582,7 +582,7 @@ def test_safe_extract_skips_tar_metadata_entries(tmp_path):
 def test_safe_extract_metadata_entries_do_not_count_toward_member_cap(monkeypatch, tmp_path):
     metadata_type = b"Z"
     monkeypatch.setattr(envs, "_MAX_MEMBERS", 2)
-    monkeypatch.setattr(envs, "_TAR_METADATA_TYPES", envs._TAR_METADATA_TYPES | {metadata_type})
+    monkeypatch.setattr(envs, "TAR_METADATA_TYPES", envs.TAR_METADATA_TYPES | {metadata_type})
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for idx in range(3):
