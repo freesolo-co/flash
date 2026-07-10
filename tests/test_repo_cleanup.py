@@ -124,7 +124,9 @@ class FakeApi:
 def _wire(monkeypatch, *, targets, deployed=None, inflight=frozenset(), known=None, hold=None):
     """Patch the sweep's seams so the end-to-end tests isolate policy from the registry/HF."""
     monkeypatch.setattr(rc, "_terminal_run_targets", lambda: list(targets))
-    monkeypatch.setattr(rc, "deployed_prefixes", (lambda: (set(), True)) if deployed is None else deployed)
+    monkeypatch.setattr(
+        rc, "deployed_prefixes", (lambda: (set(), True)) if deployed is None else deployed
+    )
     monkeypatch.setattr(rc, "_inflight_protected_prefixes", lambda: set(inflight))
     monkeypatch.setattr(
         rc, "_known_run_ids", lambda: {t.run_id for t in targets} if known is None else set(known)
@@ -133,6 +135,7 @@ def _wire(monkeypatch, *, targets, deployed=None, inflight=frozenset(), known=No
 
 
 # ---- gating -----------------------------------------------------------------------------------
+
 
 def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is False
@@ -144,12 +147,17 @@ def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
     monkeypatch.setattr(rc, "HfApi", None)
     monkeypatch.setattr(rc, "_warned_hf_unavailable", False)
     # If it didn't short-circuit it would call these; make them explode so a regression is caught.
-    monkeypatch.setattr(rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called")))
-    monkeypatch.setattr(rc, "_terminal_run_targets", lambda: (_ for _ in ()).throw(AssertionError("called")))
+    monkeypatch.setattr(
+        rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called"))
+    )
+    monkeypatch.setattr(
+        rc, "_terminal_run_targets", lambda: (_ for _ in ()).throw(AssertionError("called"))
+    )
     assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0
 
 
 # ---- helpers ----------------------------------------------------------------------------------
+
 
 def test_is_managed_env_repo_allowlist():
     assert rc._is_managed_env_repo(_managed("x")) is True
@@ -160,7 +168,10 @@ def test_is_managed_env_repo_allowlist():
 
 
 def test_source_repo_prefix_parses_internal_ref():
-    assert rc._source_repo_prefix(f"{NS}/flashrun-e:sft/flash-9-s") == (_managed("e"), "sft/flash-9-s")
+    assert rc._source_repo_prefix(f"{NS}/flashrun-e:sft/flash-9-s") == (
+        _managed("e"),
+        "sft/flash-9-s",
+    )
     # a checkpoint-step source still yields just the run prefix
     assert rc._source_repo_prefix(f"{NS}/flashrun-e:rl/flash-9-s/checkpoints/step-5") == (
         _managed("e"),
@@ -185,6 +196,7 @@ def test_run_id_epoch():
 
 
 # ---- the policy predicate ---------------------------------------------------------------------
+
 
 def test_deletable_old_undeployed_known_is_deleted():
     t = _target("r1")
@@ -212,6 +224,7 @@ def test_deletable_skips_run_this_plane_doesnt_know():
 
 
 # ---- end-to-end sweep -------------------------------------------------------------------------
+
 
 def test_sweep_deletes_only_old_undeployed(monkeypatch):
     delete = _target("flash-1-old", slug="e1")
@@ -254,6 +267,7 @@ def test_inflight_prefix_protected_regardless_of_age(monkeypatch):
 
 
 # ---- fail-closed safety -----------------------------------------------------------------------
+
 
 def test_aborts_and_deletes_nothing_when_live_set_unreachable(monkeypatch):
     def _boom():
@@ -344,7 +358,9 @@ def test_per_delete_recheck_spares_run_that_became_inflight(monkeypatch):
 
     def _inflight():
         calls["n"] += 1
-        return set() if calls["n"] == 1 else {(t.repo_id, t.prefix)}  # up-front clear; pre-delete protected
+        return (
+            set() if calls["n"] == 1 else {(t.repo_id, t.prefix)}
+        )  # up-front clear; pre-delete protected
 
     _wire(monkeypatch, targets=[t])
     monkeypatch.setattr(rc, "_inflight_protected_prefixes", _inflight)
@@ -374,6 +390,7 @@ def test_per_delete_inflight_recheck_error_skips_target(monkeypatch):
 
 # ---- in-progress deploy/export guard ----------------------------------------------------------
 
+
 def test_sweep_skips_run_with_deploy_or_export_in_progress(monkeypatch):
     busy = _target("flash-1-busy")
     other = _target("flash-2-other")
@@ -397,6 +414,7 @@ def test_cooperative_stop_halts_before_deleting(monkeypatch):
 
 
 # ---- per-prefix re-stat -----------------------------------------------------------------------
+
 
 def test_recheck_spares_prefix_written_since_enumeration(monkeypatch):
     t = _target("flash-1-a")  # old by the db age gate...
@@ -430,24 +448,38 @@ def test_recheck_skips_target_when_restat_errors(monkeypatch):
 
 # ---- reconstruction from the run registry (real functions) ------------------------------------
 
+
 def test_deployed_prefixes_built_from_run_status(monkeypatch):
     from flash.server import db
 
     statuses = {
-        "d1": _St("d1", "deployed", hf_repo=_managed("e1"), algorithm="grpo",
-                  deployment={"state": "ready"}),
-        "dep1": _St("dep1", "done", hf_repo=_managed("e4"), algorithm="opd",
-                    deployment={"state": "deploying"}),  # in-progress -> protected
-        "u1": _St("u1", "done", hf_repo=_managed("e2"),
-                  deployment={"state": "undeployed"}),
-        "f1": _St("f1", "done", hf_repo=_managed("e5"),
-                  deployment={"state": "failed"}),  # failed deploy serves nothing -> reclaimable
+        "d1": _St(
+            "d1",
+            "deployed",
+            hf_repo=_managed("e1"),
+            algorithm="grpo",
+            deployment={"state": "ready"},
+        ),
+        "dep1": _St(
+            "dep1",
+            "done",
+            hf_repo=_managed("e4"),
+            algorithm="opd",
+            deployment={"state": "deploying"},
+        ),  # in-progress -> protected
+        "u1": _St("u1", "done", hf_repo=_managed("e2"), deployment={"state": "undeployed"}),
+        "f1": _St(
+            "f1", "done", hf_repo=_managed("e5"), deployment={"state": "failed"}
+        ),  # failed deploy serves nothing -> reclaimable
         "n1": _St("n1", "done", hf_repo=_managed("e3"), deployment=None),
     }
     monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": r} for r in statuses])
     monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
     ids, complete = _REAL_DEPLOYED()
-    assert ids == {(_managed("e1"), "rl/d1"), (_managed("e4"), "opd/dep1")}  # live + in-progress only
+    assert ids == {
+        (_managed("e1"), "rl/d1"),
+        (_managed("e4"), "opd/dep1"),
+    }  # live + in-progress only
     assert complete is True
 
 
@@ -467,16 +499,22 @@ def test_inflight_protects_own_and_warmstart_source(monkeypatch):
 
     statuses = {
         # PUBLIC init_from_adapter form (a bare source RUN ID) — exactly what submit_job persists.
-        "grpo1": _St("grpo1", "running", hf_repo=_managed("e"), algorithm="grpo",
-                     init_from_adapter="sft0"),
-        "sft0": _St("sft0", "done", hf_repo=_managed("e"), algorithm="sft"),  # the warm-start source
+        "grpo1": _St(
+            "grpo1", "running", hf_repo=_managed("e"), algorithm="grpo", init_from_adapter="sft0"
+        ),
+        "sft0": _St(
+            "sft0", "done", hf_repo=_managed("e"), algorithm="sft"
+        ),  # the warm-start source
         "done1": _St("done1", "done", hf_repo=_managed("e")),
     }
     monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": r} for r in statuses])
     monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
     ids = _REAL_INFLIGHT()
     assert (_managed("e"), "rl/grpo1") in ids  # the in-flight run's own prefix
-    assert (_managed("e"), "sft/sft0") in ids  # its warm-start SOURCE prefix (resolved via get_status)
+    assert (
+        _managed("e"),
+        "sft/sft0",
+    ) in ids  # its warm-start SOURCE prefix (resolved via get_status)
     assert (_managed("e"), "sft/done1") not in ids  # a terminal run is not protected
 
 
@@ -485,9 +523,15 @@ def test_warmstart_source_prefix_public_and_internal_forms():
     # Public form (what's persisted): a bare source run id resolved via get_status.
     assert rc._warmstart_source_prefix("sft9", lambda rid: src) == (_managed("e"), "sft/sft9")
     # Public form with a step suffix.
-    assert rc._warmstart_source_prefix("sft9/step-5", lambda rid: src) == (_managed("e"), "sft/sft9")
+    assert rc._warmstart_source_prefix("sft9/step-5", lambda rid: src) == (
+        _managed("e"),
+        "sft/sft9",
+    )
     # Internal colon form is still accepted defensively (no get_status needed).
-    assert rc._warmstart_source_prefix(f"{_managed('e')}:sft/sft9", _raise) == (_managed("e"), "sft/sft9")
+    assert rc._warmstart_source_prefix(f"{_managed('e')}:sft/sft9", _raise) == (
+        _managed("e"),
+        "sft/sft9",
+    )
 
     def _missing(rid):
         raise FileNotFoundError(rid)
@@ -537,6 +581,7 @@ def test_terminal_targets_skips_missing_run(monkeypatch):
 
 
 # ---- the real per-run lock --------------------------------------------------------------------
+
 
 def test_hold_run_lock_is_nonblocking_and_mutually_exclusive():
     from flash.server._locks import _deploy_lock

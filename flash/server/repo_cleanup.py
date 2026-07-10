@@ -220,7 +220,7 @@ def _confirm_live_set() -> set[tuple[str, str]]:
     before every delete; both must fail closed so a blind delete is impossible."""
     try:
         deployed, complete = deployed_prefixes()
-    except Exception as exc:  # noqa: BLE001 - any failure to read the live set must fail closed
+    except Exception as exc:  # any failure to read the live set must fail closed
         raise CleanupAborted(f"serving live set unreachable ({exc}); deleting nothing") from exc
     if not complete:
         raise CleanupAborted("a live run could not be mapped to a repo/prefix; deleting nothing")
@@ -441,7 +441,9 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             # deploy can't register this run between the confirm and the delete. If it can't be
             # confirmed now, abort the WHOLE sweep (re-raise) rather than press on deleting other
             # prefixes while an unidentified live run may be backed by one of them.
-            fresh = _confirm_live_set()  # raises CleanupAborted -> finally releases, sweep fails closed
+            fresh = (
+                _confirm_live_set()
+            )  # raises CleanupAborted -> finally releases, sweep fails closed
             if (target.repo_id, target.prefix) in fresh:
                 logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
                 continue
@@ -456,7 +458,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                         target.prefix,
                     )
                     continue
-            except Exception as exc:  # noqa: BLE001 - can't confirm it's free -> don't delete blind
+            except Exception as exc:  # can't confirm it's free -> don't delete blind
                 logger.warning(
                     "repo GC: in-flight re-check for %s failed; skipping to stay safe (%s)",
                     target.prefix,
@@ -472,7 +474,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                         target.prefix,
                     )
                     continue
-            except Exception as exc:  # noqa: BLE001 - a re-stat failure must not delete blind
+            except Exception as exc:  # a re-stat failure must not delete blind
                 logger.warning(
                     "repo GC: re-stat of %s:%s failed; skipping to stay safe (%s)",
                     target.repo_id,
@@ -487,7 +489,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                 )
                 deleted += 1
                 logger.info("repo GC: deleted %s:%s", target.repo_id, target.prefix)
-            except Exception as exc:  # noqa: BLE001 - one failed delete must not abort the sweep
+            except Exception as exc:  # one failed delete must not abort the sweep
                 logger.warning(
                     "repo GC: failed to delete %s:%s: %s", target.repo_id, target.prefix, exc
                 )
