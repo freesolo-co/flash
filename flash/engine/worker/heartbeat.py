@@ -223,6 +223,18 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     print("HEARTBEAT", snapshot)
 
 
+def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -> float:
+    """Attach GPU diagnostics to ``payload`` at most once per ``_STEP_GPU_DIAG_INTERVAL_S``.
+
+    Returns the value to store back as ``last_gpu_diag_at``: ``now`` when diagnostics were
+    attached this call, otherwise the unchanged prior timestamp.
+    """
+    if last_gpu_diag_at == 0.0 or now - last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S:
+        payload["gpu"] = gpu_diagnostics()
+        return now
+    return last_gpu_diag_at
+
+
 def make_reward_heartbeat_callback():
     """Return a TRL callback that streams per-step reward to the HF heartbeat channel."""
     from transformers import TrainerCallback
@@ -250,12 +262,7 @@ def make_reward_heartbeat_callback():
                 "reward_last": self.reward_history[-8:],
             }
             now = time.monotonic()
-            if (
-                self.last_gpu_diag_at == 0.0
-                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
-            ):
-                payload["gpu"] = gpu_diagnostics()
-                self.last_gpu_diag_at = now
+            self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
             _w.heartbeat("rl_step", **payload)
 
     return _RewardHeartbeat()
@@ -284,12 +291,7 @@ def make_sft_heartbeat_callback():
                 "grad_norm": logs.get("grad_norm"),
                 "learning_rate": logs.get("learning_rate"),
             }
-            if (
-                self.last_gpu_diag_at == 0.0
-                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
-            ):
-                payload["gpu"] = gpu_diagnostics()
-                self.last_gpu_diag_at = now
+            self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
             _w.heartbeat("sft_step", **{k: v for k, v in payload.items() if v is not None})
 
     return _SFTHeartbeat()

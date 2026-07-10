@@ -281,7 +281,7 @@ def _thinking_prefill_text(tok) -> str:
     return ""
 
 
-def _student_model(model_id, mik, device):
+def _student_model(model_id, model_init_kwargs, device):
     """Build the trainable student LoRA and return ``(model, rollout_model_source)``.
 
     Warm-starts from ``train.init_from_adapter`` when set — continuing a prior run's adapter (e.g. an
@@ -311,7 +311,7 @@ def _student_model(model_id, mik, device):
 
     # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
     # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
+    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(device)
     return get_peft_model(base, init_peft), str(init_model)
 
 
@@ -395,9 +395,9 @@ def run_opd():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _attn = optimal_attn_impl()
-    mik = {"dtype": torch.bfloat16}
+    model_init_kwargs = {"dtype": torch.bfloat16}
     if _attn:
-        mik["attn_implementation"] = _attn
+        model_init_kwargs["attn_implementation"] = _attn
     # --- Build the on-policy prompt pool BEFORE loading the student ------------------------------
     # Fetch the dataset, seed the RNGs, and pre-filter to the prompts that fit the context budget
     # HERE — ahead of _student_model, which for a VL warm-start downloads the base and MERGES the SFT
@@ -416,7 +416,7 @@ def run_opd():
         train = train[:max_examples]
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
-    ppl_step = knobs.prompts_per_step
+    prompts_per_step = knobs.prompts_per_step
     group = knobs.group_size
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
     # never conditions on a truncated prompt the teacher didn't see. Use the configured context
@@ -443,7 +443,7 @@ def run_opd():
         return tok(text, add_special_tokens=False).input_ids
 
     # Build the on-policy pool from ONLY the prompts that fit the budget (GRPO-style pre-filter). The
-    # step loop visits a deterministic examples[(step*ppl_step+i) % len] slice, so a whole-dataset
+    # step loop visits a deterministic examples[(step*prompts_per_step+i) % len] slice, so a whole-dataset
     # `any(fits)` precheck could pass while every prompt in the visited slice is over-budget and
     # dropped — burning the GPU allocation with no trained step. Filtering the pool here (before the
     # student is even loaded) guarantees every visited prompt fits and fails fast otherwise. One
@@ -480,20 +480,20 @@ def run_opd():
             f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
             f"{prompt_budget}-token budget; pool = {len(examples)}"
         )
-    if ppl_step > len(examples):
+    if prompts_per_step > len(examples):
         print(
-            f"[opd] lowering prompts_per_step from {ppl_step} to {len(examples)}: "
+            f"[opd] lowering prompts_per_step from {prompts_per_step} to {len(examples)}: "
             "only that many prompt(s) fit after filtering"
         )
-        ppl_step = len(examples)
+        prompts_per_step = len(examples)
     steps = on_policy_steps(
         epochs=knobs.epochs,
         prompt_count=len(examples),
-        prompts_per_step=ppl_step,
+        prompts_per_step=prompts_per_step,
     )
     print(
         f"[opd] epochs={knobs.epochs} over {len(examples)} retained prompt(s) at "
-        f"{ppl_step} prompts/step -> steps={steps}"
+        f"{prompts_per_step} prompts/step -> steps={steps}"
     )
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
@@ -514,7 +514,7 @@ def run_opd():
     setup_seconds = time.time() - t_start
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
-        model, rollout_model_source = _student_model(model_id, mik, device)
+        model, rollout_model_source = _student_model(model_id, model_init_kwargs, device)
         # Apply chalk standalone kernels to the student, exactly as sft/rl do after building their
         # trainer. The HF/PEFT student remains the GKD loss target, so without this the default
         # Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA kernels and a
@@ -759,8 +759,8 @@ def run_opd():
             for no_signal_attempt in range(1, max_no_signal_attempts + 1):
                 it = step  # data-slice + display index for THIS rollout attempt
                 step += 1  # advance up front so the nseq==0 retry path can't spin forever
-                batch = [examples[(it * ppl_step + i) % len(examples)] for i in range(ppl_step)]
-                accum_target = max(1, ppl_step * group)
+                batch = [examples[(it * prompts_per_step + i) % len(examples)] for i in range(prompts_per_step)]
+                accum_target = max(1, prompts_per_step * group)
                 step_loss = 0.0
                 step_cov = 0.0
                 nseq = 0
@@ -1122,7 +1122,7 @@ def run_opd():
             "teacher_input_tokens": teacher_input_tokens,
             "temperature": knobs.temperature,
             "group_size": group,
-            "prompts_per_step": ppl_step,
+            "prompts_per_step": prompts_per_step,
             "max_completion_len": knobs.max_completion,
             "rollout_backend": "vllm",
             "vllm_model": getattr(vllm_rollout, "model_source", None),
@@ -1147,18 +1147,18 @@ def run_opd():
             "opd_phase_optimizer_steps": int(opd_phase_counts["optimizer_steps"]),
             "opd_phase_vllm_syncs": int(opd_phase_counts["vllm_syncs"]),
             "opd_rollout_pipeline_chunks": (
-                _opd_rollout_pipeline_chunks(ppl_step * group) if not multi_turn else None
+                _opd_rollout_pipeline_chunks(prompts_per_step * group) if not multi_turn else None
             ),
             "opd_rollout_chunk_size": (
-                _opd_rollout_chunk_size(ppl_step * group) if not multi_turn else None
+                _opd_rollout_chunk_size(prompts_per_step * group) if not multi_turn else None
             ),
             "opd_rollout_pipeline_target_chunk_size": (
-                _opd_rollout_pipeline_target_chunk_size(ppl_step * group)
+                _opd_rollout_pipeline_target_chunk_size(prompts_per_step * group)
                 if not multi_turn
                 else None
             ),
             "opd_rollout_pipeline_max_chunks": (
-                _opd_rollout_pipeline_max_chunks(ppl_step * group) if not multi_turn else None
+                _opd_rollout_pipeline_max_chunks(prompts_per_step * group) if not multi_turn else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,

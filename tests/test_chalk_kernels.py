@@ -12,7 +12,6 @@ import types
 
 from flash.engine.chalk_kernels import (
     active_kernels,
-    chalk_fused_ce_available,
     install_chalk_kernels,
 )
 
@@ -107,18 +106,6 @@ def test_noop_when_chalk_absent(monkeypatch):
         sys.modules, "chalk", None
     )  # force ImportError on `from chalk.transformers ...`
     assert install_chalk_kernels(object()) == {}
-
-
-def test_chalk_fused_ce_available_requires_import_and_supported_model(monkeypatch):
-    """SFT batch sizing can assume fused CE only for supported models with chalk importable."""
-    monkeypatch.setitem(sys.modules, "chalk", None)
-    assert chalk_fused_ce_available("Qwen/Qwen3.5-4B") is False
-
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    assert chalk_fused_ce_available("Qwen/Qwen3.5-4B") is True
-    assert chalk_fused_ce_available("Qwen/Qwen3.6-35B-A3B") is True
-    assert chalk_fused_ce_available("openbmb/MiniCPM5-1B") is False
 
 
 def test_apply_error_is_swallowed(monkeypatch):

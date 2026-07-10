@@ -546,7 +546,7 @@ def model_required_vram_gb(
     """Cheapest-sufficient VRAM (GB) for a specific run (allocator and provisional_gpu sizing)."""
 
     # Knob extraction must never crash: sizing runs before train validators; malformed values fall back.
-    def _g(obj, key):
+    def _get(obj, key):
         if obj is None:
             return None
         return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
@@ -560,7 +560,7 @@ def model_required_vram_gb(
         except (TypeError, ValueError):
             return default
 
-    max_tokens = _pos_int(_g(train, "max_completion_tokens"), None)
+    max_tokens = _pos_int(_get(train, "max_completion_tokens"), None)
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
@@ -569,8 +569,8 @@ def model_required_vram_gb(
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
         _default_len = 1024
-    seq_len = _pos_int(_g(train, "max_context_tokens"), _default_len)
-    lora_rank = _pos_int(_g(train, "lora_rank"), 32)
+    seq_len = _pos_int(_get(train, "max_context_tokens"), _default_len)
+    lora_rank = _pos_int(_get(train, "lora_rank"), 32)
     if _algo == "opd":
         from flash.engine.recipe import RECIPE
 
@@ -579,8 +579,8 @@ def model_required_vram_gb(
     else:
         batch_size_default = _sft_per_device_bs()
         group_size_default = 8
-    group_size = _pos_int(_g(train, "group_size"), group_size_default)
-    batch_size = _pos_int(_g(train, "batch_size"), batch_size_default)
+    group_size = _pos_int(_get(train, "group_size"), group_size_default)
+    batch_size = _pos_int(_get(train, "batch_size"), batch_size_default)
 
     def _need(
         params_b: float,

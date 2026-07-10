@@ -177,7 +177,6 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     # Drive the REAL (pure, offline) Endpoint validator/builder to lock that contract: every volume
     # DC must be within the endpoint datacenter list (serverless.py superset rule) and the locations
     # string must span all the DCs.
-    monkeypatch.setenv("FLASH_IS_LIVE_PROVISIONING", "true")
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.gpu import GpuGroup
 

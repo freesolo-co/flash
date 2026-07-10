@@ -86,7 +86,6 @@ class FreesoloEnvironment(BaseEnvironment):
         self._task_example_from_record = tools["task_example_from_record"]
         self._load_task_examples = tools["load_task_examples"]
         self._EnvironmentEpisode = tools["EnvironmentEpisode"]
-        self._EnvironmentMultiTurn = tools["EnvironmentMultiTurn"]
         self._EnvironmentTurn = tools["EnvironmentTurn"]
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
         self.is_tool_env = False

@@ -363,14 +363,12 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
     mods = {"lambda": lambda_jobs}
-    region_ok: dict = {}
     targets: list = []
     for provider in providers:
         jobs_mod = mods.get(provider)
         if jobs_mod is None:
             continue
         provider_gpu = gpu or _PRELOAD_GPU_BY_PROVIDER.get(provider, _PRELOAD_INSTANCE_GPU)
-        cache_capable = region_ok.get(provider)
         seen_regions: set = set()
         try:
             candidates = jobs_mod.usable_instances(provider_gpu)
@@ -379,10 +377,6 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             continue
         for c in candidates:
             if c.region in seen_regions:
-                continue
-            if cache_capable is not None and not cache_capable(c.region):
-                logger.info("warm %s: skipping cache-incapable region %s", provider, c.region)
-                seen_regions.add(c.region)
                 continue
             seen_regions.add(c.region)
             targets.append((provider, jobs_mod, c, provider_gpu))

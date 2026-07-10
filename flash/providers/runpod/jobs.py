@@ -316,7 +316,6 @@ def deploy_train_endpoint(
     ``endpoint_kwargs`` may be a callable factory — re-invoked per account on quota failover so the
     SDK doesn't reuse a volume id stamped for the previous account.
     """
-    os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
