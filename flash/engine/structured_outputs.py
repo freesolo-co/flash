@@ -15,6 +15,34 @@ import json
 # schema-time normalizer (schema/fields.py) imports this so the two layers can never drift.
 CONSTRAINT_KEYS = ("json", "regex", "choice", "json_object")
 
+# vLLM reasoning parser for Flash's <think>...</think> thinking format. Set as the rollout engine's
+# EngineArgs.reasoning_parser, it makes vLLM's V1 structured-output gate hold the guided grammar
+# until the reasoning block closes (</think>) instead of binding from the very first token — so a
+# thinking model reasons freely, then only its post-</think> answer is constrained. It is
+# format-based, not weight-specific: the deepseek_r1 parser resolves the </think> boundary from the
+# model's own tokenizer, so it fits every Flash thinking model (Qwen3.x, GLM, ...), all of which
+# delimit reasoning with <think>. Without it, a json/regex/choice constraint would forbid the free
+# <think> phase entirely (it forces the first token to open the schema, e.g. `{`).
+THINKING_REASONING_PARSER = "deepseek_r1"
+
+
+def reasoning_parser_for(*, thinking: bool, structured_outputs: dict | None) -> str | None:
+    """The vLLM reasoning-parser name that defers a guided grammar past </think>, or None.
+
+    Only meaningful when BOTH thinking is on AND a structured-outputs constraint is configured: with
+    no constraint the grammar gate never runs, and with thinking off there is no reasoning phase to
+    protect. When both hold, returning the parser lets vLLM apply the schema only to the answer that
+    follows the reasoning block, so structured outputs and thinking are no longer mutually exclusive.
+
+    Single-turn (the common structured-output case) is fully covered: the prompt carries no closing
+    </think>, so the grammar stays off until the model emits one. In a multi-turn rollout the parser
+    is engine-global and each later turn's prompt already contains a prior </think>, so vLLM treats
+    reasoning as already ended and constrains that turn from its first token — no worse than the
+    unparsed baseline, and turn one still reasons freely."""
+    if thinking and structured_outputs:
+        return THINKING_REASONING_PARSER
+    return None
+
 
 def parse_structured_outputs(spec_json: str | None) -> dict | None:
     """Decode a TrainSpec.structured_outputs string to StructuredOutputsParams kwargs.
