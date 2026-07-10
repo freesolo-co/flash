@@ -279,13 +279,10 @@ def _student_model(model_id, mik, device):
     the base. This makes an SFT->opd pipeline a genuine continuation (the opd stage keeps the SFT
     behavior) rather than silently restarting from base.
 
-    Two warm-start shapes, both from ``_init_adapter_model`` (parity with GRPO):
-      - non-VL (e.g. MiniCPM): a trainable PeftModel that CONTINUES the SFT adapter in place
-        (``init_peft is None``); the saved adapter already carries the SFT.
-      - VL (Qwen3.5/3.6): ``_init_adapter_model`` MERGES the SFT into the base and returns the merged
-        dir + a FRESH LoRA config. We train that fresh LoRA on the merged base; ``run_opd`` then
-        recombines SFT⊕opd at publish (``recombined_warmstart_adapter_dir``) so the DEPLOYED adapter
-        reproduces base+SFT+opd on the unmodified catalog base — exactly GRPO's VL warm-start path.
+    Warm-start (``init_peft is None``) returns a trainable PeftModel that CONTINUES the prior adapter
+    in place — VL and non-VL alike — so the saved/deployed adapter is that same rank-r adapter on the
+    catalog base (no merge, no recombine). Only the FRESH-LoRA path (``init_peft`` is a config) builds
+    a new adapter here, loading the full multimodal model for VL so all-linear LoRA sees every target.
     """
     init_model, init_peft = _w._init_adapter_model(model_id)
     if init_peft is None:
@@ -295,15 +292,15 @@ def _student_model(model_id, mik, device):
     from transformers import AutoModelForCausalLM
 
     model_cls = AutoModelForCausalLM
-    if getattr(_w, "_VL_WARMSTART_SFT_DIR", None) or _w.is_vl_checkpoint(model_id):
-        # VL checkpoints are trained/served on the full multimodal tree, including visual linears.
-        # The warm-start recombine path also requires the fresh OPD adapter to target that same tree.
+    if _w.is_vl_checkpoint(model_id):
+        # VL checkpoints are trained/served on the full multimodal tree, including visual linears, so
+        # a fresh LoRA must target that same tree (parity with the warm-start / serving module set).
         from transformers import AutoModelForImageTextToText
 
         model_cls = AutoModelForImageTextToText
 
-    # init_model is the base id (fresh run) or the VL SFT-merged dir. Non-VL runs keep the lighter
-    # causal-LM loader; VL runs load the full multimodal model so all-linear LoRA sees every target.
+    # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
+    # sees every target; non-VL runs keep the lighter causal-LM loader.
     base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
     return get_peft_model(base, init_peft), str(init_model)
 
@@ -998,8 +995,8 @@ def run_opd():
             # warm-start/deploy from step-N would use fewer updates than its name implies.
             if knobs.save_every and opt_steps % knobs.save_every == 0:
                 _save_adapter(model, tok, adapter_dir)
-                # Best-effort: a mid-run recombine/publish failure (e.g. transiently evicted SFT dir)
-                # must not abort the loop after real optimizer steps — the finalize publish is strict.
+                # Best-effort: a mid-run publish failure (e.g. a transient upload error) must not abort
+                # the loop after real optimizer steps — the finalize publish is strict.
                 _publish_opd_deployable(adapter_dir, opt_steps, as_default=False, best_effort=True)
 
     train_wall = time.time() - t_train
@@ -1050,9 +1047,8 @@ def run_opd():
         )
 
     _save_adapter(model, tok, adapter_dir)
-    # Ship the deployable adapter (VL warm-start: recombine SFT⊕opd so it reproduces base+SFT+opd on
-    # the catalog base; no-op for text/fresh). Name the final checkpoint by real optimizer steps
-    # applied, not the planned `steps` count.
+    # Ship the deployable adapter: the continued (or fresh) LoRA deploys as-is on the catalog base.
+    # Name the final checkpoint by real optimizer steps applied, not the planned `steps` count.
     _publish_opd_deployable(adapter_dir, opt_steps, as_default=True)
     # step=opt_steps on this (unthrottled) final ping AND on the opd_train_done ping below keeps the
     # persisted heartbeat's step at the true completed count. Without it, a cancel landing after the
@@ -1781,38 +1777,19 @@ def _publish_opd_deployable(
     adapter_dir: str, step: int, *, as_default: bool, best_effort: bool = False
 ) -> None:
     """Publish the step-``step`` deployable adapter (and, when ``as_default``, the ``<prefix>/adapter``
-    served default), recombining SFT⊕opd for a VL warm-start so the deployed adapter reproduces
-    base+SFT+opd on the unmodified catalog base. For a VL warm-start the trained ``adapter_dir`` is
-    SFT-less (a fresh LoRA on the SFT-merged base); ``recombined_warmstart_adapter_dir`` stacks the
-    original SFT LoRA back in. No-op recombine (deploys ``adapter_dir`` as-is) for the continued-
-    adapter (non-VL) and fresh-LoRA paths, which already carry the SFT. Mirrors GRPO finalize (rl.py).
+    served default). The opd stage CONTINUES the one warm-started adapter in place, so ``adapter_dir``
+    already carries SFT+opd on the catalog base and deploys as-is (same for fresh-LoRA runs) — no
+    recombine. Mirrors GRPO finalize (rl.py).
 
-    ``best_effort`` (mid-run per-step publish): swallow a recombine/publish failure and KEEP training —
-    a transient or evicted SFT dir during a save_every publish must not terminate run_opd after real
-    optimizer steps (GRPO's per-step checkpoint callback is likewise best-effort). At finalize
-    (``best_effort=False``) a recombine failure is FATAL: shipping the SFT-less adapter as the served
-    default is exactly the broken deploy the recombine guards against."""
-    try:
-        recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
-    except Exception as e:
-        if not best_effort:
-            raise
-        print(
-            f"[opd] deployable recombine failed at step {step}; "
-            f"skipping this publish, training continues: {e}"
-        )
-        return
-    deploy_dir = recombined or adapter_dir
+    ``best_effort`` (mid-run per-step publish): swallow a publish failure and KEEP training — a
+    transient upload error during a save_every publish must not terminate run_opd after real optimizer
+    steps (GRPO's per-step checkpoint callback is likewise best-effort). At finalize
+    (``best_effort=False``) a publish failure is FATAL."""
     try:
         if as_default:
-            _w.hf_upload_folder(deploy_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(deploy_dir, step)
+            _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        _w.publish_deployable_checkpoint(adapter_dir, step)
     except Exception as e:
         if not best_effort:
             raise
         print(f"[opd] deployable publish failed at step {step}; skipping, training continues: {e}")
-    finally:
-        if recombined:
-            import shutil
-
-            shutil.rmtree(recombined, ignore_errors=True)
