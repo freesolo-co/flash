@@ -450,10 +450,10 @@ def run_sft():
         )
     # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
     # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
-    mik = {"dtype": "bfloat16", "device_map": None}
+    model_init_kwargs = {"dtype": "bfloat16", "device_map": None}
     if _attn:
-        mik["attn_implementation"] = _attn
-    cfg_kwargs["model_init_kwargs"] = mik
+        model_init_kwargs["attn_implementation"] = _attn
+    cfg_kwargs["model_init_kwargs"] = model_init_kwargs
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
@@ -522,7 +522,7 @@ def run_sft():
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
         sft_model = _w.prepare_fresh_lora_base(
-            model_id, model_id, mik, phase="sft"
+            model_id, model_id, model_init_kwargs, phase="sft"
         )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
