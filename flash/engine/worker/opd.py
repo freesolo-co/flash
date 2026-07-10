@@ -26,32 +26,94 @@ import random
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
-from flash.engine.recipe import RECIPE, resolve_teacher
+from flash.engine.recipe import RECIPE
 from flash.engine.steps import on_policy_steps
 from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
-from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
-    _rollout_terminated,
     _teacher_prompt_text,
-    _trim_trailing_stop,
     student_tokens_with_offsets,
 )
-from flash.engine.worker.opd_vllm import (
-    OpdVllmOutput,
-    OpdVllmRolloutEngine,
+from flash.engine.worker.opd_gkd import (
+    _rollout_terminated as _rollout_terminated,
 )
-from flash.engine.worker.opd_vllm import (
-    opd_lora_rank as _opd_lora_rank,
+from flash.engine.worker.opd_gkd import (
+    _trim_trailing_stop as _trim_trailing_stop,
 )
-from flash.engine.worker.opd_vllm import (
-    opd_vllm_kwargs as _opd_vllm_kwargs,
+from flash.engine.worker.opd_knobs import OpdKnobs as OpdKnobs
+from flash.engine.worker.opd_knobs import _resolve_opd_knobs
+from flash.engine.worker.opd_loss import (
+    _EOS_RUNAWAY_HI as _EOS_RUNAWAY_HI,
 )
+from flash.engine.worker.opd_loss import (
+    _EOS_RUNAWAY_LO as _EOS_RUNAWAY_LO,
+)
+from flash.engine.worker.opd_loss import (
+    _EOS_TRUNC_EMA_DECAY,
+    _bump_model_counter,
+    _drop_fully_forced_groups,
+    _eos_reinforce_term,
+    _forward_logits,
+    _gkd_loss_from_logits_rows,
+    _prepare_gkd_groups,
+    _PreparedLoss,
+    _primary_eos_id,
+    _runaway_eos_scale,
+)
+from flash.engine.worker.opd_loss import (
+    _gkd_loss_from_logps as _gkd_loss_from_logps,
+)
+from flash.engine.worker.opd_loss import (
+    _PreparedGkdGroups as _PreparedGkdGroups,
+)
+from flash.engine.worker.opd_publish import _publish_opd_deployable, _save_adapter
+from flash.engine.worker.opd_rollout import (
+    SampleResult,
+    _generate_many_vllm,
+    _GenResult,
+    _Pending,
+    _resolve_no_loss_sample,
+    _sample_skip_reason,
+)
+from flash.engine.worker.opd_rollout import (
+    _gen_from_vllm_output as _gen_from_vllm_output,
+)
+from flash.engine.worker.opd_scoring import _score_one, _ScoreResult
+from flash.engine.worker.opd_setup import (
+    _format_skip_counts,
+    _opd_progress,
+    _student_model,
+    _thinking_prefill_text,
+)
+from flash.engine.worker.opd_sizing import (
+    OPD_LOSS_MICROBATCH_SIZE as OPD_LOSS_MICROBATCH_SIZE,
+)
+from flash.engine.worker.opd_sizing import (
+    OPD_ROLLOUT_PIPELINE_MAX_CHUNKS as OPD_ROLLOUT_PIPELINE_MAX_CHUNKS,
+)
+from flash.engine.worker.opd_sizing import (
+    OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE as OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE,
+)
+from flash.engine.worker.opd_sizing import (
+    OPD_TEACHER_BATCH_SIZE as OPD_TEACHER_BATCH_SIZE,
+)
+from flash.engine.worker.opd_sizing import (
+    _opd_loss_microbatch_size,
+    _opd_rollout_chunk_size,
+    _opd_rollout_pipeline_chunks,
+    _opd_rollout_pipeline_max_chunks,
+    _opd_rollout_pipeline_target_chunk_size,
+    _opd_teacher_batch_size,
+    _opd_teacher_workers,
+)
+from flash.engine.worker.opd_vllm import OpdVllmOutput as OpdVllmOutput
+from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+from flash.engine.worker.opd_vllm import opd_lora_rank as _opd_lora_rank
+from flash.engine.worker.opd_vllm import opd_vllm_kwargs as _opd_vllm_kwargs
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _sdpa_cudnn_ctx,
@@ -65,277 +127,6 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
-
-OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
-OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
-OPD_TEACHER_BATCH_SIZE = 8
-OPD_LOSS_MICROBATCH_SIZE = 4
-
-
-def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
-    total = max(1, int(total_prompts))
-    return max(1, min(total, OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE))
-
-
-def _opd_rollout_pipeline_max_chunks(total_prompts: int) -> int:
-    total = max(1, int(total_prompts))
-    return max(1, min(total, OPD_ROLLOUT_PIPELINE_MAX_CHUNKS))
-
-
-def _opd_rollout_pipeline_chunks(total_prompts: int) -> int:
-    """Number of single-turn rollout chunks in one OPD step.
-
-    Small steps still split once so teacher scoring can overlap later vLLM generation. Larger steps
-    target moderately sized vLLM batches, which starts remote teacher scoring earlier without reducing
-    rollout generation to one request per prompt.
-    """
-    total = max(1, int(total_prompts))
-    if total < 8:
-        return 1
-    target_chunk = _opd_rollout_pipeline_target_chunk_size(total)
-    max_chunks = _opd_rollout_pipeline_max_chunks(total)
-    chunks = (total + target_chunk - 1) // target_chunk
-    if max_chunks == 1:
-        return 1
-    return max(2, min(max_chunks, chunks))
-
-
-def _opd_rollout_chunk_size(total_prompts: int) -> int:
-    """Split a single OPD step into a small number of rollout chunks so remote teacher scoring for
-    earlier chunks overlaps with vLLM generation for later chunks without collapsing vLLM batching."""
-    total = max(1, int(total_prompts))
-    chunks = _opd_rollout_pipeline_chunks(total)
-    return max(1, (total + chunks - 1) // chunks)
-
-
-def _opd_teacher_batch_size(total_samples: int) -> int:
-    total = max(1, int(total_samples))
-    return max(1, min(total, OPD_TEACHER_BATCH_SIZE))
-
-
-def _opd_teacher_workers(total_samples: int, batch_size: int) -> int:
-    total = max(1, int(total_samples))
-    return max(1, (total + max(1, int(batch_size)) - 1) // max(1, int(batch_size)))
-
-
-def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
-    total = max(1, int(total_samples))
-    try:
-        from flash.engine.vram import resolve_params_b
-
-        params_b = float(resolve_params_b(model_id) or 0.0)
-    except Exception:
-        params_b = 0.0
-    # The dense vocab logits from GKD are the peak. Batch small/medium dense models, but keep 35B-class
-    # OPD serial by default so the B200 path does not trade speed for OOM risk.
-    default = OPD_LOSS_MICROBATCH_SIZE if params_b and params_b <= 10.0 else 1
-    return max(1, min(total, default))
-
-
-@dataclass(frozen=True)
-class OpdKnobs:
-    """Resolved opd knobs from the JobSpec's [train] table (falling back to RECIPE.opd), returned by
-    ``_resolve_opd_knobs``. A typed container replacing the old stringly-typed dict; field names match
-    the former dict keys one-for-one. The defaults are placeholders only — ``_resolve_opd_knobs``
-    always sets every field explicitly — kept so partial construction stays ergonomic for tests."""
-
-    teacher_model: str = ""
-    teacher_base_url: str = ""
-    epochs: int = RECIPE.opd.num_epochs
-    learning_rate: float = 0.0
-    temperature: float = 0.0
-    top_p: float = 1.0
-    max_completion: int = 0
-    prompts_per_step: int = 0
-    group_size: int = 0
-    # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
-    kl_coef: float = 1.0
-    # Weight of the terminal-EOS behaviour-cloning term (see _eos_reinforce_term). The reverse-KL
-    # over shared decoded-text spans cannot supervise the zero-width stop token, so this restores the
-    # stop signal; 0 disables it. [train].opd_eos_loss_coef, else RECIPE.opd.eos_loss_coef.
-    eos_loss_coef: float = RECIPE.opd.eos_loss_coef
-    save_every: int = 0
-    max_length: int = 0
-    # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
-    # scores/trains on text past the intended answer boundary.
-    stop_sequences: tuple = ()
-    # Canonical StructuredOutputsParams kwargs JSON from [train] structured_outputs ("" = off);
-    # constrains every student rollout (parity with GRPO). Teacher echo-scoring needs no schema —
-    # it scores the student's already-constrained tokens.
-    structured_outputs: str = ""
-
-
-def _resolve_opd_knobs() -> OpdKnobs:
-    """Resolve every opd knob from the JobSpec's [train] table, falling back to RECIPE.opd."""
-    d = RECIPE.opd
-    t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
-
-    def opt(name, default):
-        v = getattr(t, name, None) if t else None
-        return v if v is not None else default
-
-    # kl_penalty_coef IS the gkd distillation objective's scale: the OPD loss multiplies every span
-    # coefficient by it, so kl_coef=0 makes EVERY backward a zero gradient while the loop still counts
-    # opt_steps and would publish/charge a fully-untrained adapter. The shared schema allows 0 for GRPO
-    # (a valid "no KL penalty"), but for OPD it must be positive, so reject an explicit 0 here (a plain
-    # `or` would also wrongly treat 0.0 as unset). Omitting the field uses the positive recipe default.
-    _kl = opt("kl_penalty_coef", None)
-    kl_coef = float(_kl if _kl is not None else d.kl_coef)
-    if kl_coef == 0.0:
-        raise RuntimeError(
-            "opd: [train] kl_penalty_coef must be > 0 — it scales the gkd distillation objective, so "
-            "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
-            "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
-        )
-    # Resolve the managed teacher from [train].teacher_model (the resolved Fireworks model id, "" =>
-    # the GLM 5.2 default). Parse already validated + canonicalized it, but JobSpec.from_dict is a
-    # tolerant deserializer, so re-validate at this boundary (like the kl_coef guard above): resolve
-    # is idempotent for a canonical model id, and a spec that reaches the worker with an unsupported
-    # teacher fails loudly here rather than as an opaque Fireworks 404 mid-run. base_url is shared by
-    # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
-    try:
-        teacher = resolve_teacher(opt("teacher_model", ""))
-    except ValueError as e:
-        raise RuntimeError(f"opd: {e}") from e
-    return OpdKnobs(
-        teacher_model=teacher.model_id,
-        teacher_base_url=d.teacher_base_url,
-        epochs=int(t.epochs) if t and t.epochs is not None else d.num_epochs,
-        learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
-        temperature=float(
-            opt("temperature", None)
-            if (t and t.temperature is not None)
-            else d.sampling_temperature
-        ),
-        top_p=d.sampling_top_p,
-        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
-        prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
-        group_size=int(opt("group_size", 0) or d.group_size),
-        kl_coef=kl_coef,
-        # 0 is a VALID explicit value here (disable EOS reinforcement), unlike kl_coef, so only fall
-        # back to the recipe default when the field is UNSET (None) — a plain `or` would swallow 0.0.
-        eos_loss_coef=max(
-            0.0,
-            float(
-                _eos if (_eos := opt("opd_eos_loss_coef", None)) is not None else d.eos_loss_coef
-            ),
-        ),
-        save_every=int(opt("save_every", 0) or 20),
-        max_length=int(opt("max_context_tokens", 0) or 0),
-        stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
-        structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
-    )
-
-
-def _thinking_prefill_text(tok) -> str:
-    """The trailing text a thinking-mode chat template opens after the generation prompt (Qwen's
-    ``<think>\\n``), i.e. the delta between the enable_thinking=True and =False renders. Returns "" when
-    thinking is off or the template ignores enable_thinking (the two renders match), so callers can
-    unconditionally append it to the teacher prompt for student/teacher conditioning parity."""
-    if not _w.THINKING:
-        return ""
-    probe = [{"role": "user", "content": ""}]
-    with contextlib.suppress(Exception):
-        base = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-        think = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=True
-        )
-        if think == base:
-            return ""  # template ignores enable_thinking -> plain "Assistant: " already matches
-        # The thinking render opens a reasoning block the non-thinking render doesn't, but it is NOT
-        # always a pure suffix (the old think.startswith(base) test). Compute the longest common PREFIX
-        # and SUFFIX of the two renders; the thinking render's UNIQUE MIDDLE is the opener.
-        p = 0
-        m = min(len(base), len(think))
-        while p < m and base[p] == think[p]:
-            p += 1
-        s = 0
-        while s < len(base) - p and s < len(think) - p and base[-1 - s] == think[-1 - s]:
-            s += 1
-        think_mid = think[p : len(think) - s]
-        base_mid = base[p : len(base) - s]
-        # CLOSED-BLOCK hybrid recovery, checked BEFORE the think_mid early-return: enable_thinking=False
-        # force-CLOSES the block (base's unique middle is a closing tag "</think>...") while the shared
-        # prefix already opened "<think>", which the student pre-fills. Recover the OPEN-block opener from
-        # the think render so the teacher conditions on the same open block instead of base's closed one.
-        # This MUST run before `if think_mid` because a base that closes the block right after the opener
-        # leaves a non-empty WHITESPACE remainder in think_mid (base "<think></think>" vs think
-        # "<think>\n" -> think_mid "\n"), which the early-return would otherwise hand back in place of the
-        # real "<think>\n" opener (codex[bot]). The base "<think>\n\n</think>" / think "<think>\n" shape
-        # (think_mid EMPTY) is the SAME recovery. lstrip absorbs intra-block whitespace before the closing
-        # tag so detection still fires; we return think[cut:] (the thinking-side opener), so the strip only
-        # affects DETECTION, not the returned opener. If the opener isn't in the shared prefix, fall
-        # through: return the think_mid delta ("" only when the model opens <think> inside the completion).
-        base_mid_tag = base_mid.lstrip()
-        if base_mid_tag.startswith("</") and ">" in base_mid_tag:
-            open_tag = (
-                "<" + base_mid_tag[2 : base_mid_tag.index(">") + 1]
-            )  # "</think>..." -> "<think>"
-            cut = think.rfind(open_tag, 0, p)
-            if cut != -1:
-                return think[cut:]  # e.g. "<think>\n"
-        if think_mid:
-            return think_mid  # opener appended, or inserted before shared trailing template text
-    return ""
-
-
-def _student_model(model_id, mik, device):
-    """Build the trainable student LoRA and return ``(model, rollout_model_source)``.
-
-    Warm-starts from ``train.init_from_adapter`` when set — continuing a prior run's adapter (e.g. an
-    SFT checkpoint), the same path GRPO uses via ``_init_adapter_model`` — otherwise a fresh LoRA on
-    the base. This makes an SFT->opd pipeline a genuine continuation (the opd stage keeps the SFT
-    behavior) rather than silently restarting from base.
-
-    Warm-start (``init_peft is None``) returns a trainable PeftModel that CONTINUES the prior adapter
-    in place — VL and non-VL alike — so the saved/deployed adapter is that same rank-r adapter on the
-    catalog base (no merge, no recombine). Only the FRESH-LoRA path (``init_peft`` is a config) builds
-    a new adapter here, loading the full multimodal model for VL so all-linear LoRA sees every target.
-    """
-    init_model, init_peft = _w._init_adapter_model(model_id)
-    if init_peft is None:
-        # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
-        return init_model.to(device), model_id
-    from peft import get_peft_model
-    from transformers import AutoModelForCausalLM
-
-    model_cls = AutoModelForCausalLM
-    if _w.is_vl_checkpoint(model_id):
-        # VL checkpoints are trained/served on the full multimodal tree, including visual linears, so
-        # a fresh LoRA must target that same tree (parity with the warm-start / serving module set).
-        from transformers import AutoModelForImageTextToText
-
-        model_cls = AutoModelForImageTextToText
-
-    # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
-    # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **mik).to(device)
-    return get_peft_model(base, init_peft), str(init_model)
-
-
-def _opd_progress(step: int, done: int) -> None:
-    """Emit the in-loop non-liveness ``opd_step`` progress ping. Pollers ignore liveness heartbeats, so
-    a long teacher-bound step (the bounded-concurrency teacher scoring of a large batch/group, or a
-    slow/retrying Fireworks endpoint that stalls even the overlapped calls; also the serial on-policy
-    generation preceding it) — or a stretch where every sample skips (empty completions, no teacher
-    signal) — would otherwise emit only
-    liveness pings and trip the training stall window. Report ``step`` = optimizer updates COMPLETED so
-    far (opt_steps), NOT the loop index: opd_step is step-gated in the poller (_poll.STEP_GATED_STAGES),
-    so while the FIRST optimizer step is still accumulating (opt_steps==0) these pings keep the WIDE
-    setup grace and must not flip a still-running first step into the tight training window; once a real
-    update has landed (opt_steps>=1) they tighten it as intended, and the throttle bounds the HF upload
-    rate."""
-    _w.heartbeat("opd_step", step=step, samples_done=done)
-
-
-def _format_skip_counts(counts: Counter[str]) -> str:
-    """Compact human-readable summary for OPD no-signal diagnostics."""
-
-    if not counts:
-        return "unknown=0"
-    return ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
 
 
 def run_opd():
@@ -1181,180 +972,6 @@ def run_opd():
     free_gpu(model)
 
 
-@dataclass(frozen=True)
-class SampleResult:
-    """One student sample's outcome, returned by the rollout/loss pipeline for ``run_opd`` to aggregate.
-
-    ``loss`` is the groupwise reverse-KL loss tensor when the sample was distilled, else ``None``
-    (the sample was skipped — truncated rollout, empty completion, or no teacher signal). The stats
-    describe what happened so the caller can count teacher health / truncations and, on a no-loss run,
-    decide whether it is a retriable infra failure."""
-
-    loss: object = None  # torch scalar tensor when distilled, else None (module is torch-free)
-    # "ok" once teacher.score returns, "transient" on a retryable teacher outage, else None (teacher
-    # not reached). run_opd uses this to decide whether a no-signal run is a retriable infra failure.
-    teacher_status: str | None = None
-    # A rollout that didn't terminate naturally — cap hit OR max_time cut, no EOS/stop (skipped, not
-    # distilled — see _rollout_terminated).
-    truncated: bool = False
-    coverage: float = 0.0
-    gen_tokens: int = 0
-    teacher_tokens: int = 0
-    # Mean student-tokens-per-alignment-group; a real health signal where coverage is not.
-    group_granularity: float = 0.0
-    # Machine-readable reason when loss is None. Used for skipped-step diagnostics and train_meta.
-    skip_reason: str = ""
-    # Detached log P(eos) at the reinforced terminal position, when the EOS behaviour-cloning term
-    # was applied (else None). Surfaced as mean_eos_logprob so a run's rising termination is visible.
-    eos_logprob: float | None = None
-
-
-@dataclass(frozen=True)
-class _GenResult:
-    """One student rollout after OPD's pre-scoring gates: the sampled completion plus skip/truncated
-    verdicts. ``truncated`` (max_new_tokens cap hit OR max_time cut, no EOS/stop) and ``skip`` (empty or
-    U+FFFD completion) mean the rollout is dropped BEFORE teacher scoring; otherwise ``completion_ids`` /
-    ``completion_text`` carry the trimmed on-policy answer to score + distil. Torch-free
-    (completion_ids is a CPU list) so it can be handed to the model-free scoring thread pool."""
-
-    completion_ids: object = None
-    completion_text: str = ""
-    gen_tokens: int = 0
-    truncated: bool = False
-    skip: bool = False
-    skip_reason: str = ""
-    # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
-    # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
-    forced: tuple = ()
-
-
-@dataclass(frozen=True)
-class _ScoreResult:
-    """Teacher-scoring outcome from ``_score_one`` (RUN IN THE THREAD POOL). ``status`` is "ok"
-    (``teacher_toks`` populated), "transient" (retryable teacher outage -> sample skipped + counted),
-    or "error" (any other exception -> sample skipped, teacher uncounted). A PERMANENT ``TeacherError``
-    is NOT represented here — ``_score_one`` re-raises it so the run aborts, exactly as before."""
-
-    teacher_toks: object = None
-    status: str = "ok"
-    error: str = ""
-
-
-def _sample_skip_reason(r: SampleResult) -> str:
-    """Classify a no-loss OPD sample for skipped-step diagnostics."""
-
-    if r.skip_reason:
-        return r.skip_reason
-    if r.truncated:
-        return "truncated_rollout"
-    if r.teacher_status == "transient":
-        return "teacher_transient"
-    if r.teacher_status == "error":
-        return "teacher_error"
-    if r.teacher_status == "ok":
-        return "alignment_empty"
-    return "pre_teacher_skip"
-
-
-@dataclass
-class _Pending:
-    """A rollout awaiting concurrent teacher scoring and then loss/backward, carrying the prompt context
-    both need. Mutable: ``score`` is filled in by the thread pool for scorable rollouts."""
-
-    gen: _GenResult
-    prompt_ids: object
-    prompt_messages: object
-    score: object = None
-
-
-def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
-    """Apply OPD's pre-scoring gates to one vLLM completion."""
-    completion_ids = [int(t) for t in out.token_ids]
-    forced = tuple(bool(f) for f in (getattr(out, "forced", ()) or ()))
-    decode = getattr(tok, "decode", None)
-    completion_text = out.text or (
-        decode(completion_ids, skip_special_tokens=True) if decode else ""
-    )
-    stop_text = decode(completion_ids, skip_special_tokens=False) if decode else completion_text
-    if not (
-        out.terminated
-        or _rollout_terminated(
-            completion_ids,
-            stop_text,
-            _generation_eos_ids(None, tok),
-            knobs.stop_sequences,
-        )
-    ):
-        return _GenResult(
-            truncated=True, gen_tokens=len(completion_ids), skip_reason="truncated_rollout"
-        )
-    # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
-    # delimiter is present; otherwise keep the already-stripped ids/text.
-    if knobs.stop_sequences and any(
-        stop_text.endswith(s) or completion_text.endswith(s) for s in knobs.stop_sequences
-    ):
-        completion_ids, completion_text = _trim_trailing_stop(
-            tok, completion_ids, stop_text, knobs.stop_sequences
-        )
-    gen_tokens = len(completion_ids)
-    if not completion_text.strip():
-        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="empty_completion")
-    if "\ufffd" in completion_text:
-        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="replacement_char")
-    return _GenResult(
-        completion_ids=completion_ids,
-        completion_text=completion_text,
-        gen_tokens=gen_tokens,
-        # Trimming drops a trailing stop suffix, so the kept ids are a prefix -> slice forced to match.
-        forced=forced[: len(completion_ids)],
-    )
-
-
-def _generate_many_vllm(
-    rollout: OpdVllmRolloutEngine, tok, prompt_ids_batch: list[list[int]], knobs, *, max_tokens: int
-) -> list[_GenResult]:
-    return [
-        _gen_from_vllm_output(out, tok, knobs)
-        for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
-    ]
-
-
-def _score_one(
-    teacher, gen_result, *, prompt_messages, thinking_prefill, max_attempts: int = 2
-) -> _ScoreResult:
-    """[THREAD POOL — network only] Build the teacher prompt and echo-score the completion over the
-    API. MUST NOT touch the torch model or any shared mutable state — it reads only the completion
-    string + prompt messages and calls the stateless teacher HTTP client, so it is safe to run
-    concurrently for every scorable sample in a step. ``thinking_prefill`` is appended to the teacher
-    prompt so it conditions on the same trailing context the student sampled after in thinking mode.
-    Error semantics are the shared OPD teacher semantics: a PERMANENT ``TeacherError`` propagates (the
-    run aborts), a transient one -> status "transient", any other exception -> status "error"; both
-    leave the sample skipped with no teacher signal."""
-    teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
-    attempts = max(1, int(max_attempts))
-    for attempt in range(1, attempts + 1):
-        try:
-            teacher_toks = teacher.score(teacher_prompt, gen_result.completion_text)
-        except TeacherError as e:
-            if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
-                raise
-            if attempt < attempts:
-                print(
-                    f"[opd] teacher score failed (transient, retrying sample {attempt}/{attempts}): {e}"
-                )
-                continue
-            print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-            return _ScoreResult(status="transient", error=str(e))
-        except Exception as e:
-            if attempt < attempts:
-                print(f"[opd] teacher score failed (retrying sample {attempt}/{attempts}): {e}")
-                continue
-            print(f"[opd] teacher score failed (skipping sample): {e}")
-            return _ScoreResult(status="error", error=str(e))
-        return _ScoreResult(teacher_toks=teacher_toks, status="ok")
-    return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
-
-
 def _score_many(
     teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
 ) -> list[_ScoreResult]:
@@ -1412,209 +1029,6 @@ def _score_many(
             ]
         return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
     return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
-
-
-@dataclass(frozen=True)
-class _PreparedGkdGroups:
-    token_indices: tuple[int, ...]
-    group_lengths: tuple[int, ...]
-    teacher_logsums: tuple[float, ...]
-
-
-def _drop_fully_forced_groups(groups, forced):
-    """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
-    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
-    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
-    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op."""
-    if not forced:
-        return groups
-    return [
-        (s_idx, tsum)
-        for (s_idx, tsum) in groups
-        if not (s_idx and all(i < len(forced) and forced[i] for i in s_idx))
-    ]
-
-
-def _prepare_gkd_groups(groups) -> _PreparedGkdGroups | None:
-    token_indices: list[int] = []
-    group_lengths: list[int] = []
-    teacher_logsums: list[float] = []
-    for s_idx, teacher_logsum in groups:
-        if not s_idx:
-            continue
-        token_indices.extend(int(i) for i in s_idx)
-        group_lengths.append(len(s_idx))
-        teacher_logsums.append(float(teacher_logsum))
-    if not token_indices:
-        return None
-    return _PreparedGkdGroups(
-        token_indices=tuple(token_indices),
-        group_lengths=tuple(group_lengths),
-        teacher_logsums=tuple(teacher_logsums),
-    )
-
-
-@dataclass(frozen=True)
-class _PreparedLoss:
-    idx: int
-    prompt_ids: object
-    student_ids: object
-    groups: _PreparedGkdGroups
-    coverage: float
-    gen_tokens: int
-    teacher_tokens: int
-    group_granularity: float
-
-
-def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
-    import torch
-    import torch.nn.functional as F
-
-    if not student_ids or not groups:
-        return None
-    prepared = groups if isinstance(groups, _PreparedGkdGroups) else _prepare_gkd_groups(groups)
-    if prepared is None:
-        return None
-    rows = rows.float()
-    ids_t = torch.tensor(student_ids, device=rows.device)
-    sp_t = -F.cross_entropy(rows, ids_t, reduction="none")
-    return _gkd_loss_from_logps(sp_t, prepared, kl_coef=kl_coef)
-
-
-def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
-    import torch
-
-    if sp_t is None or not groups:
-        return None
-    prepared = groups if isinstance(groups, _PreparedGkdGroups) else _prepare_gkd_groups(groups)
-    if prepared is None:
-        return None
-    sp_det = sp_t.detach()
-    flat_idx_t = torch.tensor(prepared.token_indices, device=sp_t.device)
-    group_lengths_t = torch.tensor(prepared.group_lengths, device=sp_t.device)
-    group_ids_t = torch.repeat_interleave(
-        torch.arange(len(prepared.group_lengths), device=sp_t.device), group_lengths_t
-    )
-    student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
-    student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
-    teacher_logsum_t = torch.tensor(
-        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
-    )
-    coeffs = kl_coef * (
-        student_group_logsum - teacher_logsum_t
-    ) / group_lengths_t.to(dtype=sp_t.dtype)
-    coeff_vec = coeffs.index_select(0, group_ids_t)
-    sp_sel = sp_t.index_select(0, flat_idx_t)
-    return (coeff_vec * sp_sel).mean()
-
-
-def _forward_logits(model, input_ids, attention_mask=None):
-    kwargs = {}
-    if attention_mask is not None:
-        kwargs["attention_mask"] = attention_mask
-    try:
-        return model(input_ids, **kwargs).logits
-    except TypeError:
-        if attention_mask is not None:
-            return model(input_ids).logits
-        raise
-
-
-def _bump_model_counter(model, name: str, inc: int = 1) -> None:
-    with contextlib.suppress(Exception):
-        setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
-
-
-def _primary_eos_id(tok, eos_ids: frozenset) -> int | None:
-    """The single eos id to behaviour-clone in ``_eos_reinforce_term``'s stripped-eos case: the
-    tokenizer's ``eos_token_id`` (the chat terminator — ``<|im_end|>`` for Qwen chat models), falling
-    back to any member of the model's generation-halting set. ``None`` when no eos is defined (a bare
-    test stand-in), which disables reinforcement."""
-    tid = getattr(tok, "eos_token_id", None)
-    if isinstance(tid, int) and not isinstance(tid, bool):
-        return tid
-    if isinstance(tid, (list, tuple)) and tid:
-        for x in tid:
-            if isinstance(x, int) and not isinstance(x, bool):
-                return x
-    return min(eos_ids) if eos_ids else None
-
-
-def _eos_reinforce_term(
-    sample_logits, prompt_len: int, student_ids, eos_ids, eos_primary_id, stop_sequences, eos_coef
-):
-    """Positive supervision for the terminal stop token the cross-tokenizer alignment drops.
-
-    OPD's reverse-KL is computed over shared DECODED-TEXT spans (``groupwise_alignment``); a special/eos
-    token is zero-width (decodes to nothing) so it lands in no alignment group and receives NO gradient
-    — the student is never taught to STOP. Distilling only the content tokens toward a strong, verbose
-    teacher (GLM-5.2) then erodes the student's termination and rollouts run away to the length cap. This
-    adds a plain cross-entropy on log P(eos) at the position the rollout naturally terminated. It has a
-    BOUNDED gradient (softmax - onehot, ‖·‖ ≤ √2, unlike the reverse-KL surrogate whose magnitude grows
-    as P(eos)->0) so it never dominates grad-clipping, and it SELF-LIMITS (vanishes as P(eos)->1), so a
-    student that already stops cleanly — the models that currently train fine — is unaffected.
-
-    Two shapes, because vLLM may or may not keep the terminal eos in ``token_ids``:
-      * eos KEPT (``student_ids`` ends in an eos id) — reinforce that token's own predictive row.
-      * eos STRIPPED (content-only ids) — reinforce the FIRST post-content row toward the primary eos.
-        The forward covers ``prompt+content``, so that row (the last real position's next-token
-        prediction) already exists; no extra token is appended. Skipped when ``stop_sequences`` are
-        configured (the rollout terminates on the delimiter — ordinary text the reverse-KL already
-        trains — not on eos).
-
-    Returns ``(term, logp)`` — the differentiable scalar loss addend (``-eos_coef * log P(eos)``) plus
-    the detached log-prob for logging — or ``None`` when there is no eos to reinforce.
-    """
-    import torch
-
-    if eos_coef <= 0:
-        return None
-    comp_len = len(student_ids)
-    if comp_len == 0:
-        return None
-    last_id = int(student_ids[-1])
-    if eos_ids and last_id in eos_ids:
-        # rows[-1]: the row that predicted the sampled terminal eos.
-        row_index = prompt_len - 1 + comp_len - 1
-        target = last_id
-    elif not stop_sequences and eos_primary_id is not None:
-        # First post-content position: log P(eos | prompt + content).
-        row_index = prompt_len - 1 + comp_len
-        target = int(eos_primary_id)
-    else:
-        return None
-    if row_index < 0 or row_index >= sample_logits.shape[0]:
-        return None
-    logits_row = sample_logits[row_index].float()
-    logp = logits_row[target] - torch.logsumexp(logits_row, dim=-1)
-    return (-float(eos_coef)) * logp, float(logp.detach())
-
-
-# Terminal-EOS reinforcement is a PROPORTIONAL CONTROLLER, not a constant push. #482 added the EOS
-# behaviour-cloning term on every distilled (cleanly-terminated) rollout unconditionally; because it
-# raises the SHARED eos output logit — which governs P(eos) at EVERY position, not just the terminal
-# one — and the terminal-row "self-limit" (vanishing gradient as P(eos)->1) never engages while P(eos)
-# plateaus below 1, it ratchets the eos logit up over a long run until the student emits eos FIRST:
-# empty completions -> finish_reason='stop' -> empty serve (the very bug #458 fixed, reintroduced by
-# #482's mechanism). Seen at 500-ex scale: 342 reinforced samples "correcting" only 5 truncated
-# rollouts, then an all-empty collapse by step ~55/63. Fix: scale the coef by how much the student is
-# CURRENTLY failing to terminate (an EMA of the per-rollout truncation rate), so a run that stops
-# reliably gets ~zero EOS push and cannot ratchet, while genuine runaway still drives full reinforcement.
-_EOS_RUNAWAY_LO = 0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
-_EOS_RUNAWAY_HI = 0.15  # truncation rate >= this: full opd_eos_loss_coef (clear runaway to correct)
-_EOS_TRUNC_EMA_DECAY = 0.97  # per-rollout EMA (~30-rollout window): responsive yet smoothed
-
-
-def _runaway_eos_scale(runaway_rate: float) -> float:
-    """Fraction of ``opd_eos_loss_coef`` to apply given the CURRENT runaway rate (EMA of per-rollout
-    truncation). 0 while the student terminates reliably (rate <= _EOS_RUNAWAY_LO) so the terminal-EOS
-    reinforcement cannot ratchet the shared eos logit into an empty-collapse; ramps linearly to full by
-    _EOS_RUNAWAY_HI. Reinforce EXACTLY in proportion to the runaway the term exists to correct."""
-    if runaway_rate <= _EOS_RUNAWAY_LO:
-        return 0.0
-    if runaway_rate >= _EOS_RUNAWAY_HI:
-        return 1.0
-    return (runaway_rate - _EOS_RUNAWAY_LO) / (_EOS_RUNAWAY_HI - _EOS_RUNAWAY_LO)
 
 
 def _resolve_samples_batched(
@@ -1769,69 +1183,3 @@ def _resolve_samples_batched(
                 (sum(losses) * float(backward_scale)).backward()
 
     return [r if r is not None else SampleResult(skip_reason="teacher_error") for r in results]
-
-
-def _resolve_no_loss_sample(gen, score) -> SampleResult:
-    """Map a generated rollout with no usable teacher score to its skipped ``SampleResult``.
-
-    Scored samples must go through ``_resolve_samples_batched`` so OPD has exactly one loss path.
-    """
-    if gen.truncated:
-        # Didn't terminate naturally (cap/max_time cut) — skipped, not distilled.
-        return SampleResult(
-            truncated=True,
-            gen_tokens=gen.gen_tokens,
-            skip_reason=gen.skip_reason or "truncated_rollout",
-        )
-    if gen.skip:  # empty completion or U+FFFD — skipped before scoring
-        return SampleResult(
-            gen_tokens=gen.gen_tokens,
-            skip_reason=gen.skip_reason or "pre_teacher_skip",
-        )
-    if score is None:
-        return SampleResult(
-            teacher_status="error",
-            gen_tokens=gen.gen_tokens,
-            skip_reason="teacher_missing_score",
-        )
-    if score.status == "transient":  # retryable teacher outage — skipped + counted
-        return SampleResult(
-            teacher_status="transient",
-            gen_tokens=gen.gen_tokens,
-            skip_reason="teacher_transient",
-        )
-    if score.status != "ok":  # any other teacher exception — skipped, teacher uncounted
-        return SampleResult(
-            teacher_status="error",
-            gen_tokens=gen.gen_tokens,
-            skip_reason="teacher_error",
-        )
-    raise RuntimeError("opd scored samples must be resolved through _resolve_samples_batched")
-
-
-def _save_adapter(model, tok, adapter_dir: str) -> None:
-    """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
-    model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
-
-
-def _publish_opd_deployable(
-    adapter_dir: str, step: int, *, as_default: bool, best_effort: bool = False
-) -> None:
-    """Publish the step-``step`` deployable adapter (and, when ``as_default``, the ``<prefix>/adapter``
-    served default). The opd stage CONTINUES the one warm-started adapter in place, so ``adapter_dir``
-    already carries SFT+opd on the catalog base and deploys as-is (same for fresh-LoRA runs) — no
-    recombine. Mirrors GRPO finalize (rl.py).
-
-    ``best_effort`` (mid-run per-step publish): swallow a publish failure and KEEP training — a
-    transient upload error during a save_every publish must not terminate run_opd after real optimizer
-    steps (GRPO's per-step checkpoint callback is likewise best-effort). At finalize
-    (``best_effort=False``) a publish failure is FATAL."""
-    try:
-        if as_default:
-            _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(adapter_dir, step)
-    except Exception as e:
-        if not best_effort:
-            raise
-        print(f"[opd] deployable publish failed at step {step}; skipping, training continues: {e}")
