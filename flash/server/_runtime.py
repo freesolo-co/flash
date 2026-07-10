@@ -50,6 +50,47 @@ async def _reconcile_cost_loop() -> None:
             _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
 
 
+async def _repo_cleanup_loop() -> None:
+    """Background loop: sweep ONCE on startup, then daily, deleting aged undeployed run prefixes
+    (``<phase>/<run_id>``) inside the per-environment HF artifact repos (``Freesolo-Co/flashrun-*``)
+    to reclaim the org's private-storage quota. The 7-day age and the daily cadence are hardcoded
+    constants (no env knobs) — see ``flash.server.repo_cleanup``. Sweeping on startup (rather than
+    after a full interval) keeps the GC making progress even on a plane that restarts more often than
+    the 24h cadence.
+
+    Fails CLOSED: each sweep aborts (deleting nothing) if the live serving set can't be confirmed, so
+    a registry blip never risks deleting a live adapter — it just retries next cycle. The HF +
+    registry calls are blocking, so each sweep is offloaded to a thread. Gated by
+    ``repo_cleanup_enabled`` (needs an operator ``HF_TOKEN``)."""
+    from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+
+    interval = 24.0 * 3600.0  # daily sweep (fixed); the 7-day age makes the exact cadence non-critical
+    # Sweep IMMEDIATELY on startup, THEN sleep between subsequent sweeps (sleep is at the END of the
+    # loop). Sleeping first would let a control plane restarted — or crash-looping — more often than
+    # the interval never reclaim anything. The startup sweep is still off the critical path — this is a
+    # background task and the sweep itself runs in a worker thread (see app.lifespan).
+    while True:
+        # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop Event
+        # lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large in-flight sweep
+        # can't keep deleting after the server was told to stop (see _reconcile_cost_loop).
+        stop = threading.Event()
+        try:
+            deleted = await asyncio.to_thread(run_scheduled_cleanup, should_stop=stop.is_set)
+            if deleted:
+                _log.info("repo GC: deleted %d aged undeployed run prefix(es)", deleted)
+        except asyncio.CancelledError:
+            stop.set()  # signal the worker thread to stop deleting between targets
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except CleanupAborted as exc:
+            # Live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a serving/
+            # registry blip; not an error. Retry next cycle.
+            _log.warning("repo GC sweep skipped (live set unconfirmed); retrying next cycle: %s", exc)
+        except Exception:
+            _log.debug("repo GC sweep failed; retrying next cycle", exc_info=True)
+        # Sleep AFTER the sweep, so the first sweep runs at startup rather than a full interval later.
+        await asyncio.sleep(interval)
+
+
 async def _charge_retry_startup() -> None:
     """Run ONE completion-charge recovery sweep off the startup critical path.
 
