@@ -1625,8 +1625,11 @@ def _resolve_samples_batched(
             )
             continue
         groups = groupwise_alignment(student_toks, score.teacher_toks)
-        # Drop groups whose student tokens were ALL grammar-forced (a fully-forced completion drops
-        # to zero groups -> alignment_empty, handled below).
+        # Drop fully grammar-forced groups, THEN let the loss's per-token mean (_gkd_loss_from_logps)
+        # re-normalize over the SURVIVING tokens: masking removes the spurious forced-position teacher
+        # signal without shrinking the content-token gradient. A fully-forced completion drops to zero
+        # groups -> alignment_empty (below), and such samples are excluded from the step's 1/nseq mean
+        # (_account skips r.loss is None), so the batch stays normalized too.
         groups = _drop_fully_forced_groups(groups, gen.forced or ())
         coverage = groupwise_coverage(groups, student_toks)
         n_align = sum(1 for st in student_toks if st.end > st.start)
