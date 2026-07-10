@@ -650,6 +650,92 @@ def test_forced_from_logprobs_none_is_empty_short_masks_visible_prefix():
     assert _forced_from_logprobs([{1: _lp(0.0)}], 3) == (True, False, False)
 
 
+def test_forced_from_logprobs_empty_row_is_free_not_forced():
+    """A logprob row with zero finite entries (empty dict, or every slot -inf) is a wiring anomaly,
+    not a one-legal-token position -- it must read as FREE, else a genuine free choice's teacher
+    signal is silently dropped from the loss."""
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    neg_inf = float("-inf")
+    # row 0: empty -> 0 finite -> free; row 1: one finite -> forced; row 2: all -inf -> free.
+    lps = [{}, {5: _lp(0.0)}, {6: _lp(neg_inf), 7: _lp(neg_inf)}]
+    assert _forced_from_logprobs(lps, 3) == (False, True, False)
+
+
+def test_opd_vllm_constrained_generate_uses_fresh_params_per_request(monkeypatch, tmp_path):
+    """vLLM stamps per-request backend state onto a StructuredOutputsParams, so a constrained OPD
+    batch must hand llm.generate a FRESH SamplingParams per prompt (each with its own
+    StructuredOutputsParams), not one shared instance reused across the whole batch."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    seen = {}
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _SamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_int_id = lora_int_id
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            seen["sampling_params"] = sampling_params
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = _FakeLLM
+    vllm.SamplingParams = _SamplingParams
+    lora_pkg = types.ModuleType("vllm.lora")
+    req_mod = types.ModuleType("vllm.lora.request")
+    req_mod.LoRARequest = _LoRARequest
+    sp_mod = types.ModuleType("vllm.sampling_params")
+    sp_mod.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        structured_outputs={"json_object": True},
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    out = engine.generate([[1, 2], [3, 4], [5, 6]], max_tokens=5)
+
+    sp = seen["sampling_params"]
+    # one fresh SamplingParams per prompt (a list), NOT a single shared instance...
+    assert isinstance(sp, list)
+    assert len(sp) == 3
+    # ...each carrying its own distinct StructuredOutputsParams so vLLM can stamp per-request state.
+    embedded = [p.kwargs["structured_outputs"] for p in sp]
+    assert all(isinstance(e, _StructuredOutputsParams) for e in embedded)
+    assert len({id(e) for e in embedded}) == 3
+    assert len(out) == 3
+
+
 def test_normalize_output_marks_grammar_forced_positions():
     """_normalize_output surfaces the per-token ``forced`` mask so the OPD loss can drop spans the
     student had no choice over. Positions 0 and 2 are grammar-forced (one finite logprob, the top-2
