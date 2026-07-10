@@ -31,11 +31,10 @@ class TeacherModel:
     display_name: str
     # Fireworks serverless list price, $/1M tokens as (input, output). OPD echo-scores completions
     # (max_tokens=0) so only the INPUT column is billed / feeds the estimate, but both are kept so a
-    # mispriced row is obvious (mirrors the old TEACHER_USD_PER_1M contract). NOTE: the four non-GLM
-    # entries are best-effort estimates for these next-gen serverless models — confirm against the live
-    # fireworks.ai pricing before relying on the `flash train` cost quote.
+    # mispriced row is obvious. NOTE: the non-GLM entries are best-effort estimates for these next-gen
+    # serverless models — confirm against the live fireworks.ai pricing before relying on the
+    # `flash train` cost quote.
     usd_per_1m: tuple[float, float]
-    notes: str = ""
 
 
 # The alias used when [train] omits teacher_model — the historical fixed teacher, unchanged.
@@ -47,26 +46,24 @@ DEFAULT_TEACHER_ALIAS = "glm-5.2"
 # engine.worker.teacher._validate_echo) to drive the groupwise reverse-KL loss, and every entry needs
 # a price row for the estimate. Adding a teacher = adding ONE row here.
 TEACHER_MODELS: dict[str, TeacherModel] = {
+    # glm-5.2 is the default and the verified echo-scoring baseline (see DEFAULT_TEACHER_ALIAS).
     "glm-5.2": TeacherModel(
         alias="glm-5.2",
         model_id="accounts/fireworks/models/glm-5p2",
         display_name="GLM 5.2",
         usd_per_1m=(1.40, 4.40),
-        notes="Default teacher: strong general reasoning + very long context; the verified echo-scoring baseline.",
     ),
     "deepseek-v4-pro": TeacherModel(
         alias="deepseek-v4-pro",
         model_id="accounts/fireworks/models/deepseek-v4-pro",
         display_name="DeepSeek V4 Pro",
-        usd_per_1m=(1.20, 4.80),
-        notes="Large reasoning MoE; strong math/code.",
+        usd_per_1m=(1.74, 3.48),
     ),
     "kimi-k2.6": TeacherModel(
         alias="kimi-k2.6",
         model_id="accounts/fireworks/models/kimi-k2p6",
         display_name="Kimi K2.6",
-        usd_per_1m=(0.90, 3.60),
-        notes="Moonshot trillion-scale MoE; strong long-form reasoning + tool use.",
+        usd_per_1m=(0.95, 4.00),
     ),
 }
 
@@ -100,7 +97,7 @@ def resolve_teacher(value: str) -> TeacherModel:
             return info
     allowed = ", ".join(TEACHER_MODELS)
     raise ValueError(
-        f"unsupported opd teacher_model {value!r}; choose one of: {allowed} "
+        f"teacher_model {value!r} is not a supported teacher; choose one of: {allowed} "
         f"(default {DEFAULT_TEACHER_ALIAS})"
     )
 

@@ -27,9 +27,9 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: the Fireworks teacher model id, resolved from [train].teacher_model (an alias from the
-    # managed allow-list). Prices the teacher-API estimate; an empty value resolves to the default
-    # GLM 5.2 teacher (an omitted [train].teacher_model).
+    # OPD only: the Fireworks teacher model id (already resolved from [train].teacher_model at parse).
+    # Prices the teacher-API estimate; an empty value resolves to the default GLM 5.2 teacher (an
+    # omitted [train].teacher_model).
     teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h

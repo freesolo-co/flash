@@ -187,10 +187,11 @@ def _resolve_opd_knobs() -> OpdKnobs:
             "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
-    # Resolve the managed teacher from [train].teacher_model (a friendly alias, "" => the GLM 5.2
-    # default). resolve_teacher validated the same value at parse time; re-resolve here so the worker
-    # sends the right Fireworks model id, and re-raise as a loud RuntimeError (mirroring the kl_coef
-    # guard) if a spec somehow reaches the worker with an unsupported teacher. base_url is shared by
+    # Resolve the managed teacher from [train].teacher_model (the resolved Fireworks model id, "" =>
+    # the GLM 5.2 default). Parse already validated + canonicalized it, but JobSpec.from_dict is a
+    # tolerant deserializer, so re-validate at this boundary (like the kl_coef guard above): resolve
+    # is idempotent for a canonical model id, and a spec that reaches the worker with an unsupported
+    # teacher fails loudly here rather than as an opaque Fireworks 404 mid-run. base_url is shared by
     # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
     try:
         teacher = resolve_teacher(opt("teacher_model", ""))

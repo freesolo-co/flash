@@ -68,9 +68,9 @@ def _train_teacher(train_raw: dict) -> str:
     """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
 
     Missing/None/blank -> "" (the worker then uses the default GLM 5.2 teacher). A supported value is
-    normalized to its canonical alias and stored, so a spaced ("GLM 5.2") or raw-model-id form is
-    canonicalized once here; an unsupported teacher is rejected at PARSE time (before a paid GPU is
-    provisioned), listing the allowed aliases."""
+    resolved to its canonical Fireworks model id and stored, so a spaced ("GLM 5.2") or alias form is
+    canonicalized once here and every downstream layer reads one representation; an unsupported teacher
+    is rejected at PARSE time (before a paid GPU is provisioned), listing the allowed aliases."""
     v = train_raw.get("teacher_model")
     if v is None:
         return ""
@@ -79,15 +79,15 @@ def _train_teacher(train_raw: dict) -> str:
     if not v.strip():
         return ""
     # Imported lazily: recipe is dependency-free, but keep fields.py's import graph minimal.
-    from flash.engine.recipe import DEFAULT_TEACHER_ALIAS, TEACHER_MODELS, resolve_teacher
+    from flash.engine.recipe import resolve_teacher
 
+    # resolve_teacher owns the allow-list + its enumeration; reuse its message so the choices are
+    # listed in exactly one place (recipe.py).
     try:
-        return resolve_teacher(v).alias
-    except ValueError:
-        allowed = ", ".join(TEACHER_MODELS)
+        return resolve_teacher(v).model_id
+    except ValueError as exc:
         raise ConfigError(
-            f"train.teacher_model {v.strip()!r} is not a supported teacher; allowed: {allowed} "
-            f"(default {DEFAULT_TEACHER_ALIAS}). The teacher is a managed Fireworks model — "
+            f"train.{exc}. The teacher is a managed Fireworks model — "
             f"bring-your-own teachers are not supported."
         ) from None
 

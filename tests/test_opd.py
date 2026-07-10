@@ -642,8 +642,8 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
 
 def test_opd_selects_managed_teacher_and_rejects_unknown():
     """[train].teacher_model selects the managed teacher from a fixed allow-list: a supported alias
-    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical alias;
-    an unsupported teacher is rejected at PARSE time (before a paid GPU) with a teacher-specific error."""
+    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical
+    Fireworks model id; an unsupported teacher is rejected at PARSE time (before a paid GPU)."""
     from flash.schema import ConfigError, spec_from_dict
 
     def _spec(teacher):
@@ -657,15 +657,23 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
             run_id="x",
         )
 
-    # Supported aliases parse and are stored as the canonical alias.
-    assert _spec("kimi-k2.6").train.teacher_model == "kimi-k2.6"
-    assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
-    # A spaced / mixed-case form normalizes to the canonical alias.
-    assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
-    # The raw Fireworks model id is also accepted (resolves to its alias), including with stray
-    # surrounding whitespace (stripped like the alias branch).
-    assert _spec("accounts/fireworks/models/glm-5p2").train.teacher_model == "glm-5.2"
-    assert _spec("  accounts/fireworks/models/glm-5p2  ").train.teacher_model == "glm-5.2"
+    # Supported aliases parse and are stored as the canonical Fireworks model id.
+    assert _spec("kimi-k2.6").train.teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert (
+        _spec("deepseek-v4-pro").train.teacher_model == "accounts/fireworks/models/deepseek-v4-pro"
+    )
+    # A spaced / mixed-case form normalizes to the same model id.
+    assert _spec("GLM 5.2").train.teacher_model == "accounts/fireworks/models/glm-5p2"
+    # The raw Fireworks model id is also accepted (identity), including with stray surrounding
+    # whitespace (stripped like the alias branch).
+    assert (
+        _spec("accounts/fireworks/models/glm-5p2").train.teacher_model
+        == "accounts/fireworks/models/glm-5p2"
+    )
+    assert (
+        _spec("  accounts/fireworks/models/glm-5p2  ").train.teacher_model
+        == "accounts/fireworks/models/glm-5p2"
+    )
     # Omitting/blank leaves it unset ("" => the worker uses the default GLM 5.2 teacher).
     assert _spec("").train.teacher_model == ""
 
@@ -2620,21 +2628,19 @@ def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
 
 
 def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
-    """Every allow-listed teacher is priced by its exact row (the cost table is DERIVED from
-    recipe.TEACHER_MODELS, so there is no unpriced teacher), the new teachers carry their own input
-    prices (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
-    from flash.cost.facts import TEACHER_USD_PER_1M, teacher_price_per_1m
+    """Every allow-listed teacher is priced by its exact row (pricing routes through resolve_teacher
+    over recipe.TEACHER_MODELS, so there is no unpriced teacher), the new teachers carry their own
+    input prices (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
+    from flash.cost.facts import teacher_price_per_1m
     from flash.engine.recipe import TEACHER_MODELS
 
-    # Derivation parity: one priced row per allow-listed teacher, keyed by provider model id.
-    derived = {i.model_id: i.usd_per_1m for i in TEACHER_MODELS.values()}
-    assert derived == TEACHER_USD_PER_1M
+    # One exact price per allow-listed teacher, looked up by its provider model id.
     for info in TEACHER_MODELS.values():
         assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
 
     # The two added teachers carry their own input prices (distinct from GLM's $1.40/M).
-    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.20
-    assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.90
+    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.74
+    assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.95
     # Removed teachers (qwen-3.7-max on-demand only; minimax-m3 no echo support) are unknown ids
     # now -> priced defensively at the default (GLM) rate.
     assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 1.40
@@ -3307,9 +3313,11 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
 
 
 def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
-    """_resolve_opd_knobs reads [train].teacher_model (a friendly alias) and resolves it to the
-    Fireworks model id the TeacherClient sends; an unset value keeps the default GLM 5.2 teacher; the
-    single shared base_url is unchanged; an unsupported teacher fails loudly on the worker."""
+    """_resolve_opd_knobs defensively re-resolves [train].teacher_model at the worker's (tolerant)
+    deserialization boundary: parse already canonicalized it to a Fireworks model id, but the worker
+    still validates — accepting an alias or the model id — so the TeacherClient sends a supported model.
+    An unset value keeps the default GLM 5.2 teacher; the shared base_url is unchanged; an unsupported
+    teacher fails loudly on the worker."""
     from flash.engine.worker import opd as opd_mod
 
     class _Train:  # any [train] field not set returns None (falls back to the recipe default)

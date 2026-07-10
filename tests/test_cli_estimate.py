@@ -101,7 +101,7 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     kimi_cfg = _runconfig_from_spec(_opd("kimi-k2.6"))
     assert kimi_cfg.teacher_model == "accounts/fireworks/models/kimi-k2p6"
 
-    # kimi-k2.6 input price ($0.90/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
+    # kimi-k2.6 input price ($0.95/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
     default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
     kimi_teacher_usd = estimate_cost(kimi_cfg).teacher_api_usd
     assert 0 < kimi_teacher_usd < default_teacher_usd

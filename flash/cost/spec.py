@@ -147,14 +147,14 @@ def runconfig_from_spec(spec) -> RunConfig:
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
     has_rollout = samples_on_policy(spec.algorithm)
-    # Price the actual OPD teacher the run will use: resolve [train].teacher_model (an alias, "" =>
-    # default GLM 5.2) to the Fireworks model id that keys TEACHER_USD_PER_1M, so a higher/lower-priced
-    # teacher moves the itemized teacher-API estimate. "" for sft/grpo (no teacher).
+    # Price the actual OPD teacher the run will use. [train].teacher_model is already the resolved
+    # Fireworks model id (parse canonicalizes it), so a higher/lower-priced teacher moves the itemized
+    # teacher-API estimate; "" => the default GLM 5.2, and "" for sft/grpo (no teacher).
     teacher_model = ""
     if spec.algorithm == "opd":
-        from flash.engine.recipe import resolve_teacher
+        from flash.engine.recipe import RECIPE
 
-        teacher_model = resolve_teacher(t.teacher_model).model_id
+        teacher_model = t.teacher_model or RECIPE.opd.teacher_model
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
