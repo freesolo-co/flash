@@ -9,6 +9,7 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import on_policy_steps
+from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -472,10 +473,13 @@ def run_rl():
                 "vLLM cudagraph_mode (verl rollout default)",
             )
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
-    # The warm-start path downloads the adapter and (for VL checkpoints) merges it into a full
-    # base-model copy on disk; on a 35B that is many silent minutes.
+    # The warm-start path downloads the adapter and loads it as the trainable adapter on the base
+    # (VL checkpoints load the full multimodal model, still just an adapter — no on-disk merge copy).
     with liveness_heartbeat("rl_adapter_loading"):
         init_model, init_peft = _w._init_adapter_model(model_id)
+    # _init_adapter_model returns peft_config=None only for a warm-start (the prior adapter is loaded
+    # as the trainable "default"); a fresh run returns a LoraConfig for TRL to build.
+    is_warm_start = init_peft is None
     # chalk kernels are applied below against trainer.model (the authoritative target); TRL may
     # rebuild/wrap the PeftModel, and the fresh-LoRA path only passes the model-id string here.
     if init_peft is not None:
@@ -487,8 +491,21 @@ def run_rl():
     else:
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
+    _gen_kwargs: dict = {}
     if _t and _t.stop_sequences:
-        grpo_kwargs["generation_kwargs"] = {"stop": list(_t.stop_sequences)}
+        _gen_kwargs["stop"] = list(_t.stop_sequences)
+    # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
+    # into StructuredOutputsParams itself, so GRPOConfig (and its wandb/config serialization)
+    # never holds a vLLM object.
+    _so_spec = parse_structured_outputs(getattr(_t, "structured_outputs", "") if _t else "")
+    if _so_spec:
+        _gen_kwargs["structured_outputs"] = _so_spec
+        print(
+            f"[rl] structured outputs: every rollout turn constrained to "
+            f"{describe_structured_outputs(_so_spec)}"
+        )
+    if _gen_kwargs:
+        grpo_kwargs["generation_kwargs"] = _gen_kwargs
     # TRL has no advantage-value clip knob (it clips the importance ratio); just note the request.
     if _adv_clip > 0:
         print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
@@ -558,6 +575,7 @@ def run_rl():
             stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
             thinking=_w.THINKING,
             engine_max_len=vllm_max_len,
+            structured_outputs=_so_spec,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
     # GRPOTrainer.__init__ blocks 10-20 min on first use (vLLM build + FA2 compile); the side-thread
@@ -572,7 +590,6 @@ def run_rl():
                 init_model,
                 model_id,
                 model_init_kwargs,
-                force=bool(getattr(_w, "_VL_WARMSTART_SFT_DIR", None)),
                 phase="rl",
             )
             if not isinstance(trainer_model, str):
@@ -590,6 +607,21 @@ def run_rl():
         # Apply chalk's standalone kernels on trainer.model (the authoritative target).
         # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
         _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # Warm-start + KL anchor: continuing the one SFT adapter means TRL derives the KL reference by
+    # snapshotting a frozen "ref" adapter from the loaded SFT default (grpo_trainer: is_peft_model and
+    # beta != 0) — so KL anchors to SFT, NOT the bare base. Assert the snapshot exists whenever KL is
+    # on, so a TRL change that silently fell back to adapter-disable (ref == bare base, which pulls the
+    # policy back to base — the #296 collapse re-expressed as a loss term) fails LOUDLY here instead of
+    # quietly degrading a warm-started run. No-op when KL is off (beta == 0, flash's default) or fresh.
+    if is_warm_start and _kl_beta > 0:
+        _peft_cfg = getattr(getattr(trainer, "model", None), "peft_config", None) or {}
+        if "ref" not in _peft_cfg:
+            raise RuntimeError(
+                "GRPO warm-start with kl_penalty_coef>0 expected TRL to snapshot a frozen 'ref' "
+                "adapter from the continued SFT adapter (so the KL reference is SFT), but none was "
+                "created — the KL term would anchor to the bare base and walk the policy back to base. "
+                "Set kl_penalty_coef=0, or use a TRL build that creates the 'ref' adapter for PEFT."
+            )
     # Mid-run eval is intentionally skipped: held-out eval happens deploy-side, keeping training pure.
     _reset_peak_gpu()
     _gpu_sampler = _GpuPeakSampler().start()
@@ -637,8 +669,8 @@ def run_rl():
             f"[resume] no new reward in this worker but resumed checkpoint already reached "
             f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
-    # adapter save + recombine + required upload can take minutes (recombine loads a full base
-    # model on VL warm-starts); keep the heartbeat fresh through the whole finalize. keepalive=True:
+    # adapter save + required upload can take minutes on a 35B; keep the heartbeat fresh through the
+    # whole finalize. keepalive=True:
     # _steps_run is CONSTANT here (training is done), so without it every finalize ping is a bare
     # liveness that does NOT advance the provider's stall clock — a finalize outlasting STALL_AFTER_S
     # (1500s) would be killed at the finish line. keepalive forces a REAL heartbeat each tick.
@@ -650,35 +682,20 @@ def run_rl():
         adapter_dir = f"{out_dir}/adapter"
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
-        # VL merge-into-base warm-start (#296) saves a GRPO-ONLY LoRA trained on the SFT-merged base;
-        # deployed on the catalog base it drops the SFT and the served model collapses to ~base. Stack
-        # the original SFT LoRA back in so the DEPLOYED adapter reproduces base+SFT+GRPO on the original
-        # base (no-op for the continued-adapter / fresh-LoRA paths, which already carry the SFT). Both
-        # the default `<prefix>/adapter` upload and the `RUN_ID/step-<final>` deployable below ship the
-        # recombined adapter; the resume checkpoints (`checkpoint/**`) are untouched — they reattach to
-        # the re-merged base on resume.
-        recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)
-        deploy_dir = recombined or adapter_dir
-        try:
-            _w.hf_upload_folder(deploy_dir, "adapter", required=True)
-            # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
-            # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
-            # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
-            # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
-            # default adapter. Publish the just-saved final adapter here, keyed by the true final
-            # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
-            # exactly the deployed default. Idempotent (content-addressed path) when the step already
-            # aligned, and best-effort (never fails a paid run).
-            if _steps_run:
-                _w.publish_deployable_checkpoint(deploy_dir, _steps_run)
-        finally:
-            # recombined_warmstart_adapter_dir returns a fresh temp dir (flash_recomb_adapter_*); remove
-            # it after the uploads so a finalize that runs more than once per process (tests/refactors)
-            # doesn't grow /tmp. adapter_dir (the real save) is untouched. Mirrors the per-step cleanup.
-            if recombined:
-                import shutil
-
-                shutil.rmtree(recombined, ignore_errors=True)
+        # Warm-start CONTINUES the one SFT adapter in place, so the saved adapter already carries
+        # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs
+        # likewise deploy their single adapter directly).
+        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
+        # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
+        # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
+        # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
+        # default adapter. Publish the just-saved final adapter here, keyed by the true final
+        # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
+        # exactly the deployed default. Idempotent (content-addressed path) when the step already
+        # aligned, and best-effort (never fails a paid run).
+        if _steps_run:
+            _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
     _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).

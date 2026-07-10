@@ -296,19 +296,19 @@ def deploy_adapter(
         return dep
     base = serving_base_url()
     body = {
-        "adapterId": run_id,
-        "repoId": hf_repo,
-        "baseModel": model,
+        "adapter_id": run_id,
+        "repo_id": hf_repo,
+        "base_model": model,
         "subfolder": subfolder,
         # Must be "dataset": trainer uploads to a dataset repo; serving defaults to "model" and 404s.
-        "repoType": "dataset",
+        "repo_type": "dataset",
         "status": "ready",
         # Preserves thinking parity: without this, Qwen3.5 defaults to thinking ON regardless of training.
         "thinking": bool(thinking),
     }
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
-        body["orgId"] = normalized_org_id
+        body["org_id"] = normalized_org_id
     previous_record = _registered_adapter(run_id)
     try:
         _post_adapter_or_raise(f"{base}/adapters", body)

@@ -43,6 +43,14 @@ def _offline(monkeypatch):
     import flash.providers.runpod.keys as rp_keys
 
     rp_keys.reset()
+
+    # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
+    # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
+    # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
+    import flash.server.repo_cleanup as _rc
+
+    monkeypatch.setattr(_rc, "run_scheduled_cleanup", lambda *a, **k: 0, raising=False)
+
     yield
     rp_keys.reset()
 
