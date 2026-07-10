@@ -98,7 +98,7 @@ def cmd_login(args) -> int:
         print(render.login_failed(str(exc)), file=sys.stderr)
         return 1
     api_url = args.api_url or load_credentials()[0]
-    _ = save_credentials(api_key, api_url=api_url)
+    save_credentials(api_key, api_url=api_url)
     if args.api_key and env_api_key and env_api_key != args.api_key:
         msg = (
             "FREESOLO_API_KEY is set and will override this saved login for future "
@@ -934,7 +934,6 @@ def cmd_deploy(args) -> int:
             print(
                 render.arrow(url_note) if render.styled() else f"note: {url_note}", file=sys.stderr
             )
-    if dep.get("state") != "dry_run":
         state = dep.get("state", "deploying")
         if state == "failed":
             detail = str(dep.get("error") or dep.get("detail") or "unknown error")

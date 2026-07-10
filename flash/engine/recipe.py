@@ -7,11 +7,6 @@ from dataclasses import dataclass, field
 # Keep in sync with catalog.DEFAULT_MODEL.
 HF_MODEL_ID = "Qwen/Qwen3.5-4B"
 
-# The env-var name of the Fireworks teacher API key OPD reads at submit + on the worker. Named here
-# (a shared, dependency-free home) so the schema/worker/teacher/client all reference ONE symbol
-# instead of re-typing the literal (a typo would silently disable the required-secret gate).
-FIREWORKS_API_KEY_SECRET = "FIREWORKS_API_KEY"
-
 
 @dataclass(frozen=True)
 class LoRAConfig:
