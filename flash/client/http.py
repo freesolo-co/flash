@@ -274,10 +274,19 @@ class ApiClient:
             max_bytes=adapter._MAX_ARCHIVE_BYTES,
         )
 
-    def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
-        body = {"spec": spec}
+    def create_run(
+        self,
+        spec: dict,
+        runtime_secrets: dict[str, str] | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        body: dict = {"spec": spec}
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
+        if dry_run:
+            # Server-side preview: runs the same validation/preflights as a real submit and records a
+            # state=dry_run run, but allocates no GPU and charges nothing. Returns that status.
+            body["dry_run"] = True
         return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:

@@ -516,7 +516,8 @@ def submit_job(
     owner_key_id: int | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
-    that fits the run; dry-run only records state."""
+    that fits the run; dry-run runs the same config validation and preflights and records a
+    state=dry_run preview without allocating a GPU, provisioning, or billing."""
     _require_priced_sft_examples(spec)
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
@@ -527,27 +528,34 @@ def submit_job(
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     public_spec = spec
-    estimated_cost_usd: float | None = None
-    if not dry_run:
-        from flash.cost.spec import estimate_for_spec
+    # The cost quote and the config preflights run in BOTH dry-run and real submit, so `--dry-run` is
+    # a faithful preview of what the control plane would accept or reject. A spec a real submit would
+    # reject — a warm-start whose train.lora_rank disagrees with the continued source adapter's rank
+    # (the run trains and serves at the source rank, so cost/allocator/GRPO-sleep sizing must agree
+    # with it), or a training context longer than the model's serving window — must fail `--dry-run`
+    # too, not sail through and be rejected only at live submit. These are all CPU-only (an analytical
+    # cost model, catalog lookups, and one small adapter_config.json read for a warm-start); GPU
+    # allocation, provisioning, billing, and the warm-start GC marker stay real-submit-only below.
+    from flash.cost.spec import estimate_for_spec
+    from flash.lora_rank import (
+        preflight_init_adapter_lora_rank,
+        preflight_train_context_within_serving,
+    )
 
-        estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
+    estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
     owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
     worker_spec = _resolve_init_from_adapter(
         public_spec,
         owner_org_id=owner_org_id,
         owner_key_id=owner_key_id,
     )
+    preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
+    preflight_train_context_within_serving(worker_spec)
     if not dry_run:
-        from flash.lora_rank import (
-            preflight_init_adapter_lora_rank,
-            preflight_train_context_within_serving,
-        )
-
-        preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
-        preflight_train_context_within_serving(worker_spec)
         # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
-        # child is around (best-effort; never blocks submission).
+        # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
+        # the source repo, so this HF write stays real-submit-only (unlike the read-only preflights
+        # above, which now run in both modes).
         _mark_warmstart_source(worker_spec, public_spec.run_id)
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
@@ -566,6 +574,9 @@ def submit_job(
     _save_status(status)
     _report_status(status)
     if dry_run:
+        # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
+        # deploy dry-run) — same contract as a real submit minus GPU allocation, provisioning, and
+        # billing. Everything above already validated the spec; just flip the state and return.
         status.state = "dry_run"
         _save_status(status)
         _report_status(status)
