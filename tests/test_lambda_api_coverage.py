@@ -261,13 +261,13 @@ def test_launch_instance_builds_body_and_returns_first_id(monkeypatch):
 def test_launch_instance_raises_when_no_instance_id(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
 
-    kwargs = dict(
-        region_name="us-east-1",
-        instance_type_name="gpu_1x_a10",
-        ssh_key_names=["jk"],
-        name="flash-x",
-        user_data="#cloud-config",
-    )
+    kwargs = {
+        "region_name": "us-east-1",
+        "instance_type_name": "gpu_1x_a10",
+        "ssh_key_names": ["jk"],
+        "name": "flash-x",
+        "user_data": "#cloud-config",
+    }
     # success-shaped dict but no instance_ids -> LambdaApiError
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
     with pytest.raises(lambda_api.LambdaApiError, match="returned no instance id"):

@@ -32,12 +32,12 @@ def _install_fake_hf(monkeypatch, **attrs):
     return hub
 
 
+class _HFError(Exception):
+    """An HTTPError-shaped exception (carries .response.status_code/.headers)."""
+
+
 def _err(status=None, headers=None):
     """An exception shaped like an httpx/requests HTTPError with .response.status_code/.headers."""
-
-    class _HFError(Exception):
-        pass
-
     exc = _HFError("boom")
     if status is not None or headers is not None:
         exc.response = types.SimpleNamespace(status_code=status, headers=headers or {})
@@ -135,7 +135,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         attempts["n"] += 1
         raise _err(status=503, headers={"retry-after": "5"})
 
-    with pytest.raises(Exception) as ei:
+    with pytest.raises(_HFError) as ei:
         b._hf_call(always_503, "list")
     assert "boom" in str(ei.value)
     assert attempts["n"] == len(b._HF_RETRY_DELAYS_S) + 1  # initial try + one per delay
@@ -149,7 +149,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         calls["n"] += 1
         raise _err(status=400)
 
-    with pytest.raises(Exception):
+    with pytest.raises(_HFError):
         b._hf_call(bad_request, "list")
     assert calls["n"] == 1
     assert sleeps == []
@@ -296,10 +296,12 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
     assert rc == 0
     # The console tee is uploaded under console_<mode>.txt and captured the child's stdout.
-    assert uploads and uploads[-1][1] == "console_sft.txt"
+    assert uploads
+    assert uploads[-1][1] == "console_sft.txt"
     with open("/tmp/console_sft.txt") as f:
         body = f.read()
-    assert "hello" in body and "world" in body
+    assert "hello" in body
+    assert "world" in body
 
 
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
@@ -348,13 +350,14 @@ def test_arm_preload_wall_cap_fire_marks_and_hard_exits(monkeypatch):
     payload = {"max_wall_s": 999, "flash_arm": "lambda", "attempt": 0, "hf_repo": "o/r", "env": {}}
     cap = b._arm_preload_wall_cap(payload)
     assert cap is not None
-    timer, done = cap
+    timer, _done = cap
     timer.cancel()  # prevent the real timer from auto-firing during the test
 
     # Manually invoke the watchdog closure: not done -> writes a failure marker then os._exit(1).
     timer.function()
     assert exits == [1]
-    assert marks and marks[-1][0] is False
+    assert marks
+    assert marks[-1][0] is False
     assert "wall-clock cap" in marks[-1][1]
 
     # If the download already finished (done is set), _fire is a no-op: no marker, no exit.
@@ -445,5 +448,6 @@ def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatc
     assert b.main() == 1
     ok, error, retriable = markers[0]
     assert ok is False
-    assert "models failed" in error and "a/b" in error
+    assert "models failed" in error
+    assert "a/b" in error
     assert retriable is False

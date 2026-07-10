@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 from flash.engine.multiturn_rollout import (
-    _LRUCache,
     _engine_vocab_size,
+    _LRUCache,
     _prompt_key,
     rollout_async,
     rollout_one,
@@ -450,7 +450,7 @@ def _stub_vllm_full(monkeypatch):
     mod.sampling_params = sp_mod
     monkeypatch.setitem(sys.modules, "vllm", mod)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
-    return None
+    return
 
 
 class _Tok:
@@ -527,7 +527,8 @@ class _PartialEngine:
         pass
 
 
-def test_rollout_func_sets_final_only_kind_and_skips_unfinished(_stub_vllm_full):
+@pytest.mark.usefixtures("_stub_vllm_full")
+def test_rollout_func_sets_final_only_kind_and_skips_unfinished():
     from flash.engine.multiturn_rollout import build_rollout_func
 
     engine = _PartialEngine()
@@ -546,4 +547,5 @@ def test_rollout_func_sets_final_only_kind_and_skips_unfinished(_stub_vllm_full)
     # the unfinished first step was skipped, so more than one engine step was needed
     assert engine.steps >= 2
     # every submitted turn carried the resolved FINAL_ONLY output kind
-    assert engine.sampling and all(sp.output_kind == "final_only" for sp in engine.sampling)
+    assert engine.sampling
+    assert all(sp.output_kind == "final_only" for sp in engine.sampling)

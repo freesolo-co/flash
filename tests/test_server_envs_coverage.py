@@ -20,10 +20,10 @@ import pytest
 from flash.server import envs
 
 pytest.importorskip("fastapi")
-from fastapi import HTTPException  # noqa: E402
+from fastapi import HTTPException
 
-import flash.server.routes.serving as serving  # noqa: E402
-from flash.serve.deploy import ServingError  # noqa: E402
+import flash.server.routes.serving as serving
+from flash.serve.deploy import ServingError
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -280,7 +280,8 @@ def test_previous_ready_deployment_and_adapter_prefix():
     # A currently-ready deployment is its own "previous ready" (a copy).
     ready = {"state": "ready", "adapter_hf_prefix": "sft/r1/seed0/adapter"}
     got = serving._previous_ready_deployment(ready)
-    assert got == ready and got is not ready
+    assert got == ready
+    assert got is not ready
     # A busy deployment falls back to a ready `previous_deployment`.
     nested = {"state": "deploying", "previous_deployment": {"state": "deployed", "b": 2}}
     assert serving._previous_ready_deployment(nested) == {"state": "deployed", "b": 2}

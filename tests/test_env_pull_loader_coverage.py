@@ -12,8 +12,7 @@ import tarfile
 
 import pytest
 
-from flash.envs import loader
-from flash.envs import pull
+from flash.envs import loader, pull
 
 
 def _package_tarball(entries: dict[str, bytes]) -> bytes:
@@ -77,7 +76,7 @@ def test_download_env_file_missing_raises_filenotfound():
 def test_pull_package_missing_entrypoint_raises(tmp_path):
     package = _package_tarball({"README.md": b"# no entrypoint\n"})
 
-    with pytest.raises(FileNotFoundError, match="entrypoint 'environment.py' not found"):
+    with pytest.raises(FileNotFoundError, match=r"entrypoint 'environment\.py' not found"):
         pull.pull_environment_package_from_archive(package, tmp_path / "out")
 
 
