@@ -660,7 +660,6 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
     # Supported aliases parse and are stored as the canonical alias.
     assert _spec("kimi-k2.6").train.teacher_model == "kimi-k2.6"
     assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
-    assert _spec("minimax-m3").train.teacher_model == "minimax-m3"
     # A spaced / mixed-case form normalizes to the canonical alias.
     assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
     # The raw Fireworks model id is also accepted (resolves to its alias), including with stray
@@ -673,10 +672,12 @@ def test_opd_selects_managed_teacher_and_rejects_unknown():
     # An unsupported teacher is rejected at parse time with a teacher-specific ConfigError.
     with pytest.raises(ConfigError, match="teacher_model"):
         _spec("gpt-5.5")
-    # qwen-3.7-max is NOT serverless on Fireworks (on-demand only), so it is not an allow-listed
-    # teacher and is rejected like any other unsupported value.
+    # qwen-3.7-max (on-demand only) and minimax-m3 (serverless chat, but its /completions echo
+    # endpoint OPD needs does not respond) are NOT allow-listed teachers, so both are rejected.
     with pytest.raises(ConfigError, match="teacher_model"):
         _spec("qwen-3.7-max")
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("minimax-m3")
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
@@ -2631,12 +2632,13 @@ def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
     for info in TEACHER_MODELS.values():
         assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
 
-    # The three added teachers carry their own input prices (distinct from GLM's $1.40/M).
-    assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 0.30
+    # The two added teachers carry their own input prices (distinct from GLM's $1.40/M).
     assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.20
     assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.90
-    # qwen-3.7-max was removed (on-demand only), so its old id is unknown -> default (GLM) rate.
+    # Removed teachers (qwen-3.7-max on-demand only; minimax-m3 no echo support) are unknown ids
+    # now -> priced defensively at the default (GLM) rate.
     assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 1.40
+    assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 1.40
 
     # An unknown teacher id falls back defensively to the default (GLM) rate.
     assert teacher_price_per_1m("accounts/fireworks/models/does-not-exist")[0] == 1.40
@@ -3334,7 +3336,7 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
     assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
     assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
     # base_url is shared across every allow-listed teacher (one Fireworks endpoint + one managed key).
-    assert _knobs("minimax-m3").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
+    assert _knobs("deepseek-v4-pro").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
     # An unsupported teacher fails loudly on the worker (defensive guard, mirrors the kl_coef check).
     with pytest.raises(RuntimeError, match="teacher_model"):
         _knobs("gpt-5.5")

@@ -98,13 +98,13 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     # Omitted teacher_model -> default GLM 5.2 provider id.
     assert _runconfig_from_spec(_opd()).teacher_model == "accounts/fireworks/models/glm-5p2"
     # A selected alias resolves to its Fireworks model id.
-    minimax_cfg = _runconfig_from_spec(_opd("minimax-m3"))
-    assert minimax_cfg.teacher_model == "accounts/fireworks/models/minimax-m3"
+    kimi_cfg = _runconfig_from_spec(_opd("kimi-k2.6"))
+    assert kimi_cfg.teacher_model == "accounts/fireworks/models/kimi-k2p6"
 
-    # minimax-m3 input price ($0.30/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
+    # kimi-k2.6 input price ($0.90/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
     default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
-    minimax_teacher_usd = estimate_cost(minimax_cfg).teacher_api_usd
-    assert 0 < minimax_teacher_usd < default_teacher_usd
+    kimi_teacher_usd = estimate_cost(kimi_cfg).teacher_api_usd
+    assert 0 < kimi_teacher_usd < default_teacher_usd
 
     # sft/grpo carry no teacher.
     assert _runconfig_from_spec(_spec()).teacher_model == ""
