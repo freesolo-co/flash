@@ -21,6 +21,7 @@ from flash.schema.fields import (
     _train_float,
     _train_int,
     _train_stops,
+    _train_structured_outputs,
     _wandb_spec,
     _worker_env,
 )
@@ -207,6 +208,7 @@ _TRAIN_KEYS = frozenset(
         "thinking_length_penalty_coef",
         "opd_eos_loss_coef",
         "stop_sequences",
+        "structured_outputs",
         "max_steps",
         "max_examples",
     }
@@ -353,6 +355,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
             stop_sequences=_train_stops(train_raw),
+            structured_outputs=_train_structured_outputs(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
@@ -365,6 +368,16 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         wandb=wandb_spec,
     )
     _validate_spec(spec)
+    if spec.train.structured_outputs and thinking:
+        # Guided decoding constrains from the FIRST generated token, so a json/regex/choice
+        # constraint forbids the free-text <think> phase. Warn, don't reject: constraining the
+        # reasoning may still be intentional.
+        print(
+            "warning: train.structured_outputs constrains generation from the first token, so with "
+            "thinking = true the <think> reasoning phase is constrained too; set thinking = false "
+            "if the model should reason freely before the constrained answer",
+            file=sys.stderr,
+        )
     return spec
 
 
@@ -376,6 +389,13 @@ def _validate_sft(spec: JobSpec) -> None:
         raise ConfigError(
             "train.max_examples must be set to a positive row count for SFT "
             "(use the full dataset row count for an uncapped run)"
+        )
+    if spec.train.structured_outputs:
+        # SFT never generates — a constraint here would silently do nothing; reject at parse time
+        # like other no-op configs (see the opd kl_penalty_coef=0 guard).
+        raise ConfigError(
+            "train.structured_outputs only applies to rollout algorithms (grpo, opd); "
+            "SFT trains on dataset completions and never generates"
         )
 
 

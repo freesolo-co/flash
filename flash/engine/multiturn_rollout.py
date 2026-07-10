@@ -619,6 +619,7 @@ def build_rollout_func(
     stop: list[str] | None,
     thinking: bool,
     engine_max_len: int | None = None,
+    structured_outputs: dict | None = None,
 ):
     """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine."""
     from vllm import SamplingParams  # gpu-only; lazy import so the module loads on CPU
@@ -629,6 +630,16 @@ def build_rollout_func(
         _final_only_kind = RequestOutputKind.FINAL_ONLY
     except Exception:
         _final_only_kind = None
+
+    # [train] structured_outputs: resolve the params class once; constructed per request below
+    # (vLLM's processor stamps a per-request backend on the instance, so sharing one is unsafe).
+    # No silent fallback — a configured constraint that can't be applied must fail the run, not
+    # train on unconstrained text the reward believes is schema-bound.
+    _SOParams = None
+    if structured_outputs:
+        from vllm.sampling_params import StructuredOutputsParams
+
+        _SOParams = StructuredOutputsParams
 
     _render_cache = _LRUCache(8192)
 
@@ -671,6 +682,11 @@ def build_rollout_func(
             }
             if _final_only_kind is not None:
                 sp_kwargs["output_kind"] = _final_only_kind
+            if _SOParams is not None:
+                # Every assistant turn is constrained — mid-rollout turns included — since the
+                # env contract has no per-turn schema channel; unconstrained env/tool turns are
+                # not generated here.
+                sp_kwargs["structured_outputs"] = _SOParams(**structured_outputs)
             llm_engine.add_request(
                 req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs)
             )
