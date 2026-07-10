@@ -92,10 +92,6 @@ def _serving_request(
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
 
 
-def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
-    return _serving_request("POST", url, json=body)
-
-
 def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
     """Build a ServingError from an upstream HTTP failure with a tailored hint."""
     resp = exc.response
@@ -177,10 +173,6 @@ def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str =
             f"{model} serving supports max_lora_rank={max_lora_rank}; "
             f"{rank_source} has rank {int(lora_rank)} and cannot be deployed"
         )
-
-
-def _rank_from_adapter_config(config: dict, *, source: str) -> int:
-    return rank_from_adapter_config(config, source=source)
 
 
 def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
@@ -268,7 +260,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
         )
     _verify_adapter_artifact_tensors(hf_repo, subfolder)
-    return _rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
+    return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
 def deploy_adapter(
@@ -311,7 +303,7 @@ def deploy_adapter(
         body["orgId"] = normalized_org_id
     previous_record = _registered_adapter(run_id)
     try:
-        _post_adapter_or_raise(f"{base}/adapters", body)
+        _serving_request("POST", f"{base}/adapters", json=body)
     except ServingError as exc:
         # A 4xx means serving rejected the request outright and nothing changed. Anything else
         # (5xx, timeout, unreachable) is ambiguous: the registry may or may not have switched to

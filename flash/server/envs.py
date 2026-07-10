@@ -46,7 +46,6 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # NOT a repo-control namespace, so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
-_TAR_METADATA_TYPES = TAR_METADATA_TYPES
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 _NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
@@ -123,7 +122,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(
                         f"env package has too many entries to scan (limit {_MAX_SCAN_MEMBERS})"
                     )
-                if member.type in _TAR_METADATA_TYPES:
+                if member.type in TAR_METADATA_TYPES:
                     continue
                 segments = tar_member_segments(
                     member.name,

@@ -120,14 +120,7 @@ def spec_steps(spec) -> int:
     ``epochs`` means passes over ``max_examples`` rows when pinned, otherwise the estimate uses one
     prompt batch per epoch.
     """
-    if spec.algorithm == "grpo":
-        examples = _on_policy_example_count(spec)
-        return on_policy_steps(
-            epochs=_on_policy_epochs(spec),
-            prompt_count=examples,
-            prompts_per_step=_on_policy_prompts_per_step(spec, examples),
-        )
-    if spec.algorithm == "opd":
+    if spec.algorithm in ("grpo", "opd"):
         examples = _on_policy_example_count(spec)
         return on_policy_steps(
             epochs=_on_policy_epochs(spec),

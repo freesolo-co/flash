@@ -72,7 +72,6 @@ def run_rl():
         f"[rl] vLLM sleep mode = {sleep_mode} "
         f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
     )
-    use_vllm = True
     # vLLM colocate LLM overrides actually applied (recorded in train_meta for observability — the
     # console is only uploaded on failure, so a SUCCESSFUL run otherwise can't confirm fp8 KV engaged).
     _kv_dtype = None
@@ -274,13 +273,13 @@ def run_rl():
     # GRPO end-to-end A/B first). Until then every GRPO path keeps the conservative full-logits budget
     # cap (fused_logits=False below), so long completions are BUDGETED to fit — slower than the old Liger
     # fused loss, but not an OOM. Feature-detect GRPOConfig fields once here; the TIS and num_iterations
-    # knobs are set later even when use_vllm is False, so this must stay outside the vLLM-only block.
+    # knobs are set later, so this must stay outside the vLLM engine-kwargs block.
     _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
     _grpo_has_num_iter = "num_iterations" in _grpo_fields
     per_device_comps = _w.rl_per_device_comps(
         _cap_completion_len,
         vocab=vocab_size_for(model_id),
-        use_vllm=use_vllm,
+        use_vllm=True,
         params_b=_params_b,
         active_params_b=(float(getattr(_info, "active_params_b", 0.0) or 0.0) or None),
         seq_len=vllm_max_len,
@@ -330,7 +329,7 @@ def run_rl():
         "max_steps": steps,
         "temperature": _temperature,
         "top_p": rl.sampling_top_p,
-        "use_vllm": use_vllm,
+        "use_vllm": True,
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
@@ -361,116 +360,115 @@ def run_rl():
     }
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
-    if use_vllm:
-        # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
-        # the rollout can silently produce no completions (flash-attn PTX JIT failure).
-        _w.force_vllm_backend_for_sm120()
-        # Blackwell (sm100 B200 / sm120): force the VL model's ViT attention to TORCH_SDPA — vLLM
-        # 0.19.1's CUTE flash-attn ViT path is unimportable vs every nvidia-cutlass-dsl and crashes
-        # every B200 rollout (no version pin fixes it). No-op off Blackwell / on non-VL models.
-        _w.force_vit_sdpa_on_blackwell()
-        # colocate_kv_util sizes vLLM's KV pool from flash's per-model estimate; the old blanket
-        # 0.45 over-reserved (e.g. 36 GB on an 80 GB A100) and dominated the step peak.
-        try:
-            import torch as _torch_vram
+    # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
+    # the rollout can silently produce no completions (flash-attn PTX JIT failure).
+    _w.force_vllm_backend_for_sm120()
+    # Blackwell (sm100 B200 / sm120): force the VL model's ViT attention to TORCH_SDPA — vLLM
+    # 0.19.1's CUTE flash-attn ViT path is unimportable vs every nvidia-cutlass-dsl and crashes
+    # every B200 rollout (no version pin fixes it). No-op off Blackwell / on non-VL models.
+    _w.force_vit_sdpa_on_blackwell()
+    # colocate_kv_util sizes vLLM's KV pool from flash's per-model estimate; the old blanket
+    # 0.45 over-reserved (e.g. 36 GB on an 80 GB A100) and dominated the step peak.
+    try:
+        import torch as _torch_vram
 
-            from flash.catalog import MODELS
-            from flash.engine.vram import colocate_kv_util
+        from flash.catalog import MODELS
+        from flash.engine.vram import colocate_kv_util
 
-            # MoE: size the KV pool on the ACTIVE backbone (matches grpo_fits_resident's resident-fit
-            # gate), so the budget and the sleep-mode decision count the SAME KV. Dense -> 0 -> total.
-            _active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0)
-            _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-            _vllm_gpu_mem_util = colocate_kv_util(
-                _params_b,
-                vllm_max_len,
-                _total_vram_gb,
-                sleep_mode,
-                num_generations=group_size,
-                active_params_b=_active_b,
-                fp8_kv=_fp8_kv,
+        # MoE: size the KV pool on the ACTIVE backbone (matches grpo_fits_resident's resident-fit
+        # gate), so the budget and the sleep-mode decision count the SAME KV. Dense -> 0 -> total.
+        _active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0)
+        _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+        _vllm_gpu_mem_util = colocate_kv_util(
+            _params_b,
+            vllm_max_len,
+            _total_vram_gb,
+            sleep_mode,
+            num_generations=group_size,
+            active_params_b=_active_b,
+            fp8_kv=_fp8_kv,
+        )
+    except Exception:
+        _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10
+    grpo_kwargs.update(
+        vllm_mode="colocate",
+        vllm_max_model_length=vllm_max_len,
+        vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
+        vllm_enable_sleep_mode=sleep_mode,
+    )
+    def _set_vllm_field(names, value, label):
+        for _f in names:
+            if _f in _grpo_fields:
+                grpo_kwargs[_f] = value
+                print(f"[rl] {label} ({_f}={value})")
+                return True
+        return False
+
+    try:
+        import torch as _torch
+
+        _cc = _torch.cuda.get_device_capability()
+        _card_gb = _torch.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception:
+        _cc, _card_gb = (0, 0), 0.0
+    _kv_dtype = "fp8" if _cc >= (8, 9) else None
+    _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
+    if _kv_dtype or _mnbt:
+        _w.patch_trl_colocate_llm_kwargs(
+            kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
+        )
+    _set_vllm_field(
+        ("vllm_enable_prefix_caching", "enable_prefix_caching"),
+        True,
+        "vLLM prefix caching (shared GRPO prompt KV reuse)",
+    )
+    _set_vllm_field(
+        ("vllm_enable_chunked_prefill", "enable_chunked_prefill"),
+        True,
+        "vLLM chunked prefill",
+    )
+    # vLLM > 0.19.0 regressed the Triton slot-mapping kernel into an illegal memory access on
+    # the first generation step (CUDA graph compilation triggers it); skip FULL_AND_PIECEWISE.
+    _cudagraph_safe = True
+    try:
+        import vllm as _vllm_mod
+
+        _ver_base = _vllm_mod.__version__.split("+")[0]
+        _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
+        if _vllm_ver > (0, 19, 0):
+            _cudagraph_safe = False
+            print(
+                f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
+                "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
+                "crash workaround; update vLLM to a TRL-supported version to re-enable)"
             )
-        except Exception:
-            _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10
-        grpo_kwargs.update(
-            vllm_mode="colocate",
-            vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
-            vllm_enable_sleep_mode=sleep_mode,
-        )
-        def _set_vllm_field(names, value, label):
-            for _f in names:
-                if _f in _grpo_fields:
-                    grpo_kwargs[_f] = value
-                    print(f"[rl] {label} ({_f}={value})")
-                    return True
-            return False
+            try:
+                import torch as _t_cc
 
-        try:
-            import torch as _torch
-
-            _cc = _torch.cuda.get_device_capability()
-            _card_gb = _torch.cuda.get_device_properties(0).total_memory / 1e9
-        except Exception:
-            _cc, _card_gb = (0, 0), 0.0
-        _kv_dtype = "fp8" if _cc >= (8, 9) else None
-        _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
-        if _kv_dtype or _mnbt:
-            _w.patch_trl_colocate_llm_kwargs(
-                kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
-            )
-        _set_vllm_field(
-            ("vllm_enable_prefix_caching", "enable_prefix_caching"),
-            True,
-            "vLLM prefix caching (shared GRPO prompt KV reuse)",
-        )
-        _set_vllm_field(
-            ("vllm_enable_chunked_prefill", "enable_chunked_prefill"),
-            True,
-            "vLLM chunked prefill",
-        )
-        # vLLM > 0.19.0 regressed the Triton slot-mapping kernel into an illegal memory access on
-        # the first generation step (CUDA graph compilation triggers it); skip FULL_AND_PIECEWISE.
-        _cudagraph_safe = True
-        try:
-            import vllm as _vllm_mod
-
-            _ver_base = _vllm_mod.__version__.split("+")[0]
-            _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
-            if _vllm_ver > (0, 19, 0):
-                _cudagraph_safe = False
+                _cc = _t_cc.cuda.get_device_capability()
+            except Exception:
+                _cc = (0, 0)
+            _is_b200 = _cc == (10, 0)  # sm100, the only arch validated for cudagraphs here
+            if not _is_b200:
+                _w.patch_trl_colocate_llm_kwargs(enforce_eager=True)
                 print(
-                    f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
-                    "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
-                    "crash workaround; update vLLM to a TRL-supported version to re-enable)"
+                    f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
+                    "-> prevent 0.19.1 aot_compile/slot-mapping crash; the removed "
+                    "VLLM_TORCH_COMPILE_LEVEL env no longer applies on this vLLM)"
                 )
-                try:
-                    import torch as _t_cc
-
-                    _cc = _t_cc.cuda.get_device_capability()
-                except Exception:
-                    _cc = (0, 0)
-                _is_b200 = _cc == (10, 0)  # sm100, the only arch validated for cudagraphs here
-                if not _is_b200:
-                    _w.patch_trl_colocate_llm_kwargs(enforce_eager=True)
-                    print(
-                        f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
-                        "-> prevent 0.19.1 aot_compile/slot-mapping crash; the removed "
-                        "VLLM_TORCH_COMPILE_LEVEL env no longer applies on this vLLM)"
-                    )
-                else:
-                    print(
-                        f"[rl] cc={_cc[0]}.{_cc[1]} (B200/sm100): keeping vLLM CUDA graphs for the "
-                        "rollout (validated; MoE-decode speedup)"
-                    )
-        except Exception:
-            pass
-        if _cudagraph_safe:
-            _set_vllm_field(
-                ("vllm_compilation_config", "compilation_config"),
-                {"cudagraph_mode": "FULL_AND_PIECEWISE"},
-                "vLLM cudagraph_mode (verl rollout default)",
-            )
+            else:
+                print(
+                    f"[rl] cc={_cc[0]}.{_cc[1]} (B200/sm100): keeping vLLM CUDA graphs for the "
+                    "rollout (validated; MoE-decode speedup)"
+                )
+    except Exception:
+        pass
+    if _cudagraph_safe:
+        _set_vllm_field(
+            ("vllm_compilation_config", "compilation_config"),
+            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+            "vLLM cudagraph_mode (verl rollout default)",
+        )
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
     # The warm-start path downloads the adapter and (for VL checkpoints) merges it into a full
     # base-model copy on disk; on a 35B that is many silent minutes.
@@ -529,7 +527,7 @@ def run_rl():
     if is_tool_env and not tools:
         print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
     use_rollout_func = is_multi_turn and not (is_tool_env and tools)
-    _w.require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
+    _w.require_vllm_for_rollout_func(use_rollout_func, True, model_id)
     if is_tool_env and tools:
         extra_trainer_kwargs["tools"] = tools
         print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")

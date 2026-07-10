@@ -271,15 +271,12 @@ def build_worker_env(
 _CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
-_hf_status_code = hf_status_code
-
-
 def _hf_call(call, label: str):
     return hf_call(call, label, logger=logger, sleep=time.sleep)
 
 
 def _is_hf_not_found(exc: BaseException) -> bool:
-    return _hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
+    return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
 
 
 def _ensure_private_artifact_repo(api, repo: str) -> None:
