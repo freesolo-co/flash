@@ -23,7 +23,7 @@ from flash.client.config import load_credentials
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
-from flash.runner import TERMINAL_STATES, new_run_id
+from flash.runner import TERMINAL_STATES
 from flash.schema import ConfigError, spec_from_file
 
 from . import render
@@ -232,20 +232,29 @@ def cmd_train(args) -> int:
         return _cmd_train_cost(args)
     spec = spec_from_file(
         args.config,
-        run_id=new_run_id() if args.dry_run else None,
+        run_id=None,
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    client = client_from_config()
     if args.dry_run:
-        payload = {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
+        # Dry-run is a faithful server-side preview: the control plane runs the SAME config
+        # validation and warm-start/serving preflights it would at real submit (serving rank/context
+        # caps, the continued warm-start rank match, cost quote) and records a state=dry_run run, but
+        # allocates no GPU and charges nothing. Local runtime secrets aren't sent — the server
+        # relaxes the required-[environment].secrets check for a preview, so `--dry-run` works before
+        # prod secrets are wired up. A rejection surfaces as the server's `error: ...` (exit 1),
+        # exactly as a real submit would.
+        status = client.create_run(spec_payload(spec), dry_run=True)
         if render.styled():
             print(
-                render.object_panel("train", payload, "dry run — validated locally, not submitted")
+                render.object_panel(
+                    "train", status, "dry run — validated by the server, not submitted"
+                )
             )
         else:
-            print(json.dumps(payload, indent=2))
+            print(json.dumps(status, indent=2))
         return 0
-    client = client_from_config()
     status = client.create_run(
         spec_payload(spec),
         runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),

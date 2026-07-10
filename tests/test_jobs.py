@@ -1439,9 +1439,13 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
         monkeypatch.setattr(db, "run_owner", lambda run_id: 7 if run_id == "source-run" else None)
         monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
+        # The rank preflight now runs in dry-run too; this test exercises org-ownership, not rank, so
+        # give the source adapter the run's default lora_rank (32) to let the preflight pass.
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 32})
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1459,6 +1463,39 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         )
 
         assert status.state == "dry_run"
+
+
+def test_submit_dry_run_rejects_warmstart_rank_mismatch(monkeypatch):
+    # The continued warm-start rank preflight runs in dry-run too, so `--dry-run` rejects a config a
+    # real submit would reject (train.lora_rank disagreeing with the source adapter's rank) instead
+    # of passing and only failing at live submit.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        source = JobSpec.from_dict(
+            {
+                "run_id": "source-run",
+                "model": "Qwen/Qwen3.5-0.8B",
+                "algorithm": "grpo",
+                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
+            }
+        )
+        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        import flash.lora_rank as rank_mod
+        import flash.runner.checkpoints as checkpoints
+
+        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
+        # Source adapter is rank 64; the child leaves lora_rank at its default 32 -> a mismatch the
+        # preflight must catch even though this is only a dry-run.
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 64})
+        base = _spec("warm-run").to_dict()
+        spec = JobSpec.from_dict(
+            {**base, "train": {**base["train"], "init_from_adapter": "source-run"}}
+        )
+
+        with pytest.raises(ValueError, match=r"train\.lora_rank=32 does not match.*rank 64"):
+            orch.submit_job(spec, dry_run=True, background=False)
 
 
 def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):

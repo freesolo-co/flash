@@ -119,7 +119,7 @@ extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
 ### 4. Submit
 
 ```bash
-flash train configs/sft.toml --dry-run     # validate the config locally — no GPU, no charge
+flash train configs/sft.toml --dry-run     # validate the config on the server — no GPU, no charge
 flash train configs/sft.toml --cost        # pre-flight USD estimate, then exit
 flash train configs/sft.toml               # submit and follow logs (Ctrl-C detaches)
 flash train configs/sft.toml --background  # submit and return immediately
@@ -161,8 +161,9 @@ Work in tight, attributable iterations. Each one is a hypothesis:
 1. Reconstruct state — what's the best run so far, and what have you already tried?
 2. Form a hypothesis — pick ONE lever and say WHY it will move the metric.
 3. Change that ONE lever.
-4. Validate locally — `flash train configs/sft.toml --dry-run` (catches config errors
-   for free; a paid run on a broken config or an all-zero reward is wasted budget).
+4. Validate — `flash train configs/sft.toml --dry-run` (server-side preview: catches config
+   errors, serving rank/context caps, and warm-start rank mismatches for free — no GPU, no charge;
+   a paid run on a broken config or an all-zero reward is wasted budget).
 5. Submit — `flash train configs/sft.toml`.
 6. Judge — read the metric trend AND a sample of real rollouts (see below).
 7. Keep the best run; revert the change if it didn't beat the noise band. Repeat.
@@ -577,7 +578,7 @@ flash env setup                       # scaffold environment.py, dataset/, confi
 flash env push --name my-env .        # publish the environment; paste the returned id into [environment]
 flash env pull your-org/my-env        # download a published environment into the current folder
 flash env delete your-org/my-env -y   # delete a published environment
-flash train configs/sft.toml --dry-run # validate the config locally (no GPU, no charge)
+flash train configs/sft.toml --dry-run # validate the config on the server (no GPU, no charge)
 flash train configs/sft.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/sft.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash status <run-id>                 # state + accrued cost

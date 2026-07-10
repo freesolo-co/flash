@@ -5,8 +5,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import subprocess
-import sys
 import tempfile
 
 import pytest
@@ -79,7 +77,12 @@ def test_orchestrator_dry_run(monkeypatch):
         assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3.5-4B"
 
 
-def test_cli_train_dry_run():
+def test_cli_train_dry_run(monkeypatch, capsys):
+    # `flash train --dry-run` routes through the server (`create_run(dry_run=True)`) so the control
+    # plane runs the real submit-time preflights without allocating a GPU; the CLI renders the
+    # returned state=dry_run status. A fake client stands in for the server here.
+    from flash.cli import main
+
     with tempfile.TemporaryDirectory() as tmp:
         config = os.path.join(tmp, "run.toml")
         with open(config, "w") as f:
@@ -97,16 +100,18 @@ def test_cli_train_dry_run():
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
             )
-        env = os.environ.copy()
-        proc = subprocess.run(
-            [sys.executable, "-m", "flash.cli", "train", config, "--dry-run"],
-            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-        )
-        assert proc.returncode == 0, proc.stdout
-        payload = json.loads(proc.stdout)
+
+        seen = {}
+
+        class _FakeClient:
+            def create_run(self, spec, runtime_secrets=None, dry_run=False):
+                seen["dry_run"] = dry_run
+                return {"run_id": "flash-dry-1", "state": "dry_run", "spec": spec}
+
+        monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())
+
+        rc = main(["train", config, "--dry-run"])
+        assert rc == 0
+        assert seen["dry_run"] is True
+        payload = json.loads(capsys.readouterr().out)
         assert payload["state"] == "dry_run"
