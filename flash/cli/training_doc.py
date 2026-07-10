@@ -208,6 +208,7 @@ spending another GPU run:
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
 | All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
+| OPD makes the student worse, not better | The distilled adapter scores *below* its SFT/base start even though the per-token loss fell | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.2 teacher, so a teacher that is weak or wrong on *your* task transfers its mistakes. Vet it first: roll GLM-5.2 through your own environment on a held-out split and confirm it clearly beats your student before submitting. If it doesn't, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost. |
 | Infrastructure, CUDA, OOM, vLLM, or kernel failure | Run errors before useful metrics, often during setup/model load | Treat this as infrastructure pressure, not proof the model is too large. Read `flash log <run-id>`, reduce footprint (`max_context_tokens`, `max_completion_tokens`, `group_size`) if needed, and let Flash retry/allocate another fitting GPU class. |
 | Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
@@ -384,6 +385,17 @@ each of *its own* completions, and a dense per-token loss teaches the student to
 far more sample-efficient than reward-based RL and with no reward to design. It supports `epochs`
 like SFT/GRPO and produces a LoRA served exactly like SFT.
 
+- **Vet the teacher on your task before you distil — this is a precondition, not a formality.**
+  Reverse-KL can only pull the student *toward* the managed GLM-5.2 teacher, so OPD's ceiling is
+  roughly the teacher's own competence at your task. If the teacher is weak, frequently wrong, or
+  solves the task with a strategy your environment can't reward, distillation faithfully transfers
+  those flaws and **drives the student *below* its SFT/base starting point instead of above it** — a
+  low per-token loss just means it matched a bad teacher. So measure the teacher the way you'd score
+  a candidate *before submitting*: roll GLM-5.2 through your own environment on a held-out split and
+  read both its score and a sample of its trajectories. Only run OPD when the teacher clearly beats
+  your student (and your target bar) *and* solves the task the way you want the student to. When
+  GLM-5.2 is at or below your student on the task, OPD is the wrong tool — reach for GRPO
+  (reward-driven, can exceed any single teacher) or SFT on curated data instead.
 - **No teacher key or model override to set up.** The GLM 5.2 teacher and its Fireworks key are platform-managed: the
   service supplies its own key to every opd run, so there is nothing to export or declare — an opd
   run submits like any other. Bring-your-own teacher models and keys are not supported; a
@@ -429,6 +441,18 @@ termination and rollouts run away to `max_completion_tokens`. `opd_eos_loss_coef
 bounded, self-limiting behaviour-cloning term that reinstates the stop signal on rollouts that
 terminated naturally; watch `truncated_rollouts` fall and `mean_eos_logprob` rise in the run metrics.
 Warm-starting from an SFT adapter (which already encodes termination) compounds it.
+
+A verbose teacher also hurts in a way the stop-token term can't reach: it inflates the *content* the
+student distils toward — long per-turn reasoning and extra multi-turn looping — so episodes still
+forfeit against the length/turn budget even once EOS is supervised. Because the teacher scores the
+student's rollouts **conditioned on your environment's own system prompt**, you can shrink its target
+distribution at the source: give the prompt used for OPD rollouts a **hard, specific reasoning
+budget** — e.g. "reason in at most two or three sentences, then act; once you have started, do not
+reconsider" — rather than a vague "be brief." The phrasing matters. A soft brevity request can
+**backfire on a thinking teacher**, trimming the median while *inflating* the long tail (the model
+spirals when told to be brief on a problem it finds hard), which is exactly the tail that drives
+runaway. Constrain the content with the prompt and reinstate the stop with `opd_eos_loss_coef` —
+they are complementary, and both assume the teacher is still strong at the task (vet it first, above).
 
 ---
 
@@ -481,9 +505,9 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Failure mode | What you see | Targeted fix |
 | --- | --- | --- |
 | Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
-| Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt |
+| Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt with a *hard, specific* budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail |
 | Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
-| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | raise `opd_eos_loss_coef` and warm-start from SFT — the reverse-KL can't supervise the stop token on its own |
+| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | raise `opd_eos_loss_coef` and warm-start from SFT — the reverse-KL can't supervise the stop token on its own. Also shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task — a bad teacher is distilled in, not out. |
 | Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
 | Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
 | Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |
