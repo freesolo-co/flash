@@ -64,3 +64,41 @@ def test_managed_repo_without_prefix_is_not_an_internal_storage_ref(monkeypatch)
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff")
     assert calls == {}
     assert out is None
+
+
+# ---- warm-start source marker (control-plane producer for the artifact GC) --------------------
+
+
+def _mark(monkeypatch, ref, child_run_id):
+    """Call _mark_warmstart_source with HfApi.upload_file stubbed; return captured upload kwargs."""
+    import types
+
+    import huggingface_hub
+
+    import flash.runner as R
+
+    captured = {}
+
+    class _FakeApi:
+        def upload_file(self, path_or_fileobj=None, path_in_repo=None, repo_id=None, repo_type=None):
+            captured.update(path_in_repo=path_in_repo, repo_id=repo_id, repo_type=repo_type)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    worker_spec = types.SimpleNamespace(train=types.SimpleNamespace(init_from_adapter=ref))
+    R._mark_warmstart_source(worker_spec, child_run_id)
+    return captured
+
+
+def test_mark_warmstart_source_writes_marker_into_source_repo(monkeypatch):
+    captured = _mark(monkeypatch, "Freesolo-Co/flashrun-src:sft/flash-src", "flash-child-1")
+    assert captured == {
+        "path_in_repo": "referenced_by/flash-child-1",
+        "repo_id": "Freesolo-Co/flashrun-src",
+        "repo_type": "dataset",
+    }
+
+
+def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
+    assert _mark(monkeypatch, None, "flash-child-1") == {}  # no warm-start ref
+    assert _mark(monkeypatch, "flash-src/step-5", "flash-child-1") == {}  # public form, no ":" repo
+    assert _mark(monkeypatch, "Freesolo-Co/flashrun-src:sft/flash-src", "local") == {}  # dry/local child
