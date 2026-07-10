@@ -2623,7 +2623,8 @@ def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
     from flash.engine.recipe import TEACHER_MODELS
 
     # Derivation parity: one priced row per allow-listed teacher, keyed by provider model id.
-    assert TEACHER_USD_PER_1M == {i.model_id: i.usd_per_1m for i in TEACHER_MODELS.values()}
+    derived = {i.model_id: i.usd_per_1m for i in TEACHER_MODELS.values()}
+    assert derived == TEACHER_USD_PER_1M
     for info in TEACHER_MODELS.values():
         assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
 
