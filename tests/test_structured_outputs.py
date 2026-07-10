@@ -14,7 +14,12 @@ import json
 
 import pytest
 
-from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
+from flash.engine.structured_outputs import (
+    THINKING_REASONING_PARSER,
+    describe_structured_outputs,
+    parse_structured_outputs,
+    reasoning_parser_for,
+)
 from flash.schema import ConfigError, spec_from_dict
 from flash.spec import JobSpec
 
@@ -198,11 +203,25 @@ def test_describe_structured_outputs():
     assert describe_structured_outputs({"regex": "a+"}) == "regex"
 
 
-def test_thinking_plus_constraint_warns_on_stderr(capsys):
+def test_thinking_plus_constraint_notes_deferred_grammar_on_stderr(capsys):
+    # thinking + a constraint is supported: the worker defers the grammar past </think>, so the CLI
+    # notes the deferred behavior instead of warning about first-token constraint.
     thinking_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-4B", thinking=True)
     spec_from_dict(thinking_raw, run_id="so-warn")
-    assert "constrains generation from the first token" in capsys.readouterr().err
-    # a non-thinking constrained run does not warn
+    err = capsys.readouterr().err
+    assert "after the </think> reasoning phase" in err
+    # a non-thinking constrained run says nothing about </think>
     plain_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-4B", thinking=False)
     spec_from_dict(plain_raw, run_id="so-warn2")
-    assert "constrains generation" not in capsys.readouterr().err
+    assert "</think>" not in capsys.readouterr().err
+
+
+def test_reasoning_parser_for_gates_on_thinking_and_constraint():
+    # Only thinking AND a constraint together defer the grammar past </think>.
+    assert reasoning_parser_for(thinking=True, structured_outputs={"json": _SCHEMA}) == (
+        THINKING_REASONING_PARSER
+    )
+    # no constraint -> the grammar gate never runs; thinking off -> no reasoning phase to protect.
+    assert reasoning_parser_for(thinking=True, structured_outputs=None) is None
+    assert reasoning_parser_for(thinking=False, structured_outputs={"json": _SCHEMA}) is None
+    assert reasoning_parser_for(thinking=False, structured_outputs=None) is None

@@ -31,7 +31,11 @@ from dataclasses import dataclass
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE, resolve_teacher
 from flash.engine.steps import on_policy_steps
-from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
+from flash.engine.structured_outputs import (
+    describe_structured_outputs,
+    parse_structured_outputs,
+    reasoning_parser_for,
+)
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -559,10 +563,16 @@ def run_opd():
         f"rollout_batch={vllm_kwargs.get('rollout_batch_size') or 'auto'}"
     )
     _so_spec = parse_structured_outputs(knobs.structured_outputs)
+    _reasoning_parser = reasoning_parser_for(thinking=_w.THINKING, structured_outputs=_so_spec)
     if _so_spec:
         print(
             f"[opd] structured outputs: every student rollout constrained to "
             f"{describe_structured_outputs(_so_spec)}"
+            + (
+                f" (applied only after </think> via reasoning_parser={_reasoning_parser})"
+                if _reasoning_parser
+                else ""
+            )
         )
     t_vllm_init = time.time()
     with liveness_heartbeat("opd_vllm_initializing"):
@@ -573,6 +583,7 @@ def run_opd():
             top_p=knobs.top_p,
             stop_sequences=tuple(str(s) for s in knobs.stop_sequences),
             structured_outputs=_so_spec,
+            reasoning_parser=_reasoning_parser,
             lora_rank=lora_rank,
             seed=_w.SEED,
             **vllm_kwargs,
