@@ -158,6 +158,12 @@ class OpdKnobs:
     # over shared decoded-text spans cannot supervise the zero-width stop token, so this restores the
     # stop signal; 0 disables it. [train].opd_eos_loss_coef, else RECIPE.opd.eos_loss_coef.
     eos_loss_coef: float = RECIPE.opd.eos_loss_coef
+    # student-side entropy floor (see _entropy_floor_term): hinge weight and target (nats) on the
+    # per-sample mean completion entropy, countering reverse-KL over-sharpening on small students.
+    # coef 0 disables the loss term; the mean entropy is still computed (detached) for logging.
+    # [train].opd_entropy_floor_coef / opd_entropy_floor, else RECIPE.opd defaults.
+    entropy_floor_coef: float = RECIPE.opd.entropy_floor_coef
+    entropy_floor: float = RECIPE.opd.entropy_floor
     save_every: int = 0
     max_length: int = 0
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
@@ -223,6 +229,19 @@ def _resolve_opd_knobs() -> OpdKnobs:
             float(
                 _eos if (_eos := opt("opd_eos_loss_coef", None)) is not None else d.eos_loss_coef
             ),
+        ),
+        # like eos_loss_coef: explicit 0 is valid (disable), only None falls back to the recipe.
+        entropy_floor_coef=max(
+            0.0,
+            float(
+                _ec
+                if (_ec := opt("opd_entropy_floor_coef", None)) is not None
+                else d.entropy_floor_coef
+            ),
+        ),
+        entropy_floor=max(
+            0.0,
+            float(_ef if (_ef := opt("opd_entropy_floor", None)) is not None else d.entropy_floor),
         ),
         save_every=int(opt("save_every", 0) or 20),
         max_length=int(opt("max_context_tokens", 0) or 0),
@@ -315,7 +334,9 @@ def _student_model(model_id, model_init_kwargs, device):
 
     # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
     # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(device)
+    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(
+        device
+    )
     return get_peft_model(base, init_peft), str(init_model)
 
 
@@ -369,7 +390,8 @@ def run_opd():
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
         f"epochs={knobs.epochs} warm_start={warm_start or 'none'} "
         f"mode={'multi-turn' if multi_turn else 'single-turn'} "
-        f"eos_loss_coef={knobs.eos_loss_coef}"
+        f"eos_loss_coef={knobs.eos_loss_coef} "
+        f"entropy_floor_coef={knobs.entropy_floor_coef} entropy_floor={knobs.entropy_floor}"
     )
 
     # The GLM teacher key is a platform-owned credential the control plane injects into the worker
@@ -627,6 +649,12 @@ def run_opd():
     # to stop, the counterpart to truncated_rollouts FALLING. Surfaced in train_meta.
     eos_logprob_sum = 0.0
     eos_logprob_n = 0
+    # Running mean of the per-sample student completion entropy (nats) and how many distilled samples
+    # tripped the entropy-floor hinge — the in-band view of reverse-KL entropy collapse (see
+    # _entropy_floor_term). Surfaced in train_meta; the per-step mean goes to wandb/heartbeats.
+    entropy_sum = 0.0
+    entropy_n = 0
+    entropy_floor_active = 0
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -688,9 +716,16 @@ def run_opd():
         sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
         refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
         advanced by the caller once per generated rollout so its timing is unchanged."""
-        nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
+        nonlocal \
+            teacher_ok, \
+            teacher_transient, \
+            teacher_error, \
+            truncated_rollouts, \
+            step_loss, \
+            step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema
+        nonlocal entropy_sum, entropy_n, entropy_floor_active, step_ent_sum, step_ent_n
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -721,6 +756,13 @@ def run_opd():
         if r.eos_logprob is not None:
             eos_logprob_sum += r.eos_logprob
             eos_logprob_n += 1
+        if r.entropy is not None:
+            entropy_sum += r.entropy
+            entropy_n += 1
+            step_ent_sum += r.entropy
+            step_ent_n += 1
+            if knobs.entropy_floor_coef > 0 and r.entropy < knobs.entropy_floor:
+                entropy_floor_active += 1
         nseq += 1
         # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
         _opd_progress(opt_steps, nseq)
@@ -747,6 +789,7 @@ def run_opd():
     max_teacher_workers = _opd_teacher_workers(
         knobs.prompts_per_step * knobs.group_size, teacher_batch_size
     )
+
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -770,10 +813,15 @@ def run_opd():
             for no_signal_attempt in range(1, max_no_signal_attempts + 1):
                 it = step  # data-slice + display index for THIS rollout attempt
                 step += 1  # advance up front so the nseq==0 retry path can't spin forever
-                batch = [examples[(it * prompts_per_step + i) % len(examples)] for i in range(prompts_per_step)]
+                batch = [
+                    examples[(it * prompts_per_step + i) % len(examples)]
+                    for i in range(prompts_per_step)
+                ]
                 accum_target = max(1, prompts_per_step * group)
                 step_loss = 0.0
                 step_cov = 0.0
+                step_ent_sum = 0.0
+                step_ent_n = 0
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
@@ -991,6 +1039,8 @@ def run_opd():
                     opd_phase_counts["vllm_syncs"] += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
+            # None when no distilled sample this step carried an entropy (bare test doubles).
+            avg_ent = (step_ent_sum / step_ent_n) if step_ent_n else None
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
             _w.heartbeat(
@@ -1004,6 +1054,7 @@ def run_opd():
                 step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
+                entropy=avg_ent,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
             )
@@ -1012,11 +1063,17 @@ def run_opd():
                 with contextlib.suppress(Exception):
                     import wandb
 
-                    wandb.log({"opd/loss": avg_loss, "opd/coverage": avg_cov}, step=opt_steps)
+                    wandb_metrics = {"opd/loss": avg_loss, "opd/coverage": avg_cov}
+                    if avg_ent is not None:
+                        # falls over a collapsing run; should flatten at/above opd_entropy_floor
+                        # once the floor is enabled (see _entropy_floor_term).
+                        wandb_metrics["opd/entropy"] = avg_ent
+                    wandb.log(wandb_metrics, step=opt_steps)
             if it % 10 == 0:
                 print(
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
+                    + (f" entropy={avg_ent:.3f}" if avg_ent is not None else "")
                 )
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
             # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
@@ -1122,6 +1179,14 @@ def run_opd():
             "eos_loss_coef": knobs.eos_loss_coef,
             "eos_reinforced_samples": eos_logprob_n,
             "mean_eos_logprob": (eos_logprob_sum / eos_logprob_n) if eos_logprob_n else None,
+            # Student entropy floor (see _entropy_floor_term): the knobs, the run-mean per-sample
+            # completion entropy (nats), and how many distilled samples tripped the hinge. A
+            # collapsing run shows mean_student_entropy FALLING step over step (opd/entropy in
+            # wandb); with the floor enabled it should flatten at/above opd_entropy_floor.
+            "entropy_floor_coef": knobs.entropy_floor_coef,
+            "entropy_floor": knobs.entropy_floor,
+            "mean_student_entropy": (entropy_sum / entropy_n) if entropy_n else None,
+            "entropy_floor_active_samples": entropy_floor_active,
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
             "no_signal_resamples": no_signal_resamples,
@@ -1169,7 +1234,9 @@ def run_opd():
                 else None
             ),
             "opd_rollout_pipeline_max_chunks": (
-                _opd_rollout_pipeline_max_chunks(prompts_per_step * group) if not multi_turn else None
+                _opd_rollout_pipeline_max_chunks(prompts_per_step * group)
+                if not multi_turn
+                else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
@@ -1218,6 +1285,10 @@ class SampleResult:
     # Detached log P(eos) at the reinforced terminal position, when the EOS behaviour-cloning term
     # was applied (else None). Surfaced as mean_eos_logprob so a run's rising termination is visible.
     eos_logprob: float | None = None
+    # Detached mean completion entropy (nats) of this sample's student predictive distributions
+    # (distilled samples only, else None). Surfaced as opd/entropy + mean_student_entropy so the
+    # reverse-KL entropy collapse behind the small-model greedy repetition loop is visible in-band.
+    entropy: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1422,7 +1493,9 @@ def _score_many(
                 for _ in pendings
             ]
         return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
-    return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
+    return [
+        _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
+    ]
 
 
 @dataclass(frozen=True)
@@ -1508,12 +1581,10 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     )
     student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
     student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
-    teacher_logsum_t = torch.tensor(
-        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
+    teacher_logsum_t = torch.tensor(prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device)
+    coeffs = (
+        kl_coef * (student_group_logsum - teacher_logsum_t) / group_lengths_t.to(dtype=sp_t.dtype)
     )
-    coeffs = kl_coef * (
-        student_group_logsum - teacher_logsum_t
-    ) / group_lengths_t.to(dtype=sp_t.dtype)
     coeff_vec = coeffs.index_select(0, group_ids_t)
     sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()
@@ -1609,6 +1680,73 @@ def _eos_reinforce_term(
     return (-float(eos_coef)) * logp, float(logp.detach())
 
 
+# Row-chunk size for _entropy_floor_term's full-vocab passes: 128 rows x ~150k vocab x 3 fp32
+# temporaries ~= 250 MB transient, comfortably inside the existing dense-logits headroom.
+_ENTROPY_CHUNK_ROWS = 128
+
+
+def _entropy_floor_term(rows, coef: float, floor: float):
+    """Student-side entropy floor: hinge the per-sample MEAN completion entropy (nats) at ``floor``.
+
+    Reverse-KL distillation is mode-seeking: on small students (<=2b) it progressively over-sharpens
+    the next-token distribution over training steps until greedy (temperature=0) serving — the
+    deploy default — falls into a repetition attractor and never emits EOS (observed on the 2b:
+    step-20 checkpoint clean, step-63 loops on 80% of a 200-row eval; severity scales with
+    rank x steps / model size). The principled fix gates the KL direction on the TEACHER's per-token
+    entropy (EOPD, arxiv 2603.07079), but flash's teacher path cannot express it: Fireworks
+    echo-scoring returns only realized-token scalars (no top-k, no entropy) and teacher/student are
+    cross-tokenizer. So regularize the STUDENT's own distribution — local, same-vocab, already
+    computed for the reverse-KL loss — to keep its entropy from collapsing.
+
+    The hinge is on the per-sample MEAN, not per token: individual tokens are often legitimately
+    near-deterministic (syntax, format, ``</think>``), and a per-token floor would push every
+    confident token up, fighting correct behaviour everywhere. The observed pathology is
+    distribution-wide drift (mean entropy falls monotonically over OPD steps), which the mean hinge
+    targets exactly. Like the terminal-EOS controller above, it is SELF-LIMITING: zero loss and zero
+    gradient while the mean sits at/above the floor, so students that don't collapse (4b/9b, or the
+    2b's early steps) pay nothing.
+
+    ``rows`` is the same ``[completion_len, vocab]`` logits slice the reverse-KL loss consumes.
+    Returns ``(term_or_none, mean_entropy)``: the differentiable addend
+    ``coef * (floor - mean_entropy)`` when the hinge is active (else ``None``), plus the detached
+    mean entropy in nats for logging (always computed, even with coef 0, so a run's entropy
+    trajectory is visible in-band — serving exposes no logprobs to measure it after the fact).
+
+    MEMORY: entropy needs the full-vocab distribution, and an unchunked fp32 log_softmax + exp over
+    ``[completion_len, vocab]`` would materialize multiple ~GB temporaries per sample — an
+    unbudgeted addition to the dense-logits peak _opd_loss_microbatch_size was sized for, EVEN WITH
+    THE FEATURE DISABLED (codex[bot]). Both passes therefore run in _ENTROPY_CHUNK_ROWS-row chunks,
+    bounding the detached (logging) pass to a ~chunk x vocab transient. The AUTOGRAD pass still
+    retains ~2 fp32 ``[completion_len, vocab]`` buffers for backward — but only for samples the
+    hinge is actively penalizing (coef > 0 AND mean entropy below the floor), i.e. the opt-in
+    experimental case, never the default path."""
+    import torch
+    import torch.nn.functional as F
+
+    if rows is None or rows.shape[0] == 0:
+        return None, None
+    n = rows.shape[0]
+
+    def _chunked_entropy_sum(grad: bool):
+        total = None
+        for i in range(0, n, _ENTROPY_CHUNK_ROWS):
+            lp = F.log_softmax(rows[i : i + _ENTROPY_CHUNK_ROWS].float(), dim=-1)
+            part = -(lp.exp() * lp).sum()
+            if not grad:
+                part = float(part)
+            total = part if total is None else total + part
+        return total
+
+    # detached pass first: cheap logging value, and the gate that decides whether the (autograd)
+    # penalty pass is needed at all — at/above the floor the hinge is identically zero.
+    with torch.no_grad():
+        mean_entropy = _chunked_entropy_sum(grad=False) / n
+    if coef <= 0 or mean_entropy >= floor:
+        return None, mean_entropy
+    ent = _chunked_entropy_sum(grad=True) / n
+    return float(coef) * (float(floor) - ent), mean_entropy
+
+
 # Terminal-EOS reinforcement is a PROPORTIONAL CONTROLLER, not a constant push. #482 added the EOS
 # behaviour-cloning term on every distilled (cleanly-terminated) rollout unconditionally; because it
 # raises the SHARED eos output logit — which governs P(eos) at EVERY position, not just the terminal
@@ -1619,7 +1757,9 @@ def _eos_reinforce_term(
 # rollouts, then an all-empty collapse by step ~55/63. Fix: scale the coef by how much the student is
 # CURRENTLY failing to terminate (an EMA of the per-rollout truncation rate), so a run that stops
 # reliably gets ~zero EOS push and cannot ratchet, while genuine runaway still drives full reinforcement.
-_EOS_RUNAWAY_LO = 0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
+_EOS_RUNAWAY_LO = (
+    0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
+)
 _EOS_RUNAWAY_HI = 0.15  # truncation rate >= this: full opd_eos_loss_coef (clear runaway to correct)
 _EOS_TRUNC_EMA_DECAY = 0.97  # per-rollout EMA (~30-rollout window): responsive yet smoothed
 
@@ -1662,6 +1802,10 @@ def _resolve_samples_batched(
     # can't ratchet into an empty-collapse; genuine runaway still drives full reinforcement. Default
     # runaway_rate=1.0 keeps bare callers (tests) at full strength = pre-controller behaviour.
     eos_coef *= _runaway_eos_scale(runaway_rate)
+    # student entropy floor (see _entropy_floor_term). getattr defaults keep bare test stand-ins
+    # working with the penalty OFF; the detached mean entropy is computed either way for logging.
+    ent_coef = float(getattr(knobs, "entropy_floor_coef", 0.0) or 0.0)
+    ent_floor = float(getattr(knobs, "entropy_floor", 0.0) or 0.0)
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
     eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
@@ -1726,13 +1870,9 @@ def _resolve_samples_batched(
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros(
-                (len(seqs), max_len), dtype=torch.long, device=device
-            )
+            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(
-                    seq, dtype=torch.long, device=device
-                )
+                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
             losses = []
@@ -1771,6 +1911,12 @@ def _resolve_samples_batched(
                         if eos_out is not None:
                             eos_term, eos_logprob = eos_out
                             loss = loss + eos_term
+                    # entropy floor on the SAME rows the reverse-KL consumed; added to distilled
+                    # samples only (loss is not None), so skip accounting is unchanged. the detached
+                    # mean entropy is logged even when the penalty is off/inactive.
+                    ent_term, entropy = _entropy_floor_term(rows, ent_coef, ent_floor)
+                    if ent_term is not None:
+                        loss = loss + ent_term
                     loss_for_result = loss
                     if backward_scale is not None:
                         losses.append(loss)
@@ -1783,6 +1929,7 @@ def _resolve_samples_batched(
                         teacher_tokens=p.teacher_tokens,
                         group_granularity=p.group_granularity,
                         eos_logprob=eos_logprob,
+                        entropy=entropy,
                     )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
