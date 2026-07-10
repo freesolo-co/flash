@@ -41,6 +41,7 @@ from ._runtime import (
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
+    _repo_cleanup_loop,
     _worker_artifacts,
     recover_runs,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "_charge_retry_startup",
     "_deploy_lock",
     "_reconcile_cost_loop",
+    "_repo_cleanup_loop",
     "_worker_artifacts",
     "create_app",
     "deploy_adapter",
@@ -361,10 +363,26 @@ def create_app():
             if _instance_providers_configured()
             else None
         )
+        # Periodic artifact GC: delete aged (>7d), undeployed run prefixes inside the per-environment
+        # HF repos (Freesolo-Co/flashrun-*) so old runs' checkpoints/adapters don't accumulate against
+        # the org's storage quota. Only on a plane with an operator HF_TOKEN (it deletes operator-owned
+        # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
+        from flash.server.repo_cleanup import repo_cleanup_enabled
+
+        cleanup_task = (
+            asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
+        )
         try:
             yield
         finally:
-            for task in (startup_charge_task, cost_task, charge_task, reap_task, sweep_task):
+            for task in (
+                startup_charge_task,
+                cost_task,
+                charge_task,
+                reap_task,
+                sweep_task,
+                cleanup_task,
+            ):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
