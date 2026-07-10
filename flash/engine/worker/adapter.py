@@ -123,20 +123,21 @@ def _init_adapter_model(model_id: str):
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
     from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
-    if adapter_is_vl_warmstart(adir, model_id):
-        from transformers import AutoModelForImageTextToText
-
+    # Only the base class differs: VL checkpoints load the full multimodal model (so the adapter's
+    # language_model.* keys line up with the module tree AND the trainer arch matches the VL vLLM
+    # rollout engine); non-VL uses the lighter causal-LM loader.
+    is_vl = adapter_is_vl_warmstart(adir, model_id)
+    if is_vl:
         print("[init-adapter] VL checkpoint: continuing the adapter on the full multimodal base")
-        base = AutoModelForImageTextToText.from_pretrained(
-            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
-        )
-    else:
-        from transformers import AutoModelForCausalLM
-
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
-        )
+    base_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
+    base = base_cls.from_pretrained(
+        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+    )
+    # PeftModel.from_pretrained builds the wrapper + a trainable "default" adapter, but it doesn't
+    # forward the HF `_checkpoint_conversion_mapping`; re-load "default" with key_mapping so a VL
+    # checkpoint's keys remap onto the current module tree (mapping is None/no-op for non-VL).
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
     key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
     load_result = model.load_adapter(

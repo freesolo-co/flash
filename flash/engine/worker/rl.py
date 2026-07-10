@@ -477,6 +477,9 @@ def run_rl():
     # (VL checkpoints load the full multimodal model, still just an adapter — no on-disk merge copy).
     with liveness_heartbeat("rl_adapter_loading"):
         init_model, init_peft = _w._init_adapter_model(model_id)
+    # _init_adapter_model returns peft_config=None only for a warm-start (the prior adapter is loaded
+    # as the trainable "default"); a fresh run returns a LoraConfig for TRL to build.
+    is_warm_start = init_peft is None
     # chalk kernels are applied below against trainer.model (the authoritative target); TRL may
     # rebuild/wrap the PeftModel, and the fresh-LoRA path only passes the model-id string here.
     if init_peft is not None:
@@ -610,7 +613,7 @@ def run_rl():
     # on, so a TRL change that silently fell back to adapter-disable (ref == bare base, which pulls the
     # policy back to base — the #296 collapse re-expressed as a loss term) fails LOUDLY here instead of
     # quietly degrading a warm-started run. No-op when KL is off (beta == 0, flash's default) or fresh.
-    if init_peft is None and _kl_beta > 0:
+    if is_warm_start and _kl_beta > 0:
         _peft_cfg = getattr(getattr(trainer, "model", None), "peft_config", None) or {}
         if "ref" not in _peft_cfg:
             raise RuntimeError(
