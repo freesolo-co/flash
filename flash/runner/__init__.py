@@ -476,6 +476,36 @@ def _resolve_init_from_adapter(
     return replace(spec, train=replace(spec.train, init_from_adapter=storage))
 
 
+def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
+    """Drop a 0-byte ``referenced_by/<child_run_id>`` marker into the warm-start SOURCE run's HF repo.
+
+    The always-on artifact GC (``flash.server.repo_cleanup``) treats a source repo carrying a RECENT
+    such marker as still-referenced and spares its artifacts for the GC age window — so a child that
+    warm-starts (``init_from_adapter``) off an aged, undeployed source is not reaped out from under it.
+    ``worker_spec`` is post-resolution, so its ``init_from_adapter`` is the internal
+    ``<repo>:<phase>/<run_id>...`` storage ref whose repo is the source. Best-effort: a failed marker
+    never blocks submission — it only forfeits the GC grace (the source can still be spared by being
+    deployed or recently written). Emitted on submit AND re-emitted on recovery (``_runtime``), so a
+    child recovered across restarts keeps its source's marker fresh past the age window."""
+    import io
+
+    ref = worker_spec.train.init_from_adapter
+    if not ref or ":" not in ref or not child_run_id or child_run_id == "local":
+        return
+    source_repo = ref.split(":", 1)[0].strip()
+    if not source_repo:
+        return
+    with contextlib.suppress(Exception):
+        from huggingface_hub import HfApi
+
+        HfApi().upload_file(
+            path_or_fileobj=io.BytesIO(b""),
+            path_in_repo=f"referenced_by/{child_run_id}",
+            repo_id=source_repo,
+            repo_type="dataset",
+        )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -516,6 +546,9 @@ def submit_job(
 
         preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
         preflight_train_context_within_serving(worker_spec)
+        # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
+        # child is around (best-effort; never blocks submission).
+        _mark_warmstart_source(worker_spec, public_spec.run_id)
     # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
     status = RunStatus(
         run_id=public_spec.run_id,
