@@ -107,8 +107,8 @@ def gdn_packing_available(model_id: str | None = None) -> bool:
             from causal_conv1d import causal_conv1d_fn
 
             _x = torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16)
-            _w = torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16)
-            causal_conv1d_fn(_x, _w)
+            conv_weight = torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16)
+            causal_conv1d_fn(_x, conv_weight)
             torch.cuda.synchronize()
         return True
     except Exception:

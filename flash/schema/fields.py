@@ -54,16 +54,6 @@ def _train_float(
     return v
 
 
-def _train_str(train_raw: dict, key: str) -> str:
-    """Validate an optional string [train] knob -> ConfigError. Missing/None -> "" (worker default)."""
-    v = train_raw.get(key)
-    if v is None:
-        return ""
-    if not isinstance(v, str):
-        raise ConfigError(f"train.{key} must be a string")
-    return v.strip()
-
-
 def _train_teacher(train_raw: dict) -> str:
     """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
 

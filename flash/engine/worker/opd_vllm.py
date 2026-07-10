@@ -438,9 +438,6 @@ class OpdVllmRolloutEngine:
             out.extend(_normalize_output(item) for item in outputs)
         return out
 
-    def generate_one(self, prompt_ids: list[int], *, max_tokens: int) -> OpdVllmOutput:
-        return self.generate([prompt_ids], max_tokens=max_tokens)[0]
-
     def close(self) -> None:
         shutdown = getattr(getattr(self, "llm", None), "shutdown", None)
         if callable(shutdown):

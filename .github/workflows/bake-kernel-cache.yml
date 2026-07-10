@@ -4,8 +4,8 @@ name: flash worker kernel-cache (per-arch)
 # first-use JIT on a cold worker (the regression #194 reintroduced). Each matrix leg:
 #   1. offloads the warmup to a RunPod GPU of that arch (GH runners have none) -> build/kernel_cache,
 #   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
-#   3. pushes it. Activate by setting FLASH_WORKER_IMAGE_PER_SM=1 on the control plane so the
-#      allocator selects the cu128-<sm> tag per GPU class (see flash/providers/runpod/train/deps.py).
+#   3. pushes it. The allocator then selects the cu128-<sm> tag per GPU class for baked arches
+#      (see flash/providers/runpod/train/deps.py).
 #
 # Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
