@@ -113,7 +113,13 @@ def test_missing_env_id_rejected_client_side():
         assert "[environment] id" in submit.stderr
 
 
-def test_dry_run_needs_no_credentials_or_server():
+def test_dry_run_without_login_fails_fast():
+    # Dry-run now validates on the server — it resolves warm-start refs and runs the submit-time
+    # preflights (serving rank/context caps, continued warm-start rank match) so it is a faithful
+    # preview of a real submit. That needs a login, so a logged-out dry-run fails fast with the same
+    # friendly `not logged in` guidance as a real submit, rather than silently "validating" a config
+    # the server would actually reject. The config itself is still validated client-side first (see
+    # test_bad_model_is_friendly), so only well-formed configs reach the login check.
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
@@ -123,9 +129,10 @@ def test_dry_run_needs_no_credentials_or_server():
                 '[train]\nepochs = 1\nmax_examples = 1\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert '"state": "dry_run"' in proc.stdout
-    assert "live GPU pricing unavailable" not in proc.stderr
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not logged in" in proc.stderr
+    assert "flash login" in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr
 
 
 def test_cost_needs_no_live_pricing():
