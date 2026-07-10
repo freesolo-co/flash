@@ -91,6 +91,18 @@ def test_opd_eos_loss_coef_accepted_by_schema() -> None:
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
 
+def test_opd_forced_mask_max_legal_accepted_by_schema() -> None:
+    # Same allowlist + TrainSpec round-trip contract as opd_eos_loss_coef: the forced-mask threshold
+    # must reach the worker, and a sub-1 value is rejected (a threshold < 1 never masks — the sampled
+    # token is always legal, so legal count is always >= 1).
+    got = spec_from_dict(_raw(**{"train.opd_forced_mask_max_legal": 1}))
+    assert got.train.opd_forced_mask_max_legal == 1
+    assert spec_from_dict(_raw(**{"train.opd_forced_mask_max_legal": 3})).train.opd_forced_mask_max_legal == 3
+    assert spec_from_dict(_raw()).train.opd_forced_mask_max_legal is None  # unset -> recipe default
+    with pytest.raises(ConfigError, match="opd_forced_mask_max_legal"):
+        spec_from_dict(_raw(**{"train.opd_forced_mask_max_legal": 0}))  # < 1 rejected (minimum 1)
+
+
 def test_falsy_algorithm_defaults_to_sft() -> None:
     # The type guard must preserve the `(value or "sft")` semantics: falsy values default.
     # Supply SFT-valid [train] fields so validation reaches the algorithm assertion instead of

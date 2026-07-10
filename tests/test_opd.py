@@ -3287,6 +3287,32 @@ def test_resolve_opd_knobs_eos_loss_coef_override(monkeypatch):
     assert _resolve(opd_eos_loss_coef=-3.0) == 0.0  # clamped non-negative
 
 
+def test_resolve_opd_knobs_forced_mask_max_legal_override(monkeypatch):
+    """[train].opd_forced_mask_max_legal overrides the recipe default; UNSET falls back to it; the
+    resolve floors the value at 1 (a threshold < 1 could never mask, since legal count is always >= 1)."""
+    from flash.engine.recipe import RECIPE
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _resolve(**train):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(**train)), THINKING=False),
+        )
+        return opd_mod._resolve_opd_knobs().forced_mask_max_legal
+
+    assert _resolve() == RECIPE.opd.forced_mask_max_legal  # unset -> recipe default (1)
+    assert _resolve(opd_forced_mask_max_legal=3) == 3  # override widens the mask
+    assert _resolve(opd_forced_mask_max_legal=0) == 1  # floored at 1 (schema also rejects < 1)
+
+
 def test_train_spec_parses_opd_eos_loss_coef():
     """The [train].opd_eos_loss_coef knob parses and round-trips; omitted -> None (recipe default)."""
     from flash.spec import JobSpec

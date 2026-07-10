@@ -673,3 +673,40 @@ def test_normalize_output_without_logprobs_has_no_forced_mask():
     comp = SimpleNamespace(token_ids=[3, 4], text="ok", finish_reason="stop", stop_reason=None)
     out = _normalize_output(SimpleNamespace(outputs=[comp]))
     assert out.forced == ()
+
+
+def test_forced_from_logprobs_max_legal_widens_the_mask():
+    """opd_forced_mask_max_legal generalizes "forced" to "<= N legal tokens" (top-(N+1) dict, surplus
+    -inf-padded): a 2-legal position is masked at max_legal=2 but free at the default 1, and a 3-legal
+    position stays free at max_legal=2."""
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    neg_inf = float("-inf")
+    lps = [
+        {1: _lp(0.0), 7: _lp(neg_inf), 5: _lp(neg_inf)},  # 1 legal (2 pads)
+        {2: _lp(-0.2), 8: _lp(-2.0), 5: _lp(neg_inf)},  # 2 legal (1 pad)
+        {3: _lp(-0.2), 4: _lp(-1.0), 9: _lp(-3.0)},  # 3 legal (no pad)
+    ]
+    assert _forced_from_logprobs(lps, 3, max_legal=1) == (True, False, False)
+    assert _forced_from_logprobs(lps, 3, max_legal=2) == (True, True, False)
+
+
+def test_normalize_output_threads_max_legal():
+    """_normalize_output forwards max_legal to the detector, so a raised threshold masks
+    tightly-constrained (few-legal) spans, not just truly-forced ones."""
+    from flash.engine.worker.opd_vllm import _normalize_output
+
+    neg_inf = float("-inf")
+    comp = SimpleNamespace(
+        token_ids=[3, 4],
+        text="ok",
+        finish_reason="stop",
+        stop_reason=None,
+        logprobs=[
+            {3: _lp(0.0), 9: _lp(neg_inf), 1: _lp(neg_inf)},  # 1 legal
+            {4: _lp(-0.3), 9: _lp(-1.4), 1: _lp(neg_inf)},  # 2 legal
+        ],
+    )
+    wrap = SimpleNamespace(outputs=[comp])
+    assert _normalize_output(wrap, max_legal=1).forced == (True, False)
+    assert _normalize_output(wrap, max_legal=2).forced == (True, True)

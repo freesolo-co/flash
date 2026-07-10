@@ -207,6 +207,7 @@ _TRAIN_KEYS = frozenset(
         "advantage_clip",
         "thinking_length_penalty_coef",
         "opd_eos_loss_coef",
+        "opd_forced_mask_max_legal",
         "stop_sequences",
         "structured_outputs",
         "max_steps",
@@ -354,6 +355,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             ),
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
+            # OPD + structured_outputs: forced-mask legal-token threshold; min 1 (=truly forced only).
+            opd_forced_mask_max_legal=_train_int(train_raw, "opd_forced_mask_max_legal", minimum=1),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract

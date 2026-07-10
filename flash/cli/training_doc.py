@@ -421,6 +421,9 @@ lora_rank = 32
 # opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
 #                                                       # student runs past the length cap without
 #                                                       # stopping, 0 to disable
+# opd_forced_mask_max_legal = 1                         # with structured_outputs: mask reverse-KL
+#                                                       # spans where guided decoding left <= N legal
+#                                                       # tokens (1 = only truly forced positions)
 ```
 
 The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
@@ -429,6 +432,19 @@ termination and rollouts run away to `max_completion_tokens`. `opd_eos_loss_coef
 bounded, self-limiting behaviour-cloning term that reinstates the stop signal on rollouts that
 terminated naturally; watch `truncated_rollouts` fall and `mean_eos_logprob` rise in the run metrics.
 Warm-starting from an SFT adapter (which already encodes termination) compounds it.
+
+**Structured outputs + the forced-mask (`opd_forced_mask_max_legal`).** When you set `structured_outputs`,
+the student generates under a grammar but the teacher echo-scores **unconstrained** — so at
+grammar-*forced* positions (only one legal token) the teacher's logprob is spurious signal the student
+had no choice about. OPD masks those spans out of the reverse-KL automatically. `opd_forced_mask_max_legal`
+(default 1) widens the mask: a group is dropped when *every* student token in it had `<= N` legal
+tokens. Leave it at 1 (only truly-forced positions) unless you have reason to distrust the teacher's
+calibration on tightly-constrained spans — at a position with a few legal tokens the teacher's absolute
+logprob is deflated by mass it spends on grammar-illegal tokens, so raising `N` excludes that leakage at
+the cost of dropping the (partial) real signal there. Note this is a coarse guard, not a
+renormalization: the external echo-scorer never exposes the teacher's mass over the legal set, and the
+student/teacher tokenizers differ, so the teacher genuinely *cannot* be conditioned on the grammar. The
+real defense against teacher miscalibration remains vetting the teacher on your task before distilling.
 
 ---
 

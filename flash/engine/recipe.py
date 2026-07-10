@@ -79,6 +79,11 @@ class OPDConfig:
     # that pushes up log P(eos) at the position a rollout naturally terminated, restoring the stop
     # signal the alignment cannot express. 0 disables it; overridable via [train].opd_eos_loss_coef.
     eos_loss_coef: float = 0.5
+    # Under structured_outputs, drop reverse-KL alignment groups whose student tokens were each left
+    # with <= this many grammar-legal tokens (1 = only truly forced positions, the safe default). The
+    # unconstrained teacher scores such spans with mass on grammar-illegal tokens, so its signal there
+    # is leakage; raise this to exclude tightly-constrained spans. [train].opd_forced_mask_max_legal.
+    forced_mask_max_legal: int = 1
 
 
 @dataclass(frozen=True)

@@ -129,6 +129,9 @@ class TrainSpec:
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
     structured_outputs: str = ""
+    # OPD + structured_outputs only: drop reverse-KL groups whose student tokens each had <= this many
+    # grammar-legal tokens (recipe default 1 = only truly forced positions when None).
+    opd_forced_mask_max_legal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +219,7 @@ class JobSpec:
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
+                opd_forced_mask_max_legal=_opt_int(train.get("opd_forced_mask_max_legal")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

@@ -163,6 +163,11 @@ class OpdKnobs:
     # constrains every student rollout (parity with GRPO). Teacher echo-scoring needs no schema —
     # it scores the student's already-constrained tokens.
     structured_outputs: str = ""
+    # Forced-mask threshold: drop an alignment group from the reverse-KL when EVERY student token in
+    # it had <= this many grammar-legal tokens. 1 = only truly forced positions (default). Raising it
+    # also excludes tightly-constrained spans, where the unconstrained teacher's echo-score is
+    # dominated by mass on grammar-illegal tokens. [train] opd_forced_mask_max_legal.
+    forced_mask_max_legal: int = RECIPE.opd.forced_mask_max_legal
 
 
 def _resolve_opd_knobs() -> OpdKnobs:
@@ -214,6 +219,9 @@ def _resolve_opd_knobs() -> OpdKnobs:
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
         structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
+        # A group is masked only if ALL its student tokens are <= this legal-count; 1 = truly forced.
+        # min 1 (0/negative would never mask, since the sampled token is always legal). Schema clamps.
+        forced_mask_max_legal=max(1, int(opt("opd_forced_mask_max_legal", None) or d.forced_mask_max_legal)),
     )
 
 
@@ -553,9 +561,14 @@ def run_opd():
     )
     _so_spec = parse_structured_outputs(knobs.structured_outputs)
     if _so_spec:
+        _mask_note = (
+            f"; masking spans with <= {knobs.forced_mask_max_legal} legal tokens"
+            if knobs.forced_mask_max_legal > 1
+            else ""
+        )
         print(
             f"[opd] structured outputs: every student rollout constrained to "
-            f"{describe_structured_outputs(_so_spec)}"
+            f"{describe_structured_outputs(_so_spec)}{_mask_note}"
         )
     t_vllm_init = time.time()
     with liveness_heartbeat("opd_vllm_initializing"):
@@ -566,6 +579,7 @@ def run_opd():
             top_p=knobs.top_p,
             stop_sequences=tuple(str(s) for s in knobs.stop_sequences),
             structured_outputs=_so_spec,
+            forced_mask_max_legal=knobs.forced_mask_max_legal,
             lora_rank=lora_rank,
             seed=_w.SEED,
             **vllm_kwargs,
@@ -1410,9 +1424,10 @@ class _PreparedGkdGroups:
 
 def _drop_fully_forced_groups(groups, forced):
     """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
-    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
-    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
-    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op."""
+    (or, at a raised opd_forced_mask_max_legal, little) choice there, so the teacher's (unconstrained)
+    logprob over that span is spurious signal. Dropping the whole ``(student_idx, teacher_logsum)``
+    tuple keeps both sides of the reverse-KL balanced. ``forced`` is the per-token mask parallel to
+    the student tokens (== completion_ids), already thresholded by max_legal; empty -> no-op."""
     if not forced:
         return groups
     return [
