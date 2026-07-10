@@ -183,7 +183,7 @@ different value.
 A run is only evidence of improvement when **all** of these hold:
 
 - [ ] The run reached `done` (confirmed via `flash status <run-id>`), not merely submitted.
-- [ ] The SFT loss fell or the reward trend rose (GRPO `reward_mean`) — **beyond the noise band**, not within it.
+- [ ] The SFT loss fell or the reward trend rose (GRPO `reward`) — **beyond the noise band**, not within it.
 - [ ] You **probed the trained adapter on real inputs** (`flash deploy` + `flash chat`), including cases it should fail — not just the metrics.
 - [ ] The score is real behavior, not empty/truncated/templated outputs, skipped rows, leakage, a swallowed exception, or a format-only win.
 - [ ] If you track a clean success signal separately from the shaped reward (an explicit `RewardMetric`), *that* moved too.
@@ -206,7 +206,7 @@ spending another GPU run:
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
 | Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; set `thinking = true` only for supported models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
-| All-zero or flat GRPO reward | `reward_mean` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
+| All-zero or flat GRPO reward | `reward` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |
 | OPD makes the student worse, not better | The distilled adapter scores *below* its SFT/base start even though the per-token loss fell | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.2 teacher, so a teacher that is weak or wrong on *your* task transfers its mistakes. Vet it first: roll GLM-5.2 through your own environment on a held-out split and confirm it clearly beats your student before submitting. If it doesn't, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
 | Output is truncated | Correct-looking answers cut off mid-response or JSON is incomplete | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost. |
@@ -222,7 +222,7 @@ spending another GPU run:
 ## Judge the run, don't just finish it
 
 - **Judge the trend, not a single number.** The proof of training is the curve:
-  loss falling (SFT) or `reward_mean` rising over steps (GRPO). Record the base/early
+  loss falling (SFT) or `reward` rising over steps (GRPO). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
 - **Read the model's outputs, not just the metrics.** A rising reward can come from
   reward-hacking or a degenerate output the reward still credits — metrics alone never
@@ -253,7 +253,7 @@ can reach. Rewards are rubric / `score_response` functions in your `environment.
 
 ### Make it graded and dense — avoid the all-zero cold start
 
-If `reward_mean` is flat at ~0.000, every rollout in the group scored the same, the
+If `reward` is flat at ~0.000, every rollout in the group scored the same, the
 advantage is zero, and the policy gets **no gradient**. That is a reward-design bug,
 not a model to keep training. Reshape the reward to credit **ordered partial
 progress** so even an untrained base model earns a small nonzero score and better
@@ -356,7 +356,7 @@ Pick SFT when you already have good answers and want the model to imitate them.
   the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
   adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank`. Set
   `lora_rank` EQUAL to the SFT run's rank and within the serving cap (some serving models
-  allow rank 64, larger serving paths can cap at 32). Flash preflights both before the run:
+  allow rank 128, larger serving paths cap at 64). Flash preflights both before the run:
   it rejects an adapter over the cap, and rejects a `lora_rank` that disagrees with the
   continued adapter — because the trainer ignores `lora_rank` for a warm-start but the
   cost/GPU-allocation/GRPO-sleep sizing all read it, so a mismatch mis-quotes and mis-sizes
@@ -385,7 +385,7 @@ optimizer-step counts are derived from those epochs.
 
 Pick distillation when a much stronger **teacher** model can grade your student's work
 token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.2 by default,
-or another via `[train] teacher_model`) scores each of *its own* completions, and a dense per-token
+or another via `[train] teacher_model`) scores each of the *student's* completions, and a dense per-token
 loss teaches the student to match the teacher — far more sample-efficient than reward-based RL and
 with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA served exactly like SFT.
 
@@ -409,7 +409,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
   at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
-- **The student (Qwen / MiniCPM / Kimi) and the teacher have different tokenizers.** Flash
+- **The student (Qwen / MiniCPM) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
