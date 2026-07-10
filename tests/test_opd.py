@@ -43,6 +43,58 @@ def _skip(**k):
     return SampleResult()
 
 
+def test_drop_fully_forced_groups_removes_all_forced_spans():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    groups = [([0], -1.0), ([1, 2], -2.0), ([3], -3.0)]
+    # Student tokens 0 and 3 were grammar-forced; the [1, 2] group has a free token so it survives.
+    assert _drop_fully_forced_groups(groups, (True, False, False, True)) == [([1, 2], -2.0)]
+
+
+def test_drop_fully_forced_groups_is_a_noop_without_a_mask():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    groups = [([0], -1.0), ([1], -2.0)]
+    assert _drop_fully_forced_groups(groups, ()) == groups
+
+
+def test_drop_fully_forced_groups_keeps_a_partially_forced_span():
+    from flash.engine.worker.opd import _drop_fully_forced_groups
+
+    # Token 0 forced, token 1 free -> the group still carries real signal, so it is kept.
+    assert _drop_fully_forced_groups([([0, 1], -1.0)], (True, False)) == [([0, 1], -1.0)]
+
+
+def test_masking_then_prepare_normalizes_over_surviving_tokens_only():
+    """After forced-group masking, the prepared loss inputs contain ONLY surviving-group tokens, so
+    the downstream per-token mean normalizes over the kept (content) tokens -- dropping a fully-forced
+    span re-normalizes the reverse-KL rather than leaving a shrunken sum over the original count."""
+    from flash.engine.worker.opd import _drop_fully_forced_groups, _prepare_gkd_groups
+
+    groups = [([0], -1.0), ([1, 2], -2.0), ([3], -3.0)]  # student tokens 0 and 3 fully-forced
+    kept = _drop_fully_forced_groups(groups, (True, False, False, True))
+    prepared = _prepare_gkd_groups(kept)
+    # Tokens 0 and 3 are gone from BOTH the numerator and the mean's denominator (token_indices).
+    assert prepared.token_indices == (1, 2)
+    assert prepared.group_lengths == (2,)
+    assert prepared.teacher_logsums == (-2.0,)
+
+
+def test_masked_loss_equals_loss_without_the_forced_groups():
+    """End-to-end normalization: the masked reverse-KL equals the loss computed as if the forced
+    groups never existed -- the per-token mean re-normalizes over survivors, it is neither diluted by
+    nor retains the dropped forced positions."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import _drop_fully_forced_groups, _gkd_loss_from_logps
+
+    sp = torch.tensor([-0.5, -1.0, -1.5, -2.0], requires_grad=True)
+    with_forced = [([0], -1.0), ([1, 2], -2.0), ([3], -3.0)]  # tokens 0 and 3 grammar-forced
+    kept = _drop_fully_forced_groups(with_forced, (True, False, False, True))
+    loss_masked = _gkd_loss_from_logps(sp, kept, kl_coef=0.25)
+    loss_reference = _gkd_loss_from_logps(sp, [([1, 2], -2.0)], kl_coef=0.25)
+    assert torch.allclose(loss_masked, loss_reference)
+
+
 def _install_student_loader_fakes(monkeypatch, *, causal_raises=False, vl_raises=False):
     """Install tiny peft/transformers fakes for _student_model loader-selection tests."""
     calls = []
