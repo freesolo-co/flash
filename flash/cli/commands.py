@@ -519,8 +519,8 @@ def cmd_env_setup(args) -> int:
             "epochs = 1\n"
             "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
-            '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) | qwen-3.7-max |\n'
-            "#                             # minimax-m3 | deepseek-v4-pro | kimi-k2.6 (key stays managed)\n"
+            '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) | minimax-m3 |\n'
+            "#                             # deepseek-v4-pro | kimi-k2.6 (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )

@@ -399,7 +399,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   lets you pick the teacher that best fits your task without changing anything else.
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
   the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default), `qwen-3.7-max`, `minimax-m3`, `deepseek-v4-pro`, `kimi-k2.6`. Every option is
+  `glm-5.2` (default), `minimax-m3`, `deepseek-v4-pro`, `kimi-k2.6`. Every option is
   a Fireworks-hosted model reached with the platform's own key, so there is nothing to export or
   declare — an opd run submits like any other, and a `FIREWORKS_API_KEY` in your shell is ignored.
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
@@ -434,8 +434,8 @@ epochs = 1
 max_examples = 2
 lora_rank = 32
 # teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
-#                                                       # glm-5.2 (default) | qwen-3.7-max | minimax-m3
-#                                                       # | deepseek-v4-pro | kimi-k2.6 (key stays managed)
+#                                                       # glm-5.2 (default) | minimax-m3 | deepseek-v4-pro
+#                                                       # | kimi-k2.6 (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 # opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
 #                                                       # student runs past the length cap without

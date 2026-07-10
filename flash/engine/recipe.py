@@ -54,19 +54,12 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
         usd_per_1m=(1.40, 4.40),
         notes="Default teacher: strong general reasoning + very long context; the verified echo-scoring baseline.",
     ),
-    "qwen-3.7-max": TeacherModel(
-        alias="qwen-3.7-max",
-        model_id="accounts/fireworks/models/qwen3p7-max",
-        display_name="Qwen 3.7 Max",
-        usd_per_1m=(2.00, 8.00),
-        notes="Alibaba flagship; very strong on structured/agentic tasks. Higher price tier.",
-    ),
     "minimax-m3": TeacherModel(
         alias="minimax-m3",
         model_id="accounts/fireworks/models/minimax-m3",
         display_name="MiniMax M3",
-        usd_per_1m=(0.60, 2.40),
-        notes="Long-context MoE; economical input pricing.",
+        usd_per_1m=(0.30, 1.20),
+        notes="428B/23B-active multimodal MoE, 512K ctx; serverless, economical input pricing.",
     ),
     "deepseek-v4-pro": TeacherModel(
         alias="deepseek-v4-pro",

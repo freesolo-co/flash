@@ -82,7 +82,7 @@ def test_opd_epochs_derive_steps_from_max_examples():
 
 def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     """runconfig_from_spec resolves [train].teacher_model to the Fireworks model id so the estimate
-    prices the CHOSEN teacher; a pricier teacher raises teacher_api_usd vs the default GLM 5.2, and
+    prices the CHOSEN teacher; a cheaper teacher lowers teacher_api_usd vs the default GLM 5.2, and
     sft/grpo carry no teacher."""
     from flash.cost.analytical import estimate_cost
 
@@ -98,13 +98,13 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     # Omitted teacher_model -> default GLM 5.2 provider id.
     assert _runconfig_from_spec(_opd()).teacher_model == "accounts/fireworks/models/glm-5p2"
     # A selected alias resolves to its Fireworks model id.
-    qwen_cfg = _runconfig_from_spec(_opd("qwen-3.7-max"))
-    assert qwen_cfg.teacher_model == "accounts/fireworks/models/qwen3p7-max"
+    minimax_cfg = _runconfig_from_spec(_opd("minimax-m3"))
+    assert minimax_cfg.teacher_model == "accounts/fireworks/models/minimax-m3"
 
-    # qwen-3.7-max input price ($2.00/M) > glm-5.2 ($1.40/M), so its teacher-API estimate is larger.
+    # minimax-m3 input price ($0.30/M) < glm-5.2 ($1.40/M), so its teacher-API estimate is smaller.
     default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
-    qwen_teacher_usd = estimate_cost(qwen_cfg).teacher_api_usd
-    assert qwen_teacher_usd > default_teacher_usd > 0
+    minimax_teacher_usd = estimate_cost(minimax_cfg).teacher_api_usd
+    assert 0 < minimax_teacher_usd < default_teacher_usd
 
     # sft/grpo carry no teacher.
     assert _runconfig_from_spec(_spec()).teacher_model == ""
