@@ -115,6 +115,16 @@ def test_create_run_sends_runtime_secrets_outside_spec(stub):
     }
 
 
+def test_create_run_dry_run_flag_travels_in_body(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.create_run({"model": "m"}, dry_run=True)
+    assert seen["body"] == {"spec": {"model": "m"}, "dry_run": True}
+    # Default omits it, so existing (non-dry-run) callers send an unchanged body.
+    client.create_run({"model": "m"})
+    assert seen["body"] == {"spec": {"model": "m"}}
+
+
 def test_api_error_carries_server_detail(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test")
