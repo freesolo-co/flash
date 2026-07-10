@@ -11,8 +11,6 @@ from flash.catalog import serving_lora_rank_cap
 if TYPE_CHECKING:
     from flash.spec import JobSpec
 
-_VL_WARMSTART_RECOMBINE_PREFIXES = ("Qwen/Qwen3.5-", "Qwen/Qwen3.6-")
-
 AdapterConfigLoader = Callable[[str, str | None], Mapping[str, Any]]
 
 
@@ -70,30 +68,6 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
     return max(ranks)
 
 
-def uniform_rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
-    """Return a uniform adapter rank for the VL SFT+GRPO recombine path."""
-    if not isinstance(config, Mapping):
-        raise ValueError(f"adapter rank preflight: {source} is not a JSON object")
-    if config.get("r") is None:
-        raise ValueError(f"adapter rank preflight: {source} must contain a positive integer `r`")
-    rank = _positive_int(config["r"], source=source, field="r")
-    for key in ("rank_pattern", "alpha_pattern"):
-        pattern = config.get(key)
-        if pattern is None:
-            continue
-        if not isinstance(pattern, Mapping):
-            raise ValueError(
-                f"adapter rank preflight: {source} has invalid {key}={pattern!r}; "
-                "VL warm-start recombine requires a uniform LoRA rank/alpha"
-            )
-        if pattern:
-            raise ValueError(
-                f"adapter rank preflight: {source} has non-empty {key}={pattern!r}; "
-                "VL warm-start recombine requires a uniform LoRA rank/alpha"
-            )
-    return rank
-
-
 def load_hf_adapter_config(adapter_ref: str, token: str | None = None) -> Mapping[str, Any]:
     """Read ``adapter_config.json`` for a Flash adapter ref from Hugging Face datasets."""
     repo, filename = adapter_config_path_from_ref(adapter_ref)
@@ -128,53 +102,19 @@ def load_hf_adapter_config(adapter_ref: str, token: str | None = None) -> Mappin
     return config
 
 
-def _uses_vl_warmstart_recombine(model: str) -> bool:
-    return model.startswith(_VL_WARMSTART_RECOMBINE_PREFIXES)
-
-
-def check_recombined_lora_rank(
-    old_rank: int, new_rank: int, max_lora_rank: int | None, *, algo: str
-) -> int:
-    """Validate a VL warm-start recombine against the serving LoRA rank cap.
-
-    VL warm-start rank-stacks the PRIOR adapter (``init_from_adapter`` — produced by ANY algorithm:
-    SFT, GRPO or OPD) with the freshly-trained ``algo`` LoRA into a rank-``(old+new)`` deploy adapter
-    that must fit the serving cap. Returns the recombined rank; raises ``ValueError`` with actionable
-    guidance when it exceeds ``max_lora_rank`` (``None`` = uncapped, always allowed).
-
-    Single source of truth for the recombine arithmetic + guidance ladder, shared by the
-    control-plane preflight (:func:`preflight_init_adapter_lora_rank`) and the worker init guard
-    (``flash.engine.worker.lora.validate_recombined_lora_rank``) so both stay identical for every
-    warm-start pairing.
-    """
-    recombined_rank = old_rank + new_rank
-    if max_lora_rank is None or recombined_rank <= max_lora_rank:
-        return recombined_rank
-    allowed_new_rank = max_lora_rank - old_rank
-    if allowed_new_rank >= 1:
-        guidance = f"set {algo} train.lora_rank <= {allowed_new_rank}"
-    elif (allowed_old_rank := max_lora_rank - new_rank) >= 1:
-        guidance = f"retrain the warm-start adapter at rank <= {allowed_old_rank}"
-    else:
-        guidance = f"lower both the warm-start and {algo} ranks so their sum is <= {max_lora_rank}"
-    raise ValueError(
-        f"recombined deploy adapter would be rank {recombined_rank} "
-        f"(warm-start adapter rank {old_rank} + {algo} rank {new_rank}), exceeding the serving "
-        f"LoRA rank cap {max_lora_rank}; {guidance}"
-    )
-
-
 def preflight_init_adapter_lora_rank(
     spec: JobSpec,
     *,
     token: str | None = None,
     config_loader: AdapterConfigLoader | None = None,
 ) -> None:
-    """Reject warm-start adapters that cannot fit the model's serving LoRA rank cap.
+    """Reject a warm-start adapter that cannot fit the model's serving LoRA rank cap.
 
-    The control plane calls this before creating/submitting a run. It intentionally uses only
-    ``adapter_config.json`` so the preflight stays CPU-only and catches undeployable adapters before
-    any training GPU is allocated.
+    Warm-start CONTINUES the prior adapter in place (SFT→GRPO/OPD keep the one LoRA, rank unchanged),
+    so the deployed adapter's rank is exactly the prior adapter's rank — it just has to fit the
+    serving cap. The control plane calls this before creating/submitting a run; it intentionally uses
+    only ``adapter_config.json`` so the preflight stays CPU-only and catches an undeployable adapter
+    before any training GPU is allocated.
     """
     adapter_storage_ref = (spec.train.init_from_adapter or "").strip()
     if not adapter_storage_ref:
@@ -195,22 +135,6 @@ def preflight_init_adapter_lora_rank(
             f"{spec.model}'s serving max_lora_rank={max_lora_rank}; use a lower-rank adapter "
             "or raise the serving cap after real-GPU validation"
         )
-
-    # VL warm-start merges the prior adapter (init_from_adapter — from ANY algorithm) into the base,
-    # trains a fresh LoRA, then rank-stacks the two into a rank-(old+new) deploy adapter
-    # (recombined_warmstart_adapter_dir) that must fit the serving cap. This is a property of the
-    # model's warm-start path, NOT the training algorithm (SFT⊕OPD, GRPO⊕SFT, … all recombine), so
-    # gate purely on the model and preflight the recombined rank before a GPU is allocated.
-    if not _uses_vl_warmstart_recombine(spec.model):
-        return
-
-    old_rank = uniform_rank_from_adapter_config(config, source=source)
-    try:
-        check_recombined_lora_rank(
-            old_rank, int(spec.train.lora_rank), max_lora_rank, algo=spec.algorithm.upper()
-        )
-    except ValueError as exc:
-        raise ValueError(f"train.init_from_adapter rank preflight failed: {exc}") from exc
 
 
 def preflight_train_context_within_serving(spec: JobSpec) -> None:

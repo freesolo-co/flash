@@ -704,14 +704,14 @@ def cost_panel(est) -> str:
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
     ]
-    # opd teacher spend is itemized but NOT part of total_usd (billed by Fireworks on the user's key).
+    # opd teacher spend is itemized but NOT part of total_usd (billed by Fireworks on the managed key).
     # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).
     if getattr(est, "teacher_api_usd", 0) > 0:
         pairs.append(
             (
                 "teacher api",
                 f"{money(est.teacher_api_usd, 2)}  "
-                f"{_dim('(Fireworks GLM token spend on your key — billed by Fireworks, NOT in TOTAL)')}",
+                f"{_dim('(Fireworks teacher token spend on the managed key — billed by Fireworks, NOT in TOTAL)')}",
             )
         )
     panel = _kv(pairs)
@@ -730,6 +730,7 @@ def env_setup(paths: list[str]) -> str:
         "dataset/train.jsonl": "starter training rows",
         "configs/sft.toml": "SFT run config",
         "configs/rl.toml": "GRPO run config",
+        "configs/opd.toml": "OPD (distillation) run config",
         "TRAINING.md": "how to train well — read this first",
     }
     keyw = max(len(p) for p in paths)

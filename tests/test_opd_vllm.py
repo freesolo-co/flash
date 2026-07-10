@@ -515,3 +515,249 @@ def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
         "cudagraph_mode": "FULL_DECODE_ONLY",
     }
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+
+
+def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
+    """Minimal fake vllm (LLM + SamplingParams + lora + sampling_params) for engine tests."""
+
+    class _SamplingParams:
+        last_kwargs: ClassVar[dict] = {}
+
+        def __init__(self, **kwargs):
+            _SamplingParams.last_kwargs = dict(kwargs)
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_name = lora_name
+            self.lora_int_id = lora_int_id
+            self.lora_path = lora_path
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            comp = SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+            return [SimpleNamespace(outputs=[comp]) for _ in prompts]
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = _FakeLLM
+    vllm.SamplingParams = _SamplingParams
+    lora_pkg = types.ModuleType("vllm.lora")
+    req_mod = types.ModuleType("vllm.lora.request")
+    req_mod.LoRARequest = _LoRARequest
+    sp_mod = types.ModuleType("vllm.sampling_params")
+    if with_structured_outputs:
+        sp_mod.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
+    return _SamplingParams, _StructuredOutputsParams
+
+
+def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_path):
+    """[train] structured_outputs must constrain every OPD student rollout: the parsed spec is
+    rebuilt into a StructuredOutputsParams and handed to SamplingParams alongside the stop knobs."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    _SamplingParams, _SOParams = _install_fake_vllm(monkeypatch)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    spec = {"json": {"type": "object"}, "disable_any_whitespace": True}
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        stop_sequences=("</answer>",),
+        structured_outputs=spec,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    engine.generate([[1, 2]], max_tokens=5)
+
+    so = _SamplingParams.last_kwargs["structured_outputs"]
+    assert isinstance(so, _SOParams)
+    assert so.kwargs == spec
+    assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]  # coexists with the stop knobs
+
+
+def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_path):
+    """A configured constraint the sampler can't apply must FAIL the run — the include_stop retry
+    must not swallow it and train on unconstrained text the reward believes is schema-bound."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    _SamplingParams, _ = _install_fake_vllm(monkeypatch)
+
+    def _reject_structured(self, **kwargs):
+        _SamplingParams.last_kwargs = dict(kwargs)
+        if "structured_outputs" in kwargs:
+            raise TypeError("unexpected keyword argument 'structured_outputs'")
+
+    monkeypatch.setattr(_SamplingParams, "__init__", _reject_structured)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        stop_sequences=("</answer>",),
+        structured_outputs={"json_object": True},
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    with pytest.raises(TypeError, match="structured_outputs"):
+        engine.generate([[1, 2]], max_tokens=5)
+
+
+def _lp(value):
+    """A stand-in for vLLM's Logprob (only its .logprob float matters here)."""
+    return SimpleNamespace(logprob=value)
+
+
+def test_forced_from_logprobs_counts_finite_entries_not_dict_length():
+    """The critical case: vLLM's top-k dict is fixed-size, so a forced position is a length-2 dict
+    with one finite logprob and one -inf pad. Detection must count finite entries, not dict length."""
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    neg_inf = float("-inf")
+    lps = [
+        {1: _lp(0.0)},  # backend filtered the -inf -> single entry, forced
+        {2: _lp(0.0), 7: _lp(neg_inf)},  # top-2 padded with -inf -> still one legal token, forced
+        {3: _lp(-0.2), 8: _lp(-2.0)},  # two genuinely-legal tokens -> free
+    ]
+    assert _forced_from_logprobs(lps, 3) == (True, True, False)
+
+
+def test_forced_from_logprobs_none_is_empty_short_masks_visible_prefix():
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    assert _forced_from_logprobs(None, 3) == ()  # unconstrained: no logprobs -> no mask
+    # Fewer logprob rows than tokens (anomaly): mask the visible prefix, leave the tail unmasked
+    # rather than abandoning the whole sample's mask.
+    assert _forced_from_logprobs([{1: _lp(0.0)}], 3) == (True, False, False)
+
+
+def test_forced_from_logprobs_empty_row_is_free_not_forced():
+    """A logprob row with zero finite entries (empty dict, or every slot -inf) is a wiring anomaly,
+    not a one-legal-token position -- it must read as FREE, else a genuine free choice's teacher
+    signal is silently dropped from the loss."""
+    from flash.engine.worker.opd_vllm import _forced_from_logprobs
+
+    neg_inf = float("-inf")
+    # row 0: empty -> 0 finite -> free; row 1: one finite -> forced; row 2: all -inf -> free.
+    lps = [{}, {5: _lp(0.0)}, {6: _lp(neg_inf), 7: _lp(neg_inf)}]
+    assert _forced_from_logprobs(lps, 3) == (False, True, False)
+
+
+def test_opd_vllm_constrained_generate_uses_fresh_params_per_request(monkeypatch, tmp_path):
+    """vLLM stamps per-request backend state onto a StructuredOutputsParams, so a constrained OPD
+    batch must hand llm.generate a FRESH SamplingParams per prompt (each with its own
+    StructuredOutputsParams), not one shared instance reused across the whole batch."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    seen = {}
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _SamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+
+    class _LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_int_id = lora_int_id
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
+
+        def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            seen["sampling_params"] = sampling_params
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = _FakeLLM
+    vllm.SamplingParams = _SamplingParams
+    lora_pkg = types.ModuleType("vllm.lora")
+    req_mod = types.ModuleType("vllm.lora.request")
+    req_mod.LoRARequest = _LoRARequest
+    sp_mod = types.ModuleType("vllm.sampling_params")
+    sp_mod.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.lora", lora_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        structured_outputs={"json_object": True},
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    out = engine.generate([[1, 2], [3, 4], [5, 6]], max_tokens=5)
+
+    sp = seen["sampling_params"]
+    # one fresh SamplingParams per prompt (a list), NOT a single shared instance...
+    assert isinstance(sp, list)
+    assert len(sp) == 3
+    # ...each carrying its own distinct StructuredOutputsParams so vLLM can stamp per-request state.
+    embedded = [p.kwargs["structured_outputs"] for p in sp]
+    assert all(isinstance(e, _StructuredOutputsParams) for e in embedded)
+    assert len({id(e) for e in embedded}) == 3
+    assert len(out) == 3
+
+
+def test_normalize_output_marks_grammar_forced_positions():
+    """_normalize_output surfaces the per-token ``forced`` mask so the OPD loss can drop spans the
+    student had no choice over. Positions 0 and 2 are grammar-forced (one finite logprob, the top-2
+    slot padded with -inf); position 1 had two legal tokens."""
+    from flash.engine.worker.opd_vllm import _normalize_output
+
+    neg_inf = float("-inf")
+    comp = SimpleNamespace(
+        token_ids=[3, 4, 5],
+        text="ok",
+        finish_reason="stop",
+        stop_reason=None,
+        logprobs=[{3: _lp(0.0), 99: _lp(neg_inf)}, {4: _lp(-0.3), 9: _lp(-1.4)}, {5: _lp(0.0), 88: _lp(neg_inf)}],
+    )
+    out = _normalize_output(SimpleNamespace(outputs=[comp]))
+    assert out.forced == (True, False, True)
+
+
+def test_normalize_output_without_logprobs_has_no_forced_mask():
+    """Unconstrained rollouts request no logprobs; ``forced`` stays empty (a no-op mask downstream)."""
+    from flash.engine.worker.opd_vllm import _normalize_output
+
+    comp = SimpleNamespace(token_ids=[3, 4], text="ok", finish_reason="stop", stop_reason=None)
+    out = _normalize_output(SimpleNamespace(outputs=[comp]))
+    assert out.forced == ()
