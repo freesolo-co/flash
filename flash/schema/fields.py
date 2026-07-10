@@ -64,6 +64,34 @@ def _train_str(train_raw: dict, key: str) -> str:
     return v.strip()
 
 
+def _train_teacher(train_raw: dict) -> str:
+    """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
+
+    Missing/None/blank -> "" (the worker then uses the default GLM 5.2 teacher). A supported value is
+    resolved to its canonical Fireworks model id and stored, so a spaced ("GLM 5.2") or alias form is
+    canonicalized once here and every downstream layer reads one representation; an unsupported teacher
+    is rejected at PARSE time (before a paid GPU is provisioned), listing the allowed aliases."""
+    v = train_raw.get("teacher_model")
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise ConfigError("train.teacher_model must be a string")
+    if not v.strip():
+        return ""
+    # Imported lazily: recipe is dependency-free, but keep fields.py's import graph minimal.
+    from flash.engine.recipe import resolve_teacher
+
+    # resolve_teacher owns the allow-list + its enumeration; reuse its message so the choices are
+    # listed in exactly one place (recipe.py).
+    try:
+        return resolve_teacher(v).model_id
+    except ValueError as exc:
+        raise ConfigError(
+            f"train.{exc}. The teacher is a managed Fireworks model — "
+            f"bring-your-own teachers are not supported."
+        ) from None
+
+
 def _train_stops(train_raw: dict) -> tuple[str, ...]:
     """Validate stop_sequences -> ConfigError. A string is ONE stop (never char-split);
     a list must hold strings; empties are dropped; anything else is rejected."""
