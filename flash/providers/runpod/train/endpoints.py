@@ -595,7 +595,6 @@ def get_train_endpoint(
     spec=None,
 ):
     """Build (and cache) the live Flash endpoint handler for a GPU class."""
-    os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
     from flash.providers.runpod.auth import ensure_auth

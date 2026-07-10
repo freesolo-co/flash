@@ -348,11 +348,9 @@ def run_sft():
             print(
                 "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
             )
-    _sft_examples_per_block = 1.0
     if cfg_kwargs.get("packing"):
         _bfd_ids = [r["input_ids"] for r in _pretok]
         _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
-        _sft_examples_per_block = _bfd_ex
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, per_device_bs * _bfd_ex))
         )
@@ -393,7 +391,6 @@ def run_sft():
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
-        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
@@ -426,7 +423,6 @@ def run_sft():
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
         # cu_seqlens spans one block -> per-device=1; re-derive grad_accum to keep effective batch in examples.
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
-        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = 1
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _ex_per_block))
@@ -454,10 +450,10 @@ def run_sft():
         )
     # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
     # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
-    mik = {"dtype": "bfloat16", "device_map": None}
+    model_init_kwargs = {"dtype": "bfloat16", "device_map": None}
     if _attn:
-        mik["attn_implementation"] = _attn
-    cfg_kwargs["model_init_kwargs"] = mik
+        model_init_kwargs["attn_implementation"] = _attn
+    cfg_kwargs["model_init_kwargs"] = model_init_kwargs
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
@@ -526,7 +522,7 @@ def run_sft():
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
         sft_model = _w.prepare_fresh_lora_base(
-            model_id, model_id, mik, phase="sft"
+            model_id, model_id, model_init_kwargs, phase="sft"
         )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None

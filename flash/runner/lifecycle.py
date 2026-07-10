@@ -242,9 +242,9 @@ def _submit_seed_supervised(
 
                     _prov = last_handle["provider"]
                     get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
-                    _iid = last_handle.get("instance_id")
+                    instance_id = last_handle.get("instance_id")
                     print(
-                        f"retry {attempt}: terminated {_prov} instance {_iid} (escaping sick host)",
+                        f"retry {attempt}: terminated {_prov} instance {instance_id} (escaping sick host)",
                         file=log,
                         flush=True,
                     )
@@ -260,9 +260,9 @@ def _submit_seed_supervised(
             if teardown_confirmed:
                 remote_cleared = True
                 try:
-                    st = get_status(spec.run_id)
-                    if st.state not in TERMINAL_STATES and st.remote is not None:
-                        _update(spec.run_id, st.state, remote=None)
+                    status = get_status(spec.run_id)
+                    if status.state not in TERMINAL_STATES and status.remote is not None:
+                        _update(spec.run_id, status.state, remote=None)
                 except FileNotFoundError:
                     pass
                 except Exception:

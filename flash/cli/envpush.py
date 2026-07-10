@@ -256,9 +256,6 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
-_TAR_EXCLUDE_DIRS = _ENV_PUSH_IGNORED_NAMES
-
-
 def _tar_b64(directory: Path) -> str:
     """Pack a directory into a base64 tarball, excluding caches and metadata directories."""
     import base64
@@ -270,7 +267,7 @@ def _tar_b64(directory: Path) -> str:
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for root, dirs, files in os.walk(directory):
             root_path = Path(root)
-            dirs[:] = sorted(d for d in dirs if d not in _TAR_EXCLUDE_DIRS)
+            dirs[:] = sorted(d for d in dirs if d not in _ENV_PUSH_IGNORED_NAMES)
             for name in dirs:
                 child = root_path / name
                 tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
@@ -383,8 +380,6 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | No
 
 
 def cmd_env_push(args) -> int:
-    import tempfile
-
     env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
     if not env_name:
         return _err("env name required: pass `--name <name>`")

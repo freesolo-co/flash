@@ -281,8 +281,8 @@ def select(title: str, options: list[tuple[str, str, str]], default: int = 0) ->
     an empty answer (enter). Reads via ``input()`` so it is easy to drive in tests; the caller
     decides *when* to prompt (interactive stdin), so this always prompts when called. On EOF the
     default is returned so a closed stdin never hangs the scaffold."""
-    q = _paint(_glyph("?", "?"), _ACCENT, "1")
-    print(f"{q} {_bold(_safe(title))}")
+    prompt_mark = _paint(_glyph("?", "?"), _ACCENT, "1")
+    print(f"{prompt_mark} {_bold(_safe(title))}")
     for i, (_value, label, hint) in enumerate(options):
         num = _paint(f"{i + 1})", _ACCENT2)
         lab = _bold(label) if i == default else label
@@ -473,17 +473,17 @@ def runs_table(runs: list[dict]) -> str:
 def deployments_table(rows: list[dict]) -> str:
     body = []
     for r in rows:
-        d = r.get("deployment") or {}
-        state = str(d.get("state") or "?")
+        dep = r.get("deployment") or {}
+        state = str(dep.get("state") or "?")
         color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
-        detail = str(d.get("error") or d.get("detail") or "")
+        detail = str(dep.get("error") or dep.get("detail") or "")
         if len(detail) > 64:
             detail = detail[:61] + "..."
         body.append(
             [
                 (r["run_id"], _ACCENT2),
                 (state, color),
-                (d.get("endpoint_name", ""), _GREEN),
+                (dep.get("endpoint_name", ""), _GREEN),
                 (detail, _GRAY),
             ]
         )
@@ -738,8 +738,8 @@ def env_setup(paths: list[str]) -> str:
         f"  {_paint(p.ljust(keyw), _ACCENT2)}  {_dim(labels.get(p, ''))}" for p in paths
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
-    nxt = arrow("publish it: flash env push --name my-env .")
-    return _safe(f"{head}\n{tree}\n\n{nxt}")
+    next_step = arrow("publish it: flash env push --name my-env .")
+    return _safe(f"{head}\n{tree}\n\n{next_step}")
 
 
 def env_list(local: list[str]) -> str:
