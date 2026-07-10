@@ -125,6 +125,10 @@ class TrainSpec:
     # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
     # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
     opd_eos_loss_coef: float | None = None
+    # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
+    # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
+    # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
+    teacher_model: str = ""
     stop_sequences: tuple[str, ...] = ()
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
@@ -214,6 +218,7 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
+                teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
             ),
