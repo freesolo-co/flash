@@ -414,12 +414,21 @@ class OpdVllmRolloutEngine:
             raise RuntimeError("opd vLLM rollout used before sync_from_model()")
         limit = max(1, int(self.rollout_batch_size or len(prompt_ids_batch)))
         out: list[OpdVllmOutput] = []
-        sampling_params = self._sampling_params(max_tokens)
         for start in range(0, len(prompt_ids_batch), limit):
             prompts = [
                 {"prompt_token_ids": [int(t) for t in ids]}
                 for ids in prompt_ids_batch[start : start + limit]
             ]
+            # vLLM's structured-output processor stamps per-request backend state onto the
+            # StructuredOutputsParams instance, so a single shared constrained params corrupts
+            # every sequence after the first (same reason multiturn_rollout builds one per
+            # request). Hand vLLM a fresh params per prompt when constrained; unconstrained runs
+            # have no per-request state and share one cheaply.
+            sampling_params = (
+                [self._sampling_params(max_tokens) for _ in prompts]
+                if self._StructuredOutputsParams is not None
+                else self._sampling_params(max_tokens)
+            )
             outputs = self.llm.generate(
                 prompts,
                 sampling_params=sampling_params,
@@ -447,9 +456,11 @@ def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
     backend sets every other logit to -inf, so the single legal token gets logprob 0.0. With
     ``logprobs>=2`` requested, vLLM's top-k is ``torch.topk``-based and returns a FIXED-size dict,
     padding the surplus slot(s) with -inf entries -- so dict *length* does not distinguish forced
-    from free. Counting the finite (non -inf) logprobs does: one finite entry == forced. Returns ()
-    when logprobs are unavailable (unconstrained rollouts request none) -> the OPD loss runs
-    unmasked, exactly as before.
+    from free. Counting the finite (non -inf) logprobs does: exactly one finite entry == forced.
+    A row with ZERO finite entries (an empty/all -inf row -- a wiring anomaly, never a real forced
+    position, whose chosen token always carries a finite logprob) is treated as free, so a genuine
+    free choice is never silently dropped from the loss. Returns () when logprobs are unavailable
+    (unconstrained rollouts request none) -> the OPD loss runs unmasked, exactly as before.
     """
     if lps is None:
         return ()
@@ -467,7 +478,10 @@ def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
             for lp in lps[i].values()
             if (val := getattr(lp, "logprob", lp)) is not None and val > float("-inf")
         )
-        forced.append(legal <= 1)
+        # Exactly one finite entry == grammar-forced. Zero finite entries is a wiring anomaly
+        # (empty/all -inf row), NOT proof of forcing, so treat it as free -- otherwise a genuine
+        # free choice gets silently dropped from the loss (parity with the missing-row branch).
+        forced.append(legal == 1)
     return tuple(forced)
 
 
