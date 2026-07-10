@@ -242,6 +242,9 @@ class OpdVllmRolloutEngine:
     stop_sequences: tuple[str, ...] = ()
     # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
     structured_outputs: dict[str, Any] | None = None
+    # vLLM EngineArgs.reasoning_parser (e.g. "deepseek_r1") when thinking + a constraint are both on:
+    # defers the guided grammar until </think> so the student reasons freely first. None = off.
+    reasoning_parser: str | None = None
     lora_rank: int = 32
     gpu_memory_utilization: float = 0.10
     kv_cache_dtype: str | None = None
@@ -285,6 +288,11 @@ class OpdVllmRolloutEngine:
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
         }
+        if self.reasoning_parser:
+            # Gate the structured-outputs grammar on </think>: with a constraint AND thinking on, vLLM
+            # otherwise binds the schema from token 0 and forbids the <think> reasoning phase. Only set
+            # alongside a constraint (the caller's reasoning_parser_for guarantees this).
+            kwargs["reasoning_parser"] = self.reasoning_parser
         if self.kv_cache_dtype:
             kwargs["kv_cache_dtype"] = self.kv_cache_dtype
         if self.max_num_seqs:

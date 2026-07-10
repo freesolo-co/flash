@@ -116,6 +116,7 @@ def patch_trl_colocate_llm_kwargs(
     enforce_eager: bool | None = None,
     attention_backend: str | None = None,
     mm_encoder_attn_backend: str | None = None,
+    reasoning_parser: str | None = None,
 ) -> bool:
     """Inject vLLM ``LLM(...)`` kwargs into TRL's colocated rollout engine that can't be expressed via
     ``GRPOConfig`` or the (pinned) vLLM env registry — must run BEFORE ``GRPOTrainer.__init__`` builds
@@ -149,6 +150,11 @@ def patch_trl_colocate_llm_kwargs(
       multimodal model (Qwen3.6-35B-A3B is VL) off vLLM's CUTE flash-attn path — see
       ``force_vit_sdpa_on_blackwell``. Maps to ``MultiModalConfig.mm_encoder_attn_backend``, which
       ``get_vit_attn_backend`` honors unconditionally.
+    * ``reasoning_parser="deepseek_r1"``: gate the ``[train] structured_outputs`` grammar on the
+      ``</think>`` boundary so a thinking-mode rollout reasons freely before its answer is constrained
+      (``EngineArgs.reasoning_parser`` -> vLLM's V1 structured-output manager defers the bitmask until
+      reasoning ends). Only meaningful alongside a structured-outputs constraint under ``thinking``;
+      TRL/``GRPOConfig`` exposes no field for it, so it must ride this ``LLM(...)`` override.
 
     Repeated calls COMPOSE: run_rl injects the attention backend, the KV/prefill knobs, and eager mode
     at three SEPARATE points, so each call merges its kwargs into one accumulated module-level override
@@ -166,6 +172,8 @@ def patch_trl_colocate_llm_kwargs(
         new_overrides["attention_backend"] = attention_backend
     if mm_encoder_attn_backend is not None:
         new_overrides["mm_encoder_attn_backend"] = mm_encoder_attn_backend
+    if reasoning_parser is not None:
+        new_overrides["reasoning_parser"] = reasoning_parser
     if not new_overrides:
         return False
     try:

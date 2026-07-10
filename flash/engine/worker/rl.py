@@ -9,7 +9,11 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import on_policy_steps
-from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
+from flash.engine.structured_outputs import (
+    describe_structured_outputs,
+    parse_structured_outputs,
+    reasoning_parser_for,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -499,6 +503,16 @@ def run_rl():
         print(
             f"[rl] structured outputs: every rollout turn constrained to "
             f"{describe_structured_outputs(_so_spec)}"
+        )
+    # thinking + a constraint: gate the grammar on </think> so the rollout reasons freely before its
+    # answer is constrained. Engine-level (EngineArgs.reasoning_parser) — TRL/GRPOConfig has no field
+    # for it, so inject via the colocate-LLM patch, which MUST run before GRPOTrainer builds the engine.
+    _reasoning_parser = reasoning_parser_for(thinking=_w.THINKING, structured_outputs=_so_spec)
+    if _reasoning_parser:
+        _w.patch_trl_colocate_llm_kwargs(reasoning_parser=_reasoning_parser)
+        print(
+            f"[rl] structured outputs under thinking: grammar applied only after </think> "
+            f"(reasoning_parser={_reasoning_parser})"
         )
     if _gen_kwargs:
         grpo_kwargs["generation_kwargs"] = _gen_kwargs
