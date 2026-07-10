@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -54,9 +54,6 @@ _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_TAR_METADATA_TYPES = TAR_METADATA_TYPES
-_CANONICAL_INPUT_KEY = "input"
-_CANONICAL_OUTPUT_KEY = "output"
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -177,8 +174,6 @@ def _normalize_env_path(path: str | None) -> str:
     raw = raw.replace("\\", "/")
     if raw.startswith("/"):
         raise ValueError(f"unsafe environment path: {path!r}")
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
     parts = [part for part in raw.split("/") if part]
     if not parts:
         return _DEFAULT_ENVIRONMENT_PATH
@@ -269,7 +264,6 @@ def _urlopen(
 ) -> bytes:
     """Fetch bytes for a GitHub request with jittered retry on rate limits."""
     import random
-    import time
 
     _RATE_LIMIT_BASE_DELAY = 10.0
     attempt = 0
@@ -574,21 +568,26 @@ def _safe_extract_archive(
         return _safe_extract_archive_file(spill, dest, subdir)
 
 
-def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    root = dest.resolve()
-    want = [p for p in subdir.split("/") if p] if subdir else []
-    top_dirs: set[str] = set()
+def _extract_validated_archive_members(
+    reader: LimitedArchiveReader,
+    *,
+    extract_base: Path,
+    guard_root: Path,
+    member_filter: Callable[[list[str]], bool] | None = None,
+    on_segments: Callable[[list[str]], None] | None = None,
+) -> None:
+    """Stream a tar archive from ``reader`` and extract its members into ``extract_base``.
+
+    Enforces the archive-bomb / path-traversal guards shared by the GitHub-repo and the
+    flat-package extractors: a scan-count cap, per-member path normalization plus a
+    traversal guard against ``guard_root``, a member-count cap, and an uncompressed-byte
+    cap. ``on_segments`` observes each surviving member's path segments (after the
+    empty-path skip, before filtering); ``member_filter`` drops members whose segments it
+    rejects, before they count toward the member/byte caps.
+    """
     total = 0
     extracted = 0
     scanned = 0
-    reader = LimitedArchiveReader(
-        gzip.GzipFile(fileobj=tar_file),
-        archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
-        lambda: RuntimeError(
-            f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
-        ),
-    )
     with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
             scanned += 1
@@ -596,7 +595,7 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
                 raise RuntimeError(
                     f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
-            if member.type in _TAR_METADATA_TYPES:
+            if member.type in TAR_METADATA_TYPES:
                 continue
             raw = tar_member_segments(
                 member.name,
@@ -606,12 +605,13 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
             )
             if not raw:
                 continue
-            top_dirs.add(raw[0])
-            if want and raw[1 : 1 + len(want)] != want:
+            if on_segments is not None:
+                on_segments(raw)
+            if member_filter is not None and not member_filter(raw):
                 continue
             normalized_name = "/".join(raw)
-            target = (dest / normalized_name).resolve()
-            if target != root and root not in target.parents:
+            target = (extract_base / normalized_name).resolve()
+            if target != guard_root and guard_root not in target.parents:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
@@ -626,7 +626,28 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
                     f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
-            tar.extract(member, dest)
+            tar.extract(member, extract_base)
+
+
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+    root = dest.resolve()
+    want = [p for p in subdir.split("/") if p] if subdir else []
+    top_dirs: set[str] = set()
+    reader = LimitedArchiveReader(
+        gzip.GzipFile(fileobj=tar_file),
+        archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
+        lambda: RuntimeError(
+            f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+        ),
+    )
+    _extract_validated_archive_members(
+        reader,
+        extract_base=dest,
+        guard_root=root,
+        member_filter=lambda raw: not (want and raw[1 : 1 + len(want)] != want),
+        on_segments=lambda raw: top_dirs.add(raw[0]),
+    )
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
     extracted_dir = dest / next(iter(top_dirs))
@@ -778,7 +799,6 @@ def _import_freesolo_environment_tools():
         from freesolo.environments import (
             EnvironmentEpisode,
             EnvironmentMultiTurn,
-            EnvironmentSingleTurn,
             EnvironmentTurn,
             load_environment,
         )
@@ -786,7 +806,6 @@ def _import_freesolo_environment_tools():
         return {
             "EnvironmentEpisode": EnvironmentEpisode,
             "EnvironmentMultiTurn": EnvironmentMultiTurn,
-            "EnvironmentSingleTurn": EnvironmentSingleTurn,
             "EnvironmentTurn": EnvironmentTurn,
             "load_environment": load_environment,
             "load_task_examples": load_task_examples,

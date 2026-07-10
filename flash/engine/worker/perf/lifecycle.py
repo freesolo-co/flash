@@ -55,32 +55,6 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
     return cuda_oom_count() > 0
 
 
-def detect_mig_slice() -> str | None:
-    """Return a reason string when the assigned GPU is a MIG slice."""
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20
-        ).stdout
-        for line in out.splitlines():
-            s = line.strip()
-            if s.startswith("MIG ") or "UUID: MIG-" in s:
-                return f"MIG slice detected (nvidia-smi -L: {s[:120]!r})"
-    except Exception:
-        pass
-    try:
-        q = subprocess.run(
-            ["nvidia-smi", "--query-gpu=mig.mode.current", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20,
-        ).stdout.strip()
-        if q and "enabled" in q.lower():
-            return f"MIG mode enabled on the assigned GPU (mig.mode.current={q!r})"
-    except Exception:
-        pass
-    return None
-
-
 def _sm_major(sm: str | None) -> int | None:
     """Major compute capability from an sm token ('sm89'->8, 'sm120'->12), or None."""
     import re

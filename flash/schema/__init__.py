@@ -373,13 +373,14 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
-        # Guided decoding constrains from the FIRST generated token, so a json/regex/choice
-        # constraint forbids the free-text <think> phase. Warn, don't reject: constraining the
-        # reasoning may still be intentional.
+        # thinking + a constraint is supported: the rollout worker sets a reasoning parser on the vLLM
+        # engine so the guided grammar is held until </think>, constraining only the answer. Surface
+        # the runtime behavior (informational, not a warning) so the interaction is unambiguous — the
+        # <think> reasoning phase is NOT constrained.
         print(
-            "warning: train.structured_outputs constrains generation from the first token, so with "
-            "thinking = true the <think> reasoning phase is constrained too; set thinking = false "
-            "if the model should reason freely before the constrained answer",
+            "note: train.structured_outputs with thinking = true constrains only the answer after "
+            "the </think> reasoning phase (the model reasons freely first, via a reasoning-aware "
+            "guided-decoding gate); set thinking = false to constrain from the first token instead",
             file=sys.stderr,
         )
     return spec
