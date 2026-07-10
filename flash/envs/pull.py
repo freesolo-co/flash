@@ -7,7 +7,6 @@ import gzip
 import io
 import os
 import shutil
-import tarfile
 import tempfile
 from pathlib import Path
 
@@ -15,7 +14,6 @@ from flash.envs import loader
 from flash.envs.archive_policy import (
     LimitedArchiveReader,
     archive_stream_limit,
-    tar_member_segments,
 )
 
 
@@ -163,9 +161,6 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
 
     root = (dest / "package").resolve()
     root.mkdir(parents=True, exist_ok=True)
-    total = 0
-    extracted = 0
-    scanned = 0
     reader = LimitedArchiveReader(
         gzip.GzipFile(fileobj=io.BytesIO(package)),
         archive_stream_limit(loader._MAX_ARCHIVE_BYTES, loader._MAX_ARCHIVE_MEMBERS),
@@ -173,43 +168,7 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
             f"environment archive is too large uncompressed (limit {loader._MAX_ARCHIVE_BYTES} bytes)"
         ),
     )
-    with tarfile.open(fileobj=reader, mode="r|") as tar:
-        for member in tar:
-            scanned += 1
-            if scanned > loader._MAX_ARCHIVE_SCAN_MEMBERS:
-                raise RuntimeError(
-                    "env package has too many entries to scan "
-                    f"(limit {loader._MAX_ARCHIVE_SCAN_MEMBERS})"
-                )
-            if member.type in loader.TAR_METADATA_TYPES:
-                continue
-            raw = tar_member_segments(
-                member.name,
-                unsafe_error=lambda name: RuntimeError(
-                    f"unsafe path in environment archive: {name!r}"
-                ),
-            )
-            if not raw:
-                continue
-            normalized_name = "/".join(raw)
-            target = (root / normalized_name).resolve()
-            if target != root and root not in target.parents:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
-                continue
-            extracted += 1
-            if extracted > loader._MAX_ARCHIVE_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many members (limit {loader._MAX_ARCHIVE_MEMBERS})"
-                )
-            total += max(0, member.size)
-            if total > loader._MAX_ARCHIVE_BYTES:
-                raise RuntimeError(
-                    "environment archive is too large uncompressed "
-                    f"({total} bytes; limit {loader._MAX_ARCHIVE_BYTES} bytes)"
-                )
-            member.name = normalized_name
-            tar.extract(member, root)
+    loader._extract_validated_archive_members(reader, extract_base=root, guard_root=root)
     return root
 
 

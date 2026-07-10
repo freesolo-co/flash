@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -568,21 +568,26 @@ def _safe_extract_archive(
         return _safe_extract_archive_file(spill, dest, subdir)
 
 
-def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    root = dest.resolve()
-    want = [p for p in subdir.split("/") if p] if subdir else []
-    top_dirs: set[str] = set()
+def _extract_validated_archive_members(
+    reader: LimitedArchiveReader,
+    *,
+    extract_base: Path,
+    guard_root: Path,
+    member_filter: Callable[[list[str]], bool] | None = None,
+    on_segments: Callable[[list[str]], None] | None = None,
+) -> None:
+    """Stream a tar archive from ``reader`` and extract its members into ``extract_base``.
+
+    Enforces the archive-bomb / path-traversal guards shared by the GitHub-repo and the
+    flat-package extractors: a scan-count cap, per-member path normalization plus a
+    traversal guard against ``guard_root``, a member-count cap, and an uncompressed-byte
+    cap. ``on_segments`` observes each surviving member's path segments (after the
+    empty-path skip, before filtering); ``member_filter`` drops members whose segments it
+    rejects, before they count toward the member/byte caps.
+    """
     total = 0
     extracted = 0
     scanned = 0
-    reader = LimitedArchiveReader(
-        gzip.GzipFile(fileobj=tar_file),
-        archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
-        lambda: RuntimeError(
-            f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
-        ),
-    )
     with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
             scanned += 1
@@ -600,12 +605,13 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
             )
             if not raw:
                 continue
-            top_dirs.add(raw[0])
-            if want and raw[1 : 1 + len(want)] != want:
+            if on_segments is not None:
+                on_segments(raw)
+            if member_filter is not None and not member_filter(raw):
                 continue
             normalized_name = "/".join(raw)
-            target = (dest / normalized_name).resolve()
-            if target != root and root not in target.parents:
+            target = (extract_base / normalized_name).resolve()
+            if target != guard_root and guard_root not in target.parents:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
@@ -620,7 +626,28 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
                     f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
-            tar.extract(member, dest)
+            tar.extract(member, extract_base)
+
+
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
+    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+    root = dest.resolve()
+    want = [p for p in subdir.split("/") if p] if subdir else []
+    top_dirs: set[str] = set()
+    reader = LimitedArchiveReader(
+        gzip.GzipFile(fileobj=tar_file),
+        archive_stream_limit(_MAX_ARCHIVE_BYTES, _MAX_ARCHIVE_MEMBERS),
+        lambda: RuntimeError(
+            f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
+        ),
+    )
+    _extract_validated_archive_members(
+        reader,
+        extract_base=dest,
+        guard_root=root,
+        member_filter=lambda raw: not (want and raw[1 : 1 + len(want)] != want),
+        on_segments=lambda raw: top_dirs.add(raw[0]),
+    )
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
     extracted_dir = dest / next(iter(top_dirs))
