@@ -92,14 +92,14 @@ def _publish_slug_for_name(name: str, key: dict) -> tuple[str, str]:
     namespace = parts[0]
     if not _NAMESPACE_RE.fullmatch(namespace):
         raise EnvPublishError("env namespace must match [a-z0-9][a-z0-9._-]*")
-    clean = _sanitize_name(parts[1])
+    clean_name = _sanitize_name(parts[1])
     if namespace != caller_namespace:
         raise EnvPublishError(
             "env namespace must match your Freesolo org namespace "
-            f"({caller_namespace}/...); got {namespace}/{clean}",
+            f"({caller_namespace}/...); got {namespace}/{clean_name}",
             status=403,
         )
-    return namespace, clean
+    return namespace, clean_name
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -183,10 +183,6 @@ def _credentialed_repo_url(repo: str, token: str) -> str:
     return f"https://x-access-token:{quoted}@github.com/{repo}.git"
 
 
-def _operation_direction(operation: str) -> str:
-    return "from" if operation in {"delete", "download"} else "to"
-
-
 def _checkout_child(checkout: Path, publish_root: str, *, operation: str) -> Path:
     target = checkout / publish_root
     checkout_root = checkout.resolve()
@@ -215,7 +211,7 @@ def _run_git(
             timeout=_GIT_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
-        direction = _operation_direction(operation)
+        direction = "from" if operation in {"delete", "download"} else "to"
         raise EnvPublishError(
             f"git is required to {operation} environments {direction} Freesolo", status=503
         ) from exc

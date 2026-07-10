@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from flash.envs import loader as adapter
+from flash.envs import loader
 from flash.envs.archive_policy import (
     LimitedArchiveReader,
     archive_stream_limit,
@@ -30,21 +30,10 @@ def _safe_repo_relative_path(path: str) -> str:
 
 
 def environment_local_dirname(env_ref: str) -> str:
-    slug = adapter._parse_managed_environment_slug(env_ref)
+    slug = loader._parse_managed_environment_slug(env_ref)
     if slug is None:
         raise ValueError(f"not a managed Freesolo environment slug: {env_ref!r}")
     return slug[1]
-
-
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        path.unlink()
-    else:
-        shutil.rmtree(path)
-
-
-def _path_occupied(path: Path) -> bool:
-    return path.is_symlink() or (path.exists() and (not path.is_dir() or any(path.iterdir())))
 
 
 def _cwd_is_inside(path: Path) -> bool:
@@ -78,7 +67,10 @@ def _populate_empty_dir(source: Path, dest: Path) -> None:
         for target in reversed(moved):
             if target.exists() or target.is_symlink():
                 with contextlib.suppress(OSError):
-                    _remove_path(target)
+                    if target.is_symlink() or not target.is_dir():
+                        target.unlink()
+                    else:
+                        shutil.rmtree(target)
         raise
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
@@ -119,7 +111,10 @@ def ensure_environment_pull_destination_available(
     overwrite: bool = False,
 ) -> Path:
     dest_path = Path(dest)
-    if _path_occupied(dest_path) and not overwrite:
+    if (
+        dest_path.is_symlink()
+        or (dest_path.exists() and (not dest_path.is_dir() or any(dest_path.iterdir())))
+    ) and not overwrite:
         raise FileExistsError(
             f"destination {dest_path} already exists (pass overwrite=True to replace)"
         )
@@ -161,9 +156,9 @@ def _copy_environment_source(source: Path, dest_path: Path, *, overwrite: bool =
 
 def _extract_environment_package_archive(package: bytes | bytearray, dest: Path) -> Path:
     """Extract a flat environment package tarball into ``dest`` and return its root."""
-    if len(package) > adapter._MAX_ARCHIVE_BYTES:
+    if len(package) > loader._MAX_ARCHIVE_BYTES:
         raise RuntimeError(
-            f"environment archive is too large compressed (limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+            f"environment archive is too large compressed (limit {loader._MAX_ARCHIVE_BYTES} bytes)"
         )
 
     root = (dest / "package").resolve()
@@ -173,20 +168,20 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
     scanned = 0
     reader = LimitedArchiveReader(
         gzip.GzipFile(fileobj=io.BytesIO(package)),
-        archive_stream_limit(adapter._MAX_ARCHIVE_BYTES, adapter._MAX_ARCHIVE_MEMBERS),
+        archive_stream_limit(loader._MAX_ARCHIVE_BYTES, loader._MAX_ARCHIVE_MEMBERS),
         lambda: RuntimeError(
-            f"environment archive is too large uncompressed (limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+            f"environment archive is too large uncompressed (limit {loader._MAX_ARCHIVE_BYTES} bytes)"
         ),
     )
     with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
             scanned += 1
-            if scanned > adapter._MAX_ARCHIVE_SCAN_MEMBERS:
+            if scanned > loader._MAX_ARCHIVE_SCAN_MEMBERS:
                 raise RuntimeError(
                     "env package has too many entries to scan "
-                    f"(limit {adapter._MAX_ARCHIVE_SCAN_MEMBERS})"
+                    f"(limit {loader._MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
-            if member.type in adapter.TAR_METADATA_TYPES:
+            if member.type in loader.TAR_METADATA_TYPES:
                 continue
             raw = tar_member_segments(
                 member.name,
@@ -203,15 +198,15 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
             extracted += 1
-            if extracted > adapter._MAX_ARCHIVE_MEMBERS:
+            if extracted > loader._MAX_ARCHIVE_MEMBERS:
                 raise RuntimeError(
-                    f"env package has too many members (limit {adapter._MAX_ARCHIVE_MEMBERS})"
+                    f"env package has too many members (limit {loader._MAX_ARCHIVE_MEMBERS})"
                 )
             total += max(0, member.size)
-            if total > adapter._MAX_ARCHIVE_BYTES:
+            if total > loader._MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
                     "environment archive is too large uncompressed "
-                    f"({total} bytes; limit {adapter._MAX_ARCHIVE_BYTES} bytes)"
+                    f"({total} bytes; limit {loader._MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
             tar.extract(member, root)
@@ -230,9 +225,9 @@ def pull_environment_package_from_archive(
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pull-"))
     try:
         source = _extract_environment_package_archive(package, tmp_parent)
-        if not (source / adapter._DEFAULT_ENVIRONMENT_PATH).is_file():
+        if not (source / loader._DEFAULT_ENVIRONMENT_PATH).is_file():
             raise FileNotFoundError(
-                f"environment entrypoint {adapter._DEFAULT_ENVIRONMENT_PATH!r} not found in package"
+                f"environment entrypoint {loader._DEFAULT_ENVIRONMENT_PATH!r} not found in package"
             )
         _copy_environment_source(source, dest_path, overwrite=overwrite)
         return dest_path
