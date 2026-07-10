@@ -75,8 +75,6 @@ def run_rl():
     )
     # vLLM colocate LLM overrides actually applied (recorded in train_meta for observability — the
     # console is only uploaded on failure, so a SUCCESSFUL run otherwise can't confirm fp8 KV engaged).
-    _kv_dtype = None
-    _mnbt = None
     print("[rl] rollout backend: colocated vLLM")
     from flash.catalog import MODELS as _CATALOG
 
