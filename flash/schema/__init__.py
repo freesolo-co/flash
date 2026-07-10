@@ -22,6 +22,7 @@ from flash.schema.fields import (
     _train_int,
     _train_stops,
     _train_structured_outputs,
+    _train_teacher,
     _wandb_spec,
     _worker_env,
 )
@@ -207,6 +208,7 @@ _TRAIN_KEYS = frozenset(
         "advantage_clip",
         "thinking_length_penalty_coef",
         "opd_eos_loss_coef",
+        "teacher_model",
         "stop_sequences",
         "structured_outputs",
         "max_steps",
@@ -354,6 +356,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             ),
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
+            # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
+            teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract

@@ -216,8 +216,9 @@ All three algorithms train off this file:
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
-  the Fireworks GLM teacher, conditioned on the transcript so far — the multi-turn
-  on-policy-distillation objective. The teacher key is platform-managed (nothing to set).
+  the managed Fireworks teacher (GLM 5.2 by default; pick another with [train] teacher_model),
+  conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
+  teacher key is platform-managed (nothing to set).
 """
 
 from __future__ import annotations
@@ -501,23 +502,25 @@ def cmd_env_setup(args) -> int:
         # transcript so far. The scaffold differs only by a one-line note pointing at the mode.
         opd_multiturn_note = (
             "# NOTE: opd rolls out each episode and distils EVERY assistant turn (conditioned on the\n"
-            "# transcript so far) against the Fireworks GLM teacher — the multi-turn distillation path.\n\n"
+            "# transcript so far) against the managed Fireworks teacher — the multi-turn distillation path.\n\n"
             if multi_turn
             else ""
         )
         opd.write_text(
             f"{opd_multiturn_note}"
             'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "opd"   # on-policy distillation from the managed GLM 5.2 teacher\n\n'
+            'algorithm = "opd"   # on-policy distillation from a managed Fireworks teacher (default GLM 5.2)\n\n'
             "# Environment: upload this project folder with\n"
             "# `flash env push --name my-env .`, then paste the returned id below.\n"
-            "# The GLM 5.2 teacher and key are platform-managed — nothing to set up or export.\n"
+            "# The teacher and its Fireworks key are platform-managed — nothing to set up or export.\n"
             "[environment]\n"
             'id = ""\n\n'
             "[train]\n"
             "epochs = 1\n"
             "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
             "lora_rank = 32\n"
+            '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) |\n'
+            "#                             # deepseek-v4-pro | kimi-k2.6 (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )

@@ -245,7 +245,7 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, sample_result=None, output
         )
 
         def _resolve_samples_batched(
-            model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+            model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
         ):
             out = [
                 sample_result(
@@ -606,23 +606,52 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     assert opd_rollout_seq_len(4096, 8192, False) == 4096  # explicit max_length pins the sequence
 
 
-def test_opd_rejects_teacher_model_override():
+def test_opd_selects_managed_teacher_and_rejects_unknown():
+    """[train].teacher_model selects the managed teacher from a fixed allow-list: a supported alias
+    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical
+    Fireworks model id; an unsupported teacher is rejected at PARSE time (before a paid GPU)."""
     from flash.schema import ConfigError, spec_from_dict
 
-    with pytest.raises(ConfigError, match="teacher_model"):
-        spec_from_dict(
+    def _spec(teacher):
+        return spec_from_dict(
             {
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {
-                    "epochs": 1,
-                    "max_examples": 5,
-                    "teacher_model": "accounts/fireworks/models/glm-5p2",
-                },
+                "train": {"epochs": 1, "max_examples": 5, "teacher_model": teacher},
             },
             run_id="x",
         )
+
+    # Supported aliases parse and are stored as the canonical Fireworks model id.
+    assert _spec("kimi-k2.6").train.teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert (
+        _spec("deepseek-v4-pro").train.teacher_model == "accounts/fireworks/models/deepseek-v4-pro"
+    )
+    # A spaced / mixed-case form normalizes to the same model id.
+    assert _spec("GLM 5.2").train.teacher_model == "accounts/fireworks/models/glm-5p2"
+    # The raw Fireworks model id is also accepted (identity), including with stray surrounding
+    # whitespace (stripped like the alias branch).
+    assert (
+        _spec("accounts/fireworks/models/glm-5p2").train.teacher_model
+        == "accounts/fireworks/models/glm-5p2"
+    )
+    assert (
+        _spec("  accounts/fireworks/models/glm-5p2  ").train.teacher_model
+        == "accounts/fireworks/models/glm-5p2"
+    )
+    # Omitting/blank leaves it unset ("" => the worker uses the default GLM 5.2 teacher).
+    assert _spec("").train.teacher_model == ""
+
+    # An unsupported teacher is rejected at parse time with a teacher-specific ConfigError.
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("gpt-5.5")
+    # qwen-3.7-max (on-demand only) and minimax-m3 (serverless chat, but its /completions echo
+    # endpoint OPD needs does not respond) are NOT allow-listed teachers, so both are rejected.
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("qwen-3.7-max")
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("minimax-m3")
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
@@ -992,10 +1021,10 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     real_resolve_samples_batched = opd_mod._resolve_samples_batched
 
     def _spy_resolve_samples_batched(
-        model, tok_, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale
+            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -1224,7 +1253,7 @@ def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
         return opd_mod._ScoreResult(teacher_toks=[idx], status="ok")
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = []
         for _gen, score, _prompt_ids in samples:
@@ -1294,7 +1323,7 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
         return opd_mod._ScoreResult(teacher_toks=[], status="ok")
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = [
             opd_mod.SampleResult(
@@ -1350,7 +1379,7 @@ def test_opd_scores_generated_chunk_in_teacher_batches(monkeypatch):
         return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
 
     def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None
+        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = [
             opd_mod.SampleResult(
@@ -2535,6 +2564,29 @@ def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
     assert teacher_price_per_1m("")[0] == 1.40  # omitted teacher -> representative default rate
 
 
+def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
+    """Every allow-listed teacher is priced by its exact row (pricing routes through resolve_teacher
+    over recipe.TEACHER_MODELS, so there is no unpriced teacher), the new teachers carry their own
+    input prices (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
+    from flash.cost.facts import teacher_price_per_1m
+    from flash.engine.recipe import TEACHER_MODELS
+
+    # One exact price per allow-listed teacher, looked up by its provider model id.
+    for info in TEACHER_MODELS.values():
+        assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
+
+    # The two added teachers carry their own input prices (distinct from GLM's $1.40/M).
+    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.74
+    assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.95
+    # Removed teachers (qwen-3.7-max on-demand only; minimax-m3 no echo support) are unknown ids
+    # now -> priced defensively at the default (GLM) rate.
+    assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 1.40
+    assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 1.40
+
+    # An unknown teacher id falls back defensively to the default (GLM) rate.
+    assert teacher_price_per_1m("accounts/fireworks/models/does-not-exist")[0] == 1.40
+
+
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
@@ -3197,6 +3249,44 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
 
+def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
+    """_resolve_opd_knobs defensively re-resolves [train].teacher_model at the worker's (tolerant)
+    deserialization boundary: parse already canonicalized it to a Fireworks model id, but the worker
+    still validates — accepting an alias or the model id — so the TeacherClient sends a supported model.
+    An unset value keeps the default GLM 5.2 teacher; the shared base_url is unchanged; an unsupported
+    teacher fails loudly on the worker."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:  # any [train] field not set returns None (falls back to the recipe default)
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _knobs(teacher):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(
+                JOB_SPEC=SimpleNamespace(train=_Train(teacher_model=teacher)), THINKING=False
+            ),
+        )
+        return opd_mod._resolve_opd_knobs()
+
+    # A friendly alias resolves to the provider model id.
+    assert _knobs("kimi-k2.6").teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert _knobs("deepseek-v4-pro").teacher_model == "accounts/fireworks/models/deepseek-v4-pro"
+    # Unset / blank / None -> the default GLM 5.2 teacher (historical behavior preserved).
+    assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
+    assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
+    # base_url is shared across every allow-listed teacher (one Fireworks endpoint + one managed key).
+    assert _knobs("deepseek-v4-pro").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
+    # An unsupported teacher fails loudly on the worker (defensive guard, mirrors the kl_coef check).
+    with pytest.raises(RuntimeError, match="teacher_model"):
+        _knobs("gpt-5.5")
+
+
 def test_resolve_opd_knobs_eos_loss_coef_override(monkeypatch):
     """[train].opd_eos_loss_coef overrides the recipe default; UNSET falls back to it; an explicit 0
     (disable) SURVIVES — unlike kl_penalty_coef, 0 is a valid value here (turn EOS reinforcement off)."""
@@ -3436,6 +3526,82 @@ def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
     assert model.grad_seen_before_forward == [False, True]
     assert model.w.grad is not None
     assert model.w.grad.abs().sum() > 0
+
+
+def test_runaway_eos_scale_maps_truncation_to_coef_fraction():
+    """The terminal-EOS reinforcement (#482) is a PROPORTIONAL controller: it must apply the coef only
+    in proportion to how much the student is CURRENTLY failing to terminate (the truncation-rate EMA).
+    Zero while the student stops reliably (<= LO) so the shared eos logit can't ratchet into an
+    empty-collapse; full once runaway is clear (>= HI); a linear ramp between."""
+    from flash.engine.worker.opd import (
+        _EOS_RUNAWAY_HI,
+        _EOS_RUNAWAY_LO,
+        _runaway_eos_scale,
+    )
+
+    assert _runaway_eos_scale(0.0) == 0.0  # no truncation -> no push (this is what prevents collapse)
+    assert _runaway_eos_scale(_EOS_RUNAWAY_LO) == 0.0  # boundary: still off
+    assert _runaway_eos_scale(_EOS_RUNAWAY_HI) == 1.0  # clear runaway -> full coef
+    assert _runaway_eos_scale(1.0) == 1.0  # saturates (never exceeds 1x)
+    mid = _runaway_eos_scale((_EOS_RUNAWAY_LO + _EOS_RUNAWAY_HI) / 2)
+    assert abs(mid - 0.5) < 1e-9  # linear ramp midpoint
+    # Monotonic non-decreasing across the ramp.
+    lo_ramp = _runaway_eos_scale(_EOS_RUNAWAY_LO + 0.01)
+    hi_ramp = _runaway_eos_scale(_EOS_RUNAWAY_HI - 0.01)
+    assert 0.0 < lo_ramp < hi_ramp < 1.0
+
+
+def test_resolve_samples_batched_gates_eos_reinforcement_by_runaway_rate(monkeypatch):
+    """End-to-end: _resolve_samples_batched scales opd_eos_loss_coef by the runaway rate before the
+    terminal-EOS term fires. A low rate (student terminates fine) zeroes the coef so the term is never
+    invoked — no ratchet, no empty-collapse (the 500-ex regression). A high rate applies it at full
+    strength so genuine runaway is still corrected."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    seen_coefs = []
+    real_term = opd_mod._eos_reinforce_term
+
+    def _spy_term(sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef):
+        seen_coefs.append(eos_coef)
+        return real_term(
+            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef
+        )
+
+    monkeypatch.setattr(opd_mod, "_eos_reinforce_term", _spy_term)
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 3
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    def _samples():
+        return [
+            (
+                opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+                opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+                [1],
+            )
+        ]
+
+    knobs = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.5, stop_sequences=())
+
+    # Low runaway: coef scaled to 0 -> `if eos_coef > 0` guards the term out entirely -> no ratchet.
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1, runaway_rate=0.0
+    )
+    assert seen_coefs == []
+
+    # Clear runaway: full opd_eos_loss_coef reaches the term.
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1, runaway_rate=0.5
+    )
+    assert seen_coefs
+    assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
 
 
 def test_resolve_samples_batched_uses_full_logits():

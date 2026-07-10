@@ -161,15 +161,6 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     return AVG_REWARD_SECONDS_PER_COMPLETION
 
 
-# Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens as
-# (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and needs
-# NO FIREWORKS_API_KEY. Source: https://fireworks.ai/models/fireworks/glm-5p2 lists
-# $1.40 / $0.14 / $4.40 (input / cached input / output) per 1M. opd echo-scores completions
-# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates) — but the table keeps
-# both so a mispriced entry is obvious.
-TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
-    "accounts/fireworks/models/glm-5p2": (1.40, 4.40),
-}
 # Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
 AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 
@@ -177,13 +168,17 @@ AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
     """(input, output) $/1M tokens for a teacher model.
 
-    OPD uses the recipe's fixed GLM 5.2 teacher. ``teacher_model`` is accepted only for internal
-    diagnostics/tests; user configs cannot override it. Unknown values fall back defensively to
-    the fixed teacher rate."""
-    from flash.engine.recipe import RECIPE
+    Routes through resolve_teacher — the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
+    the one source of teacher prices. ``teacher_model`` is the Fireworks model id chosen via ``[train]
+    teacher_model``, or "" for the default GLM 5.2 teacher. Static/offline like gpu_hourly_usd (needs
+    NO FIREWORKS_API_KEY): opd echo-scores completions (max_tokens=0) so only the INPUT column is
+    billed, but both are returned. An unsupported value falls back defensively to the default rate."""
+    from flash.engine.recipe import resolve_teacher
 
-    default = TEACHER_USD_PER_1M[RECIPE.opd.teacher_model]
-    return TEACHER_USD_PER_1M.get(teacher_model or RECIPE.opd.teacher_model, default)
+    try:
+        return resolve_teacher(teacher_model).usd_per_1m
+    except ValueError:
+        return resolve_teacher("").usd_per_1m
 
 
 def teacher_token_cost_usd(

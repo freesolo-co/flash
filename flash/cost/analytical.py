@@ -169,9 +169,12 @@ def _notes(
     if n.is_opd:
         comps, _ = _opd_step_shape(n)
         tsec = teacher_seconds_per_completion()
+        from flash.engine.recipe import resolve_teacher
+
+        teacher_name = resolve_teacher(n.teacher_model).display_name
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + GLM teacher scoring ({tsec:.2f}s/completion) + policy "
+            f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + policy "
             "update (no local reference forward)"
         )
     elif n.is_grpo:
