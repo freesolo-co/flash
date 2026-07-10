@@ -54,7 +54,6 @@ _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DATASET_SPLIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_TAR_METADATA_TYPES = TAR_METADATA_TYPES
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -265,7 +264,6 @@ def _urlopen(
 ) -> bytes:
     """Fetch bytes for a GitHub request with jittered retry on rate limits."""
     import random
-    import time
 
     _RATE_LIMIT_BASE_DELAY = 10.0
     attempt = 0
@@ -592,7 +590,7 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
                 raise RuntimeError(
                     f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
-            if member.type in _TAR_METADATA_TYPES:
+            if member.type in TAR_METADATA_TYPES:
                 continue
             raw = tar_member_segments(
                 member.name,

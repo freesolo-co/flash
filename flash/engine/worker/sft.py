@@ -348,11 +348,9 @@ def run_sft():
             print(
                 "[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA"
             )
-    _sft_examples_per_block = 1.0
     if cfg_kwargs.get("packing"):
         _bfd_ids = [r["input_ids"] for r in _pretok]
         _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
-        _sft_examples_per_block = _bfd_ex
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, per_device_bs * _bfd_ex))
         )
@@ -393,7 +391,6 @@ def run_sft():
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
-        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
@@ -426,7 +423,6 @@ def run_sft():
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
         # cu_seqlens spans one block -> per-device=1; re-derive grad_accum to keep effective batch in examples.
         _ex_per_block = len(_ids) / max(1, len(_packed_rows))
-        _sft_examples_per_block = _ex_per_block
         cfg_kwargs["per_device_train_batch_size"] = 1
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, _ex_per_block))

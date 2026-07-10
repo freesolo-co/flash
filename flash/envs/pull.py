@@ -186,7 +186,7 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
                     "env package has too many entries to scan "
                     f"(limit {adapter._MAX_ARCHIVE_SCAN_MEMBERS})"
                 )
-            if member.type in adapter._TAR_METADATA_TYPES:
+            if member.type in adapter.TAR_METADATA_TYPES:
                 continue
             raw = tar_member_segments(
                 member.name,

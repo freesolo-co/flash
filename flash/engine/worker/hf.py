@@ -314,9 +314,6 @@ def publish_deployable_checkpoint(
     return None
 
 
-# Retry/backoff for the deployable-adapter publish (rides out a transient concurrent-commit 409).
-_CKPT_FLUSH_RETRIES = 3
-_CKPT_FLUSH_BACKOFF_S = 1.0
 # Retry/backoff for each synchronous checkpoint upload. `on_save` BLOCKS the training loop on the
 # upload, so a transient HF error is retried until the step lands rather than costing the step.
 _CKPT_UPLOAD_RETRIES = 3
@@ -387,9 +384,7 @@ def make_checkpoint_upload_callback():
 
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
-    def _publish_deployable_recombined(
-        ckpt_dir: str, step: int, *, with_retry: bool = False
-    ) -> None:
+    def _publish_deployable_recombined(ckpt_dir: str, step: int) -> None:
         """Publish a step's deployable adapter, stacking the SFT back in for a VL warm-start.
 
         For a VL merge-into-base warm-start (#296) the trainer checkpoint's adapter is GRPO-ONLY
@@ -415,13 +410,7 @@ def make_checkpoint_upload_callback():
                 )
                 return
             deploy_src = recombined or ckpt_dir
-            if with_retry:
-                # #295 folded _publish_deployable_with_retry into publish_deployable_checkpoint(retries=).
-                publish_deployable_checkpoint(
-                    deploy_src, step, retries=_CKPT_FLUSH_RETRIES, backoff_s=_CKPT_FLUSH_BACKOFF_S
-                )
-            else:
-                publish_deployable_checkpoint(deploy_src, step)
+            publish_deployable_checkpoint(deploy_src, step)
         finally:
             if recombined:
                 shutil.rmtree(recombined, ignore_errors=True)

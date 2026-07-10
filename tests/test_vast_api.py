@@ -57,13 +57,13 @@ def _capture_urlopen(monkeypatch, responses):
 
 
 def test_api_key_env_only(monkeypatch):
-    from flash.providers.vast.api import VastApiError, _api_key
+    from flash.providers.vast.api import VastApiError, _CLIENT
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     with pytest.raises(VastApiError, match="VAST_API_KEY"):
-        _api_key()
+        _CLIENT.api_key()
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    assert _api_key() == "vk-test"
+    assert _CLIENT.api_key() == "vk-test"
 
 
 def test_search_offers_query_shape(monkeypatch):
