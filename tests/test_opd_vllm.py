@@ -537,7 +537,10 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
             self.lora_path = lora_path
 
     class _FakeLLM:
+        last_kwargs: ClassVar[dict] = {}
+
         def __init__(self, **kwargs):
+            _FakeLLM.last_kwargs = dict(kwargs)
             self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
@@ -620,6 +623,40 @@ def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_pat
     engine.sync_from_model(_Model())
     with pytest.raises(TypeError, match="structured_outputs"):
         engine.generate([[1, 2]], max_tokens=5)
+
+
+def test_opd_vllm_reasoning_parser_reaches_engine_only_when_set(monkeypatch, tmp_path):
+    """Under thinking + a constraint the caller passes reasoning_parser so vLLM's structured-output
+    gate holds the guided grammar until </think>. It must reach EngineArgs via LLM(**kwargs) when set,
+    and stay ABSENT when unset (the `if self.reasoning_parser` guard) — a stray or missing key would
+    silently revert the student to token-0 constraining, the exact bug this fixes."""
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    _install_fake_vllm(monkeypatch)
+    fake_llm = sys.modules["vllm"].LLM
+
+    # set -> forwarded to LLM(**kwargs) -> EngineArgs.reasoning_parser
+    OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        structured_outputs={"json_object": True},
+        reasoning_parser="deepseek_r1",
+        adapter_root=str(tmp_path / "on"),
+    )
+    assert fake_llm.last_kwargs["reasoning_parser"] == "deepseek_r1"
+
+    # unset (default None) -> NOT forwarded, so vLLM's default decoding is unchanged
+    OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        structured_outputs={"json_object": True},
+        adapter_root=str(tmp_path / "off"),
+    )
+    assert "reasoning_parser" not in fake_llm.last_kwargs
 
 
 def _lp(value):
