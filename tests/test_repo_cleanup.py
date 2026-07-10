@@ -1,36 +1,37 @@
-"""The always-on artifact GC deletes a terminal run's ``<phase>/<run_id>`` prefix inside the shared
-per-environment HF repo once it ages out and isn't serving — and must NEVER touch a deployed run, an
-in-flight run (or its warm-start source), a sibling plane's run, or delete blind when the live set
+"""The always-on artifact GC is CROSS-PLANE: it reaps a run's ``<phase>/<run_id>`` prefix inside the
+shared per-environment HF repo once it ages out and isn't in the GLOBAL serving set — never touching a
+deployed adapter (on any plane), a recently-written (in-flight) prefix, a warm-start source with a
+recent ``referenced_by`` marker, ``code/``/unknown dirs, or deleting blind when the serving registry
 can't be confirmed. These tests pin those invariants and the fixed 7-day policy."""
 
 from __future__ import annotations
 
+import types
 from datetime import UTC, datetime
 
 import pytest
 
 from flash.server import repo_cleanup as rc
 
-# Real implementations captured before the autouse fixture (and the offline conftest stub) swap in
-# test defaults, so the unit tests below exercise the genuine functions.
-_REAL_KNOWN_RUN_IDS = rc._known_run_ids
-_REAL_INFLIGHT = rc._inflight_protected_prefixes
+# Real implementations captured before the offline conftest stub swaps in a no-op sweep.
 _REAL_DEPLOYED = rc.deployed_prefixes
-_REAL_TERMINAL_TARGETS = rc._terminal_run_targets
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
-# The global offline conftest stubs run_scheduled_cleanup to a no-op (so the always-on GC never
-# reaches serving/HF in offline TestClient startups). Restore the genuine sweep for this file.
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
 NS = rc._ARTIFACT_NAMESPACE
-_UNSET = object()
 NOW = 1_800_000_000.0
 DAY = 86400.0
 AGE_DAYS = rc.DELETE_AGE_SECONDS / DAY  # the fixed 7-day threshold, in days
+OLD = AGE_DAYS + 5  # comfortably past the age gate
+YOUNG = AGE_DAYS - 1  # inside the age gate
 
 
 def _ago(days: float) -> float:
     return NOW - days * DAY
+
+
+def _managed(slug: str) -> str:
+    return f"{NS}/flashrun-{slug}"
 
 
 @pytest.fixture(autouse=True)
@@ -41,57 +42,11 @@ def _frozen(monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
 
-def _managed(slug: str) -> str:
-    return f"{NS}/flashrun-{slug}"
-
-
 class _DummyHeld:
     """Stand-in for a held per-run lock: the sweep only ever calls ``release()`` on it."""
 
     def release(self) -> None:
         pass
-
-
-class _St:
-    """Minimal ``RunStatus`` stand-in (only the fields the GC reads)."""
-
-    def __init__(
-        self,
-        run_id,
-        state,
-        *,
-        hf_repo=None,
-        algorithm="sft",
-        deployment=None,
-        finished_at=None,
-        updated_at=None,
-        created_at=None,
-        init_from_adapter=None,
-        spec=_UNSET,
-    ):
-        self.run_id = run_id
-        self.state = state
-        if spec is _UNSET:
-            train: dict = {}
-            if hf_repo is not None:
-                train["hf_repo"] = hf_repo
-            if init_from_adapter is not None:
-                train["init_from_adapter"] = init_from_adapter
-            spec = {"algorithm": algorithm, "train": train}
-        self.spec = spec
-        self.deployment = deployment
-        self.finished_at = finished_at
-        self.updated_at = updated_at
-        self.created_at = created_at
-
-
-def _target(run_id="flash-1-a", *, slug="env", phase="sft", age_days=AGE_DAYS + 1) -> rc._RunTarget:
-    return rc._RunTarget(
-        run_id=run_id,
-        repo_id=_managed(slug),
-        prefix=f"{phase}/{run_id}",
-        age_ts=_ago(age_days),
-    )
 
 
 class _Commit:
@@ -100,38 +55,57 @@ class _Commit:
 
 
 class _Entry:
-    def __init__(self, date):
-        self.last_commit = _Commit(date)
+    def __init__(self, path, size, date):
+        self.path = path
+        self.size = size
+        self.last_commit = _Commit(date) if date is not None else None
 
 
 class FakeApi:
-    """Stand-in for HfApi: serves per-prefix commit dates and records ``delete_folder`` calls."""
+    """Stand-in for HfApi driving the whole sweep: enumerates repos, serves per-file commit dates for
+    both the scan and the pre-delete re-stat, and records ``delete_folder`` calls.
 
-    def __init__(self, tree: dict | None = None):
-        # (repo_id, prefix) -> list[datetime] commit dates. Absent -> empty listing.
-        self._tree = tree or {}
+    ``repos`` maps ``repo_id -> [(path, size, age_days_or_None), ...]``; an ``age_days`` of ``None``
+    models a file with no commit date (older ``huggingface_hub``)."""
+
+    def __init__(self, repos: dict | None = None):
+        self._repos = repos or {}
         self.deleted: list[tuple[str, str]] = []
+
+    def list_datasets(self, author=None):
+        return [types.SimpleNamespace(id=r) for r in self._repos]
 
     def list_repo_tree(
         self, repo_id=None, repo_type=None, path_in_repo=None, recursive=False, expand=False
     ):
-        return [_Entry(d) for d in self._tree.get((repo_id, path_in_repo), [])]
+        out = []
+        for path, size, age in self._repos.get(repo_id, []):
+            if path_in_repo and not (path == path_in_repo or path.startswith(path_in_repo + "/")):
+                continue
+            date = datetime.fromtimestamp(_ago(age), UTC) if age is not None else None
+            out.append(_Entry(path, size, date))
+        return out
 
     def delete_folder(self, path_in_repo=None, repo_id=None, repo_type=None):
         self.deleted.append((repo_id, path_in_repo))
 
 
-def _wire(monkeypatch, *, targets, deployed=None, inflight=frozenset(), known=None, hold=None):
-    """Patch the sweep's seams so the end-to-end tests isolate policy from the registry/HF."""
-    monkeypatch.setattr(rc, "_terminal_run_targets", lambda: list(targets))
+# A single live adapter in an unrelated repo, so the fail-closed "zero live adapters" guard passes in
+# tests that are really about the aged-undeployed path. Deliberately disjoint from any target prefix.
+_LIVE_SENTINEL = ({(_managed("live"), "rl/flash-live-0")}, set(), True)
+
+
+def _wire(monkeypatch, *, deployed=None, hold=None):
+    """Patch the sweep's non-HF seams: the global serving set and the per-run lock. The HF side is
+    driven entirely by the FakeApi passed to ``run_scheduled_cleanup``."""
     monkeypatch.setattr(
-        rc, "deployed_prefixes", (lambda: (set(), True)) if deployed is None else deployed
-    )
-    monkeypatch.setattr(rc, "_inflight_protected_prefixes", lambda: set(inflight))
-    monkeypatch.setattr(
-        rc, "_known_run_ids", lambda: {t.run_id for t in targets} if known is None else set(known)
+        rc, "deployed_prefixes", deployed if deployed is not None else (lambda: _LIVE_SENTINEL)
     )
     monkeypatch.setattr(rc, "_hold_run_lock", hold or (lambda run_id: _DummyHeld()))
+
+
+def _adapter(path: str, age: float, size: int = 1000):
+    return (path, size, age)
 
 
 # ---- gating -----------------------------------------------------------------------------------
@@ -146,12 +120,9 @@ def test_enabled_requires_hf_token(monkeypatch):
 def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
     monkeypatch.setattr(rc, "HfApi", None)
     monkeypatch.setattr(rc, "_warned_hf_unavailable", False)
-    # If it didn't short-circuit it would call these; make them explode so a regression is caught.
+    # If it didn't short-circuit it would confirm the live set; make that explode to catch a regression.
     monkeypatch.setattr(
         rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called"))
-    )
-    monkeypatch.setattr(
-        rc, "_terminal_run_targets", lambda: (_ for _ in ()).throw(AssertionError("called"))
     )
     assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0
 
@@ -167,417 +138,354 @@ def test_is_managed_env_repo_allowlist():
     assert rc._is_managed_env_repo(None) is False
 
 
-def test_source_repo_prefix_parses_internal_ref():
-    assert rc._source_repo_prefix(f"{NS}/flashrun-e:sft/flash-9-s") == (
-        _managed("e"),
-        "sft/flash-9-s",
-    )
-    # a checkpoint-step source still yields just the run prefix
-    assert rc._source_repo_prefix(f"{NS}/flashrun-e:rl/flash-9-s/checkpoints/step-5") == (
-        _managed("e"),
-        "rl/flash-9-s",
-    )
-    assert rc._source_repo_prefix("flash-9-s/step-5") is None  # public form, no repo
-    assert rc._source_repo_prefix("") is None
-    assert rc._source_repo_prefix(None) is None
-
-
-def test_run_repo_prefix_from_status():
-    st = _St("flash-1-a", "done", hf_repo=_managed("e"), algorithm="grpo")
-    assert rc._run_repo_prefix(st) == (_managed("e"), "rl/flash-1-a")  # grpo -> rl phase
-    st2 = _St("flash-2-b", "done", hf_repo=_managed("e"), algorithm="opd")
-    assert rc._run_repo_prefix(st2) == (_managed("e"), "opd/flash-2-b")
-    assert rc._run_repo_prefix(_St("r", "done", hf_repo=None)) is None  # no repo
-
-
 def test_run_id_epoch():
     assert rc._run_id_epoch("flash-1782280298-13db58fa") == 1782280298.0
     assert rc._run_id_epoch("weird") is None
 
 
-# ---- the policy predicate ---------------------------------------------------------------------
+def test_scan_repo_classifies_paths():
+    api = FakeApi(
+        {
+            _managed("e"): [
+                _adapter("sft/flash-1-a/adapter/w.safetensors", OLD),
+                _adapter("sft/flash-1-a/checkpoints/step-3/adapter/w", OLD + 3),  # older sibling
+                _adapter("rl/flash-2-b/adapter/w", YOUNG),
+                _adapter("recomb/flash-2-b/adapter/w", YOUNG),
+                _adapter("code/deadbeef/flash/x.py", OLD),  # snapshot -> ignored
+                _adapter("referenced_by/flash-9-child", OLD, size=0),  # lineage marker
+                _adapter("telemetry/events.jsonl", OLD),  # unknown top-level -> reported, not reaped
+            ]
+        }
+    )
+    prefixes, ref_recent_ts, unknown = rc._scan_repo(api, _managed("e"))
+    assert set(prefixes) == {"sft/flash-1-a", "rl/flash-2-b", "recomb/flash-2-b"}
+    # newest commit across the prefix's files wins (the adapter at OLD, not the older checkpoint).
+    assert prefixes["sft/flash-1-a"][1] == pytest.approx(_ago(OLD))
+    assert ref_recent_ts == pytest.approx(_ago(OLD))  # from the referenced_by marker
+    assert unknown == {"telemetry"}
 
 
-def test_deletable_old_undeployed_known_is_deleted():
-    t = _target("r1")
-    assert rc._deletable(t, set(), {"r1"}, NOW, rc.DELETE_AGE_SECONDS) is True
+# ---- the global serving set (deployed_prefixes) -----------------------------------------------
 
 
-def test_deletable_skips_deployed_even_if_ancient():
-    t = _target("r1", age_days=400)
-    assert rc._deletable(t, {(t.repo_id, t.prefix)}, {"r1"}, NOW, rc.DELETE_AGE_SECONDS) is False
+def _serving(monkeypatch, records):
+    """Point deployed_prefixes' serving call at a canned ``GET /adapters`` payload."""
+    from flash.serve import deploy as sd
+
+    monkeypatch.setattr(sd, "serving_base_url", lambda: "https://serving.test")
+    resp = types.SimpleNamespace(json=lambda: {"adapters": records})
+    monkeypatch.setattr(sd, "_serving_request", lambda method, url: resp)
 
 
-def test_deletable_skips_young():
-    t = _target("r1", age_days=AGE_DAYS - 1)
-    assert rc._deletable(t, set(), {"r1"}, NOW, rc.DELETE_AGE_SECONDS) is False
+def test_deployed_prefixes_from_serving_registry(monkeypatch):
+    _serving(
+        monkeypatch,
+        [
+            {"repoId": _managed("e1"), "subfolder": "rl/flash-1-a"},
+            {"repo_id": _managed("e2"), "subfolder": "sft/flash-2-b/checkpoints/step-4"},
+        ],
+    )
+    prefixes, whole, complete = _REAL_DEPLOYED()
+    assert prefixes == {(_managed("e1"), "rl/flash-1-a"), (_managed("e2"), "sft/flash-2-b")}
+    assert whole == set()
+    assert complete is True
 
 
-def test_deletable_skips_unknown_age():
-    t = rc._RunTarget("r1", _managed("e"), "sft/r1", age_ts=None)
-    assert rc._deletable(t, set(), {"r1"}, NOW, rc.DELETE_AGE_SECONDS) is False
+def test_deployed_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
+    _serving(monkeypatch, [{"subfolder": "rl/flash-1-a"}])  # live adapter, no repo id
+    prefixes, _whole, complete = _REAL_DEPLOYED()
+    assert complete is False
+    assert prefixes == set()
 
 
-def test_deletable_skips_run_this_plane_doesnt_know():
-    t = _target("r1")
-    assert rc._deletable(t, set(), set(), NOW, rc.DELETE_AGE_SECONDS) is False  # not in known
+def test_deployed_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
+    _serving(monkeypatch, [{"repoId": _managed("e1"), "subfolder": "toplevel-only"}])
+    prefixes, whole, complete = _REAL_DEPLOYED()
+    assert whole == {_managed("e1")}
+    assert prefixes == set()
+    assert complete is True
+
+
+# ---- fail-closed confirmation -----------------------------------------------------------------
+
+
+def test_confirm_live_set_aborts_when_unreachable(monkeypatch):
+    def _boom():
+        raise RuntimeError("registry down")
+
+    _wire(monkeypatch, deployed=_boom)
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", OLD)]})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert api.deleted == []
+
+
+def test_confirm_live_set_aborts_when_incomplete(monkeypatch):
+    _wire(monkeypatch, deployed=lambda: (set(), set(), False))  # an unmappable live adapter
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", OLD)]})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert api.deleted == []
+
+
+def test_confirm_live_set_aborts_when_registry_empty(monkeypatch):
+    # Zero live adapters almost always means a broken/empty query -> refuse rather than sweep against
+    # an empty do-not-touch set.
+    _wire(monkeypatch, deployed=lambda: (set(), set(), True))
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", OLD)]})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert api.deleted == []
 
 
 # ---- end-to-end sweep -------------------------------------------------------------------------
 
 
 def test_sweep_deletes_only_old_undeployed(monkeypatch):
-    delete = _target("flash-1-old", slug="e1")
-    deployed = _target("flash-2-dep", slug="e2")
-    young = _target("flash-3-young", slug="e3", age_days=1)
-    _wire(
-        monkeypatch,
-        targets=[delete, deployed, young],
-        deployed=lambda: ({(deployed.repo_id, deployed.prefix)}, True),
+    deployed_pfx = (_managed("e2"), "rl/flash-2-dep")
+    _wire(monkeypatch, deployed=lambda: ({deployed_pfx}, set(), True))
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-old/adapter/w", OLD)],  # -> deleted
+            _managed("e2"): [_adapter("rl/flash-2-dep/adapter/w", OLD)],  # deployed -> spared
+            _managed("e3"): [_adapter("sft/flash-3-young/adapter/w", YOUNG)],  # young -> spared
+        }
     )
-    api = FakeApi()
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
-    assert api.deleted == [(delete.repo_id, delete.prefix)]
+    assert api.deleted == [(_managed("e1"), "sft/flash-1-old")]
 
 
 def test_dry_run_deletes_nothing(monkeypatch):
-    _wire(monkeypatch, targets=[_target("r1"), _target("r2")])
-    api = FakeApi()
+    _wire(monkeypatch)
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-old/w", OLD)],
+            _managed("e2"): [_adapter("rl/flash-2-old/w", OLD)],
+        }
+    )
     assert rc.run_scheduled_cleanup(dry_run=True, api=api) == 0
     assert api.deleted == []
 
 
-def test_sweep_skips_runs_this_plane_doesnt_know(monkeypatch):
-    ours = _target("flash-1-ours")
-    theirs = _target("flash-2-theirs")
-    _wire(monkeypatch, targets=[ours, theirs], known={"flash-1-ours"})
-    api = FakeApi()
+def test_sweep_never_deletes_code_or_unknown_dirs(monkeypatch):
+    _wire(monkeypatch)
+    api = FakeApi(
+        {
+            _managed("e"): [
+                _adapter("code/deadbeef/flash/x.py", OLD),  # shared snapshot
+                _adapter("telemetry/events.jsonl", OLD),  # unknown phase
+                _adapter("sft/flash-1-old/adapter/w", OLD),  # the only real target
+            ]
+        }
+    )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
-    assert api.deleted == [(ours.repo_id, ours.prefix)]  # sibling plane's run spared
+    assert api.deleted == [(_managed("e"), "sft/flash-1-old")]  # code/ + telemetry/ untouched
 
 
-def test_inflight_prefix_protected_regardless_of_age(monkeypatch):
-    stuck = _target("flash-1-stuck", age_days=120)
-    _wire(monkeypatch, targets=[stuck], inflight={(stuck.repo_id, stuck.prefix)})
-    api = FakeApi()
+def test_sweep_protects_warmstart_source_with_recent_marker(monkeypatch):
+    # An OLD sft that a run recently warm-started from (recent referenced_by marker) is a source for a
+    # possibly-in-flight child -> spared, even though the artifact itself is aged.
+    _wire(monkeypatch)
+    api = FakeApi(
+        {
+            _managed("src"): [
+                _adapter("sft/flash-1-src/adapter/w", OLD),
+                _adapter("referenced_by/flash-9-child", YOUNG, size=0),  # recent lineage marker
+            ]
+        }
+    )
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
     assert api.deleted == []
 
 
-# ---- fail-closed safety -----------------------------------------------------------------------
+def test_sweep_reaps_source_whose_marker_is_old(monkeypatch):
+    # An OLD referenced_by marker = the child finished long ago (already baked its own recomb) -> the
+    # source is no longer needed and is reaped.
+    _wire(monkeypatch)
+    api = FakeApi(
+        {
+            _managed("src"): [
+                _adapter("sft/flash-1-src/adapter/w", OLD),
+                _adapter("referenced_by/flash-9-child", OLD, size=0),  # stale lineage marker
+            ]
+        }
+    )
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [(_managed("src"), "sft/flash-1-src")]
 
 
-def test_aborts_and_deletes_nothing_when_live_set_unreachable(monkeypatch):
-    def _boom():
-        raise RuntimeError("registry down")
-
-    _wire(monkeypatch, targets=[_target("r1")], deployed=_boom)
-    api = FakeApi()
-    with pytest.raises(rc.CleanupAborted):
-        rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == []
-
-
-def test_aborts_on_incomplete_live_set(monkeypatch):
-    _wire(monkeypatch, targets=[_target("r1")], deployed=lambda: ({_managed("x")}, False))
-    api = FakeApi()
-    with pytest.raises(rc.CleanupAborted):
-        rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == []
+def test_sweep_protects_whole_repo_when_live_unmappable(monkeypatch):
+    _wire(monkeypatch, deployed=lambda: (_LIVE_SENTINEL[0], {_managed("murky")}, True))
+    api = FakeApi(
+        {
+            _managed("murky"): [_adapter("sft/flash-1-old/w", OLD)],  # whole repo protected
+            _managed("clean"): [_adapter("sft/flash-2-old/w", OLD)],  # reaped
+        }
+    )
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [(_managed("clean"), "sft/flash-2-old")]
 
 
-def test_fails_closed_when_inflight_unenumerable(monkeypatch):
-    _wire(monkeypatch, targets=[_target("r1")])
+def test_sweep_uses_run_id_epoch_when_no_commit_dates(monkeypatch):
+    # A prefix whose files carry no commit dates falls back to the epoch in flash-<epoch>-<hex>.
+    _wire(monkeypatch)
+    old_epoch = int(NOW - OLD * DAY)
+    young_epoch = int(NOW - YOUNG * DAY)
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter(f"sft/flash-{old_epoch}-a/w", None)],  # old by epoch -> deleted
+            _managed("e2"): [_adapter(f"sft/flash-{young_epoch}-b/w", None)],  # young by epoch -> kept
+        }
+    )
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [(_managed("e1"), f"sft/flash-{old_epoch}-a")]
 
-    def _boom():
-        raise RuntimeError("runs db unreadable")
 
-    monkeypatch.setattr(rc, "_inflight_protected_prefixes", _boom)
-    api = FakeApi()
-    with pytest.raises(RuntimeError):
-        rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == []
+def test_scan_failure_on_one_repo_is_not_fatal(monkeypatch):
+    _wire(monkeypatch)
+
+    class _FlakyApi(FakeApi):
+        def list_repo_tree(self, repo_id=None, **kwargs):
+            if repo_id == _managed("bad") and kwargs.get("path_in_repo") is None:
+                raise RuntimeError("HF 429")
+            return super().list_repo_tree(repo_id=repo_id, **kwargs)
+
+    api = _FlakyApi(
+        {
+            _managed("bad"): [_adapter("sft/flash-1-old/w", OLD)],  # scan raises -> skipped this cycle
+            _managed("good"): [_adapter("sft/flash-2-old/w", OLD)],  # reaped
+        }
+    )
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [(_managed("good"), "sft/flash-2-old")]
 
 
-def test_fails_closed_when_known_runs_unenumerable(monkeypatch):
-    _wire(monkeypatch, targets=[_target("r1")])
-
-    def _boom():
-        raise RuntimeError("db unreadable")
-
-    monkeypatch.setattr(rc, "_known_run_ids", _boom)
-    api = FakeApi()
-    with pytest.raises(RuntimeError):
-        rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == []
+# ---- TOCTOU re-confirmation -------------------------------------------------------------------
 
 
 def test_per_delete_recheck_spares_prefix_deployed_midsweep(monkeypatch):
-    t1 = _target("flash-1-a")
-    t2 = _target("flash-2-b")
+    target = (_managed("e"), "sft/flash-1-a")
     calls = {"n": 0}
 
     def _live():
         calls["n"] += 1
-        # up-front confirm + t2 pre-delete: nothing live; t1 pre-delete: t1 is now live.
-        if calls["n"] == 2:
-            return ({(t1.repo_id, t1.prefix)}, True)
-        return (set(), True)
+        # up-front confirm (1): only the sentinel is live. The pre-delete re-confirm (2+) now sees the
+        # target as live -> it must be spared even though enumeration qualified it.
+        if calls["n"] >= 2:
+            return (_LIVE_SENTINEL[0] | {target}, set(), True)
+        return _LIVE_SENTINEL
 
-    _wire(monkeypatch, targets=[t1, t2], deployed=_live)
-    api = FakeApi()
-    rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == [(t2.repo_id, t2.prefix)]  # t1 spared by the mid-sweep re-check
+    _wire(monkeypatch, deployed=_live)
+    api = FakeApi({target[0]: [_adapter(target[1] + "/w", OLD)]})
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert api.deleted == []
 
 
 def test_midsweep_unconfirmable_live_set_aborts_whole_sweep(monkeypatch):
-    t1 = _target("flash-1-a")
-    t2 = _target("flash-2-b")
     calls = {"n": 0}
 
     def _live():
         calls["n"] += 1
-        if calls["n"] <= 2:
-            return (set(), True)  # up-front + t1 pre-delete: OK -> delete t1
-        return (set(), False)  # t2 pre-delete: incomplete -> abort the whole sweep
+        if calls["n"] <= 2:  # up-front + first pre-delete: OK
+            return _LIVE_SENTINEL
+        return (set(), set(), False)  # second pre-delete: incomplete -> abort the whole sweep
 
-    _wire(monkeypatch, targets=[t1, t2], deployed=_live)
-    api = FakeApi()
+    _wire(monkeypatch, deployed=_live)
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-a/w", OLD)],
+            _managed("e2"): [_adapter("sft/flash-2-b/w", OLD)],
+        }
+    )
     with pytest.raises(rc.CleanupAborted):
         rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert api.deleted == [(t1.repo_id, t1.prefix)]  # t1 deleted before the abort; t2 not
+    assert len(api.deleted) == 1  # one deleted before the abort; the sweep then stopped
 
 
-def test_per_delete_recheck_spares_run_that_became_inflight(monkeypatch):
-    # A run not in-flight at the up-front snapshot but that becomes a warm-start source (or goes
-    # in-flight) before its delete must be spared by the per-delete in-flight re-check.
-    t = _target("flash-1-a")
-    calls = {"n": 0}
+# ---- per-prefix re-stat -----------------------------------------------------------------------
 
-    def _inflight():
-        calls["n"] += 1
-        return (
-            set() if calls["n"] == 1 else {(t.repo_id, t.prefix)}
-        )  # up-front clear; pre-delete protected
 
-    _wire(monkeypatch, targets=[t])
-    monkeypatch.setattr(rc, "_inflight_protected_prefixes", _inflight)
-    api = FakeApi()
+def test_restat_spares_prefix_written_since_enumeration(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(rc, "_prefix_written_within", lambda *a, **k: True)  # a fresh write appeared
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
     assert api.deleted == []
 
 
-def test_per_delete_inflight_recheck_error_skips_target(monkeypatch):
-    # If the in-flight set can't be re-read right before a delete, fail SAFE: skip that target (an
-    # unreadable registry is not proof the prefix is free) — but don't abort the whole sweep.
-    t = _target("flash-1-a")
-    calls = {"n": 0}
+def test_restat_skips_target_when_it_errors(monkeypatch):
+    _wire(monkeypatch)
 
-    def _inflight():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return set()
-        raise RuntimeError("registry blip")
+    def _boom(*a, **k):
+        raise RuntimeError("HF blip")
 
-    _wire(monkeypatch, targets=[t])
-    monkeypatch.setattr(rc, "_inflight_protected_prefixes", _inflight)
-    api = FakeApi()
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    monkeypatch.setattr(rc, "_prefix_written_within", _boom)
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0  # skipped to stay safe
     assert api.deleted == []
+
+
+def test_prefix_written_within_reads_newest_commit():
+    api = FakeApi(
+        {
+            _managed("e"): [
+                _adapter("sft/flash-1-a/old", 30),
+                _adapter("sft/flash-1-a/fresh", 1),  # newest -> within 7d
+            ]
+        }
+    )
+    assert (
+        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        is True
+    )
+
+
+def test_prefix_written_within_false_when_all_old_or_undated():
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", 30)]})
+    assert (
+        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        is False
+    )
+    undated = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", None)]})
+    assert (
+        rc._prefix_written_within(undated, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        is False
+    )
 
 
 # ---- in-progress deploy/export guard ----------------------------------------------------------
 
 
 def test_sweep_skips_run_with_deploy_or_export_in_progress(monkeypatch):
-    busy = _target("flash-1-busy")
-    other = _target("flash-2-other")
-    _wire(
-        monkeypatch,
-        targets=[busy, other],
-        hold=lambda run_id: None if run_id == "flash-1-busy" else _DummyHeld(),
+    _wire(monkeypatch, hold=lambda run_id: None if run_id == "flash-1-busy" else _DummyHeld())
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-busy/w", OLD)],  # locked -> skipped
+            _managed("e2"): [_adapter("sft/flash-2-other/w", OLD)],  # reaped
+        }
     )
-    api = FakeApi()
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
-    assert api.deleted == [(other.repo_id, other.prefix)]
+    assert api.deleted == [(_managed("e2"), "sft/flash-2-other")]
 
 
 def test_cooperative_stop_halts_before_deleting(monkeypatch):
-    _wire(monkeypatch, targets=[_target("r1"), _target("r2")])
-    api = FakeApi()
+    _wire(monkeypatch)
+    api = FakeApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-old/w", OLD)],
+            _managed("e2"): [_adapter("sft/flash-2-old/w", OLD)],
+        }
+    )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=lambda: True)
     assert n == 0
     assert api.deleted == []
-
-
-# ---- per-prefix re-stat -----------------------------------------------------------------------
-
-
-def test_recheck_spares_prefix_written_since_enumeration(monkeypatch):
-    t = _target("flash-1-a")  # old by the db age gate...
-    _wire(monkeypatch, targets=[t])
-    # ...but a file under the prefix was committed 1 day ago -> within the 7-day window -> spare it.
-    api = FakeApi({(t.repo_id, t.prefix): [datetime.fromtimestamp(_ago(1), UTC)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
-    assert api.deleted == []
-
-
-def test_recheck_proceeds_when_prefix_is_old(monkeypatch):
-    t = _target("flash-1-a")
-    _wire(monkeypatch, targets=[t])
-    api = FakeApi({(t.repo_id, t.prefix): [datetime.fromtimestamp(_ago(30), UTC)]})  # 30d old
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 1
-    assert api.deleted == [(t.repo_id, t.prefix)]
-
-
-def test_recheck_skips_target_when_restat_errors(monkeypatch):
-    t = _target("flash-1-a")
-    _wire(monkeypatch, targets=[t])
-
-    class _BoomApi(FakeApi):
-        def list_repo_tree(self, **kwargs):
-            raise RuntimeError("HF blip")
-
-    api = _BoomApi()
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0  # skipped to stay safe
-    assert api.deleted == []
-
-
-# ---- reconstruction from the run registry (real functions) ------------------------------------
-
-
-def test_deployed_prefixes_built_from_run_status(monkeypatch):
-    from flash.server import db
-
-    statuses = {
-        "d1": _St(
-            "d1",
-            "deployed",
-            hf_repo=_managed("e1"),
-            algorithm="grpo",
-            deployment={"state": "ready"},
-        ),
-        "dep1": _St(
-            "dep1",
-            "done",
-            hf_repo=_managed("e4"),
-            algorithm="opd",
-            deployment={"state": "deploying"},
-        ),  # in-progress -> protected
-        "u1": _St("u1", "done", hf_repo=_managed("e2"), deployment={"state": "undeployed"}),
-        "f1": _St(
-            "f1", "done", hf_repo=_managed("e5"), deployment={"state": "failed"}
-        ),  # failed deploy serves nothing -> reclaimable
-        "n1": _St("n1", "done", hf_repo=_managed("e3"), deployment=None),
-    }
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": r} for r in statuses])
-    monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
-    ids, complete = _REAL_DEPLOYED()
-    assert ids == {
-        (_managed("e1"), "rl/d1"),
-        (_managed("e4"), "opd/dep1"),
-    }  # live + in-progress only
-    assert complete is True
-
-
-def test_deployed_prefixes_incomplete_when_live_run_unmappable(monkeypatch):
-    from flash.server import db
-
-    statuses = {"d1": _St("d1", "deployed", hf_repo=None, deployment={"state": "ready"})}
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "d1"}])
-    monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
-    ids, complete = _REAL_DEPLOYED()
-    assert complete is False  # a live run with no repo id -> fail closed
-    assert ids == set()
-
-
-def test_inflight_protects_own_and_warmstart_source(monkeypatch):
-    from flash.server import db
-
-    statuses = {
-        # PUBLIC init_from_adapter form (a bare source RUN ID) — exactly what submit_job persists.
-        "grpo1": _St(
-            "grpo1", "running", hf_repo=_managed("e"), algorithm="grpo", init_from_adapter="sft0"
-        ),
-        "sft0": _St(
-            "sft0", "done", hf_repo=_managed("e"), algorithm="sft"
-        ),  # the warm-start source
-        "done1": _St("done1", "done", hf_repo=_managed("e")),
-    }
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": r} for r in statuses])
-    monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
-    ids = _REAL_INFLIGHT()
-    assert (_managed("e"), "rl/grpo1") in ids  # the in-flight run's own prefix
-    assert (
-        _managed("e"),
-        "sft/sft0",
-    ) in ids  # its warm-start SOURCE prefix (resolved via get_status)
-    assert (_managed("e"), "sft/done1") not in ids  # a terminal run is not protected
-
-
-def test_warmstart_source_prefix_public_and_internal_forms():
-    src = _St("sft9", "done", hf_repo=_managed("e"), algorithm="sft")
-    # Public form (what's persisted): a bare source run id resolved via get_status.
-    assert rc._warmstart_source_prefix("sft9", lambda rid: src) == (_managed("e"), "sft/sft9")
-    # Public form with a step suffix.
-    assert rc._warmstart_source_prefix("sft9/step-5", lambda rid: src) == (
-        _managed("e"),
-        "sft/sft9",
-    )
-    # Internal colon form is still accepted defensively (no get_status needed).
-    assert rc._warmstart_source_prefix(f"{_managed('e')}:sft/sft9", _raise) == (
-        _managed("e"),
-        "sft/sft9",
-    )
-
-    def _missing(rid):
-        raise FileNotFoundError(rid)
-
-    # A cross-plane source not in this plane's registry -> None, never a crash.
-    assert rc._warmstart_source_prefix("othersrc", _missing) is None
-    assert rc._warmstart_source_prefix("", lambda rid: None) is None
-    assert rc._warmstart_source_prefix(None, lambda rid: None) is None
-
-
-def _raise(rid):
-    raise AssertionError("get_status must not be called for the internal colon form")
-
-
-def test_known_run_ids_from_db(monkeypatch):
-    from flash.server import db
-
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "r1"}, {"run_id": "r2"}])
-    assert _REAL_KNOWN_RUN_IDS() == {"r1", "r2"}
-
-
-def test_terminal_targets_filters_and_ages(monkeypatch):
-    from flash.server import db
-
-    statuses = {
-        "done1": _St("done1", "done", hf_repo=_managed("e"), finished_at=_ago(10)),
-        "run1": _St("run1", "running", hf_repo=_managed("e")),  # not terminal -> excluded
-        "ext1": _St("ext1", "done", hf_repo="someuser/my-dataset"),  # not managed -> excluded
-    }
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": r} for r in statuses])
-    monkeypatch.setattr("flash.runner.get_status", lambda rid: statuses[rid])
-    targets = _REAL_TERMINAL_TARGETS()
-    assert [t.run_id for t in targets] == ["done1"]
-    assert targets[0].prefix == "sft/done1"
-    assert targets[0].age_ts == _ago(10)  # from finished_at
-
-
-def test_terminal_targets_skips_missing_run(monkeypatch):
-    from flash.server import db
-
-    def _get(rid):
-        raise FileNotFoundError(rid)
-
-    monkeypatch.setattr(db, "all_runs", lambda: [{"run_id": "gone"}])
-    monkeypatch.setattr("flash.runner.get_status", _get)
-    assert _REAL_TERMINAL_TARGETS() == []
 
 
 # ---- the real per-run lock --------------------------------------------------------------------
