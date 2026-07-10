@@ -57,7 +57,7 @@ def _capture_urlopen(monkeypatch, responses):
 
 
 def test_api_key_env_only(monkeypatch):
-    from flash.providers.vast.api import VastApiError, _CLIENT
+    from flash.providers.vast.api import _CLIENT, VastApiError
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     with pytest.raises(VastApiError, match="VAST_API_KEY"):
