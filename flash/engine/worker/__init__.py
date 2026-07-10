@@ -22,7 +22,6 @@ from flash.engine.worker.adapter import (
     _resolve_adapter_ref,
     make_lora,
     prepare_fresh_lora_base,
-    recombined_warmstart_adapter_dir,
     require_vllm_for_rollout_func,
 )
 from flash.engine.worker.decoding import (
@@ -87,7 +86,6 @@ from flash.engine.worker.lora import (
     disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
-    recombine_lora_adapters,
 )
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
@@ -204,16 +202,6 @@ def _load_active_env():
 
 
 ACTIVE_ENV = None
-
-# Set by ``_init_adapter_model`` to the SFT adapter dir ONLY when it takes the VL merge-into-base
-# warm-start path (#296): the SFT is merged into the training base and a FRESH GRPO LoRA is trained,
-# so the saved adapter is SFT-less and MUST be recombined with this SFT before deploy. Stays None for
-# fresh-LoRA and continued-adapter (non-VL) runs, whose saved adapter is already deployable as-is.
-_VL_WARMSTART_SFT_DIR: str | None = None
-# The selected catalog model for the same VL warm-start path. Finalize uses it to enforce the same
-# model-specific serving rank cap that init-time preflight used, even if the SFT adapter config lacks
-# base_model_name_or_path.
-_VL_WARMSTART_MODEL_ID: str | None = None
 
 
 def require_active_env():
@@ -450,8 +438,6 @@ __all__ = [
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
-    "recombine_lora_adapters",
-    "recombined_warmstart_adapter_dir",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
