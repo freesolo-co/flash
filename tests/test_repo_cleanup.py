@@ -138,11 +138,6 @@ def test_is_managed_env_repo_allowlist():
     assert rc._is_managed_env_repo(None) is False
 
 
-def test_run_id_epoch():
-    assert rc._run_id_epoch("flash-1782280298-13db58fa") == 1782280298.0
-    assert rc._run_id_epoch("weird") is None
-
-
 def test_scan_repo_classifies_paths():
     api = FakeApi(
         {
@@ -330,20 +325,31 @@ def test_sweep_protects_whole_repo_when_live_unmappable(monkeypatch):
     assert api.deleted == [(_managed("clean"), "sft/flash-2-old")]
 
 
-def test_sweep_uses_run_id_epoch_when_no_commit_dates(monkeypatch):
-    # A prefix whose files carry no commit dates falls back to the epoch in flash-<epoch>-<hex>.
+def test_sweep_skips_undatable_prefix(monkeypatch):
+    # A prefix whose files carry NO commit dates is undatable: submit time (the run-id epoch) is not
+    # last-activity, so the sweep never deletes it — a still-writing in-flight run whose fresh commits
+    # the Hub returned without dates must not be reaped on submit time (fail closed; retry next cycle).
     _wire(monkeypatch)
-    old_epoch = int(NOW - OLD * DAY)
-    young_epoch = int(NOW - YOUNG * DAY)
+    old_epoch = int(NOW - OLD * DAY)  # submitted long ago, but the listing carries no commit date
+    api = FakeApi({_managed("e1"): [_adapter(f"sft/flash-{old_epoch}-a/w", None)]})
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert api.deleted == []
+
+
+def test_sweep_never_touches_non_flashrun_repos(monkeypatch):
+    # The hard allowlist (flashrun-* only) must hold end-to-end through the sweep: env/eval packages in
+    # the same namespace are never delete targets even with old artifact-shaped paths.
+    _wire(monkeypatch)
     api = FakeApi(
         {
-            _managed("e1"): [_adapter(f"sft/flash-{old_epoch}-a/w", None)],  # old by epoch -> deleted
-            _managed("e2"): [_adapter(f"sft/flash-{young_epoch}-b/w", None)],  # young by epoch -> kept
+            f"{NS}/paper-gsm8k": [_adapter("sft/flash-1-old/adapter/w", OLD)],  # eval pkg, NOT a run repo
+            f"{NS}/some-env": [_adapter("sft/flash-2-old/adapter/w", OLD)],  # env package
+            _managed("real"): [_adapter("sft/flash-3-old/adapter/w", OLD)],  # the only reapable repo
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert n == 1
-    assert api.deleted == [(_managed("e1"), f"sft/flash-{old_epoch}-a")]
+    assert api.deleted == [(_managed("real"), "sft/flash-3-old")]
 
 
 def test_scan_failure_on_one_repo_is_not_fatal(monkeypatch):
@@ -406,6 +412,46 @@ def test_midsweep_unconfirmable_live_set_aborts_whole_sweep(monkeypatch):
     with pytest.raises(rc.CleanupAborted):
         rc.run_scheduled_cleanup(dry_run=False, api=api)
     assert len(api.deleted) == 1  # one deleted before the abort; the sweep then stopped
+
+
+def test_per_delete_recheck_spares_whole_repo_unmappable_midsweep(monkeypatch):
+    # The mid-sweep re-confirm's whole-repo branch: a repo that gains a live-but-unmappable adapter
+    # between enumeration and delete is protected wholesale.
+    target = (_managed("e"), "sft/flash-1-a")
+    calls = {"n": 0}
+
+    def _live():
+        calls["n"] += 1
+        if calls["n"] >= 2:  # pre-delete re-confirm: the target's repo is now live-but-unmappable
+            return (_LIVE_SENTINEL[0], {target[0]}, True)
+        return _LIVE_SENTINEL
+
+    _wire(monkeypatch, deployed=_live)
+    api = FakeApi({target[0]: [_adapter(target[1] + "/w", OLD)]})
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert api.deleted == []
+
+
+def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
+    # A single delete_folder failure (concurrent delete / rate-limit) is logged and skipped; the sweep
+    # continues and reaps the remaining targets.
+    _wire(monkeypatch)
+
+    class _FlakyDeleteApi(FakeApi):
+        def delete_folder(self, path_in_repo=None, repo_id=None, repo_type=None):
+            if path_in_repo == "sft/flash-1-old":
+                raise RuntimeError("HF 429 concurrent delete")
+            super().delete_folder(path_in_repo=path_in_repo, repo_id=repo_id, repo_type=repo_type)
+
+    api = _FlakyDeleteApi(
+        {
+            _managed("e1"): [_adapter("sft/flash-1-old/w", OLD)],  # delete raises -> logged, continue
+            _managed("e2"): [_adapter("sft/flash-2-old/w", OLD)],  # still reaped
+        }
+    )
+    n = rc.run_scheduled_cleanup(dry_run=False, api=api)
+    assert n == 1
+    assert api.deleted == [(_managed("e2"), "sft/flash-2-old")]
 
 
 # ---- per-prefix re-stat -----------------------------------------------------------------------

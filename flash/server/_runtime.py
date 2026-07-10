@@ -354,6 +354,7 @@ def recover_runs() -> None:
     a worker."""
     from flash.runner import (
         _gc_run_endpoints,
+        _mark_warmstart_source,
         _resolve_init_from_adapter,
         _status_org_id,
         _update,
@@ -431,6 +432,9 @@ def recover_runs() -> None:
                     owner_org_id=_status_org_id(status),
                     owner_key_id=owner_key_id,
                 )
+                # Refresh the warm-start marker so a child recovered across restarts keeps its aged
+                # source protected from the artifact GC past the age window (best-effort).
+                _mark_warmstart_source(spec, spec.run_id)
             except Exception as exc:
                 _log.warning(
                     "marking run %s failed: warm-start ref could not be resolved",

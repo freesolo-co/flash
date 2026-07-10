@@ -40,11 +40,14 @@ Safety — the sweep NEVER deletes blind:
   next cycle (fails closed).
 * **Age is last-activity, not submit time.** A prefix is reaped only if its newest COMMIT is >7d old,
   so an in-flight run (still writing checkpoints) is protected without needing any run registry.
-* **Warm-start sources are protected.** A run that ``init_from_adapter``s off another writes a 0-byte
-  ``referenced_by/<child_run_id>`` marker into the SOURCE repo. If a repo carries a marker committed
-  within the GC age, its artifacts are a source for a possibly-still-training child and are spared.
-  Older markers = finished children (which already baked a self-contained ``recomb`` adapter) and do
-  not protect.
+* **Warm-start sources are protected.** When a run ``init_from_adapter``s off another,
+  ``flash.runner._mark_warmstart_source`` writes a 0-byte ``referenced_by/<child_run_id>`` marker into
+  the SOURCE repo at submit (and re-writes it on recovery). If a repo carries a marker committed within
+  the GC age, its artifacts are a source for a possibly-still-training child and are spared. Older
+  markers = finished children (which already baked a self-contained ``recomb`` adapter) and do not
+  protect. Residual: a child that trains continuously for longer than the age window WITHOUT any
+  control-plane restart lets its source's marker age out; the fail-closed-on-undatable age gate (a
+  still-writing source keeps recent commits) is the backstop there.
 * **Only ``flashrun-*`` repos, only ``ARTIFACT_PHASES``** (hard allowlists); a prefix whose age can't be
   determined is left alone; the destructive delete holds this plane's per-run deploy/export lock; and
   the prefix is re-stat'd for recent writes right before deletion.
@@ -127,14 +130,6 @@ def _is_managed_env_repo(repo_id) -> bool:
     return repo_id.startswith(f"{_ARTIFACT_NAMESPACE}/") and repo_id.split("/", 1)[-1].startswith(
         RUN_REPO_PREFIX
     )
-
-
-def _run_id_epoch(run_id: str) -> float | None:
-    """The submit epoch embedded in ``flash-<epoch>-<hex>`` (``new_run_id``), or ``None``."""
-    parts = (run_id or "").split("-")
-    if len(parts) >= 3 and parts[0] == "flash" and parts[1].isdigit():
-        return float(parts[1])
-    return None
 
 
 def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
@@ -296,15 +291,18 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
             for pfx, (_size, ts) in prefixes.items():
                 if (repo, pfx) in live:
                     continue  # currently serving on some plane
-                age_ts = ts if ts is not None else _run_id_epoch(pfx.split("/", 1)[1])
-                if age_ts is None:
-                    continue  # undatable -> never delete on a guess
-                if (now - age_ts) <= max_age_s:
+                if ts is None:
+                    # No commit date => LAST ACTIVITY is unknown. The run-id epoch is SUBMIT time, not
+                    # activity — a run submitted >7d ago can still be training (long RunPod queue) or
+                    # have fresh commits the Hub hasn't dated yet. Never delete on submit time; skip and
+                    # retry next cycle (fail closed, matching the module's "can't date -> leave alone").
+                    continue
+                if (now - ts) <= max_age_s:
                     continue  # recently active (in-flight or just finished)
                 if warm_src:
-                    continue  # warm-start source for a recent child
+                    continue  # warm-start source for a recent child (referenced_by marker)
                 targets.append(
-                    _RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1], age_ts=age_ts)
+                    _RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1], age_ts=ts)
                 )
     if unknown_tops:
         logger.info("repo GC: skipped unrecognized non-artifact dirs (never deleted): %s", sorted(unknown_tops))
@@ -366,16 +364,10 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             )
             continue
         try:
-            # Re-confirm the GLOBAL live set immediately before the delete — now UNDER the held lock, so
-            # a deploy can't register this run between the confirm and the delete. If it can't be
-            # confirmed now, abort the WHOLE sweep (re-raise) rather than press on deleting other
-            # prefixes while an unidentified live adapter may be backed by one of them.
-            fresh, fresh_whole = _confirm_live_set()  # raises -> finally releases, sweep fails closed
-            if (target.repo_id, target.prefix) in fresh or target.repo_id in fresh_whole:
-                logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
-                continue
-            # Re-stat the prefix right before deleting: its newest file may have been written since
-            # enumeration (a cross-plane warm-start touch, a late checkpoint, a redeploy read-back).
+            # Re-stat the prefix: its newest file may have been written since enumeration (a cross-plane
+            # warm-start touch, a late checkpoint, a redeploy read-back). Do this FIRST — it is a slow
+            # recursive HF list — so the live-set re-confirm below is the LAST thing before the delete
+            # and its confirm->delete window is ~microseconds, not a full HF round-trip.
             try:
                 if _prefix_written_within(api, target.repo_id, target.prefix, now, max_age_s):
                     logger.warning(
@@ -390,6 +382,14 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                     target.prefix,
                     exc,
                 )
+                continue
+            # Re-confirm the GLOBAL live set immediately before the delete — now UNDER the held lock and
+            # right ahead of delete_folder, so a deploy can't register this run in the confirm->delete
+            # gap. If it can't be confirmed now, abort the WHOLE sweep (re-raise) rather than press on
+            # deleting other prefixes while an unidentified live adapter may be backed by one of them.
+            fresh, fresh_whole = _confirm_live_set()  # raises -> finally releases, sweep fails closed
+            if (target.repo_id, target.prefix) in fresh or target.repo_id in fresh_whole:
+                logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
                 continue
             try:
                 # delete_folder has no missing_ok; a concurrent delete / already-gone prefix raises.
