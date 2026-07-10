@@ -416,23 +416,36 @@ def _fake_trainer(engine, *, sleep_mode):
     )
 
 
+class _StubStructuredOutputsParams:
+    """CPU stand-in for vllm.sampling_params.StructuredOutputsParams; records its kwargs."""
+
+    def __init__(self, **kw):
+        self.kwargs = dict(kw)
+
+
 @pytest.fixture
 def _stub_vllm():
     """Stub the GPU-only ``vllm.SamplingParams`` so build_rollout_func imports on CPU."""
     prev = sys.modules.get("vllm")
+    prev_sp = sys.modules.get("vllm.sampling_params")
     mod = types.ModuleType("vllm")
     mod.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
+    sp_mod = types.ModuleType("vllm.sampling_params")
+    sp_mod.StructuredOutputsParams = _StubStructuredOutputsParams
+    mod.sampling_params = sp_mod
     sys.modules["vllm"] = mod
+    sys.modules["vllm.sampling_params"] = sp_mod
     try:
         yield
     finally:
-        if prev is None:
-            sys.modules.pop("vllm", None)
-        else:
-            sys.modules["vllm"] = prev
+        for name, prev_mod in (("vllm", prev), ("vllm.sampling_params", prev_sp)):
+            if prev_mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prev_mod
 
 
-def _build(tok, active_env=None):
+def _build(tok, active_env=None, structured_outputs=None):
     from flash.engine.multiturn_rollout import build_rollout_func
 
     return build_rollout_func(
@@ -446,6 +459,7 @@ def _build(tok, active_env=None):
         stop=None,
         thinking=False,
         engine_max_len=None,
+        structured_outputs=structured_outputs,
     )
 
 
@@ -934,3 +948,40 @@ def test_make_env_glue_rejects_non_verbatim_template():
     glue = make_env_glue(_BadTok(), thinking=False)
     with pytest.raises(ValueError, match="could not uniquely locate its probe"):
         glue([{"role": "user", "content": "obs"}])
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_constrains_every_turn_with_structured_outputs():
+    """[train] structured_outputs must reach SamplingParams on EVERY assistant turn (mid-rollout
+    turns included), as a FRESH StructuredOutputsParams per request — vLLM's processor stamps a
+    per-request backend on the instance, so sharing one across requests is unsafe."""
+    captured = []
+
+    def _gen(ids, sp):
+        captured.append(sp)
+        return ([5, 6], None, "ok")
+
+    engine = _FakeEngine(gen=_gen)
+    spec = {"json": {"type": "object"}, "disable_any_whitespace": True}
+    rf = _build(_FakeTok(), active_env=_TwoTurnEnv(), structured_outputs=spec)
+    rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
+    assert len(captured) == 2  # both model turns of the two-turn rollout
+    for sp in captured:
+        assert sp.structured_outputs.kwargs == spec
+    assert captured[0].structured_outputs is not captured[1].structured_outputs
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_unconstrained_without_structured_outputs():
+    # No [train] structured_outputs -> the sampler kwargs must not carry the field at all.
+    captured = []
+
+    def _gen(ids, sp):
+        captured.append(sp)
+        return ([5, 6], None, "ok")
+
+    engine = _FakeEngine(gen=_gen)
+    rf = _build(_FakeTok())
+    rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
+    assert captured
+    assert all(not hasattr(sp, "structured_outputs") for sp in captured)
