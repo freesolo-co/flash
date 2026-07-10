@@ -274,6 +274,46 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch):
+    # A dry-run is a faithful server-side preview: it runs the SAME warm-start rank preflight as a
+    # real submit, so a rank-mismatched adapter is rejected at --dry-run (400) instead of being
+    # silently accepted and only failing at live submit. A rejected dry-run leaves no run behind.
+    import flash.lora_rank as rank_mod
+    import flash.runner as runner
+    import flash.runner.checkpoints as checkpoints
+    from flash.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
+        }
+    )
+    runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+    monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
+    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 96})
+
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+        },
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 400
+    assert "has rank 96" in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.

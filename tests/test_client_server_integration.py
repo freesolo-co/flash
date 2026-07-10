@@ -209,6 +209,24 @@ def test_create_status_list_cancel_lifecycle(make_client) -> None:
     assert cancelled["state"] == "cancelled"
 
 
+def test_dry_run_create_previews_on_the_server(make_client) -> None:
+    # `create_run(dry_run=True)` runs the real submit-time validation on the server (cost quote +
+    # config preflights) but allocates no GPU and charges nothing. It returns a state=dry_run status
+    # carrying the cost estimate, and the preview is persisted like any run (retrievable/listable).
+    client = make_client()
+
+    created = client.create_run(SPEC, dry_run=True)
+    run_id = created["run_id"]
+    assert run_id
+    assert created["state"] == "dry_run"
+    assert created["spec"]["model"] == SPEC["model"]
+    # The cost quote now runs in dry-run too, so the preview carries an estimate.
+    assert created.get("estimated_cost_usd") is not None
+    # Persisted like any run — retrievable and listed — but no GPU was ever allocated.
+    assert client.get_run(run_id)["state"] == "dry_run"
+    assert run_id in [r["run_id"] for r in client.list_runs()]
+
+
 def test_logs_offset_paging_roundtrip(make_client) -> None:
     import flash.runner as runner
 
