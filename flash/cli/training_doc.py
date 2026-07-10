@@ -380,28 +380,32 @@ optimizer-step counts are derived from those epochs.
 ## On-policy distillation (`algorithm = "opd"`)
 
 Pick distillation when a much stronger **teacher** model can grade your student's work
-token-by-token. The student samples on-policy (like GRPO), the managed GLM 5.2 teacher scores
-each of *its own* completions, and a dense per-token loss teaches the student to match the teacher —
-far more sample-efficient than reward-based RL and with no reward to design. It supports `epochs`
-like SFT/GRPO and produces a LoRA served exactly like SFT.
+token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.2 by default,
+or another via `[train] teacher_model`) scores each of *its own* completions, and a dense per-token
+loss teaches the student to match the teacher — far more sample-efficient than reward-based RL and
+with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA served exactly like SFT.
 
 - **Vet the teacher on your task before you distil — this is a precondition, not a formality.**
-  Reverse-KL can only pull the student *toward* the managed GLM-5.2 teacher, so OPD's ceiling is
+  Reverse-KL can only pull the student *toward* the selected teacher, so OPD's ceiling is
   roughly the teacher's own competence at your task. If the teacher is weak, frequently wrong, or
   solves the task with a strategy your environment can't reward, distillation faithfully transfers
   those flaws and **drives the student *below* its SFT/base starting point instead of above it** — a
   low per-token loss just means it matched a bad teacher. So measure the teacher the way you'd score
-  a candidate *before submitting*: roll GLM-5.2 through your own environment on a held-out split and
-  read both its score and a sample of its trajectories. Only run OPD when the teacher clearly beats
-  your student (and your target bar) *and* solves the task the way you want the student to. When
-  GLM-5.2 is at or below your student on the task, OPD is the wrong tool — reach for GRPO
-  (reward-driven, can exceed any single teacher) or SFT on curated data instead.
-- **No teacher key or model override to set up.** The GLM 5.2 teacher and its Fireworks key are platform-managed: the
-  service supplies its own key to every opd run, so there is nothing to export or declare — an opd
-  run submits like any other. Bring-your-own teacher models and keys are not supported; a
-  `FIREWORKS_API_KEY` in your shell is simply ignored. The key is never stored in the spec or
-  needed at serving time.
-- **The student (Qwen / MiniCPM / Kimi) and the teacher (GLM) have different tokenizers.** Flash
+  a candidate *before submitting*: roll your chosen teacher through your own environment on a held-out
+  split and read both its score and a sample of its trajectories. Only run OPD when the teacher clearly
+  beats your student (and your target bar) *and* solves the task the way you want the student to. When
+  the teacher is at or below your student on the task, OPD is the wrong tool — reach for GRPO
+  (reward-driven, can exceed any single teacher) or SFT on curated data instead. `[train] teacher_model`
+  lets you pick the teacher that best fits your task without changing anything else.
+- **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
+  the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
+  `glm-5.2` (default), `qwen-3.7-max`, `minimax-m3`, `deepseek-v4-pro`, `kimi-k2.6`. Every option is
+  a Fireworks-hosted model reached with the platform's own key, so there is nothing to export or
+  declare — an opd run submits like any other, and a `FIREWORKS_API_KEY` in your shell is ignored.
+  Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
+  teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
+  at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
+- **The student (Qwen / MiniCPM / Kimi) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
@@ -412,7 +416,7 @@ like SFT/GRPO and produces a LoRA served exactly like SFT.
   teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
   the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
   never distilled (they're context, not the student's output). Set `[train] max_context_tokens` to bound the
-  transcript; the teacher must cover it (GLM-5.2's context far exceeds the default budget).
+  transcript; the teacher must cover it (the allow-listed teachers' contexts far exceed the default budget).
 - **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
   Keep a held-out split, `flash deploy` the adapter, and score it — confirm the student actually
   moved toward the teacher's behavior, not just its surface tokens.
@@ -429,6 +433,9 @@ id = "your-org/my-env"
 epochs = 1
 max_examples = 2
 lora_rank = 32
+# teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
+#                                                       # glm-5.2 (default) | qwen-3.7-max | minimax-m3
+#                                                       # | deepseek-v4-pro | kimi-k2.6 (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 # opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
 #                                                       # student runs past the length cap without
@@ -436,7 +443,7 @@ lora_rank = 32
 ```
 
 The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
-the zero-width stop token** — distilling toward a verbose teacher (GLM-5.2) erodes the student's
+the zero-width stop token** — distilling toward a verbose teacher (e.g. GLM-5.2) erodes the student's
 termination and rollouts run away to `max_completion_tokens`. `opd_eos_loss_coef` (default 0.5) adds a
 bounded, self-limiting behaviour-cloning term that reinstates the stop signal on rollouts that
 terminated naturally; watch `truncated_rollouts` fall and `mean_eos_logprob` rise in the run metrics.

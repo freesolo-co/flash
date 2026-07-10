@@ -640,23 +640,40 @@ def test_opd_vram_sizing_uses_completion_budget_not_sft_default():
     assert opd_rollout_seq_len(4096, 8192, False) == 4096  # explicit max_length pins the sequence
 
 
-def test_opd_rejects_teacher_model_override():
+def test_opd_selects_managed_teacher_and_rejects_unknown():
+    """[train].teacher_model selects the managed teacher from a fixed allow-list: a supported alias
+    (or the raw Fireworks id, or a spaced/mixed-case form) parses and is stored as its canonical alias;
+    an unsupported teacher is rejected at PARSE time (before a paid GPU) with a teacher-specific error."""
     from flash.schema import ConfigError, spec_from_dict
 
-    with pytest.raises(ConfigError, match="teacher_model"):
-        spec_from_dict(
+    def _spec(teacher):
+        return spec_from_dict(
             {
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {
-                    "epochs": 1,
-                    "max_examples": 5,
-                    "teacher_model": "accounts/fireworks/models/glm-5p2",
-                },
+                "train": {"epochs": 1, "max_examples": 5, "teacher_model": teacher},
             },
             run_id="x",
         )
+
+    # Supported aliases parse and are stored as the canonical alias.
+    assert _spec("kimi-k2.6").train.teacher_model == "kimi-k2.6"
+    assert _spec("qwen-3.7-max").train.teacher_model == "qwen-3.7-max"
+    assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("minimax-m3").train.teacher_model == "minimax-m3"
+    # A spaced / mixed-case form normalizes to the canonical alias.
+    assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
+    # The raw Fireworks model id is also accepted (resolves to its alias), including with stray
+    # surrounding whitespace (stripped like the alias branch).
+    assert _spec("accounts/fireworks/models/glm-5p2").train.teacher_model == "glm-5.2"
+    assert _spec("  accounts/fireworks/models/glm-5p2  ").train.teacher_model == "glm-5.2"
+    # Omitting/blank leaves it unset ("" => the worker uses the default GLM 5.2 teacher).
+    assert _spec("").train.teacher_model == ""
+
+    # An unsupported teacher is rejected at parse time with a teacher-specific ConfigError.
+    with pytest.raises(ConfigError, match="teacher_model"):
+        _spec("gpt-5.5")
 
 
 def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
@@ -2598,6 +2615,28 @@ def test_opd_teacher_rate_matches_fireworks_glm5p2_input_price():
     assert teacher_price_per_1m("")[0] == 1.40  # omitted teacher -> representative default rate
 
 
+def test_opd_teacher_price_table_covers_every_allowlisted_teacher():
+    """Every allow-listed teacher is priced by its exact row (the cost table is DERIVED from
+    recipe.TEACHER_MODELS, so there is no unpriced teacher), the new teachers carry their own input
+    prices (not silently GLM-priced), and an unknown teacher falls back to the default rate."""
+    from flash.cost.facts import TEACHER_USD_PER_1M, teacher_price_per_1m
+    from flash.engine.recipe import TEACHER_MODELS
+
+    # Derivation parity: one priced row per allow-listed teacher, keyed by provider model id.
+    assert TEACHER_USD_PER_1M == {i.model_id: i.usd_per_1m for i in TEACHER_MODELS.values()}
+    for info in TEACHER_MODELS.values():
+        assert teacher_price_per_1m(info.model_id) == info.usd_per_1m
+
+    # The four new teachers carry their own input prices (distinct from GLM's $1.40/M).
+    assert teacher_price_per_1m("accounts/fireworks/models/qwen3p7-max")[0] == 2.00
+    assert teacher_price_per_1m("accounts/fireworks/models/minimax-m3")[0] == 0.60
+    assert teacher_price_per_1m("accounts/fireworks/models/deepseek-v4-pro")[0] == 1.20
+    assert teacher_price_per_1m("accounts/fireworks/models/kimi-k2p6")[0] == 0.90
+
+    # An unknown teacher id falls back defensively to the default (GLM) rate.
+    assert teacher_price_per_1m("accounts/fireworks/models/does-not-exist")[0] == 1.40
+
+
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
@@ -3258,6 +3297,42 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
         ),
     )
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
+
+
+def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
+    """_resolve_opd_knobs reads [train].teacher_model (a friendly alias) and resolves it to the
+    Fireworks model id the TeacherClient sends; an unset value keeps the default GLM 5.2 teacher; the
+    single shared base_url is unchanged; an unsupported teacher fails loudly on the worker."""
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:  # any [train] field not set returns None (falls back to the recipe default)
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _knobs(teacher):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(
+                JOB_SPEC=SimpleNamespace(train=_Train(teacher_model=teacher)), THINKING=False
+            ),
+        )
+        return opd_mod._resolve_opd_knobs()
+
+    # A friendly alias resolves to the provider model id.
+    assert _knobs("kimi-k2.6").teacher_model == "accounts/fireworks/models/kimi-k2p6"
+    assert _knobs("qwen-3.7-max").teacher_model == "accounts/fireworks/models/qwen3p7-max"
+    # Unset / blank / None -> the default GLM 5.2 teacher (historical behavior preserved).
+    assert _knobs("").teacher_model == "accounts/fireworks/models/glm-5p2"
+    assert _knobs(None).teacher_model == "accounts/fireworks/models/glm-5p2"
+    # base_url is shared across every allow-listed teacher (one Fireworks endpoint + one managed key).
+    assert _knobs("minimax-m3").teacher_base_url == opd_mod.RECIPE.opd.teacher_base_url
+    # An unsupported teacher fails loudly on the worker (defensive guard, mirrors the kl_coef check).
+    with pytest.raises(RuntimeError, match="teacher_model"):
+        _knobs("gpt-5.5")
 
 
 def test_resolve_opd_knobs_eos_loss_coef_override(monkeypatch):

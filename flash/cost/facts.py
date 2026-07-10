@@ -4,6 +4,7 @@ selection, model size/quant, and reward-grader latency. Pure tables + accessors.
 from __future__ import annotations
 
 from flash.catalog import MODELS
+from flash.engine.recipe import TEACHER_MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -161,14 +162,15 @@ def reward_seconds_per_completion(override: float | None = None) -> float:
     return AVG_REWARD_SECONDS_PER_COMPLETION
 
 
-# Fireworks serverless pricing for the on-policy-distillation GLM teacher, $/1M tokens as
-# (input, output). Static like gpu_hourly_usd so cost estimation is deterministic/offline and needs
-# NO FIREWORKS_API_KEY. Source: https://fireworks.ai/models/fireworks/glm-5p2 lists
-# $1.40 / $0.14 / $4.40 (input / cached input / output) per 1M. opd echo-scores completions
-# (max_tokens=0), so only INPUT tokens are billed (the teacher never generates) — but the table keeps
-# both so a mispriced entry is obvious.
+# Fireworks serverless pricing for the on-policy-distillation teachers, $/1M tokens as (input, output),
+# keyed by provider model id. DERIVED from the recipe.TEACHER_MODELS allow-list so there is ONE source
+# of truth (adding a teacher there prices it here automatically — no drift). Static like gpu_hourly_usd
+# so cost estimation is deterministic/offline and needs NO FIREWORKS_API_KEY. opd echo-scores
+# completions (max_tokens=0), so only INPUT tokens are billed (the teacher never generates) — but the
+# table keeps both columns so a mispriced entry is obvious. The default GLM 5.2 is
+# https://fireworks.ai/models/fireworks/glm-5p2 ($1.40 / $0.14 / $4.40 input / cached / output per 1M).
 TEACHER_USD_PER_1M: dict[str, tuple[float, float]] = {
-    "accounts/fireworks/models/glm-5p2": (1.40, 4.40),
+    info.model_id: info.usd_per_1m for info in TEACHER_MODELS.values()
 }
 # Fireworks echo-scoring round-trip per completion (wall time, concurrency-bound like reward grading).
 AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
@@ -177,9 +179,10 @@ AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
     """(input, output) $/1M tokens for a teacher model.
 
-    OPD uses the recipe's fixed GLM 5.2 teacher. ``teacher_model`` is accepted only for internal
-    diagnostics/tests; user configs cannot override it. Unknown values fall back defensively to
-    the fixed teacher rate."""
+    ``teacher_model`` is the provider model id chosen via ``[train] teacher_model`` (resolved from the
+    recipe.TEACHER_MODELS allow-list); an empty value resolves to the default GLM 5.2 teacher. Every
+    allow-listed teacher has a priced row, so a real (validated) spec always hits an exact entry;
+    unknown values still fall back defensively to the default rate."""
     from flash.engine.recipe import RECIPE
 
     default = TEACHER_USD_PER_1M[RECIPE.opd.teacher_model]

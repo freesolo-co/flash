@@ -29,7 +29,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
-from flash.engine.recipe import RECIPE
+from flash.engine.recipe import RECIPE, resolve_teacher
 from flash.engine.steps import on_policy_steps
 from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
 from flash.engine.vram import opd_completion_len
@@ -187,8 +187,17 @@ def _resolve_opd_knobs() -> OpdKnobs:
             "0 makes every optimizer step a no-op (zero gradient) yet still counts toward `steps` and "
             "publishes an untrained adapter. Omit the field to use the default, or set a positive value."
         )
+    # Resolve the managed teacher from [train].teacher_model (a friendly alias, "" => the GLM 5.2
+    # default). resolve_teacher validated the same value at parse time; re-resolve here so the worker
+    # sends the right Fireworks model id, and re-raise as a loud RuntimeError (mirroring the kl_coef
+    # guard) if a spec somehow reaches the worker with an unsupported teacher. base_url is shared by
+    # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
+    try:
+        teacher = resolve_teacher(opt("teacher_model", ""))
+    except ValueError as e:
+        raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
-        teacher_model=d.teacher_model,
+        teacher_model=teacher.model_id,
         teacher_base_url=d.teacher_base_url,
         epochs=int(t.epochs) if t and t.epochs is not None else d.num_epochs,
         learning_rate=float(opt("learning_rate", 0) or d.learning_rate),
