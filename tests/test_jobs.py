@@ -1370,7 +1370,9 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 16})
+        # A continued warm-start runs at the source adapter's rank, so it must equal the run's
+        # train.lora_rank (default 32 here) — the rank preflight rejects a mismatch.
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 32})
         monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
