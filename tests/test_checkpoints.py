@@ -366,78 +366,6 @@ def test_prune_stale_resume_checkpoints_no_repo_is_noop(monkeypatch):
     assert rec.deleted == []
 
 
-def test_on_save_skips_deployable_when_vl_recombine_fails(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """A VL warm-start whose recorded SFT dir was evicted makes recombined_warmstart_adapter_dir
-    RAISE. The raw checkpoint adapter is GRPO-only / SFT-less, so the deployable publish must be
-    SKIPPED (not fall back to the raw adapter and advertise a known-broken step). The resume
-    checkpoint is still uploaded so the run can resume and re-merge."""
-    import flash.engine.worker as worker
-
-    rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
-
-    def _raise(_ckpt):
-        raise RuntimeError("recombine: ... SFT-less adapter cannot be recombined")
-
-    monkeypatch.setattr(worker, "recombined_warmstart_adapter_dir", _raise)
-
-    out = tmp_path / "out"
-    out.mkdir()
-    _make_ckpt_dir(out, 4)
-    cb = worker.make_checkpoint_upload_callback()
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-
-    paths = [u["path_in_repo"] for u in rec.uploads]
-    # NO deployable adapter advertised for this step...
-    assert not any(p.endswith("checkpoints/step-4/adapter") for p in paths), paths
-    # ...but the resume checkpoint is still uploaded so the run can resume and re-merge.
-    assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
-
-
-def test_recombined_warmstart_skips_stale_legacy_weights(tmp_path, monkeypatch):
-    """The recombined deploy adapter writes fresh safetensors; do not copy stale raw .bin weights."""
-    import shutil
-    from pathlib import Path
-
-    import flash.engine.worker as worker
-    import flash.engine.worker.adapter as worker_adapter
-
-    sft = tmp_path / "sft"
-    grpo = tmp_path / "grpo"
-    sft.mkdir()
-    grpo.mkdir()
-    (grpo / "adapter_config.json").write_text("{}")
-    (grpo / "adapter_model.bin").write_bytes(b"stale")
-    (grpo / "special_tokens_map.json").write_text("{}")
-    (grpo / "optimizer.pt").write_text("trainer state")
-
-    def fake_recombine(sft_adir, src_adapter_dir, out_dir, *, model_id=None):
-        assert sft_adir == str(sft)
-        assert src_adapter_dir == str(grpo)
-        out = Path(out_dir)
-        (out / "adapter_config.json").write_text("{}")
-        (out / "adapter_model.safetensors").write_bytes(b"fresh")
-        return 8
-
-    monkeypatch.setattr(worker, "_VL_WARMSTART_SFT_DIR", str(sft), raising=False)
-    monkeypatch.setattr(worker, "_VL_WARMSTART_MODEL_ID", "Qwen/Qwen3.5-4B", raising=False)
-    monkeypatch.setattr(worker_adapter, "recombine_lora_adapters", fake_recombine)
-
-    out_path = worker_adapter.recombined_warmstart_adapter_dir(str(grpo))
-    assert out_path is not None
-    out = Path(out_path)
-
-    try:
-        assert (out / "adapter_model.safetensors").exists()
-        assert not (out / "adapter_model.bin").exists()
-        assert (out / "special_tokens_map.json").exists()
-        assert not (out / "optimizer.pt").exists()
-    finally:
-        shutil.rmtree(out, ignore_errors=True)
-
-
 # --------------------------------------------------------------------------------------------
 # Control plane: list_checkpoints
 # --------------------------------------------------------------------------------------------
@@ -766,15 +694,12 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
     src = _finalize_src("flash.engine.worker.rl", "run_rl")
-    # Final adapter is saved, recombined for a VL warm-start (SFT⊕GRPO so the deploy isn't SFT-less),
-    # then both the default upload and the deployable checkpoint ship that recombined dir — and the
-    # recombined temp dir is cleaned up afterwards so finalize doesn't leak /tmp.
+    # Warm-start CONTINUES the one adapter in place, so the saved adapter already carries SFT+GRPO on
+    # the original catalog base and deploys as-is: the final adapter is uploaded as the default and
+    # published as the deployable checkpoint directly — no recombine step.
     assert "save_pretrained(adapter_dir)" in src
-    assert "recombined = _w.recombined_warmstart_adapter_dir(adapter_dir)" in src
-    assert "deploy_dir = recombined or adapter_dir" in src
-    assert 'hf_upload_folder(deploy_dir, "adapter"' in src
-    assert "publish_deployable_checkpoint(deploy_dir, _steps_run)" in src
-    assert "shutil.rmtree(recombined" in src
+    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_w.publish_deployable_checkpoint(adapter_dir, _steps_run)" in src
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
