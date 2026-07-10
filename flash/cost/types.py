@@ -27,8 +27,9 @@ class RunConfig:
     thinking: bool = False
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
-    # OPD only: internal Fireworks teacher id for teacher-token diagnostics. User configs cannot
-    # override this; an empty value resolves to the recipe's fixed GLM 5.2 teacher.
+    # OPD only: the Fireworks teacher model id (already resolved from [train].teacher_model at parse).
+    # Prices the teacher-API estimate; an empty value resolves to the default GLM 5.2 teacher (an
+    # omitted [train].teacher_model).
     teacher_model: str = ""
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
@@ -148,7 +149,7 @@ class CostEstimate:
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
-    # opd only: external Fireworks GLM teacher token spend (0.0 for sft/grpo). Billed by Fireworks
+    # opd only: external Fireworks teacher token spend (0.0 for sft/grpo). Billed by Fireworks
     # to the platform-managed teacher key (users don't supply one), tracked separately from the
     # platform-billed GPU charge — so it is NOT part of total_usd; shown as its own itemized
     # diagnostic line only.
@@ -181,7 +182,7 @@ class CostEstimate:
         ]
         if self.teacher_api_usd > 0:
             lines.append(
-                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks GLM token spend on the "
+                f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks teacher token spend on the "
                 "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
