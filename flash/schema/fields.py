@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
+from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
 from flash.spec import WandbSpec
 
@@ -70,6 +72,124 @@ def _train_stops(train_raw: dict) -> tuple[str, ...]:
 
 class ConfigError(ValueError):
     pass
+
+
+# vLLM StructuredOutputsParams surface: exactly one constraint field (_SO_CONSTRAINT_KEYS, imported
+# above from flash.engine.structured_outputs as the single source of truth) plus these options.
+# vLLM also offers grammar/structural_tag, but Flash does not support them; reject explicitly so a
+# `{"grammar": ...}` table isn't silently swallowed by the bare-JSON-schema fallback below.
+_SO_REMOVED_KEYS = frozenset({"grammar", "structural_tag"})
+_SO_OPTION_KEYS = ("disable_any_whitespace", "disable_additional_properties", "whitespace_pattern")
+# Common TOML/JSON spellings folded onto the vLLM field names, so users can write whichever they know.
+_SO_ALIASES = {"json_schema": "json", "schema": "json", "choices": "choice"}
+
+
+def _so_error(msg: str) -> ConfigError:
+    return ConfigError(f"train.structured_outputs {msg}")
+
+
+def _so_canonical(value: Any) -> dict | None:
+    """Fold one structured_outputs value into canonical StructuredOutputsParams kwargs.
+
+    Accepts (flexibility over one blessed spelling): a canonical/aliased constraint table, a bare
+    JSON-schema table, a JSON string of either, or the "json"/"json_object" shorthand. Returns
+    None for the explicit "unconstrained" forms (false/""/"none")."""
+    if value is None or value is False:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.lower() == "none":
+            return None
+        if s.lower() in ("json", "json_object"):
+            return {"json_object": True}
+        try:
+            parsed = json.loads(s)
+        except ValueError as exc:
+            raise _so_error(
+                'string form must be JSON (a schema/constraint object) or the "json_object" '
+                f"shorthand; got unparseable {s[:80]!r} ({exc})"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise _so_error("JSON string form must decode to an object")
+        return _so_canonical(parsed)
+    if not isinstance(value, dict):
+        raise _so_error("must be a table, a JSON string, or false")
+    removed = sorted(k for k in value if k in _SO_REMOVED_KEYS)
+    if removed:
+        raise _so_error(
+            f"{', '.join(removed)} constraint(s) are not supported; use one of "
+            f"{', '.join(_SO_CONSTRAINT_KEYS)}"
+        )
+
+    folded = {_SO_ALIASES.get(k, k): v for k, v in value.items()}
+    if len(folded) < len(value):
+        raise _so_error(f"sets the same constraint twice via aliases: {sorted(value)}")
+    constraints = [k for k in _SO_CONSTRAINT_KEYS if folded.get(k) is not None]
+    if not constraints:
+        # No constraint key at all: the whole table is an inline JSON schema (its own
+        # "type"/"properties" keys are schema vocabulary, not ours).
+        return {"json": value}
+    unknown = sorted(set(folded) - set(_SO_CONSTRAINT_KEYS) - set(_SO_OPTION_KEYS))
+    if unknown:
+        raise _so_error(
+            f"unknown key(s): {', '.join(unknown)} (constraints: "
+            f"{', '.join(_SO_CONSTRAINT_KEYS)}; options: {', '.join(_SO_OPTION_KEYS)}; "
+            f"aliases: {', '.join(sorted(_SO_ALIASES))})"
+        )
+    if len(constraints) > 1:
+        raise _so_error(f"must set exactly ONE constraint, got: {', '.join(constraints)}")
+
+    kind = constraints[0]
+    val = folded[kind]
+    canonical: dict[str, Any] = {}
+    if kind == "json":
+        if isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except ValueError as exc:
+                raise _so_error(f"json schema string is not valid JSON: {exc}") from exc
+        if not isinstance(val, dict):
+            raise _so_error("json must be a schema table or a JSON-object string")
+        canonical["json"] = val
+    elif kind == "choice":
+        if (
+            not isinstance(val, (list, tuple))
+            or not val
+            or not all(isinstance(c, str) and c for c in val)
+        ):
+            raise _so_error("choice must be a non-empty list of non-empty strings")
+        canonical["choice"] = list(val)
+    elif kind == "json_object":
+        if val is not True:
+            raise _so_error("json_object must be true (omit the key for unconstrained output)")
+        canonical["json_object"] = True
+    else:  # regex
+        if not isinstance(val, str) or not val.strip():
+            raise _so_error(f"{kind} must be a non-empty string")
+        canonical[kind] = val
+
+    for opt in _SO_OPTION_KEYS:
+        v = folded.get(opt)
+        if v is None:
+            continue
+        if opt == "whitespace_pattern":
+            if not isinstance(v, str) or not v:
+                raise _so_error("whitespace_pattern must be a non-empty string")
+        elif not isinstance(v, bool):
+            raise _so_error(f"{opt} must be a boolean")
+        canonical[opt] = v
+    return canonical
+
+
+def _train_structured_outputs(train_raw: dict) -> str:
+    """Validate/normalize [train] structured_outputs to canonical JSON ("" = unconstrained).
+
+    The canonical string is exactly the kwargs of vLLM's StructuredOutputsParams, so the worker
+    applies it with zero re-interpretation (json.loads -> StructuredOutputsParams(**spec))."""
+    canonical = _so_canonical(train_raw.get("structured_outputs"))
+    if canonical is None:
+        return ""
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"))
 
 
 def _require_environment_ref(value: str, message: str) -> None:

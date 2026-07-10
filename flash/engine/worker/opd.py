@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import on_policy_steps
+from flash.engine.structured_outputs import describe_structured_outputs, parse_structured_outputs
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -158,6 +159,10 @@ class OpdKnobs:
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
     # scores/trains on text past the intended answer boundary.
     stop_sequences: tuple = ()
+    # Canonical StructuredOutputsParams kwargs JSON from [train] structured_outputs ("" = off);
+    # constrains every student rollout (parity with GRPO). Teacher echo-scoring needs no schema —
+    # it scores the student's already-constrained tokens.
+    structured_outputs: str = ""
 
 
 def _resolve_opd_knobs() -> OpdKnobs:
@@ -208,6 +213,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         save_every=int(opt("save_every", 0) or 20),
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
+        structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
     )
 
 
@@ -545,6 +551,12 @@ def run_opd():
         f"ctx={seq_cap} lora_rank={lora_rank} util={vllm_kwargs['gpu_memory_utilization']:.2f} "
         f"rollout_batch={vllm_kwargs.get('rollout_batch_size') or 'auto'}"
     )
+    _so_spec = parse_structured_outputs(knobs.structured_outputs)
+    if _so_spec:
+        print(
+            f"[opd] structured outputs: every student rollout constrained to "
+            f"{describe_structured_outputs(_so_spec)}"
+        )
     t_vllm_init = time.time()
     with liveness_heartbeat("opd_vllm_initializing"):
         vllm_rollout = OpdVllmRolloutEngine(
@@ -553,6 +565,7 @@ def run_opd():
             temperature=knobs.temperature,
             top_p=knobs.top_p,
             stop_sequences=tuple(str(s) for s in knobs.stop_sequences),
+            structured_outputs=_so_spec,
             lora_rank=lora_rank,
             seed=_w.SEED,
             **vllm_kwargs,
@@ -1197,6 +1210,9 @@ class _GenResult:
     truncated: bool = False
     skip: bool = False
     skip_reason: str = ""
+    # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
+    # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
+    forced: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1241,6 +1257,7 @@ class _Pending:
 def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
+    forced = tuple(bool(f) for f in (getattr(out, "forced", ()) or ()))
     decode = getattr(tok, "decode", None)
     completion_text = out.text or (
         decode(completion_ids, skip_special_tokens=True) if decode else ""
@@ -1275,6 +1292,8 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         completion_ids=completion_ids,
         completion_text=completion_text,
         gen_tokens=gen_tokens,
+        # Trimming drops a trailing stop suffix, so the kept ids are a prefix -> slice forced to match.
+        forced=forced[: len(completion_ids)],
     )
 
 
@@ -1387,6 +1406,20 @@ class _PreparedGkdGroups:
     token_indices: tuple[int, ...]
     group_lengths: tuple[int, ...]
     teacher_logsums: tuple[float, ...]
+
+
+def _drop_fully_forced_groups(groups, forced):
+    """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
+    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
+    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
+    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op."""
+    if not forced:
+        return groups
+    return [
+        (s_idx, tsum)
+        for (s_idx, tsum) in groups
+        if not (s_idx and all(i < len(forced) and forced[i] for i in s_idx))
+    ]
 
 
 def _prepare_gkd_groups(groups) -> _PreparedGkdGroups | None:
@@ -1584,6 +1617,12 @@ def _resolve_samples_batched(
             )
             continue
         groups = groupwise_alignment(student_toks, score.teacher_toks)
+        # Drop fully grammar-forced groups, THEN let the loss's per-token mean (_gkd_loss_from_logps)
+        # re-normalize over the SURVIVING tokens: masking removes the spurious forced-position teacher
+        # signal without shrinking the content-token gradient. A fully-forced completion drops to zero
+        # groups -> alignment_empty (below), and such samples are excluded from the step's 1/nseq mean
+        # (_account skips r.loss is None), so the batch stays normalized too.
+        groups = _drop_fully_forced_groups(groups, gen.forced or ())
         coverage = groupwise_coverage(groups, student_toks)
         n_align = sum(1 for st in student_toks if st.end > st.start)
         group_granularity = (n_align / len(groups)) if groups else 0.0
