@@ -3573,7 +3573,8 @@ def test_resolve_samples_batched_gates_eos_reinforcement_by_runaway_rate(monkeyp
     opd_mod._resolve_samples_batched(
         _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1, runaway_rate=0.5
     )
-    assert seen_coefs and all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
+    assert seen_coefs
+    assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
 
 
 def test_resolve_samples_batched_uses_full_logits():
