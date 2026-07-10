@@ -107,22 +107,20 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     assert "torch==2.10.0" not in script
 
 
-def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
-    """Opt-in per-SM warmed images (PR #213) reach Lambda too: with FLASH_WORKER_IMAGE_PER_SM set,
-    the GPU class picks the matching -smXX tag (so the worker's baked kernel cache matches the rented
-    GPU's arch). Default + FLASH_WORKER_IMAGE override semantics are unchanged."""
+def test_image_per_sm_selects_arch_tag(monkeypatch):
+    """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
+    tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch). A call
+    with no GPU class + the FLASH_WORKER_IMAGE override semantics are unchanged."""
     from flash.providers.lambdalabs.jobs import builders
     from flash.providers.runpod.train import WORKER_IMAGE
 
-    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_PER_SM", "FLASH_WORKER_IMAGE_TEMPLATE"):
+    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_TEMPLATE"):
         monkeypatch.delenv(key, raising=False)
 
-    # default: flat base image, byte-identical to pre-PR behavior
+    # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE
-    assert builders.lambda_image("H100") == WORKER_IMAGE
 
-    # per-SM opt-in: the GPU class appends the arch tag, and it lands in the cloud-init
-    monkeypatch.setenv("FLASH_WORKER_IMAGE_PER_SM", "1")
+    # a baked GPU class appends the arch tag by default, and it lands in the cloud-init
     assert builders.lambda_image("H100") == f"{WORKER_IMAGE}-sm90"  # H100 = sm90
     assert builders.lambda_image("A10") == f"{WORKER_IMAGE}-sm86"  # A10 = sm86
     payload = builders.build_payload(_spec(gpu_type="H100"), seed=0, attempt=0)

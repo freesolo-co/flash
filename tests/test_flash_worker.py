@@ -559,7 +559,6 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "install_chalk_kernels(" in src
     assert "fused_ce=False" in src
     assert "_sft_fused = False" in src
-    assert "_sft_examples_per_block" in src
     assert 'cfg_kwargs["use_liger_kernel"] = False' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)

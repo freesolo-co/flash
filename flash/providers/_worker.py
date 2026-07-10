@@ -56,15 +56,10 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
-WORKER_IMAGE_PER_SM_ENV = "FLASH_WORKER_IMAGE_PER_SM"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
 # back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
-
-
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _append_tag_suffix(image: str, suffix: str) -> str:
@@ -91,9 +86,10 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
                 sm=info.sm,
                 sm_num=info.sm.removeprefix("sm"),
             )
-        if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)) and info.sm in BAKED_PER_SM_ARCHES:
+        # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
+        # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
+        if info.sm in BAKED_PER_SM_ARCHES:
             return _append_tag_suffix(WORKER_IMAGE, info.sm)
-        # arch not in BAKED_PER_SM_ARCHES: fall through to base image to avoid a 404 docker pull
     return WORKER_IMAGE if allow_default else None
 
 
@@ -271,15 +267,12 @@ def build_worker_env(
 _CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
-_hf_status_code = hf_status_code
-
-
 def _hf_call(call, label: str):
     return hf_call(call, label, logger=logger, sleep=time.sleep)
 
 
 def _is_hf_not_found(exc: BaseException) -> bool:
-    return _hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
+    return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
 
 
 def _ensure_private_artifact_repo(api, repo: str) -> None:

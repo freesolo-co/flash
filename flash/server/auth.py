@@ -120,21 +120,26 @@ def _cached_identity(token: str) -> dict[str, Any]:
     return {}
 
 
+# Identity fields copied verbatim from a verified caller identity into the auth row, and
+# forwarded again by the /v1/me endpoint. Kept as one list so the two passthroughs cannot drift.
+_IDENTITY_PASSTHROUGH_FIELDS = (
+    "user_id",
+    "org_id",
+    "org_slug",
+    "org_name",
+    "api_key_id",
+    "training_agent_job_id",
+    "project_id",
+)
+
+
 def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     out = dict(row)
     out["auth_kind"] = "freesolo_api_key"
     out["key_prefix"] = _external_key_prefix(token, identity)
     if identity.get("email"):
         out["email"] = identity["email"]
-    for key in (
-        "user_id",
-        "org_id",
-        "org_slug",
-        "org_name",
-        "api_key_id",
-        "training_agent_job_id",
-        "project_id",
-    ):
+    for key in _IDENTITY_PASSTHROUGH_FIELDS:
         if identity.get(key):
             out[key] = identity[key]
     return out

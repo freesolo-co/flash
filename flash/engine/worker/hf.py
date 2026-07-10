@@ -313,9 +313,6 @@ def publish_deployable_checkpoint(
     return None
 
 
-# Retry/backoff for the deployable-adapter publish (rides out a transient concurrent-commit 409).
-_CKPT_FLUSH_RETRIES = 3
-_CKPT_FLUSH_BACKOFF_S = 1.0
 # Retry/backoff for each synchronous checkpoint upload. `on_save` BLOCKS the training loop on the
 # upload, so a transient HF error is retried until the step lands rather than costing the step.
 _CKPT_UPLOAD_RETRIES = 3
@@ -386,20 +383,14 @@ def make_checkpoint_upload_callback():
 
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
-    def _publish_deployable(ckpt_dir: str, step: int, *, with_retry: bool = False) -> None:
+    def _publish_deployable(ckpt_dir: str, step: int) -> None:
         """Publish a step's deployable adapter directly from the trainer checkpoint.
 
         Warm-start CONTINUES the one adapter in place (VL and non-VL) and fresh runs train a single
         adapter, so the trainer checkpoint's adapter IS the deployable — it carries the full policy on
         the catalog base and serves as-is (no merge, no SFT rank-stack recombine).
         """
-        if with_retry:
-            # #295 folded _publish_deployable_with_retry into publish_deployable_checkpoint(retries=).
-            publish_deployable_checkpoint(
-                ckpt_dir, step, retries=_CKPT_FLUSH_RETRIES, backoff_s=_CKPT_FLUSH_BACKOFF_S
-            )
-        else:
-            publish_deployable_checkpoint(ckpt_dir, step)
+        publish_deployable_checkpoint(ckpt_dir, step)
 
     def _upload_once(step: int, ckpt_dir: str) -> None:
         # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
