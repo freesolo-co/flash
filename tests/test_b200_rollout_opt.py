@@ -116,6 +116,38 @@ def test_patch_injects_attention_backend(fake_vg):
     assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
 
 
+def test_patch_injects_reasoning_parser(fake_vg):
+    # thinking + a structured-outputs constraint: the grammar must be held until </think>. That is
+    # EngineArgs.reasoning_parser, which GRPOConfig/TRL can't set — so it must ride this LLM override.
+    assert patch_trl_colocate_llm_kwargs(reasoning_parser="deepseek_r1") is True
+    fake_vg.LLM(model="m")
+    assert _FakeLLM.last_kwargs["reasoning_parser"] == "deepseek_r1"
+
+
+def test_run_rl_gates_reasoning_parser_on_thinking_and_constraint():
+    """run_rl must inject reasoning_parser into the colocate engine EXACTLY when thinking + a
+    constraint are both on (reasoning_parser_for(...) non-None), and only then — otherwise the
+    grammar would either bind from the first token (parser missing) or defer for a non-thinking run.
+    The call sits behind torch.cuda probing in run_rl, so assert on its source (same approach as the
+    other run_rl wiring tests)."""
+    import inspect
+    import re
+
+    from flash.engine.worker.rl import run_rl
+
+    src = inspect.getsource(run_rl)
+    # resolved via the shared gate, then injected only when that gate returns a parser name
+    assert re.search(
+        r"_reasoning_parser\s*=\s*reasoning_parser_for\(", src
+    ), "run_rl must resolve the parser via reasoning_parser_for"
+    assert re.search(
+        r"if _reasoning_parser:", src
+    ), "the colocate injection must be gated on a resolved parser (thinking + constraint only)"
+    assert re.search(
+        r"patch_trl_colocate_llm_kwargs\(\s*reasoning_parser=_reasoning_parser", src
+    ), "run_rl must pass the resolved parser to the colocate-LLM patch"
+
+
 def test_patch_overrides_accumulate_across_calls(fake_vg):
     """run_rl injects the attention backend (sm120), the KV/prefill knobs, and eager mode at three
     SEPARATE points. Each call must MERGE into the one wrapper — the wrap-once guard must not drop the
