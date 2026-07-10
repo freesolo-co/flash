@@ -108,32 +108,58 @@ def preflight_init_adapter_lora_rank(
     token: str | None = None,
     config_loader: AdapterConfigLoader | None = None,
 ) -> None:
-    """Reject a warm-start adapter that cannot fit the model's serving LoRA rank cap.
+    """Reject a warm-start adapter the model can't serve, or that mismatches ``train.lora_rank``.
 
     Warm-start CONTINUES the prior adapter in place (SFT→GRPO/OPD keep the one LoRA, rank unchanged),
-    so the deployed adapter's rank is exactly the prior adapter's rank — it just has to fit the
-    serving cap. The control plane calls this before creating/submitting a run; it intentionally uses
-    only ``adapter_config.json`` so the preflight stays CPU-only and catches an undeployable adapter
-    before any training GPU is allocated.
+    so the run trains and serves at the SOURCE adapter's rank — ``train.lora_rank`` is ignored once
+    ``init_from_adapter`` is set (the trainer keeps the loaded LoRA; see
+    ``flash.engine.worker.adapter._init_adapter_model``). That rank must therefore (a) fit the serving
+    cap — for cataloged serving models — and (b) equal ``spec.train.lora_rank`` for EVERY warm-start,
+    because the cost model, allocator, and GRPO sleep-mode sizing all read ``spec.train.lora_rank`` — a
+    mismatch (e.g. a rank-64 source with the default ``lora_rank=32``) is quoted/placed for the wrong
+    rank and can then OOM or fail to load at the true rank, even on an uncataloged model that has no
+    cap. The control plane calls this before creating/submitting a run; it intentionally uses only
+    ``adapter_config.json`` so the preflight stays CPU-only (no GPU) and catches an undeployable or
+    mis-sized adapter before any training GPU is allocated.
     """
     adapter_storage_ref = (spec.train.init_from_adapter or "").strip()
     if not adapter_storage_ref:
-        return
-    max_lora_rank = serving_lora_rank_cap(spec.model)
-    if max_lora_rank is None:
         return
 
     repo, filename = adapter_config_path_from_ref(adapter_storage_ref)
     source = f"{repo}:{filename}"
     loader = config_loader or load_hf_adapter_config
     config = loader(adapter_storage_ref, token)
-
     adapter_rank = rank_from_adapter_config(config, source=source)
-    if adapter_rank > max_lora_rank:
+
+    # The serving cap only bounds cataloged serving models; open-policy / uncataloged models have no
+    # cap and skip THIS check (but not the sizing-mismatch check below, which is cap-independent).
+    max_lora_rank = serving_lora_rank_cap(spec.model)
+    if max_lora_rank is not None and adapter_rank > max_lora_rank:
         raise ValueError(
             f"train.init_from_adapter={adapter_storage_ref!r} has rank {adapter_rank}, exceeding "
             f"{spec.model}'s serving max_lora_rank={max_lora_rank}; use a lower-rank adapter "
             "or raise the serving cap after real-GPU validation"
+        )
+
+    # A continued warm-start keeps the SOURCE adapter, so it trains and serves at ``adapter_rank`` no
+    # matter what ``train.lora_rank`` says. But cost/allocator/GRPO-sleep sizing all read
+    # ``spec.train.lora_rank``; if it disagrees with the source rank the run is quoted and placed for
+    # the wrong rank (a rank-64 source with the default lora_rank=32 is sized as 32) and then OOMs or
+    # fails to load the rank-64 adapter. This mis-sizing is cap-independent — an uncataloged model is
+    # quoted, billed, and placed at the wrong rank too — so the check runs for every warm-start, not
+    # just capped ones. Reject the mismatch so every sizing consumer agrees on the one true rank once
+    # the config is corrected.
+    configured_rank = int(spec.train.lora_rank)
+    if configured_rank != adapter_rank:
+        raise ValueError(
+            f"train.lora_rank={configured_rank} does not match the continued warm-start adapter's "
+            f"rank {adapter_rank} (train.init_from_adapter={adapter_storage_ref!r}). A warm-start "
+            f"CONTINUES the source adapter in place, so this run trains and serves at rank "
+            f"{adapter_rank} regardless of train.lora_rank — but cost, GPU allocation, and GRPO "
+            f"sleep-mode sizing all read train.lora_rank, so a mismatch is mis-quoted and mis-placed. "
+            f"Set train.lora_rank={adapter_rank} to match the source adapter (or warm-start from a "
+            f"rank-{configured_rank} adapter)."
         )
 
 
