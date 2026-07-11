@@ -1025,6 +1025,36 @@ def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
     assert "gpu_name" not in seen["deploy_kwargs"]
 
 
+def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
+    """The deploy route hands the run's [train].structured_outputs to deploy_adapter so serving can
+    register it as the adapter's guided-decoding default (guided-decoding train/serve parity)."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    schema = {"type": "object", "properties": {"industries": {"type": "array"}}}
+    so_spec = {**SPEC, "train": {**SPEC["train"], "structured_outputs": {"json": schema}}}
+    run_id = api.post(
+        "/v1/runs", json={"spec": so_spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def fake_start(target, **kwargs):
+        seen.update({"target": target, **kwargs})
+        return False
+
+    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    forwarded = seen["deploy_kwargs"]["structured_outputs"]
+    assert json.loads(forwarded) == {"json": schema}
+
+
 def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
