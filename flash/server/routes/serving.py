@@ -386,6 +386,10 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
+            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
+            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
+            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
         }
         if dry_run:
