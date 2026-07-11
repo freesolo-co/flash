@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -11,6 +12,9 @@ from typing import Any
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
+_HF_REPO_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
+)
 
 
 def _str_tuple(value: Any) -> tuple[str, ...]:
@@ -193,9 +197,15 @@ class ModelInterpolationSpec:
     instruct_revision: str = ""
 
     def __post_init__(self) -> None:
-        if not self.base_model.strip() or not self.instruct_model.strip():
-            raise ValueError("model_initialization parents must be non-empty model ids")
-        if self.base_model.strip() == self.instruct_model.strip():
+        for name, model_id in (
+            ("base_model", self.base_model),
+            ("instruct_model", self.instruct_model),
+        ):
+            if model_id.strip() != model_id or not _HF_REPO_RE.fullmatch(model_id) or ".." in model_id:
+                raise ValueError(
+                    f"model_initialization.{name} must be a strict Hugging Face namespace/name id"
+                )
+        if self.base_model == self.instruct_model:
             raise ValueError("model_initialization parents must be distinct")
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError("model_initialization.alpha must be between 0 and 1")
@@ -203,6 +213,18 @@ class ModelInterpolationSpec:
             raise ValueError(
                 "model_initialization.tokenizer_config_source must be 'base' or 'instruct'"
             )
+        for name, revision in (
+            ("base_revision", self.base_revision),
+            ("instruct_revision", self.instruct_revision),
+        ):
+            if (
+                revision != revision.lower()
+                or len(revision) != 40
+                or any(ch not in "0123456789abcdef" for ch in revision)
+            ):
+                raise ValueError(
+                    f"model_initialization.{name} must be an immutable 40-character commit sha"
+                )
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,10 @@ _REPO_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
 )
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+INTERPOLATION_METADATA_SCHEMA = "flash.model-interpolation"
+INTERPOLATION_METADATA_VERSION = 1
+_READBACK_ATTEMPTS = 3
+_READBACK_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,38 @@ def _request(method: str, path: str, **kwargs: Any) -> httpx.Response:
         raise ServingError(f"checkpoint-backed serving is unavailable at {url}: {exc}") from exc
 
 
+def canonical_interpolation_metadata(
+    *,
+    canonical_model: str,
+    interpolation_manifest: dict[str, Any],
+    trained_tree_fingerprint: str,
+) -> dict[str, Any]:
+    """build the versioned metadata that serving must echo exactly."""
+    spec = interpolation_manifest.get("spec") or {}
+    required = {
+        "formula": interpolation_manifest.get("formula"),
+        "parents": interpolation_manifest.get("parents"),
+        "output_fingerprint": interpolation_manifest.get("output_fingerprint"),
+        "tree_fingerprint": interpolation_manifest.get("tree_fingerprint"),
+        "alpha": spec.get("alpha"),
+    }
+    missing = sorted(key for key, value in required.items() if value is None)
+    if missing or not trained_tree_fingerprint:
+        raise ValueError(f"interpolation metadata is incomplete: {missing}")
+    return {
+        "schema": INTERPOLATION_METADATA_SCHEMA,
+        "version": INTERPOLATION_METADATA_VERSION,
+        "canonical_model": canonical_model,
+        "formula": interpolation_manifest.get("formula"),
+        "alpha": spec.get("alpha"),
+        "parents": interpolation_manifest.get("parents"),
+        "tokenizer_config_source": interpolation_manifest.get("tokenizer_config_source"),
+        "interpolation_output_fingerprint": interpolation_manifest.get("output_fingerprint"),
+        "interpolation_tree_fingerprint": interpolation_manifest.get("tree_fingerprint"),
+        "trained_tree_fingerprint": trained_tree_fingerprint,
+    }
+
+
 def register_evaluation_checkpoint(
     *,
     model_id: str,
@@ -99,6 +136,10 @@ def register_evaluation_checkpoint(
     model_revision = _validate_sha(model_revision)
     if not canonical_base_model.strip():
         raise ValueError("canonical_base_model must not be empty")
+    if metadata.get("schema") != INTERPOLATION_METADATA_SCHEMA or metadata.get(
+        "version"
+    ) != INTERPOLATION_METADATA_VERSION:
+        raise ValueError("checkpoint metadata must use the canonical interpolation metadata schema")
     if tokenizer_repo_id is not None:
         tokenizer_repo_id = _validate_repo(tokenizer_repo_id)
         if tokenizer_revision is None:
@@ -132,6 +173,7 @@ def register_evaluation_checkpoint(
         "tokenizer_repo_id": expected_tokenizer_repo,
         "tokenizer_revision": expected_tokenizer_revision,
         "status": "ready",
+        "metadata": dict(metadata),
     }
     mismatches = {
         key: (body.get(key), value)
@@ -145,20 +187,29 @@ def register_evaluation_checkpoint(
             f"mismatches={mismatches}, deployment_token={deployment_token!r}"
         )
 
-    listed = _request("GET", "/model-checkpoints").json()
-    records = listed.get("model_checkpoints") if isinstance(listed, dict) else None
-    active = next(
-        (
-            item
-            for item in records or []
-            if item.get("model_id") == model_id
-            and item.get("deployment_token") == deployment_token
-        ),
-        None,
-    )
-    if active is None or any(active.get(key) != value for key, value in expected.items()):
+    active = None
+    last_error: ServingError | None = None
+    for attempt in range(_READBACK_ATTEMPTS):
+        try:
+            active = _request(
+                "GET",
+                f"/model-checkpoints/{model_id}",
+                params={"expected_deployment_token": deployment_token},
+                timeout=60.0,
+            ).json()
+            break
+        except ServingError as exc:
+            last_error = exc
+            if exc.status_code not in {None, 502, 503, 504} or attempt + 1 >= _READBACK_ATTEMPTS:
+                raise
+            time.sleep(_READBACK_DELAY_SECONDS)
+    if active is None:
+        raise ServingError(f"authoritative checkpoint readback failed: {last_error}")
+    if active.get("deployment_token") != deployment_token or any(
+        active.get(key) != value for key, value in expected.items()
+    ):
         raise ServingError(
-            "checkpoint registration was not visible as the exact active checkpoint; refusing "
+            "authoritative checkpoint readback did not match the exact active checkpoint; refusing "
             "canonical-base plus LoRA fallback"
         )
 

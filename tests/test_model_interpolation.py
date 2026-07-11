@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +14,10 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from flash.engine.worker.model_interpolation import (
-    interpolation_disk_gb,
+    interpolation_required_disk_gb,
     materialize_interpolation_from_paths,
+    materialize_model_interpolation,
+    validate_materialized_interpolation,
 )
 from flash.engine.worker.model_source import assert_model_source_parity
 from flash.schema import ConfigError, spec_from_dict
@@ -115,8 +119,8 @@ def test_interpolation_spec_parses_and_round_trips() -> None:
             "instruct_model": "Qwen/Qwen3.5-4B",
             "alpha": 0.25,
             "tokenizer_config_source": "instruct",
-            "base_revision": "base-rev",
-            "instruct_revision": "instruct-rev",
+            "base_revision": "a" * 40,
+            "instruct_revision": "b" * 40,
         },
     }
     spec = spec_from_dict(raw)
@@ -126,8 +130,8 @@ def test_interpolation_spec_parses_and_round_trips() -> None:
         instruct_model="Qwen/Qwen3.5-4B",
         alpha=0.25,
         tokenizer_config_source="instruct",
-        base_revision="base-rev",
-        instruct_revision="instruct-rev",
+        base_revision="a" * 40,
+        instruct_revision="b" * 40,
     )
     assert JobSpec.from_json(spec.to_json()) == spec
 
@@ -135,6 +139,26 @@ def test_interpolation_spec_parses_and_round_trips() -> None:
         bad = {**raw, "model_initialization": {**raw["model_initialization"], "alpha": alpha}}
         with pytest.raises((ConfigError, ValueError), match="alpha"):
             spec_from_dict(bad)
+    with pytest.raises((ConfigError, ValueError), match="namespace/name"):
+        spec_from_dict(
+            {
+                **raw,
+                "model_initialization": {
+                    **raw["model_initialization"],
+                    "base_model": "Qwen/../private",
+                },
+            }
+        )
+    with pytest.raises((ConfigError, ValueError), match="immutable"):
+        spec_from_dict(
+            {
+                **raw,
+                "model_initialization": {
+                    **raw["model_initialization"],
+                    "base_revision": "A" * 40,
+                },
+            }
+        )
     with pytest.raises(ConfigError, match="distinct"):
         spec_from_dict(
             {
@@ -183,6 +207,53 @@ def test_alpha_endpoints_midpoint_shards_and_full_tree(
     assert result.manifest["formula"] == "W=(1-alpha)*W_base+alpha*W_instruct"
     assert result.manifest["parents"]["base"]["commit"] == "a" * 40
     assert result.manifest["parents"]["instruct"]["commit"] == "b" * 40
+
+
+def test_warm_start_rejected_for_interpolated_child_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "environment": {"id": "owner/env"},
+        "train": {"epochs": 1, "max_examples": 8, "init_from_adapter": "source-run"},
+        "model_initialization": {
+            "type": "interpolation",
+            "base_model": "Qwen/Qwen3.5-4B-Base",
+            "instruct_model": "Qwen/Qwen3.5-4B",
+            "alpha": 0.5,
+            "base_revision": "a" * 40,
+            "instruct_revision": "b" * 40,
+        },
+    }
+    with pytest.raises(ConfigError, match="exact full checkpoint"):
+        spec_from_dict(raw)
+
+    import flash.runner as runner
+
+    source = JobSpec.from_dict(
+        {
+            **spec_from_dict({**raw, "train": {"epochs": 1, "max_examples": 8}}).to_dict(),
+            "run_id": "source-run",
+            "train": {"hf_repo": "Freesolo-Co/source", "epochs": 1, "max_examples": 8},
+        }
+    )
+    child_raw = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env"},
+            "train": {"epochs": 1, "max_examples": 8, "init_from_adapter": "source-run"},
+        }
+    ).to_dict()
+    child = JobSpec.from_dict(child_raw)
+    monkeypatch.setattr(
+        runner,
+        "get_status",
+        lambda run_id: SimpleNamespace(spec=source.to_dict(), billing_context={}, platform_context={}),
+    )
+    with pytest.raises(ValueError, match="exact full checkpoint"):
+        runner._resolve_init_from_adapter(child)
 
 
 def test_nonfloating_missing_extra_shape_and_config_mismatches(tmp_path: Path) -> None:
@@ -242,9 +313,14 @@ def test_nonfloating_missing_extra_shape_and_config_mismatches(tmp_path: Path) -
         )
 
 
-def test_interpolation_disk_accounts_for_two_parents_output_and_headroom() -> None:
-    assert interpolation_disk_gb(4.0) == 29
-    assert interpolation_disk_gb(0.0) == 0
+def test_interpolation_disk_uses_both_immutable_hub_totals_and_temp_headroom() -> None:
+    class Api:
+        def list_repo_tree(self, *, repo_id, revision, **kwargs):
+            assert revision in {"a" * 40, "b" * 40}
+            sizes = [2_000_000_000, 500_000_000] if repo_id.endswith("-Base") else [3_000_000_000]
+            return [SimpleNamespace(size=size) for size in sizes]
+
+    assert interpolation_required_disk_gb(_spec(), api=Api()) == 19
 
 
 def test_manifest_is_deterministic(tmp_path: Path) -> None:
@@ -294,6 +370,11 @@ def test_sft_grpo_opd_share_one_materialized_source() -> None:
     assert "resolve_model_source(model_id)" in (root / "opd.py").read_text()
     assert "model_source=model_source" in (root / "rl.py").read_text()
     assert "model_source=rollout_model_source" in (root / "opd.py").read_text()
+    assert "finalize_interpolated_training(trainer.model, tok)" in (root / "sft.py").read_text()
+    assert "finalize_interpolated_training(trainer.model, tok)" in (root / "rl.py").read_text()
+    assert "finalize_interpolated_training(model, tok)" in (root / "opd.py").read_text()
+    serving_route = Path(__file__).parents[1] / "flash" / "server" / "routes" / "serving.py"
+    assert "interpolated-model runs cannot deploy a LoRA" in serving_route.read_text()
     assert assert_model_source_parity("/tmp/model", "/tmp/model") == "/tmp/model"
     with pytest.raises(RuntimeError, match="parity"):
         assert_model_source_parity("/tmp/trainer", "/tmp/rollout")
@@ -316,7 +397,7 @@ class _Response:
             )
 
 
-def test_freesolo_registration_payload_and_fail_closed(
+def test_freesolo_registration_payload_authoritative_readback_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from flash.serve import model_checkpoints
@@ -324,22 +405,33 @@ def test_freesolo_registration_payload_and_fail_closed(
 
     sha = "d" * 40
     token = "00000000-0000-0000-0000-000000000123"
+    metadata = model_checkpoints.canonical_interpolation_metadata(
+        canonical_model="Qwen/Qwen3.5-4B",
+        interpolation_manifest={
+            "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+            "spec": {"alpha": 0.5},
+            "parents": {"base": {"commit": "a" * 40}, "instruct": {"commit": "b" * 40}},
+            "tokenizer_config_source": "instruct",
+            "output_fingerprint": "source-manifest-fingerprint",
+            "tree_fingerprint": "source-tree-fingerprint",
+        },
+        trained_tree_fingerprint="trained-tree-fingerprint",
+    )
     ready = {
         "model_id": "interp-run-30",
         "base_model": "Qwen/Qwen3.5-4B",
-        "model_repo_id": "Freesolo-Co/interp-run-30",
+        "model_repo_id": "Freesolo-Co/flash-checkpoint-interp-run-30",
         "model_revision": sha,
-        "tokenizer_repo_id": "Freesolo-Co/interp-run-30",
+        "tokenizer_repo_id": "Freesolo-Co/flash-checkpoint-interp-run-30",
         "tokenizer_revision": sha,
         "deployment_token": token,
         "status": "ready",
+        "metadata": metadata,
     }
     calls: list[dict] = []
 
     def request(method, url, **kwargs):
         calls.append({"method": method, "url": url, **kwargs})
-        if method == "GET":
-            return _Response({"ok": True, "model_checkpoints": [ready]})
         return _Response(ready)
 
     monkeypatch.setenv("FREESOLO_CHECKPOINT_INTERNAL_KEY", "checkpoint-secret")
@@ -347,42 +439,253 @@ def test_freesolo_registration_payload_and_fail_closed(
     registered = model_checkpoints.register_evaluation_checkpoint(
         model_id="interp-run-30",
         canonical_base_model="Qwen/Qwen3.5-4B",
-        model_repo_id="Freesolo-Co/interp-run-30",
+        model_repo_id="Freesolo-Co/flash-checkpoint-interp-run-30",
         model_revision=sha,
         thinking=False,
-        metadata={"output_fingerprint": "fingerprint", "alpha": 0.5},
+        metadata=metadata,
     )
     assert registered.model_revision == sha
     assert calls[0]["headers"] == {
         "X-Freesolo-Checkpoint-Internal-Key": "checkpoint-secret"
     }
-    assert calls[0]["json"] == {
-        "model_id": "interp-run-30",
-        "base_model": "Qwen/Qwen3.5-4B",
-        "model_repo_id": "Freesolo-Co/interp-run-30",
-        "model_revision": sha,
-        "thinking": False,
-        "private": True,
-        "metadata": {"output_fingerprint": "fingerprint", "alpha": 0.5},
-    }
-    assert all("repo_id" not in call.get("json", {}) for call in calls)
+    assert calls[0]["json"]["metadata"] == metadata
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"].endswith("/model-checkpoints/interp-run-30")
+    assert calls[1]["params"] == {"expected_deployment_token": token}
+
+    wrong = {**ready, "deployment_token": "00000000-0000-0000-0000-000000000999"}
+    monkeypatch.setattr(
+        model_checkpoints.httpx,
+        "request",
+        lambda method, url, **kwargs: _Response(ready if method == "POST" else wrong),
+    )
+    with pytest.raises(ServingError, match="authoritative"):
+        model_checkpoints.register_evaluation_checkpoint(
+            model_id="interp-run-30",
+            canonical_base_model="Qwen/Qwen3.5-4B",
+            model_repo_id="Freesolo-Co/flash-checkpoint-interp-run-30",
+            model_revision=sha,
+            thinking=False,
+            metadata=metadata,
+        )
+
+    wrong_metadata = {**ready, "metadata": {**metadata, "trained_tree_fingerprint": "wrong"}}
+    monkeypatch.setattr(
+        model_checkpoints.httpx,
+        "request",
+        lambda method, url, **kwargs: _Response(ready if method == "POST" else wrong_metadata),
+    )
+    with pytest.raises(ServingError, match="authoritative"):
+        model_checkpoints.register_evaluation_checkpoint(
+            model_id="interp-run-30",
+            canonical_base_model="Qwen/Qwen3.5-4B",
+            model_repo_id="Freesolo-Co/flash-checkpoint-interp-run-30",
+            model_revision=sha,
+            thinking=False,
+            metadata=metadata,
+        )
 
     monkeypatch.delenv("FREESOLO_CHECKPOINT_INTERNAL_KEY")
     with pytest.raises(ServingError, match="unavailable"):
         model_checkpoints.register_evaluation_checkpoint(
             model_id="interp-run-30",
             canonical_base_model="Qwen/Qwen3.5-4B",
-            model_repo_id="Freesolo-Co/interp-run-30",
+            model_repo_id="Freesolo-Co/flash-checkpoint-interp-run-30",
             model_revision=sha,
             thinking=False,
-            metadata={},
+            metadata=metadata,
         )
-    with pytest.raises(ValueError, match="immutable"):
-        model_checkpoints.register_evaluation_checkpoint(
-            model_id="interp-run-30",
-            canonical_base_model="Qwen/Qwen3.5-4B",
-            model_repo_id="Freesolo-Co/interp-run-30",
-            model_revision="main",
-            thinking=False,
-            metadata={},
+
+
+def test_complete_fingerprint_rejects_asset_and_index_corruption(tmp_path: Path) -> None:
+    base = _repo(tmp_path, "base", _tensors())
+    instruct = _repo(tmp_path, "instruct", _tensors(2.0))
+    output = tmp_path / "output"
+    result = materialize_interpolation_from_paths(
+        _spec(), base_path=str(base), instruct_path=str(instruct), output_dir=str(output)
+    )
+    validate_materialized_interpolation(output, result.manifest)
+
+    (output / "processing_qwen.py").write_text("CORRUPT = True\n")
+    with pytest.raises(ValueError, match="complete source fingerprint"):
+        validate_materialized_interpolation(output, result.manifest)
+    (output / "processing_qwen.py").write_text("REMOTE_CODE = True\n")
+
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    index["weight_map"]["model.layers.0.weight"] = "missing.safetensors"
+    (output / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="complete source fingerprint"):
+        validate_materialized_interpolation(output, result.manifest)
+
+
+def test_cache_lock_race_atomic_replacement_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import huggingface_hub
+
+    base = _repo(tmp_path, "base", _tensors())
+    instruct = _repo(tmp_path, "instruct", _tensors(2.0))
+    calls: list[tuple[str, str]] = []
+    gate = threading.Lock()
+
+    def snapshot_download(*, repo_id, cache_dir, **kwargs):
+        with gate:
+            calls.append((repo_id, cache_dir))
+        time.sleep(0.02)
+        return str(base if repo_id.endswith("-Base") else instruct)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    root = tmp_path / "cache"
+    results: list[str] = []
+
+    def run() -> None:
+        results.append(materialize_model_interpolation(_spec(), output_root=str(root)).source)
+
+    threads = [threading.Thread(target=run), threading.Thread(target=run)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(set(results)) == 1
+    assert len(calls) == 2
+    assert not list(root.glob("*.staging-*"))
+    assert not list(root.glob("*.hub-cache-*"))
+
+    output = Path(results[0])
+    (output / "visual.py").write_text("corrupt\n")
+    materialize_model_interpolation(_spec(), output_root=str(root))
+    assert (output / "visual.py").read_text() == "VISUAL = True\n"
+    assert len(calls) == 4
+
+
+def test_private_parent_cache_isolation_accounts_for_both_parents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import huggingface_hub
+
+    base = _repo(tmp_path, "base", _tensors())
+    instruct = _repo(tmp_path, "instruct", _tensors(2.0))
+    seen: list[str] = []
+
+    def snapshot_download(*, repo_id, cache_dir, **kwargs):
+        seen.append(cache_dir)
+        return str(base if repo_id.endswith("base") else instruct)
+
+    monkeypatch.setenv("FLASH_INTERPOLATION_ALLOWED_NAMESPACES", "private-org")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    private = ModelInterpolationSpec(
+        base_model="private-org/base",
+        instruct_model="private-org/instruct",
+        alpha=0.5,
+        base_revision="a" * 40,
+        instruct_revision="b" * 40,
+    )
+    materialize_model_interpolation(
+        private,
+        output_root=str(tmp_path / "private-output"),
+        cache_dir=str(tmp_path / "shared-cache"),
+    )
+    assert len(seen) == 2
+    assert all(path != str(tmp_path / "shared-cache") for path in seen)
+    assert seen[0] == seen[1]
+
+
+def test_final_merge_publish_and_register_production_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from flash.engine import worker
+    from flash.engine.worker.finalize import finalize_interpolated_training
+    from flash.engine.worker.model_source import ResolvedModelSource
+    from flash.serve import model_checkpoints
+
+    base = _repo(tmp_path, "base", _tensors())
+    instruct = _repo(tmp_path, "instruct", _tensors(2.0))
+    materialized = materialize_interpolation_from_paths(
+        _spec(),
+        base_path=str(base),
+        instruct_path=str(instruct),
+        output_dir=str(tmp_path / "source"),
+        base_commit="a" * 40,
+        instruct_commit="b" * 40,
+    )
+    monkeypatch.setattr(
+        worker,
+        "RESOLVED_MODEL_SOURCE",
+        ResolvedModelSource(
+            canonical_model="Qwen/Qwen3.5-4B",
+            source=materialized.source,
+            setup_seconds=1.0,
+            interpolation=materialized.manifest,
+        ),
+    )
+    monkeypatch.setattr(worker, "RUN_ID", "interp-run-30")
+    monkeypatch.setattr(worker, "THINKING", False)
+
+    class Merged:
+        def save_pretrained(self, output, **kwargs):
+            Path(output, "config.json").write_text(json.dumps(_config()))
+            save_file(_tensors(3.0), Path(output, "model.safetensors"))
+
+    class Model:
+        def merge_and_unload(self):
+            return Merged()
+
+    class Tokenizer:
+        def save_pretrained(self, output):
+            Path(output, "tokenizer.json").write_text('{"trained":true}')
+
+    class Api:
+        def __init__(self):
+            self.uploaded_files: set[str] = set()
+            self.uploaded = False
+
+        def create_repo(self, **kwargs):
+            assert kwargs["repo_id"] == "Freesolo-Co/flash-checkpoint-interp-run-30"
+            assert kwargs["private"] is True
+
+        def update_repo_settings(self, **kwargs):
+            assert kwargs["private"] is True
+
+        def repo_info(self, **kwargs):
+            return SimpleNamespace(sha=("d" if self.uploaded else "c") * 40)
+
+        def upload_folder(self, *, folder_path, **kwargs):
+            self.uploaded_files = {
+                path.relative_to(folder_path).as_posix()
+                for path in Path(folder_path).rglob("*")
+                if path.is_file()
+            }
+            self.uploaded = True
+            return SimpleNamespace(oid="d" * 40)
+
+    api = Api()
+    monkeypatch.setattr(worker, "hf_api", lambda: api)
+    registered: dict = {}
+
+    def register(**kwargs):
+        registered.update(kwargs)
+        return SimpleNamespace(
+            model_id=kwargs["model_id"],
+            model_repo_id=kwargs["model_repo_id"],
+            model_revision=kwargs["model_revision"],
+            deployment_token="token",
         )
+
+    monkeypatch.setattr(model_checkpoints, "register_evaluation_checkpoint", register)
+    result = finalize_interpolated_training(Model(), Tokenizer())
+    assert result["model_revision"] == "d" * 40
+    assert registered["model_id"] == "interp-run-30"
+    assert registered["metadata"]["interpolation_output_fingerprint"] == materialized.output_fingerprint
+    for required in (
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "config.json",
+        "tokenizer.json",
+        "processor_config.json",
+        "processing_qwen.py",
+        "visual.py",
+        "mtp_config.json",
+        "gdn_config.json",
+        "flash_interpolation_manifest.json",
+    ):
+        assert required in api.uploaded_files

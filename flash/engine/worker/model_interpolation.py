@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
+import os
 import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +19,13 @@ from flash.spec import ModelInterpolationSpec
 _FORMULA = "W=(1-alpha)*W_base+alpha*W_instruct"
 _DEFAULT_MAX_SHARD_BYTES = 1024**3
 _MANIFEST_NAME = "flash_interpolation_manifest.json"
+_MANIFEST_VERSION = 2
+_ALLOWED_NAMESPACE_ENV = "FLASH_INTERPOLATION_ALLOWED_NAMESPACES"
+_SAFE_CATALOG_PAIRS = frozenset(
+    {
+        ("Qwen/Qwen3.5-4B-Base", "Qwen/Qwen3.5-4B"),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +33,7 @@ class TensorLocation:
     file: str
     shape: tuple[int, ...]
     dtype: str
+    nbytes: int
 
 
 @dataclass(frozen=True)
@@ -162,6 +174,7 @@ def _tensor_inventory(repo: Path, mapping: dict[str, str]) -> dict[str, TensorLo
                     file=filename,
                     shape=tuple(int(dim) for dim in tensor.shape),
                     dtype=str(tensor.dtype),
+                    nbytes=_tensor_bytes(tensor),
                 )
     return inventory
 
@@ -281,18 +294,147 @@ def _manifest_fingerprint(manifest: dict[str, Any]) -> str:
     return _sha256_bytes(_canonical_json(payload))
 
 
+def tree_manifest(root: str | Path, *, exclude: set[str] | None = None) -> dict[str, dict[str, Any]]:
+    """return a deterministic complete file inventory for a checkpoint tree."""
+    base = Path(root)
+    excluded = exclude or set()
+    files: dict[str, dict[str, Any]] = {}
+    for path in sorted(item for item in base.rglob("*") if item.is_file()):
+        rel = path.relative_to(base).as_posix()
+        if rel in excluded:
+            continue
+        files[rel] = {"size": path.stat().st_size, "sha256": _sha256_file(path)}
+    return files
+
+
+def tree_fingerprint(files: dict[str, dict[str, Any]]) -> str:
+    return _sha256_bytes(_canonical_json(files))
+
+
+def ensure_safetensors_index(output: str | Path) -> None:
+    """write a canonical index even when save_pretrained emitted one safetensors shard."""
+    root = Path(output)
+    mapping = _weight_map(root)
+    inventory = _tensor_inventory(root, mapping)
+    total_size = sum(location.nbytes for location in inventory.values())
+    if total_size <= 0:
+        raise ValueError("checkpoint tensor inventory has an unsupported dtype")
+    index = {
+        "metadata": {"total_size": total_size},
+        "weight_map": {key: mapping[key] for key in sorted(mapping)},
+    }
+    path = root / "model.safetensors.index.json"
+    path.write_text(
+        json.dumps(index, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def validate_output_tree(output: str | Path) -> str:
+    """validate a complete loadable checkpoint tree and return its content fingerprint."""
+    root = Path(output)
+    files = tree_manifest(root)
+    if not files or "config.json" not in files or "model.safetensors.index.json" not in files:
+        raise ValueError("checkpoint output tree is incomplete")
+    mapping = _weight_map(root)
+    inventory = _tensor_inventory(root, mapping)
+    if set(mapping) != set(inventory):
+        raise ValueError("checkpoint tensor inventory is incomplete")
+    return tree_fingerprint(files)
+
+
 def _materialized_files_valid(output: Path, manifest: dict[str, Any]) -> bool:
+    if manifest.get("version") != _MANIFEST_VERSION:
+        return False
     if manifest.get("output_fingerprint") != _manifest_fingerprint(manifest):
         return False
-    shards = manifest.get("shards")
-    if not isinstance(shards, dict) or not (output / "model.safetensors.index.json").is_file():
+    expected_files = manifest.get("files")
+    if not isinstance(expected_files, dict):
         return False
-    return all(
-        isinstance(expected, str)
-        and (path := output / str(filename)).is_file()
-        and _sha256_file(path) == expected
-        for filename, expected in shards.items()
+    actual_files = tree_manifest(output, exclude={_MANIFEST_NAME})
+    if actual_files != expected_files or manifest.get("tree_fingerprint") != tree_fingerprint(actual_files):
+        return False
+    try:
+        mapping = _weight_map(output)
+        inventory = _tensor_inventory(output, mapping)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return len(inventory) == manifest.get("tensor_count") and set(mapping) == set(inventory)
+
+
+def validate_materialized_interpolation(
+    output: str | Path, manifest: dict[str, Any]
+) -> None:
+    """fail closed unless a cached interpolation exactly matches its bound manifest."""
+    if not _materialized_files_valid(Path(output), manifest):
+        raise ValueError("materialized interpolation does not match its complete source fingerprint")
+
+
+def _allowed_parent_namespaces() -> frozenset[str]:
+    return frozenset(
+        value.strip()
+        for value in (os.environ.get(_ALLOWED_NAMESPACE_ENV) or "").split(",")
+        if value.strip()
     )
+
+
+def parents_safe_for_shared_cache(spec: ModelInterpolationSpec) -> bool:
+    from flash.catalog import MODELS
+
+    pair = (spec.base_model, spec.instruct_model)
+    return pair in _SAFE_CATALOG_PAIRS or all(parent in MODELS for parent in pair)
+
+
+def validate_parent_policy(spec: ModelInterpolationSpec) -> bool:
+    """validate parent trust and return whether both are safe for the shared cache."""
+    from flash.catalog import MODELS
+
+    pair = (spec.base_model, spec.instruct_model)
+    pair_repositories = set(pair) if pair in _SAFE_CATALOG_PAIRS else set()
+    allowed = _allowed_parent_namespaces()
+    for parent in pair:
+        if parent in MODELS or parent in pair_repositories:
+            continue
+        namespace = parent.split("/", 1)[0] if "/" in parent else ""
+        if namespace not in allowed:
+            raise ValueError(
+                f"interpolation parent {parent!r} is not cataloged and its namespace is not "
+                f"approved by {_ALLOWED_NAMESPACE_ENV}"
+            )
+    return parents_safe_for_shared_cache(spec)
+
+
+def hub_repo_bytes(api: Any, repo_id: str, revision: str) -> int:
+    """sum immutable Hub file sizes for one parent repository."""
+    entries = api.list_repo_tree(
+        repo_id=repo_id,
+        repo_type="model",
+        revision=revision,
+        recursive=True,
+        expand=True,
+    )
+    total = 0
+    for entry in entries:
+        size = getattr(entry, "size", None)
+        if size is not None:
+            total += max(0, int(size))
+    if total <= 0:
+        raise ValueError(f"could not resolve positive Hub file bytes for {repo_id}@{revision}")
+    return total
+
+
+def interpolation_required_disk_gb(spec: ModelInterpolationSpec, *, api: Any | None = None) -> int:
+    """size parent downloads, staging output, and atomic replacement from actual Hub bytes."""
+    validate_parent_policy(spec)
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+    base_bytes = hub_repo_bytes(api, spec.base_model, spec.base_revision)
+    instruct_bytes = hub_repo_bytes(api, spec.instruct_model, spec.instruct_revision)
+    output_bytes = max(base_bytes, instruct_bytes)
+    required = (base_bytes + instruct_bytes) * 2 + output_bytes * 2
+    return max(1, math.ceil(required * 1.10 / 1_000_000_000))
 
 
 def materialize_interpolation_from_paths(
@@ -420,8 +562,9 @@ def materialize_interpolation_from_paths(
         json.dump(index, handle, sort_keys=True, separators=(",", ":"))
         handle.write("\n")
 
+    files = tree_manifest(output, exclude={_MANIFEST_NAME})
     manifest: dict[str, Any] = {
-        "version": 1,
+        "version": _MANIFEST_VERSION,
         "formula": _FORMULA,
         "spec": asdict(spec),
         "parents": {
@@ -442,6 +585,8 @@ def materialize_interpolation_from_paths(
         "tensor_count": len(keys),
         "total_size": total_size,
         "shards": {name: shard_hashes[name] for name in sorted(shard_hashes)},
+        "files": files,
+        "tree_fingerprint": tree_fingerprint(files),
     }
     manifest["output_fingerprint"] = _manifest_fingerprint(manifest)
     with (output / _MANIFEST_NAME).open("w", encoding="utf-8") as handle:
@@ -459,48 +604,66 @@ def materialize_model_interpolation(
     """prefetch both parents, then materialize a deterministic concrete source path."""
     from huggingface_hub import snapshot_download
 
+    shared_cache_safe = validate_parent_policy(spec)
     key = _sha256_bytes(_canonical_json(asdict(spec)))[:24]
-    output = Path(output_root) / key
-    manifest_path = output / _MANIFEST_NAME
-    if manifest_path.is_file():
-        with manifest_path.open(encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        if _materialized_files_valid(output, manifest):
-            return MaterializedInterpolation(source=str(output), manifest=manifest)
-        shutil.rmtree(output)
-
-    common = {
-        "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-    }
-    if cache_dir is not None:
-        common["cache_dir"] = cache_dir
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    output = root / key
+    lock_path = root / f".{key}.lock"
+    staging = root / f".{key}.staging-{uuid.uuid4().hex}"
+    private_cache = root / f".{key}.hub-cache-{uuid.uuid4().hex}"
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
-    with liveness_heartbeat("model_interpolation_prefetching"):
-        base_path = snapshot_download(
-            repo_id=spec.base_model,
-            revision=spec.base_revision or None,
-            **common,
-        )
-        instruct_path = snapshot_download(
-            repo_id=spec.instruct_model,
-            revision=spec.instruct_revision or None,
-            **common,
-        )
-    with liveness_heartbeat("model_interpolation_materializing"):
-        return materialize_interpolation_from_paths(
-            spec,
-            base_path=base_path,
-            instruct_path=instruct_path,
-            output_dir=str(output),
-        )
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        manifest_path = output / _MANIFEST_NAME
+        if manifest_path.is_file():
+            with contextlib.suppress(OSError, ValueError, json.JSONDecodeError):
+                with manifest_path.open(encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                if _materialized_files_valid(output, manifest):
+                    return MaterializedInterpolation(source=str(output), manifest=manifest)
 
-
-def interpolation_disk_gb(params_b: float) -> int:
-    """ephemeral disk floor for two bf16 parents, one output, and download headroom."""
-    if not math.isfinite(params_b) or params_b <= 0:
-        return 0
-    return math.ceil(params_b * 2.0 * 3.0 * 1.2)
+        common = {
+            "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+            "cache_dir": cache_dir if shared_cache_safe and cache_dir else str(private_cache),
+        }
+        replaced: Path | None = None
+        try:
+            with liveness_heartbeat("model_interpolation_prefetching"):
+                base_path = snapshot_download(
+                    repo_id=spec.base_model,
+                    revision=spec.base_revision,
+                    **common,
+                )
+                instruct_path = snapshot_download(
+                    repo_id=spec.instruct_model,
+                    revision=spec.instruct_revision,
+                    **common,
+                )
+            with liveness_heartbeat("model_interpolation_materializing"):
+                result = materialize_interpolation_from_paths(
+                    spec,
+                    base_path=base_path,
+                    instruct_path=instruct_path,
+                    output_dir=str(staging),
+                    base_commit=spec.base_revision,
+                    instruct_commit=spec.instruct_revision,
+                )
+            if not _materialized_files_valid(staging, result.manifest):
+                raise RuntimeError("materialized interpolation failed complete cache validation")
+            if output.exists():
+                replaced = root / f".{key}.replaced-{uuid.uuid4().hex}"
+                output.replace(replaced)
+            staging.replace(output)
+            if replaced is not None:
+                shutil.rmtree(replaced, ignore_errors=True)
+            return MaterializedInterpolation(source=str(output), manifest=result.manifest)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(private_cache, ignore_errors=True)
+            if replaced is not None and replaced.exists() and not output.exists():
+                replaced.replace(output)
 
 
 def main(argv: list[str] | None = None) -> int:

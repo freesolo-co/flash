@@ -419,6 +419,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
+    init_adapter_ref = _init_from_adapter_ref(train_raw)
+    if model_initialization is not None and init_adapter_ref:
+        raise ConfigError(
+            "train.init_from_adapter is not supported with model_initialization; continue from an "
+            "exact full checkpoint instead"
+        )
 
     spec = JobSpec(
         model=model,
@@ -433,7 +439,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=_init_from_adapter_ref(train_raw),
+            init_from_adapter=init_adapter_ref,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),

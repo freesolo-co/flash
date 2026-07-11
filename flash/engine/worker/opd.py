@@ -1149,6 +1149,7 @@ def run_opd():
     # Ship the deployable adapter: the continued (or fresh) LoRA deploys as-is on the catalog base.
     # Name the final checkpoint by real optimizer steps applied, not the planned `steps` count.
     _publish_opd_deployable(adapter_dir, opt_steps, as_default=True)
+    _w.finalize_interpolated_training(model, tok)
     # step=opt_steps on this (unthrottled) final ping AND on the opd_train_done ping below keeps the
     # persisted heartbeat's step at the true completed count. Without it, a cancel landing after the
     # adapter publish but before DONE is persisted reads a STEPLESS opd_trained/opd_train_done as the

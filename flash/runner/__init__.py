@@ -219,9 +219,9 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     d = spec.to_dict()
     need = int(getattr(info, "min_disk_gb", 0) or 0)
     if spec.model_initialization is not None:
-        from flash.engine.worker.model_interpolation import interpolation_disk_gb
+        from flash.engine.worker.model_interpolation import interpolation_required_disk_gb
 
-        need = max(need, interpolation_disk_gb(float(getattr(info, "params_b", 0.0) or 0.0)))
+        need = max(need, interpolation_required_disk_gb(spec.model_initialization))
     if need > int(d["gpu"].get("disk_gb") or 0):
         d["gpu"] = {**d["gpu"], "disk_gb": need}
     return d
@@ -335,6 +335,22 @@ def _fits_weight_cache(info: ModelInfo) -> bool:
     return _WEIGHT_CACHE_PEAK_FACTOR * download_gb <= WEIGHT_CACHE_VOLUME_GB
 
 
+def _interpolation_fits_weight_cache(spec: JobSpec) -> bool:
+    interpolation = spec.model_initialization
+    if interpolation is None:
+        return False
+    from flash.catalog import MODELS
+    from flash.engine.worker.model_interpolation import parents_safe_for_shared_cache
+
+    parents = (interpolation.base_model, interpolation.instruct_model)
+    if not parents_safe_for_shared_cache(interpolation):
+        return False
+    if any(parent not in MODELS for parent in parents):
+        return True
+    total_download_gb = sum(MODELS[parent].params_b * 2.0 for parent in parents)
+    return _WEIGHT_CACHE_PEAK_FACTOR * total_download_gb <= WEIGHT_CACHE_VOLUME_GB
+
+
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
     """Attach the shared weight-cache volume for PUBLIC catalog models only.
 
@@ -345,7 +361,11 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     existing = getattr(spec.gpu, "network_volume", None)
     if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
         return spec
-    attach = is_catalog and (info is None or _fits_weight_cache(info))
+    attach = is_catalog and (
+        _interpolation_fits_weight_cache(spec)
+        if spec.model_initialization is not None
+        else info is None or _fits_weight_cache(info)
+    )
     if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
         return spec
     d = spec.to_dict()
@@ -441,6 +461,11 @@ def _resolve_init_from_adapter(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
     src_spec = JobSpec.from_dict(src_status.spec)
+    if spec.model_initialization is not None or src_spec.model_initialization is not None:
+        raise ValueError(
+            "train.init_from_adapter cannot cross an interpolated-model run boundary; continue "
+            "from an exact full checkpoint instead"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
