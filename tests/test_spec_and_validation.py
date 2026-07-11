@@ -100,6 +100,82 @@ def test_falsy_algorithm_defaults_to_sft() -> None:
         assert spec_from_dict(raw).algorithm == "sft"
 
 
+def test_sft_gold_source_defaults_to_oracle_and_round_trips() -> None:
+    raw = _raw(algorithm="sft", **{"train.epochs": 1, "train.max_examples": 8})
+    spec = spec_from_dict(raw)
+    assert spec.train.sft_gold_source.value == "oracle"
+    restored = JobSpec.from_json(spec.to_json())
+    assert restored.train.sft_gold_source.value == "oracle"
+    assert restored == spec
+
+
+def test_sft_gold_source_is_closed_enum() -> None:
+    raw = _raw(
+        algorithm="sft",
+        **{
+            "train.epochs": 1,
+            "train.max_examples": 8,
+            "train.sft_gold_source": "invented",
+        },
+    )
+    with pytest.raises(ConfigError, match=r"sft_gold_source.*oracle.*teacher.*self.*existing"):
+        spec_from_dict(raw)
+
+
+def test_raw_base_rejects_self_sft_gold() -> None:
+    raw = _raw(
+        algorithm="sft",
+        **{
+            "train.epochs": 1,
+            "train.max_examples": 8,
+            "train.sft_gold_source": "self",
+        },
+    )
+    with pytest.raises(ConfigError, match=r"raw base.*cannot use.*self"):
+        spec_from_dict(raw)
+
+
+def test_raw_base_rejects_unproven_existing_gold() -> None:
+    raw = _raw(
+        algorithm="sft",
+        **{
+            "train.epochs": 1,
+            "train.max_examples": 8,
+            "train.sft_gold_source": "existing",
+        },
+    )
+    with pytest.raises(ConfigError, match=r"raw base.*cannot prove oracle provenance"):
+        spec_from_dict(raw)
+
+
+def test_instruct_checkpoint_can_select_self_gold(monkeypatch) -> None:
+    from flash.catalog import ModelInfo
+
+    info = ModelInfo(
+        id="acme/instruct",
+        display_name="instruct",
+        params="1B",
+        params_b=1.0,
+        checkpoint_type="instruct",
+        algos=("sft",),
+        min_vram_gb=12,
+    )
+    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 4090")
+    raw = _raw(
+        model="acme/instruct",
+        algorithm="sft",
+        **{
+            "train.epochs": 1,
+            "train.max_examples": 8,
+            "train.sft_gold_source": "self",
+        },
+    )
+    assert spec_from_dict(raw).train.sft_gold_source.value == "self"
+    raw["train"]["sft_gold_source"] = "existing"
+    assert spec_from_dict(raw).train.sft_gold_source.value == "existing"
+
+
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 0, "max_examples": 8, "lora_rank": 8}

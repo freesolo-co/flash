@@ -99,6 +99,35 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
         return c_hidden, c_layers
 
 
+def reasoning_target_coverage(completions: list[list[dict]]) -> tuple[int, int, float]:
+    """Return reasoning-target rows, total rows, and coverage fraction."""
+    total = len(completions)
+    reasoning = sum(
+        any("<think>" in str(message.get("content") or "") for message in completion)
+        for completion in completions
+    )
+    return reasoning, total, reasoning / total if total else 0.0
+
+
+def validate_sft_gold_source(model_id: str, gold_source: str) -> None:
+    """Reject self-generated supervision for catalogued raw base checkpoints."""
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if not info or info.checkpoint_type != "raw_base":
+        return
+    if gold_source == "self":
+        raise ValueError(
+            f"{model_id} is a raw base checkpoint and cannot train on self-generated SFT gold; "
+            "provide oracle or teacher reasoning gold"
+        )
+    if gold_source == "existing":
+        raise ValueError(
+            f"{model_id} is a raw base checkpoint and existing SFT gold cannot prove oracle "
+            "provenance; provide oracle or teacher reasoning gold"
+        )
+
+
 def select_sft_examples(train, max_examples, seed):
     """Pick the SFT sample: the first ``max_examples`` rows of the dataset (file order), shuffled.
 
@@ -129,6 +158,9 @@ def run_sft():
     download_seconds = _w.prefetch_model(model_id)
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    _source_value = getattr(_t, "sft_gold_source", "oracle")
+    _gold_source = str(getattr(_source_value, "value", _source_value))
+    validate_sft_gold_source(model_id, _gold_source)
 
     def _train_opt(name, default):
         val = getattr(_t, name, None) if _t else None
@@ -145,9 +177,11 @@ def run_sft():
             env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED
         )
         texts = []
+        completions = []
         multiturn_targets = 0
         for ex in train:
-            completion = env.sft_completion(ex)
+            completion = env.sft_completion(ex, gold_source=_gold_source)
+            completions.append(completion)
             if len(completion) > 1:
                 multiturn_targets += 1
             prompt_messages = env.prompt_messages(ex)
@@ -168,6 +202,11 @@ def run_sft():
                     ),
                 }
             )
+    _reasoning_rows, _target_rows, _reasoning_coverage = reasoning_target_coverage(completions)
+    print(
+        f"[sft] gold provenance={_gold_source}; reasoning targets="
+        f"{_reasoning_rows}/{_target_rows} ({_reasoning_coverage:.0%})"
+    )
     if multiturn_targets:
         print(
             f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript"
@@ -178,7 +217,7 @@ def run_sft():
             "target completion; SFT collapses to a single assistant turn per row (tool/env turns "
             'ignored). Provide target transcripts (output={"messages": [...]}) for proper multi-turn SFT.'
         )
-    if _w.THINKING and not any("<think>" in t["text"] for t in texts[:256]):
+    if _w.THINKING and not _reasoning_rows:
         print(
             "WARN: thinking mode is ON but no sampled SFT target contains a <think> "
             "trace — training on non-reasoning targets teaches the model to SKIP "
@@ -605,6 +644,10 @@ def run_sft():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "thinking": _w.THINKING,
+            "sft_gold_source": _gold_source,
+            "reasoning_target_rows": _reasoning_rows,
+            "reasoning_target_total_rows": _target_rows,
+            "reasoning_target_coverage": _reasoning_coverage,
             "gradient_checkpointing": _grad_ckpt,
             "loss_curve": _metric_curve(trainer, "loss"),
             "peak_gpu_gb": sft_peak_gpu_gb,

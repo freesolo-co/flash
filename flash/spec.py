@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
@@ -99,6 +100,29 @@ class EnvironmentSpec:
 FIXED_SEED = 42
 
 
+class SFTGoldSource(StrEnum):
+    """Declared provenance for supervised completion targets."""
+
+    ORACLE = "oracle"
+    TEACHER = "teacher"
+    SELF = "self"
+    EXISTING = "existing"
+
+    @classmethod
+    def parse(cls, value: Any) -> SFTGoldSource:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("train.sft_gold_source must be a string")
+        try:
+            return cls(value.strip().lower())
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in cls)
+            raise ValueError(
+                f"train.sft_gold_source must be one of: {allowed}; got {value!r}"
+            ) from exc
+
+
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = None
@@ -134,6 +158,7 @@ class TrainSpec:
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
     teacher_model: str = ""
+    sft_gold_source: SFTGoldSource = SFTGoldSource.ORACLE
     stop_sequences: tuple[str, ...] = ()
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
@@ -226,6 +251,9 @@ class JobSpec:
                 opd_entropy_floor_coef=_opt_float(train.get("opd_entropy_floor_coef")),
                 opd_entropy_floor=_opt_float(train.get("opd_entropy_floor")),
                 teacher_model=str(train.get("teacher_model") or ""),
+                sft_gold_source=SFTGoldSource.parse(
+                    train.get("sft_gold_source", SFTGoldSource.ORACLE.value)
+                ),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
             ),

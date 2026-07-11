@@ -23,6 +23,12 @@ from flash.envs.loader import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+_SFT_SOURCE_FIELDS = {
+    "oracle": "oracle_output",
+    "teacher": "teacher_output",
+    "self": "self_output",
+    "existing": _CANONICAL_OUTPUT_KEY,
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -195,14 +201,8 @@ class FreesoloEnvironment(BaseEnvironment):
         messages = self._env.start_episode(self._task_example(example), self._contract_text)
         return self._with_system_prompt(messages)
 
-    def sft_completion(self, example: dict) -> list[dict]:
-        """Target completion messages for one SFT example; falls back to raw record output."""
-        fn = getattr(self._env, "sft_completion", None)
-        if callable(fn):
-            msgs = fn(self._task_example(example))
-            if msgs:
-                return [dict(m) for m in msgs]
-        value = example.get(_CANONICAL_OUTPUT_KEY)
+    @staticmethod
+    def _completion_messages(value: Any) -> list[dict]:
         if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
             return [dict(m) for m in value]
         if (
@@ -212,6 +212,30 @@ class FreesoloEnvironment(BaseEnvironment):
         ):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
+
+    def sft_completion(self, example: dict, gold_source: str = "existing") -> list[dict]:
+        """Resolve one SFT target from the explicitly selected provenance."""
+        source = str(getattr(gold_source, "value", gold_source) or "").strip().lower()
+        if source not in _SFT_SOURCE_FIELDS:
+            allowed = ", ".join(_SFT_SOURCE_FIELDS)
+            raise ValueError(f"unsupported SFT gold source {source!r}; choose one of: {allowed}")
+
+        callback_name = "sft_completion" if source == "existing" else f"sft_{source}_completion"
+        fn = getattr(self._env, callback_name, None)
+        if callable(fn):
+            msgs = fn(self._task_example(example))
+            if msgs:
+                return [dict(m) for m in msgs]
+
+        field = _SFT_SOURCE_FIELDS[source]
+        if field not in example:
+            if source == "existing":
+                return [{"role": "assistant", "content": ""}]
+            raise ValueError(
+                f"SFT gold source {source!r} requires dataset field {field!r} or environment "
+                f"callback {callback_name}(); generic output is not a proven {source} target"
+            )
+        return self._completion_messages(example[field])
 
     def _single(self, results, method: str):
         if len(results) != 1:

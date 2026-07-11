@@ -7,7 +7,13 @@ model to emit nothing. Regression for the shuffle-before-slice ordering in run_s
 
 from __future__ import annotations
 
-from flash.engine.worker.sft import select_sft_examples
+import pytest
+
+from flash.engine.worker.sft import (
+    reasoning_target_coverage,
+    select_sft_examples,
+    validate_sft_gold_source,
+)
 
 
 def test_max_examples_is_a_prefix_fence_not_a_random_subsample():
@@ -34,3 +40,25 @@ def test_zero_or_unset_max_examples_keeps_the_full_dataset():
     rows = list(range(20))
     out = select_sft_examples(list(rows), 0, seed=3)
     assert sorted(out) == rows
+
+
+def test_reasoning_target_coverage_counts_target_messages():
+    completions = [
+        [{"role": "assistant", "content": "<think>a</think>answer"}],
+        [{"role": "assistant", "content": "answer only"}],
+        [
+            {"role": "assistant", "content": "tool call"},
+            {"role": "assistant", "content": "<think>b</think>done"},
+        ],
+    ]
+    assert reasoning_target_coverage(completions) == (2, 3, pytest.approx(2 / 3))
+    assert reasoning_target_coverage([]) == (0, 0, 0.0)
+
+
+def test_worker_defense_rejects_raw_base_self_gold():
+    with pytest.raises(ValueError, match=r"raw base.*self-generated"):
+        validate_sft_gold_source("Qwen/Qwen3.5-4B", "self")
+    with pytest.raises(ValueError, match=r"existing.*cannot prove oracle"):
+        validate_sft_gold_source("Qwen/Qwen3.5-4B", "existing")
+    validate_sft_gold_source("Qwen/Qwen3.5-4B", "oracle")
+    validate_sft_gold_source("uncatalogued/instruct", "self")

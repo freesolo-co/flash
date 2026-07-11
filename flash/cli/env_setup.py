@@ -45,7 +45,7 @@ def load_jsonl(path: str | Path):
 
 
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
-    expected = str(example.output or "").strip()
+    expected = str((example.record or {}).get("oracle_output") or example.output or "").strip()
     score = 1.0 if expected and expected in response_text else 0.0
     return RewardResult(score=score, threshold=1.0)
 
@@ -68,8 +68,8 @@ def load_environment(dataset_path: str | None = None, **kwargs) -> StarterEnv:
 '''
 
 _STARTER_DATASET_JSONL = """\
-{"input":"What is 2 + 2?","output":"4"}
-{"input":"What is 3 + 5?","output":"8"}
+{"input":"What is 2 + 2?","oracle_output":"4"}
+{"input":"What is 3 + 5?","oracle_output":"8"}
 """
 
 
@@ -92,9 +92,9 @@ episode hooks wired end-to-end. Replace it with your real task before a real run
 
 All three algorithms train off this file:
 - GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
-- SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
-  `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
-  `output` for a single gold assistant turn.
+- SFT (configs/sft.toml) learns the oracle trajectory. Provide it per row as
+  `oracle_output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
+  `oracle_output` for a single gold assistant turn.
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
   the managed Fireworks teacher (GLM 5.2 by default; pick another with [train] teacher_model),
   conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
@@ -132,7 +132,8 @@ def load_jsonl(path: str | Path):
 
 
 def _secret(example: TaskExample) -> int:
-    return int(str(example.output).strip())
+    value = (example.record or {}).get("oracle_output") or example.output
+    return int(str(value).strip())
 
 
 class StarterMultiTurnEnv(EnvironmentMultiTurn):
@@ -205,12 +206,11 @@ def load_environment(dataset_path: str | None = None, **kwargs) -> StarterMultiT
 '''
 
 
-# Multi-turn rows: `input` sets up the episode, `output` is the secret number.
-# The scalar `output` also serves as the gold single-turn SFT target; swap in
-# `{"messages": [...]}` to teach a full gold trajectory.
+# multi-turn rows use oracle_output as both the secret and the declared SFT target.
+# replace the scalar with {"messages": [...]} to teach a full oracle trajectory.
 _STARTER_DATASET_MULTITURN_JSONL = """\
-{"input":"I picked a secret whole number between 1 and 100.","output":"42"}
-{"input":"I picked a secret whole number between 1 and 100.","output":"73"}
+{"input":"I picked a secret whole number between 1 and 100.","oracle_output":"42"}
+{"input":"I picked a secret whole number between 1 and 100.","oracle_output":"73"}
 """
 
 
@@ -337,7 +337,7 @@ def cmd_env_setup(args) -> int:
         else ""
     )
     sft_reasoning_note = (
-        "# reasoning is on (thinking = true): each gold `output` must contain a <think>...</think>\n"
+        "# reasoning is on (thinking = true): each oracle_output must contain a <think>...</think>\n"
         "# block; validate locally with freesolo.datasets.warn_missing_think_tags before a real run.\n"
         if reasoning
         else ""
@@ -370,6 +370,7 @@ def cmd_env_setup(args) -> int:
             "[train]\n"
             "epochs = 1\n"
             "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
+            'sft_gold_source = "oracle"  # reads oracle_output; raw bases require oracle or teacher gold\n'
             "lora_rank = 32\n"
             f"{sft_reasoning_note}"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"

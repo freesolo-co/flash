@@ -44,6 +44,7 @@ DEFAULT_GPU = "RTX 5090"
 
 # Over-estimating is memory-safe (larger VRAM estimate, smaller cap); fallback = largest catalog vocab.
 _DEFAULT_VOCAB_SIZE = 248_320
+CHECKPOINT_TYPES = ("raw_base", "instruct", "unknown")
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class ModelInfo:
     # asserts every curated MODELS entry sets it > 0, so a new entry can never silently fall back to a
     # parsed string again.
     params_b: float
+    checkpoint_type: str = "unknown"
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
@@ -111,6 +113,11 @@ class ModelInfo:
     # multimodal-nested config, so the curated values are what actually engage the gate.
     num_layers: int = 0
     hidden_size: int = 0
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_type not in CHECKPOINT_TYPES:
+            allowed = ", ".join(CHECKPOINT_TYPES)
+            raise ValueError(f"checkpoint_type must be one of: {allowed}")
 
     @property
     def is_moe(self) -> bool:
@@ -161,6 +168,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="MiniCPM5 1B",
         params="1.2B dense (Llama arch)",
         params_b=1.2,
+        checkpoint_type="raw_base",
         vocab_size=130_560,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
@@ -180,6 +188,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 0.8B",
         params="0.9B (text-only fine-tune)",
         params_b=0.9,
+        checkpoint_type="raw_base",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
@@ -199,6 +208,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 2B",
         params="2.3B (text-only fine-tune)",
         params_b=2.3,
+        checkpoint_type="raw_base",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=16,
@@ -217,6 +227,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 4B",
         params="4.7B (text-only fine-tune)",
         params_b=4.7,
+        checkpoint_type="raw_base",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=32,
@@ -239,6 +250,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
         params_b=9.7,
+        checkpoint_type="raw_base",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=48,
@@ -266,6 +278,7 @@ MODELS: dict[str, ModelInfo] = {
         params="35B total / ~3B active (MoE)",
         # 35.0 not 35.95: the marketing figure tips the SFT equation over the B200 budget (see test_sft_equation_covers_honest_peak_across_seq_boundary).
         params_b=35.0,
+        checkpoint_type="raw_base",
         active_params_b=3.0,
         # Geometry for the SFT GC-off activation estimate (config.json text_config): 40 decoder
         # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).

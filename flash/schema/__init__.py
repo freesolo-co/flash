@@ -26,7 +26,7 @@ from flash.schema.fields import (
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, SFTGoldSource, TrainSpec
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -211,6 +211,7 @@ _TRAIN_KEYS = frozenset(
         "opd_entropy_floor_coef",
         "opd_entropy_floor",
         "teacher_model",
+        "sft_gold_source",
         "stop_sequences",
         "structured_outputs",
         "max_steps",
@@ -318,6 +319,24 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    try:
+        sft_gold_source = SFTGoldSource.parse(
+            train_raw.get("sft_gold_source", SFTGoldSource.ORACLE.value)
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if algorithm == "sft" and info.checkpoint_type == "raw_base":
+        if sft_gold_source is SFTGoldSource.SELF:
+            raise ConfigError(
+                f"{model} is a raw base checkpoint and cannot use train.sft_gold_source=\"self\"; "
+                "provide oracle or teacher reasoning gold instead"
+            )
+        if sft_gold_source is SFTGoldSource.EXISTING:
+            raise ConfigError(
+                f"{model} is a raw base checkpoint and train.sft_gold_source=\"existing\" cannot "
+                "prove oracle provenance; use oracle_output or teacher_output with the matching "
+                "declared source"
+            )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)
     if max_lora_rank is not None and lora_rank > max_lora_rank:
@@ -365,6 +384,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             opd_entropy_floor=_train_float(train_raw, "opd_entropy_floor", minimum=0.0),
             # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
             teacher_model=_train_teacher(train_raw),
+            sft_gold_source=sft_gold_source,
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract

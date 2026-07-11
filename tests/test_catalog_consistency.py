@@ -44,6 +44,11 @@ def test_thinking_capability_values_are_valid():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
+def test_curated_models_declare_raw_base_checkpoint_type():
+    assert MODELS
+    assert {info.checkpoint_type for info in MODELS.values()} == {"raw_base"}
+
+
 def test_serving_capacity_matches_validated_matrix():
     expected = {
         "openbmb/MiniCPM5-1B": {

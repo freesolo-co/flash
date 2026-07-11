@@ -301,6 +301,58 @@ def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     assert env.sft_completion({"input": "x"}) == [{"role": "assistant", "content": ""}]
 
 
+def test_freesolo_sft_gold_selection_is_fail_closed(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    row = {
+        "input": "x",
+        "output": "generic",
+        "oracle_output": "oracle",
+        "teacher_output": "teacher",
+        "self_output": "self",
+    }
+    assert env.sft_completion(row, gold_source="oracle") == [
+        {"role": "assistant", "content": "oracle"}
+    ]
+    assert env.sft_completion(row, gold_source="teacher") == [
+        {"role": "assistant", "content": "teacher"}
+    ]
+    assert env.sft_completion(row, gold_source="self") == [
+        {"role": "assistant", "content": "self"}
+    ]
+    assert env.sft_completion(row, gold_source="existing") == [
+        {"role": "assistant", "content": "generic"}
+    ]
+    with pytest.raises(ValueError, match=r"oracle_output.*generic output is not a proven oracle"):
+        env.sft_completion({"input": "x", "output": "generic"}, gold_source="oracle")
+
+
+def test_freesolo_existing_callback_keeps_precedence(monkeypatch):
+    class _CallbackEnv(_FakeSingleTurnEnv):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "callback"}]
+
+        def sft_oracle_completion(self, example):
+            return [{"role": "assistant", "content": "oracle callback"}]
+
+    sdk_env = _CallbackEnv()
+    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
+    row = {"input": "x", "output": "generic", "oracle_output": "oracle field"}
+    assert env.sft_completion(row, gold_source="existing") == [
+        {"role": "assistant", "content": "callback"}
+    ]
+    assert env.sft_completion(row, gold_source="oracle") == [
+        {"role": "assistant", "content": "oracle callback"}
+    ]
+
+
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
     _install_fake_freesolo(monkeypatch, sdk_env=_BudgetMultiTurnEnv())
 

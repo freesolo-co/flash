@@ -576,6 +576,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
     assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
     assert '"optim": fused_optim_name()' in src
+    assert 'env.sft_completion(ex, gold_source=_gold_source)' in src
+    assert '"sft_gold_source": _gold_source' in src
+    assert '"reasoning_target_coverage": _reasoning_coverage' in src
 
 
 def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():

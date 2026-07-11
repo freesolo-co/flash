@@ -491,6 +491,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert dataset.is_file()
     assert not (tmp_path / "datasets").exists()
     assert '"input":"What is 2 + 2?"' in dataset.read_text()
+    assert '"oracle_output":"4"' in dataset.read_text()
     grpo = tmp_path / "configs/rl.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
@@ -504,6 +505,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
     assert "max_examples = 2" in sft.read_text()
+    assert 'sft_gold_source = "oracle"' in sft.read_text()
     assert "cheapest fitting managed class" in sft.read_text()
     assert "private environment-scoped repo" in sft.read_text()
     opd = tmp_path / "configs/opd.toml"

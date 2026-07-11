@@ -39,7 +39,7 @@ flash gpus                           # managed GPU classes with estimated $/hr
 
 ```text
 environment.py          # the task: how to prompt the model and how to score it
-dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
+dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "oracle_output": ...}
 configs/sft.toml        # an SFT run config
 configs/rl.toml         # a GRPO (RL) run config
 configs/opd.toml        # an on-policy distillation run config
@@ -107,6 +107,7 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
+sft_gold_source = "oracle" # sft only; reads oracle_output and is the safe default
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
@@ -327,6 +328,23 @@ explicitly inspect the separated completion, reasoning, or original raw model ou
 
 Pick SFT when you already have good answers and want the model to imitate them.
 
+- **Declare the gold provenance.** `[train] sft_gold_source` is a closed choice:
+  `oracle` (the default), `teacher`, `self`, or `existing`. Oracle rows use
+  `oracle_output`; teacher rows use `teacher_output`; self rows use `self_output`;
+  `existing` preserves the environment's `sft_completion()` callback and generic
+  `output` field. Flash never falls back from a requested oracle or teacher field to
+  generic `output`, because generic data cannot prove its provenance.
+- **Raw base checkpoints require oracle or teacher reasoning gold.** Never bootstrap a
+  raw base by generating its own chain of thought and training it back on that text.
+  `sft_gold_source = "self"` is rejected for catalogued raw bases. When `thinking = true`,
+  put the desired reasoning trace in `oracle_output` or `teacher_output`, for example
+  `<think>reasoning steps</think>final answer`. Flash records the selected provenance and
+  reasoning-target row coverage in `train_meta.json`.
+- **Existing data is explicit compatibility mode, not inferred oracle data.** For
+  instruct or unknown checkpoints, use `sft_gold_source = "existing"` only when you
+  intentionally accept an environment's existing callback or generic `output` as the
+  target. Raw bases reject this unproven mode. If you cannot establish that a generic
+  dataset is oracle-authored, do not label it oracle.
 - **Data quality is the ceiling.** SFT can only be as good as the answers you show it.
   A small set of high-quality examples beats a large mediocre one. Keep response format
   consistent (if you want JSON, *every* example is JSON) and keep the prompt format the
