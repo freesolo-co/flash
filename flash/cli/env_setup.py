@@ -44,6 +44,34 @@ def load_jsonl(path: str | Path):
     return rows
 
 
+def warn_missing_oracle_think_tags(rows):
+    missing = []
+    for index, row in enumerate(rows):
+        metadata = row.get("metadata") or {}
+        target = row.get("oracle_output") or metadata.get("oracle_output")
+        if isinstance(target, dict):
+            texts = [
+                str(message.get("content") or "")
+                for message in target.get("messages", [])
+                if message.get("role") == "assistant"
+            ]
+        else:
+            texts = [str(target or "")]
+        if not any(
+            "<think>" in text and text.find("<think>") < text.find("</think>")
+            for text in texts
+        ):
+            missing.append(index)
+    if missing:
+        import warnings
+
+        warnings.warn(
+            f"oracle reasoning targets missing closed assistant think blocks at rows: {missing}",
+            stacklevel=2,
+        )
+    return missing
+
+
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
     record = example.record or {}
     metadata = record.get("metadata") or {}
@@ -342,7 +370,7 @@ def cmd_env_setup(args) -> int:
     )
     sft_reasoning_note = (
         "# reasoning is on (thinking = true): each metadata.oracle_output needs a closed think block\n"
-        "# block; validate locally with freesolo.datasets.warn_missing_think_tags before a real run.\n"
+        "# block; call warn_missing_oracle_think_tags(StarterEnv.dataset) before a real run.\n"
         if reasoning
         else ""
     )

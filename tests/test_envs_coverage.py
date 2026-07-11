@@ -91,3 +91,37 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     assert messages == [{"role": "user", "content": "What is 2 + 2?"}]
     assert mod.exact_match_reward(example, "the answer is 4").score == 1.0
     assert mod.exact_match_reward(example, "nope").score == 0.0
+
+
+def test_scaffolded_reasoning_validator_reads_metadata_oracle_output(tmp_path, monkeypatch) -> None:
+    import importlib.util
+    from argparse import Namespace
+
+    pytest.importorskip("freesolo")
+    from flash.cli import cmd_env_setup
+
+    monkeypatch.chdir(tmp_path)
+    assert cmd_env_setup(Namespace(reasoning="on")) == 0
+
+    spec = importlib.util.spec_from_file_location("scaffold_reasoning_env", tmp_path / "environment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    rows = [
+        {"input": "bad", "metadata": {"oracle_output": "answer without reasoning"}},
+        {"input": "good", "metadata": {"oracle_output": "<think>reasoning</think>\nanswer"}},
+        {
+            "input": "messages",
+            "metadata": {
+                "oracle_output": {
+                    "messages": [
+                        {"role": "user", "content": "<think>not supervision</think>"},
+                        {"role": "assistant", "content": "answer"},
+                    ]
+                }
+            },
+        },
+    ]
+    with pytest.warns(UserWarning, match=r"rows: \[0, 2\]"):
+        assert mod.warn_missing_oracle_think_tags(rows) == [0, 2]
+    assert mod.warn_missing_oracle_think_tags([rows[1]]) == []

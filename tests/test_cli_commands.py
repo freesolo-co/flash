@@ -596,7 +596,7 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     # GRPO raises the generation budget so reasoning does not truncate the answer.
     assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
-    assert "warn_missing_think_tags" in sft
+    assert "warn_missing_oracle_think_tags" in sft
     assert "max_completion_tokens" not in sft
 
 
