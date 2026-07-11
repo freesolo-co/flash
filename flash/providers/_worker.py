@@ -237,8 +237,13 @@ def build_worker_env(
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # RUN_ID/HF_REPO/FLASH_ARM are control-plane-owned: overriding them would orphan artifacts.
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
+    # control-plane-owned values cannot be overridden by user worker env.
+    _RESERVED_WORKER_ENV = {
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+        "FREESOLO_CHECKPOINT_INTERNAL_KEY",
+    }
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
         if ku in _RESERVED_WORKER_ENV:
@@ -261,6 +266,14 @@ def build_worker_env(
     # runtime_secret can override it.
     if str(getattr(spec, "algorithm", "")).lower() == "opd" and os.environ.get("FIREWORKS_API_KEY"):
         env["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
+    # interpolated runs finalize by registering an exact full checkpoint. this is a platform credential,
+    # scoped to those runs and applied last so user configuration cannot override it.
+    if getattr(spec, "model_initialization", None) is not None and os.environ.get(
+        "FREESOLO_CHECKPOINT_INTERNAL_KEY"
+    ):
+        env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] = os.environ[
+            "FREESOLO_CHECKPOINT_INTERNAL_KEY"
+        ]
     return env
 
 

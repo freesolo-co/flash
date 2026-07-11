@@ -21,6 +21,23 @@ def _spec():
     )
 
 
+def _interpolation_spec(algorithm: str = "sft"):
+    from flash.spec import JobSpec, ModelInterpolationSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm=algorithm,
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        model_initialization=ModelInterpolationSpec(
+            base_model="Qwen/Qwen3.5-4B-Base",
+            instruct_model="Qwen/Qwen3.5-4B",
+            alpha=0.7,
+            base_revision="a" * 40,
+            instruct_revision="b" * 40,
+        ),
+    )
+
+
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     """Flash is managed: process-env tuning toggles do not change worker behavior."""
     from flash.providers.runpod.train import build_worker_env
@@ -129,6 +146,44 @@ def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatc
     env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
     assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
     assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_build_worker_env_forwards_checkpoint_key_for_interpolation(monkeypatch, algorithm):
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("FREESOLO_CHECKPOINT_INTERNAL_KEY", "platform-checkpoint-key")
+    env = build_worker_env(_interpolation_spec(algorithm), 0)
+    assert env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] == "platform-checkpoint-key"
+
+
+def test_build_worker_env_scopes_checkpoint_key_to_interpolation(monkeypatch):
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("FREESOLO_CHECKPOINT_INTERNAL_KEY", "platform-checkpoint-key")
+    assert "FREESOLO_CHECKPOINT_INTERNAL_KEY" not in build_worker_env(_spec(), 0)
+
+
+def test_build_worker_env_checkpoint_key_is_platform_authoritative(monkeypatch):
+    from dataclasses import replace
+
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec
+
+    monkeypatch.setenv("FREESOLO_CHECKPOINT_INTERNAL_KEY", "platform-checkpoint-key")
+    spec = replace(
+        _interpolation_spec("opd"),
+        environment=EnvironmentSpec(
+            id="org/env", secrets=("FREESOLO_CHECKPOINT_INTERNAL_KEY",)
+        ),
+        worker_env={"FREESOLO_CHECKPOINT_INTERNAL_KEY": "worker-env-user-key"},
+    )
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={"FREESOLO_CHECKPOINT_INTERNAL_KEY": "runtime-user-key"},
+    )
+    assert env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] == "platform-checkpoint-key"
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
