@@ -1024,7 +1024,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
+            model,
+            tok_,
+            device,
+            samples,
+            knobs,
+            microbatch,
+            backward_scale=backward_scale,
+            **_kwargs,
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -2283,7 +2290,9 @@ def test_student_model_continues_warmstart_adapter_in_place(monkeypatch):
     out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out is live  # the same live adapter, moved to device
     assert moved == ["cpu"]
-    assert rollout_model_source == "Qwen/Qwen3.5-4B"  # continued adapter deploys on the catalog base
+    assert (
+        rollout_model_source == "Qwen/Qwen3.5-4B"
+    )  # continued adapter deploys on the catalog base
     assert calls == []  # no base reload: neither causal nor VL loader is used
 
 
@@ -2456,7 +2465,9 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+    assert not supports_fp8_kv(
+        cheapest_gpu(need)
+    )  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
@@ -3324,6 +3335,156 @@ def test_train_spec_parses_opd_eos_loss_coef():
     assert JobSpec.from_dict({"algorithm": "opd", "train": {}}).train.opd_eos_loss_coef is None
 
 
+def test_resolve_opd_knobs_entropy_floor_overrides(monkeypatch):
+    """[train].opd_entropy_floor_coef / opd_entropy_floor override the recipe defaults; UNSET falls
+    back; an explicit 0 (disable) survives; negatives clamp to 0 (mirrors opd_eos_loss_coef)."""
+    from flash.engine.recipe import RECIPE
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _resolve(**train):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(**train)), THINKING=False),
+        )
+        k = opd_mod._resolve_opd_knobs()
+        return k.entropy_floor_coef, k.entropy_floor
+
+    assert _resolve() == (RECIPE.opd.entropy_floor_coef, RECIPE.opd.entropy_floor)
+    assert _resolve(opd_entropy_floor_coef=1.5, opd_entropy_floor=0.75) == (1.5, 0.75)
+    assert _resolve(opd_entropy_floor_coef=0.0)[0] == 0.0  # explicit disable survives
+    assert _resolve(opd_entropy_floor_coef=-3.0, opd_entropy_floor=-1.0) == (0.0, 0.0)
+
+
+def test_train_spec_parses_opd_entropy_floor_knobs():
+    """Both entropy-floor knobs parse and round-trip; omitted -> None (recipe defaults)."""
+    from flash.spec import JobSpec
+
+    raw = {"algorithm": "opd", "train": {"opd_entropy_floor_coef": 2.0, "opd_entropy_floor": 0.4}}
+    spec = JobSpec.from_dict(raw)
+    assert spec.train.opd_entropy_floor_coef == 2.0
+    assert spec.train.opd_entropy_floor == 0.4
+    rt = JobSpec.from_dict(spec.to_dict()).train
+    assert (rt.opd_entropy_floor_coef, rt.opd_entropy_floor) == (2.0, 0.4)
+    unset = JobSpec.from_dict({"algorithm": "opd", "train": {}}).train
+    assert unset.opd_entropy_floor_coef is None
+    assert unset.opd_entropy_floor is None
+
+
+def test_entropy_floor_term_inactive_at_or_above_floor():
+    # Uniform rows have entropy ln(V) — above any sane floor, so the hinge must contribute NOTHING
+    # (self-limiting: healthy runs pay nothing) while still reporting the mean entropy for logging.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.zeros(3, 8, requires_grad=True)
+    term, mean_h = opd_mod._entropy_floor_term(rows, coef=1.0, floor=0.5)
+    assert term is None
+    assert mean_h == pytest.approx(math.log(8), rel=1e-4)
+
+
+def test_entropy_floor_term_zero_coef_logs_but_never_penalizes():
+    # coef 0 = the term is OFF, but the detached mean entropy is still computed: a control run's
+    # entropy trajectory must be observable without enabling the penalty.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.zeros(2, 8)
+    rows[:, 3] = 30.0  # collapsed: ~all mass on one token, entropy ~0
+    term, mean_h = opd_mod._entropy_floor_term(rows, coef=0.0, floor=0.5)
+    assert term is None
+    assert mean_h is not None
+    assert mean_h < 0.01
+
+
+def test_entropy_floor_term_gradient_raises_collapsed_entropy():
+    # Below the floor the hinge is positive and differentiable, and one gradient step on the logits
+    # must RAISE the mean entropy — the direction that counteracts reverse-KL over-sharpening.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.zeros(2, 8)
+    rows[:, 3] = 5.0  # p_max ~0.95, mean entropy ~0.27 nats: collapsed but with a usable gradient
+    rows.requires_grad_(True)
+    term, mean_h = opd_mod._entropy_floor_term(rows, coef=2.0, floor=0.5)
+    assert mean_h < 0.5
+    assert term is not None
+    assert term.requires_grad
+    assert float(term.detach()) == pytest.approx(2.0 * (0.5 - mean_h), rel=1e-4)
+    term.backward()
+    stepped = (rows - 1.0 * rows.grad).detach()
+    _, mean_h_after = opd_mod._entropy_floor_term(stepped, coef=2.0, floor=0.5)
+    assert mean_h_after > mean_h
+
+
+def test_entropy_floor_term_chunked_matches_unchunked(monkeypatch):
+    # The row-chunked full-vocab passes (memory bound, codex[bot]) must be numerically identical to
+    # a direct whole-tensor computation, for both the detached mean and the differentiable term.
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    from flash.engine.worker import opd as opd_mod
+
+    torch.manual_seed(7)
+    rows = torch.randn(9, 16) * 4.0
+    lp = F.log_softmax(rows.float(), dim=-1)
+    direct_mean = float(-(lp.exp() * lp).sum(dim=-1).mean())
+    monkeypatch.setattr(opd_mod, "_ENTROPY_CHUNK_ROWS", 2)  # force many partial chunks
+    rows.requires_grad_(True)
+    floor = direct_mean + 1.0  # guarantee the hinge is active
+    term, mean_h = opd_mod._entropy_floor_term(rows, coef=1.0, floor=floor)
+    assert mean_h == pytest.approx(direct_mean, rel=1e-5)
+    assert float(term.detach()) == pytest.approx(floor - direct_mean, rel=1e-5)
+    assert term.requires_grad
+
+
+def test_resolve_samples_batched_applies_entropy_floor_and_logs_entropy():
+    # End-to-end through the loss path: entropy is logged on every distilled sample regardless of
+    # coef, and enabling the floor above the sample's entropy adds a positive addend to the loss.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    def _run(**knob_kw):
+        model = _TinyLM(torch, T=3, V=8)
+        samples = [
+            (
+                opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+                opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+                [1],
+            )
+        ]
+        knobs = SimpleNamespace(kl_coef=1.0, **knob_kw)
+        return opd_mod._resolve_samples_batched(model, _Tok(), "cpu", samples, knobs, microbatch=1)[
+            0
+        ]
+
+    base = _run()  # no entropy knobs on the namespace -> penalty off (bare test stand-in)
+    # _TinyLM logits are all-zero -> uniform -> entropy ln(8); logged either way.
+    assert base.entropy == pytest.approx(math.log(8), rel=1e-4)
+    off = _run(entropy_floor_coef=0.0, entropy_floor=5.0)
+    assert float(off.loss.detach()) == pytest.approx(float(base.loss.detach()), rel=1e-6)
+    on = _run(entropy_floor_coef=1.0, entropy_floor=5.0)  # floor above ln(8) -> hinge active
+    assert on.entropy == pytest.approx(math.log(8), rel=1e-4)
+    expected_addend = 1.0 * (5.0 - math.log(8))
+    assert float(on.loss.detach()) - float(base.loss.detach()) == pytest.approx(
+        expected_addend, rel=1e-4
+    )
+    assert on.loss.requires_grad
+
+
 def test_opd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).
@@ -3331,9 +3492,7 @@ def test_opd_loss_skips_empty_student_group_without_crashing():
     from flash.engine.worker import opd as opd_mod
 
     rows = torch.zeros(1, 8, requires_grad=True)
-    loss = opd_mod._gkd_loss_from_logits_rows(
-        rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0
-    )
+    loss = opd_mod._gkd_loss_from_logits_rows(rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0)
     assert loss is not None  # the empty group is ignored; the real group still trains
     loss.backward()
     assert rows.grad is not None
@@ -3539,7 +3698,9 @@ def test_runaway_eos_scale_maps_truncation_to_coef_fraction():
         _runaway_eos_scale,
     )
 
-    assert _runaway_eos_scale(0.0) == 0.0  # no truncation -> no push (this is what prevents collapse)
+    assert (
+        _runaway_eos_scale(0.0) == 0.0
+    )  # no truncation -> no push (this is what prevents collapse)
     assert _runaway_eos_scale(_EOS_RUNAWAY_LO) == 0.0  # boundary: still off
     assert _runaway_eos_scale(_EOS_RUNAWAY_HI) == 1.0  # clear runaway -> full coef
     assert _runaway_eos_scale(1.0) == 1.0  # saturates (never exceeds 1x)
@@ -3785,7 +3946,10 @@ def test_eos_reinforce_term_returns_none_when_not_applicable():
     V, eos = 6, 5
     logits = torch.zeros(3, V, requires_grad=True)
     # stop-string env, content-only ids -> the delimiter terminated it, not eos.
-    assert opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset({eos}), eos, ("</a>",), 1.0) is None
+    assert (
+        opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset({eos}), eos, ("</a>",), 1.0)
+        is None
+    )
     # disabled
     assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, (), 0.0) is None
     # no eos defined + content-only -> nothing to target
@@ -3793,7 +3957,10 @@ def test_eos_reinforce_term_returns_none_when_not_applicable():
     # empty completion
     assert opd_mod._eos_reinforce_term(logits, 1, [], frozenset({eos}), eos, (), 1.0) is None
     # a trailing eos is reinforced EVEN with stop_sequences (it ended on eos, not the delimiter)
-    assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, ("</a>",), 1.0) is not None
+    assert (
+        opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, ("</a>",), 1.0)
+        is not None
+    )
 
 
 def test_resolve_samples_batched_reinforces_terminal_eos():
@@ -3856,12 +4023,14 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     groups = [([0, 1], -0.75), ([2], -0.25)]
 
     loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
-    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
-        rows, dim=-1
-    )
+    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(
+        1
+    ) - torch.logsumexp(rows, dim=-1)
     coeff0 = 0.5 * (manual_logps[:2].detach().sum() - groups[0][1]) / 2
     coeff1 = 0.5 * (manual_logps[2:].detach().sum() - groups[1][1])
-    expected = torch.stack([coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]).mean()
+    expected = torch.stack(
+        [coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]
+    ).mean()
 
     assert loss is not None
     torch.testing.assert_close(loss, expected)
@@ -3895,12 +4064,8 @@ def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     student_ids = [2]
     rows_hi = torch.zeros(1, V, requires_grad=True)  # uniform logits -> student logprob = -log V
     rows_lo = torch.zeros(1, V, requires_grad=True)
-    hi = opd_mod._gkd_loss_from_logits_rows(
-        rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0
-    )
-    lo = opd_mod._gkd_loss_from_logits_rows(
-        rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0
-    )
+    hi = opd_mod._gkd_loss_from_logits_rows(rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0)
+    lo = opd_mod._gkd_loss_from_logits_rows(rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0)
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
     # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
     assert hi is not None
