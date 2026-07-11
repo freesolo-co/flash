@@ -196,8 +196,12 @@ def run_sft():
     from flash.engine.vram import sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
+    # Total SFT sequence budget (prompt + completion), honoring [train] max_context_tokens like the
+    # cost/preflight path (flash.cost.spec._sft_seq_len); unset -> the tuned recipe cap. Read the
+    # RENAMED knob: reading a stale "max_length" here made getattr silently return the 1024 default.
     sft_max_len = _train_opt(
-        "max_length", RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len
+        "max_context_tokens",
+        RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len,
     )
     with liveness_heartbeat("sft_pretokenizing"):
         texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
