@@ -178,8 +178,16 @@ class OPDConfig:
     # self-limiting: zero loss and zero gradient while mean entropy sits at/above the floor, so runs
     # that don't collapse pay nothing. 0 disables the term (mean entropy is still logged);
     # overridable via [train].opd_entropy_floor_coef / [train].opd_entropy_floor.
+    #
+    # floor default 1.5, NOT the greedy-path separator (~0.5): the hinge binds against TEMP-1.0
+    # on-policy rollout entropy, which runs ~1.5 nats hotter than the greedy path - a 0.5 floor
+    # never fires (validated: 2b sweep, flash-testing entropy_sweep_runs.md). 1.5 is the highest
+    # deployable setting on a 2b: it cut temp-0 unparseable 80%->48% and lifted accuracy 12%->33%.
+    # floors >= 1.6 currently tip small students over an eos-first cliff (the flattened
+    # distribution lifts P(eos|pos0) past the greedy threshold -> empty serves); #508's pos-0 eos
+    # penalty is the counter-force - once merged, re-validate 1.75-2.0.
     entropy_floor_coef: float = 0.0
-    entropy_floor: float = 0.5
+    entropy_floor: float = 1.5
 
 
 @dataclass(frozen=True)
