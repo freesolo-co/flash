@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+launcher_checkout="$(cd "$script_dir/.." && pwd -P)"
+checkout="${FLASHDEV_CHECKOUT:-$launcher_checkout}"
+port="${FLASHDEV_PORT:-8080}"
+port_explicit=0
+[ -z "${FLASHDEV_PORT:-}" ] || port_explicit=1
+env_file="${FLASHDEV_ENV_FILE:-}"
+command_name=""
+lock_held=0
+managed_pid=""
+
+usage() {
+  cat <<'EOF'
+usage: dev/flashdev [options] <command> [args]
+
+options:
+  --checkout PATH   flash checkout to run (default: checkout containing this script)
+  --port PORT       local control-plane port (default: 8080)
+  --env-file PATH   operator environment file (default: selected or launcher dev/local.env)
+  -h, --help        show this help
+
+commands:
+  serve             start the checkout-local control plane in the background
+  cli [args...]     run the checkout-local cli against the local plane
+  status            show process and health status
+  logs              print the control-plane log
+  stop              stop the local control plane
+  verify            check health and authenticated identity without submitting work
+EOF
+}
+
+die() {
+  printf 'flashdev: %s\n' "$*" >&2
+  exit 1
+}
+
+is_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+canonical_dir() {
+  [ -d "$1" ] || die "checkout does not exist: $1"
+  (cd "$1" && pwd -P)
+}
+
+canonical_file() {
+  [ -f "$1" ] || return 1
+  local directory basename
+  directory="$(cd "$(dirname "$1")" && pwd -P)"
+  basename="$(basename "$1")"
+  printf '%s/%s\n' "$directory" "$basename"
+}
+
+resolve_checkout() {
+  checkout="$(canonical_dir "$checkout")"
+  [ -f "$checkout/pyproject.toml" ] || die "not a Flash checkout: $checkout"
+  [ -f "$checkout/flash/server/__main__.py" ] || die "missing flash.server: $checkout"
+  [ -f "$checkout/flash/cli/__main__.py" ] || die "missing flash.cli: $checkout"
+
+  state_dir="$checkout/.flashdev"
+  server_home="$state_dir/home"
+  pid_file="$state_dir/server.pid"
+  log_file="$state_dir/server.log"
+  metadata_file="$state_dir/server.port"
+  lock_dir="$state_dir/lifecycle.lock"
+  lock_owner_file="$lock_dir/owner.pid"
+  api_url="http://127.0.0.1:$port"
+}
+
+require_local_control_plane_support() {
+  local app_file="$checkout/flash/server/app.py"
+  [ -f "$app_file" ] || die "selected checkout is missing flash/server/app.py: $checkout"
+  grep -Fq 'if os.environ.get("FLASH_LOCAL_CONTROL_PLANE") == "1":' "$app_file" || \
+    die "selected checkout does not support safe FLASH_LOCAL_CONTROL_PLANE=1 startup; use a checkout containing or cherry-pick the local-control-plane safety change"
+}
+
+require_uv() {
+  command -v uv >/dev/null 2>&1 || die "uv is required and was not found on PATH"
+}
+
+stat_mode() {
+  local mode
+  if [ "$(uname -s)" = "Darwin" ]; then
+    mode="$(stat -f '%Lp' "$1" 2>/dev/null)" || return 1
+  else
+    mode="$(stat -c '%a' "$1" 2>/dev/null)" || return 1
+  fi
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  printf '%s\n' "$mode"
+}
+
+check_env_permissions() {
+  local selected="$1" selected_path mode mode_value
+  selected_path="$(canonical_file "$selected")" || die "environment file not found: $selected"
+  if [ "$selected_path" = "$checkout/dev/local.env.example" ] || \
+    [ "$selected_path" = "$launcher_checkout/dev/local.env.example" ]; then
+    return 0
+  fi
+  mode="$(stat_mode "$selected_path")" || return 0
+  mode_value=$((8#$mode))
+  [ $((mode_value & 077)) -eq 0 ] || \
+    die "environment file must not be group/world accessible: $selected_path (mode $mode)"
+}
+
+load_operator_env() {
+  local selected="$env_file"
+  if [ -z "$selected" ]; then
+    if [ -f "$checkout/dev/local.env" ]; then
+      selected="$checkout/dev/local.env"
+    elif [ -f "$launcher_checkout/dev/local.env" ]; then
+      selected="$launcher_checkout/dev/local.env"
+    else
+      selected="$launcher_checkout/dev/local.env.example"
+    fi
+  fi
+  [ -f "$selected" ] || die "environment file not found: $selected"
+  check_env_permissions "$selected"
+
+  set -a
+  # shellcheck disable=SC1090
+  . "$selected"
+  set +a
+
+  local name
+  for name in RUNPOD_API_KEY LAMBDA_API_KEY FREESOLO_INTERNAL_KEY GITHUB_TOKEN HF_TOKEN; do
+    [ -n "${!name:-}" ] || die "$name is missing from $selected"
+  done
+
+  FREESOLO_API_KEY="${FREESOLO_API_KEY:-$FREESOLO_INTERNAL_KEY}"
+  [ "$FREESOLO_API_KEY" = "$FREESOLO_INTERNAL_KEY" ] || \
+    die "FREESOLO_API_KEY must match FREESOLO_INTERNAL_KEY for local auth"
+  export FREESOLO_API_KEY
+}
+
+read_pid() {
+  [ -f "$pid_file" ] || return 1
+  local pid
+  pid="$(<"$pid_file")"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$pid"
+}
+
+process_is_running() {
+  local state
+  kill -0 "$1" 2>/dev/null || return 1
+  state="$(ps -p "$1" -o stat= 2>/dev/null || true)"
+  case "$state" in
+    *Z*) return 1 ;;
+    '') return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+process_is_managed_flash_server() {
+  local process_command
+  process_is_running "$1" || return 1
+  process_command="$(ps -p "$1" -o command= 2>/dev/null || true)"
+  [[ "$process_command" == *"python -m flash.server"* ]] || return 1
+  [[ "$process_command" == *"HOME=$server_home"* ]] || return 1
+  case " $process_command " in
+    *" --port $port "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+release_lifecycle_lock() {
+  local owner
+  [ "$lock_held" -eq 1 ] || return 0
+  if [ -f "$lock_owner_file" ]; then
+    owner="$(<"$lock_owner_file")"
+    if [ "$owner" = "$$" ]; then
+      rm -f "$lock_owner_file"
+      rmdir "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+  lock_held=0
+}
+
+handle_lifecycle_signal() {
+  local exit_code="$1"
+  trap - HUP INT TERM
+  if [ -n "$managed_pid" ] && ! terminate_managed_process "$managed_pid"; then
+    printf 'flashdev: signal cleanup for pid %s did not complete; pid file retained\n' "$managed_pid" >&2
+  fi
+  managed_pid=""
+  release_lifecycle_lock
+  trap - EXIT
+  exit "$exit_code"
+}
+
+acquire_lifecycle_lock() {
+  local owner reclaim_dir
+  mkdir -p "$state_dir"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    [ -f "$lock_owner_file" ] || \
+      die "lifecycle lock has no owner pid; refusing to reclaim it: $lock_dir"
+    owner="$(<"$lock_owner_file")"
+    case "$owner" in
+      ''|*[!0-9]*) die "lifecycle lock has an invalid owner pid; refusing to reclaim it: $lock_dir" ;;
+    esac
+    if process_is_running "$owner"; then
+      die "lifecycle state is locked by running pid $owner: $lock_dir"
+    fi
+
+    reclaim_dir="$state_dir/lifecycle.lock.reclaim.$$"
+    [ ! -e "$reclaim_dir" ] || \
+      die "stale lock reclaim path already exists; refusing to continue: $reclaim_dir"
+    if ! mv "$lock_dir" "$reclaim_dir" 2>/dev/null; then
+      die "lifecycle lock changed while checking it; try again: $lock_dir"
+    fi
+    rm -rf "$reclaim_dir"
+    mkdir "$lock_dir" 2>/dev/null || \
+      die "another process acquired the lifecycle lock; try again: $lock_dir"
+  fi
+
+  printf '%s\n' "$$" >"$lock_owner_file" || {
+    rmdir "$lock_dir" 2>/dev/null || true
+    die "could not record lifecycle lock owner: $lock_owner_file"
+  }
+  lock_held=1
+  trap 'release_lifecycle_lock' EXIT
+  trap 'handle_lifecycle_signal 129' HUP
+  trap 'handle_lifecycle_signal 130' INT
+  trap 'handle_lifecycle_signal 143' TERM
+}
+
+port_is_occupied() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}
+
+handle_occupied_port() {
+  die "port $port is already occupied; stop the existing service or pass --port PORT"
+}
+
+write_metadata() {
+  local temporary="$metadata_file.$$"
+  printf '%s\n' "$port" >"$temporary"
+  mv "$temporary" "$metadata_file"
+}
+
+remove_pid_file_if_matches() {
+  local expected_pid="$1" current_pid
+  [ -f "$pid_file" ] || return 0
+  current_pid="$(<"$pid_file")"
+  case "$current_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$current_pid" = "$expected_pid" ] || return 1
+  rm -f "$pid_file"
+}
+
+load_runtime_metadata() {
+  local saved_port
+  [ -f "$metadata_file" ] || return 0
+  IFS= read -r saved_port <"$metadata_file" || die "invalid runtime port metadata: $metadata_file"
+  is_port "$saved_port" || die "invalid runtime port metadata: $metadata_file"
+  if [ "$port_explicit" -eq 1 ]; then
+    case "$command_name" in
+      status|verify|stop)
+        [ "$port" = "$saved_port" ] || \
+          die "explicit port $port conflicts with persisted runtime port $saved_port; refusing to associate the recorded pid with another service"
+        ;;
+    esac
+    return 0
+  fi
+  port="$saved_port"
+  api_url="http://127.0.0.1:$port"
+}
+
+wait_for_health() {
+  local pid="$1"
+  FLASHDEV_HEALTH_URL="$api_url/v1/health" uv run python - "$pid" <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+pid = int(sys.argv[1])
+url = os.environ["FLASHDEV_HEALTH_URL"]
+deadline = time.monotonic() + 20
+last_error = "server did not become healthy"
+
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            payload = json.load(response)
+        if response.status == 200 and payload.get("ok") is True:
+            raise SystemExit(0)
+        last_error = f"unexpected health response: {payload!r}"
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        last_error = str(exc)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        print("control plane exited during startup", file=sys.stderr)
+        raise SystemExit(1)
+    time.sleep(0.2)
+
+print(last_error, file=sys.stderr)
+raise SystemExit(1)
+PY
+}
+
+cli_command_name() {
+  local arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+    if [ "$arg" = "--" ]; then
+      [ "$#" -gt 0 ] && printf '%s\n' "$1"
+      return 0
+    fi
+    case "$arg" in
+      --debug|--verbose) continue ;;
+    esac
+    if [[ "$arg" =~ ^-v+$ ]]; then
+      continue
+    fi
+    printf '%s\n' "$arg"
+    return 0
+  done
+}
+
+run_checkout_cli() {
+  local cli_command
+  [ "$#" -gt 0 ] || die "cli requires a Flash CLI command"
+  cli_command="$(cli_command_name "$@")"
+  [ "$cli_command" != "login" ] || die "cli login is disabled; flashdev injects local credentials"
+  mkdir -p "$server_home/.flash"
+  (
+    cd "$checkout"
+    uv run /usr/bin/env \
+      HOME="$server_home" \
+      FLASH_API_URL="$api_url" \
+      FREESOLO_API_KEY="$FREESOLO_API_KEY" \
+      FLASH_NO_UPDATE_CHECK=1 \
+      python -m flash.cli "$@"
+  )
+}
+
+terminate_managed_process() {
+  local pid="$1" attempt
+  if ! process_is_running "$pid"; then
+    wait "$pid" 2>/dev/null || true
+    remove_pid_file_if_matches "$pid"
+    return
+  fi
+  process_is_managed_flash_server "$pid" || return 1
+
+  kill "$pid"
+  attempt=0
+  while process_is_running "$pid" && [ "$attempt" -lt 50 ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  if process_is_running "$pid"; then
+    process_is_managed_flash_server "$pid" || return 1
+    kill -KILL "$pid"
+    attempt=0
+    while process_is_running "$pid" && [ "$attempt" -lt 20 ]; do
+      sleep 0.1
+      attempt=$((attempt + 1))
+    done
+  fi
+  process_is_running "$pid" && return 1
+  wait "$pid" 2>/dev/null || true
+  remove_pid_file_if_matches "$pid"
+}
+
+serve() {
+  local pid recorded_pid
+  acquire_lifecycle_lock
+  load_runtime_metadata
+  is_port "$port" || die "invalid port in runtime metadata: $port"
+  api_url="http://127.0.0.1:$port"
+  mkdir -p "$server_home/.flash"
+
+  if pid="$(read_pid)"; then
+    if process_is_managed_flash_server "$pid"; then
+      die "control plane is already running for $checkout on pid $pid"
+    fi
+    if process_is_running "$pid"; then
+      die "pid file points to an unmanaged process; refusing to replace it: $pid_file"
+    fi
+    remove_pid_file_if_matches "$pid" || \
+      die "pid file changed while checking stale state; refusing to replace it: $pid_file"
+  fi
+
+  if port_is_occupied "$port"; then
+    handle_occupied_port
+  fi
+
+  : >"$log_file"
+  write_metadata
+  (
+    cd "$checkout"
+    exec uv run /usr/bin/env \
+      HOME="$server_home" \
+      FLASH_LOCAL_CONTROL_PLANE=1 \
+      python -m flash.server --host 127.0.0.1 --port "$port"
+  ) >>"$log_file" 2>&1 &
+  pid=$!
+  managed_pid="$pid"
+  printf '%s\n' "$pid" >"$pid_file.$$"
+  mv "$pid_file.$$" "$pid_file"
+
+  if ! (cd "$checkout" && wait_for_health "$pid"); then
+    if ! terminate_managed_process "$pid"; then
+      printf 'flashdev: startup failed and cleanup for pid %s did not complete; pid file retained\n' "$pid" >&2
+    fi
+    printf 'flashdev: startup failed; log: %s\n' "$log_file" >&2
+    return 1
+  fi
+
+  recorded_pid="$(read_pid || true)"
+  if [ "$recorded_pid" != "$pid" ] || ! process_is_managed_flash_server "$pid"; then
+    if ! terminate_managed_process "$pid"; then
+      printf 'flashdev: post-start ownership cleanup for pid %s did not complete; pid file retained\n' "$pid" >&2
+    fi
+    die "control plane became healthy but its pid ownership changed; refusing to report success"
+  fi
+
+  managed_pid=""
+  printf 'flashdev: running %s on %s (pid %s)\n' "$checkout" "$api_url" "$pid"
+}
+
+status() {
+  local pid
+  if ! pid="$(read_pid)"; then
+    printf 'flashdev: stopped (%s)\n' "$checkout"
+    return 1
+  fi
+  if ! process_is_managed_flash_server "$pid"; then
+    printf 'flashdev: stale or unmanaged pid file (%s)\n' "$pid_file"
+    return 1
+  fi
+
+  printf 'flashdev: running %s on %s (pid %s)\n' "$checkout" "$api_url" "$pid"
+  if port_is_occupied "$port"; then
+    printf 'flashdev: port %s accepts connections\n' "$port"
+  else
+    printf 'flashdev: process exists but port %s is not accepting connections\n' "$port"
+    return 1
+  fi
+}
+
+logs() {
+  [ -f "$log_file" ] || die "no log exists for $checkout"
+  /bin/cat "$log_file"
+}
+
+stop() {
+  local pid
+  acquire_lifecycle_lock
+  load_runtime_metadata
+  is_port "$port" || die "invalid port in runtime metadata: $port"
+  api_url="http://127.0.0.1:$port"
+  if ! pid="$(read_pid)"; then
+    printf 'flashdev: already stopped (%s)\n' "$checkout"
+    return 0
+  fi
+  if ! process_is_managed_flash_server "$pid"; then
+    if process_is_running "$pid"; then
+      die "pid $pid is not owned by this checkout and port $port; refusing to stop it"
+    fi
+    remove_pid_file_if_matches "$pid" || \
+      die "pid file changed while checking stale state; refusing to remove it: $pid_file"
+    die "removed stale pid file; pid $pid is not running"
+  fi
+
+  managed_pid="$pid"
+  terminate_managed_process "$pid" || die "stop cleanup for pid $pid did not complete; pid file retained"
+  managed_pid=""
+  printf 'flashdev: stopped pid %s\n' "$pid"
+}
+
+verify() {
+  local pid
+  pid="$(read_pid)" || die "control plane is not running"
+  process_is_managed_flash_server "$pid" || die "control plane pid is stale or unmanaged: $pid"
+
+  (
+    cd "$checkout"
+    FLASHDEV_HEALTH_URL="$api_url/v1/health" uv run python - <<'PY'
+import json
+import os
+import urllib.request
+
+with urllib.request.urlopen(os.environ["FLASHDEV_HEALTH_URL"], timeout=3) as response:
+    payload = json.load(response)
+if response.status != 200 or payload.get("ok") is not True:
+    raise SystemExit(f"unhealthy response: {payload!r}")
+print(f"health ok: flash {payload.get('version', 'unknown')}")
+PY
+  )
+  run_checkout_cli whoami
+  printf 'flashdev: local no-spend verification passed\n'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --checkout)
+      [ "$#" -ge 2 ] || die "--checkout requires a path"
+      checkout="$2"
+      shift 2
+      ;;
+    --port)
+      [ "$#" -ge 2 ] || die "--port requires a value"
+      port="$2"
+      port_explicit=1
+      shift 2
+      ;;
+    --env-file)
+      [ "$#" -ge 2 ] || die "--env-file requires a path"
+      env_file="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      command_name="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+[ -n "$command_name" ] || {
+  usage >&2
+  exit 2
+}
+is_port "$port" || die "invalid port: $port"
+resolve_checkout
+case "$command_name" in
+  serve|stop) ;;
+  *) load_runtime_metadata ;;
+esac
+is_port "$port" || die "invalid port in runtime metadata: $port"
+api_url="http://127.0.0.1:$port"
+require_uv
+
+case "$command_name" in
+  serve)
+    [ "$#" -eq 0 ] || die "serve does not accept arguments"
+    require_local_control_plane_support
+    load_operator_env
+    serve
+    ;;
+  cli)
+    load_operator_env
+    run_checkout_cli "$@"
+    ;;
+  status)
+    [ "$#" -eq 0 ] || die "status does not accept arguments"
+    status
+    ;;
+  logs)
+    [ "$#" -eq 0 ] || die "logs does not accept arguments"
+    logs
+    ;;
+  stop)
+    [ "$#" -eq 0 ] || die "stop does not accept arguments"
+    stop
+    ;;
+  verify)
+    [ "$#" -eq 0 ] || die "verify does not accept arguments"
+    load_operator_env
+    verify
+    ;;
+  *) die "unknown command: $command_name" ;;
+esac

@@ -31,3 +31,8 @@ uv-cache/
 
 # Operator credentials (use .env.example as the template)
 .env
+
+# local development harness state and credentials
+.flashdev/
+dev/local.env
+dev/*.local.env

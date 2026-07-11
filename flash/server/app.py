@@ -321,6 +321,10 @@ def create_app():
         from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
+        if os.environ.get("FLASH_LOCAL_CONTROL_PLANE") == "1":
+            yield
+            return
+
         recover_runs()
         serving.recover_deployments()
         # Recover completion-time customer charges left pending/failed by a transient blip or a
