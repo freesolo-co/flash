@@ -437,7 +437,7 @@ def test_structured_outputs_body_helper():
     spec = json.dumps({"json": {"type": "object"}})
     assert _structured_outputs_body("r1", spec, thinking=True) is None
     assert _structured_outputs_body("r1", spec, thinking=False) == {"json": {"type": "object"}}
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="corrupt train"):
         _structured_outputs_body("r1", "{not json", thinking=False)
 
 
