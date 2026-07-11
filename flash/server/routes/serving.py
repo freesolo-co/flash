@@ -345,6 +345,15 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
+        if spec.model_initialization is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "interpolated-model runs cannot deploy a LoRA over the canonical base; "
+                    "publish the exact full checkpoint and register it through the internal "
+                    "/model-checkpoints contract"
+                ),
+            )
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
         current_deployment = status.deployment or {}

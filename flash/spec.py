@@ -184,6 +184,28 @@ class WandbSpec:
 
 
 @dataclass(frozen=True)
+class ModelInterpolationSpec:
+    base_model: str
+    instruct_model: str
+    alpha: float
+    tokenizer_config_source: str = "instruct"
+    base_revision: str = ""
+    instruct_revision: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.base_model.strip() or not self.instruct_model.strip():
+            raise ValueError("model_initialization parents must be non-empty model ids")
+        if self.base_model.strip() == self.instruct_model.strip():
+            raise ValueError("model_initialization parents must be distinct")
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError("model_initialization.alpha must be between 0 and 1")
+        if self.tokenizer_config_source not in {"base", "instruct"}:
+            raise ValueError(
+                "model_initialization.tokenizer_config_source must be 'base' or 'instruct'"
+            )
+
+
+@dataclass(frozen=True)
 class JobSpec:
     model: str = DEFAULT_MODEL
     algorithm: str = "sft"
@@ -197,6 +219,7 @@ class JobSpec:
     model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
+    model_initialization: ModelInterpolationSpec | None = None
 
     @property
     def phase(self) -> str:
@@ -219,6 +242,27 @@ class JobSpec:
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
+        initialization = data.get("model_initialization")
+        if initialization is not None and not isinstance(initialization, dict):
+            raise ValueError("model_initialization must be a table")
+        interpolation = None
+        if initialization:
+            init_type = str(initialization.get("type") or "interpolation").strip().lower()
+            if init_type != "interpolation":
+                raise ValueError("model_initialization.type must be 'interpolation'")
+            alpha = _opt_float(initialization.get("alpha"))
+            if alpha is None:
+                raise ValueError("model_initialization.alpha is required")
+            interpolation = ModelInterpolationSpec(
+                base_model=str(initialization.get("base_model") or "").strip(),
+                instruct_model=str(initialization.get("instruct_model") or "").strip(),
+                alpha=alpha,
+                tokenizer_config_source=str(
+                    initialization.get("tokenizer_config_source") or "instruct"
+                ).strip(),
+                base_revision=str(initialization.get("base_revision") or "").strip(),
+                instruct_revision=str(initialization.get("instruct_revision") or "").strip(),
+            )
         return cls(
             model=data.get("model", cls.model),
             algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
@@ -273,6 +317,7 @@ class JobSpec:
             model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
+            model_initialization=interpolation,
         )
 
     @classmethod

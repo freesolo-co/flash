@@ -304,7 +304,7 @@ def _thinking_prefill_text(tok) -> str:
     return ""
 
 
-def _student_model(model_id, model_init_kwargs, device):
+def _student_model(model_id, model_init_kwargs, device, model_source=None):
     """Build the trainable student LoRA and return ``(model, rollout_model_source)``.
 
     Warm-starts from ``train.init_from_adapter`` when set — continuing a prior run's adapter (e.g. an
@@ -317,10 +317,15 @@ def _student_model(model_id, model_init_kwargs, device):
     catalog base (no merge, no recombine). Only the FRESH-LoRA path (``init_peft`` is a config) builds
     a new adapter here, loading the full multimodal model for VL so all-linear LoRA sees every target.
     """
-    init_model, init_peft = _w._init_adapter_model(model_id)
+    source = model_source or model_id
+    init_model, init_peft = (
+        _w._init_adapter_model(model_id, source)
+        if source != model_id
+        else _w._init_adapter_model(model_id)
+    )
     if init_peft is None:
         # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
-        return init_model.to(device), model_id
+        return init_model.to(device), source
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
@@ -408,10 +413,10 @@ def run_opd():
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    # Tokenizer only (a few small files) up front -- the prompt-budget filter below needs it. The FULL
-    # base-weight prefetch (tens of GB) is deferred until AFTER the filter confirms a non-empty pool, so
-    # a dataset whose every prompt is over-budget fails fast without paying for the download (codex[bot]).
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    resolved_source = _w.resolve_model_source(model_id)
+    model_source = resolved_source.source
+    download_seconds = resolved_source.setup_seconds
+    tok = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     # Thinking-mode student prompts open a reasoning block (e.g. Qwen's <think>) after the generation
@@ -522,11 +527,6 @@ def run_opd():
         f"{prompts_per_step} prompts/step -> steps={steps}"
     )
 
-    # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
-    # setup so an all-over-budget dataset fails before this download). Still inside the setup phase
-    # (opt_steps==0 -> wide poller grace), same as when it ran earlier.
-    download_seconds = _w.prefetch_model(model_id)
-
     # Seed torch/CUDA BEFORE constructing the student LoRA: get_peft_model samples the LoRA A matrix
     # (init_lora_weights=True) from the torch default generator, so seeding must precede _student_model
     # for the fixed Flash seed to reproduce the same adapter init run-to-run (the fresh-LoRA and VL
@@ -540,7 +540,10 @@ def run_opd():
     setup_seconds = time.time() - t_start
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
-        model, rollout_model_source = _student_model(model_id, model_init_kwargs, device)
+        model, rollout_model_source = _student_model(
+            model_id, model_init_kwargs, device, model_source=model_source
+        )
+        _w.assert_model_source_parity(model_source, rollout_model_source, resolved_source.source)
         # Apply chalk standalone kernels to the student, exactly as sft/rl do after building their
         # trainer. The HF/PEFT student remains the GKD loss target, so without this the default
         # Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA kernels and a

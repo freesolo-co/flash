@@ -215,9 +215,13 @@ def runs_file_path(run_id: str, suffix: str) -> str:
 
 
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
-    """Spec dict with gpu.disk_gb raised to the model's catalog min_disk_gb."""
+    """spec dict with enough disk for the model and any interpolation workspace."""
     d = spec.to_dict()
     need = int(getattr(info, "min_disk_gb", 0) or 0)
+    if spec.model_initialization is not None:
+        from flash.engine.worker.model_interpolation import interpolation_disk_gb
+
+        need = max(need, interpolation_disk_gb(float(getattr(info, "params_b", 0.0) or 0.0)))
     if need > int(d["gpu"].get("disk_gb") or 0):
         d["gpu"] = {**d["gpu"], "disk_gb": need}
     return d

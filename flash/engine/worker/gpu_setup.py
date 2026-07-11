@@ -117,6 +117,7 @@ def patch_trl_colocate_llm_kwargs(
     attention_backend: str | None = None,
     mm_encoder_attn_backend: str | None = None,
     reasoning_parser: str | None = None,
+    model_source: str | None = None,
 ) -> bool:
     """Inject vLLM ``LLM(...)`` kwargs into TRL's colocated rollout engine that can't be expressed via
     ``GRPOConfig`` or the (pinned) vLLM env registry — must run BEFORE ``GRPOTrainer.__init__`` builds
@@ -174,6 +175,8 @@ def patch_trl_colocate_llm_kwargs(
         new_overrides["mm_encoder_attn_backend"] = mm_encoder_attn_backend
     if reasoning_parser is not None:
         new_overrides["reasoning_parser"] = reasoning_parser
+    if model_source is not None:
+        new_overrides["model"] = model_source
     if not new_overrides:
         return False
     try:
@@ -202,7 +205,14 @@ def patch_trl_colocate_llm_kwargs(
     def _patched_LLM(*args, **kwargs):
         # Override TRL's hardcoded/absent values with ours (the kwargs TRL/env can't set). Read the
         # accumulated dict live so kwargs registered by later calls are applied too.
-        kwargs.update(_vg._flash_llm_overrides)
+        overrides = dict(_vg._flash_llm_overrides)
+        model_source = overrides.pop("model", None)
+        if model_source is not None and args:
+            args = (model_source, *args[1:])
+            kwargs.pop("model", None)
+        elif model_source is not None:
+            kwargs["model"] = model_source
+        kwargs.update(overrides)
         print(f"[rl] colocate vLLM LLM(...) kwargs override applied: {_vg._flash_llm_overrides}")
         return _orig_LLM(*args, **kwargs)
 

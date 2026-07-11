@@ -23,6 +23,15 @@ def write_train_meta(
     step=None,
 ):
     env = _w.require_active_env()
+    resolved = getattr(_w, "RESOLVED_MODEL_SOURCE", None)
+    source_metadata = (
+        {
+            "model_source": resolved.source,
+            "model_interpolation": resolved.interpolation,
+        }
+        if resolved is not None
+        else {"model_source": model_id, "model_interpolation": None}
+    )
     meta = {
         "phase": phase,
         "adapter_dir": adapter_dir,
@@ -31,6 +40,7 @@ def write_train_meta(
         "setup_seconds": setup_seconds,
         "train_tokens": train_tokens,
         "generated_tokens": generated_tokens,
+        **source_metadata,
         "notes": notes or {},
     }
     with open("/tmp/train_meta.json", "w") as f:
@@ -69,6 +79,7 @@ def write_train_meta(
             "model_id": model_id,
             "environment": env.id,
             "job_spec": _w.JOB_SPEC.to_dict() if _w.JOB_SPEC else None,
+            **source_metadata,
         },
     )
     _w._finalize(m)

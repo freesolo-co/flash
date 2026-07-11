@@ -31,7 +31,14 @@ from flash.schema.fields import (
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, SFTGoldSource, TrainSpec
+from flash.spec import (
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    ModelInterpolationSpec,
+    SFTGoldSource,
+    TrainSpec,
+)
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -192,9 +199,22 @@ _TOP_LEVEL_KEYS = frozenset(
         "gpu",
         "worker_env",
         "wandb",
+        "model_initialization",
         "run_id",
     }
 )
+_MODEL_INITIALIZATION_KEYS = frozenset(
+    {
+        "type",
+        "base_model",
+        "instruct_model",
+        "alpha",
+        "tokenizer_config_source",
+        "base_revision",
+        "instruct_revision",
+    }
+)
+
 _TRAIN_KEYS = frozenset(
     {
         "epochs",
@@ -251,7 +271,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             )
         raise ConfigError(
             f"unknown config section(s): {', '.join(unknown)} "
-            f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
+            f"(allowed tables: environment, train, gpu, wandb, worker_env, "
+            f"model_initialization){hint}"
         )
     try:
         model = raw["model"]
@@ -267,6 +288,45 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     model_policy = "catalog"  # not a user knob; "allow" path exists for internal use only
+    init_raw = raw.get("model_initialization")
+    if init_raw is not None and not isinstance(init_raw, dict):
+        raise ConfigError("[model_initialization] must be a table")
+    model_initialization = None
+    if init_raw:
+        unknown_init = sorted(set(init_raw) - _MODEL_INITIALIZATION_KEYS)
+        if unknown_init:
+            raise ConfigError(
+                f"[model_initialization] unknown key(s): {', '.join(unknown_init)}"
+            )
+        init_type = init_raw.get("type", "interpolation")
+        if init_type != "interpolation":
+            raise ConfigError("model_initialization.type must be 'interpolation'")
+        alpha = init_raw.get("alpha")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+            raise ConfigError("model_initialization.alpha must be a number between 0 and 1")
+        for key in (
+            "base_model",
+            "instruct_model",
+            "tokenizer_config_source",
+            "base_revision",
+            "instruct_revision",
+        ):
+            value = init_raw.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"model_initialization.{key} must be a string")
+        try:
+            model_initialization = ModelInterpolationSpec(
+                base_model=str(init_raw.get("base_model") or "").strip(),
+                instruct_model=str(init_raw.get("instruct_model") or "").strip(),
+                alpha=float(alpha),
+                tokenizer_config_source=str(
+                    init_raw.get("tokenizer_config_source") or "instruct"
+                ).strip(),
+                base_revision=str(init_raw.get("base_revision") or "").strip(),
+                instruct_revision=str(init_raw.get("instruct_revision") or "").strip(),
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
@@ -408,6 +468,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         model_policy=model_policy,
         thinking=thinking,
         wandb=wandb_spec,
+        model_initialization=model_initialization,
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:

@@ -87,6 +87,7 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
 )
+from flash.engine.worker.model_source import assert_model_source_parity, resolve_model_source
 from flash.engine.worker.opd import run_opd
 from flash.engine.worker.perf import (
     RetriableInfraError,
@@ -137,6 +138,7 @@ SEED = int(os.environ.get("SEED", str(FIXED_SEED)))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
+RESOLVED_MODEL_SOURCE = None
 PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
@@ -343,6 +345,7 @@ __all__ = [
     "HF_REPO",
     "JOB_SPEC",
     "PHASE",
+    "RESOLVED_MODEL_SOURCE",
     "RUN_ID",
     "RUN_MODE",
     "SEED",
@@ -399,6 +402,7 @@ __all__ = [
     "assert_adapter_delta_nonzero",
     "assert_adapter_load_clean",
     "assert_lora_applied",
+    "assert_model_source_parity",
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
     # gpu/backend setup
@@ -442,6 +446,7 @@ __all__ = [
     "require_active_env",
     "require_vllm_for_rollout_func",
     "resolve_grpo_prompts_per_step",
+    "resolve_model_source",
     "rl_per_device_comps",
     "run_opd",
     "run_rl",

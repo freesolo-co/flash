@@ -38,6 +38,7 @@ gpu = [
     "datasets>=2.19",
     "freesolo>=0.2.54",
     "huggingface-hub>=0.34",
+    "safetensors>=0.4",
 ]
 # freesolo-chalk (Freesolo's custom Triton/CUDA kernels) is a worker-side package selected by the
 # submit path, not a control-plane dependency. flash appends DEFAULT_CHALK_SPEC to each worker job's
@@ -75,6 +76,7 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.2.54",
     "transformers>=5.6,<5.11",
+    "safetensors>=0.4",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -129,6 +131,7 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.2.54",
+    "safetensors>=0.4",
 ]
 
 [tool.mypy]

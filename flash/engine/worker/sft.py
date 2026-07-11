@@ -160,7 +160,9 @@ def run_sft():
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    resolved_source = _w.resolve_model_source(model_id)
+    model_source = resolved_source.source
+    download_seconds = resolved_source.setup_seconds
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
     _source_value = getattr(_t, "sft_gold_source", "oracle")
@@ -174,7 +176,7 @@ def run_sft():
     # tokenizer + dataset download + O(N) chat-template render can run for minutes on a big
     # dataset with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("sft_data_loading"):
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -570,8 +572,9 @@ def run_sft():
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
         sft_model = _w.prepare_fresh_lora_base(
-            model_id, model_id, model_init_kwargs, phase="sft"
+            model_source, model_id, model_init_kwargs, phase="sft"
         )
+        _w.assert_model_source_parity(model_source, resolved_source.source)
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
         trainer = _SFT(

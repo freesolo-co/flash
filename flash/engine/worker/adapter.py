@@ -91,7 +91,7 @@ def _assert_warmstart_adapter_applied(model, model_id: str, load_result) -> None
     assert_adapter_delta_nonzero(model, model_id)
 
 
-def _init_adapter_model(model_id: str):
+def _init_adapter_model(model_id: str, model_source: str | None = None):
     """Load init_from_adapter as a trainable PeftModel that CONTINUES the prior adapter in place, or
     return ``(model_id, fresh LoRA config)`` when no warm-start is requested.
 
@@ -107,9 +107,10 @@ def _init_adapter_model(model_id: str):
     and opd train the LOADED adapter, ``peft_config=None``); for a fresh LoRA TRL/opd build it from the
     returned ``LoraConfig`` — VL fresh runs load the full multimodal base via ``prepare_fresh_lora_base``.
     """
+    source = model_source or model_id
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     if not prefix:
-        return model_id, make_lora(model_id)
+        return source, make_lora(model_id)
     adir = _download_adapter(prefix)
     if not adir:
         raise RuntimeError(
@@ -133,7 +134,7 @@ def _init_adapter_model(model_id: str):
         print("[init-adapter] VL checkpoint: continuing the adapter on the full multimodal base")
     base_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
     base = base_cls.from_pretrained(
-        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
+        source, dtype="bfloat16", trust_remote_code=True, **attn_kw
     )
     # PeftModel.from_pretrained builds the wrapper + a trainable "default" adapter, but it doesn't
     # forward the HF `_checkpoint_conversion_mapping`; re-load "default" with key_mapping so a VL

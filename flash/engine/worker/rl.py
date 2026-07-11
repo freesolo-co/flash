@@ -58,7 +58,9 @@ def run_rl():
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    resolved_source = _w.resolve_model_source(model_id)
+    model_source = resolved_source.source
+    download_seconds = resolved_source.setup_seconds
     rl = RECIPE.rl
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
     gcfg = _w.grpo_overrides()
@@ -86,7 +88,7 @@ def run_rl():
     # tokenizer + dataset download + per-prompt budget tokenization of the whole dataset can run
     # for minutes with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("rl_data_loading"):
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -472,11 +474,18 @@ def run_rl():
             {"cudagraph_mode": "FULL_AND_PIECEWISE"},
             "vLLM cudagraph_mode (verl rollout default)",
         )
+    source_patch = _w.patch_trl_colocate_llm_kwargs(model_source=model_source)
+    if _w.JOB_SPEC and _w.JOB_SPEC.model_initialization is not None and not source_patch:
+        raise RuntimeError(
+            "model source parity failure: could not pin the GRPO rollout engine to the "
+            "materialized interpolation"
+        )
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
     # The warm-start path downloads the adapter and loads it as the trainable adapter on the base
     # (VL checkpoints load the full multimodal model, still just an adapter — no on-disk merge copy).
     with liveness_heartbeat("rl_adapter_loading"):
-        init_model, init_peft = _w._init_adapter_model(model_id)
+        init_model, init_peft = _w._init_adapter_model(model_id, model_source)
+    _w.assert_model_source_parity(model_source, resolved_source.source)
     # _init_adapter_model returns peft_config=None only for a warm-start (the prior adapter is loaded
     # as the trainable "default"); a fresh run returns a LoraConfig for TRL to build.
     is_warm_start = init_peft is None
