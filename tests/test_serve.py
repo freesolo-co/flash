@@ -50,6 +50,35 @@ def _stub_adapter_config(
     return seen
 
 
+def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **deploy_kwargs):
+    """Run a non-dry-run deploy_adapter with httpx.post captured; return the POSTed /adapters body."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+
+    seen: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        seen["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    run_id = deploy_kwargs.get("run_id", "flash-7-abcd")
+    stub_serving_registry(
+        {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
+    )
+    d.deploy_adapter(**deploy_kwargs)
+    return seen["json"]
+
+
 def test_deploy_dry_run():
     from flash.serve.deploy import deploy_adapter
 
@@ -332,6 +361,84 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     assert dep.openai_model == "flash-7-abcd"
     assert dep.endpoint_name == "https://serve.example"
     assert dep.state == "ready"
+
+
+def test_deploy_registers_structured_outputs_default(
+    monkeypatch, tmp_path, stub_serving_registry
+):
+    """A non-thinking run trained with structured_outputs registers that grammar as the adapter's
+    per-adapter guided-decoding DEFAULT, so serving constrains every request the same way training
+    did (closes the train/serve exposure-bias gap). The spec is forwarded as its parsed canonical
+    StructuredOutputsParams-kwargs dict (serving re-validates it)."""
+    schema = {"type": "object", "properties": {"industries": {"type": "array"}}}
+    spec = json.dumps({"json": schema})
+
+    body = _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        structured_outputs=spec,
+    )
+    assert body["structured_outputs"] == {"json": schema}
+    # thinking default is still carried and independent of the constraint.
+    assert body["thinking"] is False
+
+
+def test_deploy_omits_structured_outputs_when_unset(monkeypatch, tmp_path, stub_serving_registry):
+    """A run with no structured_outputs registers no serving grammar default (body key absent, not
+    an empty/None value that serving would have to interpret)."""
+    body = _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        structured_outputs="",
+    )
+    assert "structured_outputs" not in body
+
+
+def test_deploy_skips_structured_outputs_default_for_thinking(
+    monkeypatch, tmp_path, stub_serving_registry
+):
+    """A THINKING run does NOT register a serving grammar default even if a constraint is set:
+    serving binds the grammar from token 0 (no reasoning-parser deferral), which would suppress the
+    <think> phase. (Training stays compatible via a deferred grammar; serving has no such deferral,
+    so the serve-time default is skipped rather than break reasoning.)"""
+    spec = json.dumps({"json": {"type": "object"}})
+    body = _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        thinking=True,
+        structured_outputs=spec,
+    )
+    assert "structured_outputs" not in body
+    assert body["thinking"] is True
+
+
+def test_structured_outputs_body_helper():
+    """Unit-level contract of the deploy helper: unset/thinking -> None; non-thinking spec ->
+    parsed canonical dict; corrupt spec -> ValueError (fail loud, not silently unconstrained)."""
+    from flash.serve.deploy import _structured_outputs_body
+
+    assert _structured_outputs_body("r1", "", thinking=False) is None
+    assert _structured_outputs_body("r1", "", thinking=True) is None
+    spec = json.dumps({"json": {"type": "object"}})
+    assert _structured_outputs_body("r1", spec, thinking=True) is None
+    assert _structured_outputs_body("r1", spec, thinking=False) == {"json": {"type": "object"}}
+    with pytest.raises(ValueError):
+        _structured_outputs_body("r1", "{not json", thinking=False)
 
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import httpx
 
 from flash._logging import get_logger
+from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
 
 logger = get_logger(__name__)
@@ -263,6 +264,34 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
+def _structured_outputs_body(
+    run_id: str, structured_outputs: str, *, thinking: bool
+) -> dict | None:
+    """The per-adapter structured-outputs serving default for the registration body, or None.
+
+    Returns the parsed canonical StructuredOutputsParams-kwargs dict when the run configured a
+    constraint AND is non-thinking; None otherwise (no default is registered). Non-thinking only:
+    serving sets no reasoning-parser, so a per-adapter grammar would bind from the very first
+    generated token and force a thinking adapter's ``<think>`` phase to open the schema (e.g. ``{``)
+    — strictly worse than serving it unconstrained. Training stays compatible with thinking via a
+    DEFERRED grammar (``reasoning_parser="deepseek_r1"`` holds the constraint until ``</think>``),
+    but serving has no such deferral, so we skip the serve-time default for thinking runs rather
+    than break reasoning. Raises ValueError on a corrupt spec — a wiring bug, since
+    ``[train].structured_outputs`` is already canonicalized at run creation (schema/fields.py), so
+    this cannot fire for a real run; it fails loudly rather than ever silently serving unconstrained."""
+    if not structured_outputs:
+        return None
+    if thinking:
+        logger.info(
+            "adapter %s trained with structured_outputs but thinking=True; not registering a "
+            "serving guided-decoding default — serving has no reasoning-parser deferral, so it "
+            "would bind the grammar from token 0 and suppress the <think> phase",
+            run_id,
+        )
+        return None
+    return parse_structured_outputs(structured_outputs)
+
+
 def deploy_adapter(
     run_id: str,
     model: str,
@@ -272,9 +301,18 @@ def deploy_adapter(
     dry_run: bool = False,
     lora_rank: int = 32,
     thinking: bool = False,
+    structured_outputs: str = "",
     org_id: str | None = None,
 ) -> Deployment:
-    """Register the trained adapter with the freesolo serving app."""
+    """Register the trained adapter with the freesolo serving app.
+
+    ``structured_outputs`` is the run's ``[train].structured_outputs`` spec (canonical
+    StructuredOutputsParams-kwargs JSON, or "" for none). When set, it is registered as the
+    adapter's per-adapter guided-decoding DEFAULT so every serve request is constrained by the
+    SAME grammar the adapter trained under — otherwise a structured-outputs run drifts at
+    unconstrained serving (train/serve exposure bias: it over-generates arrays that truncate to
+    invalid JSON and emits keys the training grammar had masked). See ``_structured_outputs_body``.
+    """
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
     if not dry_run:
@@ -298,6 +336,9 @@ def deploy_adapter(
         # Preserves thinking parity: without this, Qwen3.5 defaults to thinking ON regardless of training.
         "thinking": bool(thinking),
     }
+    so_default = _structured_outputs_body(run_id, structured_outputs, thinking=thinking)
+    if so_default is not None:
+        body["structured_outputs"] = so_default
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["org_id"] = normalized_org_id
