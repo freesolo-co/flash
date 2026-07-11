@@ -1573,8 +1573,18 @@ def _primary_eos_id(tok, eos_ids: frozenset) -> int | None:
     return min(eos_ids) if eos_ids else None
 
 
+_EOS_POS0_WEIGHT = 1.0  # weight of the position-0 eos penalty relative to the terminal reinforcement
+
+
 def _eos_reinforce_term(
-    sample_logits, prompt_len: int, student_ids, eos_ids, eos_primary_id, stop_sequences, eos_coef
+    sample_logits,
+    prompt_len: int,
+    student_ids,
+    eos_ids,
+    eos_primary_id,
+    stop_sequences,
+    eos_coef,
+    eos_pos0_coef: float = 0.0,
 ):
     """Positive supervision for the terminal stop token the cross-tokenizer alignment drops.
 
@@ -1600,27 +1610,58 @@ def _eos_reinforce_term(
     """
     import torch
 
-    if eos_coef <= 0:
+    if eos_coef <= 0 and eos_pos0_coef <= 0:
         return None
     comp_len = len(student_ids)
     if comp_len == 0:
         return None
-    last_id = int(student_ids[-1])
-    if eos_ids and last_id in eos_ids:
-        # rows[-1]: the row that predicted the sampled terminal eos.
-        row_index = prompt_len - 1 + comp_len - 1
-        target = last_id
-    elif not stop_sequences and eos_primary_id is not None:
-        # First post-content position: log P(eos | prompt + content).
-        row_index = prompt_len - 1 + comp_len
-        target = int(eos_primary_id)
-    else:
+    n_rows = sample_logits.shape[0]
+    total = None
+    logp_detached = None
+
+    # --- Terminal reinforcement: raise log P(eos) at the position the rollout naturally stopped (#482),
+    #     scaled by the two-sided controller (runaway ramp x empty-rate damp). ---
+    if eos_coef > 0:
+        last_id = int(student_ids[-1])
+        row_index = target = None
+        if eos_ids and last_id in eos_ids:
+            # rows[-1]: the row that predicted the sampled terminal eos.
+            row_index = prompt_len - 1 + comp_len - 1
+            target = last_id
+        elif not stop_sequences and eos_primary_id is not None:
+            # First post-content position: log P(eos | prompt + content).
+            row_index = prompt_len - 1 + comp_len
+            target = int(eos_primary_id)
+        if target is not None and 0 <= row_index < n_rows:
+            logits_row = sample_logits[row_index].float()
+            logp = logits_row[target] - torch.logsumexp(logits_row, dim=-1)
+            total = (-float(eos_coef)) * logp
+            logp_detached = float(logp.detach())
+
+    # --- Position-0 penalty: LOWER log P(eos) at the FIRST generation row (prompt_len-1). Reinforcing the
+    #     terminal eos raises the SHARED eos logit, which also lifts P(eos | position 0) until the student
+    #     emits eos FIRST -> empty completion -> empty serve; the runaway/empty controller reacts too late
+    #     (measured 92% empty serves on a base-model 35B run). This adds the counter-force the terminal
+    #     term lacks: a bounded, self-limiting BCE-toward-not-eos at position 0 = -log(1 - P(eos|pos0))
+    #     (gradient P(eos|pos0), strong exactly when the collapse is forming, ~0 when healthy). Applied at
+    #     the runaway-scaled coef WITHOUT the empty-rate damp, so it stays strong while the damp is easing
+    #     the terminal push. Skipped for stop_sequences envs (termination is a text delimiter, not eos)
+    #     and cleanly-terminating runs (runaway scale -> 0 -> eos_pos0_coef 0), so warm-start is unaffected. ---
+    if eos_pos0_coef > 0 and eos_primary_id is not None and not stop_sequences:
+        pos0_row = prompt_len - 1  # the row whose next-token prediction is the first generated token
+        if 0 <= pos0_row < n_rows:
+            row = sample_logits[pos0_row].float()
+            lse_all = torch.logsumexp(row, dim=-1)
+            masked = row.clone()
+            masked[int(eos_primary_id)] = float("-inf")
+            lse_no_eos = torch.logsumexp(masked, dim=-1)
+            penalty = lse_all - lse_no_eos  # = -log(1 - P(eos|pos0)) >= 0
+            pos0_term = float(eos_pos0_coef) * _EOS_POS0_WEIGHT * penalty
+            total = pos0_term if total is None else total + pos0_term
+
+    if total is None:
         return None
-    if row_index < 0 or row_index >= sample_logits.shape[0]:
-        return None
-    logits_row = sample_logits[row_index].float()
-    logp = logits_row[target] - torch.logsumexp(logits_row, dim=-1)
-    return (-float(eos_coef)) * logp, float(logp.detach())
+    return total, logp_detached
 
 
 # Terminal-EOS reinforcement is a PROPORTIONAL CONTROLLER, not a constant push. #482 added the EOS
@@ -1695,16 +1736,22 @@ def _resolve_samples_batched(
     # Terminal-EOS supervision config (see _eos_reinforce_term). Resolved once — the model/tokenizer
     # don't change across the chunk. getattr defaults keep bare test stand-ins (SimpleNamespace knobs)
     # and eos-less fake tokenizers working with reinforcement OFF.
-    eos_coef = float(getattr(knobs, "eos_loss_coef", 0.0) or 0.0)
-    # Two-sided controller: reinforce the terminal EOS in proportion to the student's CURRENT failure to
-    # terminate (_runaway_eos_scale), then DAMP by its current empty-completion rate (_overcorrection_damp)
-    # so the push shuts off if it starts collapsing rollouts to empty. A cleanly-terminating run -> ~0
-    # push; genuine runaway -> full push UNLESS that push is already producing empties. Defaults
+    eos_coef_base = float(getattr(knobs, "eos_loss_coef", 0.0) or 0.0)
+    runaway_scale = _runaway_eos_scale(runaway_rate)
+    # Terminal reinforcement (raise P(eos) at the stop): two-sided controller — ramp UP in proportion to
+    # the student's CURRENT failure to terminate (_runaway_eos_scale), then DAMP by its empty-completion
+    # rate (_overcorrection_damp) so the push eases if it starts collapsing rollouts. Defaults
     # runaway_rate=1.0 / overcorr_rate=0.0 keep bare callers (tests) at full strength = pre-controller.
-    eos_coef *= _runaway_eos_scale(runaway_rate) * _overcorrection_damp(overcorr_rate)
+    eos_coef = eos_coef_base * runaway_scale * _overcorrection_damp(overcorr_rate)
+    # Position-0 penalty (lower P(eos) at the first generation row): the PROACTIVE counter-force to the
+    # empty-collapse. Runaway-scaled like the terminal term, but deliberately NOT empty-damped — as the
+    # damp eases the terminal push, this must stay strong to actively pull P(eos|pos0) back down (damping
+    # the terminal push alone can't, since reverse-KL doesn't lower eos). Self-limiting, so ~0 once healthy.
+    eos_pos0_coef = eos_coef_base * runaway_scale
+    _eos_on = eos_coef > 0 or eos_pos0_coef > 0
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
-    eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
-    eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
+    eos_ids = _generation_eos_ids(model, tok) if _eos_on else frozenset()
+    eos_primary = _primary_eos_id(tok, eos_ids) if _eos_on else None
     for idx, (gen, score, prompt_ids) in enumerate(samples):
         if gen.truncated or gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
@@ -1798,7 +1845,7 @@ def _resolve_samples_batched(
                     # unchanged. logits[row] is this sample's per-position logits [max_len, V]; the term
                     # self-limits, so a student that already stops cleanly contributes ~0.
                     eos_logprob = None
-                    if eos_coef > 0:
+                    if eos_coef > 0 or eos_pos0_coef > 0:
                         eos_out = _eos_reinforce_term(
                             logits[row],
                             prompt_len,
@@ -1807,6 +1854,7 @@ def _resolve_samples_batched(
                             eos_primary,
                             eos_stop_sequences,
                             eos_coef,
+                            eos_pos0_coef,
                         )
                         if eos_out is not None:
                             eos_term, eos_logprob = eos_out

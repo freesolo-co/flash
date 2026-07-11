@@ -3560,12 +3560,18 @@ def test_resolve_samples_batched_gates_eos_reinforcement_by_runaway_rate(monkeyp
     from flash.engine.worker import opd as opd_mod
 
     seen_coefs = []
+    seen_pos0 = []
     real_term = opd_mod._eos_reinforce_term
 
-    def _spy_term(sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef):
+    def _spy_term(
+        sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef,
+        eos_pos0_coef=0.0,
+    ):
         seen_coefs.append(eos_coef)
+        seen_pos0.append(eos_pos0_coef)
         return real_term(
-            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef
+            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef,
+            eos_pos0_coef,
         )
 
     monkeypatch.setattr(opd_mod, "_eos_reinforce_term", _spy_term)
@@ -3639,12 +3645,18 @@ def test_resolve_samples_batched_backs_off_eos_on_overcorrection(monkeypatch):
     from flash.engine.worker import opd as opd_mod
 
     seen_coefs = []
+    seen_pos0 = []
     real_term = opd_mod._eos_reinforce_term
 
-    def _spy_term(sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef):
+    def _spy_term(
+        sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef,
+        eos_pos0_coef=0.0,
+    ):
         seen_coefs.append(eos_coef)
+        seen_pos0.append(eos_pos0_coef)
         return real_term(
-            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef
+            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef,
+            eos_pos0_coef,
         )
 
     monkeypatch.setattr(opd_mod, "_eos_reinforce_term", _spy_term)
@@ -3667,22 +3679,58 @@ def test_resolve_samples_batched_backs_off_eos_on_overcorrection(monkeypatch):
 
     knobs = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.5, stop_sequences=())
 
-    # Full runaway BUT the student is already collapsing to empty -> damp to 0 -> term guarded out.
+    # Full runaway BUT the student is already collapsing to empty: the TERMINAL reinforcement is damped
+    # to 0 (#505), while the position-0 penalty (runaway-scaled, NOT empty-damped) stays at full strength
+    # as the proactive counter-force that actively pulls P(eos|pos0) back down.
     seen_coefs.clear()
+    seen_pos0.clear()
     opd_mod._resolve_samples_batched(
         _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
         runaway_rate=1.0, overcorr_rate=opd_mod._EOS_OVERCORR_HI,
     )
-    assert seen_coefs == []
+    assert seen_coefs  # the term was invoked
+    assert all(abs(c) < 1e-9 for c in seen_coefs)  # terminal push damped off
+    assert seen_pos0  # pos-0 penalty was passed
+    assert all(p > 0 for p in seen_pos0)  # pos-0 counter-force still engaged
 
-    # Full runaway, no empties -> full coef still reaches the term (no regression to #482/#493 behaviour).
+    # Full runaway, no empties -> full terminal coef reaches the term (no regression to #482/#493).
     seen_coefs.clear()
+    seen_pos0.clear()
     opd_mod._resolve_samples_batched(
         _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
         runaway_rate=1.0, overcorr_rate=0.0,
     )
     assert seen_coefs
     assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
+
+
+def test_eos_reinforce_term_position0_penalty_lowers_start_eos():
+    """Position-0 penalty = the PROACTIVE counter-force to the empty-collapse. Reinforcing the terminal
+    eos lifts the SHARED eos logit until the student emits eos FIRST (empty serve). The penalty
+    -log(1 - P(eos | position 0)) pushes P(eos|pos0) DOWN, strongest exactly when it's high (collapse
+    forming), ~0 when healthy. It fires even when the terminal reinforcement is damped to 0 (eos_coef=0),
+    and is skipped for stop_sequences envs."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    V, EOS = 8, 3
+
+    def rows(z):  # 2 rows (prompt_len 1 + comp_len 1); row 0 predicts the first generated token
+        t = torch.zeros(2, V)
+        t[0, EOS] = z  # higher z -> higher P(eos | position 0)
+        return t
+
+    # Terminal OFF (eos_coef=0), pos-0 ON: the term still fires and is LARGER when P(eos|pos0) is high.
+    hi = opd_mod._eos_reinforce_term(rows(10.0), 1, [2], frozenset(), EOS, (), 0.0, 0.5)
+    lo = opd_mod._eos_reinforce_term(rows(-10.0), 1, [2], frozenset(), EOS, (), 0.0, 0.5)
+    assert hi is not None
+    assert lo is not None
+    assert float(hi[0]) > float(lo[0]) >= -1e-6  # penalty >= 0; self-limiting (strong only when needed)
+    assert float(hi[0]) > 1.0  # near-1 P(eos|pos0) -> large penalty
+    assert float(lo[0]) < 0.1  # already-low P(eos|pos0) -> ~0 push (healthy student unaffected)
+
+    # stop_sequences env -> pos-0 penalty skipped (termination is a text delimiter, not eos).
+    assert opd_mod._eos_reinforce_term(rows(10.0), 1, [2], frozenset(), EOS, ("STOP",), 0.0, 0.5) is None
 
 
 def test_resolve_samples_batched_uses_full_logits():
