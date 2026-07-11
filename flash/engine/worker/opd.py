@@ -643,6 +643,12 @@ def run_opd():
     # EMA of the per-rollout truncation rate — the runaway signal that scales terminal-EOS reinforcement
     # (see _runaway_eos_scale). Starts at 0 (assume the student stops fine); rises if rollouts run away.
     trunc_ema = 0.0
+    # EMA of the per-rollout EMPTY-completion rate — the OVER-correction signal (see _overcorrection_damp).
+    # Terminal-EOS reinforcement raises the SHARED eos logit, so pushing it too hard makes the student
+    # emit eos FIRST (empty completion -> empty serve). trunc_ema can't see this: an empty rollout is
+    # truncated=False, so it reads as "terminated fine" and keeps the coef pinned high; empty_ema damps
+    # the coef back down as empties appear, closing the feedback loop.
+    empty_ema = 0.0
     granularity_sum = 0.0
     granularity_n = 0
     # Running mean of the reinforced terminal log P(eos): should RISE over a run as the student learns
@@ -724,7 +730,7 @@ def run_opd():
             step_loss, \
             step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
-        nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema
+        nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema, empty_ema
         nonlocal entropy_sum, entropy_n, entropy_floor_active, step_ent_sum, step_ent_n
         if r.teacher_status == "ok":
             teacher_ok += 1
@@ -737,6 +743,10 @@ def run_opd():
         # Update the runaway EMA once per accounted rollout (truncated or not) so terminal-EOS
         # reinforcement tracks the student's live termination health (see _runaway_eos_scale).
         trunc_ema += (1.0 - _EOS_TRUNC_EMA_DECAY) * ((1.0 if r.truncated else 0.0) - trunc_ema)
+        # An empty completion terminates (truncated=False), so trunc_ema reads it as healthy; track it
+        # separately so the controller can back OFF when its own EOS push starts collapsing rollouts.
+        _is_empty = r.loss is None and _sample_skip_reason(r) == "empty_completion"
+        empty_ema += (1.0 - _EOS_TRUNC_EMA_DECAY) * ((1.0 if _is_empty else 0.0) - empty_ema)
         if r.loss is None:
             reason = _sample_skip_reason(r)
             skip_counts[reason] += 1
@@ -896,6 +906,7 @@ def run_opd():
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
                         runaway_rate=trunc_ema,
+                        overcorr_rate=empty_ema,
                     )
                     opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
                     opd_phase_counts["loss_batches"] += 1
@@ -1179,6 +1190,9 @@ def run_opd():
             "eos_loss_coef": knobs.eos_loss_coef,
             "eos_reinforced_samples": eos_logprob_n,
             "mean_eos_logprob": (eos_logprob_sum / eos_logprob_n) if eos_logprob_n else None,
+            # Final EMA of the empty-completion rate (_overcorrection_damp input). A non-trivial value
+            # means the controller detected its own EOS push collapsing rollouts and damped the coef.
+            "final_empty_rate_ema": round(empty_ema, 5),
             # Student entropy floor (see _entropy_floor_term): the knobs, the run-mean per-sample
             # completion entropy (nats), and how many distilled samples tripped the hinge. A
             # collapsing run shows mean_student_entropy FALLING step over step (opd/entropy in
@@ -1776,6 +1790,30 @@ def _runaway_eos_scale(runaway_rate: float) -> float:
     return (runaway_rate - _EOS_RUNAWAY_LO) / (_EOS_RUNAWAY_HI - _EOS_RUNAWAY_LO)
 
 
+# _runaway_eos_scale ramps the coef UP on runaway, but on its own it CANNOT stop an empty-collapse when
+# runaway is extreme (base-model / cold start): truncation stays high the whole run so the coef is pinned
+# at full, and an empty completion is truncated=False so it reads as "terminated" and never lowers the
+# ramp. Result (measured on a base-model 35B-thinking run, coef 0.5): 0 runaway but 58% of SAMPLED serves
+# come back empty. So damp the coef by an EMA of the empty-completion rate — the direct symptom of the
+# over-correction — giving two-sided negative feedback: reinforce EOS when running away, but SHUT THE
+# PUSH OFF the moment the student starts emitting eos first. Empties are always a failure (never
+# task-length like a truncation), so damp aggressively.
+_EOS_OVERCORR_LO = 0.01  # empty-rate EMA <= this: no damping (full reinforcement per _runaway_eos_scale)
+_EOS_OVERCORR_HI = 0.05  # empty-rate EMA >= this: reinforcement fully suppressed (student over-stops)
+
+
+def _overcorrection_damp(empty_rate: float) -> float:
+    """Fraction of the runaway-scaled EOS coef to KEEP given the CURRENT empty-completion rate (EMA).
+    1.0 while the student isn't collapsing to empty (rate <= _EOS_OVERCORR_LO); ramps linearly to 0.0 by
+    _EOS_OVERCORR_HI so the terminal-EOS push shuts off before it ratchets P(eos | position 0) past the
+    sampling threshold. Composes multiplicatively with _runaway_eos_scale."""
+    if empty_rate <= _EOS_OVERCORR_LO:
+        return 1.0
+    if empty_rate >= _EOS_OVERCORR_HI:
+        return 0.0
+    return 1.0 - (empty_rate - _EOS_OVERCORR_LO) / (_EOS_OVERCORR_HI - _EOS_OVERCORR_LO)
+
+
 def _resolve_samples_batched(
     model,
     tok,
@@ -1786,6 +1824,7 @@ def _resolve_samples_batched(
     *,
     backward_scale: float | None = None,
     runaway_rate: float = 1.0,
+    overcorr_rate: float = 0.0,
 ) -> list[SampleResult]:
     import torch
 
@@ -1797,11 +1836,12 @@ def _resolve_samples_batched(
     # don't change across the chunk. getattr defaults keep bare test stand-ins (SimpleNamespace knobs)
     # and eos-less fake tokenizers working with reinforcement OFF.
     eos_coef = float(getattr(knobs, "eos_loss_coef", 0.0) or 0.0)
-    # Controller: reinforce the terminal EOS only in proportion to the student's CURRENT failure to
-    # terminate (see _runaway_eos_scale). A cleanly-terminating run -> ~0 push -> the shared eos logit
-    # can't ratchet into an empty-collapse; genuine runaway still drives full reinforcement. Default
-    # runaway_rate=1.0 keeps bare callers (tests) at full strength = pre-controller behaviour.
-    eos_coef *= _runaway_eos_scale(runaway_rate)
+    # Two-sided controller: reinforce the terminal EOS in proportion to the student's CURRENT failure to
+    # terminate (_runaway_eos_scale), then DAMP by its current empty-completion rate (_overcorrection_damp)
+    # so the push shuts off if it starts collapsing rollouts to empty. A cleanly-terminating run -> ~0
+    # push; genuine runaway -> full push UNLESS that push is already producing empties. Defaults
+    # runaway_rate=1.0 / overcorr_rate=0.0 keep bare callers (tests) at full strength = pre-controller.
+    eos_coef *= _runaway_eos_scale(runaway_rate) * _overcorrection_damp(overcorr_rate)
     # student entropy floor (see _entropy_floor_term). getattr defaults keep bare test stand-ins
     # working with the penalty OFF; the detached mean entropy is computed either way for logging.
     ent_coef = float(getattr(knobs, "entropy_floor_coef", 0.0) or 0.0)

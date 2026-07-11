@@ -3765,6 +3765,87 @@ def test_resolve_samples_batched_gates_eos_reinforcement_by_runaway_rate(monkeyp
     assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
 
 
+def test_overcorrection_damp_maps_empty_rate_to_coef_fraction():
+    """The empty-completion damp is the SECOND half of the two-sided controller. Terminal-EOS
+    reinforcement raises the SHARED eos logit, so an over-aggressive push makes the student emit eos at
+    position 0 -> empty completion -> empty serve (measured 58% of SAMPLED serves on a base-model
+    35B-thinking run at coef 0.5). An empty rollout is truncated=False so _runaway_eos_scale can't see
+    it; _overcorrection_damp scales the coef back toward 0 as the empty-rate EMA rises so the push shuts
+    off before it ratchets P(eos|pos0) past the sampling threshold."""
+    from flash.engine.worker.opd import (
+        _EOS_OVERCORR_HI,
+        _EOS_OVERCORR_LO,
+        _overcorrection_damp,
+    )
+
+    assert _overcorrection_damp(0.0) == 1.0  # no empties -> keep the full runaway-scaled push
+    assert _overcorrection_damp(_EOS_OVERCORR_LO) == 1.0  # boundary: still full
+    assert _overcorrection_damp(_EOS_OVERCORR_HI) == 0.0  # collapsing to empty -> push OFF
+    assert _overcorrection_damp(1.0) == 0.0  # saturates (never negative)
+    mid = _overcorrection_damp((_EOS_OVERCORR_LO + _EOS_OVERCORR_HI) / 2)
+    assert abs(mid - 0.5) < 1e-9  # linear ramp midpoint
+    # Monotonic NON-INCREASING across the ramp (more empties -> less push).
+    lo_ramp = _overcorrection_damp(_EOS_OVERCORR_LO + 0.005)
+    hi_ramp = _overcorrection_damp(_EOS_OVERCORR_HI - 0.005)
+    assert 1.0 > lo_ramp > hi_ramp > 0.0
+
+
+def test_resolve_samples_batched_backs_off_eos_on_overcorrection(monkeypatch):
+    """End-to-end: even at FULL runaway (which alone pins the coef at full via _runaway_eos_scale), a
+    high empty-completion rate damps the coef to 0 so the terminal-EOS term is guarded out. This is the
+    fix for the base-model empty-collapse: extreme runaway kept the coef at full strength while the push
+    itself was producing empty serves, and the runaway-only controller could never back off. Without
+    empties the full coef still reaches the term."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    seen_coefs = []
+    real_term = opd_mod._eos_reinforce_term
+
+    def _spy_term(sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef):
+        seen_coefs.append(eos_coef)
+        return real_term(
+            sample_logits, prompt_len, student_ids, eos_ids, eos_primary_id, stops, eos_coef
+        )
+
+    monkeypatch.setattr(opd_mod, "_eos_reinforce_term", _spy_term)
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 3
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "b"}.get(int(i), "x") for i in ids)
+
+    def _samples():
+        return [
+            (
+                opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+                opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+                [1],
+            )
+        ]
+
+    knobs = SimpleNamespace(kl_coef=1.0, eos_loss_coef=0.5, stop_sequences=())
+
+    # Full runaway BUT the student is already collapsing to empty -> damp to 0 -> term guarded out.
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
+        runaway_rate=1.0, overcorr_rate=opd_mod._EOS_OVERCORR_HI,
+    )
+    assert seen_coefs == []
+
+    # Full runaway, no empties -> full coef still reaches the term (no regression to #482/#493 behaviour).
+    seen_coefs.clear()
+    opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
+        runaway_rate=1.0, overcorr_rate=0.0,
+    )
+    assert seen_coefs
+    assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
+
+
 def test_resolve_samples_batched_uses_full_logits():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
