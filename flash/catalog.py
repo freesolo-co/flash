@@ -147,6 +147,17 @@ class ModelInfo:
         return data
 
 
+def checkpoint_type_for(model_id: str, info: ModelInfo | None = None) -> str:
+    """Resolve checkpoint type from explicit metadata, then conservative id conventions."""
+    resolved = info or MODELS.get(model_id)
+    if resolved is not None and resolved.checkpoint_type != "unknown":
+        return resolved.checkpoint_type
+    final_name = str(model_id or "").rstrip("/").rsplit("/", 1)[-1]
+    if final_name.lower().endswith("-base"):
+        return "raw_base"
+    return "unknown"
+
+
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 # The pre-quantized FP8 checkpoint each base model's serving engine LOADS (mirrors serving's
@@ -168,7 +179,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="MiniCPM5 1B",
         params="1.2B dense (Llama arch)",
         params_b=1.2,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         vocab_size=130_560,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
@@ -188,7 +199,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 0.8B",
         params="0.9B (text-only fine-tune)",
         params_b=0.9,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=12,
@@ -208,7 +219,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 2B",
         params="2.3B (text-only fine-tune)",
         params_b=2.3,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=16,
@@ -227,7 +238,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 4B",
         params="4.7B (text-only fine-tune)",
         params_b=4.7,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=32,
@@ -250,7 +261,7 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
         params_b=9.7,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         vocab_size=248_320,
         algos=("sft", "grpo", "opd"),
         min_vram_gb=48,
@@ -278,7 +289,7 @@ MODELS: dict[str, ModelInfo] = {
         params="35B total / ~3B active (MoE)",
         # 35.0 not 35.95: the marketing figure tips the SFT equation over the B200 budget (see test_sft_equation_covers_honest_peak_across_seq_boundary).
         params_b=35.0,
-        checkpoint_type="raw_base",
+        checkpoint_type="instruct",
         active_params_b=3.0,
         # Geometry for the SFT GC-off activation estimate (config.json text_config): 40 decoder
         # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).

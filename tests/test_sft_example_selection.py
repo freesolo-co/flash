@@ -42,23 +42,32 @@ def test_zero_or_unset_max_examples_keeps_the_full_dataset():
     assert sorted(out) == rows
 
 
-def test_reasoning_target_coverage_counts_target_messages():
+def test_reasoning_target_coverage_counts_closed_assistant_blocks_only():
     completions = [
         [{"role": "assistant", "content": "<think>a</think>answer"}],
         [{"role": "assistant", "content": "answer only"}],
+        [{"role": "user", "content": "literal <think>user</think>"}],
+        [{"role": "tool", "content": "literal <think>tool</think>"}],
+        [{"role": "assistant", "content": "<think>unclosed"}],
+        [{"role": "assistant", "content": "</think>backwards<think>"}],
         [
             {"role": "assistant", "content": "tool call"},
             {"role": "assistant", "content": "<think>b</think>done"},
         ],
     ]
-    assert reasoning_target_coverage(completions) == (2, 3, pytest.approx(2 / 3))
+    assert reasoning_target_coverage(completions) == (2, 7, pytest.approx(2 / 7))
     assert reasoning_target_coverage([]) == (0, 0, 0.0)
 
 
-def test_worker_defense_rejects_raw_base_self_gold():
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B-Base", "Qwen/Qwen3-4B-Base"])
+def test_worker_defense_rejects_raw_base_self_gold(model_id):
     with pytest.raises(ValueError, match=r"raw base.*self-generated"):
-        validate_sft_gold_source("Qwen/Qwen3.5-4B", "self")
+        validate_sft_gold_source(model_id, "self")
     with pytest.raises(ValueError, match=r"existing.*cannot prove oracle"):
-        validate_sft_gold_source("Qwen/Qwen3.5-4B", "existing")
-    validate_sft_gold_source("Qwen/Qwen3.5-4B", "oracle")
+        validate_sft_gold_source(model_id, "existing")
+    validate_sft_gold_source(model_id, "oracle")
+
+
+def test_worker_allows_instruct_and_unknown_self_gold():
+    validate_sft_gold_source("Qwen/Qwen3.5-4B", "self")
     validate_sft_gold_source("uncatalogued/instruct", "self")

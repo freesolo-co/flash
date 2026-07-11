@@ -228,14 +228,20 @@ class FreesoloEnvironment(BaseEnvironment):
                 return [dict(m) for m in msgs]
 
         field = _SFT_SOURCE_FIELDS[source]
-        if field not in example:
-            if source == "existing":
-                return [{"role": "assistant", "content": ""}]
+        metadata = example.get("metadata") if isinstance(example.get("metadata"), dict) else {}
+        if field in example:
+            value = example[field]
+        elif field in metadata:
+            value = metadata[field]
+        elif source == "existing":
+            return [{"role": "assistant", "content": ""}]
+        else:
             raise ValueError(
-                f"SFT gold source {source!r} requires dataset field {field!r} or environment "
-                f"callback {callback_name}(); generic output is not a proven {source} target"
+                f"SFT gold source {source!r} requires dataset field {field!r}, metadata.{field}, "
+                f"or environment callback {callback_name}(); generic output is not a proven "
+                f"{source} target"
             )
-        return self._completion_messages(example[field])
+        return self._completion_messages(value)
 
     def _single(self, results, method: str):
         if len(results) != 1:

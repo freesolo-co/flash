@@ -109,6 +109,18 @@ def test_sft_gold_source_defaults_to_oracle_and_round_trips() -> None:
     assert restored == spec
 
 
+def test_legacy_jobspec_payload_without_provenance_uses_existing() -> None:
+    restored = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "environment": {"id": "owner/env"},
+            "train": {"epochs": 1, "max_examples": 8},
+        }
+    )
+    assert restored.train.sft_gold_source.value == "existing"
+
+
 def test_sft_gold_source_is_closed_enum() -> None:
     raw = _raw(
         algorithm="sft",
@@ -122,8 +134,10 @@ def test_sft_gold_source_is_closed_enum() -> None:
         spec_from_dict(raw)
 
 
-def test_raw_base_rejects_self_sft_gold() -> None:
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-4B-Base", "Qwen/Qwen3-4B-Base"])
+def test_raw_base_ids_reject_self_and_unproven_existing_gold(model) -> None:
     raw = _raw(
+        model=model,
         algorithm="sft",
         **{
             "train.epochs": 1,
@@ -133,17 +147,7 @@ def test_raw_base_rejects_self_sft_gold() -> None:
     )
     with pytest.raises(ConfigError, match=r"raw base.*cannot use.*self"):
         spec_from_dict(raw)
-
-
-def test_raw_base_rejects_unproven_existing_gold() -> None:
-    raw = _raw(
-        algorithm="sft",
-        **{
-            "train.epochs": 1,
-            "train.max_examples": 8,
-            "train.sft_gold_source": "existing",
-        },
-    )
+    raw["train"]["sft_gold_source"] = "existing"
     with pytest.raises(ConfigError, match=r"raw base.*cannot prove oracle provenance"):
         spec_from_dict(raw)
 

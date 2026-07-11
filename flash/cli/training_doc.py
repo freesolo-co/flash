@@ -39,7 +39,7 @@ flash gpus                           # managed GPU classes with estimated $/hr
 
 ```text
 environment.py          # the task: how to prompt the model and how to score it
-dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "oracle_output": ...}
+dataset/train.jsonl     # training rows: {"input": ..., "metadata": {"oracle_output": ...}}
 configs/sft.toml        # an SFT run config
 configs/rl.toml         # a GRPO (RL) run config
 configs/opd.toml        # an on-policy distillation run config
@@ -64,7 +64,9 @@ class MyEnv(EnvironmentSingleTurn):
         return [{"role": "user", "content": example.input}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
-        expected = str(example.output or "").strip()
+        record = example.record or {}
+        metadata = record.get("metadata") or {}
+        expected = str(record.get("oracle_output") or metadata.get("oracle_output") or example.output or "").strip()
         score = 1.0 if expected and expected in response_text else 0.0
         return RewardResult(score=score, threshold=1.0)
 
@@ -107,7 +109,7 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 lora_rank = 32
 lora_alpha = 64
-sft_gold_source = "oracle" # sft only; reads oracle_output and is the safe default
+sft_gold_source = "oracle" # sft only; reads metadata.oracle_output by default
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
@@ -329,15 +331,16 @@ explicitly inspect the separated completion, reasoning, or original raw model ou
 Pick SFT when you already have good answers and want the model to imitate them.
 
 - **Declare the gold provenance.** `[train] sft_gold_source` is a closed choice:
-  `oracle` (the default), `teacher`, `self`, or `existing`. Oracle rows use
-  `oracle_output`; teacher rows use `teacher_output`; self rows use `self_output`;
+  `oracle` (the default), `teacher`, `self`, or `existing`. Canonical rows put
+  `oracle_output`, `teacher_output`, or `self_output` under `metadata` so the SDK
+  preserves them; top-level forms remain accepted for compatible environment loaders;
   `existing` preserves the environment's `sft_completion()` callback and generic
   `output` field. Flash never falls back from a requested oracle or teacher field to
   generic `output`, because generic data cannot prove its provenance.
 - **Raw base checkpoints require oracle or teacher reasoning gold.** Never bootstrap a
   raw base by generating its own chain of thought and training it back on that text.
   `sft_gold_source = "self"` is rejected for catalogued raw bases. When `thinking = true`,
-  put the desired reasoning trace in `oracle_output` or `teacher_output`, for example
+  put the desired reasoning trace in `metadata.oracle_output` or `metadata.teacher_output`, for example
   `<think>reasoning steps</think>final answer`. Flash records the selected provenance and
   reasoning-target row coverage in `train_meta.json`.
 - **Existing data is explicit compatibility mode, not inferred oracle data.** For

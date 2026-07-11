@@ -8,7 +8,14 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import DEFAULT_MODEL, MODELS, SERVING_FP8_MODEL_REPOS, get_model
+from flash.catalog import (
+    DEFAULT_MODEL,
+    MODELS,
+    SERVING_FP8_MODEL_REPOS,
+    ModelInfo,
+    checkpoint_type_for,
+    get_model,
+)
 from flash.providers.base import KNOWN, canonical_gpu
 
 
@@ -44,9 +51,32 @@ def test_thinking_capability_values_are_valid():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
-def test_curated_models_declare_raw_base_checkpoint_type():
-    assert MODELS
-    assert {info.checkpoint_type for info in MODELS.values()} == {"raw_base"}
+def test_curated_models_declare_expected_checkpoint_type():
+    expected = {
+        "openbmb/MiniCPM5-1B": "instruct",
+        "Qwen/Qwen3.5-0.8B": "instruct",
+        "Qwen/Qwen3.5-2B": "instruct",
+        "Qwen/Qwen3.5-4B": "instruct",
+        "Qwen/Qwen3.5-9B": "instruct",
+        "Qwen/Qwen3.6-35B-A3B": "instruct",
+    }
+    assert {model_id: info.checkpoint_type for model_id, info in MODELS.items()} == expected
+
+
+def test_checkpoint_type_resolver_recognizes_explicit_and_conventional_bases():
+    explicit = ModelInfo(
+        id="acme/custom",
+        display_name="custom",
+        params="1B",
+        params_b=1.0,
+        checkpoint_type="raw_base",
+        algos=("sft",),
+        min_vram_gb=12,
+    )
+    assert checkpoint_type_for(explicit.id, explicit) == "raw_base"
+    assert checkpoint_type_for("Qwen/Qwen3.5-4B-Base") == "raw_base"
+    assert checkpoint_type_for("Qwen/Qwen3-4B-Base") == "raw_base"
+    assert checkpoint_type_for("acme/not-classified") == "unknown"
 
 
 def test_serving_capacity_matches_validated_matrix():

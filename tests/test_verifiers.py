@@ -326,6 +326,10 @@ def test_freesolo_sft_gold_selection_is_fail_closed(monkeypatch):
     assert env.sft_completion(row, gold_source="existing") == [
         {"role": "assistant", "content": "generic"}
     ]
+    assert env.sft_completion(
+        {"input": "x", "metadata": {"oracle_output": "metadata oracle"}},
+        gold_source="oracle",
+    ) == [{"role": "assistant", "content": "metadata oracle"}]
     with pytest.raises(ValueError, match=r"oracle_output.*generic output is not a proven oracle"):
         env.sft_completion({"input": "x", "output": "generic"}, gold_source="oracle")
 

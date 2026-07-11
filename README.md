@@ -34,7 +34,7 @@ The allocator picks the cheapest validated managed GPU class that fits the run.
   recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine). SFT defaults to
   declared oracle provenance (`[train] sft_gold_source = "oracle"`, dataset field
-  `oracle_output`); catalogued raw bases reject self-generated SFT gold.
+  `metadata.oracle_output`); raw base ids reject self-generated SFT gold.
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments onto the worker's interface
 - `flash env setup` — scaffold a starter local Freesolo env, `dataset/train.jsonl`,

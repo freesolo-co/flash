@@ -252,7 +252,7 @@ class JobSpec:
                 opd_entropy_floor=_opt_float(train.get("opd_entropy_floor")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 sft_gold_source=SFTGoldSource.parse(
-                    train.get("sft_gold_source", SFTGoldSource.ORACLE.value)
+                    train.get("sft_gold_source", SFTGoldSource.EXISTING.value)
                 ),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),

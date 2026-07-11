@@ -7,7 +7,12 @@ import sys
 import tomllib
 from typing import Any
 
-from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.catalog import (
+    checkpoint_type_for,
+    normalize_algorithm,
+    resolve_model,
+    serving_lora_rank_cap,
+)
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -220,6 +225,20 @@ _TRAIN_KEYS = frozenset(
 )
 
 
+def _reject_unsafe_raw_base_gold(model: str, source: SFTGoldSource) -> None:
+    if source is SFTGoldSource.SELF:
+        raise ConfigError(
+            f"{model} is a raw base checkpoint and cannot use train.sft_gold_source=\"self\"; "
+            "provide oracle or teacher reasoning gold instead"
+        )
+    if source is SFTGoldSource.EXISTING:
+        raise ConfigError(
+            f"{model} is a raw base checkpoint and train.sft_gold_source=\"existing\" cannot "
+            "prove oracle provenance; use oracle_output or teacher_output with the matching "
+            "declared source"
+        )
+
+
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -286,6 +305,14 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"[train] unknown key(s): {', '.join(unknown_train)} "
             f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
         )
+    try:
+        sft_gold_source = SFTGoldSource.parse(
+            train_raw.get("sft_gold_source", SFTGoldSource.ORACLE.value)
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if algorithm == "sft" and checkpoint_type_for(model) == "raw_base":
+        _reject_unsafe_raw_base_gold(model, sft_gold_source)
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}
@@ -319,24 +346,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
-    try:
-        sft_gold_source = SFTGoldSource.parse(
-            train_raw.get("sft_gold_source", SFTGoldSource.ORACLE.value)
-        )
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-    if algorithm == "sft" and info.checkpoint_type == "raw_base":
-        if sft_gold_source is SFTGoldSource.SELF:
-            raise ConfigError(
-                f"{model} is a raw base checkpoint and cannot use train.sft_gold_source=\"self\"; "
-                "provide oracle or teacher reasoning gold instead"
-            )
-        if sft_gold_source is SFTGoldSource.EXISTING:
-            raise ConfigError(
-                f"{model} is a raw base checkpoint and train.sft_gold_source=\"existing\" cannot "
-                "prove oracle provenance; use oracle_output or teacher_output with the matching "
-                "declared source"
-            )
+    if algorithm == "sft" and checkpoint_type_for(model, info) == "raw_base":
+        _reject_unsafe_raw_base_gold(model, sft_gold_source)
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)
     if max_lora_rank is not None and lora_rank > max_lora_rank:

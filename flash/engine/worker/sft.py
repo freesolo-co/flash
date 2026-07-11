@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
@@ -103,18 +104,22 @@ def reasoning_target_coverage(completions: list[list[dict]]) -> tuple[int, int, 
     """Return reasoning-target rows, total rows, and coverage fraction."""
     total = len(completions)
     reasoning = sum(
-        any("<think>" in str(message.get("content") or "") for message in completion)
+        any(
+            str(message.get("role") or "").lower() == "assistant"
+            and re.search(r"<think>.*?</think>", str(message.get("content") or ""), re.DOTALL)
+            is not None
+            for message in completion
+        )
         for completion in completions
     )
     return reasoning, total, reasoning / total if total else 0.0
 
 
 def validate_sft_gold_source(model_id: str, gold_source: str) -> None:
-    """Reject self-generated supervision for catalogued raw base checkpoints."""
-    from flash.catalog import MODELS
+    """Reject unsafe supervision for recognized raw base checkpoints."""
+    from flash.catalog import checkpoint_type_for
 
-    info = MODELS.get(model_id)
-    if not info or info.checkpoint_type != "raw_base":
+    if checkpoint_type_for(model_id) != "raw_base":
         return
     if gold_source == "self":
         raise ValueError(
