@@ -169,6 +169,17 @@ class OPDConfig:
     # that pushes up log P(eos) at the position a rollout naturally terminated, restoring the stop
     # signal the alignment cannot express. 0 disables it; overridable via [train].opd_eos_loss_coef.
     eos_loss_coef: float = 0.5
+    # student-side entropy floor: a hinge on the per-sample MEAN completion entropy (nats), added to
+    # the reverse-KL loss. reverse-KL is mode-seeking and progressively over-sharpens small students
+    # (<=2b) until greedy (temp=0) serving falls into a repetition loop that never emits EOS — the
+    # teacher-gated fix (EOPD, arxiv 2603.07079) is unimplementable here (Fireworks echo-scoring
+    # returns no teacher distribution, and teacher/student are cross-tokenizer), so the STUDENT's own
+    # distribution — local, same-vocab, already computed — is regularized instead. the hinge is
+    # self-limiting: zero loss and zero gradient while mean entropy sits at/above the floor, so runs
+    # that don't collapse pay nothing. 0 disables the term (mean entropy is still logged);
+    # overridable via [train].opd_entropy_floor_coef / [train].opd_entropy_floor.
+    entropy_floor_coef: float = 0.0
+    entropy_floor: float = 0.5
 
 
 @dataclass(frozen=True)
