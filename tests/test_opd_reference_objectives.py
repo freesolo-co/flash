@@ -601,3 +601,96 @@ def test_reference_field_is_opd_only_and_required_by_reference_objectives():
                 "train": {"opd_objective_ids": ["c06"]},
             }
         )
+
+
+def test_c06_composes_with_c09_on_one_shared_view():
+    """c06 (frozen reference) and c09 (repetition) plan and evaluate together, both terms live."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd_repetition import analyze_repetition
+
+    plan = OPD_OBJECTIVES.plan(("c06", "c09"))
+    assert plan.objective_ids == ("c06", "c09")
+    requirements = plan.requirements
+    assert requirements.frozen_sft_reference
+    assert requirements.completion_mask
+    assert requirements.student_logits
+    assert requirements.repetition_weighting
+
+    rows, vocab = 8, 16
+    policy = torch.zeros(rows, vocab, requires_grad=True)
+    reference = torch.randn(rows, vocab, generator=torch.Generator().manual_seed(7))
+    # a repeating tail so c09's loop-closing unlikelihood contributes a real term.
+    completion_ids = (9, 8, 1, 2, 1, 2, 1, 2)
+
+    evaluated = OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "completion_logits": policy,
+                "reference_completion_logits": reference,
+                "completion_mask": torch.ones(rows, dtype=torch.bool),
+                "completion_ids": completion_ids,
+                "forced": (False,) * rows,
+                "repetition_analysis": analyze_repetition(list(completion_ids)),
+                "sequence_weight": 1.0,
+            }
+        ),
+        base_term=torch.tensor(0.0, dtype=torch.float32),
+    )
+
+    assert len(evaluated.terms) == 2
+    total = evaluated.terms[0] + evaluated.terms[1]
+    assert total.dtype == torch.float32
+    total.backward()
+    assert policy.grad is not None
+    assert torch.isfinite(policy.grad).all()
+    assert any(key.startswith("opd/objectives/c06/") for key in evaluated.metrics)
+    assert any(key.startswith("opd/objectives/c09/") for key in evaluated.metrics)
+
+
+def test_c11_composes_with_c10_on_one_shared_view():
+    """c11 (reference margin) and c10 (tail entropy) share a view and both back-propagate."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.opd_objectives import CvarEntropyConfig
+
+    plan = OPD_OBJECTIVES.plan(("c11", "c10"))
+    assert plan.objective_ids == ("c11", "c10")
+    requirements = plan.requirements
+    assert requirements.frozen_sft_reference
+    assert requirements.completion_mask
+    assert requirements.student_logits
+    assert requirements.position_statistics
+
+    rows, vocab = 4, 8
+    policy = torch.zeros(rows, vocab, requires_grad=True)
+    # reference has a clear top-1/top-2 ordering the uniform policy violates, so c11 is positive.
+    reference = torch.tensor([[3.0, 1.0] + [0.0] * (vocab - 2)] * rows)
+    stats = opd_mod._completion_position_statistics(policy, ())
+
+    evaluated = OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "completion_logits": policy,
+                "reference_completion_logits": reference,
+                "completion_mask": torch.ones(rows, dtype=torch.bool),
+                "position_statistics": stats,
+                "entropy_for_rows": lambda indices: opd_mod._chunked_row_entropies(
+                    policy, indices, grad=True
+                ),
+                # floor above the uniform-row entropy so the tail term activates.
+                "cvar_entropy_config": CvarEntropyConfig(fraction=1.0, floor=10.0, coef=1.0),
+                "base_term": torch.tensor(0.0),
+            }
+        ),
+        base_term=torch.tensor(0.0),
+    )
+
+    assert len(evaluated.terms) == 2
+    total = evaluated.terms[0] + evaluated.terms[1]
+    total.backward()
+    assert policy.grad is not None
+    assert torch.isfinite(policy.grad).all()
+    assert any(key.startswith("opd/objectives/c11/") for key in evaluated.metrics)
+    assert evaluated.metrics["opd/objectives/c10/activation"] == 1.0
