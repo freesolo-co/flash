@@ -1248,6 +1248,158 @@ def test_exhausted_physical_attempts_raise_dedicated_error():
     assert aborted == ["attempt-1", "attempt-2"]
 
 
+def test_abort_precedes_retry_submission_in_shared_op_order():
+    clock = _FakeMonotonic()
+    ops = []
+    pending = set()
+    poll_count = 0
+    ids = iter(["attempt-1", "attempt-2"])
+
+    def submit(req_id, prefix, max_tokens, initial):
+        ops.append(("submit", req_id))
+        pending.add(req_id)
+
+    def abort(request_ids):
+        for req_id in request_ids:
+            ops.append(("abort", req_id))
+            pending.discard(req_id)
+
+    def poll():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            clock.advance(6.0)
+            return []
+        clock.advance(0.1)
+        current = next(iter(pending))
+        pending.discard(current)
+        return [_finished_event(current)]
+
+    out = rollout_async(
+        examples=[{}],
+        active_env=_CountingOneTurnEnv(),
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=lambda: bool(pending),
+        abort=abort,
+        env_glue=env_glue,
+        max_turns=1,
+        per_turn_max_tokens=8,
+        request_timeout_seconds=5.0,
+        request_max_attempts=2,
+        monotonic=clock,
+        request_id_factory=lambda: next(ids),
+    )
+
+    assert ops == [("submit", "attempt-1"), ("abort", "attempt-1"), ("submit", "attempt-2")]
+    assert out[0]["completion_ids"] == [5]
+
+
+def test_token_progress_never_extends_the_absolute_request_deadline():
+    clock = _FakeMonotonic()
+    pending = set()
+    aborted = []
+    poll_count = 0
+    ids = iter(["attempt-1", "attempt-2"])
+
+    def submit(req_id, prefix, max_tokens, initial):
+        pending.add(req_id)
+
+    def abort(request_ids):
+        aborted.extend(request_ids)
+        pending.difference_update(request_ids)
+
+    def poll():
+        nonlocal poll_count
+        poll_count += 1
+        current = next(iter(pending))
+        if poll_count <= 3:
+            # tokens grow on every poll, so the stall guard stays quiet the whole time.
+            clock.advance(2.0)
+            return [{"request_id": current, "finished": False, "cumulative_tokens": poll_count}]
+        clock.advance(0.1)
+        pending.discard(current)
+        return [_finished_event(current)]
+
+    out = rollout_async(
+        examples=[{}],
+        active_env=_CountingOneTurnEnv(),
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=lambda: bool(pending),
+        abort=abort,
+        env_glue=env_glue,
+        max_turns=1,
+        per_turn_max_tokens=8,
+        request_timeout_seconds=5.0,
+        request_max_attempts=2,
+        stall_timeout_seconds=100.0,
+        monotonic=clock,
+        request_id_factory=lambda: next(ids),
+    )
+
+    assert aborted == ["attempt-1"]
+    assert out[0]["completion_ids"] == [5]
+
+
+def test_tombstone_eviction_is_bounded_and_still_suppresses_stale_output(monkeypatch):
+    import flash.engine.multiturn_rollout as mtr
+
+    monkeypatch.setattr(mtr, "_TOMBSTONE_LIMIT", 1)
+    clock = _FakeMonotonic()
+    pending = set()
+    aborted = []
+    poll_count = 0
+    ids = iter(["attempt-1", "attempt-2", "attempt-3"])
+
+    def submit(req_id, prefix, max_tokens, initial):
+        pending.add(req_id)
+
+    def abort(request_ids):
+        aborted.extend(request_ids)
+        pending.difference_update(request_ids)
+
+    def poll():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count <= 2:
+            clock.advance(6.0)
+            return []
+        clock.advance(0.1)
+        pending.discard("attempt-3")
+        # attempt-1's tombstone was evicted by the limit; attempt-2's is retained. neither
+        # stale completion may reach the environment, only the live third attempt.
+        return [
+            _finished_event("attempt-1", token=98, text="stale-evicted"),
+            _finished_event("attempt-2", token=99, text="stale-tombstoned"),
+            _finished_event("attempt-3", token=7, text="accepted"),
+        ]
+
+    env = _CountingOneTurnEnv()
+    out = rollout_async(
+        examples=[{}],
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=lambda: bool(pending),
+        abort=abort,
+        env_glue=env_glue,
+        max_turns=1,
+        per_turn_max_tokens=8,
+        request_timeout_seconds=5.0,
+        request_max_attempts=3,
+        monotonic=clock,
+        request_id_factory=lambda: next(ids),
+    )
+
+    assert aborted == ["attempt-1", "attempt-2"]
+    assert env.record_calls == ["accepted"]
+    assert out[0]["completion_ids"] == [7]
+
+
 def test_stall_timeout_tracks_only_cumulative_token_growth():
     clock = _FakeMonotonic()
     pending = set()
