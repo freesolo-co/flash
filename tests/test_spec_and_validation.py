@@ -10,7 +10,12 @@ import os
 
 import pytest
 
-from flash.schema import ConfigError, spec_from_dict
+from flash.schema import (
+    TRAIN_KEY_MIN_VERSIONS,
+    ConfigError,
+    spec_from_dict,
+    validate_train_keys,
+)
 from flash.spec import JobSpec, load_job_spec_from_env
 
 BASE_RAW = {
@@ -80,13 +85,121 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def test_train_key_registry_records_minimum_released_versions() -> None:
+    assert TRAIN_KEY_MIN_VERSIONS == {
+        "epochs": "0.2.0",
+        "lora_rank": "0.2.0",
+        "lora_alpha": "0.2.0",
+        "init_from_adapter": "0.2.0",
+        "hf_repo": "0.2.0",
+        "learning_rate": "0.2.0",
+        "batch_size": "0.2.0",
+        "max_context_tokens": "0.2.49",
+        "save_every": "0.2.0",
+        "group_size": "0.2.0",
+        "temperature": "0.2.0",
+        "max_completion_tokens": "0.2.49",
+        "kl_penalty_coef": "0.2.0",
+        "advantage_clip": "0.2.0",
+        "thinking_length_penalty_coef": "0.2.0",
+        "opd_eos_loss_coef": "0.2.55",
+        "teacher_model": "0.2.56",
+        "stop_sequences": "0.2.0",
+        "structured_outputs": "0.2.56",
+        "max_steps": "0.2.0",
+        "max_examples": "0.2.0",
+    }
+
+
+def test_train_key_validator_reports_known_key_requiring_newer_flash() -> None:
+    supported = set(TRAIN_KEY_MIN_VERSIONS) - {"opd_eos_loss_coef"}
+    with pytest.raises(ConfigError) as excinfo:
+        validate_train_keys(
+            {"epochs", "opd_eos_loss_coef"},
+            supported_keys=supported,
+            installed_version="0.2.54",
+        )
+    message = str(excinfo.value)
+    assert "unsupported key" in message
+    assert "opd_eos_loss_coef" in message
+    assert "requires Flash >= 0.2.55" in message
+    assert "installed Flash 0.2.54" in message
+    assert "schema agreement was not checked because local validation failed" in message
+
+
+def test_train_key_validator_checks_minimum_version_even_if_key_is_listed_supported() -> None:
+    with pytest.raises(ConfigError, match=r"teacher_model.*0\.2\.56.*0\.2\.55"):
+        validate_train_keys(
+            {"teacher_model"},
+            supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
+            installed_version="0.2.55",
+        )
+
+
+@pytest.mark.parametrize("installed_version", ["0.2.55rc1", "0.2.55.dev4"])
+def test_train_key_validator_treats_prerelease_as_older(installed_version: str) -> None:
+    with pytest.raises(ConfigError, match=r"opd_eos_loss_coef.*0\.2\.55"):
+        validate_train_keys(
+            {"opd_eos_loss_coef"},
+            supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
+            installed_version=installed_version,
+        )
+
+
+def test_train_key_validator_accepts_local_final_version() -> None:
+    validate_train_keys(
+        {"opd_eos_loss_coef"},
+        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
+        installed_version="0.2.55+local.1",
+    )
+
+
+def test_train_key_validator_does_not_guess_for_malformed_version() -> None:
+    validate_train_keys(
+        {"teacher_model"},
+        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
+        installed_version="0.2.55garbage",
+    )
+
+
+@pytest.mark.parametrize("metadata_version", ["0+unknown", "0.2.55"])
+def test_train_key_validator_uses_imported_schema_for_local_validation(
+    monkeypatch, metadata_version: str
+) -> None:
+    import flash.schema as schema
+
+    monkeypatch.setattr(schema, "__version__", metadata_version)
+    schema.validate_train_keys(
+        {"teacher_model"},
+        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
+    )
+    assert spec_from_dict(_raw(**{"train.teacher_model": "glm-5.2"})).train.teacher_model.endswith(
+        "/glm-5p2"
+    )
+
+
+def test_train_key_validator_keeps_unknown_key_diagnostic_and_allowed_list() -> None:
+    supported = {"epochs", "lora_rank"}
+    with pytest.raises(ConfigError) as excinfo:
+        validate_train_keys(
+            {"removed_spelling"},
+            supported_keys=supported,
+            installed_version="0.2.13",
+        )
+    message = str(excinfo.value)
+    assert "unknown key(s): removed_spelling" in message
+    assert "allowed: epochs, lora_rank" in message
+
+
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:
     # Regression: opd_eos_loss_coef was added to flash.spec.TrainSpec + the worker, but NOT the
     # client/server schema allowlist, so `[train] opd_eos_loss_coef` was hard-rejected as an unknown
     # key at submit — the documented override never reached the worker. It must round-trip here.
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
-    assert spec_from_dict(_raw()).train.opd_eos_loss_coef is None  # unset -> recipe default at resolve
+    assert (
+        spec_from_dict(_raw()).train.opd_eos_loss_coef is None
+    )  # unset -> recipe default at resolve
     with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
@@ -436,10 +549,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     d = spec.to_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = JobSpec.from_dict(d)
-    assert (
-        orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
-    )
+    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------

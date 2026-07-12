@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 
 from flash import __version__
 from flash.catalog import public_model_rows
+from flash.schema import train_schema_metadata
 from flash.server._deps import require_key
 from flash.server.auth import _IDENTITY_PASSTHROUGH_FIELDS
 
@@ -22,7 +23,12 @@ router = APIRouter()
 # makes the liveness probe structurally immune to that starvation. (See ISSUE.md 2026-07-02.)
 @router.get("/v1/health")
 async def health():
-    return {"ok": True, "service": "flash", "version": __version__}
+    return {
+        "ok": True,
+        "service": "flash",
+        "version": __version__,
+        "train_schema": train_schema_metadata(),
+    }
 
 
 @router.get("/v1/me")

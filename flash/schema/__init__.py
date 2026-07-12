@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
+from collections.abc import Collection
 from typing import Any
 
+from flash import __version__
+from flash._update_check import compare_pep440_versions
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.providers.base import (
     UnsupportedGpuError,
@@ -116,12 +119,30 @@ def spec_from_file(
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
 ) -> JobSpec:
+    spec, _ = spec_and_train_keys_from_file(
+        path,
+        run_id=run_id,
+        overrides=overrides,
+        extra_configs=extra_configs,
+    )
+    return spec
+
+
+def spec_and_train_keys_from_file(
+    path: str,
+    run_id: str | None = None,
+    overrides: list[str] | None = None,
+    extra_configs: list[str] | None = None,
+) -> tuple[JobSpec, frozenset[str]]:
+    """parse a config and retain the raw authored [train] keys for schema preflights."""
     raw = load_toml(path)
     for extra in extra_configs or []:
         _deep_merge(raw, load_toml(extra))
     for item in overrides or []:
         _apply_override(raw, item)
-    return spec_from_dict(raw, run_id=run_id)
+    train_raw = raw.get("train")
+    authored_train_keys = frozenset(train_raw) if isinstance(train_raw, dict) else frozenset()
+    return spec_from_dict(raw, run_id=run_id), authored_train_keys
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -190,31 +211,84 @@ _TOP_LEVEL_KEYS = frozenset(
         "run_id",
     }
 )
-_TRAIN_KEYS = frozenset(
-    {
-        "epochs",
-        "lora_rank",
-        "lora_alpha",
-        "init_from_adapter",
-        "hf_repo",
-        "learning_rate",
-        "batch_size",
-        "max_context_tokens",
-        "save_every",
-        "group_size",
-        "temperature",
-        "max_completion_tokens",
-        "kl_penalty_coef",
-        "advantage_clip",
-        "thinking_length_penalty_coef",
-        "opd_eos_loss_coef",
-        "teacher_model",
-        "stop_sequences",
-        "structured_outputs",
-        "max_steps",
-        "max_examples",
+TRAIN_KEY_MIN_VERSIONS = {
+    "epochs": "0.2.0",
+    "lora_rank": "0.2.0",
+    "lora_alpha": "0.2.0",
+    "init_from_adapter": "0.2.0",
+    "hf_repo": "0.2.0",
+    "learning_rate": "0.2.0",
+    "batch_size": "0.2.0",
+    "max_context_tokens": "0.2.49",
+    "save_every": "0.2.0",
+    "group_size": "0.2.0",
+    "temperature": "0.2.0",
+    "max_completion_tokens": "0.2.49",
+    "kl_penalty_coef": "0.2.0",
+    "advantage_clip": "0.2.0",
+    "thinking_length_penalty_coef": "0.2.0",
+    "opd_eos_loss_coef": "0.2.55",
+    "teacher_model": "0.2.56",
+    "stop_sequences": "0.2.0",
+    "structured_outputs": "0.2.56",
+    "max_steps": "0.2.0",
+    "max_examples": "0.2.0",
+}
+TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
+
+
+def train_schema_metadata() -> dict[str, object]:
+    """return deterministic metadata for exact client/server [train] schema comparison."""
+    keys = sorted(TRAIN_SCHEMA_KEYS)
+    return {
+        "supported_keys": keys,
+        "minimum_versions": {key: TRAIN_KEY_MIN_VERSIONS[key] for key in keys},
     }
-)
+
+
+def validate_train_keys(
+    keys: Collection[str],
+    *,
+    supported_keys: Collection[str] = TRAIN_SCHEMA_KEYS,
+    installed_version: str | None = None,
+) -> None:
+    """reject unknown keys and known keys unsupported by an installed schema."""
+    key_set = set(keys)
+    supported = set(supported_keys)
+    displayed_version = __version__ if installed_version is None else installed_version
+
+    def requires_newer_version(key: str) -> bool:
+        if installed_version is None or installed_version == "0+unknown":
+            return False
+        comparison = compare_pep440_versions(installed_version, TRAIN_KEY_MIN_VERSIONS[key])
+        return comparison == -1
+
+    unsupported = sorted(
+        key
+        for key in key_set & TRAIN_SCHEMA_KEYS
+        if key not in supported or requires_newer_version(key)
+    )
+    unknown = sorted(key_set - TRAIN_SCHEMA_KEYS)
+    errors = []
+    if unsupported:
+        details = ", ".join(
+            f"{key} (requires Flash >= {TRAIN_KEY_MIN_VERSIONS[key]}; "
+            f"installed Flash {displayed_version})"
+            for key in unsupported
+        )
+        errors.append(f"unsupported key(s): {details}")
+    if unknown:
+        errors.append(
+            f"unknown key(s): {', '.join(unknown)} (allowed: {', '.join(sorted(supported))})"
+        )
+    if errors:
+        agreement = (
+            ". client/server [train] schema agreement was not checked because local validation failed"
+            if unsupported
+            else ""
+        )
+        raise ConfigError(f"[train] {'; '.join(errors)}{agreement}")
+
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
@@ -276,12 +350,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
-    unknown_train = sorted(set(train_raw) - _TRAIN_KEYS)
-    if unknown_train:
-        raise ConfigError(
-            f"[train] unknown key(s): {', '.join(unknown_train)} "
-            f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
-        )
+    validate_train_keys(train_raw)
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}

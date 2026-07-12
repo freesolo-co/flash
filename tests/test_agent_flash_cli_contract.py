@@ -110,6 +110,12 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
     seen: dict = {}
 
     class _FakeClient:
+        def health(self):
+            from flash import __version__
+            from flash.schema import train_schema_metadata
+
+            return {"version": __version__, "train_schema": train_schema_metadata()}
+
         def create_run(self, spec, runtime_secrets=None, dry_run=False):
             seen["dry_run"] = dry_run
             seen["runtime_secrets"] = runtime_secrets

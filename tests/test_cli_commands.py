@@ -24,6 +24,17 @@ class _FakeClient:
     def me(self) -> dict:
         return {"key_prefix": "freesolo", "email": "t@example.com"}
 
+    def health(self) -> dict:
+        from flash import __version__
+        from flash.schema import train_schema_metadata
+
+        self.calls.append(("health",))
+        return {"ok": True, "version": __version__, "train_schema": train_schema_metadata()}
+
+    def create_run(self, spec: dict, runtime_secrets=None, dry_run: bool = False) -> dict:
+        self.calls.append(("create_run", spec, runtime_secrets, dry_run))
+        return {"run_id": "flash-dry", "state": "dry_run", "spec": spec}
+
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
             {
@@ -235,6 +246,272 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "lambda" not in out.lower()
     assert "You can still tune" not in out
     assert "[gpu] config table" not in out
+
+
+def _train_config(tmp_path, *, extra_train: str = ""):
+    path = tmp_path / "train.toml"
+    path.write_text(
+        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'algorithm = "grpo"\n'
+        '[environment]\nid = "freesolo/gsm8k"\n'
+        f"[train]\nepochs = 1\nmax_examples = 10\n{extra_train}"
+    )
+    return path
+
+
+def test_train_dry_run_reports_exact_schema_agreement_and_posts(
+    fake_client, tmp_path, capsys
+) -> None:
+    config = _train_config(tmp_path)
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "client/server [train] schemas agree exactly" in captured.err
+    assert any(call[0] == "health" for call in fake_client.calls)
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+    assert json.loads(captured.out)["state"] == "dry_run"
+
+
+def test_train_dry_run_exact_metadata_still_checks_server_version(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.54", "train_schema": train_schema_metadata()},
+    )
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "client/server [train] schemas agree exactly" in captured.err
+    assert "unsupported [train] key(s) on the server: opd_eos_loss_coef" in captured.err
+    assert "minimum Flash version 0.2.55" in captured.err
+    assert "installed server Flash 0.2.54" in captured.err
+    assert json.loads(captured.out)["state"] == "dry_run"
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_source_checkout_server_uses_explicit_schema_metadata(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0+unknown", "train_schema": train_schema_metadata()},
+    )
+    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "client/server [train] schemas agree exactly" in captured.err
+    assert "server-version compatibility cannot be verified" in captured.err
+    assert "unsupported [train] key(s)" not in captured.err
+    assert json.loads(captured.out)["state"] == "dry_run"
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_reports_unsupported_server_key_and_schema_disagreement(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    metadata = train_schema_metadata()
+    metadata["supported_keys"].remove("opd_eos_loss_coef")
+    metadata["minimum_versions"].pop("opd_eos_loss_coef")
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.54", "train_schema": metadata},
+    )
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "client/server [train] schemas disagree" in captured.err
+    assert "unsupported [train] key(s) on the server: opd_eos_loss_coef" in captured.err
+    assert "minimum Flash version 0.2.55" in captured.err
+    assert "installed server Flash 0.2.54" in captured.err
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_reports_differing_minimum_version_map_and_posts(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    metadata = train_schema_metadata()
+    metadata["minimum_versions"]["opd_eos_loss_coef"] = "0.2.60"
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.59", "train_schema": metadata},
+    )
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "client/server [train] schemas disagree" in captured.err
+    assert (
+        "minimum-version differences: opd_eos_loss_coef (client 0.2.55, server 0.2.60)"
+        in captured.err
+    )
+    assert "minimum Flash version 0.2.60" in captured.err
+    assert "installed server Flash 0.2.59" in captured.err
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+@pytest.mark.parametrize(
+    "metadata_mutator",
+    [
+        lambda metadata: metadata.update(supported_keys=["epochs", "epochs"]),
+        lambda metadata: metadata.update(supported_keys=["epochs", 3]),
+        lambda metadata: metadata.update(minimum_versions=[]),
+        lambda metadata: metadata["minimum_versions"].pop("epochs"),
+        lambda metadata: metadata["minimum_versions"].update(extra_key="0.2.0"),
+        lambda metadata: metadata["minimum_versions"].update(epochs=3),
+        lambda metadata: metadata["minimum_versions"].update(epochs="not-a-version"),
+    ],
+)
+def test_train_dry_run_rejects_malformed_schema_metadata_and_posts(
+    fake_client, tmp_path, capsys, monkeypatch, metadata_mutator
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    metadata = train_schema_metadata()
+    metadata_mutator(metadata)
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.56", "train_schema": metadata},
+    )
+    config = _train_config(tmp_path)
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "exact client/server [train] schema agreement cannot be verified" in captured.err
+    assert "exposes malformed schema metadata" in captured.err
+    assert "schemas agree exactly" not in captured.err
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_malformed_minimum_metadata_uses_version_inference(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.schema import train_schema_metadata
+
+    metadata = train_schema_metadata()
+    metadata["minimum_versions"]["epochs"] = "not-a-version"
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.54", "train_schema": metadata},
+    )
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "exposes malformed schema metadata" in captured.err
+    assert "client/server [train] schemas disagree by version inference" in captured.err
+    assert "unsupported [train] key(s) on the server: opd_eos_loss_coef" in captured.err
+    assert "minimum Flash version 0.2.55" in captured.err
+    assert json.loads(captured.out)["state"] == "dry_run"
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_malformed_server_version_is_unverifiable_and_posts(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        fake_client,
+        "health",
+        lambda: {"version": "0.2.54garbage", "train_schema": {}},
+    )
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "server version is malformed or unknown (0.2.54garbage)" in captured.err
+    assert "schemas disagree by version inference" not in captured.err
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_infers_legacy_server_key_incompatibility_and_posts(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(fake_client, "health", lambda: {"version": "0.2.54", "ok": True})
+    config = _train_config(tmp_path, extra_train="opd_eos_loss_coef = 0.1\n")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "exact client/server [train] schema agreement cannot be verified" in captured.err
+    assert "server Flash 0.2.54 does not expose schema metadata" in captured.err
+    assert "client/server [train] schemas disagree by version inference" in captured.err
+    assert "unsupported [train] key(s) on the server: opd_eos_loss_coef" in captured.err
+    assert "minimum Flash version 0.2.55" in captured.err
+    assert "installed server Flash 0.2.54" in captured.err
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_health_failure_does_not_hide_authoritative_post(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.client import ClientError
+
+    def fail_health():
+        raise ClientError("health unavailable")
+
+    monkeypatch.setattr(fake_client, "health", fail_health)
+    config = _train_config(tmp_path)
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "health lookup failed (health unavailable)" in captured.err
+    assert json.loads(captured.out)["state"] == "dry_run"
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+def test_train_dry_run_incomplete_health_read_still_posts(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from http.client import IncompleteRead
+
+    def fail_health():
+        raise IncompleteRead(b"partial", 10)
+
+    monkeypatch.setattr(fake_client, "health", fail_health)
+    config = _train_config(tmp_path)
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "health lookup failed" in captured.err
+    assert json.loads(captured.out)["state"] == "dry_run"
+    assert any(call[0] == "create_run" and call[3] is True for call in fake_client.calls)
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(7)])
+def test_train_schema_preflight_does_not_swallow_process_interrupts(interrupt) -> None:
+    class _InterruptingClient:
+        def health(self):
+            raise interrupt
+
+    with pytest.raises(type(interrupt)):
+        cli.commands._dry_run_train_schema_preflight(_InterruptingClient(), frozenset())
 
 
 def test_status_runs_and_log_command(fake_client, capsys) -> None:
@@ -578,9 +855,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "TRAINING.md" in out
 
 
-def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(
-    monkeypatch, tmp_path, capsys
-) -> None:
+def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
     """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd). opd now supports
     multi-turn (it rolls out each episode and distils every assistant turn), so the multi-turn opd.toml
     and the starter env docstring must NOT warn it is single-turn only / fails fast."""
