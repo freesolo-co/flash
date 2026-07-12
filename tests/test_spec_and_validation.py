@@ -81,6 +81,9 @@ def _raw(**overrides) -> dict:
         ({"train.max_token": 256}, "unknown key"),  # typo of max_completion_tokens
         ({"train.max_length": 256}, "unknown key"),
         ({"train.max_tokens": 256}, "unknown key"),
+        ({"train.rollout_request_timeout_seconds": 600}, "unknown key"),
+        ({"train.rollout_request_max_attempts": 2}, "unknown key"),
+        ({"train.rollout_stall_timeout_seconds": 60}, "unknown key"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
