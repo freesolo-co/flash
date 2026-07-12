@@ -46,6 +46,7 @@ from flash.engine.worker.opd_gkd import (
     _trim_trailing_stop,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.opd_objectives import OPD_OBJECTIVES, ObjectiveView
 from flash.engine.worker.opd_vllm import (
     OpdVllmOutput,
     OpdVllmRolloutEngine,
@@ -173,6 +174,8 @@ class OpdKnobs:
     # constrains every student rollout (parity with GRPO). Teacher echo-scoring needs no schema —
     # it scores the student's already-constrained tokens.
     structured_outputs: str = ""
+    # closed auxiliary objective ids. empty keeps the exact c0 path.
+    objective_ids: tuple[str, ...] = ()
 
 
 def _resolve_opd_knobs() -> OpdKnobs:
@@ -205,6 +208,11 @@ def _resolve_opd_knobs() -> OpdKnobs:
     # every allow-listed teacher (one Fireworks endpoint + one managed key), so it stays d.teacher_base_url.
     try:
         teacher = resolve_teacher(opt("teacher_model", ""))
+    except ValueError as e:
+        raise RuntimeError(f"opd: {e}") from e
+    objective_ids = tuple(getattr(t, "opd_objective_ids", ()) or ()) if t else ()
+    try:
+        OPD_OBJECTIVES.resolve(objective_ids)
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
@@ -247,6 +255,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
         structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
+        objective_ids=objective_ids,
     )
 
 
@@ -1303,6 +1312,8 @@ class SampleResult:
     # (distilled samples only, else None). Surfaced as opd/entropy + mean_student_entropy so the
     # reverse-KL entropy collapse behind the small-model greedy repetition loop is visible in-band.
     entropy: float | None = None
+    # namespaced, detached metrics emitted by selected registry objectives.
+    objective_metrics: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1846,6 +1857,8 @@ def _resolve_samples_batched(
     # working with the penalty OFF; the detached mean entropy is computed either way for logging.
     ent_coef = float(getattr(knobs, "entropy_floor_coef", 0.0) or 0.0)
     ent_floor = float(getattr(knobs, "entropy_floor", 0.0) or 0.0)
+    objective_ids = tuple(getattr(knobs, "objective_ids", ()) or ())
+    selected_objectives = OPD_OBJECTIVES.resolve(objective_ids)
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
     eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
@@ -1933,10 +1946,9 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
-                    # Behaviour-clone the terminal stop the reverse-KL alignment cannot reach. Added
-                    # to the distilled samples only (loss is not None), so no-signal skip accounting is
-                    # unchanged. logits[row] is this sample's per-position logits [max_len, V]; the term
-                    # self-limits, so a student that already stops cleanly contributes ~0.
+                    auxiliary_terms = []
+                    # behaviour-clone the terminal stop the reverse-kl alignment cannot reach. added
+                    # to distilled samples only, so no-signal skip accounting stays unchanged.
                     eos_logprob = None
                     if eos_coef > 0:
                         eos_out = _eos_reinforce_term(
@@ -1950,13 +1962,32 @@ def _resolve_samples_batched(
                         )
                         if eos_out is not None:
                             eos_term, eos_logprob = eos_out
-                            loss = loss + eos_term
-                    # entropy floor on the SAME rows the reverse-KL consumed; added to distilled
-                    # samples only (loss is not None), so skip accounting is unchanged. the detached
-                    # mean entropy is logged even when the penalty is off/inactive.
+                            auxiliary_terms.append(eos_term)
+                    # the entropy floor uses the same rows as gkd. its detached metric remains available
+                    # when the penalty is off, matching the existing c0 path.
                     ent_term, entropy = _entropy_floor_term(rows, ent_coef, ent_floor)
                     if ent_term is not None:
-                        loss = loss + ent_term
+                        auxiliary_terms.append(ent_term)
+                    objective_metrics = ()
+                    if selected_objectives:
+                        objective_evaluation = OPD_OBJECTIVES.evaluate(
+                            objective_ids,
+                            ObjectiveView(
+                                {
+                                    "sample_logits": logits[row],
+                                    "completion_logits": rows,
+                                    "prompt_len": prompt_len,
+                                    "student_ids": tuple(p.student_ids),
+                                    "gkd_groups": p.groups,
+                                }
+                            ),
+                        )
+                        auxiliary_terms.extend(objective_evaluation.terms)
+                        objective_metrics = tuple(objective_evaluation.metrics.items())
+                    # preserve addition order and compose every auxiliary term exactly once before the
+                    # existing normalization, backward, clipping, optimizer, and vllm sync path.
+                    for auxiliary_term in auxiliary_terms:
+                        loss = loss + auxiliary_term
                     loss_for_result = loss
                     if backward_scale is not None:
                         losses.append(loss)
@@ -1970,6 +2001,7 @@ def _resolve_samples_batched(
                         group_granularity=p.group_granularity,
                         eos_logprob=eos_logprob,
                         entropy=entropy,
+                        objective_metrics=objective_metrics,
                     )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()

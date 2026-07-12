@@ -21,6 +21,23 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     return tuple(s for s in (str(x) for x in value) if s)
 
 
+def normalize_opd_objective_ids(value: Any, *, algorithm: str) -> tuple[str, ...]:
+    """validate the typed, opd-only objective id list at every serialization boundary."""
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError("train.opd_objective_ids must be a list of strings")
+    if not all(isinstance(objective_id, str) and objective_id for objective_id in value):
+        raise ValueError("train.opd_objective_ids entries must be non-empty strings")
+    objective_ids = tuple(value)
+    if objective_ids and algorithm != "opd":
+        raise ValueError("train.opd_objective_ids is only valid when algorithm = \"opd\"")
+    from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
+
+    OPD_OBJECTIVES.resolve(objective_ids)
+    return objective_ids
+
+
 def coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed sources; treats "false"/"0"/"no"/"off" as False."""
     if isinstance(value, str):
@@ -138,6 +155,8 @@ class TrainSpec:
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
     structured_outputs: str = ""
+    # opd only: closed auxiliary objective ids. empty keeps the exact c0 training path.
+    opd_objective_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,9 +213,10 @@ class JobSpec:
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
+        algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
         return cls(
             model=data.get("model", cls.model),
-            algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
+            algorithm=algorithm,
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
@@ -228,6 +248,9 @@ class JobSpec:
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
+                opd_objective_ids=normalize_opd_objective_ids(
+                    train.get("opd_objective_ids"), algorithm=algorithm
+                ),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

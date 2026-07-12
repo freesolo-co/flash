@@ -98,6 +98,18 @@ def _train_stops(train_raw: dict) -> tuple[str, ...]:
     return tuple(s for s in v if s)
 
 
+def _train_opd_objective_ids(train_raw: dict, algorithm: str) -> tuple[str, ...]:
+    """validate the closed opd objective id list before any worker is provisioned."""
+    from flash.spec import normalize_opd_objective_ids
+
+    try:
+        return normalize_opd_objective_ids(
+            train_raw.get("opd_objective_ids"), algorithm=algorithm
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 class ConfigError(ValueError):
     pass
 

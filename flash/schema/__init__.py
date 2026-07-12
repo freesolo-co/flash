@@ -20,6 +20,7 @@ from flash.schema.fields import (
     _require_environment_ref,
     _train_float,
     _train_int,
+    _train_opd_objective_ids,
     _train_stops,
     _train_structured_outputs,
     _train_teacher,
@@ -210,6 +211,7 @@ _TRAIN_KEYS = frozenset(
         "opd_eos_loss_coef",
         "opd_entropy_floor_coef",
         "opd_entropy_floor",
+        "opd_objective_ids",
         "teacher_model",
         "stop_sequences",
         "structured_outputs",
@@ -367,6 +369,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
+            opd_objective_ids=_train_opd_objective_ids(train_raw, algorithm),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
