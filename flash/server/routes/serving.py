@@ -47,7 +47,16 @@ def _deployment_state(deployment: dict, state: str, **fields) -> dict:
 
 def _public_deployment(deployment: dict) -> dict:
     out = dict(deployment)
-    out.pop("previous_deployment", None)
+    for field in (
+        "previous_deployment",
+        "previous_registry_snapshot",
+        "desired_registry_record",
+        "target_registry_revision",
+        "registry_revision",
+        "registry_snapshot_captured",
+        "registry_mutation_started",
+    ):
+        out.pop(field, None)
     return out
 
 
@@ -72,33 +81,90 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
 
 
 def recover_deployments() -> int:
-    """Clear deployment lifecycle records left busy by a control-plane restart."""
+    """Reconcile stale deployment mutations left by a control-plane restart."""
     recovered = 0
     for row in db.all_runs():
-        try:
-            status = _app.get_status(row["run_id"])
-        except FileNotFoundError:
-            continue
-        deployment = status.deployment or {}
-        if not _deployment_attempt_is_stale(deployment):
-            continue
-        failed = _deployment_state(
-            deployment,
-            "failed",
-            error="deployment lifecycle interrupted by control-plane restart",
-            detail="deployment interrupted; retry `flash deploy`",
-            recovered_at=time.time(),
-        )
-        mark_deployment_failed(status.run_id, failed)
-        recovered += 1
+        run_id = row["run_id"]
+        with _app._deploy_lock(run_id):
+            try:
+                status = _app.get_status(run_id)
+            except FileNotFoundError:
+                continue
+            deployment = status.deployment or {}
+            if not _deployment_attempt_is_stale(deployment):
+                continue
+            failed = _deployment_state(
+                deployment,
+                "failed",
+                error="deployment lifecycle interrupted by control-plane restart",
+                detail="deployment interrupted; retry `flash deploy`",
+                recovered_at=time.time(),
+            )
+            if deployment.get("registry_snapshot_captured") is True:
+                previous = deployment.get("previous_registry_snapshot")
+                desired = deployment.get("desired_registry_record")
+                target = deployment.get("target_registry_revision")
+                try:
+                    current = _app.snapshot_adapter_record(run_id)
+                except Exception as exc:
+                    failed["reconciliation_required"] = True
+                    failed["rollback_error"] = str(exc)
+                    failed["detail"] = (
+                        "deployment interrupted and registry readback failed; reconciliation required"
+                    )
+                else:
+                    mutation_landed = (
+                        isinstance(desired, dict)
+                        and isinstance(target, int)
+                        and _app.registry_snapshot_matches(current, desired, target)
+                    )
+                    rollback_already_landed = (
+                        previous is None
+                        and isinstance(current, dict)
+                        and isinstance(current.get("adapter"), dict)
+                        and current["adapter"].get("status") == "disabled"
+                        and isinstance(target, int)
+                        and current.get("revision") == target + 1
+                    )
+                    if mutation_landed:
+                        try:
+                            failed["rollback_revision"] = _app.restore_adapter_record(
+                                run_id, previous, target
+                            )
+                        except Exception as exc:
+                            failed["reconciliation_required"] = True
+                            failed["rollback_error"] = str(exc)
+                            failed["detail"] = (
+                                "deployment interrupted and serving rollback failed; "
+                                "reconciliation required"
+                            )
+                        else:
+                            failed["detail"] = (
+                                "deployment interrupted; restored the prior serving registry state"
+                            )
+                    elif current == previous or rollback_already_landed:
+                        failed["detail"] = (
+                            "deployment interrupted; registry mutation did not remain active"
+                        )
+                    else:
+                        failed["reconciliation_required"] = True
+                        failed["detail"] = (
+                            "deployment interrupted after another registry revision became active; "
+                            "reconciliation required"
+                        )
+            mark_deployment_failed(run_id, failed)
+            recovered += 1
     return recovered
 
 
 def _answer_after_reasoning(content: str, *, thinking: bool) -> str:
     if not thinking:
         return content.strip()
-    _before, separator, answer = content.rpartition("</think>")
-    return (answer if separator else content).strip()
+    opened = content.rfind("<think>")
+    closed = content.rfind("</think>")
+    if opened >= 0 and closed < opened:
+        raise ServingError("smoke generation opened a <think> block but did not close it")
+    return (content[closed + len("</think>") :] if closed >= 0 else content).strip()
 
 
 def _validate_structured_smoke(answer: str, structured_outputs: str) -> None:
@@ -139,6 +205,8 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
+    if finish == "length":
+        raise ServingError("smoke generation was truncated at the maximum token length")
     answer = _answer_after_reasoning(content, thinking=spec.thinking)
     if not answer:
         raise ServingError(
@@ -160,9 +228,9 @@ def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
 
 
 def _rollback_registered_deployment(
-    *, run_id: str, previous_registry_record: dict | None
-) -> None:
-    _app.restore_adapter_record(run_id, previous_registry_record)
+    *, run_id: str, previous_registry_snapshot: dict | None, registry_revision: int
+) -> int | None:
+    return _app.restore_adapter_record(run_id, previous_registry_snapshot, registry_revision)
 
 
 def _finish_deployment_unlocked(
@@ -177,7 +245,7 @@ def _finish_deployment_unlocked(
     verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
-    active = (_app.get_status(run_id).deployment or {})
+    active = _app.get_status(run_id).deployment or {}
     if (
         active.get("requested_at") != deployment.get("requested_at")
         or active.get("state") not in _DEPLOYMENT_BUSY_STATES
@@ -186,13 +254,51 @@ def _finish_deployment_unlocked(
     current = _deployment_state(deployment, "registering", detail="registering adapter")
     mark_deployment_pending(run_id, current)
     registered = False
-    previous_registry_record = None
+    previous_registry_snapshot = None
+    registry_revision: int | None = None
+
+    def _persist_registry_intent(previous: dict | None, desired: dict, target: int) -> None:
+        nonlocal current
+        current = _deployment_state(
+            current,
+            "registering",
+            detail="registry mutation prepared",
+            previous_registry_snapshot=previous,
+            desired_registry_record=desired,
+            target_registry_revision=target,
+            registry_snapshot_captured=True,
+            registry_mutation_started=True,
+        )
+        marked = mark_deployment_pending(run_id, current)
+        marked_deployment = marked.deployment or {}
+        if (
+            marked_deployment.get("requested_at") != deployment.get("requested_at")
+            or marked_deployment.get("target_registry_revision") != target
+        ):
+            raise ServingError(
+                "deployment lifecycle ownership changed before registry mutation; mutation aborted"
+            )
+
     try:
-        dep = _app.deploy_adapter(**deploy_kwargs)
+        dep = _app.deploy_adapter(
+            **deploy_kwargs, before_registry_mutation=_persist_registry_intent
+        )
         registered = True
-        previous_registry_record = dep.previous_registry_record
+        previous_registry_snapshot = dep.previous_registry_snapshot
+        registry_revision = dep.registry_revision
+        if not isinstance(registry_revision, int):
+            raise ServingError("serving registration did not return a registry revision")
         previous_deployment = deployment.get("previous_deployment")
-        current = dep.to_dict()
+        current = {
+            **dep.to_dict(),
+            "previous_registry_snapshot": previous_registry_snapshot,
+            "desired_registry_record": current.get("desired_registry_record"),
+            "target_registry_revision": current.get("target_registry_revision"),
+            "registry_revision": registry_revision,
+            "registry_snapshot_captured": True,
+            "registry_mutation_started": True,
+            "requested_at": deployment.get("requested_at"),
+        }
         if previous_deployment:
             current["previous_deployment"] = previous_deployment
         if checkpoint_step is not None:
@@ -202,10 +308,15 @@ def _finish_deployment_unlocked(
         if is_checkpoint:
             state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
         if _deployment_cas_lost(run_id, state_guard):
+            # Another deploy won the lifecycle CAS and now owns the serving record. Roll back our
+            # own registration best-effort and leave the winner's deployment record untouched. A
+            # lost CAS means the winner may already have advanced the revision, so a conflicting
+            # restore here is expected and deliberately suppressed.
             with contextlib.suppress(Exception):
                 _rollback_registered_deployment(
                     run_id=run_id,
-                    previous_registry_record=previous_registry_record,
+                    previous_registry_snapshot=previous_registry_snapshot,
+                    registry_revision=registry_revision,
                 )
             return
         if verify:
@@ -214,20 +325,21 @@ def _finish_deployment_unlocked(
             current = _deployment_state(current, "ready", **_run_deployment_smoke(run_id, spec))
         else:
             current = _deployment_state(current, "ready", detail="registered; smoke skipped")
-        current = _public_deployment(current)
+        public_current = _public_deployment(current)
 
         if is_checkpoint:
-            marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
+            marked = mark_checkpoint_deployed(run_id, public_current, expect_state=state_guard)
         else:
-            marked = mark_deployed(run_id, current, expect_state=prev_state)
+            marked = mark_deployed(run_id, public_current, expect_state=prev_state)
         cas_failed = (
-            marked.deployment != current if is_checkpoint else marked.state != "deployed"
+            marked.deployment != public_current if is_checkpoint else marked.state != "deployed"
         )
         if state_guard is not None and cas_failed:
             with contextlib.suppress(Exception):
                 _rollback_registered_deployment(
                     run_id=run_id,
-                    previous_registry_record=previous_registry_record,
+                    previous_registry_snapshot=previous_registry_snapshot,
+                    registry_revision=registry_revision,
                 )
             return
     except Exception as exc:
@@ -248,27 +360,30 @@ def _finish_deployment_unlocked(
             error=error,
             detail="deployment failed; retry `flash deploy` after fixing the error",
         )
-        if registered:
-            previous_deployment = deployment.get("previous_deployment")
-            rollback_error = None
+        if getattr(exc, "reconciliation_required", False):
+            failed["reconciliation_required"] = True
+            failed["detail"] = "deployment outcome is ambiguous; reconciliation required"
+        if registered and registry_revision is not None:
             try:
-                _rollback_registered_deployment(
+                failed["rollback_revision"] = _rollback_registered_deployment(
                     run_id=run_id,
-                    previous_registry_record=previous_registry_record,
+                    previous_registry_snapshot=previous_registry_snapshot,
+                    registry_revision=registry_revision,
                 )
             except Exception as rollback_exc:
-                rollback_error = str(rollback_exc)
-            if rollback_error:
                 failed.pop("previous_deployment", None)
-                failed["rollback_error"] = rollback_error
+                failed["rollback_error"] = str(rollback_exc)
+                failed["reconciliation_required"] = True
                 failed["detail"] = (
-                    "deployment failed and serving rollback failed; "
-                    "operator cleanup required"
+                    "deployment failed and serving rollback failed; operator cleanup required"
                 )
-            elif previous_registry_record is not None:
-                failed["detail"] = "deployment failed; restored exact previous serving record"
             else:
-                failed["detail"] = "deployment failed; restored absent serving record"
+                if previous_registry_snapshot is not None:
+                    failed["detail"] = "deployment failed; restored exact previous serving record"
+                else:
+                    failed["detail"] = (
+                        "deployment failed; restored an unroutable serving tombstone"
+                    )
         mark_deployment_failed(run_id, failed)
 
 

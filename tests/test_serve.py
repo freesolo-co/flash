@@ -99,7 +99,13 @@ def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **d
                 return None
 
             def json(self):
-                return {"capabilities": ["thinking_structured_outputs_deferred_v1"]}
+                model = deploy_kwargs["model"]
+                return {
+                    "reasoning_parser_by_model": {model: "qwen3"},
+                    "deferred_structured_outputs_by_model": {
+                        model: {"status": "live", "verified": True}
+                    },
+                }
 
         monkeypatch.setattr(
             d.httpx,
@@ -151,7 +157,7 @@ def test_thinking_structured_dry_run_does_not_probe_or_mutate(monkeypatch):
         structured_outputs=json.dumps({"json_object": True}),
     )
     assert dep.state == "dry_run"
-    assert dep.previous_registry_record is None
+    assert dep.previous_registry_snapshot is None
 
 
 def test_deploy_9b_dry_run_is_not_rejected():
@@ -469,7 +475,7 @@ def test_deploy_registers_deferred_structured_outputs_for_thinking(
         tmp_path,
         stub_serving_registry,
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.6-35B-A3B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=True,
@@ -493,7 +499,106 @@ def test_structured_outputs_body_helper():
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `org_id` so serving can persist
-    hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
+    hosted_lora_adapters.org_id and later authorize external chat by org. A replacement of an
+    existing record inherits the prior owner even when the caller omits org_id, and a truly
+    fresh adapter with no org omits the key entirely."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        seen["json"] = json
+        seen["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    # deploy reads the registry back before reporting ready; one expected record per mutation
+    stub_serving_registry(
+        {
+            "adapter_id": "flash-7-abcd",
+            "subfolder": "sft/flash-7-abcd/seed0/adapter",
+            "org_id": "org-xyz",
+        },
+        {
+            "adapter_id": "flash-7-abcd",
+            "subfolder": "sft/flash-7-abcd/seed0/adapter",
+            "org_id": "org-xyz",
+        },
+    )
+
+    dep = d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        org_id="org-xyz",
+    )
+    assert seen["json"]["org_id"] == "org-xyz"
+    # a fresh adapter has no prior revision to compare against
+    assert seen["headers"] is None or "If-Match" not in seen["headers"]
+    assert dep.registry_revision == 1
+
+    # Redeploying without an org inherits the recorded owner (ownership never silently drops)
+    # and carries If-Match against the previous revision.
+    dep = d.deploy_adapter(
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+    )
+    assert seen["json"]["org_id"] == "org-xyz"
+    assert seen["headers"]["If-Match"] == '"1"'
+    assert dep.registry_revision == 2
+
+
+def test_deploy_rejects_owner_change(monkeypatch, tmp_path, stub_serving_registry):
+    """Replacing an existing adapter cannot move it to a different org; the deploy fails
+    before any registry mutation is attempted."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+
+    def fail_post(*_args, **_kwargs):
+        pytest.fail("owner-change rejection must happen before POST /adapters")
+
+    monkeypatch.setattr(d.httpx, "post", fail_post)
+    stub_serving_registry(
+        {
+            "adapter_id": "flash-7-abcd",
+            "subfolder": "sft/flash-7-abcd/seed0/adapter",
+            "org_id": "org-original",
+        }
+    )
+    # commit the initial record so a previous snapshot exists at revision 1
+    d._etag_revision(None)
+
+    with pytest.raises(d.ServingError, match="cannot change owner"):
+        d.deploy_adapter(
+            run_id="flash-7-abcd",
+            model="Qwen/Qwen3.5-0.8B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/flash-7-abcd/seed0",
+            org_id="org-other",
+        )
+
+
+def test_deploy_omits_org_id_for_fresh_unowned_adapter(
+    monkeypatch, tmp_path, stub_serving_registry
+):
+    """A first-time deploy with no org omits the key entirely (registration shape unchanged
+    for older callers)."""
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
@@ -513,21 +618,10 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
-    # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
-    d.deploy_adapter(
-        run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/flash-7-abcd/seed0",
-        org_id="org-xyz",
-    )
-    assert seen["json"]["org_id"] == "org-xyz"
-
-    # No org -> the key is omitted entirely (registration shape unchanged for older callers).
     d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
@@ -611,78 +705,104 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
-    """undeploy DELETEs {FREESOLO_SERVING_URL}/adapters/{run_id} with the auth header and
-    returns [run_id] on success, [] on 404."""
+    """undeploy uses If-Match and verifies the disabled tombstone revision."""
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
-
     seen = {}
+    deleted = False
 
     class _Resp:
-        def __init__(self, code):
+        def __init__(self, code, payload=None, headers=None):
             self.status_code = code
+            self._payload = payload
+            self.headers = headers or {}
 
         def raise_for_status(self):
             return None
 
+        def json(self):
+            return self._payload
+
+    def fake_get(*_args, **_kwargs):
+        record = {
+            "adapter_id": "flash-7-abcd",
+            "repo_id": "org/repo",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "repo_type": "dataset",
+            "thinking": False,
+            "status": "disabled" if deleted else "ready",
+        }
+        return _Resp(
+            200,
+            {"adapter": record, "org_id": "org-1", "revision": 5 if deleted else 4},
+        )
+
     def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
-        seen["url"] = url
-        seen["headers"] = headers
-        seen["follow_redirects"] = follow_redirects
-        return _Resp(200)
+        nonlocal deleted
+        seen.update(
+            url=url,
+            headers=headers,
+            follow_redirects=follow_redirects,
+        )
+        deleted = True
+        return _Resp(200, headers={"ETag": '"5"'})
 
+    monkeypatch.setattr(d.httpx, "get", fake_get)
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
-    out = d.undeploy_adapter("flash-7-abcd")
-    assert out == ["flash-7-abcd"]
+    assert d.undeploy_adapter("flash-7-abcd") == ["flash-7-abcd"]
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
+    assert seen["headers"]["If-Match"] == '"4"'
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-    # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
     assert seen["follow_redirects"] is True
-
-    # A 404 (already gone) returns an empty list, not an error.
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd") == []
 
 
 def test_undeploy_propagates_serving_error(monkeypatch):
-    """A non-404 failure from the serving app surfaces as a ServingError (carrying the upstream
-    status, so the server maps it to a 502) — exactly like deploy — instead of letting a raw
-    httpx error escape as an unhandled 500. A 404 still no-ops (already-gone is success)."""
+    """A failed ambiguous delete is surfaced with its status and reconciliation state."""
+    import httpx
+
     import flash.serve.deploy as d
 
-    class _Resp:
-        def __init__(self, code):
-            self.status_code = code
-            self.text = "kaboom"
+    snapshot = {
+        "adapter": {
+            "adapter_id": "flash-7-abcd",
+            "repo_id": "org/repo",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "repo_type": "dataset",
+            "thinking": False,
+            "status": "ready",
+        },
+        "org_id": "org-1",
+        "revision": 4,
+    }
+
+    class _GetResp:
+        status_code = 200
 
         def raise_for_status(self):
-            raise d.httpx.HTTPStatusError("boom", request=None, response=self)
+            return None
 
-    # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(500))
+        def json(self):
+            return snapshot
+
+    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _GetResp())
+    request = httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd")
+    response = httpx.Response(500, text="kaboom", request=request)
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: response)
     with pytest.raises(d.ServingError) as ei:
         d.undeploy_adapter("flash-7-abcd")
     assert ei.value.status_code == 500
+    assert ei.value.reconciliation_required is True
 
-    # A transport error (never reached the backend) is also translated into a ServingError.
-    # httpx.RequestError must carry the originating request (httpx>=0.27); building it with only a
-    # message can raise TypeError before undeploy_adapter() can translate it, so mirror the real
-    # undeploy call (DELETE {serving}/adapters/{run_id}).
-    def _boom_delete(*a, **k):
-        raise d.httpx.RequestError(
-            "no route to host",
-            request=d.httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
-        )
+    def _boom_delete(*_args, **_kwargs):
+        raise httpx.RequestError("no route to host", request=request)
 
     monkeypatch.setattr(d.httpx, "delete", _boom_delete)
-    with pytest.raises(d.ServingError):
+    with pytest.raises(d.ServingError) as ei:
         d.undeploy_adapter("flash-7-abcd")
-
-    # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd") == []
+    assert ei.value.reconciliation_required is True
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
@@ -902,13 +1022,13 @@ def test_thinking_structured_capability_precedes_registration(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     events = []
-    registry = []
+    registry = None
 
     class _Resp:
-        status_code = 200
-
-        def __init__(self, payload=None):
+        def __init__(self, status_code=200, payload=None, headers=None):
+            self.status_code = status_code
             self.payload = payload
+            self.headers = headers or {}
 
         def raise_for_status(self):
             return None
@@ -916,30 +1036,40 @@ def test_thinking_structured_capability_precedes_registration(monkeypatch):
         def json(self):
             return self.payload
 
-    def fake_get(url, **kwargs):
+    def fake_get(url, **_kwargs):
         if url.endswith("/healthz"):
             events.append("healthz")
-            return _Resp({"capabilities": ["thinking_structured_outputs_deferred_v1"]})
-        return _Resp({"adapters": registry})
+            return _Resp(
+                payload={
+                    "reasoning_parser_by_model": {"Qwen/Qwen3.6-35B-A3B": "qwen3"},
+                    "deferred_structured_outputs_by_model": {
+                        "Qwen/Qwen3.6-35B-A3B": {"status": "live", "verified": True}
+                    },
+                }
+            )
+        if registry is None:
+            return _Resp(status_code=404)
+        return _Resp(payload={"adapter": registry, "org_id": None, "revision": 1})
 
-    def fake_post(url, json=None, **kwargs):
+    def fake_post(url, json=None, **_kwargs):
+        nonlocal registry
         events.append("post")
-        registry[:] = [dict(json)]
-        return _Resp()
+        registry = dict(json)
+        return _Resp(headers={"ETag": '"1"'})
 
     monkeypatch.setattr(d.httpx, "get", fake_get)
     monkeypatch.setattr(d.httpx, "post", fake_post)
     d.deploy_adapter(
         "r-cap",
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.6-35B-A3B",
         "org/repo",
         "rl/r-cap/seed0",
         thinking=True,
         structured_outputs=json.dumps({"choice": ["4"]}),
     )
     assert events == ["healthz", "post"]
-    assert registry[0]["structured_outputs_after_reasoning"] == {"choice": ["4"]}
-    assert "structured_outputs" not in registry[0]
+    assert registry["structured_outputs_after_reasoning"] == {"choice": ["4"]}
+    assert "structured_outputs" not in registry
 
 
 @pytest.mark.parametrize(
@@ -953,25 +1083,31 @@ def test_capability_probe_is_only_for_thinking_constraints(
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    registry = []
+    registry = None
     get_urls = []
 
     class _Resp:
-        status_code = 200
+        def __init__(self, status_code=200, payload=None, headers=None):
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = headers or {}
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"adapters": registry}
+            return self._payload
 
-    def fake_get(url, **kwargs):
+    def fake_get(url, **_kwargs):
         get_urls.append(url)
-        return _Resp()
+        if registry is None:
+            return _Resp(status_code=404)
+        return _Resp(payload={"adapter": registry, "org_id": None, "revision": 1})
 
-    def fake_post(url, json=None, **kwargs):
-        registry[:] = [dict(json)]
-        return _Resp()
+    def fake_post(url, json=None, **_kwargs):
+        nonlocal registry
+        registry = dict(json)
+        return _Resp(headers={"ETag": '"1"'})
 
     monkeypatch.setattr(d.httpx, "get", fake_get)
     monkeypatch.setattr(d.httpx, "post", fake_post)
@@ -986,88 +1122,127 @@ def test_capability_probe_is_only_for_thinking_constraints(
     assert all(not url.endswith("/healthz") for url in get_urls)
 
 
-@pytest.mark.parametrize(
-    "prior_constraint",
-    [{"structured_outputs": {"choice": ["old"]}}, {}],
-    ids=["constrained", "unconstrained"],
-)
-def test_failed_readback_restores_exact_prior_record(monkeypatch, prior_constraint):
+def test_replacement_preserves_org_and_uses_if_match(monkeypatch):
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     prior = {
-        "adapter_id": "r-rollback",
-        "repo_id": "org/old",
-        "repo_type": "dataset",
-        "base_model": "Qwen/Qwen3.5-0.8B",
-        "subfolder": "rl/old/adapter",
-        "thinking": False,
-        "status": "ready",
-        **prior_constraint,
+        "adapter": {
+            "adapter_id": "r-replace",
+            "repo_id": "org/old",
+            "repo_type": "dataset",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "subfolder": "rl/old/adapter",
+            "thinking": False,
+            "status": "ready",
+        },
+        "org_id": "tenant-1",
+        "revision": 7,
     }
-    registry = [dict(prior)]
-    posted = []
+    current = prior
+    seen = {}
 
     class _Resp:
-        status_code = 200
+        def __init__(self, payload=None, headers=None):
+            self.status_code = 200
+            self._payload = payload
+            self.headers = headers or {}
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"adapters": registry}
+            return self._payload
 
-    def fake_post(url, json=None, **kwargs):
-        posted.append(dict(json))
-        if json == prior:
-            registry[:] = [dict(prior)]
-        return _Resp()
+    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _Resp(current))
 
-    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _Resp())
+    def fake_post(url, json=None, headers=None, **_kwargs):
+        nonlocal current
+        seen.update(url=url, json=json, headers=headers)
+        current = {"adapter": dict(json), "org_id": "tenant-1", "revision": 8}
+        return _Resp(headers={"ETag": '"8"'})
+
     monkeypatch.setattr(d.httpx, "post", fake_post)
-    with pytest.raises(d.ServingError, match="restored to its exact pre-deploy state"):
+    dep = d.deploy_adapter(
+        "r-replace", "Qwen/Qwen3.5-0.8B", "org/new", "rl/new", org_id="tenant-1"
+    )
+    assert seen["headers"]["If-Match"] == '"7"'
+    assert seen["json"]["org_id"] == "tenant-1"
+    assert dep.registry_revision == 8
+    assert dep.previous_registry_snapshot == prior
+
+
+def test_replacement_rejects_org_change_before_mutation(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    prior = {
+        "adapter": {
+            "adapter_id": "r-replace",
+            "repo_id": "org/old",
+            "repo_type": "dataset",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "subfolder": "rl/old/adapter",
+            "thinking": False,
+            "status": "ready",
+        },
+        "org_id": "tenant-1",
+        "revision": 7,
+    }
+    monkeypatch.setattr(d, "snapshot_adapter_record", lambda _run_id: prior)
+    monkeypatch.setattr(
+        d.httpx, "post", lambda *a, **k: pytest.fail("owner mismatch must not mutate")
+    )
+    with pytest.raises(d.ServingError, match="cannot change owner"):
         d.deploy_adapter(
-            "r-rollback",
+            "r-replace",
             "Qwen/Qwen3.5-0.8B",
             "org/new",
             "rl/new",
-            structured_outputs=json.dumps({"choice": ["new"]}),
+            org_id="tenant-2",
         )
-    assert posted[-1] == prior
-    assert registry == [prior]
 
 
-def test_failed_readback_restores_exact_absence(monkeypatch):
+@pytest.mark.parametrize("committed", [False, True])
+def test_ambiguous_post_reconciles_strong_snapshot(monkeypatch, committed):
+    import httpx
+
     import flash.serve.deploy as d
 
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    registry = []
-    deleted = []
+    current = None
+    request = httpx.Request("POST", "https://serve.example/adapters")
 
     class _Resp:
-        status_code = 200
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"adapters": registry}
+            return self._payload
 
-    def fake_post(url, json=None, **kwargs):
-        registry[:] = [{**dict(json), "repo_id": "stale/repo"}]
-        return _Resp()
+    def fake_get(*_args, **_kwargs):
+        if current is None:
+            return _Resp(404)
+        return _Resp(200, current)
 
-    def fake_delete(url, **kwargs):
-        deleted.append(url)
-        registry.clear()
-        return _Resp()
+    def fake_post(_url, json=None, **_kwargs):
+        nonlocal current
+        if committed:
+            current = {"adapter": dict(json), "org_id": None, "revision": 1}
+        raise httpx.ReadTimeout("timed out", request=request)
 
-    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(d.httpx, "get", fake_get)
     monkeypatch.setattr(d.httpx, "post", fake_post)
-    monkeypatch.setattr(d.httpx, "delete", fake_delete)
-    with pytest.raises(d.ServingError, match="restored to its exact pre-deploy state"):
-        d.deploy_adapter("r-new", "Qwen/Qwen3.5-0.8B", "org/new", "rl/new")
-    assert deleted == ["https://serve.example/adapters/r-new"]
-    assert registry == []
+    if committed:
+        assert d.deploy_adapter(
+            "r-timeout", "Qwen/Qwen3.5-0.8B", "org/new", "rl/new"
+        ).registry_revision == 1
+    else:
+        with pytest.raises(d.ServingError, match="did not commit") as excinfo:
+            d.deploy_adapter("r-timeout", "Qwen/Qwen3.5-0.8B", "org/new", "rl/new")
+        assert excinfo.value.reconciliation_required is False

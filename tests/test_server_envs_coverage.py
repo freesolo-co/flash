@@ -426,9 +426,19 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: {"choices": [{"message": {"content": "   "}, "finish_reason": "length"}]},
+        lambda **_k: {"choices": [{"message": {"content": "   "}, "finish_reason": "stop"}]},
     )
     with pytest.raises(ServingError, match="no answer content"):
+        serving._run_deployment_smoke("run-1", spec)
+
+    # A generation truncated at the token limit is rejected before the empty-answer check, because
+    # a length-capped sample cannot prove the adapter emits a complete, well-formed answer.
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "length"}]},
+    )
+    with pytest.raises(ServingError, match="truncated at the maximum token length"):
         serving._run_deployment_smoke("run-1", spec)
 
 

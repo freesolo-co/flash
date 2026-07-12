@@ -65,7 +65,15 @@ def _fast_serving_readback(monkeypatch):
 
 @pytest.fixture
 def stub_serving_registry(monkeypatch):
-    """Patch GET /adapters to return the given records (deploy read-back verification)."""
+    """Model the revisioned privileged registry used by deployment verification.
+
+    Each positional record is the expected post-mutation adapter state, in mutation
+    order. The stub starts empty (GET 404); every _etag_revision call commits the
+    next mutation, so snapshot reads return the latest committed record at its
+    monotonic revision. Repeated deploys of the same adapter therefore see the
+    prior revision on the pre-mutation read and the next revision on readback,
+    matching the serving compare-and-swap contract.
+    """
 
     def _stub(*records: dict):
         import flash.serve.deploy as _deploy
@@ -75,21 +83,44 @@ def stub_serving_registry(monkeypatch):
                 "repo_id": "org/repo",
                 "base_model": "Qwen/Qwen3.5-0.8B",
                 "repo_type": "dataset",
+                "status": "ready",
                 "thinking": False,
                 **record,
             }
             for record in records
         ]
+        state = {"committed": 0}
 
         class _RegistryResp:
-            status_code = 200
+            def __init__(self, status_code: int, payload: dict | None = None):
+                self.status_code = status_code
+                self._payload = payload
 
             def raise_for_status(self) -> None:
                 return None
 
             def json(self) -> dict:
-                return {"ok": True, "adapters": normalized}
+                assert self._payload is not None
+                return self._payload
 
-        monkeypatch.setattr(_deploy.httpx, "get", lambda *a, **k: _RegistryResp())
+        def fake_get(url, **_kwargs):
+            if state["committed"] == 0 or not normalized:
+                return _RegistryResp(404)
+            record = normalized[min(state["committed"], len(normalized)) - 1]
+            return _RegistryResp(
+                200,
+                {
+                    "adapter": record,
+                    "org_id": record.get("org_id"),
+                    "revision": state["committed"],
+                },
+            )
+
+        def fake_etag_revision(_response):
+            state["committed"] += 1
+            return state["committed"]
+
+        monkeypatch.setattr(_deploy.httpx, "get", fake_get)
+        monkeypatch.setattr(_deploy, "_etag_revision", fake_etag_revision)
 
     return _stub

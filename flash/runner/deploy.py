@@ -317,6 +317,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         if (
             isinstance(previous, dict)
             and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
+            and not deployment.get("reconciliation_required")
+            and not deployment.get("rollback_error")
         ):
             status.deployment = {
                 **previous,

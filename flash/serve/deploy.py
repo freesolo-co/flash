@@ -6,7 +6,7 @@ import copy
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 
 import httpx
@@ -25,14 +25,22 @@ DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.ru
 READBACK_ATTEMPTS = 5
 READBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+EXPECTED_REASONING_PARSER_BY_MODEL = {"Qwen/Qwen3.6-35B-A3B": "qwen3"}
 
 
 class ServingError(RuntimeError):
     """Serving backend rejected a request or was unreachable; carries the upstream status."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        reconciliation_required: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.reconciliation_required = reconciliation_required
 
 
 class AdapterConfigMissing(ServingError):
@@ -76,11 +84,13 @@ def _serving_request(
     url: str,
     *,
     json: dict | None = None,
+    headers: dict[str, str] | None = None,
     ok_statuses: tuple[int, ...] = (),
 ) -> httpx.Response:
     """Issue a request to the serving backend; translates failures into ServingError."""
-    # follow_redirects: Modal 303-redirects slow requests to an async-result poll URL.
-    kwargs: dict = {"headers": _internal_key_header(), "timeout": 60.0, "follow_redirects": True}
+    # follow redirects because modal may return an async-result poll location.
+    request_headers = {**_internal_key_header(), **(headers or {})}
+    kwargs: dict = {"headers": request_headers, "timeout": 60.0, "follow_redirects": True}
     if json is not None:
         kwargs["json"] = json
     try:
@@ -139,11 +149,13 @@ class Deployment:
     # the openai-compatible base url. endpoint_name is the bare serving root.
     url: str = ""
     # internal lifecycle state used to restore serving after a failed smoke or cas transition.
-    previous_registry_record: dict | None = field(default=None, repr=False)
+    previous_registry_snapshot: dict | None = field(default=None, repr=False)
+    registry_revision: int | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         data = asdict(self)
-        data.pop("previous_registry_record", None)
+        data.pop("previous_registry_snapshot", None)
+        data.pop("registry_revision", None)
         return data
 
 
@@ -276,58 +288,100 @@ def _structured_outputs_body(structured_outputs: str) -> dict | None:
     return parse_structured_outputs(structured_outputs)
 
 
-def _require_thinking_structured_outputs_capability(base: str) -> None:
-    """Fail closed unless serving advertises deferred thinking constraint support."""
-    url = f"{base}/healthz"
+def _require_thinking_structured_outputs_capability(base: str, model: str) -> None:
+    """Fail closed unless the requested model is live with the serving parser we support."""
+    expected_parser = EXPECTED_REASONING_PARSER_BY_MODEL.get(model)
+    if expected_parser is None:
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because the requested "
+            f"model {model!r} has no supported serving reasoning parser. No adapter registry mutation "
+            "was attempted"
+        )
     try:
-        payload = _serving_request("GET", url).json()
+        payload = _serving_request("GET", f"{base}/healthz").json()
     except (ServingError, ValueError) as exc:
         raise ServingError(
             "cannot safely deploy a thinking adapter with structured outputs because the serving "
             "capability probe was unreachable or malformed. No adapter registry mutation was "
-            "attempted; serving must advertise "
-            f"{THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r} before Flash can preserve training/serving "
-            "exposure safety"
+            "attempted"
         ) from exc
-    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
-    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+    if not isinstance(payload, dict):
         raise ServingError(
             "cannot safely deploy a thinking adapter with structured outputs because /healthz "
-            "returned a malformed capabilities list. No adapter registry mutation was attempted; "
-            f"serving must advertise {THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r}"
+            "returned a malformed response. No adapter registry mutation was attempted"
         )
-    if THINKING_STRUCTURED_OUTPUTS_CAPABILITY not in capabilities:
+    parsers = payload.get("reasoning_parser_by_model")
+    states = payload.get("deferred_structured_outputs_by_model")
+    parser = parsers.get(model) if isinstance(parsers, dict) else None
+    state = states.get(model) if isinstance(states, dict) else None
+    if parser != expected_parser or not isinstance(state, dict):
         raise ServingError(
-            "cannot safely deploy a thinking adapter with structured outputs because serving does "
-            "not advertise deferred structured-output enforcement. No adapter registry mutation "
-            "was attempted; deploying unconstrained would reintroduce training/serving exposure "
-            f"bias. Required capability: {THINKING_STRUCTURED_OUTPUTS_CAPABILITY}"
+            "cannot safely deploy a thinking adapter with structured outputs because the requested "
+            f"model {model!r} does not advertise parser {expected_parser!r}. No adapter registry "
+            "mutation was attempted"
+        )
+    if state.get("status") != "live" or state.get("verified") is not True:
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because the requested "
+            f"model {model!r} is not live with verified deferred enforcement. No adapter registry "
+            "mutation was attempted"
         )
 
 
-def _record_value(record: dict, snake: str, camel: str | None = None):
-    value = record.get(snake)
-    if value is None and camel:
-        value = record.get(camel)
-    return value
+def _snapshot_url(run_id: str) -> str:
+    return f"{serving_base_url()}/internal/adapter-registry/{run_id}"
 
 
-def _record_mismatches(record: dict | None, expected: dict) -> list[str]:
-    if not isinstance(record, dict):
+def _etag_revision(response: httpx.Response) -> int:
+    raw = (response.headers.get("ETag") or "").strip().strip('"')
+    try:
+        revision = int(raw)
+    except ValueError as exc:
+        raise ServingError("serving mutation response omitted a valid ETag revision") from exc
+    if revision < 0:
+        raise ServingError("serving mutation response returned a negative ETag revision")
+    return revision
+
+
+def _read_registry_snapshot(run_id: str) -> dict | None:
+    response = _serving_request("GET", _snapshot_url(run_id), ok_statuses=(404,))
+    if response.status_code == 404:
+        return None
+    try:
+        snapshot = response.json()
+    except ValueError as exc:
+        raise ServingError(f"serving registry snapshot for {run_id} was not valid JSON") from exc
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("adapter"), dict):
+        raise ServingError(f"serving registry snapshot for {run_id} was malformed")
+    revision = snapshot.get("revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise ServingError(f"serving registry snapshot for {run_id} had an invalid revision")
+    return copy.deepcopy(snapshot)
+
+
+def _record_mismatches(snapshot: dict | None, expected: dict, revision: int | None = None) -> list[str]:
+    if not isinstance(snapshot, dict):
         return ["adapter record is absent"]
+    record = snapshot.get("adapter")
+    if not isinstance(record, dict):
+        return ["adapter record is malformed"]
     comparisons = {
-        "adapter_id": (_record_value(record, "adapter_id", "adapterId"), expected["adapter_id"]),
+        "adapter_id": (record.get("adapter_id"), expected["adapter_id"]),
         "subfolder": (record.get("subfolder"), expected["subfolder"]),
-        "base_model": (_record_value(record, "base_model", "baseModel"), expected["base_model"]),
-        "repo_id": (_record_value(record, "repo_id", "repoId"), expected["repo_id"]),
-        "repo_type": (_record_value(record, "repo_type", "repoType"), expected["repo_type"]),
+        "base_model": (record.get("base_model"), expected["base_model"]),
+        "repo_id": (record.get("repo_id"), expected["repo_id"]),
+        "repo_type": (record.get("repo_type"), expected["repo_type"]),
+        "status": (record.get("status"), expected["status"]),
         "thinking": (record.get("thinking"), expected["thinking"]),
         "structured_outputs": (record.get("structured_outputs"), expected.get("structured_outputs")),
         "structured_outputs_after_reasoning": (
             record.get("structured_outputs_after_reasoning"),
             expected.get("structured_outputs_after_reasoning"),
         ),
+        "org_id": (snapshot.get("org_id"), expected.get("org_id")),
     }
+    if revision is not None:
+        comparisons["revision"] = (snapshot.get("revision"), revision)
     return [
         f"{name}={actual!r}, expected {wanted!r}"
         for name, (actual, wanted) in comparisons.items()
@@ -335,40 +389,99 @@ def _record_mismatches(record: dict | None, expected: dict) -> list[str]:
     ]
 
 
-def snapshot_adapter_record(run_id: str) -> dict | None:
-    """Return a deep copy of the exact current registry record."""
-    record = _registered_adapter(run_id, strict=True)
-    return copy.deepcopy(record) if record is not None else None
+def _same_snapshot(left: dict | None, right: dict | None) -> bool:
+    return left == right
 
 
-def restore_adapter_record(run_id: str, previous_record: dict | None) -> None:
-    """Restore the exact pre-deploy registry state and verify the result."""
-    base = serving_base_url()
-    if previous_record is None:
-        _serving_request("DELETE", f"{base}/adapters/{run_id}", ok_statuses=(404,))
-        if _registered_adapter(run_id, strict=True) is not None:
-            raise ServingError(
-                f"adapter {run_id} remains registered after rollback delete; operator cleanup required"
-            )
-        return
-
-    restored = copy.deepcopy(previous_record)
-    _serving_request("POST", f"{base}/adapters", json=restored)
-    readback = _registered_adapter(run_id, strict=True)
-    if readback != restored:
-        raise ServingError(
-            f"adapter {run_id} rollback readback did not exactly match the prior registry record; "
-            "operator cleanup required"
+def _restored_snapshot_mismatches(actual: dict | None, expected: dict, revision: int) -> list[str]:
+    if not isinstance(actual, dict):
+        return ["adapter record is absent"]
+    mismatches: list[str] = []
+    if actual.get("org_id") != expected.get("org_id"):
+        mismatches.append(
+            f"org_id={actual.get('org_id')!r}, expected {expected.get('org_id')!r}"
         )
+    if actual.get("revision") != revision:
+        mismatches.append(f"revision={actual.get('revision')!r}, expected {revision!r}")
+    actual_record = actual.get("adapter")
+    expected_record = expected.get("adapter")
+    if not isinstance(actual_record, dict) or not isinstance(expected_record, dict):
+        return [*mismatches, "adapter record is malformed"]
+    for name, wanted in expected_record.items():
+        if name in {"created_at", "updated_at"}:
+            continue
+        if actual_record.get(name) != wanted:
+            mismatches.append(
+                f"adapter.{name}={actual_record.get(name)!r}, expected {wanted!r}"
+            )
+    return mismatches
 
 
-def _restore_after_failure(run_id: str, previous_record: dict | None, exc: Exception) -> ServingError:
+def snapshot_adapter_record(run_id: str) -> dict | None:
+    """Return the strongly consistent privileged registry snapshot."""
+    return _read_registry_snapshot(run_id)
+
+
+def registry_snapshot_matches(snapshot: dict | None, expected: dict, revision: int) -> bool:
+    """Return whether a privileged snapshot exactly represents a requested mutation."""
+    return not _record_mismatches(snapshot, expected, revision)
+
+
+def restore_adapter_record(
+    run_id: str,
+    previous_snapshot: dict | None,
+    current_revision: int,
+) -> int | None:
+    """Restore a prior snapshot only while the caller still owns current_revision."""
+    headers = {"If-Match": f'"{current_revision}"'}
+    if previous_snapshot is None:
+        response = _serving_request(
+            "DELETE", f"{serving_base_url()}/adapters/{run_id}", headers=headers
+        )
+        committed = _etag_revision(response)
+        readback = _read_registry_snapshot(run_id)
+        record = readback.get("adapter") if isinstance(readback, dict) else None
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != "disabled"
+            or readback.get("revision") != committed
+        ):
+            raise ServingError(
+                f"adapter {run_id} rollback delete did not produce a disabled tombstone at "
+                f"revision {committed}; reconciliation required"
+            )
+        return committed
+
+    response = _serving_request(
+        "PUT",
+        _snapshot_url(run_id),
+        json=copy.deepcopy(previous_snapshot),
+        headers=headers,
+    )
+    committed = _etag_revision(response)
+    readback = _read_registry_snapshot(run_id)
+    mismatches = _restored_snapshot_mismatches(readback, previous_snapshot, committed)
+    if mismatches:
+        raise ServingError(
+            f"adapter {run_id} rollback readback did not match the prior snapshot at revision "
+            f"{committed}: {'; '.join(mismatches)}; reconciliation required"
+        )
+    return committed
+
+
+def _restore_after_failure(
+    run_id: str,
+    previous_snapshot: dict | None,
+    current_revision: int,
+    exc: Exception,
+) -> ServingError:
     try:
-        restore_adapter_record(run_id, previous_record)
+        restore_adapter_record(run_id, previous_snapshot, current_revision)
     except Exception as rollback_exc:
         return ServingError(
-            f"{exc}; serving rollback failed ({rollback_exc}); operator cleanup required",
+            f"{exc}; serving rollback failed ({rollback_exc}); reconciliation required",
             status_code=getattr(exc, "status_code", None),
+            reconciliation_required=True,
         )
     return ServingError(
         f"{exc}; serving registry was restored to its exact pre-deploy state",
@@ -387,16 +500,9 @@ def deploy_adapter(
     thinking: bool = False,
     structured_outputs: str = "",
     org_id: str | None = None,
+    before_registry_mutation: Callable[[dict | None, dict, int], None] | None = None,
 ) -> Deployment:
-    """Register the trained adapter with the freesolo serving app.
-
-    ``structured_outputs`` is the run's ``[train].structured_outputs`` spec as canonical
-    ``StructuredOutputsParams`` keyword arguments, or an empty string when disabled. Non-thinking
-    adapters register it under ``structured_outputs``. Thinking adapters require the deferred
-    serving capability and register it under ``structured_outputs_after_reasoning`` so guided
-    decoding begins only after the reasoning boundary. This preserves the training grammar without
-    constraining reasoning tokens or reintroducing train/serve exposure bias.
-    """
+    """Register an adapter through the revisioned serving registry contract."""
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
     if not dry_run:
@@ -408,129 +514,162 @@ def deploy_adapter(
     dep = deployment_record(run_id, model, adapter_prefix, state="dry_run" if dry_run else "ready")
     if dry_run:
         return dep
+
     base = serving_base_url()
     so_default = _structured_outputs_body(structured_outputs)
     if thinking and so_default is not None:
-        _require_thinking_structured_outputs_capability(base)
+        _require_thinking_structured_outputs_capability(base, model)
     body = {
         "adapter_id": run_id,
         "repo_id": hf_repo,
         "base_model": model,
         "subfolder": subfolder,
-        # trainer artifacts live in dataset repositories.
         "repo_type": "dataset",
         "status": "ready",
         "thinking": bool(thinking),
     }
     if so_default is not None:
-        constraint_key = (
-            "structured_outputs_after_reasoning" if thinking else "structured_outputs"
-        )
-        body[constraint_key] = so_default
-    normalized_org_id = (org_id or "").strip()
-    if normalized_org_id:
-        body["org_id"] = normalized_org_id
+        key = "structured_outputs_after_reasoning" if thinking else "structured_outputs"
+        body[key] = so_default
 
-    previous_record = snapshot_adapter_record(run_id)
-    dep.previous_registry_record = copy.deepcopy(previous_record)
+    previous_snapshot = snapshot_adapter_record(run_id)
+    previous_revision = previous_snapshot["revision"] if previous_snapshot is not None else None
+    previous_org = previous_snapshot.get("org_id") if previous_snapshot is not None else None
+    requested_org = (org_id or "").strip() or None
+    if previous_snapshot is not None:
+        if requested_org is not None and requested_org != previous_org:
+            raise ServingError(
+                f"adapter {run_id} belongs to org {previous_org!r}; replacement cannot change owner"
+            )
+        body["org_id"] = previous_org
+    elif requested_org is not None:
+        body["org_id"] = requested_org
+
+    target_revision = (previous_revision or 0) + 1
+    dep.previous_registry_snapshot = copy.deepcopy(previous_snapshot)
+    if before_registry_mutation is not None:
+        before_registry_mutation(
+            copy.deepcopy(previous_snapshot), copy.deepcopy(body), target_revision
+        )
+
+    headers = (
+        {"If-Match": f'"{previous_revision}"'} if previous_revision is not None else None
+    )
     try:
-        _serving_request("POST", f"{base}/adapters", json=body)
+        response = _serving_request(
+            "POST", f"{base}/adapters", json=body, headers=headers
+        )
     except ServingError as exc:
         if exc.status_code is not None and exc.status_code < 500:
-            raise _restore_after_failure(run_id, previous_record, exc) from exc
+            raise
         try:
-            record = _registered_adapter(run_id, strict=True)
-        except ServingError:
-            raise _restore_after_failure(run_id, previous_record, exc) from exc
-        mismatches = _record_mismatches(record, body)
-        if not mismatches:
-            logger.warning(
-                "POST /adapters for %s failed (%s) but exact registry readback confirms the "
-                "requested adapter metadata; continuing",
-                run_id,
-                exc,
-            )
-        else:
-            ambiguous = ServingError(
-                f"{exc}; ambiguous registration readback for adapter {run_id}: "
-                + "; ".join(mismatches),
+            snapshot = _verify_adapter_registered(run_id, body, target_revision)
+        except ServingError as readback_exc:
+            observed = _read_registry_snapshot(run_id)
+            if _same_snapshot(observed, previous_snapshot):
+                raise ServingError(
+                    f"{exc}; privileged readback confirms the registry mutation did not commit",
+                    status_code=exc.status_code,
+                ) from exc
+            raise ServingError(
+                f"{exc}; ambiguous registration outcome: {readback_exc}; reconciliation required",
                 status_code=exc.status_code,
-            )
-            raise _restore_after_failure(run_id, previous_record, ambiguous) from exc
+                reconciliation_required=True,
+            ) from exc
+        logger.warning(
+            "adapter registration for %s returned an ambiguous error (%s), but the privileged "
+            "snapshot confirms revision %d",
+            run_id,
+            exc,
+            target_revision,
+        )
     else:
-        try:
-            _verify_adapter_registered(run_id, body)
-        except ServingError as exc:
-            raise _restore_after_failure(run_id, previous_record, exc) from exc
-    logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
+        committed_revision = _etag_revision(response)
+        if committed_revision != target_revision:
+            raise ServingError(
+                f"serving committed adapter {run_id} at revision {committed_revision}, expected "
+                f"{target_revision}; reconciliation required",
+                reconciliation_required=True,
+            )
+        snapshot = _verify_adapter_registered(run_id, body, target_revision)
+
+    dep.registry_revision = snapshot["revision"]
+    logger.info(
+        "registered adapter %s with freesolo serving at revision %d (%s)",
+        run_id,
+        dep.registry_revision,
+        base,
+    )
     return dep
 
 
-def _registered_adapter(run_id: str, *, strict: bool = False) -> dict | None:
-    """Return the adapter registry record, optionally failing on unreadable metadata."""
-    try:
-        resp = _serving_request("GET", f"{serving_base_url()}/adapters")
-        payload = resp.json()
-    except (ServingError, ValueError) as exc:
-        if strict:
-            raise ServingError(
-                f"could not read serving registry while checking adapter {run_id}: {exc}"
-            ) from exc
-        return None
-    records = payload.get("adapters") if isinstance(payload, dict) else None
-    if not isinstance(records, list):
-        if strict:
-            raise ServingError("serving registry returned malformed adapter metadata")
-        return None
-    for record in records:
-        if not isinstance(record, dict):
-            if strict:
-                raise ServingError("serving registry returned a malformed adapter record")
-            continue
-        adapter_id = _record_value(record, "adapter_id", "adapterId")
-        if adapter_id == run_id:
-            return record
-    return None
-
-
-def _verify_adapter_registered(run_id: str, expected: dict) -> None:
-    """Poll until every safety-relevant adapter field matches the requested registration."""
+def _verify_adapter_registered(run_id: str, expected: dict, revision: int) -> dict:
+    """Poll the strongly consistent snapshot until the requested revision is visible."""
     mismatches = ["adapter record is absent"]
+    snapshot = None
     for attempt in range(READBACK_ATTEMPTS):
         if attempt:
             time.sleep(READBACK_DELAY_SECONDS * attempt)
-        record = _registered_adapter(run_id, strict=True)
-        mismatches = _record_mismatches(record, expected)
+        snapshot = _read_registry_snapshot(run_id)
+        mismatches = _record_mismatches(snapshot, expected, revision)
         if not mismatches:
-            return
-    if mismatches == ["adapter record is absent"]:
-        raise ServingError(
-            f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
-            "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
-            "ready; retry `flash deploy`, and if this persists an operator must check serving"
-        )
+            return snapshot
     raise ServingError(
-        f"adapter {run_id} registry readback does not match the requested metadata: "
+        f"adapter {run_id} registry snapshot does not match the requested mutation: "
         + "; ".join(mismatches)
-        + ". The deployment was not marked ready"
     )
 
 
 def undeploy_adapter(run_id: str) -> list[str]:
-    """Deregister the adapter; returns [run_id] on success, [] if already gone (404)."""
+    """Disable an adapter through revisioned compare-and-swap deletion."""
     base = serving_base_url()
-    url = f"{base}/adapters/{run_id}"
-    resp = _serving_request("DELETE", url, ok_statuses=(404,))
-    if resp.status_code == 404:
+    snapshot = _read_registry_snapshot(run_id)
+    if snapshot is None:
         return []
-    if _registered_adapter(run_id) is not None:
-        logger.warning(
-            "adapter %s still appears in the serving registry after DELETE; a stale router may "
-            "keep serving it until its next reload",
-            run_id,
+    record = snapshot.get("adapter")
+    if not isinstance(record, dict):
+        raise ServingError(f"serving registry snapshot for {run_id} was malformed")
+    if record.get("status") == "disabled":
+        return []
+    current_revision = snapshot["revision"]
+    target_revision = current_revision + 1
+    headers = {"If-Match": f'"{current_revision}"'}
+    mutation_error: ServingError | None = None
+    try:
+        response = _serving_request(
+            "DELETE", f"{base}/adapters/{run_id}", headers=headers, ok_statuses=(404,)
         )
-    logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
-    return [run_id]
+    except ServingError as exc:
+        if exc.status_code is not None and exc.status_code < 500:
+            raise
+        mutation_error = exc
+        response = None
+
+    readback = _read_registry_snapshot(run_id)
+    readback_record = readback.get("adapter") if isinstance(readback, dict) else None
+    committed = _etag_revision(response) if response is not None and response.status_code != 404 else None
+    if (
+        isinstance(readback_record, dict)
+        and readback_record.get("status") == "disabled"
+        and readback.get("revision") == target_revision
+        and committed in {None, target_revision}
+    ):
+        logger.info(
+            "deregistered adapter %s from freesolo serving at revision %d (%s)",
+            run_id,
+            target_revision,
+            base,
+        )
+        return [run_id]
+    if response is not None and response.status_code == 404 and readback is None:
+        return []
+    prefix = f"{mutation_error}; " if mutation_error is not None else ""
+    raise ServingError(
+        f"{prefix}adapter {run_id} delete outcome did not produce the expected disabled revision "
+        f"{target_revision}; reconciliation required",
+        status_code=mutation_error.status_code if mutation_error is not None else None,
+        reconciliation_required=True,
+    )
 
 
 def chat(
