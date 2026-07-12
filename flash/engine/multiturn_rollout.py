@@ -518,7 +518,9 @@ def rollout_async(
     A logical assistant turn snapshots its accepted prefix and sampling limits. A timed-out physical
     attempt is synchronously aborted before an identical retry gets a fresh process-unique id. Only a
     successful final event reaches the environment worker, so retries never replay opaque env calls or
-    mutate transcript state. There is deliberately no episode wall-clock deadline.
+    mutate transcript state. There is deliberately no episode wall-clock deadline. Deadlines are
+    checked cooperatively between engine polls: an expiry cannot interrupt one blocking engine call
+    mid-flight and fires on the next loop iteration instead.
     """
     if request_max_attempts < 1:
         raise ValueError("request_max_attempts must be at least 1")
