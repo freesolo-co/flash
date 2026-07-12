@@ -1242,10 +1242,10 @@ def run_opd():
                     sidecars,
                     microbatch=loss_microbatch_size,
                 )
+                greedy_sidecar_loss_steps += 1
                 if sidecar_term is not None:
                     sidecar_term.backward()
                     greedy_sidecar_loss_sum += float(sidecar_term.detach())
-                    greedy_sidecar_loss_steps += 1
             optimizer_started = time.perf_counter()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()

@@ -789,7 +789,15 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
 
 
 def _opd_harness(
-    monkeypatch, *, sample_result, beats=None, liveness=None, epochs=1, group=1, max_steps=0
+    monkeypatch,
+    *,
+    sample_result,
+    beats=None,
+    liveness=None,
+    epochs=1,
+    group=1,
+    max_steps=0,
+    objective_ids=(),
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -861,6 +869,7 @@ def _opd_harness(
             save_every=0,
             max_length=0,
             stop_sequences=(),
+            objective_ids=objective_ids,
         ),
     )
     monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (_Model(), "fake/model"))
@@ -1317,6 +1326,91 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
 
     engine = opd_mod.OpdVllmRolloutEngine.instances[0]
     assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
+
+
+def test_opd_reports_zero_mean_sidecar_loss_for_all_clean_batches(monkeypatch):
+    pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=1,
+        group=1,
+        objective_ids=("c07",),
+    )
+    meta = {}
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kwargs: meta.update(kwargs))
+    monkeypatch.setattr(
+        opd_mod,
+        "_generate_greedy_sidecars",
+        lambda _rollout, prompts, **_kwargs: [opd_mod._GenResult() for _prompt in prompts],
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_greedy_sidecar_unlikelihood",
+        lambda *_args, **_kwargs: (None, 0, 0),
+    )
+
+    opd_mod.run_opd()
+
+    assert meta["notes"]["mean_greedy_sidecar_loss"] == 0.0
+    assert meta["notes"]["opt_steps"] == 1
+
+
+def test_opd_sidecar_telemetry_averages_loop_loss_with_clean_batches(monkeypatch):
+    pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=10,
+        group=1,
+        objective_ids=("c07",),
+    )
+    meta = {}
+    calls = {"n": 0}
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kwargs: meta.update(kwargs))
+    monkeypatch.setattr(
+        opd_mod,
+        "_generate_greedy_sidecars",
+        lambda _rollout, prompts, **_kwargs: [opd_mod._GenResult() for _prompt in prompts],
+    )
+
+    def _sidecar_loss(model, *_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return model.w.float().sum() * 0.0 + 0.1, 1, 1
+        return None, 0, 0
+
+    monkeypatch.setattr(opd_mod, "_greedy_sidecar_unlikelihood", _sidecar_loss)
+
+    opd_mod.run_opd()
+
+    assert calls["n"] == 10
+    assert meta["notes"]["mean_greedy_sidecar_loss"] == pytest.approx(0.01)
+    assert meta["notes"]["opt_steps"] == 10
 
 
 def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
