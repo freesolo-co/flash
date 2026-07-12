@@ -472,22 +472,29 @@ def runs_table(runs: list[dict]) -> str:
 
 def deployments_table(rows: list[dict]) -> str:
     body = []
-    for r in rows:
-        dep = r.get("deployment") or {}
-        state = str(dep.get("state") or "?")
+    for row in rows:
+        state = str(row.get("state") or "?")
         color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
-        detail = str(dep.get("error") or dep.get("detail") or "")
+        step = row.get("checkpoint_step")
+        verified_at = row.get("verified_at")
+        detail = str(row.get("detail") or "")
         if len(detail) > 64:
             detail = detail[:61] + "..."
         body.append(
             [
-                (r["run_id"], _ACCENT2),
+                (row["run_id"], _ACCENT2),
+                ("final" if step is None else str(step), _TEAL),
+                (str(row.get("adapter_revision") or "-"), _ACCENT2),
                 (state, color),
-                (dep.get("endpoint_name", ""), _GREEN),
+                ("-" if verified_at is None else str(verified_at), _GRAY),
+                (str(row.get("openai_model") or ""), _GREEN),
                 (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "STATE", "ENDPOINT", "DETAIL"], body)
+    table = _table(
+        ["RUN ID", "STEP", "REVISION", "STATE", "VERIFIED AT", "OPENAI MODEL", "DETAIL"],
+        body,
+    )
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
@@ -649,19 +656,17 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash undeploy`: confirm the run's serving deployment was torn down. The server clears the
-    deployment record idempotently (an already-absent serving adapter that 404s still counts as a
-    teardown), and the response can't distinguish that from a true no-op, so we always confirm;
-    when the serving backend actually deregistered endpoints we name them."""
+    """`flash undeploy`: report the run-scoped aliases and immutable revisions disabled."""
     rid = _paint(result.get("run_id", ""), _ACCENT2)
-    deleted = result.get("deleted_endpoints") or []
+    aliases = result.get("disabled_aliases") or []
+    revisions = result.get("disabled_revisions") or []
+    legacy = result.get("deleted_endpoints") or []
+    affected = [*aliases, *revisions, *legacy]
     line = ok(f"torn down {rid}")
-    if deleted:
-        line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    if affected:
+        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")
     else:
-        line += "\n" + _dim(
-            "  serving had no registered adapter to deregister (already gone or never registered)"
-        )
+        line += "\n" + _dim("  serving records were already disabled or absent")
     return _safe(line)
 
 

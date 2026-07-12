@@ -515,11 +515,7 @@ def cmd_deploy(args) -> int:
         return 1
     base_run_id, _step = parsed
     client = client_from_config()
-    dep = client.deploy(
-        args.run_id,
-        dry_run=args.dry_run,
-        verify=not getattr(args, "no_verify", False),
-    )
+    dep = client.deploy(args.run_id, dry_run=args.dry_run)
     if render.styled():
         print(render.deployed(dep))
     else:
@@ -557,12 +553,6 @@ def cmd_deploy(args) -> int:
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,
         )
-        if getattr(args, "no_verify", False):
-            skip_note = "server-side smoke verification was skipped for this deployment."
-            print(
-                render.arrow(skip_note) if render.styled() else f"note: {skip_note}",
-                file=sys.stderr,
-            )
     return 1 if dep.get("state") == "failed" else 0
 
 
@@ -610,8 +600,53 @@ def cmd_undeploy(args) -> int:
     return 0
 
 
+def _deployment_summaries(rows: list[dict]) -> list[dict]:
+    summaries = []
+    for row in rows:
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
+        summaries.append(
+            {
+                "run_id": run_id,
+                "checkpoint_step": deployment.get("checkpoint_step"),
+                "adapter_revision": deployment.get("adapter_revision"),
+                "state": deployment.get("state"),
+                "verified_at": deployment.get("verified_at"),
+                "openai_model": deployment.get("openai_model") or run_id,
+                "detail": detail,
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda row: (
+            row["run_id"],
+            row["checkpoint_step"] is None,
+            row["checkpoint_step"] if row["checkpoint_step"] is not None else 0,
+            row["adapter_revision"] or "",
+        ),
+    )
+
+
 def cmd_deployments(args) -> int:
-    rows = client_from_config().deployments()
+    rows = _deployment_summaries(client_from_config().deployments())
+    if getattr(args, "json", False):
+        projected = [
+            {
+                key: row[key]
+                for key in (
+                    "run_id",
+                    "checkpoint_step",
+                    "adapter_revision",
+                    "state",
+                    "verified_at",
+                    "openai_model",
+                )
+            }
+            for row in rows
+        ]
+        print(json.dumps({"schema_version": 1, "deployments": projected}, sort_keys=True))
+        return 0
     if not rows:
         if render.styled():
             print(render.empty("deployments", "0 active", "no active deployments"))
@@ -621,13 +656,17 @@ def cmd_deployments(args) -> int:
     if render.styled():
         print(render.deployments_table(rows))
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'ENDPOINT':<32}  DETAIL")
-    for r in rows:
-        d = r.get("deployment") or {}
-        detail = str(d.get("error") or d.get("detail") or "")
+    print(
+        f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
+        f"{'VERIFIED AT':<18}  {'OPENAI MODEL':<30}  DETAIL"
+    )
+    for row in rows:
+        step = "final" if row["checkpoint_step"] is None else str(row["checkpoint_step"])
+        verified_at = "-" if row["verified_at"] is None else str(row["verified_at"])
         print(
-            f"{r['run_id']:<32}  {d.get('state', '?'):<10}  "
-            f"{d.get('endpoint_name', ''):<32}  {detail}"
+            f"{row['run_id']:<30}  {step:<6}  {row['adapter_revision'] or '-'!s:<40}  "
+            f"{row['state'] or '-'!s:<14}  {verified_at:<18}  "
+            f"{row['openai_model']:<30}  {row['detail']}"
         )
     return 0
 

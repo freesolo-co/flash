@@ -68,6 +68,28 @@ def test_help_catalog_matches_registered_env_subcommands() -> None:
     assert _catalog_env_rows() == _registered_env_subcommands()
 
 
+def test_deployments_json_parser_and_help_are_additive() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["deployments", "--json"])
+    assert args.json is True
+    deployments = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ).choices["deployments"]
+    assert "--json" in deployments.format_help()
+    assert parser.parse_args(["deployments"]).json is False
+
+
+def test_deploy_parser_offers_no_smoke_opt_out() -> None:
+    # smoke verification is mandatory; the deploy parser must not expose --no-verify.
+    parser = cli._build_parser()
+    deploy = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ).choices["deploy"]
+    assert "--no-verify" not in deploy.format_help()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["deploy", "run-1", "--no-verify"])
+
+
 def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")  # layout kept, color dropped — assert on contiguous text

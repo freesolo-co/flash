@@ -31,6 +31,12 @@ def test_deploy_dry_run_has_no_user_facing_mode():
     assert "est_idle_cost_usd_per_day" not in data
 
 
+def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
+    monkeypatch.setattr(deploy_mod, "resolve_hf_revision", lambda repo: "a" * 40)
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", lambda: None)
+
+
 def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     import httpx
 
@@ -40,7 +46,7 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(500, text="no base-model engines loaded", request=req)
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    _stub_deploy_preconditions(monkeypatch, deploy_mod)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
@@ -60,7 +66,7 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(401, text="invalid internal key", request=req)
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    _stub_deploy_preconditions(monkeypatch, deploy_mod)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
@@ -84,7 +90,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
     def fake_post(url, *a, **k):
         raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    _stub_deploy_preconditions(monkeypatch, deploy_mod)
     monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
@@ -104,13 +110,22 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         def raise_for_status(self):
             return None
 
+        def json(self):
+            return {
+                "run_id": "flash-1-abc",
+                "disabled_aliases": ["flash-1-abc"],
+                "disabled_revisions": ["flash-1-abc@final." + "a" * 40],
+            }
+
     def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         deleted_urls.append(url)
         return _Resp()
 
     monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
     out = undeploy_adapter("flash-1-abc")
-    assert out == ["flash-1-abc"]
+    assert out["run_id"] == "flash-1-abc"
+    assert out["disabled_aliases"] == ["flash-1-abc"]
+    assert out["serving_deregistered"] is True
     assert deleted_urls == ["https://serve.example/adapters/flash-1-abc"]
 
 
@@ -124,7 +139,12 @@ def test_undeploy_404_is_clean(monkeypatch):
             raise AssertionError("404 must not raise")
 
     monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
-    assert undeploy_adapter("flash-1-gone") == []
+    assert undeploy_adapter("flash-1-gone") == {
+        "run_id": "flash-1-gone",
+        "disabled_aliases": [],
+        "disabled_revisions": [],
+        "serving_deregistered": False,
+    }
 
 
 def test_deployment_roundtrip_dict():
@@ -205,191 +225,381 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
         assert ei.value.status_code == 400, bad
 
 
-def _registry_resp(records):
-    class _Resp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"ok": True, "adapters": records}
-
-    return _Resp()
-
-
-def test_deploy_reads_registry_back_before_ready(monkeypatch):
-    """POST /adapters returning 2xx is not enough: ready must be registry-backed."""
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-
-    class _PostResp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-    gets: list[str] = []
-
-    def fake_get(url, **k):
-        gets.append(url)
-        return _registry_resp([{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}])
-
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
-    monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
-
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
-    assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
-
-
-def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-
-    class _PostResp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
-    monkeypatch.setattr(
-        deploy_mod.httpx,
-        "get",
-        lambda *a, **k: _registry_resp(
-            [{"adapter_id": None, "adapterId": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
-        ),
-    )
-
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
-
-
-def test_deploy_fails_when_adapter_never_appears_in_registry(monkeypatch):
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-
-    class _PostResp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
-    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: _registry_resp([]))
-
-    with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    msg = str(ei.value)
-    assert "never appeared" in msg
-    assert "Unknown adapter id" in msg
-
-
-def test_deploy_fails_when_registry_keeps_prior_checkpoint(monkeypatch):
-    """A checkpoint swap that leaves the OLD subfolder registered must fail loudly."""
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-
-    class _PostResp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
-    monkeypatch.setattr(
-        deploy_mod.httpx,
-        "get",
-        lambda *a, **k: _registry_resp(
-            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/checkpoints/step_100/adapter"}]
-        ),
-    )
-
-    with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert "previously deployed checkpoint" in str(ei.value)
-
-
-def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatch):
-    """An ambiguous POST failure (timeout/5xx) is resolved by reading the registry back."""
-    import httpx
-
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    req = httpx.Request("POST", "https://serve.example/adapters")
-    resp = httpx.Response(502, text="bad gateway", request=req)
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    monkeypatch.setattr(
-        deploy_mod.httpx,
-        "get",
-        lambda *a, **k: _registry_resp(
-            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
-        ),
-    )
-
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
-
-
-def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatch):
-    """Older serving builds omit subfolder; accept it only when there was no prior deployment."""
-    import httpx
-
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    req = httpx.Request("POST", "https://serve.example/adapters")
-    resp = httpx.Response(502, text="bad gateway", request=req)
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
-    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
-
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
-
-
-def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypatch):
-    """A checkpoint swap must not accept a subfolder-less record after an ambiguous POST failure."""
-    import httpx
-
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    req = httpx.Request("POST", "https://serve.example/adapters")
-    resp = httpx.Response(502, text="bad gateway", request=req)
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    responses = iter(
-        [
-            _registry_resp([{"adapter_id": "flash-1-abc"}]),
-            _registry_resp([{"adapter_id": "flash-1-abc"}]),
-        ]
-    )
-    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
-
-    with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert "cannot confirm" in str(ei.value)
-
-
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["url"] == "https://serve.example/v1"
+
+
+def test_immutable_revision_identifier_uses_full_hub_sha():
+    from flash.serve.deploy import adapter_revision_id
+
+    sha = "a1" * 20
+    assert adapter_revision_id("flash-1-abc", 32, sha) == f"flash-1-abc@step-32.{sha}"
+    assert adapter_revision_id("flash-1-abc", None, sha) == f"flash-1-abc@final.{sha}"
+
+
+def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    sha = "b2" * 20
+    revision = f"flash-1-abc@step-20.{sha}"
+    events = []
+    requests = []
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, payload=None):
+            self.payload = payload or {}
+            self.headers = {}
+
+        def json(self):
+            return self.payload
+
+    monkeypatch.setattr(deploy, "resolve_hf_revision", lambda repo: events.append("sha") or sha)
+
+    def artifact_rank(repo, subfolder, *, hf_revision):
+        assert hf_revision == sha
+        events.append("verify")
+        return 32
+
+    monkeypatch.setattr(deploy, "adapter_artifact_lora_rank", artifact_rank)
+    monkeypatch.setattr(
+        deploy, "_require_serving_capabilities", lambda: events.append("capabilities")
+    )
+
+    def request(method, url, *, json=None, ok_statuses=()):
+        requests.append((method, url, json))
+        if url.endswith("/activate"):
+            events.append("activate")
+            return Resp(
+                {
+                    "adapter_id": "flash-1-abc",
+                    "target_adapter_revision": revision,
+                    "previous_adapter_revision": "flash-1-abc@step-10." + "c3" * 20,
+                    "checkpoint": "flash-1-abc/step-20",
+                    "updated_at": "2026-07-12T12:00:15Z",
+                }
+            )
+        events.append("register")
+        return Resp()
+
+    monkeypatch.setattr(deploy, "_serving_request", request)
+
+    def wait_ready(adapter_revision, subfolder, *, expected_identity=None, on_state=None):
+        assert adapter_revision == revision
+        assert expected_identity["metadata"]["hf_revision"] == sha
+        events.append("ready")
+        return {}
+
+    monkeypatch.setattr(deploy, "_wait_revision_ready", wait_ready)
+
+    def smoke(adapter_revision, checkpoint):
+        assert adapter_revision == revision
+        assert checkpoint == "flash-1-abc/step-20"
+        events.append("smoke")
+
+    previous = "flash-1-abc@step-10." + "c3" * 20
+    result = deploy.deploy_adapter(
+        "flash-1-abc",
+        "Qwen/Qwen3.5-0.8B",
+        "org/repo",
+        "sft/flash-1-abc/checkpoints/step_20",
+        checkpoint_step=20,
+        expected_adapter_revision=previous,
+        before_activate=smoke,
+    )
+
+    assert events == ["sha", "verify", "capabilities", "register", "ready", "smoke", "activate"]
+    registration = requests[0][2]
+    assert registration["adapter_id"] == revision
+    assert registration["status"] == "ready"
+    assert registration["metadata"]["hf_revision"] == sha
+    assert requests[1][2] == {"expected_adapter_revision": previous}
+    assert result.adapter_revision == revision
+    assert result.openai_model == "flash-1-abc"
+    assert result.verified_at is None
+
+
+def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    _stub_deploy_preconditions(monkeypatch, deploy)
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            deploy.ServingError("revision conflict", status_code=409)
+        ),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: pytest.fail(
+            "a 409 conflict must not be reconciled as transport ambiguity"
+        ),
+    )
+
+    with pytest.raises(deploy.ServingError, match="revision conflict"):
+        deploy.deploy_adapter(
+            "flash-1",
+            "Qwen/Qwen3.5-0.8B",
+            "org/repo",
+            "sft/flash-1/seed0",
+        )
+
+
+def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    _stub_deploy_preconditions(monkeypatch, deploy)
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "repo_id": "other/repo",
+            "repo_type": "dataset",
+            "subfolder": "sft/flash-1/seed0/adapter",
+            "base_model": "Qwen/Qwen3.5-0.8B",
+            "checkpoint": "flash-1",
+            "thinking": False,
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "flash-1",
+                "checkpoint_step": None,
+                "hf_revision": "a" * 40,
+            },
+        },
+    )
+
+    with pytest.raises(deploy.ServingError, match="timeout"):
+        deploy.deploy_adapter(
+            "flash-1",
+            "Qwen/Qwen3.5-0.8B",
+            "org/repo",
+            "sft/flash-1/seed0",
+        )
+
+
+def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    expected = {
+        "adapter_id": revision,
+        "repo_id": "org/repo",
+        "repo_type": "dataset",
+        "subfolder": "sft/flash-1/seed0/adapter",
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "checkpoint": "flash-1",
+        "thinking": False,
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "flash-1",
+            "checkpoint_step": None,
+            "hf_revision": "a" * 40,
+        },
+    }
+    mismatched = {**expected, "repo_id": "other/repo"}
+    monkeypatch.setattr(deploy, "_registered_adapter", lambda adapter_id: mismatched)
+
+    with pytest.raises(deploy.ServingError, match="different immutable identity"):
+        deploy._wait_revision_ready(
+            revision,
+            expected["subfolder"],
+            expected_identity=expected,
+        )
+
+
+def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": "flash-1",
+            "updated_at": "2026-07-12T12:00:15Z",
+            "metadata": {"record_type": "alias", "alias_of": revision},
+        },
+    )
+    out = deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
+    assert out["target_adapter_revision"] == revision
+    assert out["updated_at"] == "2026-07-12T12:00:15Z"
+
+
+def test_activation_response_mismatch_reconciles_authoritative_previous_alias(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    previous = "flash-1@step-10." + "b" * 40
+    revision = "flash-1@step-20." + "a" * 40
+
+    class Resp:
+        def json(self):
+            return {
+                "adapter_id": "flash-1",
+                "target_adapter_revision": revision,
+                "previous_adapter_revision": "wrong",
+                "checkpoint": "flash-1/step-20",
+            }
+
+    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "updated_at": "2026-07-12T12:00:15Z",
+            "metadata": {"record_type": "alias", "alias_of": previous},
+        },
+    )
+    with pytest.raises(deploy.ServingError, match="was not committed"):
+        deploy._activate_revision(
+            "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
+        )
+
+
+def test_malformed_activation_response_reconciles_committed_alias(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    previous = "flash-1@step-10." + "b" * 40
+    revision = "flash-1@step-20." + "a" * 40
+
+    class Resp:
+        def json(self):
+            return {"adapter_id": "flash-1", "target_adapter_revision": "wrong"}
+
+    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "updated_at": "2026-07-12T12:00:15Z",
+            "metadata": {"record_type": "alias", "alias_of": revision},
+        },
+    )
+
+    out = deploy._activate_revision(
+        "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
+    )
+    assert out == {
+        "adapter_id": "flash-1",
+        "target_adapter_revision": revision,
+        "previous_adapter_revision": previous,
+        "checkpoint": "flash-1/step-20",
+        "updated_at": "2026-07-12T12:00:15Z",
+    }
+
+
+def test_undeploy_returns_disabled_aliases_and_revisions(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "run_id": "flash-1",
+                "disabled_aliases": ["flash-1"],
+                "disabled_revisions": ["flash-1@final." + "a" * 40],
+            }
+
+    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    out = deploy.undeploy_adapter("flash-1")
+    assert out["serving_deregistered"] is True
+    assert out["disabled_aliases"] == ["flash-1"]
+    assert len(out["disabled_revisions"]) == 1
+
+
+def test_undeploy_rejects_malformed_disabled_id_lists(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "run_id": "flash-1",
+                "disabled_aliases": "flash-1",
+                "disabled_revisions": [],
+            }
+
+    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    with pytest.raises(deploy.ServingError, match="invalid disabled_aliases"):
+        deploy.undeploy_adapter("flash-1")
+
+
+def test_serving_capabilities_are_required(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class Resp:
+        def json(self):
+            return {"capabilities": ["immutable_adapter_revisions"]}
+
+    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    with pytest.raises(deploy.ServingError, match="alias_compare_and_swap"):
+        deploy._require_serving_capabilities()
+
+
+def test_capability_preflight_reads_healthz(monkeypatch):
+    # serving exposes GET /healthz only; a /health preflight 404s and fails every real deploy.
+    import flash.serve.deploy as deploy
+
+    seen = {}
+
+    class Resp:
+        def json(self):
+            return {
+                "capabilities": [
+                    "immutable_adapter_revisions",
+                    "alias_compare_and_swap",
+                    "revision_provenance",
+                ]
+            }
+
+    def request(method, url, **kwargs):
+        seen["method"] = method
+        seen["url"] = url
+        return Resp()
+
+    monkeypatch.setattr(deploy, "_serving_request", request)
+    deploy._require_serving_capabilities()
+    assert seen["method"] == "GET"
+    assert seen["url"] == f"{deploy.serving_base_url()}/healthz"
+
+
+def test_activation_conflict_preserves_expected_alias(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    previous = "flash-1@step-10." + "b" * 40
+    revision = "flash-1@step-20." + "a" * 40
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("conflict")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {"metadata": {"alias_of": previous}},
+    )
+    with pytest.raises(deploy.ServingError, match="was not committed"):
+        deploy._activate_revision(
+            "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
+        )

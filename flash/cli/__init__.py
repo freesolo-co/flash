@@ -392,12 +392,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
     )
     deploy.add_argument("--dry-run", action="store_true")
-    deploy.add_argument(
-        "--no-verify",
-        action="store_true",
-        help="skip the server-side post-deploy smoke generation (registration alone does NOT "
-        "guarantee the adapter serves; only ready deployments should be scored by evals)",
-    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
@@ -430,6 +424,11 @@ def _build_parser() -> argparse.ArgumentParser:
     export.set_defaults(func=cmd_export)
 
     deployments = sub.add_parser("deployments", help="list active serving deployments")
+    deployments.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable deployment records",
+    )
     deployments.set_defaults(func=cmd_deployments)
 
     chat = sub.add_parser("chat", help="chat with a deployed adapter")

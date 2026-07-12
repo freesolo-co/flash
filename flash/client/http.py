@@ -339,7 +339,6 @@ class ApiClient:
         self,
         run_id: str,
         dry_run: bool = False,
-        verify: bool = True,
     ) -> dict:
         from flash.schema import parse_checkpoint_ref
 
@@ -350,7 +349,8 @@ class ApiClient:
                 "for a saved checkpoint"
             )
         base_run_id, step = parsed
-        body: dict = {"dry_run": dry_run, "verify": verify}
+        # smoke verification is mandatory server-side; there is no opt-out to forward.
+        body: dict = {"dry_run": dry_run}
         if step is not None:
             body["step"] = step
         return self._request(

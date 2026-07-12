@@ -984,15 +984,238 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "deploying"
+    assert resp.json()["state"] == "queued"
     assert resp.json()["verify"] is True
     assert started["run_id"] == run_id
     assert started["deploy_kwargs"]["adapter_prefix"].endswith(run_id)
 
     deployment = runner.get_status(run_id).deployment
-    assert deployment["state"] == "deploying"
+    assert deployment["state"] == "queued"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
-    assert deployments[0]["deployment"]["state"] == "deploying"
+    assert deployments[0]["deployment"]["state"] == "queued"
+
+
+def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch):
+    # smoke verification is mandatory: an explicit opt-out is a 400 before queuing, and neither
+    # serving registration nor alias activation is ever attempted.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **kwargs: pytest.fail("verify=false must never reach deploy_adapter"),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "start_deployment_job",
+        lambda *args, **kwargs: pytest.fail("verify=false must never queue a deployment"),
+    )
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"verify": False},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "verify=false is not supported" in resp.json()["detail"]
+    assert not runner.get_status(run_id).deployment
+
+
+def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    def fake_deploy(**kwargs):
+        latest = runner.get_status(run_id)
+        latest.state = "cancelled"
+        runner._save_status(latest)
+        kwargs["before_activate"](f"{run_id}@final." + "a" * 40, run_id)
+        pytest.fail("state recheck must block alias activation")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "failed"
+    assert "run state changed from 'done' to 'cancelled'" in resp.json()["error"]
+
+
+def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            adapter_revision=revision,
+        )
+
+    original_mark_deployed = serving.mark_deployed
+    calls = {"count": 0}
+
+    def persist_then_raise(*args, **kwargs):
+        calls["count"] += 1
+        result = original_mark_deployed(*args, **kwargs)
+        raise OSError("status write acknowledgement lost")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(serving, "mark_deployed", persist_then_raise)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **kwargs: _smoke_chat_result(revision, run_id)
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert calls["count"] == 1
+    assert resp.json()["state"] == "ready"
+    assert resp.json()["adapter_revision"] == revision
+    assert runner.get_status(run_id).state == "deployed"
+
+
+def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypatch):
+    # the run state moves under the cas guard (e.g. done -> deployed by a sibling write) while
+    # this attempt still owns the deployment record: the ready commit must be retried against the
+    # fresh state, never dropped silently after the serving alias already flipped.
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        # the guard was captured at state "done"; move the run so the first cas write misses
+        latest = runner.get_status(run_id)
+        latest.state = "deployed"
+        runner._save_status(latest)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            adapter_revision=revision,
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **kwargs: _smoke_chat_result(revision, run_id)
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["adapter_revision"] == revision
+
+
+def test_commit_miss_superseded_records_divergence_without_alias_revert(api, monkeypatch):
+    # a newer actor (undeploy) took the record during activation: the lost commit must be
+    # recorded as a divergence rather than dropped, and the serving alias must NOT be reverted
+    # (post-promotion recovery reads the authoritative alias).
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        # a concurrent undeploy supersedes the record after activation
+        latest = runner.get_status(run_id)
+        latest.state = "cancelled"
+        latest.deployment = {**(latest.deployment or {}), "state": "undeployed"}
+        runner._save_status(latest)
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            adapter_revision=revision,
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **kwargs: _smoke_chat_result(revision, run_id)
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda *args, **kwargs: pytest.fail("commit reconciliation must never revert the alias"),
+    )
+    divergences = []
+    printed = print
+
+    def capture_print(*args, **kwargs):
+        text = " ".join(str(a) for a in args)
+        if "deployment_record_diverged" in text:
+            divergences.append(text)
+        printed(*args, **kwargs)
+
+    import builtins
+
+    monkeypatch.setattr(builtins, "print", capture_print)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert divergences, "lost commit must be logged as a divergence"
+    # the newer actor's record is preserved: undeploy wrote "undeployed" and it stays
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "undeployed"
 
 
 def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
@@ -1020,7 +1243,7 @@ def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "deploying"
+    assert resp.json()["state"] == "queued"
     assert "gpu" not in resp.json()
     assert "gpu_name" not in seen["deploy_kwargs"]
 
@@ -1117,6 +1340,7 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
 
     def fake_deploy(**kwargs):
         registered_prefixes.append(kwargs["adapter_prefix"])
+        kwargs["before_activate"]("immutable@final." + "a" * 40, run_id)
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
@@ -1129,7 +1353,7 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
     assert resp.status_code == 200, resp.text
-    assert registered_prefixes[-1] == "rl/old"
+    assert registered_prefixes == [f"rl/{run_id}"]
     deployment = runner.get_status(run_id).deployment
     assert deployment["state"] == "ready"
     assert deployment["endpoint_name"] == "old"
@@ -1182,7 +1406,7 @@ def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "deploying"
+    assert resp.json()["state"] == "queued"
     assert "gpu" not in resp.json()
     assert "gpu_name" not in seen["deploy_kwargs"]
 
@@ -1209,9 +1433,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
         )
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
-    monkeypatch.setattr(
-        app_mod, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}]
-    )
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}])
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
@@ -1757,7 +1979,9 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
     assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
-    assert reaped == ["nohandle-1"], "must force-reap the run's instance-provider label before resubmit"
+    assert reaped == ["nohandle-1"], (
+        "must force-reap the run's instance-provider label before resubmit"
+    )
     # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
     assert runner.get_status("nohandle-1").state != "failed"
 
@@ -1820,7 +2044,9 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
     assert reaped == ["phantom-1"], "must still attempt the force-reap"
     assert resubmitted == [], "must NOT resubmit while an instance for the run may still be live"
-    assert runner.get_status("phantom-1").state != "failed", "deferred, not failed (later recovery retries)"
+    assert runner.get_status("phantom-1").state != "failed", (
+        "deferred, not failed (later recovery retries)"
+    )
 
 
 def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, tmp_path):
@@ -1855,7 +2081,9 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
             state="provisioning",
             spec=spec,
             remote=None,
-            submitted_instance_providers=["vast"],  # Vast was configured when this run was submitted
+            submitted_instance_providers=[
+                "vast"
+            ],  # Vast was configured when this run was submitted
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "unconf-1"}])
@@ -1875,7 +2103,9 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     app_mod.recover_runs()
 
     assert resubmitted == [], "must NOT resubmit while an uncheckable Vast phantom may still bill"
-    assert runner.get_status("unconf-1").state != "failed", "deferred, not failed (later restart retries)"
+    assert runner.get_status("unconf-1").state != "failed", (
+        "deferred, not failed (later restart retries)"
+    )
 
 
 def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypatch, tmp_path):
@@ -1937,8 +2167,12 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "queued run must launch a resubmit thread, not defer on a phantom check"
-    assert resubmitted == ["queued-1"], "a never-provisioned queued run resubmits despite unconfigurable Vast"
+    assert done.wait(timeout=5), (
+        "queued run must launch a resubmit thread, not defer on a phantom check"
+    )
+    assert resubmitted == ["queued-1"], (
+        "a never-provisioned queued run resubmits despite unconfigurable Vast"
+    )
     assert runner.get_status("queued-1").state != "failed"
 
 
@@ -1989,7 +2223,9 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "a run that never recorded Vast must still recover on a Vast-less plane"
+    assert done.wait(timeout=5), (
+        "a run that never recorded Vast must still recover on a Vast-less plane"
+    )
     assert resubmitted == ["novast-1"]
 
 
@@ -2086,9 +2322,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
     done = threading.Event()
-    monkeypatch.setattr(
-        runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
-    )
+    monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
     monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_RETRY_S", 0.01)  # fast background retry
 
     calls = {"n": 0}
@@ -2112,7 +2346,9 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
 
     app_mod.recover_runs()  # first check sees the box -> defers + schedules the background retry
 
-    assert done.wait(timeout=5), "the background retry must resubmit once the run is confirmed clear"
+    assert done.wait(timeout=5), (
+        "the background retry must resubmit once the run is confirmed clear"
+    )
     assert resubmitted == ["retry-1"]
 
 
@@ -2542,6 +2778,24 @@ _FAKE_CKPTS = [
 ]
 
 
+def _smoke_chat_result(revision: str, checkpoint: str, content: str = "4") -> dict:
+    # a serve_chat response that passes _smoke_provenance for the given immutable revision
+    hf_revision = revision.rsplit(".", 1)[-1]
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+        "freesolo": {
+            "adapter_revision": revision,
+            "checkpoint": checkpoint,
+            "hf_revision": hf_revision,
+        },
+        "_freesolo_headers": {
+            "adapter_revision": revision,
+            "checkpoint": checkpoint,
+            "hf_revision": hf_revision,
+        },
+    }
+
+
 class _FakeDeployment:
     def __init__(self, adapter_prefix):
         self.adapter_prefix = adapter_prefix
@@ -2666,13 +2920,13 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
     assert status.deployment["checkpoint_step"] == 40
 
 
-def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch):
+def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    rollbacks = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+    undeploys = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: undeploys.append(run_id))
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -2685,7 +2939,7 @@ def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch)
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
-    assert rollbacks == [run_id]
+    assert undeploys == []
     status = runner.get_status(run_id)
     assert status.state == "deployed"
     assert status.deployment == {"state": "ready", "endpoint_name": "final"}
@@ -2708,13 +2962,13 @@ def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
     assert "dry-run runs cannot be deployed" in r.json()["detail"]
 
 
-def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch):
+def test_deploy_checkpoint_preserves_concurrent_run_undeploy(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    rollbacks = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+    undeploys = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: undeploys.append(run_id))
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -2730,7 +2984,7 @@ def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch)
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
-    assert rollbacks == [run_id]
+    assert undeploys == []
     status = runner.get_status(run_id)
     assert status.state == "done"
     assert status.deployment["state"] == "undeployed"

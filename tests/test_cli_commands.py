@@ -8,6 +8,7 @@ the remaining commands are covered without a server.
 from __future__ import annotations
 
 import io
+import json
 import types
 
 import pytest
@@ -431,10 +432,10 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
 
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     err = capsys.readouterr().err
     assert "flash undeploy flash-1`" in err
     assert "flash undeploy flash-1/step-40`" not in err
@@ -444,6 +445,66 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
 
     assert _run(["undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
+
+
+def test_deployments_json_is_versioned_sorted_and_null_complete(
+    fake_client, capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setattr(
+        fake_client,
+        "deployments",
+        lambda: [
+            {
+                "run_id": "run-b",
+                "deployment": {
+                    "run_id": "run-b",
+                    "checkpoint_step": None,
+                    "adapter_revision": None,
+                    "state": "queued",
+                    "verified_at": None,
+                    "openai_model": None,
+                },
+            },
+            {
+                "run_id": "run-a",
+                "deployment": {
+                    "run_id": "run-a",
+                    "checkpoint_step": None,
+                    "adapter_revision": "run-a@final." + "b" * 40,
+                    "state": "ready",
+                    "verified_at": 2.0,
+                    "openai_model": "run-a",
+                },
+            },
+            {
+                "run_id": "run-a",
+                "deployment": {
+                    "run_id": "run-a",
+                    "checkpoint_step": 10,
+                    "adapter_revision": "run-a@step-10." + "a" * 40,
+                    "state": "loading",
+                    "verified_at": None,
+                    "openai_model": "run-a",
+                },
+            },
+        ],
+    )
+
+    assert _run(["deployments", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert [
+        (row["run_id"], row["checkpoint_step"]) for row in payload["deployments"]
+    ] == [("run-a", 10), ("run-a", None), ("run-b", None)]
+    assert payload["deployments"][-1] == {
+        "run_id": "run-b",
+        "checkpoint_step": None,
+        "adapter_revision": None,
+        "state": "queued",
+        "verified_at": None,
+        "openai_model": "run-b",
+    }
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
@@ -751,7 +812,7 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
     assert "flash deployments" in err
@@ -760,15 +821,16 @@ def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
 
 def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
 
 
-def test_deploy_no_verify_skips_server_smoke(fake_client, capsys) -> None:
-    assert _run(["deploy", "flash-1", "--no-verify"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": False}) in fake_client.calls
-    assert not any(c[0] == "chat" for c in fake_client.calls)
-    assert "smoke verification was skipped" in capsys.readouterr().err
+def test_deploy_no_verify_flag_is_rejected(fake_client, capsys) -> None:
+    # smoke verification is mandatory; the cli exposes no opt-out flag at all.
+    with pytest.raises(SystemExit):
+        _run(["deploy", "flash-1", "--no-verify"])
+    assert "--no-verify" in capsys.readouterr().err
+    assert not any(c[0] == "deploy" for c in fake_client.calls)
 
 
 def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, capsys) -> None:

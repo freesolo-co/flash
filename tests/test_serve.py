@@ -34,6 +34,10 @@ def _stub_adapter_config(
         tensor_files = {"adapter_model.safetensors": 123}
 
     class _HfApi:
+        def repo_info(self, **kwargs):
+            seen["repo_info"] = kwargs
+            return types.SimpleNamespace(sha="a" * 40)
+
         def list_repo_tree(self, **kwargs):
             seen["list_repo_tree"] = kwargs
             prefix = str(kwargs.get("path_in_repo") or "").rstrip("/")
@@ -46,6 +50,20 @@ def _stub_adapter_config(
         sys.modules,
         "huggingface_hub",
         types.SimpleNamespace(hf_hub_download=fake_hf_hub_download, HfApi=_HfApi),
+    )
+
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(deploy, "_require_serving_capabilities", lambda: None)
+    monkeypatch.setattr(deploy, "_wait_revision_ready", lambda *a, **k: {})
+    monkeypatch.setattr(
+        deploy,
+        "_activate_revision",
+        lambda run_id, revision, checkpoint, **kwargs: {
+            "adapter_id": run_id,
+            "target_adapter_revision": revision,
+            "checkpoint": checkpoint,
+        },
     )
     return seen
 
@@ -192,8 +210,11 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
+    monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
 
-    with pytest.raises(d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter") as excinfo:
+    with pytest.raises(
+        d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"
+    ) as excinfo:
         d.deploy_adapter(
             run_id="r-hf-down",
             model="Qwen/Qwen3.5-4B",
@@ -220,8 +241,11 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
+    monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
 
-    with pytest.raises(d.AdapterConfigMissing, match="failed to read org/repo:sft/r-missing/seed0/adapter"):
+    with pytest.raises(
+        d.AdapterConfigMissing, match="failed to read org/repo:sft/r-missing/seed0/adapter"
+    ):
         d.deploy_adapter(
             run_id="r-missing",
             model="Qwen/Qwen3.5-4B",
@@ -276,9 +300,7 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
         },
     )
 
-    with pytest.raises(
-        d.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"
-    ):
+    with pytest.raises(d.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"):
         d.deploy_adapter(
             run_id="r-empty-shard",
             model="Qwen/Qwen3.5-4B",
@@ -294,7 +316,10 @@ def test_deploy_accepts_legacy_bin_adapter_tensor(monkeypatch, tmp_path):
 
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
-    assert adapter_artifact_lora_rank("org/repo", "sft/r-bin/seed0/adapter") == 32
+    assert (
+        adapter_artifact_lora_rank("org/repo", "sft/r-bin/seed0/adapter", hf_revision="a" * 40)
+        == 32
+    )
     assert seen["list_repo_tree"]["path_in_repo"] == "sft/r-bin/seed0/adapter"
 
 
@@ -342,16 +367,24 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         adapter_prefix="sft/flash-7-abcd/seed0",
     )
     assert seen["url"] == "https://serve.example/adapters"
+    revision = "flash-7-abcd@final." + "a" * 40
     assert seen["json"] == {
-        "adapter_id": "flash-7-abcd",
+        "adapter_id": revision,
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-0.8B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
         # flash always uploads adapters to HF *dataset* repos, so serving must be told to
         # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
         "repo_type": "dataset",
+        "checkpoint": "flash-7-abcd",
         "status": "ready",
-        # Per-adapter thinking default carried so serving can apply it as enable_thinking when a
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "flash-7-abcd",
+            "checkpoint_step": None,
+            "hf_revision": "a" * 40,
+        },
+        # per-adapter thinking default carried so serving can apply it as enable_thinking when a
         # raw chat caller omits chat_template_kwargs (deploy_adapter defaults thinking=False).
         "thinking": False,
     }
@@ -363,9 +396,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     assert dep.state == "ready"
 
 
-def test_deploy_registers_structured_outputs_default(
-    monkeypatch, tmp_path, stub_serving_registry
-):
+def test_deploy_registers_structured_outputs_default(monkeypatch, tmp_path, stub_serving_registry):
     """A non-thinking run trained with structured_outputs registers that grammar as the adapter's
     per-adapter guided-decoding DEFAULT, so serving constrains every request the same way training
     did (closes the train/serve exposure-bias gap). The spec is forwarded as its parsed canonical
@@ -571,6 +602,13 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         def raise_for_status(self):
             return None
 
+        def json(self):
+            return {
+                "run_id": "flash-7-abcd",
+                "disabled_aliases": ["flash-7-abcd"],
+                "disabled_revisions": ["flash-7-abcd@final." + "a" * 40],
+            }
+
     def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["headers"] = headers
@@ -579,7 +617,8 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
 
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
     out = d.undeploy_adapter("flash-7-abcd")
-    assert out == ["flash-7-abcd"]
+    assert out["disabled_aliases"] == ["flash-7-abcd"]
+    assert out["serving_deregistered"] is True
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
@@ -587,7 +626,7 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
 
     # A 404 (already gone) returns an empty list, not an error.
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd") == []
+    assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
 def test_undeploy_propagates_serving_error(monkeypatch):
@@ -626,7 +665,7 @@ def test_undeploy_propagates_serving_error(monkeypatch):
 
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd") == []
+    assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
