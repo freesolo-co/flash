@@ -46,7 +46,12 @@ from flash.engine.worker.opd_gkd import (
     _trim_trailing_stop,
     student_tokens_with_offsets,
 )
-from flash.engine.worker.opd_objectives import OPD_OBJECTIVES, ObjectiveView
+from flash.engine.worker.opd_objectives import (
+    OPD_OBJECTIVES,
+    CvarEntropyConfig,
+    ObjectiveView,
+    PositionStatistics,
+)
 from flash.engine.worker.opd_vllm import (
     OpdVllmOutput,
     OpdVllmRolloutEngine,
@@ -166,6 +171,10 @@ class OpdKnobs:
     # [train].opd_entropy_floor_coef / opd_entropy_floor, else RECIPE.opd defaults.
     entropy_floor_coef: float = RECIPE.opd.entropy_floor_coef
     entropy_floor: float = RECIPE.opd.entropy_floor
+    # c10 lower-tail cvar entropy config. inert unless c10 is selected.
+    cvar_entropy_fraction: float = RECIPE.opd.cvar_entropy_fraction
+    cvar_entropy_floor: float = RECIPE.opd.cvar_entropy_floor
+    cvar_entropy_coef: float = RECIPE.opd.cvar_entropy_coef
     save_every: int = 0
     max_length: int = 0
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
@@ -216,6 +225,23 @@ def _resolve_opd_knobs() -> OpdKnobs:
             getattr(t, "opd_objective_ids", None) if t else None
         )
         OPD_OBJECTIVES.plan(objective_ids)
+        cvar_config = CvarEntropyConfig(
+            fraction=float(
+                _cf
+                if (_cf := opt("opd_cvar_entropy_fraction", None)) is not None
+                else d.cvar_entropy_fraction
+            ),
+            floor=float(
+                _cfl
+                if (_cfl := opt("opd_cvar_entropy_floor", None)) is not None
+                else d.cvar_entropy_floor
+            ),
+            coef=float(
+                _cc
+                if (_cc := opt("opd_cvar_entropy_coef", None)) is not None
+                else d.cvar_entropy_coef
+            ),
+        )
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
@@ -254,6 +280,9 @@ def _resolve_opd_knobs() -> OpdKnobs:
             0.0,
             float(_ef if (_ef := opt("opd_entropy_floor", None)) is not None else d.entropy_floor),
         ),
+        cvar_entropy_fraction=cvar_config.fraction,
+        cvar_entropy_floor=cvar_config.floor,
+        cvar_entropy_coef=cvar_config.coef,
         save_every=int(opt("save_every", 0) or 20),
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
@@ -1597,6 +1626,7 @@ class _PreparedLoss:
     teacher_tokens: int
     group_granularity: float
     teacher_scores: tuple = ()
+    forced: tuple[bool, ...] = ()
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -1729,9 +1759,49 @@ def _eos_reinforce_term(
     return (-float(eos_coef)) * logp, float(logp.detach())
 
 
-# Row-chunk size for _entropy_floor_term's full-vocab passes: 128 rows x ~150k vocab x 3 fp32
+# row-chunk size for full-vocabulary entropy passes: 128 rows x ~150k vocab x 3 fp32
 # temporaries ~= 250 MB transient, comfortably inside the existing dense-logits headroom.
 _ENTROPY_CHUNK_ROWS = 128
+
+
+def _chunked_row_entropies(rows, indices=None, *, grad: bool):
+    """compute full-vocabulary row entropies with bounded temporaries.
+
+    detached mode returns a tuple of python floats for selection and telemetry. grad mode returns the
+    differentiable mean and only materializes autograd state for the requested rows.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if rows is None:
+        return None
+    selected = tuple(range(rows.shape[0])) if indices is None else tuple(int(i) for i in indices)
+    if not selected:
+        return None
+    parts = []
+    context = contextlib.nullcontext() if grad else torch.no_grad()
+    with context:
+        for start in range(0, len(selected), _ENTROPY_CHUNK_ROWS):
+            index = torch.tensor(
+                selected[start : start + _ENTROPY_CHUNK_ROWS],
+                dtype=torch.long,
+                device=rows.device,
+            )
+            chunk = rows.index_select(0, index).float()
+            log_probs = F.log_softmax(chunk, dim=-1)
+            parts.append(-(log_probs.exp() * log_probs).sum(dim=-1))
+    if grad:
+        return torch.cat(parts).mean()
+    return tuple(float(value) for value in torch.cat(parts).tolist())
+
+
+def _completion_position_statistics(rows, forced=()) -> PositionStatistics:
+    """build detached completion-row statistics without embedding objective policy."""
+    entropies = _chunked_row_entropies(rows, grad=False) or ()
+    eligible = tuple(
+        index for index in range(len(entropies)) if not (index < len(forced) and forced[index])
+    )
+    return PositionStatistics(entropies=entropies, eligible_indices=eligible)
 
 
 def _entropy_floor_term(rows, coef: float, floor: float):
@@ -1769,30 +1839,16 @@ def _entropy_floor_term(rows, coef: float, floor: float):
     retains ~2 fp32 ``[completion_len, vocab]`` buffers for backward — but only for samples the
     hinge is actively penalizing (coef > 0 AND mean entropy below the floor), i.e. the opt-in
     experimental case, never the default path."""
-    import torch
-    import torch.nn.functional as F
-
     if rows is None or rows.shape[0] == 0:
         return None, None
-    n = rows.shape[0]
 
-    def _chunked_entropy_sum(grad: bool):
-        total = None
-        for i in range(0, n, _ENTROPY_CHUNK_ROWS):
-            lp = F.log_softmax(rows[i : i + _ENTROPY_CHUNK_ROWS].float(), dim=-1)
-            part = -(lp.exp() * lp).sum()
-            if not grad:
-                part = float(part)
-            total = part if total is None else total + part
-        return total
-
-    # detached pass first: cheap logging value, and the gate that decides whether the (autograd)
-    # penalty pass is needed at all — at/above the floor the hinge is identically zero.
-    with torch.no_grad():
-        mean_entropy = _chunked_entropy_sum(grad=False) / n
+    # detached pass first: cheap logging value, and the gate that decides whether the autograd penalty
+    # pass is needed at all. at or above the floor the hinge is identically zero.
+    entropies = _chunked_row_entropies(rows, grad=False)
+    mean_entropy = sum(entropies) / len(entropies)
     if coef <= 0 or mean_entropy >= floor:
         return None, mean_entropy
-    ent = _chunked_entropy_sum(grad=True) / n
+    ent = _chunked_row_entropies(rows, grad=True)
     return float(coef) * (float(floor) - ent), mean_entropy
 
 
@@ -1936,6 +1992,10 @@ def _resolve_samples_batched(
                 teacher_scores=(
                     tuple(score.teacher_toks) if objective_plan.requirements.teacher_scores else ()
                 ),
+                forced=tuple(
+                    bool(gen.forced[i]) if i < len(gen.forced) else False
+                    for i in range(len(student_ids))
+                ),
             )
         )
 
@@ -2008,6 +2068,19 @@ def _resolve_samples_batched(
                             )
                         if objective_plan.requirements.teacher_scores:
                             objective_values["teacher_scores"] = p.teacher_scores
+                        if objective_plan.requirements.position_statistics:
+                            objective_values.update(
+                                position_statistics=_completion_position_statistics(rows, p.forced),
+                                entropy_for_rows=lambda indices, _rows=rows: _chunked_row_entropies(
+                                    _rows, indices, grad=True
+                                ),
+                                cvar_entropy_config=CvarEntropyConfig(
+                                    fraction=float(knobs.cvar_entropy_fraction),
+                                    floor=float(knobs.cvar_entropy_floor),
+                                    coef=float(knobs.cvar_entropy_coef),
+                                ),
+                                base_term=loss,
+                            )
                         objective_evaluation = OPD_OBJECTIVES.evaluate(
                             objective_plan,
                             ObjectiveView(objective_values),

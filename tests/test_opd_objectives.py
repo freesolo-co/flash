@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -11,11 +12,13 @@ import pytest
 
 from flash.engine.worker.opd_objectives import (
     OPD_OBJECTIVES,
+    CvarEntropyConfig,
     ObjectiveDefinition,
     ObjectiveRegistry,
     ObjectiveRequirements,
     ObjectiveResult,
     ObjectiveView,
+    PositionStatistics,
 )
 
 
@@ -224,6 +227,154 @@ def test_c0_requires_no_extra_work_and_returns_no_additions():
     assert OPD_OBJECTIVES.evaluate(plan, ObjectiveView(), base_term=0.0).metrics == {}
 
 
+def _evaluate_c10(rows, *, fraction=0.5, floor=1.0, coef=1.0, forced=(), base_term=None):
+    from flash.engine.worker import opd as opd_mod
+
+    if base_term is None:
+        base_term = rows.sum() * 0.0
+    plan = OPD_OBJECTIVES.plan(("c10",))
+    stats = opd_mod._completion_position_statistics(rows, forced)
+    return OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "completion_logits": rows,
+                "position_statistics": stats,
+                "entropy_for_rows": lambda indices: opd_mod._chunked_row_entropies(
+                    rows, indices, grad=True
+                ),
+                "cvar_entropy_config": CvarEntropyConfig(
+                    fraction=fraction, floor=floor, coef=coef
+                ),
+                "base_term": base_term,
+            }
+        ),
+        base_term=base_term,
+    )
+
+
+def test_c10_quantile_ties_include_every_row_at_threshold():
+    torch = pytest.importorskip("torch")
+    selected = []
+    rows = torch.zeros(4, 3, requires_grad=True)
+    stats = PositionStatistics(entropies=(0.1, 0.2, 0.2, 0.9), eligible_indices=(0, 1, 2, 3))
+    plan = OPD_OBJECTIVES.plan(("c10",))
+    evaluated = OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "completion_logits": rows,
+                "position_statistics": stats,
+                "entropy_for_rows": lambda indices: selected.extend(indices)
+                or rows.sum() * 0.0
+                + 0.2,
+                "cvar_entropy_config": CvarEntropyConfig(fraction=0.5, floor=1.0, coef=1.0),
+                "base_term": rows.sum(),
+            }
+        ),
+        base_term=rows.sum(),
+    )
+
+    assert selected == [0, 1, 2]
+    assert evaluated.metrics["opd/objectives/c10/threshold"] == pytest.approx(0.2)
+    assert evaluated.metrics["opd/objectives/c10/selected_count"] == 3.0
+
+
+def test_c10_short_sequence_selects_one_row():
+    torch = pytest.importorskip("torch")
+    rows = torch.tensor([[3.0, 0.0, 0.0]], requires_grad=True)
+
+    evaluated = _evaluate_c10(rows, fraction=0.01, floor=1.0)
+
+    assert evaluated.metrics["opd/objectives/c10/selected_count"] == 1.0
+    assert len(evaluated.terms) == 1
+
+
+def test_c10_fraction_one_matches_mean_entropy_floor():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.tensor([[4.0, 0.0, 0.0], [2.0, 0.0, 0.0]], requires_grad=True)
+    expected, _ = opd_mod._entropy_floor_term(rows, coef=1.7, floor=1.2)
+    evaluated = _evaluate_c10(rows, fraction=1.0, floor=1.2, coef=1.7)
+
+    assert len(evaluated.terms) == 1
+    assert torch.allclose(evaluated.terms[0], expected)
+
+
+def test_c10_zero_selection_is_finite_and_inactive():
+    torch = pytest.importorskip("torch")
+    rows = torch.zeros(2, 4, requires_grad=True)
+
+    evaluated = _evaluate_c10(rows, forced=(True, True), floor=10.0)
+
+    assert evaluated.terms == ()
+    assert evaluated.metrics["opd/objectives/c10/selected_count"] == 0.0
+    assert evaluated.metrics["opd/objectives/c10/activation"] == 0.0
+    assert all(math.isfinite(value) for value in evaluated.metrics.values())
+
+
+def test_c10_excludes_grammar_forced_rows():
+    torch = pytest.importorskip("torch")
+    rows = torch.tensor([[8.0, 0.0, 0.0], [0.0, 0.0, 0.0]], requires_grad=True)
+
+    evaluated = _evaluate_c10(rows, fraction=0.5, floor=2.0, forced=(True, False))
+
+    assert evaluated.metrics["opd/objectives/c10/selected_count"] == 1.0
+    assert evaluated.metrics["opd/objectives/c10/threshold"] == pytest.approx(math.log(3), rel=1e-5)
+    assert evaluated.terms[0] is not None
+
+
+def test_c10_gradient_step_raises_selected_tail_entropy():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.tensor([[5.0, 0.0, 0.0, 0.0]], requires_grad=True)
+    before = opd_mod._chunked_row_entropies(rows, grad=False)[0]
+    term = _evaluate_c10(rows, fraction=1.0, floor=1.0, coef=2.0).terms[0]
+    term.backward()
+    with torch.no_grad():
+        rows -= 0.1 * rows.grad
+    after = opd_mod._chunked_row_entropies(rows, grad=False)[0]
+
+    assert after > before
+
+
+def test_c10_reports_gradient_ratio_when_base_gradient_exists():
+    torch = pytest.importorskip("torch")
+    rows = torch.tensor([[4.0, 0.0, 0.0]], requires_grad=True)
+    base_term = rows.square().mean()
+
+    evaluated = _evaluate_c10(rows, fraction=1.0, floor=1.0, base_term=base_term)
+
+    assert evaluated.metrics["opd/objectives/c10/gradient_ratio"] > 0.0
+
+
+def test_c10_chunk_consistency(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.randn(7, 11, generator=torch.Generator().manual_seed(7), requires_grad=True)
+    monkeypatch.setattr(opd_mod, "_ENTROPY_CHUNK_ROWS", 1)
+    one = _evaluate_c10(rows, fraction=0.4, floor=10.0)
+    monkeypatch.setattr(opd_mod, "_ENTROPY_CHUNK_ROWS", 128)
+    full = _evaluate_c10(rows, fraction=0.4, floor=10.0)
+
+    assert one.metrics == pytest.approx(full.metrics)
+    assert torch.allclose(one.terms[0], full.terms[0])
+
+
+def test_c10_nonfinite_rows_are_excluded_from_selection():
+    torch = pytest.importorskip("torch")
+    rows = torch.tensor([[float("nan"), 0.0], [2.0, 0.0]], requires_grad=True)
+
+    evaluated = _evaluate_c10(rows, fraction=1.0, floor=1.0)
+
+    assert evaluated.metrics["opd/objectives/c10/selected_count"] == 1.0
+    assert math.isfinite(evaluated.metrics["opd/objectives/c10/threshold"])
+    assert all(math.isfinite(value) for value in evaluated.metrics.values())
+
+
 def test_job_spec_parsing_does_not_import_worker_package():
     script = """
 import sys
@@ -328,6 +479,40 @@ def test_opd_objective_ids_are_typed_opd_only_and_round_trip():
             },
             run_id="untyped-objective",
         )
+
+
+def test_c10_config_is_strict_and_round_trips():
+    from flash.schema import spec_from_dict
+    from flash.schema.fields import ConfigError
+    from flash.spec import JobSpec, TrainSpec
+
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "opd",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "train": {
+            "opd_objective_ids": ["c10"],
+            "opd_cvar_entropy_fraction": 0.25,
+            "opd_cvar_entropy_floor": 0.7,
+            "opd_cvar_entropy_coef": 1.5,
+        },
+    }
+    spec = spec_from_dict(raw, run_id="c10-config")
+    restored = JobSpec.from_json(spec.to_json())
+
+    assert TrainSpec().opd_cvar_entropy_fraction is None
+    assert restored.train.opd_cvar_entropy_fraction == 0.25
+    assert restored.train.opd_cvar_entropy_floor == 0.7
+    assert restored.train.opd_cvar_entropy_coef == 1.5
+    for value in (0.0, -0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ConfigError, match="opd_cvar_entropy_fraction"):
+            spec_from_dict(
+                {
+                    **raw,
+                    "train": {**raw["train"], "opd_cvar_entropy_fraction": value},
+                },
+                run_id="bad-c10-config",
+            )
 
 
 def test_selected_objective_receives_logits_and_detached_teacher_scores(monkeypatch):

@@ -180,6 +180,12 @@ class OPDConfig:
     # overridable via [train].opd_entropy_floor_coef / [train].opd_entropy_floor.
     entropy_floor_coef: float = 0.0
     entropy_floor: float = 0.5
+    # c10 lower-tail cvar entropy defaults. these values have no effect unless c10 is selected in
+    # [train].opd_objective_ids. c10 raises the mean entropy of the lowest-entropy completion rows,
+    # excluding grammar-forced rows, until the selected tail reaches the floor.
+    cvar_entropy_fraction: float = 0.1
+    cvar_entropy_floor: float = 0.5
+    cvar_entropy_coef: float = 1.0
 
 
 @dataclass(frozen=True)

@@ -211,6 +211,9 @@ _TRAIN_KEYS = frozenset(
         "opd_eos_loss_coef",
         "opd_entropy_floor_coef",
         "opd_entropy_floor",
+        "opd_cvar_entropy_fraction",
+        "opd_cvar_entropy_floor",
+        "opd_cvar_entropy_coef",
         "opd_objective_ids",
         "teacher_model",
         "stop_sequences",
@@ -365,6 +368,20 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # None -> recipe defaults (0.0 / 0.5, i.e. off until validated).
             opd_entropy_floor_coef=_train_float(train_raw, "opd_entropy_floor_coef", minimum=0.0),
             opd_entropy_floor=_train_float(train_raw, "opd_entropy_floor", minimum=0.0),
+            # c10 lower-tail cvar entropy config; defaults are inert unless c10 is selected.
+            opd_cvar_entropy_fraction=_train_float(
+                train_raw,
+                "opd_cvar_entropy_fraction",
+                minimum=0.0,
+                exclusive=True,
+                maximum=1.0,
+            ),
+            opd_cvar_entropy_floor=_train_float(
+                train_raw, "opd_cvar_entropy_floor", minimum=0.0
+            ),
+            opd_cvar_entropy_coef=_train_float(
+                train_raw, "opd_cvar_entropy_coef", minimum=0.0
+            ),
             # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),

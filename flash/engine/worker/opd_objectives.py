@@ -25,6 +25,7 @@ class ObjectiveRequirements:
 
     student_logits: bool = False
     teacher_scores: bool = False
+    position_statistics: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,31 @@ class ObjectiveResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", _immutable_mapping(self.metrics))
+
+
+@dataclass(frozen=True)
+class PositionStatistics:
+    """detached, objective-neutral completion-row statistics."""
+
+    entropies: tuple[float, ...] = ()
+    eligible_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class CvarEntropyConfig:
+    """strict runtime config for the c10 lower-tail entropy objective."""
+
+    fraction: float
+    floor: float
+    coef: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.fraction) or not 0.0 < self.fraction <= 1.0:
+            raise ValueError("c10 cvar entropy fraction must be finite and in (0, 1]")
+        if not math.isfinite(self.floor) or self.floor < 0.0:
+            raise ValueError("c10 cvar entropy floor must be finite and >= 0")
+        if not math.isfinite(self.coef) or self.coef < 0.0:
+            raise ValueError("c10 cvar entropy coef must be finite and >= 0")
 
 
 ObjectiveFunction = Callable[[ObjectiveView], ObjectiveResult]
@@ -198,6 +224,7 @@ class ObjectiveRegistry:
             requirements=ObjectiveRequirements(
                 student_logits=any(d.requirements.student_logits for d in definitions),
                 teacher_scores=any(d.requirements.teacher_scores for d in definitions),
+                position_statistics=any(d.requirements.position_statistics for d in definitions),
             ),
         )
 
@@ -215,6 +242,8 @@ class ObjectiveRegistry:
                 view.require("completion_logits")
             if definition.requirements.teacher_scores:
                 view.require("teacher_scores")
+            if definition.requirements.position_statistics:
+                view.require("position_statistics")
             result = definition.evaluate(view)
             if not isinstance(result, ObjectiveResult):
                 raise TypeError(
@@ -245,12 +274,89 @@ def _c0(_view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult()
 
 
+def _c10_gradient_ratio(term, base_term, rows) -> float | None:
+    torch = _torch_module()
+    if torch is None or not all(torch.is_tensor(value) for value in (term, base_term, rows)):
+        return None
+    try:
+        tail_grad = torch.autograd.grad(term, rows, retain_graph=True, allow_unused=True)[0]
+        base_grad = torch.autograd.grad(base_term, rows, retain_graph=True, allow_unused=True)[0]
+    except RuntimeError:
+        return None
+    if tail_grad is None or base_grad is None:
+        return None
+    denominator = float(base_grad.detach().float().norm())
+    numerator = float(tail_grad.detach().float().norm())
+    if denominator <= 0.0 or not math.isfinite(denominator) or not math.isfinite(numerator):
+        return None
+    return numerator / denominator
+
+
+def _c10(view: ObjectiveView) -> ObjectiveResult:
+    stats = view.require("position_statistics")
+    config = view.require("cvar_entropy_config")
+    if not isinstance(stats, PositionStatistics):
+        raise TypeError("c10 position_statistics must be PositionStatistics")
+    if not isinstance(config, CvarEntropyConfig):
+        raise TypeError("c10 cvar_entropy_config must be CvarEntropyConfig")
+
+    finite = [
+        (index, stats.entropies[index])
+        for index in stats.eligible_indices
+        if index < len(stats.entropies) and math.isfinite(stats.entropies[index])
+    ]
+    metrics: dict[str, object] = {
+        "tail_fraction": config.fraction,
+        "threshold": 0.0,
+        "selected_count": 0.0,
+        "mean_entropy": 0.0,
+        "tail_entropy": 0.0,
+        "activation": 0.0,
+    }
+    if not finite:
+        return ObjectiveResult(metrics=metrics)
+
+    ordered = sorted(entropy for _, entropy in finite)
+    count = max(1, math.ceil(config.fraction * len(ordered)))
+    threshold = ordered[count - 1]
+    selected = tuple(index for index, entropy in finite if entropy <= threshold)
+    tail_entropy_detached = sum(stats.entropies[index] for index in selected) / len(selected)
+    metrics.update(
+        threshold=threshold,
+        selected_count=float(len(selected)),
+        mean_entropy=sum(entropy for _, entropy in finite) / len(finite),
+        tail_entropy=tail_entropy_detached,
+    )
+    if config.coef <= 0.0 or tail_entropy_detached >= config.floor:
+        return ObjectiveResult(metrics=metrics)
+
+    entropy_for_rows = view.require("entropy_for_rows")
+    tail_entropy = entropy_for_rows(selected)
+    if tail_entropy is None:
+        return ObjectiveResult(metrics=metrics)
+    term = config.coef * (config.floor - tail_entropy)
+    metrics["activation"] = 1.0
+    ratio = _c10_gradient_ratio(
+        term,
+        view.values.get("base_term"),
+        view.values.get("completion_logits"),
+    )
+    if ratio is not None:
+        metrics["gradient_ratio"] = ratio
+    return ObjectiveResult(term=term, metrics=metrics)
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
             objective_id="c0",
             requirements=ObjectiveRequirements(),
             evaluate=_c0,
+        ),
+        ObjectiveDefinition(
+            objective_id="c10",
+            requirements=ObjectiveRequirements(student_logits=True, position_statistics=True),
+            evaluate=_c10,
         ),
     )
 )

@@ -131,6 +131,11 @@ class TrainSpec:
     # reverse-KL over-sharpening on small students (the greedy repetition loop at temp=0).
     opd_entropy_floor_coef: float | None = None
     opd_entropy_floor: float | None = None
+    # opd c10 only: lower-tail cvar entropy selection fraction, target floor, and loss coefficient.
+    # recipe defaults apply when unset, but remain inactive unless c10 is explicitly selected.
+    opd_cvar_entropy_fraction: float | None = None
+    opd_cvar_entropy_floor: float | None = None
+    opd_cvar_entropy_coef: float | None = None
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
@@ -229,6 +234,9 @@ class JobSpec:
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 opd_entropy_floor_coef=_opt_float(train.get("opd_entropy_floor_coef")),
                 opd_entropy_floor=_opt_float(train.get("opd_entropy_floor")),
+                opd_cvar_entropy_fraction=_opt_float(train.get("opd_cvar_entropy_fraction")),
+                opd_cvar_entropy_floor=_opt_float(train.get("opd_cvar_entropy_floor")),
+                opd_cvar_entropy_coef=_opt_float(train.get("opd_cvar_entropy_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
