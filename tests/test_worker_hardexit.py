@@ -58,6 +58,32 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
     assert raised.code == 0, "must exit 0 on success"
 
 
+def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
+    from flash.spec import JobSpec, TrainSpec
+
+    _patch_common(monkeypatch, lambda code=0: None)
+    monkeypatch.setattr(
+        worker,
+        "JOB_SPEC",
+        JobSpec(
+            algorithm="sft",
+            train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
+        ),
+    )
+    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
+    monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker,
+        "run_sft",
+        lambda: pytest.fail("sft handler must not run for adapter continuation"),
+    )
+
+    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
+        worker.main()
+
+
 def test_worker_dispatches_opd_run_mode(monkeypatch):
     """RUN_MODE=='opd' must dispatch to run_opd (the third algorithm's worker handler)."""
     ran = {"v": False}

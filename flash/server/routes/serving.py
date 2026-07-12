@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from flash.runner import (
     adapter_prefix,
+    effective_spec_from_status,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_failed,
@@ -107,8 +108,7 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     finish = choice.get("finish_reason")
     if not content.strip():
         raise ServingError(
-            "smoke generation returned no content "
-            f"(finish_reason={finish!r}) after {latency:.1f}s"
+            f"smoke generation returned no content (finish_reason={finish!r}) after {latency:.1f}s"
         )
     return {
         "verified_at": time.time(),
@@ -160,7 +160,7 @@ def _finish_deployment_unlocked(
     verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
-    active = (_app.get_status(run_id).deployment or {})
+    active = _app.get_status(run_id).deployment or {}
     if (
         active.get("requested_at") != deployment.get("requested_at")
         or active.get("state") not in _DEPLOYMENT_BUSY_STATES
@@ -198,9 +198,7 @@ def _finish_deployment_unlocked(
             marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
         else:
             marked = mark_deployed(run_id, current, expect_state=prev_state)
-        cas_failed = (
-            marked.deployment != current if is_checkpoint else marked.state != "deployed"
-        )
+        cas_failed = marked.deployment != current if is_checkpoint else marked.state != "deployed"
         if state_guard is not None and cas_failed:
             with contextlib.suppress(Exception):
                 _app.undeploy_adapter(run_id)
@@ -238,8 +236,7 @@ def _finish_deployment_unlocked(
                 failed.pop("previous_deployment", None)
                 failed["rollback_error"] = rollback_error
                 failed["detail"] = (
-                    "deployment failed and serving rollback failed; "
-                    "operator cleanup required"
+                    "deployment failed and serving rollback failed; operator cleanup required"
                 )
             elif isinstance(previous_deployment, dict):
                 failed["detail"] = "deployment failed; restored previous deployment"
@@ -251,6 +248,7 @@ def _finish_deployment_unlocked(
 def _finish_deployment(**kwargs) -> None:
     with _app._deploy_lock(kwargs["run_id"]):
         _finish_deployment_unlocked(**kwargs)
+
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
     raw = payload.get("messages")
@@ -345,6 +343,10 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
+        try:
+            effective_spec = effective_spec_from_status(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
         current_deployment = status.deployment or {}
@@ -383,7 +385,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "hf_repo": spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
             "dry_run": dry_run,
-            "lora_rank": spec.train.lora_rank,
+            "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
             # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
@@ -407,7 +409,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             from flash.serve.deploy import validate_serving_lora_rank
 
             validate_serving_lora_rank(
-                spec.model, spec.train.lora_rank, rank_source="configured train.lora_rank"
+                spec.model,
+                effective_spec.train.lora_rank,
+                rank_source="effective prepared LoRA rank",
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -534,7 +538,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         "adapter_id": run_id,
         "repository": repository,
         "url": url,
-        "source": f"{spec.train.hf_repo}:{subfolder}",
+        "source": f"{run_id}/step-{checkpoint_step}" if is_checkpoint else run_id,
     }
     if is_checkpoint:
         result["step"] = checkpoint_step

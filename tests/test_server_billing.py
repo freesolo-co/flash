@@ -316,6 +316,31 @@ def test_submit_records_pending_completion_billing(api):
     assert [r["run_id"] for r in listed] == [run_id]
 
 
+def test_budget_precheck_uses_prepared_estimate_before_record_run(api, monkeypatch):
+    import flash.server.billing as billing_mod
+    import flash.server.db as db_mod
+
+    events = []
+    original_record_run = db_mod.record_run
+
+    def capture_precheck(**kwargs):
+        events.append(("precheck", kwargs["estimate_usd"]))
+        return {"ok": True}
+
+    def capture_record_run(*args, **kwargs):
+        events.append(("record", args[0]))
+        return original_record_run(*args, **kwargs)
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", capture_precheck)
+    monkeypatch.setattr(db_mod, "record_run", capture_record_run)
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+
+    assert res.status_code == 200, res.text
+    assert events[0] == ("precheck", res.json()["estimated_cost_usd"])
+    assert events[1] == ("record", res.json()["run_id"])
+
+
 def test_external_submit_requires_org_for_completion_billing(api):
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-noorg"))
     assert res.status_code == 400, res.text
@@ -372,16 +397,29 @@ def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
     ] == [res.json()["run_id"]]
 
 
-def test_dry_run_skips_precheck(api, monkeypatch):
-    # dry runs never bill, so they must never be gated either.
+def test_dry_run_runs_affordability_precheck_before_persistence(api, monkeypatch):
     import flash.server.billing as billing_mod
+    import flash.server.db as db_mod
 
-    def _block(**k):
+    events = []
+
+    def _block(**kwargs):
+        events.append(("precheck", kwargs["org_id"]))
         raise billing_mod.BillingError(402, "insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-    res = api.post("/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-1"))
-    assert res.status_code == 200, res.text
+    monkeypatch.setattr(
+        db_mod,
+        "record_run",
+        lambda *a, **k: events.append(("record", a[0])),
+    )
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=_bearer("fslo-user-1"),
+    )
+    assert res.status_code == 402, res.text
+    assert events == [("precheck", "org-1")]
 
 
 def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):

@@ -30,6 +30,7 @@ def cancel_run(run_id: str) -> RunStatus:
         _update,
         actual_steps_run,
         charge_usd_for_spec,
+        effective_spec_from_status,
         get_status,
         mark_deployment_undeployed,
     )
@@ -39,7 +40,11 @@ def cancel_run(run_id: str) -> RunStatus:
         return status
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
     entered_deployed = status.state == "deployed"
-    spec = JobSpec.from_dict(status.spec)
+    public_spec = JobSpec.from_dict(status.spec)
+    effective_spec = None
+    with contextlib.suppress(Exception):
+        effective_spec = effective_spec_from_status(status)
+    cleanup_spec = effective_spec or public_spec
     # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
     # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
     # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here. The price
@@ -68,13 +73,28 @@ def cancel_run(run_id: str) -> RunStatus:
             provider.destroy(handle)
         except Exception:
             pass
-    _gc_run_endpoints(spec)
-    # Price the cancel now that the worker is torn down, from the freshest persisted heartbeat.
-    cancel_charge_usd: float | None = (
-        charge_usd_for_spec(spec, steps=actual_steps_run(get_status(run_id)), fallback=0.0)
-        if bill_cancel
-        else None
-    )
+    with contextlib.suppress(Exception):
+        _gc_run_endpoints(cleanup_spec)
+    # price only from the validated effective snapshot. a missing or malformed private snapshot must
+    # never make the public child rank authoritative, but it also must never block teardown.
+    cancel_charge_usd: float | None = None
+    billing_diagnostic: dict = {}
+    if bill_cancel:
+        if effective_spec is not None:
+            cancel_charge_usd = charge_usd_for_spec(
+                effective_spec,
+                steps=actual_steps_run(get_status(run_id)),
+                fallback=0.0,
+            )
+        else:
+            cancel_charge_usd = 0.0
+            billing_diagnostic = {
+                "billing_state": "failed",
+                "billing_error": (
+                    "cancellation charge was not computed because the private preparation "
+                    "snapshot was unavailable or invalid; teardown was still attempted"
+                ),
+            }
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):
@@ -82,6 +102,7 @@ def cancel_run(run_id: str) -> RunStatus:
         # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
         # charges the run from cost_usd (idempotent by runId).
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
+        cancel_updates.update(billing_diagnostic)
         _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
         if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
@@ -106,13 +127,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
-        _resolve_init_from_adapter,
         _run_training,
         _RunCancelled,
         _status_estimated_charge,
-        _status_org_id,
         _update,
         artifacts_dir,
+        effective_spec_from_status,
         get_status,
     )
 
@@ -123,11 +143,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
     public_spec = JobSpec.from_dict(status.spec)
+    worker_spec = public_spec
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
     try:
+        worker_spec = effective_spec_from_status(status, verify_source=True)
         remote = dict(status.remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
@@ -138,7 +160,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         allocated_gpu = remote.pop("allocated_gpu", None)
         handle = JobHandle.from_dict(remote)
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-        res = get_provider(handle.provider).poll(handle, public_spec, seed, log=log)
+        res = get_provider(handle.provider).poll(handle, worker_spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
@@ -173,7 +195,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # GC the dead endpoint / any label-named instances (a second force-reap attempt when the
             # teardown above was unconfirmed), then clear the stale handle.
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(public_spec)
+                _gc_run_endpoints(worker_spec)
             if not teardown_confirmed:
                 # Keep ``remote`` so the still-billing box stays reachable for the next recovery/sweep,
                 # and leave the run non-terminal (do not _update) so a future re-attach re-polls it.
@@ -183,16 +205,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            owner_key_id = None
-            with contextlib.suppress(Exception):
-                from flash.server import db
-
-                owner_key_id = db.run_owner(run_id)
-            worker_spec = _resolve_init_from_adapter(
-                public_spec,
-                owner_org_id=_status_org_id(status),
-                owner_key_id=owner_key_id,
-            )
             if code_prefix is None:
                 from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
@@ -226,7 +238,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        _gc_run_endpoints(public_spec)
+        _gc_run_endpoints(worker_spec)
     return get_status(run_id)
 
 
@@ -314,10 +326,7 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         ):
             return status
         previous = deployment.get("previous_deployment")
-        if (
-            isinstance(previous, dict)
-            and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
-        ):
+        if isinstance(previous, dict) and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES:
             status.deployment = {
                 **previous,
                 "last_deploy_error": deployment.get("error") or "deployment failed",

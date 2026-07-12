@@ -80,13 +80,25 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
+    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
+        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+
+
+def test_warmstart_child_rank_above_cap_is_deferred_to_source_metadata() -> None:
+    spec = spec_from_dict(_raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": 256}))
+    assert spec.train.lora_rank == 256
+
+
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:
     # Regression: opd_eos_loss_coef was added to flash.spec.TrainSpec + the worker, but NOT the
     # client/server schema allowlist, so `[train] opd_eos_loss_coef` was hard-rejected as an unknown
     # key at submit — the documented override never reached the worker. It must round-trip here.
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
-    assert spec_from_dict(_raw()).train.opd_eos_loss_coef is None  # unset -> recipe default at resolve
+    assert (
+        spec_from_dict(_raw()).train.opd_eos_loss_coef is None
+    )  # unset -> recipe default at resolve
     with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
@@ -426,6 +438,20 @@ def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) ->
         orch.submit_job(spec, dry_run=True)
 
 
+def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+    from flash.spec import JobSpec, TrainSpec
+
+    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    spec = JobSpec(
+        run_id="sft-warmstart",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
+    )
+    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
+        orch.submit_job(spec, dry_run=True)
+
+
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
@@ -436,10 +462,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     d = spec.to_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = JobSpec.from_dict(d)
-    assert (
-        orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
-    )
+    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------

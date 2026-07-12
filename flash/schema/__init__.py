@@ -216,6 +216,7 @@ _TRAIN_KEYS = frozenset(
     }
 )
 
+
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -315,9 +316,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    init_from_adapter = _init_from_adapter_ref(train_raw)
+    if algorithm == "sft" and init_from_adapter:
+        raise ConfigError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)
-    if max_lora_rank is not None and lora_rank > max_lora_rank:
+    if not init_from_adapter and max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
             f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
             f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
@@ -340,7 +347,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=_init_from_adapter_ref(train_raw),
+            init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),

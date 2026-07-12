@@ -9,6 +9,18 @@ from typing import ClassVar
 import pytest
 
 
+def test_opd_lora_rank_uses_maximum_default_and_pattern_rank():
+    from flash.engine.worker.opd_vllm import opd_lora_rank
+
+    model = SimpleNamespace(
+        peft_config={
+            "first": SimpleNamespace(r=16, rank_pattern={"a": 64}),
+            "second": SimpleNamespace(r=32, rank_pattern={"b": 8}),
+        }
+    )
+    assert opd_lora_rank(model) == 64
+
+
 def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_path):
     """OPD's vLLM engine must generate with the latest saved adapter, not a stale LoRA."""
     from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
@@ -728,7 +740,9 @@ def test_opd_vllm_constrained_generate_uses_fresh_params_per_request(monkeypatch
             return [
                 SimpleNamespace(
                     outputs=[
-                        SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+                        SimpleNamespace(
+                            token_ids=[3], text="x", finish_reason="stop", stop_reason=None
+                        )
                     ]
                 )
                 for _ in prompts
@@ -785,7 +799,11 @@ def test_normalize_output_marks_grammar_forced_positions():
         text="ok",
         finish_reason="stop",
         stop_reason=None,
-        logprobs=[{3: _lp(0.0), 99: _lp(neg_inf)}, {4: _lp(-0.3), 9: _lp(-1.4)}, {5: _lp(0.0), 88: _lp(neg_inf)}],
+        logprobs=[
+            {3: _lp(0.0), 99: _lp(neg_inf)},
+            {4: _lp(-0.3), 9: _lp(-1.4)},
+            {5: _lp(0.0), 88: _lp(neg_inf)},
+        ],
     )
     out = _normalize_output(SimpleNamespace(outputs=[comp]))
     assert out.forced == (True, False, True)
