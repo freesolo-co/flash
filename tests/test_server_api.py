@@ -925,6 +925,41 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_public_run_routes_redact_private_and_legacy_deployment_fields(api):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "openai_base_url": "https://serve.example/v1",
+        "url": "https://stale.example/v1",
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+    }
+    runner._save_status(status)
+
+    responses = [
+        api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json(),
+        api.get("/v1/runs", headers=_bearer(key)).json()["runs"][0],
+        api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key)).json(),
+        api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"][0],
+    ]
+    for body in responses:
+        deployment = body["deployment"]
+        assert deployment["openai_base_url"] == "https://serve.example/v1"
+        assert "url" not in deployment
+        assert "previous_deployment" not in deployment
+
+    persisted = runner.get_status(run_id).deployment
+    assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
+    assert persisted["openai_base_url"] == "https://serve.example/v1"
+    assert persisted["url"] == "https://stale.example/v1"
+
+
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
     """A serving-backend failure during deploy is recorded on the deployment status."""
     import flash.runner as runner
@@ -1082,6 +1117,7 @@ def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monke
             adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
             openai_model=run_id,
             endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
             adapter_revision=revision,
         )
 
@@ -1137,6 +1173,7 @@ def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypat
             adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
             openai_model=run_id,
             endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
             adapter_revision=revision,
         )
 
@@ -1184,6 +1221,7 @@ def test_commit_miss_superseded_records_divergence_without_alias_revert(api, mon
             adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
             openai_model=run_id,
             endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
             adapter_revision=revision,
         )
 
@@ -1496,6 +1534,7 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
             adapter_hf_prefix="x/adapter",
             openai_model=run_id,
             endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
             state="ready",
         )
 
@@ -1534,6 +1573,7 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
             adapter_hf_prefix="x/adapter",
             openai_model=run_id,
             endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
             state="ready",
         )
 

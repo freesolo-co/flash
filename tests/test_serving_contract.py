@@ -19,6 +19,8 @@ def test_serving_base_url_default_and_override(monkeypatch):
     assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
     assert serving_base_url() == "https://serve.example"
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    assert serving_base_url() == "https://serve.example"
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
@@ -154,9 +156,12 @@ def test_deployment_roundtrip_dict():
         adapter_hf_prefix="p",
         openai_model="r",
         endpoint_name="https://serve.example",
+        openai_base_url="https://serve.example/v1",
     )
     data = d.to_dict()
     assert data["run_id"] == "r"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
     assert "gpu" not in data
     assert "mode" not in data
 
@@ -230,7 +235,8 @@ def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
-    assert data["url"] == "https://serve.example/v1"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
 
 
 def test_immutable_revision_identifier_uses_full_hub_sha():
@@ -603,3 +609,12 @@ def test_activation_conflict_preserves_expected_alias(monkeypatch):
         deploy._activate_revision(
             "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
         )
+
+
+def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    data = dep.to_dict()
+    assert data["endpoint_name"] == "https://serve.example"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data

@@ -88,6 +88,7 @@ class _FakeClient:
             "run_id": run_id,
             "openai_model": f"flash-{run_id}",
             "endpoint_name": "https://serve.example",
+            "openai_base_url": "https://serve.example/v1",
             "state": "deploying",
         }
 
@@ -96,7 +97,16 @@ class _FakeClient:
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
+        return [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "state": "ready",
+                    "endpoint_name": "https://serve.example",
+                    "openai_base_url": "https://serve.example/v1",
+                },
+            }
+        ]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -441,7 +451,9 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert "flash undeploy flash-1/step-40`" not in err
 
     assert _run(["deployments"]) == 0
-    assert "flash-1" in capsys.readouterr().out
+    deployments_out = capsys.readouterr().out
+    assert "flash-1" in deployments_out
+    assert "https://serve.example/v1" in deployments_out
 
     assert _run(["undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
@@ -505,6 +517,13 @@ def test_deployments_json_is_versioned_sorted_and_null_complete(
         "verified_at": None,
         "openai_model": "run-b",
     }
+
+
+def test_deployments_json_empty_list_is_versioned(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(fake_client, "deployments", lambda: [])
+    assert _run(["deployments", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"schema_version": 1, "deployments": []}
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:

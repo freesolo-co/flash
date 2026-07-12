@@ -586,11 +586,10 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
-    """undeploy DELETEs {FREESOLO_SERVING_URL}/adapters/{run_id} with the auth header and
-    returns [run_id] on success, [] on 404."""
+    """A terminal /v1 override keeps undeploy calls on the serving control root."""
     import flash.serve.deploy as d
 
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
     seen = {}
@@ -615,11 +614,17 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
+    def fake_get(url, **kwargs):
+        seen["verification_url"] = url
+        return _Resp(200)
+
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
+    monkeypatch.setattr(d.httpx, "get", fake_get)
     out = d.undeploy_adapter("flash-7-abcd")
     assert out["disabled_aliases"] == ["flash-7-abcd"]
     assert out["serving_deregistered"] is True
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
+    assert seen["verification_url"] == "https://serve.example/adapters"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
     assert seen["follow_redirects"] is True
@@ -669,11 +674,10 @@ def test_undeploy_propagates_serving_error(monkeypatch):
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
-    """chat POSTs to {FREESOLO_SERVING_URL}/v1/chat/completions addressing the adapter by
-    run_id, and returns the parsed OpenAI response dict."""
+    """A terminal /v1 override produces one OpenAI path for direct chat."""
     import flash.serve.deploy as d
 
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
     seen = {}
@@ -736,10 +740,10 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
 
 
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
-    """chat_stream requests OpenAI streaming and yields assistant content deltas only."""
+    """A terminal /v1 override produces one OpenAI path for streaming chat."""
     import flash.serve.deploy as d
 
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     seen = {}
 

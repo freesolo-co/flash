@@ -522,8 +522,7 @@ def cmd_deploy(args) -> int:
         print(json.dumps(dep, indent=2))
     # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
     if dep.get("state") != "dry_run":
-        endpoint = str(dep.get("endpoint_name") or "").rstrip("/")
-        openai_base = dep.get("url") or (f"{endpoint}/v1" if endpoint else "")
+        openai_base = str(dep.get("openai_base_url") or "")
         note = (
             f"serving is billed per token only; use `flash undeploy {base_run_id}` "
             "to deregister the adapter."

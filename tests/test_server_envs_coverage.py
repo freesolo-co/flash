@@ -250,7 +250,15 @@ def test_deployment_state_and_public_deployment():
     assert original == {"a": 1, "state": "deploying"}
 
     pub = serving._public_deployment(
-        {"run_id": "run-1", "state": "ready", "previous_deployment": {"x": 1}, "b": 2}
+        {
+            "run_id": "run-1",
+            "state": "ready",
+            "previous_deployment": {"x": 1},
+            "endpoint_name": "https://serve.example",
+            "openai_base_url": "https://serve.example/v1",
+            "url": "https://stale.example/v1",
+            "b": 2,
+        }
     )
     assert pub == {
         "run_id": "run-1",
@@ -259,6 +267,8 @@ def test_deployment_state_and_public_deployment():
         "state": "ready",
         "verified_at": None,
         "openai_model": "run-1",
+        "endpoint_name": "https://serve.example",
+        "openai_base_url": "https://serve.example/v1",
         "b": 2,
     }
 

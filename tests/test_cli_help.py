@@ -72,6 +72,7 @@ def test_deployments_json_parser_and_help_are_additive() -> None:
     parser = cli._build_parser()
     args = parser.parse_args(["deployments", "--json"])
     assert args.json is True
+    assert args.func is cli.cmd_deployments
     deployments = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ).choices["deployments"]

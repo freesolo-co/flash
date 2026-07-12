@@ -25,6 +25,7 @@ from flash.runner import (
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
 from flash.serve.deploy import AdapterConfigMissing, ServingError
+from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _require_bool, owned_run, require_key
@@ -114,8 +115,7 @@ def _deployment_state(deployment: dict, state: str, **fields) -> dict:
 
 
 def _public_deployment(deployment: dict) -> dict:
-    out = dict(deployment)
-    out.pop("previous_deployment", None)
+    out = public_deployment(deployment)
     run_id = out.get("run_id")
     out.update(
         {
