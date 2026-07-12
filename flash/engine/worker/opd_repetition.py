@@ -11,6 +11,9 @@ MIN_REPEAT_TOKENS = 6
 MAX_CYCLE_PERIOD = 16
 MIN_NGRAM = 3
 MAX_NGRAM = 12
+MAX_NGRAM_GAP = 8
+MAX_NGRAM_PERIOD = 16
+MAX_NGRAM_SPAN = 48
 REPETITION_WEIGHT_MIN = 0.5
 REPETITION_WEIGHT_MAX = 1.5
 LOOP_UNLIKELIHOOD_COEF = 0.1
@@ -25,10 +28,11 @@ class RepetitionMatch:
     end: int
     unit_length: int
     repeats: int
+    occurrence_starts: tuple[int, ...] = ()
 
     @property
     def repeated_tokens(self) -> int:
-        return self.end - self.start
+        return self.unit_length * self.repeats
 
 
 @dataclass(frozen=True)
@@ -76,12 +80,14 @@ def detect_token_cycle(
             actual_repeats += 1
         if actual_repeats * period < min_tokens:
             continue
+        start = len(ids) - actual_repeats * period
         return RepetitionMatch(
             kind="cycle",
-            start=len(ids) - actual_repeats * period,
+            start=start,
             end=len(ids),
             unit_length=period,
             repeats=actual_repeats,
+            occurrence_starts=tuple(range(start, len(ids) - period + 1, period)),
         )
     return None
 
@@ -92,39 +98,59 @@ def detect_repeated_ngram(
     min_repeats: int = MIN_REPEAT_COUNT,
     min_ngram: int = MIN_NGRAM,
     max_ngram: int = MAX_NGRAM,
+    max_gap: int = MAX_NGRAM_GAP,
+    max_period: int = MAX_NGRAM_PERIOD,
+    max_span: int = MAX_NGRAM_SPAN,
 ) -> RepetitionMatch | None:
-    """detect a repeated suffix ngram, requiring three non-overlapping occurrences."""
+    """detect a local repeated suffix ngram with bounded gaps and total span."""
 
     ids = _token_ids(token_ids)
     repeats = max(MIN_REPEAT_COUNT, int(min_repeats))
     lo = max(2, int(min_ngram))
     hi = min(max(lo, int(max_ngram)), len(ids) // repeats)
+    gap_limit = max(0, int(max_gap))
+    period_limit = max(1, int(max_period))
+    span_limit = max(1, int(max_span))
     for ngram_size in range(lo, hi + 1):
         needle = ids[-ngram_size:]
-        starts = [
-            start
-            for start in range(0, len(ids) - ngram_size + 1)
-            if ids[start : start + ngram_size] == needle
-        ]
-        non_overlapping: list[int] = []
-        for start in starts:
-            if not non_overlapping or start >= non_overlapping[-1] + ngram_size:
-                non_overlapping.append(start)
-        if len(non_overlapping) < repeats or non_overlapping[-1] != len(ids) - ngram_size:
+        selected = [len(ids) - ngram_size]
+        while True:
+            current = selected[0]
+            earliest = max(0, current - period_limit)
+            latest = current - ngram_size
+            previous = next(
+                (
+                    start
+                    for start in range(latest, earliest - 1, -1)
+                    if current - (start + ngram_size) <= gap_limit
+                    and ids[start : start + ngram_size] == needle
+                ),
+                None,
+            )
+            if previous is None:
+                break
+            if len(ids) - previous > span_limit:
+                break
+            selected.insert(0, previous)
+        if len(selected) < repeats:
             continue
-        selected = non_overlapping[-repeats:]
         return RepetitionMatch(
             kind="ngram",
             start=selected[0],
             end=len(ids),
             unit_length=ngram_size,
             repeats=len(selected),
+            occurrence_starts=tuple(selected),
         )
     return None
 
 
-def analyze_repetition(token_ids: Sequence[int] | None) -> RepetitionAnalysis:
-    """return suffix-loop matches and positions whose sampled tokens close the loop."""
+def analyze_repetition(
+    token_ids: Sequence[int] | None,
+    *,
+    forced: Sequence[bool] = (),
+) -> RepetitionAnalysis:
+    """return actionable suffix-loop positions and eligible repeated-token coverage."""
 
     ids = _token_ids(token_ids)
     if len(ids) < MIN_REPEAT_TOKENS:
@@ -132,14 +158,34 @@ def analyze_repetition(token_ids: Sequence[int] | None) -> RepetitionAnalysis:
     cycle = detect_token_cycle(ids)
     ngram = None if cycle is not None else detect_repeated_ngram(ids)
     matches = tuple(match for match in (cycle, ngram) if match is not None)
+    eligible = [not (index < len(forced) and bool(forced[index])) for index in range(len(ids))]
     mask = [False] * len(ids)
+    repeated_indices: set[int] = set()
+    actionable_matches = []
     for match in matches:
-        final_start = max(match.start, match.end - match.unit_length)
-        for index in range(final_start, match.end):
-            mask[index] = True
-    repeated = max((match.repeated_tokens for match in matches), default=0)
-    severity = min(1.0, repeated / max(1, len(ids)))
-    return RepetitionAnalysis(matches=matches, closing_mask=tuple(mask), severity=severity)
+        starts = match.occurrence_starts or tuple(
+            range(match.start, match.end - match.unit_length + 1, match.unit_length)
+        )
+        final_start = starts[-1]
+        actionable = False
+        for index in range(final_start, final_start + match.unit_length):
+            if eligible[index]:
+                mask[index] = True
+                actionable = True
+        if not actionable:
+            continue
+        actionable_matches.append(match)
+        for start in starts:
+            for index in range(start, start + match.unit_length):
+                if eligible[index]:
+                    repeated_indices.add(index)
+    eligible_tokens = sum(eligible)
+    severity = min(1.0, len(repeated_indices) / max(1, eligible_tokens))
+    return RepetitionAnalysis(
+        matches=tuple(actionable_matches),
+        closing_mask=tuple(mask),
+        severity=severity,
+    )
 
 
 def normalize_repetition_weights(
@@ -192,7 +238,7 @@ def loop_closing_unlikelihood(
     ids = _token_ids(token_ids)
     if rows is None or not ids or float(coef) <= 0:
         return None
-    analysis = analysis or analyze_repetition(ids)
+    analysis = analysis or analyze_repetition(ids, forced=forced)
     selected = [
         index
         for index, closes in enumerate(analysis.closing_mask)

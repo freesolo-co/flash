@@ -472,6 +472,7 @@ def _c09(view: ObjectiveView) -> ObjectiveResult:
     if analysis is not None:
         metrics = {
             "repetition_severity": analysis.severity,
+            "repetition_weight": view.values.get("sequence_weight", 1.0),
             "loop_closing_tokens": sum(analysis.closing_mask),
         }
     return ObjectiveResult(term=term, metrics=metrics)

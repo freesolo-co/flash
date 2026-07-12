@@ -820,8 +820,6 @@ def run_opd():
                     ),
                     seed=_w.SEED + mt_generate_count,
                 )
-            if objective_plan.requirements.repetition_weighting:
-                kwargs["repetition_weighting"] = True
             mt_generate_count += 1
             return _generate_many_vllm(vllm_rollout, tok, [prefix_ids], knobs, **kwargs)[0]
 
@@ -954,12 +952,12 @@ def run_opd():
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
                 step_sidecar_inputs = None
-                # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
-                # handed to the resident teacher pool, and completed teacher futures are converted into
-                # differentiable GKD losses as soon as they finish. This preserves one optimizer update
-                # per OPD step, but removes the old "wait for every teacher response before any loss"
-                # barrier.
+                # Step pipeline. vLLM produces on-policy rollouts and hands scorable completions to the
+                # resident teacher pool. ordinary objectives resolve completed teacher batches immediately.
+                # c09 retains the scored samples until the attempt is complete so its bounded weights have
+                # exact mean one over the aligned samples contributing to this optimizer update.
                 teacher_futures: dict[Future, list[_Pending]] = {}
+                step_scored_samples: list[tuple[_GenResult, _ScoreResult, object]] = []
 
                 def _queue_teacher_batch(
                     pendings: list[_Pending],
@@ -1020,6 +1018,9 @@ def run_opd():
                     fut: Future,
                     *,
                     _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
+                    _step_scored_samples: list[
+                        tuple[_GenResult, _ScoreResult, object]
+                    ] = step_scored_samples,
                     _accum_target=accum_target,
                 ) -> None:
                     batch = _teacher_futures.pop(fut)
@@ -1038,6 +1039,9 @@ def run_opd():
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
+                    if objective_plan.requirements.repetition_weighting:
+                        _step_scored_samples.extend(scored_samples)
+                        return
                     loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
                         model,
@@ -1149,8 +1153,6 @@ def run_opd():
                                     ),
                                     seed=_w.SEED + it * accum_target + start,
                                 )
-                            if objective_plan.requirements.repetition_weighting:
-                                primary_kwargs["repetition_weighting"] = True
                             gens = _generate_many_vllm(
                                 vllm_rollout,
                                 tok,
@@ -1188,6 +1190,23 @@ def run_opd():
                     if fut in teacher_futures:
                         _consume_teacher_future(fut)
                     wait_started = time.perf_counter()
+                if step_scored_samples:
+                    loss_started = time.perf_counter()
+                    resolved = _resolve_samples_batched(
+                        model,
+                        tok,
+                        device,
+                        step_scored_samples,
+                        knobs,
+                        loss_microbatch_size,
+                        backward_scale=1.0 / accum_target,
+                        runaway_rate=trunc_ema,
+                        overcorr_rate=empty_ema,
+                    )
+                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
+                    opd_phase_counts["loss_batches"] += 1
+                    for r in resolved:
+                        _account(r, backward=False)
                 _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
 
                 if nseq:
@@ -1555,9 +1574,8 @@ class _GenResult:
     # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
     # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
     forced: tuple = ()
-    # detached local repetition analysis and bounded c09 gkd sequence weight.
+    # detached local repetition analysis; c09 weights are assigned after teacher alignment.
     repetition_analysis: object = None
-    sequence_weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1697,7 +1715,6 @@ def _generate_many_vllm(
     eos_ids=None,
     temperature: float | None = None,
     seed: int | None = None,
-    repetition_weighting: bool = False,
 ) -> list[_GenResult]:
     generate_kwargs = {"max_tokens": max_tokens}
     if temperature is not None:
@@ -1708,15 +1725,15 @@ def _generate_many_vllm(
         _gen_from_vllm_output(out, tok, knobs, eos_ids=eos_ids)
         for out in rollout.generate(prompt_ids_batch, **generate_kwargs)
     ]
-    analyses = [analyze_repetition(gen.completion_ids) for gen in generated]
-    weights = (
-        normalize_repetition_weights([analysis.severity for analysis in analyses])
-        if repetition_weighting
-        else (1.0,) * len(generated)
-    )
     return [
-        replace(gen, repetition_analysis=analysis, sequence_weight=weight)
-        for gen, analysis, weight in zip(generated, analyses, weights, strict=True)
+        replace(
+            gen,
+            repetition_analysis=analyze_repetition(
+                gen.completion_ids,
+                forced=gen.forced,
+            ),
+        )
+        for gen in generated
     ]
 
 
@@ -1738,16 +1755,15 @@ def _generate_greedy_sidecars(
     sidecars = []
     for out in outputs:
         ids = [int(token_id) for token_id in out.token_ids]
+        forced = tuple(bool(value) for value in (getattr(out, "forced", ()) or ()))[: len(ids)]
         sidecars.append(
             _GenResult(
                 completion_ids=ids,
                 completion_text=str(out.text or ""),
                 gen_tokens=len(ids),
                 truncated=not out.terminated,
-                forced=tuple(bool(value) for value in (getattr(out, "forced", ()) or ()))[
-                    : len(ids)
-                ],
-                repetition_analysis=analyze_repetition(ids),
+                forced=forced,
+                repetition_analysis=analyze_repetition(ids, forced=forced),
             )
         )
     return sidecars
@@ -1766,6 +1782,7 @@ def _greedy_sidecar_unlikelihood(
 
     import torch
 
+    retained_count = len(sidecars)
     selected = [
         (prompt_ids, sidecar)
         for prompt_ids, sidecar in zip(prompt_ids_batch, sidecars, strict=True)
@@ -1808,7 +1825,7 @@ def _greedy_sidecar_unlikelihood(
             if term is not None:
                 terms.append(term)
                 closing_tokens += sum(sidecar.repetition_analysis.closing_mask)
-    return (sum(terms) / len(terms) if terms else None), len(selected), closing_tokens
+    return (sum(terms) / retained_count if terms else None), len(selected), closing_tokens
 
 
 def _score_one(
@@ -2380,11 +2397,20 @@ def _resolve_samples_batched(
                     for i in range(len(student_ids))
                 ),
                 repetition_analysis=gen.repetition_analysis
-                or analyze_repetition(gen.completion_ids),
-                sequence_weight=float(gen.sequence_weight),
+                or analyze_repetition(gen.completion_ids, forced=gen.forced or ()),
+                sequence_weight=1.0,
                 termination_cause=gen.termination_cause,
             )
         )
+
+    if prepared and objective_plan.requirements.repetition_weighting:
+        weights = normalize_repetition_weights(
+            [item.repetition_analysis.severity for item in prepared]
+        )
+        prepared = [
+            replace(item, sequence_weight=weight)
+            for item, weight in zip(prepared, weights, strict=True)
+        ]
 
     if prepared:
         model.train()

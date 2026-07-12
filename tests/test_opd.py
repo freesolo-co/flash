@@ -1007,13 +1007,11 @@ class _CharTok:
 
 
 def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
-    """END-TO-END proof that multi-turn opd distils EACH assistant turn against the teacher, conditioned
-    on the growing transcript. Drives the REAL run_opd -> rollout_one_records -> vLLM rollout shim ->
-    batched teacher scoring -> _resolve_samples_batched path on CPU with a scripted 2-turn "guess"
-    episode: a fake student that emits a distinct completion per turn and a fake teacher that
-    echo-scores each. We assert (1) two turns were distilled with real gradients, (2) the second turn's
-    teacher prompt and loss prefix strictly GREW over the first (per-turn transcript conditioning, not
-    a re-scored first turn), and (3) train_meta reports the multi-turn shape."""
+    """exercise real multi-turn distillation with clean and repetitive c09 trajectories.
+
+    the two teacher-successful turns must be resolved together so their repetition weights have exact
+    mean one instead of each singleton being normalized independently.
+    """
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -1111,7 +1109,15 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
             **_kwargs,
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
-            loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
+            metrics = dict(r.objective_metrics)
+            loss_calls.append(
+                (
+                    len(prompt_ids),
+                    gen.completion_text,
+                    r.loss is not None,
+                    metrics.get("opd/objectives/c09/repetition_weight"),
+                )
+            )
         return out
 
     monkeypatch.setattr(opd_mod, "_resolve_samples_batched", _spy_resolve_samples_batched)
@@ -1153,6 +1159,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
             save_every=0,
             max_length=128,
             stop_sequences=(),
+            objective_ids=("c09",),
         ),
     )
     monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (model, "fake/model"))
@@ -1168,8 +1175,8 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         monkeypatch,
         opd_mod,
         outputs=[
-            opd_mod.OpdVllmOutput([*tok._enc("42"), tok.eos_token_id], "42", finish_reason="stop"),
-            opd_mod.OpdVllmOutput([*tok._enc("ok"), tok.eos_token_id], "ok", finish_reason="stop"),
+            opd_mod.OpdVllmOutput(tok._enc("42"), "42", finish_reason="stop"),
+            opd_mod.OpdVllmOutput(tok._enc("gggggg"), "gggggg", finish_reason="stop"),
         ],
     )
     import transformers
@@ -1187,9 +1194,11 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
 
     # (1) Both assistant turns were distilled with a real (non-None) loss, texts in generation order.
     assert len(loss_calls) == 2, f"expected 2 per-turn losses, got {loss_calls}"
-    assert [c[1] for c in loss_calls] == ["42", "ok"]
+    assert [c[1] for c in loss_calls] == ["42", "gggggg"]
     assert all(c[2] for c in loss_calls), "every distilled turn must produce a real loss"
-    # The second turn's loss prefix (transcript so far) is strictly LONGER than the first's.
+    assert [c[3] for c in loss_calls] == pytest.approx((1.25, 0.75))
+    assert sum(c[3] for c in loss_calls) / len(loss_calls) == pytest.approx(1.0)
+    # the second turn's loss prefix is strictly longer because it includes the transcript so far.
     assert loss_calls[1][0] > loss_calls[0][0]
 
     # (2) The teacher was called once per turn, each conditioned on the growing transcript: turn 2's
