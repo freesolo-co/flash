@@ -395,8 +395,18 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
         }
     )
     runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
-    monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
-    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 96})
+    monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda spec, *, step: True)
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda *a, **k: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 96,
+            "lora_alpha": 192,
+        },
+    )
 
     spec = {
         **SPEC,
@@ -413,7 +423,8 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
     )
 
     assert resp.status_code == 400
-    assert "has rank 96" in resp.text
+    assert "source 'source-run' could not be prepared" in resp.text
+    assert "rank 96" not in resp.text
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -435,8 +446,18 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
         }
     )
     runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
-    monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
-    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 96})
+    monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda spec, *, step: True)
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda *a, **k: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 96,
+            "lora_alpha": 192,
+        },
+    )
 
     spec = {
         **SPEC,
@@ -453,7 +474,36 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
     )
 
     assert resp.status_code == 400
-    assert "has rank 96" in resp.text
+    assert "source 'source-run' could not be prepared" in resp.text
+    assert "rank 96" not in resp.text
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
+    monkeypatch.setattr(
+        app_mod,
+        "prepare_job",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"failed to read {internal_ref}")),
+    )
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "source-run/step-20" in detail
+    assert "private-owner" not in resp.text
+    assert "private-repo" not in resp.text
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -1103,6 +1153,59 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api):
     assert persisted["url"] == "https://stale.example/v1"
 
 
+def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    public_spec = {**status.spec, "train": {**status.spec["train"]}}
+    public_spec["train"].update({"init_from_adapter": "source-run", "lora_rank": 8})
+    worker_spec = {**public_spec, "train": {**public_spec["train"]}}
+    worker_spec["train"].update(
+        {
+            "init_from_adapter": "private-owner/private-repo:sft/source-run",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 64,
+        }
+    )
+    identity = {"digest": "immutable-v1"}
+    status.spec = public_spec
+    status.effective_preparation = {
+        "worker_spec": worker_spec,
+        "adapter_identity": identity,
+        "preparation_digest": runner._preparation_digest(
+            runner.JobSpec.from_dict(public_spec),
+            runner.JobSpec.from_dict(worker_spec),
+            identity,
+        ),
+    }
+    runner._save_status(status)
+    seen = {}
+
+    def fake_deploy(**kwargs):
+        seen.update(kwargs)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen["lora_rank"] == 64
+    public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert public["spec"]["train"]["lora_rank"] == 8
+    assert public["spec"]["train"]["init_from_adapter"] == "source-run"
+    assert "effective_preparation" not in public
+
+
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
     """A serving-backend failure during deploy is recorded on the deployment status."""
     import flash.runner as runner
@@ -1349,6 +1452,7 @@ def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     status.spec["gpu"]["type"] = "Quantum TPU"
+    status.effective_preparation = None
     runner._save_status(status)
     seen: dict = {}
 
@@ -2367,11 +2471,13 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     assert resubmitted == ["clear-1"]
 
 
-def test_recover_runs_resolves_init_ref_for_no_handle_resubmit(monkeypatch, tmp_path):
+def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
+    monkeypatch, tmp_path
+):
     import threading
 
+    import flash.lora_rank as rank_mod
     import flash.runner as runner
-    import flash.runner.checkpoints as checkpoints
     import flash.server.db as db_mod
 
     importlib.reload(runner)
@@ -2382,32 +2488,68 @@ def test_recover_runs_resolves_init_ref_for_no_handle_resubmit(monkeypatch, tmp_
 
     importlib.reload(app_mod)
 
-    source_spec = {
+    public_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/source-runs"},
-        "gpu": {"type": "RTX 5090"},
-        "run_id": "source-run",
-    }
-    warm_spec = {
-        "model": "Qwen/Qwen3.5-4B",
-        "algorithm": "grpo",
-        "train": {"epochs": 1, "max_examples": 1, "init_from_adapter": "source-run"},
+        "train": {
+            "epochs": 1,
+            "max_examples": 1,
+            "init_from_adapter": "source-run",
+            "lora_rank": 8,
+        },
         "gpu": {"type": "RTX 5090"},
         "run_id": "nohandle-warm",
     }
-    runner._save_status(runner.RunStatus(run_id="source-run", state="done", spec=source_spec))
+    worker_spec = {
+        **public_spec,
+        "train": {
+            **public_spec["train"],
+            "init_from_adapter": "org/source-runs:rl/source-run",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 32,
+        },
+    }
+    identity = rank_mod.AdapterArtifactIdentity(
+        "digest-v1", "config-v1", "adapter_model.safetensors", "weights-v1:123"
+    )
+    from flash.spec import JobSpec
+
+    public_job = JobSpec.from_dict(public_spec)
+    worker_job = JobSpec.from_dict(worker_spec)
     runner._save_status(
-        runner.RunStatus(run_id="nohandle-warm", state="provisioning", spec=warm_spec, remote=None)
+        runner.RunStatus(
+            run_id="nohandle-warm",
+            state="provisioning",
+            spec=public_spec,
+            remote=None,
+            effective_preparation={
+                "worker_spec": worker_spec,
+                "adapter_identity": identity.to_dict(),
+                "preparation_digest": runner._preparation_digest(
+                    public_job, worker_job, identity.to_dict()
+                ),
+            },
+        )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-warm"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
-    monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
-    resubmitted: list[str] = []
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda *a, **k: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 32,
+            "lora_alpha": 64,
+        },
+    )
+    monkeypatch.setattr(rank_mod, "adapter_artifact_identity", lambda *a, **k: identity)
+    resubmitted: list[tuple[str, int]] = []
     done = threading.Event()
 
     def fake_run_job(s):
-        resubmitted.append(s.train.init_from_adapter)
+        resubmitted.append((s.train.init_from_adapter, s.train.lora_rank))
         done.set()
 
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
@@ -2415,7 +2557,96 @@ def test_recover_runs_resolves_init_ref_for_no_handle_resubmit(monkeypatch, tmp_
     app_mod.recover_runs()
 
     assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
-    assert resubmitted == ["org/source-runs:rl/source-run"]
+    assert resubmitted == [("org/source-runs:rl/source-run", 32)]
+
+
+def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
+    import flash.lora_rank as rank_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    public_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"init_from_adapter": "source-run", "lora_rank": 8},
+        "run_id": "drifted-warm",
+    }
+    worker_spec = {
+        **public_spec,
+        "train": {
+            **public_spec["train"],
+            "init_from_adapter": "private-owner/private-repo:rl/source-run",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 32,
+        },
+    }
+    from flash.spec import JobSpec
+
+    public_job = JobSpec.from_dict(public_spec)
+    worker_job = JobSpec.from_dict(worker_spec)
+    original_identity = {
+        "digest": "original",
+        "config_sha256": "config-v1",
+        "weight_filename": "adapter_model.safetensors",
+        "weight_identity": "weights-v1:123",
+    }
+    runner._save_status(
+        runner.RunStatus(
+            run_id="drifted-warm",
+            state="provisioning",
+            spec=public_spec,
+            effective_preparation={
+                "worker_spec": worker_spec,
+                "adapter_identity": original_identity,
+                "preparation_digest": runner._preparation_digest(
+                    public_job, worker_job, original_identity
+                ),
+            },
+        )
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "drifted-warm"}])
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda *a, **k: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 32,
+            "lora_alpha": 64,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            "changed", "config-v2", "adapter_model.safetensors", "weights-v2:123"
+        ),
+    )
+    cleaned = []
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: cleaned.append(spec))
+    monkeypatch.setattr(
+        runner,
+        "_run_job",
+        lambda s: pytest.fail("drifted warm-start source must not be resubmitted"),
+    )
+
+    app_mod.recover_runs()
+
+    status = runner.get_status("drifted-warm")
+    assert status.state == "failed"
+    assert len(cleaned) == 1
+    assert cleaned[0].train.init_from_adapter == "source-run"
+    assert "source-run" in (status.error or "")
+    assert "private-owner" not in (status.error or "")
+    assert "private-repo" not in (status.error or "")
 
 
 def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
@@ -3048,8 +3279,7 @@ def _finished_run(api, key) -> str:
 
 
 def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
-    """A finished run's final adapter is read from its private artifact repo (operator side) and
-    re-uploaded to the user's repo with the user's token; the response reports the source path."""
+    """A finished run's final adapter is read privately and exported with a public source ref."""
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -3076,9 +3306,10 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     body = resp.json()
     assert body["repository"] == "me/adapters"
     assert body["url"] == "https://huggingface.co/me/adapters"
-    assert body["source"] == f"{src_repo}:rl/{run_id}/adapter"
+    assert body["source"] == run_id
+    assert src_repo not in resp.text
     assert "step" not in body
-    # Source = the run's private dataset repo + final-adapter subfolder; dest = the user's repo.
+    # the operator still reads the private source internally; only the response uses the public ref.
     assert seen["source_repo"] == src_repo
     assert seen["source_subfolder"] == f"rl/{run_id}/adapter"
     assert seen["dest_repo"] == "me/adapters"
@@ -3301,6 +3532,8 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["step"] == 40
+    assert ok.json()["source"] == f"{run_id}/step-40"
+    assert "org/test-runs" not in ok.text
     assert seen["source_subfolder"] == f"rl/{run_id}/checkpoints/step-40/adapter"
     assert seen["base_model"] == SPEC["model"]
 

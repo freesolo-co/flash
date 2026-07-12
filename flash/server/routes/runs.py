@@ -72,29 +72,13 @@ def _client_train_schema(payload: dict) -> dict | None:
     }
 
 
-def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
-    """Reject a run up front when its org can't afford the flash.cost estimate.
-
-    Runs at submit, BEFORE any GPU is allocated, so a run that can't be billed never trains to
-    completion only to fail the charge at the end. Blocks ONLY on a definitive 402 (insufficient
-    balance / no billing record). Fails open on everything else -- internal reporting disabled, a
-    cost-estimate error, or an unreachable/5xx billing service must not halt training over a
-    transient blip (the completion charge is the backstop). Verify-only: no money moves here.
-    """
+def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> None:
+    """Reject an unaffordable prepared run before recording or allocating it."""
     from flash.server._internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
         # internal reporting is off -> no completion billing either, so there is nothing to gate.
-        return
-    try:
-        from flash.cost.spec import estimate_for_spec
-
-        estimate_usd = float(estimate_for_spec(spec).total_usd)
-    except Exception:
-        _LOG.warning(
-            "budget precheck skipped for %s: cost estimate failed", spec.run_id, exc_info=True
-        )
         return
     try:
         from flash.server.billing import precheck_training_run
@@ -105,8 +89,7 @@ def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
 
         if isinstance(exc, BillingError) and exc.status_code == 402:
             raise HTTPException(status_code=402, detail=exc.detail) from exc
-        # backend unreachable / 5xx / unexpected -> fail open, never block training on infra noise.
-        _LOG.warning("budget precheck skipped for %s (billing service error): %s", spec.run_id, exc)
+        _LOG.warning("budget precheck skipped for %s (billing service error): %s", run_id, exc)
 
 
 @router.post("/v1/runs")
@@ -142,55 +125,90 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             raise HTTPException(status_code=400, detail=detail) from exc
         raise
     runtime_secrets = _runtime_secrets(payload, spec, require_environment_secrets=not dry_run)
-    # Bill with operator key at completion; never persist the user's API key.
+    affordability_org_id = str(key.get("org_id") or "").strip()
     bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
     billing_context = None
     if bill_on_completion:
-        org_id = str(key.get("org_id") or "").strip()
-        if not org_id:
+        if not affordability_org_id:
             raise HTTPException(
                 status_code=400,
                 detail="org id is required to bill a completed training run",
             )
-        billing_context = {"org_id": org_id}
-        # gate BEFORE recording/submitting: reject an unaffordable run before any GPU is allocated.
-        _precheck_budget_or_block(spec, org_id)
+        billing_context = {"org_id": affordability_org_id}
+    platform_context = {
+        field: value
+        for field, value in {
+            "org_id": key.get("org_id"),
+            "user_id": key.get("user_id"),
+            "api_key_id": key.get("api_key_id"),
+        }.items()
+        if value
+    }
+    run_id = spec.run_id
     try:
-        db.record_run(spec.run_id, key["id"])
-        submit_kwargs = {"dry_run": dry_run, "background": True, "owner_key_id": key["id"]}
+        try:
+            prepared = _app.prepare_job(
+                spec,
+                billing_context=billing_context,
+                platform_context=platform_context or None,
+                owner_key_id=key["id"],
+            )
+        except Exception as exc:
+            source_ref = spec.train.init_from_adapter
+            if source_ref:
+                _LOG.warning(
+                    "warm-start preparation failed for %s from %s",
+                    run_id,
+                    source_ref,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"train.init_from_adapter source {source_ref!r} could not be prepared; "
+                        "verify that the source adapter is complete, compatible, and unchanged"
+                    ),
+                ) from exc
+            raise
+        run_id = prepared.public_spec.run_id
+        if affordability_org_id:
+            _precheck_budget_or_block(
+                run_id=run_id,
+                estimate_usd=prepared.estimated_cost_usd,
+                org_id=affordability_org_id,
+            )
+        db.record_run(run_id, key["id"])
+        submit_kwargs = {
+            "dry_run": dry_run,
+            "background": True,
+            "owner_key_id": key["id"],
+            "prepared_job": prepared,
+        }
         if runtime_secrets:
             submit_kwargs["runtime_secrets"] = runtime_secrets
         if billing_context:
             submit_kwargs["billing_context"] = billing_context
-        platform_context = {
-            field: value
-            for field, value in {
-                "org_id": key.get("org_id"),
-                "user_id": key.get("user_id"),
-                "api_key_id": key.get("api_key_id"),
-            }.items()
-            if value
-        }
         if platform_context:
             submit_kwargs["platform_context"] = platform_context
-        status = _app.submit_job(spec, **submit_kwargs)
+        status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
+        db.delete_run(run_id)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # Platform reporting is best-effort; must NEVER roll back an already-submitted run.
     try:
         from flash.envs.adapter import is_managed_environment_slug
         from flash.server.environment_registry import record_environment_use
 
-        if is_managed_environment_slug(spec.environment.id):
-            record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
+        if is_managed_environment_slug(prepared.public_spec.environment.id):
+            record_environment_use(
+                slug=prepared.public_spec.environment.id,
+                run_id=run_id,
+                key=key,
+            )
     except Exception:
         _LOG.warning(
-            "platform reporting failed for %s (run already submitted)",
-            spec.run_id,
-            exc_info=True,
+            "platform reporting failed for %s (run already submitted)", run_id, exc_info=True
         )
     response = status.to_dict()
     if dry_run and schema is not None:

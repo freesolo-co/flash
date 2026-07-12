@@ -178,12 +178,15 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
+    effective_preparation: dict | None = None
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
         from flash.serve.urls import public_deployment
 
         data = _status_storage_dict(self)
+        # internal warm-start preparation (storage locators, digests) never leaves the server
+        data.pop("effective_preparation", None)
         if isinstance(self.deployment, dict):
             data["deployment"] = public_deployment(self.deployment)
         return data
@@ -414,17 +417,33 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
         return False
 
 
-def _resolve_init_from_adapter(
-    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
-) -> JobSpec:
-    """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
+def _require_supported_adapter_continuation(spec: JobSpec) -> None:
+    if spec.algorithm == "sft" and spec.train.init_from_adapter:
+        raise ValueError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
 
-    The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
-    the source run's hf_repo + phase key the artifact location the worker downloads from.
-    """
+
+def _prepare_init_from_adapter(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+    token: str | None = None,
+) -> tuple[JobSpec, JobSpec, dict | None]:
+    """Preserve the public request while applying source metadata only to the worker spec."""
+    _require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
-        return spec
+        return spec, spec, None
+    from flash.lora_rank import (
+        adapter_artifact_identity,
+        load_hf_adapter_config,
+        preflight_init_adapter_lora_rank,
+        resolve_hf_dataset_revision,
+    )
+    from flash.runner.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
@@ -441,52 +460,74 @@ def _resolve_init_from_adapter(
     owner_org_id = owner_org_id.strip()
     if owner_org_id:
         src_org_id = _status_org_id(src_status)
-        if src_org_id:
-            owner_ok = src_org_id == owner_org_id
-        else:
-            owner_ok = _source_owned_by_key(src_run_id, owner_key_id)
+        owner_ok = (
+            src_org_id == owner_org_id
+            if src_org_id
+            else _source_owned_by_key(src_run_id, owner_key_id)
+        )
         if not owner_ok:
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
     src_spec = JobSpec.from_dict(src_status.spec)
+    if src_spec.model != spec.model:
+        raise ValueError(
+            f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
+            f"{spec.model!r}"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
         )
-    if step is not None:
-        from flash.runner.checkpoints import CheckpointListingError, checkpoint_step_exists
-
-        try:
-            exists = checkpoint_step_exists(src_spec, step)
-        except CheckpointListingError as exc:
-            raise ValueError(str(exc)) from exc
-        if not exists:
-            raise ValueError(
-                f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
-                "deployable checkpoint was not found"
-            )
-    else:
-        if src_status.state not in {"done", "deployed"}:
-            raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but that run is "
-                f"{src_status.state!r}; use a completed source run or a concrete "
-                f"{src_run_id}/step-N checkpoint"
-            )
-        from flash.runner.checkpoints import CheckpointListingError, final_adapter_exists
-
-        try:
-            exists = final_adapter_exists(src_spec)
-        except CheckpointListingError as exc:
-            raise ValueError(str(exc)) from exc
-        if not exists:
-            raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but its final "
-                "adapter was not found; use a concrete checkpoint ref like "
-                f"{src_run_id}/step-N if one exists"
-            )
+    if step is None and src_status.state not in {"done", "deployed"}:
+        raise ValueError(
+            f"train.init_from_adapter references run {src_run_id!r}, but that run is "
+            f"{src_status.state!r}; use a completed source run or a concrete "
+            f"{src_run_id}/step-N checkpoint"
+        )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
-    return replace(spec, train=replace(spec.train, init_from_adapter=storage))
+    revision = resolve_hf_dataset_revision(src_spec.train.hf_repo, token)
+    try:
+        exists = adapter_artifact_exists(src_spec, step=step, revision=revision)
+    except CheckpointListingError as exc:
+        raise ValueError(str(exc)) from exc
+    if not exists:
+        target = f"{src_run_id}/step-{step}" if step is not None else src_run_id
+        raise ValueError(
+            f"train.init_from_adapter references {target!r}, but its complete adapter artifact "
+            "was not found"
+        )
+    worker_spec = replace(
+        spec,
+        train=replace(
+            spec.train,
+            init_from_adapter=storage,
+            init_from_adapter_revision=revision,
+        ),
+    )
+    config = load_hf_adapter_config(storage, token, revision)
+    metadata = preflight_init_adapter_lora_rank(
+        worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
+    )
+    assert metadata is not None
+    identity = adapter_artifact_identity(storage, config, token, revision).to_dict()
+    public_spec = spec
+    worker_spec = replace(
+        worker_spec,
+        train=replace(worker_spec.train, lora_rank=metadata.rank, lora_alpha=metadata.alpha),
+    )
+    return public_spec, worker_spec, identity
+
+
+def _resolve_init_from_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
+    return _prepare_init_from_adapter(
+        spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+        token=os.environ.get("HF_TOKEN"),
+    )[1]
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
@@ -519,6 +560,105 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
         )
 
 
+def _preparation_digest(
+    public_spec: JobSpec, worker_spec: JobSpec, adapter_identity: dict | None
+) -> str:
+    payload = {
+        "version": 1,
+        "public_spec": public_spec.to_dict(),
+        "worker_spec": worker_spec.to_dict(),
+        "adapter_identity": adapter_identity,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None:
+    public = public_spec.to_dict()
+    effective = worker_spec.to_dict()
+    public_train = dict(public["train"])
+    effective_train = dict(effective["train"])
+    public_ref = public_train.get("init_from_adapter") or ""
+    internal_ref = effective_train.get("init_from_adapter") or ""
+    for train_field in (
+        "init_from_adapter",
+        "init_from_adapter_revision",
+        "lora_rank",
+        "lora_alpha",
+    ):
+        effective_train[train_field] = public_train.get(train_field)
+    effective["train"] = effective_train
+    if effective != public:
+        raise ValueError("persisted effective preparation does not match the public run")
+    if not public_ref:
+        if internal_ref or worker_spec.train.init_from_adapter_revision:
+            raise ValueError("persisted effective preparation has an unexpected source adapter")
+        return
+    from flash.schema import parse_adapter_storage_ref, parse_checkpoint_ref
+
+    public_target = parse_checkpoint_ref(public_ref)
+    resolved = parse_adapter_storage_ref(internal_ref)
+    if public_target is None or resolved is None:
+        raise ValueError("persisted effective preparation has an invalid source adapter")
+    _repo, prefix = resolved
+    match = re.fullmatch(
+        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:/checkpoints/step-(?P<step>\d+))?",
+        prefix,
+    )
+    if match is None:
+        raise ValueError("persisted effective preparation has an invalid source adapter")
+    source_run, source_step = public_target
+    internal_step = int(match.group("step")) if match.group("step") is not None else None
+    if match.group("run") != source_run or internal_step != source_step:
+        raise ValueError("persisted effective preparation source does not match the public run")
+    if not worker_spec.train.init_from_adapter_revision:
+        raise ValueError("persisted effective preparation has no pinned source revision")
+
+
+@dataclass(frozen=True)
+class PreparedJob:
+    public_spec: JobSpec
+    worker_spec: JobSpec
+    estimated_cost_usd: float
+    adapter_identity: dict | None = None
+
+
+def prepare_job(
+    spec: JobSpec,
+    *,
+    billing_context: dict | None = None,
+    platform_context: dict | None = None,
+    owner_key_id: int | None = None,
+) -> PreparedJob:
+    """Prepare all read-only submission inputs before persistence or allocation."""
+    _require_priced_sft_examples(spec)
+    _require_supported_adapter_continuation(spec)
+    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
+    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    spec = _assign_managed_hf_repo(spec)
+    spec = _assign_weight_cache_volume(spec, info)
+    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
+    public_spec, worker_spec, adapter_identity = _prepare_init_from_adapter(
+        spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    from flash.cost.spec import estimate_for_spec
+    from flash.lora_rank import preflight_train_context_within_serving
+
+    preflight_train_context_within_serving(worker_spec)
+    estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    return PreparedJob(
+        public_spec=public_spec,
+        worker_spec=worker_spec,
+        estimated_cost_usd=estimated_cost_usd,
+        adapter_identity=adapter_identity,
+    )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -527,43 +667,20 @@ def submit_job(
     billing_context: dict | None = None,
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
+    prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
-    """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
-    that fits the run; dry-run runs the same config validation and preflights and records a
-    state=dry_run preview without allocating a GPU, provisioning, or billing."""
-    _require_priced_sft_examples(spec)
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
-    # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
-    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
-    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
-    spec = _assign_managed_hf_repo(spec)
-    spec = _assign_weight_cache_volume(spec, info)
-    from flash.providers import INSTANCE_PROVIDERS, available_providers
-
-    public_spec = spec
-    # The cost quote and the config preflights run in BOTH dry-run and real submit, so `--dry-run` is
-    # a faithful preview of what the control plane would accept or reject. A spec a real submit would
-    # reject — a warm-start whose train.lora_rank disagrees with the continued source adapter's rank
-    # (the run trains and serves at the source rank, so cost/allocator/GRPO-sleep sizing must agree
-    # with it), or a training context longer than the model's serving window — must fail `--dry-run`
-    # too, not sail through and be rejected only at live submit. These are all CPU-only (an analytical
-    # cost model, catalog lookups, and one small adapter_config.json read for a warm-start); GPU
-    # allocation, provisioning, billing, and the warm-start GC marker stay real-submit-only below.
-    from flash.cost.spec import estimate_for_spec
-    from flash.lora_rank import (
-        preflight_init_adapter_lora_rank,
-        preflight_train_context_within_serving,
-    )
-
-    estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
-    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
-    worker_spec = _resolve_init_from_adapter(
-        public_spec,
-        owner_org_id=owner_org_id,
+    """Submit a prepared job, allocating resources only outside dry-run mode."""
+    prepared = prepared_job or prepare_job(
+        spec,
+        billing_context=billing_context,
+        platform_context=platform_context,
         owner_key_id=owner_key_id,
     )
-    preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
-    preflight_train_context_within_serving(worker_spec)
+    public_spec = prepared.public_spec
+    worker_spec = prepared.worker_spec
+    estimated_cost_usd = prepared.estimated_cost_usd
+    from flash.providers import INSTANCE_PROVIDERS, available_providers
+
     if not dry_run:
         # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
         # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
@@ -579,6 +696,13 @@ def submit_job(
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
+        effective_preparation={
+            "worker_spec": worker_spec.to_dict(),
+            "adapter_identity": prepared.adapter_identity,
+            "preparation_digest": _preparation_digest(
+                public_spec, worker_spec, prepared.adapter_identity
+            ),
+        },
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
@@ -627,6 +751,76 @@ def get_status(run_id: str) -> RunStatus:
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
         return _runstatus_from_json(json.load(f))
+
+
+def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    public_spec = JobSpec.from_dict(status.spec)
+    snapshot = status.effective_preparation
+    if not isinstance(snapshot, dict):
+        if public_spec.train.init_from_adapter:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original preparation snapshot is unavailable"
+            )
+        return public_spec
+    raw_worker = snapshot.get("worker_spec")
+    if not isinstance(raw_worker, dict):
+        raise ValueError("persisted effective preparation is malformed")
+    worker_spec = JobSpec.from_dict(raw_worker)
+    _validate_effective_spec(public_spec, worker_spec)
+    expected = snapshot.get("adapter_identity")
+    stored_digest = snapshot.get("preparation_digest")
+    if public_spec.train.init_from_adapter:
+        if not isinstance(expected, dict) or not expected.get("digest"):
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original artifact identity is unavailable"
+            )
+        if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
+            public_spec, worker_spec, expected
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
+    if verify_source and public_spec.train.init_from_adapter:
+        try:
+            from flash.lora_rank import (
+                adapter_artifact_identity,
+                inspect_adapter_config,
+                load_hf_adapter_config,
+            )
+
+            revision = worker_spec.train.init_from_adapter_revision
+            config = load_hf_adapter_config(
+                worker_spec.train.init_from_adapter,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            )
+            metadata = inspect_adapter_config(
+                config,
+                source="pinned warm-start adapter",
+                target_model=worker_spec.model,
+            )
+            if (
+                metadata.rank != worker_spec.train.lora_rank
+                or metadata.alpha != worker_spec.train.lora_alpha
+            ):
+                raise ValueError("prepared adapter topology changed")
+            current = adapter_artifact_identity(
+                worker_spec.train.init_from_adapter,
+                config,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            ).to_dict()
+        except Exception as exc:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} could not be revalidated"
+            ) from exc
+        if current != expected:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} changed after submission; "
+                "recovery was refused"
+            )
+    return worker_spec
 
 
 def list_runs() -> list[RunStatus]:
@@ -702,6 +896,9 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
     wall time; setup/cold-start is reported separately and is not included here."""
+    from flash.engine.accounting import sanitize_worker_metrics
+
+    metrics = sanitize_worker_metrics(metrics)
     dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.

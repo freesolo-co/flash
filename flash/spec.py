@@ -107,6 +107,9 @@ class TrainSpec:
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
+    # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
+    # control-plane jobspec payloads; the public config schema does not accept this key.
+    init_from_adapter_revision: str = ""
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
     hf_repo: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # None -> worker's tuned recipe default.
@@ -206,6 +209,7 @@ class JobSpec:
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
+                init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),

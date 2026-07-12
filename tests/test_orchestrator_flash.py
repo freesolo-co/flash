@@ -19,7 +19,9 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
         # _run_job_inner uploads the run code before training; stub it (no HF).
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo")
+        monkeypatch.setattr(
+            "flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo"
+        )
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
@@ -485,7 +487,6 @@ def test_run_job_background_swallows_exception(monkeypatch):
         raise RuntimeError("seed 0 failed after retries: job_failed")
 
     # The wrapper dispatches through the package-level _run_job that tests patch.
-    monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
     monkeypatch.setattr(runner, "_run_job", boom)
     spec = type("S", (), {"run_id": "bg-run"})()
     # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
@@ -513,7 +514,6 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
         def boom(spec):
             raise RuntimeError("crashed before persisting terminal state")
 
-        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-fail"})()
         runner._run_job_background(spec)  # must not raise
@@ -544,7 +544,6 @@ def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
         def boom(spec):
             raise RuntimeError("generic wrapper-level error")
 
-        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-done"})()
         runner._run_job_background(spec)  # must not raise

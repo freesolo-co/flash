@@ -89,9 +89,9 @@ def test_spec_validation_rejections(overrides, match) -> None:
 
 
 def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
-    train_fields = fields(TrainSpec)
+    train_fields = [item for item in fields(TrainSpec) if item.metadata.get("introduced_in")]
 
-    assert all(item.metadata.get("introduced_in") for item in train_fields)
+    assert "init_from_adapter_revision" not in TRAIN_SCHEMA_KEYS
     assert frozenset(item.name for item in train_fields) == TRAIN_SCHEMA_KEYS
     assert {
         item.name: item.metadata["introduced_in"] for item in train_fields
@@ -168,6 +168,14 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
             "20c4452c",
             *({"699a8aab"} if key == "teacher_model" else set()),
         }
+def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
+    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
+        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+
+
+def test_warmstart_child_rank_above_cap_is_deferred_to_source_metadata() -> None:
+    spec = spec_from_dict(_raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": 256}))
+    assert spec.train.lora_rank == 256
 
 
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:
@@ -515,6 +523,20 @@ def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) ->
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(run_id="sft-no-examples", model="Qwen/Qwen3.5-0.8B", algorithm="sft")
     with pytest.raises(ValueError, match=r"max_examples.*positive"):
+        orch.submit_job(spec, dry_run=True)
+
+
+def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+    from flash.spec import JobSpec, TrainSpec
+
+    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    spec = JobSpec(
+        run_id="sft-warmstart",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
+    )
+    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
         orch.submit_job(spec, dry_run=True)
 
 
