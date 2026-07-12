@@ -10,6 +10,7 @@ reachable through the package global rather than a statically-bound copy.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -198,6 +199,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 worker_spec,
                 owner_org_id=_status_org_id(status),
                 owner_key_id=owner_key_id,
+            )
+            from flash.lora_rank import preflight_opd_reference_lora_rank
+
+            worker_spec = preflight_opd_reference_lora_rank(
+                worker_spec, token=os.environ.get("HF_TOKEN")
             )
             if code_prefix is None:
                 from flash.providers._worker import upload_code

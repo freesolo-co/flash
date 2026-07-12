@@ -162,6 +162,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         thinking=spec.thinking,
         teacher_model=teacher_model,
         opd_objective_ids=tuple(t.opd_objective_ids),
+        opd_reference_lora_rank=t.opd_reference_lora_rank,
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,

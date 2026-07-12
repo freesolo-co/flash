@@ -2753,16 +2753,15 @@ def _resolve_samples_batched(
                             reference_rows = reference_logits[
                                 row, prompt_len - 1 : prompt_len - 1 + comp_len
                             ]
-                            objective_values.update(
-                                reference_completion_logits=reference_rows,
-                                completion_mask=torch.tensor(
-                                    [
-                                        not (index < len(p.forced) and p.forced[index])
-                                        for index in range(comp_len)
-                                    ],
-                                    dtype=torch.bool,
-                                    device=rows.device,
-                                ),
+                            objective_values["reference_completion_logits"] = reference_rows
+                        if objective_plan.requirements.completion_mask:
+                            objective_values["completion_mask"] = torch.tensor(
+                                [
+                                    not (index < len(p.forced) and p.forced[index])
+                                    for index in range(comp_len)
+                                ],
+                                dtype=torch.bool,
+                                device=rows.device,
                             )
                         if objective_plan.requirements.teacher_scores:
                             objective_values["teacher_scores"] = p.teacher_scores

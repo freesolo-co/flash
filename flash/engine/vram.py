@@ -330,6 +330,7 @@ def estimate_vram_gb(
     fp8_kv: bool = False,
     sft_fused_ce: bool | None = None,
     frozen_reference: bool = False,
+    reference_lora_rank: int | None = None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
@@ -342,7 +343,14 @@ def estimate_vram_gb(
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
-    base = weights + _BASE_OVERHEAD_GB + lora_opt
+    # peft may autocast adapter weights to fp32. A frozen adapter has no gradient or adam states,
+    # so reserve one quarter of the empirical trainable-lora state estimate at its independent rank.
+    reference_lora = (
+        (reference_lora_rank / 16.0) * (0.3 + 0.04 * eff_b) / 4.0
+        if frozen_reference and reference_lora_rank
+        else 0.0
+    )
+    base = weights + _BASE_OVERHEAD_GB + lora_opt + reference_lora
     if algo == "grpo":
         # Sleep mode: peak = max(rollout, train). Resident: both live at once, peak = sum.
         rollout = 0.0
@@ -586,6 +594,9 @@ def model_required_vram_gb(
     batch_size = _pos_int(_get(train, "batch_size"), batch_size_default)
     objective_ids = tuple(_get(train, "opd_objective_ids") or ())
     frozen_reference = bool({"c06", "c11"} & set(objective_ids))
+    reference_lora_rank = (
+        _pos_int(_get(train, "opd_reference_lora_rank"), None) if frozen_reference else None
+    )
 
     def _need(
         params_b: float,
@@ -613,6 +624,7 @@ def model_required_vram_gb(
             fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
             frozen_reference=frozen_reference,
+            reference_lora_rank=reference_lora_rank,
         )
         return math.ceil(est * headroom)
 

@@ -33,6 +33,7 @@ class ObjectiveRequirements:
     repetition_weighting: bool = False
     candidate_topk: bool = False
     frozen_sft_reference: bool = False
+    completion_mask: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,7 @@ class ObjectiveRegistry:
                 repetition_weighting=any(d.requirements.repetition_weighting for d in definitions),
                 candidate_topk=any(d.requirements.candidate_topk for d in definitions),
                 frozen_sft_reference=any(d.requirements.frozen_sft_reference for d in definitions),
+                completion_mask=any(d.requirements.completion_mask for d in definitions),
             ),
         )
 
@@ -290,6 +292,8 @@ class ObjectiveRegistry:
                 view.require("candidate_topk")
             if definition.requirements.frozen_sft_reference:
                 view.require("reference_completion_logits")
+            if definition.requirements.completion_mask:
+                view.require("completion_mask")
             result = definition.evaluate(view)
             if not isinstance(result, ObjectiveResult):
                 raise TypeError(
@@ -327,9 +331,7 @@ def _masked_rows(view: ObjectiveView):
         raise RuntimeError(
             "policy and frozen-reference completion logits must have identical shapes"
         )
-    mask = view.values.get("completion_mask")
-    if mask is None:
-        return policy, reference
+    mask = view.require("completion_mask")
     if mask.ndim != 1 or mask.shape[0] != policy.shape[0]:
         raise RuntimeError("completion_mask must be one-dimensional and match completion rows")
     return policy[mask], reference[mask]
@@ -345,7 +347,7 @@ def forward_kl_topk_tail(policy_logits, reference_logits, *, top_k: int = _REFER
     if policy_logits.ndim != 2:
         raise ValueError("forward kl expects [rows, vocab] logits")
     if policy_logits.shape[0] == 0:
-        return policy_logits.sum() * 0.0
+        return policy_logits.float().sum() * 0.0
     vocab = policy_logits.shape[-1]
     k = max(1, min(int(top_k), vocab))
     total = torch.zeros((), dtype=torch.float32, device=policy_logits.device)
@@ -359,12 +361,16 @@ def forward_kl_topk_tail(policy_logits, reference_logits, *, top_k: int = _REFER
         top_ref_p = top_ref_lp.exp()
         chunk_kl = (top_ref_p * (top_ref_lp - top_policy_lp)).sum(dim=-1)
         if k < vocab:
-            ref_tail = (1.0 - top_ref_p.sum(dim=-1)).clamp_min(1e-12)
-            policy_top_p = top_policy_lp.exp().sum(dim=-1)
-            policy_tail = (1.0 - policy_top_p).clamp_min(1e-12)
-            chunk_kl = chunk_kl + ref_tail * (ref_tail.log() - policy_tail.log())
+            top_mask = torch.zeros_like(policy_lp, dtype=torch.bool)
+            top_mask.scatter_(dim=-1, index=top_idx, value=True)
+            reference_tail_lp = torch.logsumexp(
+                reference_lp.masked_fill(top_mask, -torch.inf), dim=-1
+            )
+            policy_tail_lp = torch.logsumexp(policy_lp.masked_fill(top_mask, -torch.inf), dim=-1)
+            reference_tail_p = reference_tail_lp.exp()
+            chunk_kl = chunk_kl + reference_tail_p * (reference_tail_lp - policy_tail_lp)
         total = total + chunk_kl.sum()
-    return (total / policy_logits.shape[0]).to(dtype=policy_logits.dtype)
+    return total / policy_logits.shape[0]
 
 
 def sft_relative_top2_margin(policy_logits, reference_logits):
@@ -374,7 +380,7 @@ def sft_relative_top2_margin(policy_logits, reference_logits):
     if policy_logits.shape != reference_logits.shape or policy_logits.ndim != 2:
         raise ValueError("margin objective expects matching [rows, vocab] logits")
     if policy_logits.shape[0] == 0:
-        return policy_logits.sum() * 0.0
+        return policy_logits.float().sum() * 0.0
     if policy_logits.shape[-1] < 2:
         raise ValueError("margin objective requires a vocabulary of at least two tokens")
     ref_top, ref_idx = reference_logits.float().topk(k=2, dim=-1)
@@ -382,9 +388,9 @@ def sft_relative_top2_margin(policy_logits, reference_logits):
     ref_margin = (ref_top[:, 0] - ref_top[:, 1]).detach()
     active = ref_margin > 0
     if not bool(active.any().item()):
-        return policy_logits.sum() * 0.0
+        return policy_logits.float().sum() * 0.0
     policy_margin = policy_top[:, 0] - policy_top[:, 1]
-    return F.relu(ref_margin[active] - policy_margin[active]).mean().to(dtype=policy_logits.dtype)
+    return F.relu(ref_margin[active] - policy_margin[active]).mean()
 
 
 def _c0(_view: ObjectiveView) -> ObjectiveResult:
@@ -598,7 +604,11 @@ OPD_OBJECTIVES = ObjectiveRegistry(
         ),
         ObjectiveDefinition(
             objective_id="c06",
-            requirements=ObjectiveRequirements(student_logits=True, frozen_sft_reference=True),
+            requirements=ObjectiveRequirements(
+                student_logits=True,
+                frozen_sft_reference=True,
+                completion_mask=True,
+            ),
             evaluate=_c06,
         ),
         ObjectiveDefinition(
@@ -626,7 +636,11 @@ OPD_OBJECTIVES = ObjectiveRegistry(
         ),
         ObjectiveDefinition(
             objective_id="c11",
-            requirements=ObjectiveRequirements(student_logits=True, frozen_sft_reference=True),
+            requirements=ObjectiveRequirements(
+                student_logits=True,
+                frozen_sft_reference=True,
+                completion_mask=True,
+            ),
             evaluate=_c11,
         ),
         ObjectiveDefinition(

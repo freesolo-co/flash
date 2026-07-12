@@ -4,7 +4,11 @@ from dataclasses import replace
 
 import pytest
 
-from flash.lora_rank import preflight_init_adapter_lora_rank, resolve_adapter_ref
+from flash.lora_rank import (
+    preflight_init_adapter_lora_rank,
+    preflight_opd_reference_lora_rank,
+    resolve_adapter_ref,
+)
 from flash.schema import spec_from_dict
 
 _ADAPTER_REF = "owner/runs:sft/sft-run"
@@ -133,6 +137,45 @@ def test_init_adapter_preflight_allows_matching_rank_for_uncapped_model():
     spec = _open_policy_spec(rank=64)
 
     preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 64}))
+
+
+def test_opd_reference_rank_preflight_is_independent_from_policy_rank():
+    from flash.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(
+            lora_rank=8,
+            opd_reference_adapter=_ADAPTER_REF,
+            opd_reference_lora_rank=128,
+            opd_objective_ids=("c06",),
+        ),
+    )
+
+    verified = preflight_opd_reference_lora_rank(
+        spec, config_loader=_loader({"r": 64, "rank_pattern": {"layer": 128}})
+    )
+    assert verified.train.lora_rank == 8
+    assert verified.train.opd_reference_lora_rank == 128
+
+
+def test_opd_reference_rank_preflight_rejects_source_metadata_mismatch():
+    from flash.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(
+            lora_rank=8,
+            opd_reference_adapter=_ADAPTER_REF,
+            opd_reference_lora_rank=64,
+            opd_objective_ids=("c11",),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"has rank 128.*source SFT run records.*64"):
+        preflight_opd_reference_lora_rank(spec, config_loader=_loader({"r": 128}))
 
 
 def test_lora_rank_uses_schema_adapter_storage_ref_parser():

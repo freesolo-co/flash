@@ -53,6 +53,33 @@ def test_forward_kl_topk_tail_matches_manual_aggregated_tail():
     assert torch.allclose(actual, expected, atol=1e-6)
 
 
+def test_forward_kl_peaked_policy_matches_stable_oracle_and_tail_gradients():
+    torch = pytest.importorskip("torch")
+    policy = torch.tensor([[50.0, 49.0, 0.5, -0.5]], requires_grad=True)
+    reference = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+
+    actual = forward_kl_topk_tail(policy, reference, top_k=2)
+    actual.backward()
+    actual_grad = policy.grad.detach().clone()
+
+    oracle_policy = policy.detach().clone().requires_grad_(True)
+    reference_lp = reference.float().log_softmax(dim=-1)
+    policy_lp = oracle_policy.float().log_softmax(dim=-1)
+    top_ref_lp, top_idx = reference_lp.topk(2, dim=-1)
+    top_mask = torch.zeros_like(policy_lp, dtype=torch.bool)
+    top_mask.scatter_(1, top_idx, True)
+    reference_tail_lp = torch.logsumexp(reference_lp.masked_fill(top_mask, -torch.inf), dim=-1)
+    policy_tail_lp = torch.logsumexp(policy_lp.masked_fill(top_mask, -torch.inf), dim=-1)
+    oracle = (top_ref_lp.exp() * (top_ref_lp - policy_lp.gather(-1, top_idx))).sum(dim=-1)
+    oracle = oracle + reference_tail_lp.exp() * (reference_tail_lp - policy_tail_lp)
+    oracle = oracle.mean()
+    oracle.backward()
+
+    assert torch.allclose(actual.detach(), oracle.detach(), atol=1e-6)
+    assert torch.allclose(actual_grad, oracle_policy.grad, atol=1e-6)
+    assert torch.count_nonzero(actual_grad[0, 2:]) == 2
+
+
 def test_forward_kl_chunking_is_numerically_stable(monkeypatch):
     torch = pytest.importorskip("torch")
     import flash.engine.worker.opd_objectives as objectives
@@ -94,6 +121,51 @@ def test_sft_relative_margin_direction_ties_and_masking():
 
     reversed_policy = torch.tensor([[0.0, 3.0, 0.0]])
     assert float(sft_relative_top2_margin(reversed_policy, reference[:1])) > 0
+
+
+@pytest.mark.parametrize("objective_id", ["c06", "c11"])
+def test_reference_objectives_normalize_bf16_terms_to_fp32_and_backward(objective_id):
+    torch = pytest.importorskip("torch")
+    policy = torch.tensor(
+        [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0]], dtype=torch.bfloat16, requires_grad=True
+    )
+    reference = torch.tensor([[2.0, 1.0, 0.0], [3.0, 1.0, 0.0]], dtype=torch.bfloat16)
+    plan = OPD_OBJECTIVES.plan((objective_id,))
+    evaluated = OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "completion_logits": policy,
+                "reference_completion_logits": reference,
+                "completion_mask": torch.tensor([True, True]),
+            }
+        ),
+        base_term=torch.tensor(0.0, dtype=torch.float32),
+    )
+
+    term = evaluated.terms[0]
+    assert term.dtype == torch.float32
+    term.backward()
+    assert policy.grad is not None
+    assert torch.isfinite(policy.grad).all()
+
+
+@pytest.mark.parametrize("objective_id", ["c06", "c11"])
+def test_reference_objectives_require_completion_mask(objective_id):
+    torch = pytest.importorskip("torch")
+    plan = OPD_OBJECTIVES.plan((objective_id,))
+
+    with pytest.raises(RuntimeError, match="completion_mask"):
+        OPD_OBJECTIVES.evaluate(
+            plan,
+            ObjectiveView(
+                {
+                    "completion_logits": torch.zeros(1, 3),
+                    "reference_completion_logits": torch.zeros(1, 3),
+                }
+            ),
+            base_term=torch.tensor(0.0),
+        )
 
 
 def test_reference_forward_restores_policy_adapter_on_success_and_failure():
@@ -287,8 +359,15 @@ def test_reference_objectives_declare_extra_cost_and_vram():
         batch_size=1,
         group_size=1,
     )
-    anchored = RunConfig(**{**base.__dict__, "opd_objective_ids": ("c06",)})
+    anchored = RunConfig(
+        **{
+            **base.__dict__,
+            "opd_objective_ids": ("c06",),
+            "opd_reference_lora_rank": 128,
+        }
+    )
     assert seconds_per_step(anchored, "A100-SXM-80GB") > seconds_per_step(base, "A100-SXM-80GB")
+    assert anchored.train_knobs()["opd_reference_lora_rank"] == 128
 
     common = {
         "max_context_tokens": 1024,
@@ -306,8 +385,37 @@ def test_reference_objectives_declare_extra_cost_and_vram():
     assert anchored_vram >= plain_vram
 
 
+def test_reference_rank_increases_vram_and_changes_boundary_routing():
+    from flash.engine.vram import model_required_vram_gb
+    from flash.providers.base import cheapest_gpu
+
+    common = {
+        "lora_rank": 8,
+        "max_context_tokens": 2048,
+        "max_completion_tokens": 1024,
+        "batch_size": 1,
+        "group_size": 4,
+        "opd_objective_ids": ("c06",),
+    }
+    low_rank_need = model_required_vram_gb(
+        "openbmb/MiniCPM5-1B",
+        "opd",
+        train={**common, "opd_reference_lora_rank": 8},
+    )
+    high_rank_need = model_required_vram_gb(
+        "openbmb/MiniCPM5-1B",
+        "opd",
+        train={**common, "opd_reference_lora_rank": 128},
+    )
+
+    assert high_rank_need > low_rank_need
+    assert cheapest_gpu(high_rank_need) != cheapest_gpu(low_rank_need)
+
+
 def test_raw_and_warm_reference_lineage_parse_and_round_trip():
+    from flash.cost.spec import runconfig_from_spec
     from flash.schema import spec_from_dict
+    from flash.schema.fields import ConfigError
     from flash.spec import JobSpec
 
     base = {
@@ -341,6 +449,27 @@ def test_raw_and_warm_reference_lineage_parse_and_round_trip():
     assert restored.train.init_from_adapter == "sft-run/step-20"
     assert restored.train.opd_reference_adapter == "sft-run/step-20"
 
+    internal = JobSpec.from_dict(
+        {
+            **warm.to_dict(),
+            "train": {**warm.to_dict()["train"], "opd_reference_lora_rank": 128},
+        }
+    )
+    assert internal.train.opd_reference_lora_rank == 128
+    assert runconfig_from_spec(internal).opd_reference_lora_rank == 128
+
+    with pytest.raises(ConfigError, match="unknown key"):
+        spec_from_dict(
+            {
+                **base,
+                "train": {
+                    "opd_objective_ids": ["c06"],
+                    "opd_reference_adapter": "sft-run",
+                    "opd_reference_lora_rank": 1,
+                },
+            }
+        )
+
 
 def test_reference_resolution_requires_matching_sft_source(monkeypatch):
     from flash import runner
@@ -370,6 +499,7 @@ def test_reference_resolution_requires_matching_sft_source(monkeypatch):
     monkeypatch.setattr("flash.runner.checkpoints.final_adapter_exists", lambda _spec: True)
     resolved = runner._resolve_opd_reference_adapter(target)
     assert resolved.train.opd_reference_adapter == "owner/repo:sft/sft-run"
+    assert resolved.train.opd_reference_lora_rank == 32
     assert resolved.train.init_from_adapter == ""
 
     monkeypatch.setattr(runner, "get_status", lambda _run_id: status(algorithm="opd"))

@@ -438,6 +438,9 @@ def recover_runs() -> None:
                     owner_org_id=_status_org_id(status),
                     owner_key_id=owner_key_id,
                 )
+                from flash.lora_rank import preflight_opd_reference_lora_rank
+
+                spec = preflight_opd_reference_lora_rank(spec, token=os.environ.get("HF_TOKEN"))
                 # refresh the adapter-reference marker so a child recovered across restarts keeps its aged
                 # source protected from the artifact GC past the age window (best-effort).
                 _mark_warmstart_source(spec, spec.run_id)

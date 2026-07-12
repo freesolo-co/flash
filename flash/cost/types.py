@@ -33,6 +33,8 @@ class RunConfig:
     teacher_model: str = ""
     # opd only: selected auxiliary objectives; reference objectives add a frozen local forward.
     opd_objective_ids: tuple[str, ...] = ()
+    # opd only: verified rank of the separately resident frozen reference adapter.
+    opd_reference_lora_rank: int | None = None
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
@@ -56,7 +58,14 @@ class RunConfig:
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.
-        for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
+        for _name in (
+            "seq_len",
+            "batch_size",
+            "group_size",
+            "completion_len",
+            "lora_rank",
+            "opd_reference_lora_rank",
+        ):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
@@ -126,6 +135,8 @@ class RunConfig:
             knobs["group_size"] = n.group_size
         if self.opd_objective_ids:
             knobs["opd_objective_ids"] = self.opd_objective_ids
+        if self.opd_reference_lora_rank is not None:
+            knobs["opd_reference_lora_rank"] = self.opd_reference_lora_rank
         return knobs
 
 

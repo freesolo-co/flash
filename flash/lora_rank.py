@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from flash.catalog import serving_lora_rank_cap
@@ -161,6 +162,42 @@ def preflight_init_adapter_lora_rank(
             f"Set train.lora_rank={adapter_rank} to match the source adapter (or warm-start from a "
             f"rank-{configured_rank} adapter)."
         )
+
+
+def preflight_opd_reference_lora_rank(
+    spec: JobSpec,
+    *,
+    token: str | None = None,
+    config_loader: AdapterConfigLoader | None = None,
+) -> JobSpec:
+    """Verify the frozen reference adapter rank and return a sizing-safe worker spec."""
+    adapter_storage_ref = (spec.train.opd_reference_adapter or "").strip()
+    if not adapter_storage_ref:
+        return spec
+    if spec.algorithm != "opd":
+        raise ValueError("train.opd_reference_adapter is only valid for OPD runs")
+
+    repo, filename = adapter_config_path_from_ref(adapter_storage_ref)
+    source = f"{repo}:{filename}"
+    loader = config_loader or load_hf_adapter_config
+    config = loader(adapter_storage_ref, token)
+    adapter_rank = rank_from_adapter_config(config, source=source)
+    declared_rank = spec.train.opd_reference_lora_rank
+    if declared_rank is None:
+        raise ValueError(
+            "could not verify train.opd_reference_adapter rank against its source SFT run"
+        )
+    if int(declared_rank) != adapter_rank:
+        raise ValueError(
+            f"train.opd_reference_adapter={adapter_storage_ref!r} has rank {adapter_rank}, but its "
+            f"source SFT run records train.lora_rank={declared_rank}; refusing to size or load "
+            "inconsistent adapter metadata"
+        )
+
+    return replace(
+        spec,
+        train=replace(spec.train, opd_reference_lora_rank=adapter_rank),
+    )
 
 
 def preflight_train_context_within_serving(spec: JobSpec) -> None:

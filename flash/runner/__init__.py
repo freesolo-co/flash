@@ -476,7 +476,10 @@ def _resolve_adapter_field(
                 f"use a concrete checkpoint ref like {src_run_id}/step-N if one exists"
             )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
-    return replace(spec, train=replace(spec.train, **{field: storage}))
+    updates: dict[str, object] = {field: storage}
+    if require_sft:
+        updates["opd_reference_lora_rank"] = int(src_spec.train.lora_rank)
+    return replace(spec, train=replace(spec.train, **updates))
 
 
 def _resolve_init_from_adapter(
@@ -573,10 +576,10 @@ def submit_job(
     from flash.cost.spec import estimate_for_spec
     from flash.lora_rank import (
         preflight_init_adapter_lora_rank,
+        preflight_opd_reference_lora_rank,
         preflight_train_context_within_serving,
     )
 
-    estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
     owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
     worker_spec = _resolve_init_from_adapter(
         public_spec,
@@ -589,7 +592,16 @@ def submit_job(
         owner_key_id=owner_key_id,
     )
     preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
+    worker_spec = preflight_opd_reference_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
     preflight_train_context_within_serving(worker_spec)
+    public_spec = replace(
+        public_spec,
+        train=replace(
+            public_spec.train,
+            opd_reference_lora_rank=worker_spec.train.opd_reference_lora_rank,
+        ),
+    )
+    estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
     if not dry_run:
         # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
         # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
