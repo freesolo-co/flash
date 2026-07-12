@@ -212,7 +212,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         raise RuntimeError(f"opd: {e}") from e
     objective_ids = tuple(getattr(t, "opd_objective_ids", ()) or ()) if t else ()
     try:
-        OPD_OBJECTIVES.resolve(objective_ids)
+        OPD_OBJECTIVES.plan(objective_ids)
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     return OpdKnobs(
@@ -670,6 +670,8 @@ def run_opd():
     entropy_sum = 0.0
     entropy_n = 0
     entropy_floor_active = 0
+    objective_metric_sums: Counter[str] = Counter()
+    objective_metric_counts: Counter[str] = Counter()
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -782,6 +784,11 @@ def run_opd():
             step_ent_n += 1
             if knobs.entropy_floor_coef > 0 and r.entropy < knobs.entropy_floor:
                 entropy_floor_active += 1
+        for metric_name, metric_value in r.objective_metrics:
+            objective_metric_sums[metric_name] += metric_value
+            objective_metric_counts[metric_name] += 1
+            step_objective_metric_sums[metric_name] += metric_value
+            step_objective_metric_counts[metric_name] += 1
         nseq += 1
         # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
         _opd_progress(opt_steps, nseq)
@@ -841,6 +848,8 @@ def run_opd():
                 step_cov = 0.0
                 step_ent_sum = 0.0
                 step_ent_n = 0
+                step_objective_metric_sums: Counter[str] = Counter()
+                step_objective_metric_counts: Counter[str] = Counter()
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
@@ -1061,6 +1070,10 @@ def run_opd():
             avg_cov = step_cov / nseq
             # None when no distilled sample this step carried an entropy (bare test doubles).
             avg_ent = (step_ent_sum / step_ent_n) if step_ent_n else None
+            step_objective_metrics = {
+                name: step_objective_metric_sums[name] / count
+                for name, count in sorted(step_objective_metric_counts.items())
+            }
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
             _w.heartbeat(
@@ -1077,6 +1090,7 @@ def run_opd():
                 entropy=avg_ent,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
+                **step_objective_metrics,
             )
             if _wandb_on:
                 # Best-effort: a W&B network hiccup must never abort a paid training run.
@@ -1088,6 +1102,7 @@ def run_opd():
                         # falls over a collapsing run; should flatten at/above opd_entropy_floor
                         # once the floor is enabled (see _entropy_floor_term).
                         wandb_metrics["opd/entropy"] = avg_ent
+                    wandb_metrics.update(step_objective_metrics)
                     wandb.log(wandb_metrics, step=opt_steps)
             if it % 10 == 0:
                 print(
@@ -1161,6 +1176,10 @@ def run_opd():
     # last heartbeat, and actual_steps_run floors a fully-trained run to 0 (opd_trained isn't a training
     # stage) -- re-pricing paid work as $0 (codex[bot]).
     _w.heartbeat("opd_trained", step=opt_steps, train_wall=train_wall, gpu=gpu_diagnostics())
+    objective_metric_means = {
+        name: objective_metric_sums[name] / count
+        for name, count in sorted(objective_metric_counts.items())
+    }
 
     _w.write_train_meta(
         phase="opd",
@@ -1210,6 +1229,7 @@ def run_opd():
             "entropy_floor": knobs.entropy_floor,
             "mean_student_entropy": (entropy_sum / entropy_n) if entropy_n else None,
             "entropy_floor_active_samples": entropy_floor_active,
+            **({"objective_metrics": objective_metric_means} if objective_metric_means else {}),
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
             "no_signal_resamples": no_signal_resamples,
@@ -1573,6 +1593,7 @@ class _PreparedLoss:
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
+    teacher_scores: tuple = ()
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -1839,6 +1860,8 @@ def _resolve_samples_batched(
 ) -> list[SampleResult]:
     import torch
 
+    objective_ids = tuple(getattr(knobs, "objective_ids", ()) or ())
+    objective_plan = OPD_OBJECTIVES.plan(objective_ids)
     if not samples:
         return []
     results: list[SampleResult | None] = [None] * len(samples)
@@ -1857,8 +1880,6 @@ def _resolve_samples_batched(
     # working with the penalty OFF; the detached mean entropy is computed either way for logging.
     ent_coef = float(getattr(knobs, "entropy_floor_coef", 0.0) or 0.0)
     ent_floor = float(getattr(knobs, "entropy_floor", 0.0) or 0.0)
-    objective_ids = tuple(getattr(knobs, "objective_ids", ()) or ())
-    selected_objectives = OPD_OBJECTIVES.resolve(objective_ids)
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
     eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
@@ -1909,6 +1930,9 @@ def _resolve_samples_batched(
                 gen_tokens=gen.gen_tokens,
                 teacher_tokens=teacher_tokens,
                 group_granularity=group_granularity,
+                teacher_scores=(
+                    tuple(score.teacher_toks) if objective_plan.requirements.teacher_scores else ()
+                ),
             )
         )
 
@@ -1969,18 +1993,22 @@ def _resolve_samples_batched(
                     if ent_term is not None:
                         auxiliary_terms.append(ent_term)
                     objective_metrics = ()
-                    if selected_objectives:
+                    if objective_plan.definitions:
+                        objective_values = {
+                            "prompt_len": prompt_len,
+                            "student_ids": tuple(p.student_ids),
+                            "gkd_groups": p.groups,
+                        }
+                        if objective_plan.requirements.student_logits:
+                            objective_values.update(
+                                sample_logits=logits[row], completion_logits=rows
+                            )
+                        if objective_plan.requirements.teacher_scores:
+                            objective_values["teacher_scores"] = p.teacher_scores
                         objective_evaluation = OPD_OBJECTIVES.evaluate(
-                            objective_ids,
-                            ObjectiveView(
-                                {
-                                    "sample_logits": logits[row],
-                                    "completion_logits": rows,
-                                    "prompt_len": prompt_len,
-                                    "student_ids": tuple(p.student_ids),
-                                    "gkd_groups": p.groups,
-                                }
-                            ),
+                            objective_plan,
+                            ObjectiveView(objective_values),
+                            base_term=loss,
                         )
                         auxiliary_terms.extend(objective_evaluation.terms)
                         objective_metrics = tuple(objective_evaluation.metrics.items())

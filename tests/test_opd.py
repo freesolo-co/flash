@@ -1917,6 +1917,97 @@ def test_opd_initializes_and_logs_to_wandb_when_configured(monkeypatch):
     assert step == 1, "wandb.log must be keyed by opt_steps (1 after the single update)"
 
 
+def test_opd_propagates_objective_metric_means(monkeypatch):
+    import sys
+    import types
+
+    torch = pytest.importorskip("torch")
+    beats = []
+    logs = []
+    meta = {}
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.log = lambda data, step=None: logs.append((dict(data), step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    values = iter((2.0, 4.0))
+
+    def _successful_sample(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        metric = next(values)
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+            objective_metrics=(("opd/objectives/candidate/score", metric),),
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_successful_sample,
+        beats=beats,
+        epochs=1,
+        group=2,
+    )
+    monkeypatch.setattr(opd_mod._w, "wandb_report_to", lambda: ["wandb"])
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kwargs: meta.update(kwargs))
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: None)
+
+    opd_mod.run_opd()
+
+    step_beats = [
+        fields
+        for stage, fields in beats
+        if stage == "opd_step" and fields.get("step") == 1 and "loss" in fields
+    ]
+    assert step_beats[-1]["opd/objectives/candidate/score"] == 3.0
+    assert logs[-1][0]["opd/objectives/candidate/score"] == 3.0
+    assert logs[-1][1] == 1
+    assert meta["notes"]["objective_metrics"] == {"opd/objectives/candidate/score": 3.0}
+
+
+def test_opd_objective_metrics_disabled_path_adds_no_output_fields(monkeypatch):
+    import sys
+    import types
+
+    pytest.importorskip("torch")
+    beats = []
+    logs = []
+    meta = {}
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.log = lambda data, step=None: logs.append((dict(data), step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    def _successful_sample(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_successful_sample,
+        beats=beats,
+        epochs=1,
+        group=1,
+    )
+    monkeypatch.setattr(opd_mod._w, "wandb_report_to", lambda: ["wandb"])
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kwargs: meta.update(kwargs))
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: None)
+
+    opd_mod.run_opd()
+
+    assert not any(key.startswith("opd/objectives/") for _stage, fields in beats for key in fields)
+    assert not any(key.startswith("opd/objectives/") for fields, _step in logs for key in fields)
+    assert "objective_metrics" not in meta["notes"]
+
+
 def test_opd_skips_wandb_logging_when_not_configured(monkeypatch):
     """W&B OFF (no WANDB_API_KEY -> wandb_report_to() returns []): run_opd must NOT import/log to wandb,
     so a run completes its optimizer steps without touching the (here, exploding) wandb module."""
@@ -3223,6 +3314,34 @@ def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkey
         ei.value.permanent is False
     )  # 503 retryable -> transient TeacherError, not a raw exception
     assert "503" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("objective_ids", "message"),
+    [
+        (("future-objective",), "unknown opd objective id"),
+        (("c0", "c0"), "duplicate opd objective id"),
+    ],
+)
+def test_resolve_opd_knobs_strictly_validates_persisted_objective_ids(
+    monkeypatch, objective_ids, message
+):
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        opd_objective_ids = objective_ids
+
+        def __getattr__(self, name):
+            return None
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train()), THINKING=False),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        opd_mod._resolve_opd_knobs()
 
 
 def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):

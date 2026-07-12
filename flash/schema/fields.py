@@ -100,7 +100,7 @@ def _train_stops(train_raw: dict) -> tuple[str, ...]:
 
 def _train_opd_objective_ids(train_raw: dict, algorithm: str) -> tuple[str, ...]:
     """validate the closed opd objective id list before any worker is provisioned."""
-    from flash.spec import normalize_opd_objective_ids
+    from flash.opd_objectives import normalize_opd_objective_ids
 
     try:
         return normalize_opd_objective_ids(

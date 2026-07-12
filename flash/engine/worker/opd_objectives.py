@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
+import numbers
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-_OBJECTIVE_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+from flash.opd_objectives import OPD_OBJECTIVE_IDS, validate_opd_objective_id
+
 _METRIC_NAME_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 
 
@@ -19,16 +21,10 @@ def _immutable_mapping(values: Mapping[str, Any] | None = None) -> Mapping[str, 
 
 @dataclass(frozen=True)
 class ObjectiveRequirements:
-    """declared runtime work needed by one objective."""
+    """runtime values needed by one objective without extra model or network calls."""
 
     student_logits: bool = False
     teacher_scores: bool = False
-    extra_forwards: int = 0
-    network_calls: int = 0
-
-    def __post_init__(self) -> None:
-        if self.extra_forwards < 0 or self.network_calls < 0:
-            raise ValueError("objective requirements cannot contain negative work counts")
 
 
 @dataclass(frozen=True)
@@ -70,10 +66,19 @@ class ObjectiveDefinition:
     evaluate: ObjectiveFunction
 
     def __post_init__(self) -> None:
-        if not _OBJECTIVE_ID_RE.fullmatch(self.objective_id):
-            raise ValueError(
-                f"objective id must match [a-z][a-z0-9_.-]*, got {self.objective_id!r}"
-            )
+        validate_opd_objective_id(self.objective_id)
+
+
+@dataclass(frozen=True)
+class ObjectivePlan:
+    """resolved definitions and their aggregate no-extra-work requirements."""
+
+    definitions: tuple[ObjectiveDefinition, ...] = ()
+    requirements: ObjectiveRequirements = field(default_factory=ObjectiveRequirements)
+
+    @property
+    def objective_ids(self) -> tuple[str, ...]:
+        return tuple(definition.objective_id for definition in self.definitions)
 
 
 @dataclass(frozen=True)
@@ -88,39 +93,66 @@ class ObjectiveEvaluation:
         object.__setattr__(self, "metrics", _immutable_mapping(self.metrics))
 
 
-def _detached_float(value: object, *, context: str) -> float:
-    detached = value.detach() if hasattr(value, "detach") else value
-    if hasattr(detached, "numel") and int(detached.numel()) != 1:
-        raise RuntimeError(f"{context} must be a scalar")
-    if hasattr(detached, "item"):
-        detached = detached.item()
+def _torch_module():
     try:
-        number = float(detached)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{context} must be numeric") from exc
+        import torch
+    except ImportError:
+        return None
+    return torch
+
+
+def _detached_float(value: object, *, context: str) -> float:
+    torch = _torch_module()
+    if torch is not None and torch.is_tensor(value):
+        detached = value.detach()
+        if detached.numel() != 1:
+            raise RuntimeError(f"{context} must be a scalar")
+        if detached.dtype == torch.bool or torch.is_complex(detached):
+            raise RuntimeError(f"{context} must be a real numeric scalar")
+        number = float(detached.item())
+    else:
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise RuntimeError(f"{context} must be a real numeric scalar")
+        number = float(value)
     if not math.isfinite(number):
         raise RuntimeError(f"{context} must be finite")
     return number
 
 
-def _require_finite_term(term: object, *, objective_id: str) -> None:
-    detached = term.detach() if hasattr(term, "detach") else term
-    if hasattr(detached, "numel") and int(detached.numel()) != 1:
-        raise RuntimeError(f"opd objective {objective_id!r} returned a non-scalar term")
-    if hasattr(detached, "isfinite"):
-        finite = detached.isfinite()
-        if hasattr(finite, "all"):
-            finite = finite.all()
-        if hasattr(finite, "item"):
-            finite = finite.item()
-        if not bool(finite):
-            raise RuntimeError(f"opd objective {objective_id!r} returned a non-finite term")
-        return
-    _detached_float(term, context=f"opd objective {objective_id!r} term")
+def _normalize_term(term: object, *, objective_id: str, base_term: object) -> object:
+    context = f"opd objective {objective_id!r} term"
+    torch = _torch_module()
+    if torch is not None and torch.is_tensor(term):
+        if term.numel() != 1:
+            raise RuntimeError(f"{context} must be a one-element tensor")
+        if term.dtype == torch.bool or torch.is_complex(term):
+            raise RuntimeError(f"{context} must be a real tensor")
+        if not bool(torch.isfinite(term.detach()).all().item()):
+            raise RuntimeError(f"{context} must be finite")
+        if not torch.is_tensor(base_term):
+            raise RuntimeError(f"{context} requires a tensor base gkd loss")
+        if term.device != base_term.device:
+            raise RuntimeError(
+                f"{context} device {term.device} does not match base gkd loss device "
+                f"{base_term.device}"
+            )
+        if term.dtype != base_term.dtype:
+            raise RuntimeError(
+                f"{context} dtype {term.dtype} does not match base gkd loss dtype {base_term.dtype}"
+            )
+        return term.reshape(())
+    if isinstance(term, bool) or not isinstance(term, numbers.Real):
+        raise RuntimeError(f"{context} must be a real numeric scalar or one-element tensor")
+    number = float(term)
+    if not math.isfinite(number):
+        raise RuntimeError(f"{context} must be finite")
+    if torch is not None and torch.is_tensor(base_term):
+        return base_term.new_tensor(number)
+    return number
 
 
 class ObjectiveRegistry:
-    """immutable objective lookup and evaluator with strict id validation."""
+    """immutable objective lookup, planning, and evaluation."""
 
     def __init__(self, definitions: Iterable[ObjectiveDefinition]) -> None:
         entries: dict[str, ObjectiveDefinition] = {}
@@ -143,6 +175,7 @@ class ObjectiveRegistry:
         seen: set[str] = set()
         duplicate: list[str] = []
         for objective_id in requested:
+            validate_opd_objective_id(objective_id)
             if objective_id in seen and objective_id not in duplicate:
                 duplicate.append(objective_id)
             seen.add(objective_id)
@@ -158,10 +191,26 @@ class ObjectiveRegistry:
             )
         return tuple(self._definitions[objective_id] for objective_id in requested)
 
-    def evaluate(self, objective_ids: Iterable[str], view: ObjectiveView) -> ObjectiveEvaluation:
+    def plan(self, objective_ids: Iterable[str]) -> ObjectivePlan:
+        definitions = self.resolve(objective_ids)
+        return ObjectivePlan(
+            definitions=definitions,
+            requirements=ObjectiveRequirements(
+                student_logits=any(d.requirements.student_logits for d in definitions),
+                teacher_scores=any(d.requirements.teacher_scores for d in definitions),
+            ),
+        )
+
+    def evaluate(
+        self,
+        plan: ObjectivePlan,
+        view: ObjectiveView,
+        *,
+        base_term: object,
+    ) -> ObjectiveEvaluation:
         terms: list[object] = []
         metrics: dict[str, float] = {}
-        for definition in self.resolve(objective_ids):
+        for definition in plan.definitions:
             if definition.requirements.student_logits:
                 view.require("completion_logits")
             if definition.requirements.teacher_scores:
@@ -172,8 +221,13 @@ class ObjectiveRegistry:
                     f"opd objective {definition.objective_id!r} must return ObjectiveResult"
                 )
             if result.term is not None:
-                _require_finite_term(result.term, objective_id=definition.objective_id)
-                terms.append(result.term)
+                terms.append(
+                    _normalize_term(
+                        result.term,
+                        objective_id=definition.objective_id,
+                        base_term=base_term,
+                    )
+                )
             for name, value in result.metrics.items():
                 if not _METRIC_NAME_RE.fullmatch(name):
                     raise ValueError(
@@ -200,3 +254,9 @@ OPD_OBJECTIVES = ObjectiveRegistry(
         ),
     )
 )
+
+if OPD_OBJECTIVES.objective_ids != OPD_OBJECTIVE_IDS:
+    raise RuntimeError(
+        "worker opd objective definitions do not match shared objective identifiers: "
+        f"{OPD_OBJECTIVES.objective_ids!r} != {OPD_OBJECTIVE_IDS!r}"
+    )
