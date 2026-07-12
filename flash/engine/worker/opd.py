@@ -25,7 +25,7 @@ import contextlib
 import os
 import random
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 
@@ -52,9 +52,21 @@ from flash.engine.worker.opd_gkd import (
     _trim_trailing_stop,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.opd_listwise import (
+    C14_STUDENT_CONTINUATIONS,
+    ExactTeacherScoreCache,
+    TeacherInputBudget,
+    TeacherScoreCacheKey,
+    build_continuation_record,
+    detached_target_distribution,
+    listwise_sequence_score_loss,
+    select_teacher_candidates,
+    student_sequence_score,
+)
 from flash.engine.worker.opd_objectives import (
     OPD_OBJECTIVES,
     CvarEntropyConfig,
+    ObjectivePlan,
     ObjectiveView,
     PositionStatistics,
 )
@@ -487,6 +499,12 @@ def run_opd():
     recover_empty_rollouts = any(
         definition.config.recover_empty_rollouts for definition in objective_plan.definitions
     )
+    c14_enabled = "c14" in knobs.objective_ids
+    if c14_enabled and multi_turn:
+        raise RuntimeError("opd c14 continuation-level listwise distillation requires a single-turn environment")
+    if c14_enabled:
+        knobs = replace(knobs, group_size=C14_STUDENT_CONTINUATIONS)
+
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
@@ -636,6 +654,19 @@ def run_opd():
         f"{prompts_per_step} prompts/step -> steps={steps}"
         + (f" (planned ceiling from {uncapped_steps})" if ceiling_applied else "")
     )
+    teacher_score_cache = ExactTeacherScoreCache() if c14_enabled else None
+    teacher_input_budget = None
+    if c14_enabled:
+        ordinary_run_tokens = 0
+        for planned_step in range(steps):
+            for prompt_offset in range(prompts_per_step):
+                _, _, planned_prompt_ids = examples[
+                    (planned_step * prompts_per_step + prompt_offset) % len(examples)
+                ]
+                ordinary_run_tokens += C14_STUDENT_CONTINUATIONS * (
+                    len(planned_prompt_ids) + knobs.max_completion
+                )
+        teacher_input_budget = TeacherInputBudget(ordinary_run_tokens)
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
     # setup so an all-over-budget dataset fails before this download). Still inside the setup phase
@@ -809,6 +840,7 @@ def run_opd():
     teacher_ok = 0
     teacher_transient = 0
     teacher_error = 0
+    teacher_budget_exhausted = 0
     skip_counts: Counter[str] = Counter()
     no_signal_resamples = 0
     no_signal_skipped_steps = 0
@@ -870,6 +902,7 @@ def run_opd():
             teacher_ok, \
             teacher_transient, \
             teacher_error, \
+            teacher_budget_exhausted, \
             truncated_rollouts, \
             step_loss, \
             step_cov
@@ -882,6 +915,8 @@ def run_opd():
             teacher_transient += 1
         elif r.teacher_status == "error":
             teacher_error += 1
+        elif r.teacher_status == "budget_exhausted":
+            teacher_budget_exhausted += 1
         if r.truncated:
             truncated_rollouts += 1
         # Update the runaway EMA once per accounted rollout (truncated or not) so terminal-EOS
@@ -1004,17 +1039,26 @@ def run_opd():
                 ) -> None:
                     def _score_many_timed(batch: list[_Pending]):
                         started = time.perf_counter()
-                        retain_teacher_prompts = _retain_candidate_teacher_prompt(
-                            batch,
-                            cadence=knobs.topk_cadence,
-                            candidate_topk=topk_meter is not None,
-                        )
-                        scores = _score_many(
-                            teacher,
-                            batch,
-                            thinking_prefill=thinking_prefill,
-                            retain_teacher_prompts=retain_teacher_prompts,
-                        )
+                        if c14_enabled:
+                            scores = _score_many_c14(
+                                teacher,
+                                batch,
+                                thinking_prefill=thinking_prefill,
+                                cache=teacher_score_cache,
+                                budget=teacher_input_budget,
+                            )
+                        else:
+                            retain_teacher_prompts = _retain_candidate_teacher_prompt(
+                                batch,
+                                cadence=knobs.topk_cadence,
+                                candidate_topk=topk_meter is not None,
+                            )
+                            scores = _score_many(
+                                teacher,
+                                batch,
+                                thinking_prefill=thinking_prefill,
+                                retain_teacher_prompts=retain_teacher_prompts,
+                            )
                         return scores, time.perf_counter() - started
 
                     for i in range(0, len(pendings), teacher_batch_size):
@@ -1086,7 +1130,19 @@ def run_opd():
                     scored_samples = []
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
-                        scored_samples.append((p.gen, score, p.prompt_ids))
+                        if c14_enabled:
+                            scored_samples.append(
+                                _ScoredContinuation(
+                                    gen=p.gen,
+                                    score=score,
+                                    prompt_ids=p.prompt_ids,
+                                    example=p.example,
+                                    prompt_key=p.prompt_key,
+                                    candidate_index=p.candidate_index,
+                                )
+                            )
+                        else:
+                            scored_samples.append((p.gen, score, p.prompt_ids))
                     if objective_plan.requirements.repetition_weighting:
                         _step_scored_samples.extend(scored_samples)
                         return
@@ -1173,13 +1229,28 @@ def run_opd():
                                 )
                             _drain_ready_teacher_futures()
                 else:
-                    contexts: list[tuple[list[int], object]] = []
+                    contexts: list[tuple[list[int], object, object, str, int]] = []
                     prompts: list[list[int]] = []
-                    for _ex, prompt_messages, prompt_ids in batch:
-                        for _g in range(group):
-                            contexts.append((prompt_ids, prompt_messages))
+                    for prompt_offset, (_ex, prompt_messages, prompt_ids) in enumerate(batch):
+                        prompt_key = f"{it}:{prompt_offset}"
+                        for candidate_index in range(group):
+                            contexts.append(
+                                (
+                                    prompt_ids,
+                                    prompt_messages,
+                                    _ex,
+                                    prompt_key,
+                                    candidate_index,
+                                )
+                            )
                             prompts.append(prompt_ids)
                     chunk_size = _opd_rollout_chunk_size(len(prompts))
+                    if c14_enabled:
+                        chunk_size = max(
+                            C14_STUDENT_CONTINUATIONS,
+                            chunk_size
+                            - (chunk_size % C14_STUDENT_CONTINUATIONS),
+                        )
                     for start in range(0, len(prompts), chunk_size):
                         end = start + chunk_size
                         chunk_prompts = prompts[start:end]
@@ -1216,11 +1287,20 @@ def run_opd():
                             )
                             opd_phase_counts["rollout_generate_calls"] += 1
                         scorable: list[_Pending] = []
-                        for gen, (prompt_ids, prompt_messages) in zip(
-                            gens, chunk_contexts, strict=True
-                        ):
+                        for gen, (
+                            prompt_ids,
+                            prompt_messages,
+                            example,
+                            prompt_key,
+                            candidate_index,
+                        ) in zip(gens, chunk_contexts, strict=True):
                             p = _Pending(
-                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                                gen=gen,
+                                prompt_ids=prompt_ids,
+                                prompt_messages=prompt_messages,
+                                example=example,
+                                prompt_key=prompt_key,
+                                candidate_index=candidate_index,
                             )
                             if gen.skip or gen.truncated:
                                 if recover_empty_rollouts and gen.skip_reason == "empty_completion":
@@ -1372,6 +1452,11 @@ def run_opd():
 
     train_wall = time.time() - t_train
     if not loss_curve:
+        if teacher_budget_exhausted > 0:
+            raise RuntimeError(
+                "opd c14 teacher-input budget_exhausted before a trained step; "
+                "the hard 2.0 ordinary-run-equivalent cap refused the next teacher call"
+            )
         if teacher_ok == 0 and teacher_transient > 0:
             # No sample ever got a teacher score and every failure was a RETRYABLE outage (5xx /
             # timeout / rate-limit): a Fireworks outage that happened to span the whole run. Raise a
@@ -1397,9 +1482,15 @@ def run_opd():
             f"opd reached only {opt_steps}/{steps} optimizer updates within {max_iters} iterations "
             f"({n_over_budget} prompts pre-filtered over budget, {truncated_rollouts} non-terminated "
             f"rollouts, {teacher_transient} transient teacher failures, {teacher_error} teacher errors, "
+            f"{teacher_budget_exhausted} budget_exhausted candidates, "
             f"{no_signal_resamples} no-signal resamples, {no_signal_skipped_steps} no-signal skipped "
             f"steps, skip reasons: {_format_skip_counts(skip_counts)})"
         )
+        if teacher_budget_exhausted > 0:
+            raise RuntimeError(
+                f"{diag} — budget_exhausted: the hard 2.0 ordinary-run-equivalent teacher-input "
+                "cap refused the next call before crossing"
+            )
         if teacher_transient > 0:
             # SOME scoring calls hit a RETRYABLE teacher outage: a healthier teacher next attempt may
             # complete the remaining updates, so RETRY rather than ship short (codex[bot]).
@@ -1501,6 +1592,18 @@ def run_opd():
             ),
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
+            "budget_exhausted": bool(
+                teacher_input_budget and teacher_input_budget.budget_exhausted
+            ),
+            "teacher_input_cap_tokens": (
+                teacher_input_budget.cap_tokens if teacher_input_budget else None
+            ),
+            "teacher_input_budget_used_tokens": (
+                teacher_input_budget.used_tokens if teacher_input_budget else None
+            ),
+            "teacher_score_cache_entries": (
+                len(teacher_score_cache) if teacher_score_cache is not None else None
+            ),
             "no_signal_resamples": no_signal_resamples,
             "no_signal_skipped_steps": no_signal_skipped_steps,
             "skip_reasons": dict(sorted(skip_counts.items())),
@@ -1636,6 +1739,8 @@ class _GenResult:
     skip_reason: str = ""
     # eos, stop_sequence, stop, length, or unknown; preserved for objective gating and telemetry.
     termination_cause: str = ""
+    terminal_eos: bool = False
+    length_terminated: bool = False
     # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
     # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
     forced: tuple = ()
@@ -1654,6 +1759,8 @@ class _ScoreResult:
     status: str = "ok"
     error: str = ""
     teacher_prompt: str = ""
+    input_tokens: int | None = None
+    cache_hit: bool = False
 
 
 def _sample_skip_reason(r: SampleResult) -> str:
@@ -1667,6 +1774,8 @@ def _sample_skip_reason(r: SampleResult) -> str:
         return "teacher_transient"
     if r.teacher_status == "error":
         return "teacher_error"
+    if r.teacher_status == "budget_exhausted":
+        return "budget_exhausted"
     if r.teacher_status == "ok":
         return "alignment_empty"
     return "pre_teacher_skip"
@@ -1680,7 +1789,20 @@ class _Pending:
     gen: _GenResult
     prompt_ids: object
     prompt_messages: object
+    example: object = None
+    prompt_key: str = ""
+    candidate_index: int = 0
     score: object = None
+
+
+@dataclass(frozen=True)
+class _ScoredContinuation:
+    gen: _GenResult
+    score: _ScoreResult
+    prompt_ids: object
+    example: object = None
+    prompt_key: str = ""
+    candidate_index: int = 0
 
 
 def _termination_cause(out: OpdVllmOutput, completion_ids, stop_text: str, eos_ids, stops) -> str:
@@ -1720,6 +1842,17 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _G
     termination_cause = _termination_cause(
         out, completion_ids, stop_text, eos_ids, knobs.stop_sequences
     )
+    stop_reason = getattr(out, "stop_reason", None)
+    terminal_eos = bool(
+        ((out.finish_reason or "").lower() == "eos")
+        or (completion_ids and int(completion_ids[-1]) in eos_ids)
+        or (
+            isinstance(stop_reason, int)
+            and not isinstance(stop_reason, bool)
+            and stop_reason in eos_ids
+        )
+    )
+    length_terminated = (out.finish_reason or "").lower() == "length"
     if not (
         out.terminated
         or _rollout_terminated(
@@ -1736,6 +1869,8 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _G
             gen_tokens=len(completion_ids),
             skip_reason="truncated_rollout",
             termination_cause=termination_cause,
+            terminal_eos=terminal_eos,
+            length_terminated=length_terminated,
             forced=forced[: len(completion_ids)],
         )
     # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
@@ -1766,6 +1901,8 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _G
         completion_text=completion_text,
         gen_tokens=gen_tokens,
         termination_cause=termination_cause,
+        terminal_eos=terminal_eos,
+        length_terminated=length_terminated,
         # Trimming drops a trailing stop suffix, so the kept ids are a prefix -> slice forced to match.
         forced=forced[: len(completion_ids)],
     )
@@ -2046,6 +2183,85 @@ def _score_many(
     ]
 
 
+def _score_many_c14(
+    teacher,
+    pendings: list[_Pending],
+    *,
+    thinking_prefill,
+    cache: ExactTeacherScoreCache,
+    budget: TeacherInputBudget,
+    max_attempts: int = 2,
+) -> list[_ScoreResult]:
+    """score c14 candidates with exact caching and a pre-call hard input cap."""
+    if not pendings:
+        return []
+    input_tokens = [len(p.prompt_ids) + p.gen.gen_tokens for p in pendings]
+    if not budget.preflight(input_tokens):
+        return [
+            _ScoreResult(status="budget_exhausted", error="teacher input budget exhausted")
+            for _ in pendings
+        ]
+    prompts = [
+        (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
+        for p in pendings
+    ]
+    keys = [
+        TeacherScoreCacheKey(str(getattr(teacher, "model", "")), prompt, completion)
+        for prompt, completion in prompts
+    ]
+    results: list[_ScoreResult | None] = [None] * len(pendings)
+    missing_by_key: dict[TeacherScoreCacheKey, tuple[int, _Pending]] = {}
+    for index, (key, pending) in enumerate(zip(keys, pendings, strict=True)):
+        cached = cache.get(key)
+        if isinstance(cached, _ScoreResult):
+            results[index] = replace(cached, input_tokens=0, cache_hit=True)
+        elif key not in missing_by_key:
+            missing_by_key[key] = (index, pending)
+    missing = list(missing_by_key.values())
+    if missing:
+        missing_tokens = [len(p.prompt_ids) + p.gen.gen_tokens for _, p in missing]
+        scored = None
+        for attempt in range(max(1, int(max_attempts))):
+            if not budget.charge(missing_tokens):
+                scored = [
+                    _ScoreResult(status="budget_exhausted", error="teacher input budget exhausted")
+                    for _ in missing
+                ]
+                break
+            scored = _score_many(
+                teacher,
+                [pending for _, pending in missing],
+                thinking_prefill=thinking_prefill,
+                max_attempts=1,
+            )
+            if not any(result.status == "transient" for result in scored) or attempt + 1 >= max_attempts:
+                break
+        assert scored is not None
+        for (first_index, pending), result in zip(missing, scored, strict=True):
+            key = keys[first_index]
+            request_tokens = (
+                0
+                if result.status == "budget_exhausted"
+                else len(pending.prompt_ids) + pending.gen.gen_tokens
+            )
+            charged_result = replace(result, input_tokens=request_tokens, cache_hit=False)
+            if result.status == "ok":
+                cache.put(key, result)
+            for index, candidate_key in enumerate(keys):
+                if candidate_key == key:
+                    results[index] = (
+                        charged_result
+                        if index == first_index
+                        else replace(result, input_tokens=0, cache_hit=True)
+                    )
+    return [
+        result
+        if result is not None
+        else _ScoreResult(status="error", error="teacher score cache resolution failed")
+        for result in results
+    ]
+
+
 @dataclass(frozen=True)
 class _PreparedGkdGroups:
     token_indices: tuple[int, ...]
@@ -2103,6 +2319,9 @@ class _PreparedLoss:
     empty_rollout: bool = False
     termination_cause: str = ""
     score_result: object = None
+    continuation_record: object = None
+    prompt_key: str = ""
+    candidate_index: int = 0
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -2489,7 +2708,7 @@ def _resolve_samples_batched(
     model,
     tok,
     device,
-    samples: list[tuple[_GenResult, _ScoreResult, object]],
+    samples: list[tuple[_GenResult, _ScoreResult, object] | _ScoredContinuation],
     knobs,
     microbatch: int,
     *,
@@ -2506,8 +2725,40 @@ def _resolve_samples_batched(
     objective_plan = OPD_OBJECTIVES.plan(objective_ids)
     if objective_plan.requirements.candidate_topk and (teacher is None or topk_meter is None):
         raise RuntimeError("opd c13 requires a teacher client and teacher-input meter")
+    sample_objective_plan = ObjectivePlan(
+        definitions=tuple(
+            definition
+            for definition in objective_plan.definitions
+            if not definition.requirements.continuation_records
+        ),
+        requirements=replace(objective_plan.requirements, continuation_records=False),
+    )
+    c14_plan = ObjectivePlan(
+        definitions=tuple(
+            definition
+            for definition in objective_plan.definitions
+            if definition.requirements.continuation_records
+        ),
+        requirements=objective_plan.requirements,
+    )
     if not samples:
         return []
+    valid_c14_prompt_keys: set[str] | None = None
+    if c14_plan.definitions:
+        c14_group_counts: Counter[str] = Counter()
+        c14_ok_counts: Counter[str] = Counter()
+        for sample in samples:
+            if not isinstance(sample, _ScoredContinuation):
+                continue
+            c14_group_counts[sample.prompt_key] += 1
+            if sample.score is not None and sample.score.status == "ok":
+                c14_ok_counts[sample.prompt_key] += 1
+        valid_c14_prompt_keys = {
+            prompt_key
+            for prompt_key, count in c14_group_counts.items()
+            if count == C14_STUDENT_CONTINUATIONS
+            and c14_ok_counts[prompt_key] == C14_STUDENT_CONTINUATIONS
+        }
     results: list[SampleResult | None] = [None] * len(samples)
     prepared: list[_PreparedLoss] = []
     # Terminal-EOS supervision config (see _eos_reinforce_term). Resolved once — the model/tokenizer
@@ -2544,7 +2795,39 @@ def _resolve_samples_batched(
     )
     eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 or objective_eos else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
-    for idx, (gen, score, prompt_ids) in enumerate(samples):
+    for idx, sample in enumerate(samples):
+        if isinstance(sample, _ScoredContinuation):
+            gen = sample.gen
+            score = sample.score
+            prompt_ids = sample.prompt_ids
+            example = sample.example
+            prompt_key = sample.prompt_key
+            candidate_index = sample.candidate_index
+        else:
+            gen, score, prompt_ids = sample
+            example = None
+            prompt_key = str(tuple(int(token_id) for token_id in prompt_ids))
+            candidate_index = idx
+        if (
+            valid_c14_prompt_keys is not None
+            and isinstance(sample, _ScoredContinuation)
+            and prompt_key not in valid_c14_prompt_keys
+            and not gen.truncated
+            and not gen.skip
+            and score is not None
+            and score.status == "ok"
+        ):
+            results[idx] = SampleResult(
+                teacher_status="ok",
+                gen_tokens=gen.gen_tokens,
+                teacher_tokens=(
+                    score.input_tokens
+                    if score.input_tokens is not None
+                    else len(prompt_ids) + gen.gen_tokens
+                ),
+                skip_reason="listwise_group_incomplete",
+            )
+            continue
         recover_empty = (
             objective_plan.requirements.empty_rollouts
             and objective_empty_recovery
@@ -2578,7 +2861,11 @@ def _resolve_samples_batched(
         if gen.truncated or gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
-        teacher_tokens = len(prompt_ids) + gen.gen_tokens
+        teacher_tokens = (
+            score.input_tokens
+            if score.input_tokens is not None
+            else len(prompt_ids) + gen.gen_tokens
+        )
         student_ids, student_toks = student_tokens_with_offsets(
             tok, gen.completion_ids, gen.completion_text
         )
@@ -2611,6 +2898,19 @@ def _resolve_samples_batched(
                 skip_reason="alignment_empty",
             )
             continue
+        continuation_record = None
+        if objective_plan.requirements.continuation_records:
+            continuation_record = build_continuation_record(
+                prompt_key=prompt_key,
+                candidate_index=candidate_index,
+                prompt_ids=prompt_ids,
+                completion_ids=student_ids,
+                completion_text=gen.completion_text,
+                teacher_tokens=score.teacher_toks,
+                example=example,
+                terminal_eos=gen.terminal_eos,
+                length_terminated=gen.length_terminated,
+            )
         prepared.append(
             _PreparedLoss(
                 idx=idx,
@@ -2633,6 +2933,9 @@ def _resolve_samples_batched(
                 sequence_weight=1.0,
                 termination_cause=gen.termination_cause,
                 score_result=score if objective_plan.requirements.candidate_topk else None,
+                continuation_record=continuation_record,
+                prompt_key=prompt_key,
+                candidate_index=candidate_index,
             )
         )
 
@@ -2650,6 +2953,8 @@ def _resolve_samples_batched(
         model.config.use_cache = False
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
         mb = max(1, int(microbatch))
+        if c14_plan.definitions:
+            mb = max(mb, C14_STUDENT_CONTINUATIONS)
         for start in range(0, len(prepared), mb):
             chunk = prepared[start : start + mb]
             _bump_model_counter(model, "_flash_opd_full_logits_batches")
@@ -2675,6 +2980,59 @@ def _resolve_samples_batched(
             reference_logits = None
             if objective_plan.requirements.frozen_sft_reference:
                 reference_logits = _reference_forward_logits(model, input_ids, attention_mask)
+            c14_terms: dict[int, tuple[object, tuple[tuple[str, float], ...]]] = {}
+            if c14_plan.definitions:
+                prompt_groups: dict[str, list[tuple[_PreparedLoss, object]]] = defaultdict(list)
+                for row, prepared_loss in enumerate(chunk):
+                    prompt_len = len(prepared_loss.prompt_ids)
+                    comp_len = len(prepared_loss.student_ids)
+                    rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                    prompt_groups[prepared_loss.prompt_key].append(
+                        (
+                            prepared_loss,
+                            student_sequence_score(rows, prepared_loss.student_ids),
+                        )
+                    )
+                for prompt_group in prompt_groups.values():
+                    prompt_group.sort(key=lambda item: item[0].candidate_index)
+                    records = select_teacher_candidates(
+                        [item[0].continuation_record for item in prompt_group]
+                    )
+                    if len(records) != C14_STUDENT_CONTINUATIONS:
+                        continue
+                    selected = [
+                        item
+                        for item in prompt_group
+                        if item[0].continuation_record in records
+                    ]
+                    selected.sort(key=lambda item: records.index(item[0].continuation_record))
+                    target = detached_target_distribution(records)
+                    sequence_scores = torch.stack([item[1] for item in selected])
+                    listwise_loss = listwise_sequence_score_loss(sequence_scores, target)
+                    target_entropy = float(
+                        (-(target * target.clamp_min(1e-12).log()).sum()).detach()
+                    )
+                    evaluation = OPD_OBJECTIVES.evaluate(
+                        c14_plan,
+                        ObjectiveView(
+                            {
+                                "completion_logits": sequence_scores,
+                                "teacher_scores": tuple(
+                                    record.teacher_logprob for record in records
+                                ),
+                                "continuation_records": records,
+                                "listwise_loss": listwise_loss,
+                                "target_entropy": target_entropy,
+                            }
+                        ),
+                        base_term=listwise_loss,
+                    )
+                    first = selected[0][0]
+                    if evaluation.terms:
+                        c14_terms[first.idx] = (
+                            sum(evaluation.terms),
+                            tuple(evaluation.metrics.items()),
+                        )
             losses = []
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
@@ -2727,7 +3085,7 @@ def _resolve_samples_batched(
                     if ent_term is not None:
                         auxiliary_terms.append(ent_term)
                     objective_metrics: tuple[tuple[str, float], ...] = ()
-                    if objective_plan.definitions:
+                    if sample_objective_plan.definitions:
                         objective_values = {
                             "prompt_len": prompt_len,
                             "student_ids": tuple(p.student_ids),
@@ -2743,18 +3101,18 @@ def _resolve_samples_batched(
                             "repetition_analysis": p.repetition_analysis,
                             "sequence_weight": p.sequence_weight,
                         }
-                        if objective_plan.requirements.student_logits:
+                        if sample_objective_plan.requirements.student_logits:
                             objective_values.update(
                                 sample_logits=logits[row], completion_logits=rows
                             )
-                        if objective_plan.requirements.frozen_sft_reference:
+                        if sample_objective_plan.requirements.frozen_sft_reference:
                             if reference_logits is None:
                                 raise RuntimeError("frozen-reference logits were not computed")
                             reference_rows = reference_logits[
                                 row, prompt_len - 1 : prompt_len - 1 + comp_len
                             ]
                             objective_values["reference_completion_logits"] = reference_rows
-                        if objective_plan.requirements.completion_mask:
+                        if sample_objective_plan.requirements.completion_mask:
                             objective_values["completion_mask"] = torch.tensor(
                                 [
                                     not (index < len(p.forced) and p.forced[index])
@@ -2763,7 +3121,7 @@ def _resolve_samples_batched(
                                 dtype=torch.bool,
                                 device=rows.device,
                             )
-                        if objective_plan.requirements.teacher_scores:
+                        if sample_objective_plan.requirements.teacher_scores:
                             objective_values["teacher_scores"] = p.teacher_scores
                         if objective_plan.requirements.position_statistics:
                             objective_values.update(
@@ -2781,7 +3139,7 @@ def _resolve_samples_batched(
                         if objective_plan.requirements.candidate_topk:
                             objective_values["candidate_topk"] = candidate_inputs[row]
                         objective_evaluation = OPD_OBJECTIVES.evaluate(
-                            objective_plan,
+                            sample_objective_plan,
                             ObjectiveView(objective_values),
                             base_term=base_term,
                         )
@@ -2794,6 +3152,10 @@ def _resolve_samples_batched(
                             termination_cause=p.termination_cause,
                         )
                         continue
+                    if p.idx in c14_terms:
+                        c14_term, c14_metrics = c14_terms[p.idx]
+                        auxiliary_terms.append(c14_term)
+                        objective_metrics = (*objective_metrics, *c14_metrics)
                     # preserve addition order and compose every auxiliary term exactly once before the
                     # existing normalization, backward, clipping, optimizer, and vllm sync path.
                     loss = base_term
@@ -2854,6 +3216,12 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
             gen_tokens=gen.gen_tokens,
             skip_reason="teacher_transient",
             termination_cause=gen.termination_cause,
+        )
+    if score.status == "budget_exhausted":
+        return SampleResult(
+            teacher_status="budget_exhausted",
+            gen_tokens=gen.gen_tokens,
+            skip_reason="budget_exhausted",
         )
     if score.status != "ok":  # any other teacher exception — skipped, teacher uncounted
         return SampleResult(

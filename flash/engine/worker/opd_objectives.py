@@ -34,6 +34,7 @@ class ObjectiveRequirements:
     candidate_topk: bool = False
     frozen_sft_reference: bool = False
     completion_mask: bool = False
+    continuation_records: bool = False
 
 
 @dataclass(frozen=True)
@@ -269,6 +270,9 @@ class ObjectiveRegistry:
                 candidate_topk=any(d.requirements.candidate_topk for d in definitions),
                 frozen_sft_reference=any(d.requirements.frozen_sft_reference for d in definitions),
                 completion_mask=any(d.requirements.completion_mask for d in definitions),
+                continuation_records=any(
+                    d.requirements.continuation_records for d in definitions
+                ),
             ),
         )
 
@@ -294,6 +298,8 @@ class ObjectiveRegistry:
                 view.require("reference_completion_logits")
             if definition.requirements.completion_mask:
                 view.require("completion_mask")
+            if definition.requirements.continuation_records:
+                view.require("continuation_records")
             result = definition.evaluate(view)
             if not isinstance(result, ObjectiveResult):
                 raise TypeError(
@@ -619,6 +625,18 @@ def _c12(view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult(term=term, metrics=metrics)
 
 
+def _c14(view: ObjectiveView) -> ObjectiveResult:
+    records = view.require("continuation_records")
+    loss = view.require("listwise_loss")
+    return ObjectiveResult(
+        term=loss,
+        metrics={
+            "candidate_count": len(records),
+            "target_entropy": view.require("target_entropy"),
+        },
+    )
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
@@ -688,6 +706,15 @@ OPD_OBJECTIVES = ObjectiveRegistry(
             objective_id="c13",
             requirements=ObjectiveRequirements(student_logits=True, candidate_topk=True),
             evaluate=_c13,
+        ),
+        ObjectiveDefinition(
+            objective_id="c14",
+            requirements=ObjectiveRequirements(
+                student_logits=True,
+                teacher_scores=True,
+                continuation_records=True,
+            ),
+            evaluate=_c14,
         ),
     )
 )
