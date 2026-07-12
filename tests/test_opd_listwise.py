@@ -561,16 +561,17 @@ def test_c14_registry_and_default_noop_contracts():
     )
 
 
-def test_c14_conflicting_objectives_rejects_duplicate_rollout_policies():
+def test_c14_conflicting_objectives_rejects_independent_policies():
     from flash.engine.worker import opd as opd_mod
     from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
 
-    # c14 owns the rollout + teacher policy; pairing it with a sidecar/sampled-primary/top-k
-    # objective would silently run two rollout policies, so the worker must refuse the combination.
+    # c07 and c12 own greedy-sidecar rollouts. c08 modifies the existing primary rollout and owns a
+    # greedy sidecar. c13 owns an independent teacher-scoring and metering policy over top-k prefixes.
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c12", "c14"))) == ("c12",)
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c13", "c14"))) == ("c13",)
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c07", "c14"))) == ("c07",)
-    # c14 on its own (optionally with the c0 no-op) stays compatible.
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c08", "c14"))) == ("c08",)
+    # c14 on its own or with the c0 no-op stays compatible.
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c14",))) == ()
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c0", "c14"))) == ()
 
@@ -579,9 +580,8 @@ def test_c14_shared_conflict_id_set_matches_registry_requirements():
     from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
     from flash.opd_objectives import OPD_C14_CONFLICTING_OBJECTIVE_IDS
 
-    # the dependency-free conflict id list (used by the schema/spec validators AND the worker) must
-    # equal the set of registry objectives that own a rollout/teacher policy, so a new rollout-owning
-    # objective cannot silently slip past submission-time validation without updating the shared list.
+    # the dependency-free conflict list used by schema/spec validators and the worker must match the
+    # registry flags for independent sidecars, primary-rollout modification, or teacher scoring.
     registry = frozenset(
         definition.objective_id
         for definition in OPD_OBJECTIVES.definitions.values()
@@ -595,11 +595,11 @@ def test_c14_shared_conflict_id_set_matches_registry_requirements():
 def test_c14_conflict_message_lists_conflicts_and_does_not_claim_c14_must_be_alone():
     from flash.opd_objectives import opd_c14_conflict_message
 
-    message = opd_c14_conflict_message(("c07", "c12"))
-    assert "rollout-owning" in message
+    message = opd_c14_conflict_message(("c07", "c13"))
+    assert "objective(s) that own an independent rollout or teacher-scoring policy" in message
     assert "c07" in message
-    assert "c12" in message
-    # it must NOT tell users c14 has to run alone -- c14 composes with c0/c05/c06/c09/c10/c11.
+    assert "c13" in message
+    # it must not tell users c14 has to run alone; c14 composes with c0/c05/c06/c09/c10/c11.
     assert "on its own" not in message
     assert "may still be combined with" in message
     for compatible in ("c0", "c05", "c06", "c09", "c10", "c11"):

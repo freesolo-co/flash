@@ -584,14 +584,17 @@ _C14_SCHEMA_BASE = {
         ("c13", {"opd_objective_ids": ["c14", "c13"], "opd_topk_cadence": 4}),
     ],
 )
-def test_c14_rollout_owning_conflicts_are_rejected_at_spec_validation(conflict, train):
-    # c14 owns the rollout + teacher-input policy, so pairing it with any rollout-owning objective
-    # (c07/c08/c12/c13) is rejected BEFORE a worker is provisioned. The reject must fire regardless of
-    # the other required knobs (c12's reference adapter, c13's cadence).
+def test_c14_independent_policy_conflicts_are_rejected_at_spec_validation(conflict, train):
+    # c07 and c12 own greedy-sidecar rollouts. c08 modifies the existing primary rollout and owns a
+    # greedy sidecar. c13 owns an independent teacher-scoring and metering policy. each conflict is
+    # rejected before worker provisioning, regardless of c12's reference adapter or c13's cadence.
     from flash.schema import spec_from_dict
     from flash.schema.fields import ConfigError
 
-    with pytest.raises(ConfigError, match="cannot be combined with rollout-owning"):
+    with pytest.raises(
+        ConfigError,
+        match=r"cannot be combined with objective.*independent rollout or teacher-scoring policy",
+    ):
         spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{conflict}")
     with pytest.raises(ConfigError, match=conflict):
         spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{conflict}-named")
@@ -608,9 +611,8 @@ def test_c14_rollout_owning_conflicts_are_rejected_at_spec_validation(conflict, 
         ("c11", {"opd_objective_ids": ["c14", "c11"], "opd_reference_adapter": "sft-run"}),
     ],
 )
-def test_c14_accepts_non_rollout_owning_objective_combinations(compatible, train):
-    # c14 composes cleanly with objectives that only add a local forward / no extra rollout
-    # (c0/c05/c06/c09/c10/c11): these must PARSE, not be rejected.
+def test_c14_accepts_objectives_without_independent_policies(compatible, train):
+    # c14 composes with objectives that own no independent rollout or teacher-scoring policy.
     from flash.schema import spec_from_dict
 
     spec = spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{compatible}")
