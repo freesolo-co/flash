@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from flash._logging import get_logger
 from flash.catalog import public_model_rows
 from flash.client import (
     ApiClient,
+    ApiError,
     ClientError,
     client_from_config,
     save_credentials,
@@ -24,7 +26,12 @@ from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES
-from flash.schema import ConfigError, spec_from_file
+from flash.schema import (
+    ConfigError,
+    spec_and_train_keys_from_file,
+    spec_from_file,
+    train_schema_metadata,
+)
 
 from . import render
 from ._tty import TtyStatusLine
@@ -53,6 +60,11 @@ _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
 _SPINNER_FRAMES = "|/-\\"
 _SPINNER_TICK_SECONDS = 0.1
+_LEGACY_TRAIN_UNKNOWN_KEYS_RE = re.compile(
+    r"\A\[train\] unknown key\(s\): "
+    r"(?P<keys>[A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*) "
+    r"\(allowed: [A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*\)\Z"
+)
 
 
 class _LogFollowSpinner(TtyStatusLine):
@@ -227,15 +239,67 @@ def _cmd_train_cost(args) -> int:
     return 0
 
 
+def _legacy_train_key_rejection_detail(
+    exc: ApiError, authored_train_keys: frozenset[str]
+) -> str | None:
+    if exc.status != 400:
+        return None
+    match = _LEGACY_TRAIN_UNKNOWN_KEYS_RE.fullmatch(str(exc))
+    if match is None:
+        return None
+    metadata = train_schema_metadata()
+    unsupported = sorted(set(match.group("keys").split(", ")) & authored_train_keys & set(metadata))
+    if not unsupported:
+        return None
+    declared = ", ".join(
+        f"{key} (minimum released Flash version {metadata[key]})" for key in unsupported
+    )
+    return (
+        f"{exc}. Unsupported authored [train] key(s): {declared}; "
+        "client/server [train] schemas disagree"
+    )
+
+
+def _print_train_schema_compatibility(result: object) -> None:
+    if not isinstance(result, dict):
+        message = "client/server [train] schema compatibility is unverifiable (legacy server)"
+    elif result.get("status") == "agreement":
+        message = "client/server [train] schemas agree exactly"
+    else:
+        differences = []
+        for label, key in (
+            ("client-only keys", "client_only"),
+            ("server-only keys", "server_only"),
+        ):
+            values = result.get(key)
+            if isinstance(values, list) and values:
+                differences.append(f"{label}: {', '.join(str(value) for value in values)}")
+        metadata = result.get("introduced_in_differences")
+        if isinstance(metadata, list) and metadata:
+            rendered = ", ".join(
+                f"{item['key']} (client {item['client']}, server {item['server']})"
+                for item in metadata
+                if isinstance(item, dict)
+                and all(isinstance(item.get(key), str) for key in ("key", "client", "server"))
+            )
+            if rendered:
+                differences.append(f"introduced_in differences: {rendered}")
+        suffix = f"; {'; '.join(differences)}" if differences else ""
+        message = f"client/server [train] schemas disagree{suffix}"
+    text = f"train schema: {message}"
+    print(render.note(text) if render.styled() else text, file=sys.stderr)
+
+
 def cmd_train(args) -> int:
     if getattr(args, "cost", False):
         return _cmd_train_cost(args)
-    spec = spec_from_file(
+    spec, authored_train_keys = spec_and_train_keys_from_file(
         args.config,
         run_id=None,
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
     if args.dry_run:
         # Dry-run is a faithful server-side preview: the control plane runs the SAME config
@@ -245,7 +309,23 @@ def cmd_train(args) -> int:
         # relaxes the required-[environment].secrets check for a preview, so `--dry-run` works before
         # prod secrets are wired up. A rejection surfaces as the server's `error: ...` (exit 1),
         # exactly as a real submit would.
-        status = client.create_run(spec_payload(spec), dry_run=True)
+        try:
+            status = client.create_run(
+                payload,
+                dry_run=True,
+                client_train_schema={
+                    "version": __version__,
+                    "fields": train_schema_metadata(),
+                    "authored_keys": sorted(authored_train_keys),
+                },
+            )
+        except ApiError as exc:
+            detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
+            if detail is None:
+                raise
+            raise ApiError(exc.status, detail) from exc
+        compatibility = status.pop("train_schema_compatibility", None)
+        _print_train_schema_compatibility(compatibility)
         if render.styled():
             print(
                 render.object_panel(
@@ -256,7 +336,7 @@ def cmd_train(args) -> int:
             print(json.dumps(status, indent=2))
         return 0
     status = client.create_run(
-        spec_payload(spec),
+        payload,
         runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),
     )
     run_id = status["run_id"]
