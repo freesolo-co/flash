@@ -176,6 +176,23 @@ def _c14_planned_ordinary_input_tokens(
     return total
 
 
+def _c14_conflicting_objectives(objective_plan) -> tuple[str, ...]:
+    """objectives whose rollout/teacher policy c14 cannot compose with.
+
+    c14 owns the rollout (K=2 sampled continuations per prompt) and the exact teacher-input
+    budget/cache/metering. an objective that drives its own rollout (greedy sidecar) or teacher
+    policy (extra sampled primary, top-k candidate scoring) cannot coexist without silently running
+    two rollout policies, so the worker rejects the combination up front. c0 and frozen-reference
+    anchors that only add a local forward stay compatible."""
+    return tuple(
+        definition.objective_id
+        for definition in objective_plan.definitions
+        if definition.requirements.greedy_sidecar
+        or definition.requirements.sampled_primary
+        or definition.requirements.candidate_topk
+    )
+
+
 def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
     total = max(1, int(total_samples))
     try:
@@ -519,6 +536,14 @@ def run_opd():
             "opd c14 continuation-level listwise distillation requires a single-turn environment"
         )
     if c14_enabled:
+        conflicting = _c14_conflicting_objectives(objective_plan)
+        if conflicting:
+            raise RuntimeError(
+                "opd c14 listwise distillation cannot be combined with objective(s) "
+                f"{', '.join(conflicting)}: c14 owns the rollout and teacher-input policy, so "
+                "pairing it with a sidecar/sampled-primary/top-k objective would run two rollout "
+                "policies. Select c14 on its own (optionally with c0)."
+            )
         knobs = replace(knobs, group_size=C14_STUDENT_CONTINUATIONS)
 
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""

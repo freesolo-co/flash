@@ -559,3 +559,17 @@ def test_c14_registry_and_default_noop_contracts():
         teacher_scores=True,
         continuation_records=True,
     )
+
+
+def test_c14_conflicting_objectives_rejects_duplicate_rollout_policies():
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
+
+    # c14 owns the rollout + teacher policy; pairing it with a sidecar/sampled-primary/top-k
+    # objective would silently run two rollout policies, so the worker must refuse the combination.
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c12", "c14"))) == ("c12",)
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c13", "c14"))) == ("c13",)
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c07", "c14"))) == ("c07",)
+    # c14 on its own (optionally with the c0 no-op) stays compatible.
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c14",))) == ()
+    assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c0", "c14"))) == ()
