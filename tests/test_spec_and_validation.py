@@ -7,11 +7,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import fields
 
 import pytest
 
-from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec, load_job_spec_from_env
+from flash.schema import (
+    TRAIN_KEY_MIN_VERSIONS,
+    TRAIN_SCHEMA_KEYS,
+    ConfigError,
+    spec_from_dict,
+    train_schema_metadata,
+    validate_train_keys,
+)
+from flash.spec import JobSpec, TrainSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -83,13 +91,97 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
+    train_fields = fields(TrainSpec)
+
+    assert all(item.metadata.get("introduced_in") for item in train_fields)
+    assert frozenset(item.name for item in train_fields) == TRAIN_SCHEMA_KEYS
+    assert {
+        item.name: item.metadata["introduced_in"] for item in train_fields
+    } == TRAIN_KEY_MIN_VERSIONS
+    assert train_schema_metadata() == {
+        key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)
+    }
+    assert TRAIN_KEY_MIN_VERSIONS["hf_repo"] == "0.2.0"
+    assert TRAIN_KEY_MIN_VERSIONS["max_context_tokens"] == "0.2.49"
+    assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
+    assert TRAIN_KEY_MIN_VERSIONS["opd_eos_loss_coef"] == "0.2.55"
+    assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
+    assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
+    assert {
+        value
+        for key, value in TRAIN_KEY_MIN_VERSIONS.items()
+        if key
+        not in {
+            "max_context_tokens",
+            "max_completion_tokens",
+            "opd_eos_loss_coef",
+            "teacher_model",
+            "structured_outputs",
+        }
+    } == {"0.2.0"}
+
+
+def test_train_key_validator_rejects_unknown_names_only() -> None:
+    validate_train_keys(TRAIN_SCHEMA_KEYS)
+    with pytest.raises(ConfigError) as excinfo:
+        validate_train_keys({"epochs", "removed_spelling"})
+
+    message = str(excinfo.value)
+    assert "unknown key(s): removed_spelling" in message
+    assert "allowed:" in message
+
+
+def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None:
+    established = frozenset(
+        {
+            "advantage_clip",
+            "batch_size",
+            "epochs",
+            "group_size",
+            "hf_repo",
+            "init_from_adapter",
+            "kl_penalty_coef",
+            "learning_rate",
+            "lora_alpha",
+            "lora_rank",
+            "max_completion_tokens",
+            "max_context_tokens",
+            "max_examples",
+            "max_steps",
+            "opd_eos_loss_coef",
+            "save_every",
+            "stop_sequences",
+            "temperature",
+            "thinking_length_penalty_coef",
+        }
+    )
+    historical_shapes = {
+        "20c4452c": established,
+        "699a8aab": established | {"structured_outputs"},
+        "861571e7": established | {"structured_outputs", "teacher_model"},
+    }
+    baseline = {"epochs", "hf_repo", "max_examples"}
+
+    assert historical_shapes["861571e7"] == TRAIN_SCHEMA_KEYS
+    assert all(baseline <= shape for shape in historical_shapes.values())
+    for key in ("structured_outputs", "teacher_model"):
+        rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
+        assert rejected_by == {
+            "20c4452c",
+            *({"699a8aab"} if key == "teacher_model" else set()),
+        }
+
+
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:
     # Regression: opd_eos_loss_coef was added to flash.spec.TrainSpec + the worker, but NOT the
     # client/server schema allowlist, so `[train] opd_eos_loss_coef` was hard-rejected as an unknown
     # key at submit — the documented override never reached the worker. It must round-trip here.
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
-    assert spec_from_dict(_raw()).train.opd_eos_loss_coef is None  # unset -> recipe default at resolve
+    assert (
+        spec_from_dict(_raw()).train.opd_eos_loss_coef is None
+    )  # unset -> recipe default at resolve
     with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
@@ -439,10 +531,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     d = spec.to_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = JobSpec.from_dict(d)
-    assert (
-        orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
-    )
+    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------
