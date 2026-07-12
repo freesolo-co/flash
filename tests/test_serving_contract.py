@@ -19,6 +19,8 @@ def test_serving_base_url_default_and_override(monkeypatch):
     assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
     assert serving_base_url() == "https://serve.example"
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    assert serving_base_url() == "https://serve.example"
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
@@ -134,9 +136,12 @@ def test_deployment_roundtrip_dict():
         adapter_hf_prefix="p",
         openai_model="r",
         endpoint_name="https://serve.example",
+        openai_base_url="https://serve.example/v1",
     )
     data = d.to_dict()
     assert data["run_id"] == "r"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
     assert "gpu" not in data
     assert "mode" not in data
 
@@ -219,10 +224,10 @@ def _registry_resp(records):
 
 
 def test_deploy_reads_registry_back_before_ready(monkeypatch):
-    """POST /adapters returning 2xx is not enough: ready must be registry-backed."""
+    """A terminal /v1 override keeps registration and verification on the control root."""
     import flash.serve.deploy as deploy_mod
 
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
 
     class _PostResp:
@@ -231,17 +236,25 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
         def raise_for_status(self):
             return None
 
+    posts: list[str] = []
     gets: list[str] = []
+
+    def fake_post(url, **k):
+        posts.append(url)
+        return _PostResp()
 
     def fake_get(url, **k):
         gets.append(url)
         return _registry_resp([{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}])
 
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
     monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
+    assert dep.endpoint_name == "https://serve.example"
+    assert dep.openai_base_url == "https://serve.example/v1"
+    assert posts == ["https://serve.example/adapters"]
     assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
 
 
@@ -392,4 +405,14 @@ def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
-    assert data["url"] == "https://serve.example/v1"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
+
+
+def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    data = dep.to_dict()
+    assert data["endpoint_name"] == "https://serve.example"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
