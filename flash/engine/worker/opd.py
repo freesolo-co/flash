@@ -989,7 +989,7 @@ def run_opd():
                 ) -> None:
                     def _score_many_timed(batch: list[_Pending]):
                         started = time.perf_counter()
-                        retain_teacher_prompt = _retain_candidate_teacher_prompt(
+                        retain_teacher_prompts = _retain_candidate_teacher_prompt(
                             batch,
                             cadence=knobs.topk_cadence,
                             candidate_topk=topk_meter is not None,
@@ -998,7 +998,7 @@ def run_opd():
                             teacher,
                             batch,
                             thinking_prefill=thinking_prefill,
-                            retain_teacher_prompt=retain_teacher_prompt,
+                            retain_teacher_prompts=retain_teacher_prompts,
                         )
                         return scores, time.perf_counter() - started
 
@@ -1899,7 +1899,6 @@ def _score_one(
     leave the sample skipped with no teacher signal."""
     if teacher_prompt is None:
         teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
-    result_prompt = teacher_prompt if retain_teacher_prompt else ""
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
@@ -1913,26 +1912,30 @@ def _score_one(
                 )
                 continue
             print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-            return _ScoreResult(status="transient", error=str(e), teacher_prompt=result_prompt)
+            return _ScoreResult(status="transient", error=str(e))
         except Exception as e:
             if attempt < attempts:
                 print(f"[opd] teacher score failed (retrying sample {attempt}/{attempts}): {e}")
                 continue
             print(f"[opd] teacher score failed (skipping sample): {e}")
-            return _ScoreResult(status="error", error=str(e), teacher_prompt=result_prompt)
-        return _ScoreResult(teacher_toks=teacher_toks, status="ok", teacher_prompt=result_prompt)
-    return _ScoreResult(
-        status="error", error="teacher scoring attempts exhausted", teacher_prompt=result_prompt
-    )
+            return _ScoreResult(status="error", error=str(e))
+        return _ScoreResult(
+            teacher_toks=teacher_toks,
+            status="ok",
+            teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
+        )
+    return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
 
 
 def _retain_candidate_teacher_prompt(
     pendings: list[_Pending], *, cadence: int | None, candidate_topk: bool
-) -> bool:
+) -> tuple[bool, ...]:
     if not candidate_topk:
-        return False
+        return (False,) * len(pendings)
     value = int(cadence)
-    return any(selected_prefix_indices(len(p.gen.completion_ids or ()), value) for p in pendings)
+    return tuple(
+        bool(selected_prefix_indices(len(p.gen.completion_ids or ()), value)) for p in pendings
+    )
 
 
 def _score_many(
@@ -1941,11 +1944,18 @@ def _score_many(
     *,
     thinking_prefill,
     max_attempts: int = 2,
-    retain_teacher_prompt: bool = False,
+    retain_teacher_prompts: tuple[bool, ...] | None = None,
 ) -> list[_ScoreResult]:
     """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
     if not pendings:
         return []
+    retention = (
+        (False,) * len(pendings)
+        if retain_teacher_prompts is None
+        else tuple(bool(value) for value in retain_teacher_prompts)
+    )
+    if len(retention) != len(pendings):
+        raise ValueError("opd teacher prompt retention must align with the pending batch")
     teacher_prompts = [_teacher_prompt_text(p.prompt_messages, thinking_prefill) for p in pendings]
     prompts = [
         (teacher_prompt, p.gen.completion_text)
@@ -1966,7 +1976,9 @@ def _score_many(
                     teacher_prompt=teacher_prompt,
                     retain_teacher_prompt=retain_teacher_prompt,
                 )
-                for p, teacher_prompt in zip(pendings, teacher_prompts, strict=True)
+                for p, teacher_prompt, retain_teacher_prompt in zip(
+                    pendings, teacher_prompts, retention, strict=True
+                )
             ]
         except TeacherError as e:
             if e.permanent:
@@ -1981,12 +1993,8 @@ def _score_many(
                 f"[opd] teacher batch failed (transient, skipping batch, samples={len(pendings)}): {e}"
             )
             return [
-                _ScoreResult(
-                    status="transient",
-                    error=str(e),
-                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
-                )
-                for teacher_prompt in teacher_prompts
+                _ScoreResult(status="transient", error=str(e))
+                for _teacher_prompt in teacher_prompts
             ]
         except Exception as e:
             if attempt < attempts:
@@ -1997,21 +2005,15 @@ def _score_many(
                 continue
             print(f"[opd] teacher batch failed (skipping batch, samples={len(pendings)}): {e}")
             return [
-                _ScoreResult(
-                    status="error",
-                    error=str(e),
-                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
-                )
-                for teacher_prompt in teacher_prompts
+                _ScoreResult(status="error", error=str(e)) for _teacher_prompt in teacher_prompts
             ]
         if len(scored) != len(pendings):
             return [
                 _ScoreResult(
                     status="error",
                     error=f"teacher batch returned {len(scored)} score(s) for {len(pendings)} sample(s)",
-                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
                 )
-                for teacher_prompt in teacher_prompts
+                for _teacher_prompt in teacher_prompts
             ]
         return [
             _ScoreResult(
@@ -2019,15 +2021,13 @@ def _score_many(
                 status="ok",
                 teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
             )
-            for toks, teacher_prompt in zip(scored, teacher_prompts, strict=True)
+            for toks, teacher_prompt, retain_teacher_prompt in zip(
+                scored, teacher_prompts, retention, strict=True
+            )
         ]
     return [
-        _ScoreResult(
-            status="error",
-            error="teacher batch attempts exhausted",
-            teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
-        )
-        for teacher_prompt in teacher_prompts
+        _ScoreResult(status="error", error="teacher batch attempts exhausted")
+        for _teacher_prompt in teacher_prompts
     ]
 
 

@@ -436,17 +436,17 @@ def test_nonfiring_objectives_do_not_render_or_allocate_candidate_prompts(
         prompt_messages=[{"role": "user", "content": "p"}],
     )
     candidate_topk = objective_ids == ("c13",)
-    retain_teacher_prompt = opd_mod._retain_candidate_teacher_prompt(
+    retain_teacher_prompts = opd_mod._retain_candidate_teacher_prompt(
         [pending], cadence=100, candidate_topk=candidate_topk
     )
     score = opd_mod._score_many(
         teacher,
         [pending],
         thinking_prefill="",
-        retain_teacher_prompt=retain_teacher_prompt,
+        retain_teacher_prompts=retain_teacher_prompts,
     )[0]
 
-    assert not retain_teacher_prompt
+    assert retain_teacher_prompts == (False,)
     assert len(rendered) == 1
     assert score.teacher_prompt == ""
     meter = TeacherInputMeter() if candidate_topk else None
@@ -480,6 +480,152 @@ def test_nonfiring_objectives_do_not_render_or_allocate_candidate_prompts(
         metrics = dict(results[0].objective_metrics)
         assert metrics["opd/objectives/c13/selected_prefixes"] == 0.0
         assert metrics["opd/objectives/c13/scored_prefixes"] == 0.0
+
+
+def test_c13_prompt_retention_is_per_sample_for_mixed_multiturn_batch(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.tokenizer_align import TeacherToken
+
+    class _Tok:
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            mapping = {1: "p", 2: "a", 3: "b", 5: ""}
+            return "".join(mapping.get(int(token_id), "d") for token_id in ids)
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            if len(self.calls) != 1:
+                raise AssertionError("the non-firing sample must not trigger candidate scoring")
+            return [[TeacherToken("a" * 101, -0.5, 0, 101)], []]
+
+    rendered = []
+
+    def _render_teacher_prompt(prompt_messages, thinking_prefill=""):
+        name = prompt_messages[-1]["content"]
+        rendered.append((name, thinking_prefill))
+        return f"teacher:{name}:"
+
+    monkeypatch.setattr(opd_mod, "_teacher_prompt_text", _render_teacher_prompt)
+    long_gen = opd_mod._GenResult(
+        completion_ids=[2] * 101, completion_text="a" * 101, gen_tokens=101
+    )
+    short_gen = opd_mod._GenResult(completion_ids=[3], completion_text="b", gen_tokens=1)
+    pendings = [
+        opd_mod._Pending(
+            gen=long_gen,
+            prompt_ids=[1],
+            prompt_messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "long"},
+            ],
+        ),
+        opd_mod._Pending(
+            gen=short_gen,
+            prompt_ids=[1],
+            prompt_messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "short"},
+            ],
+        ),
+    ]
+    retain_teacher_prompts = opd_mod._retain_candidate_teacher_prompt(
+        pendings, cadence=100, candidate_topk=True
+    )
+    scores = opd_mod._score_many(
+        _teacher := _Teacher(),
+        pendings,
+        thinking_prefill="prefill",
+        retain_teacher_prompts=retain_teacher_prompts,
+    )
+
+    assert retain_teacher_prompts == (True, False)
+    assert rendered == [("long", "prefill"), ("short", "prefill")]
+    assert scores[0].teacher_prompt == "teacher:long:"
+    assert scores[1].teacher_prompt == ""
+    assert len(scores[0].teacher_toks) == 1
+    assert scores[1].teacher_toks == []
+    assert _teacher.calls == [[("teacher:long:", "a" * 101), ("teacher:short:", "b")]]
+
+    meter = TeacherInputMeter()
+    meter.record_ordinary(2)
+    outputs = opd_mod._candidate_objectives_for_chunk(
+        torch.zeros((1, 2, 6), requires_grad=True),
+        [
+            SimpleNamespace(
+                prompt_ids=[1],
+                student_ids=[3],
+                score_result=scores[1],
+            )
+        ],
+        _Tok(),
+        SimpleNamespace(topk_cadence=100),
+        _teacher,
+        meter,
+        {},
+    )
+
+    assert len(_teacher.calls) == 1
+    assert meter.candidate_tokens == 0
+    assert outputs[0].selected_prefixes == 0
+    assert outputs[0].scored_prefixes == 0
+
+
+def test_c13_prompt_retention_stays_aligned_when_fallback_sample_fails(monkeypatch):
+    from flash.engine.worker import opd as opd_mod
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score(self, context, surface):
+            self.calls.append((context, surface))
+            if surface == "short":
+                raise RuntimeError("sample failed")
+            return [SimpleNamespace(logprob=-0.5)]
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_teacher_prompt_text",
+        lambda prompt_messages, _thinking_prefill="": f"teacher:{prompt_messages[-1]['content']}:",
+    )
+    pendings = [
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_ids=[2], completion_text="short", gen_tokens=1),
+            prompt_ids=[1],
+            prompt_messages=[{"role": "user", "content": "short"}],
+        ),
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(
+                completion_ids=[2] * 101, completion_text="long", gen_tokens=101
+            ),
+            prompt_ids=[1],
+            prompt_messages=[{"role": "user", "content": "long"}],
+        ),
+    ]
+    retain_teacher_prompts = opd_mod._retain_candidate_teacher_prompt(
+        pendings, cadence=100, candidate_topk=True
+    )
+    teacher = _Teacher()
+    scores = opd_mod._score_many(
+        teacher,
+        pendings,
+        thinking_prefill="",
+        max_attempts=1,
+        retain_teacher_prompts=retain_teacher_prompts,
+    )
+
+    assert retain_teacher_prompts == (False, True)
+    assert [score.status for score in scores] == ["error", "ok"]
+    assert [score.teacher_prompt for score in scores] == ["", "teacher:long:"]
+    assert teacher.calls == [("teacher:short:", "short"), ("teacher:long:", "long")]
 
 
 def test_c13_integrates_candidate_teacher_scores_into_loss_gradient(monkeypatch):
@@ -543,16 +689,16 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient(monkeypatch)
         prompt_ids=[1],
         prompt_messages=[{"role": "user", "content": "p"}],
     )
-    retain_teacher_prompt = opd_mod._retain_candidate_teacher_prompt(
+    retain_teacher_prompts = opd_mod._retain_candidate_teacher_prompt(
         [pending], cadence=1, candidate_topk=True
     )
     score = opd_mod._score_many(
         teacher,
         [pending],
         thinking_prefill="",
-        retain_teacher_prompt=retain_teacher_prompt,
+        retain_teacher_prompts=retain_teacher_prompts,
     )[0]
-    assert retain_teacher_prompt
+    assert retain_teacher_prompts == (True,)
     assert len(rendered) == 1
     assert score.teacher_prompt == "teacher:"
     meter = TeacherInputMeter()
