@@ -207,6 +207,9 @@ _TRAIN_KEYS = frozenset(
         "kl_penalty_coef",
         "advantage_clip",
         "thinking_length_penalty_coef",
+        "rollout_request_timeout_seconds",
+        "rollout_request_max_attempts",
+        "rollout_stall_timeout_seconds",
         "opd_eos_loss_coef",
         "teacher_model",
         "stop_sequences",
@@ -353,6 +356,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
+            ),
+            rollout_request_timeout_seconds=_train_float(
+                train_raw, "rollout_request_timeout_seconds", minimum=0.0, exclusive=True
+            ),
+            rollout_request_max_attempts=(
+                _train_int(train_raw, "rollout_request_max_attempts", minimum=1) or 2
+            ),
+            rollout_stall_timeout_seconds=(
+                _train_float(train_raw, "rollout_stall_timeout_seconds", minimum=0.0) or 0.0
             ),
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),

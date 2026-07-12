@@ -118,8 +118,11 @@ class _VarTurnEnv:
     multi_turn = True
 
     def new_rollout_state(self, example):
-        return {"prompt": [{"role": "user", "content": "u1"}], "completion": [],
-                "max_model": example["max_model"]}
+        return {
+            "prompt": [{"role": "user", "content": "u1"}],
+            "completion": [],
+            "max_model": example["max_model"],
+        }
 
     def record_model_turn(self, state, content):
         state["completion"].append({"role": "assistant", "content": content})
@@ -133,7 +136,9 @@ class _VarTurnEnv:
         return [msg]
 
     def reward(self, completion, example, state=None):
-        return float(sum(1 for m in (state or {}).get("completion", []) if m["role"] == "assistant"))
+        return float(
+            sum(1 for m in (state or {}).get("completion", []) if m["role"] == "assistant")
+        )
 
 
 class _NoPromptEnv:
@@ -191,7 +196,20 @@ def _fake_async_engine(gen):
             return []
         batch = pending[:]
         pending.clear()
-        return [(rid, *gen(ids, mt)) for rid, ids, mt in batch]
+        events = []
+        for rid, ids, mt in batch:
+            completion_ids, logprobs, text = gen(ids, mt)
+            events.append(
+                {
+                    "request_id": rid,
+                    "finished": True,
+                    "cumulative_tokens": len(completion_ids),
+                    "completion_ids": completion_ids,
+                    "logprobs": logprobs,
+                    "text": text,
+                }
+            )
+        return events
 
     def busy():
         return bool(pending)
@@ -202,8 +220,14 @@ def _fake_async_engine(gen):
 def _run_async(examples, active_env, **kw):
     submit, poll, busy = _fake_async_engine(_det_generate)
     return rollout_async(
-        examples=examples, active_env=active_env, render=render, submit=submit, poll=poll,
-        busy=busy, env_glue=env_glue, max_turns=kw.get("max_turns", 8),
+        examples=examples,
+        active_env=active_env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        env_glue=env_glue,
+        max_turns=kw.get("max_turns", 8),
         per_turn_max_tokens=kw.get("per_turn_max_tokens", 8),
         engine_max_len=kw.get("engine_max_len"),
     )
@@ -232,18 +256,25 @@ def test_engine_vocab_size_variants():
 
     # get_vocab_size present and working -> used directly
     mc_ok = SimpleNamespace(get_vocab_size=lambda: 999)
-    assert _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_ok))) == 999
+    assert (
+        _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_ok))) == 999
+    )
 
     # get_vocab_size raises -> fall through to hf_text_config.vocab_size
     def _boom():
         raise RuntimeError("vocab probe blew up")
 
     mc_hf = SimpleNamespace(get_vocab_size=_boom, hf_text_config=SimpleNamespace(vocab_size=1234))
-    assert _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_hf))) == 1234
+    assert (
+        _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_hf))) == 1234
+    )
 
     # no getters and no hf_text_config -> None (never raises)
     mc_bare = SimpleNamespace()
-    assert _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_bare))) is None
+    assert (
+        _engine_vocab_size(SimpleNamespace(llm_engine=SimpleNamespace(model_config=mc_bare)))
+        is None
+    )
 
 
 # --- rollout_one edge branches ------------------------------------------------------------------
@@ -252,16 +283,26 @@ def test_engine_vocab_size_variants():
 def test_rollout_one_raises_without_prompt_or_messages():
     with pytest.raises(KeyError, match="must include prompt or messages"):
         rollout_one(
-            example={}, active_env=_NoPromptEnv(), render=render,
-            generate=_generator(["a1"]), env_glue=env_glue, max_turns=4, per_turn_max_tokens=8,
+            example={},
+            active_env=_NoPromptEnv(),
+            render=render,
+            generate=_generator(["a1"]),
+            env_glue=env_glue,
+            max_turns=4,
+            per_turn_max_tokens=8,
         )
 
 
 def test_rollout_one_budget_edge_breaks():
     # (a) engine budget already exhausted by the prompt -> loop breaks before any generation.
     out_zero = rollout_one(
-        example={}, active_env=FakeEnv(), render=render, generate=_generator(["a1", "GOOD"]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
         engine_max_len=PROMPT_LEN + 8,  # token_budget == 0 -> remaining <= 0 on entry
     )
     assert out_zero["completion_ids"] == []
@@ -270,8 +311,13 @@ def test_rollout_one_budget_edge_breaks():
 
     # (b) first turn fits but the inter-turn glue would overflow the budget -> stop before the glue.
     out_glue = rollout_one(
-        example={}, active_env=FakeEnv(), render=render, generate=_generator(["a1", "GOOD"]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
         engine_max_len=PROMPT_LEN + 8 + 4,  # token_budget == 4: fits the 2-token turn, not +4 glue
     )
     # only the first assistant turn survives (a1, END); no env/glue tokens appended.
@@ -283,9 +329,13 @@ def test_rollout_one_stops_when_env_finishes_after_reply():
     # rollout_done is False before env_reply (so the env DOES reply) but True right after it -> the
     # loop must stop without appending glue for a next model turn that will never happen.
     out = rollout_one(
-        example={}, active_env=_DoneAfterReplyEnv(), render=render,
-        generate=_generator(["a1", "GOOD"]), env_glue=realistic_env_glue,
-        max_turns=8, per_turn_max_tokens=8,
+        example={},
+        active_env=_DoneAfterReplyEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        env_glue=realistic_env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
     )
     assert out["completion_ids"] == [CONTENT["a1"], END]  # no glue appended after the env finished
     assert out["env_mask"] == [1, 1]
@@ -298,9 +348,13 @@ def test_rollout_one_stops_when_env_finishes_after_reply():
 def test_rollout_one_records_raises_without_prompt_or_messages():
     with pytest.raises(KeyError, match="must include prompt or messages"):
         rollout_one_records(
-            example={}, active_env=_NoPromptEnv(), render=render,
+            example={},
+            active_env=_NoPromptEnv(),
+            render=render,
             generate=_records_generator([_gen_obj([1], "x")]),
-            env_glue=env_glue, max_turns=4, per_turn_max_tokens=8,
+            env_glue=env_glue,
+            max_turns=4,
+            per_turn_max_tokens=8,
         )
 
 
@@ -312,10 +366,15 @@ def test_rollout_one_records_budget_and_progress():
         ticks["n"] += 1
 
     recs = rollout_one_records(
-        example={}, active_env=FakeEnv(), render=render,
-        generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1"),
-                                     _gen_obj([CONTENT["GOOD"], END], "GOOD")]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=16,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_records_generator(
+            [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+        ),
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
         engine_max_len=100,  # budget non-None but generous -> exercises the min(max_new, remaining) arm
         on_turn_generated=_tick,
     )
@@ -324,19 +383,28 @@ def test_rollout_one_records_budget_and_progress():
 
     # (b) budget already spent by the prompt -> not a single turn is generated / recorded.
     recs_zero = rollout_one_records(
-        example={}, active_env=FakeEnv(), render=render,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
         generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1")]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=16,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
         engine_max_len=PROMPT_LEN + 8,  # token_budget == 0
     )
     assert recs_zero == []
 
     # (c) the first turn exactly fills the budget -> recorded, then the episode halts at that turn.
     recs_fill = rollout_one_records(
-        example={}, active_env=FakeEnv(), render=render,
-        generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1"),
-                                     _gen_obj([CONTENT["GOOD"], END], "GOOD")]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=16,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_records_generator(
+            [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+        ),
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
         engine_max_len=PROMPT_LEN + 8 + 2,  # token_budget == 2 == one 2-token turn
     )
     assert len(recs_fill) == 1
@@ -352,27 +420,41 @@ def test_rollout_one_records_advance_branch_terminations():
             return []
 
     recs_empty = rollout_one_records(
-        example={}, active_env=_EmptyReplyEnv(), render=render,
+        example={},
+        active_env=_EmptyReplyEnv(),
+        render=render,
         generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1")]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=16,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
     )
     assert len(recs_empty) == 1
 
     # (b) rollout_done flips True only after env_reply -> stop without emitting the next turn's glue.
     recs_done = rollout_one_records(
-        example={}, active_env=_DoneAfterReplyEnv(), render=render,
-        generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1"),
-                                     _gen_obj([CONTENT["GOOD"], END], "GOOD")]),
-        env_glue=realistic_env_glue, max_turns=8, per_turn_max_tokens=16,
+        example={},
+        active_env=_DoneAfterReplyEnv(),
+        render=render,
+        generate=_records_generator(
+            [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+        ),
+        env_glue=realistic_env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
     )
     assert len(recs_done) == 1
 
     # (c) the env replies but the glue would overflow the engine budget -> stop before the next turn.
     recs_glue = rollout_one_records(
-        example={}, active_env=FakeEnv(), render=render,
-        generate=_records_generator([_gen_obj([CONTENT["a1"], END], "a1"),
-                                     _gen_obj([CONTENT["GOOD"], END], "GOOD")]),
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=16,
+        example={},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_records_generator(
+            [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
+        ),
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=16,
         engine_max_len=PROMPT_LEN + 8 + 4,  # token_budget == 4: fits the turn (2) but not +4 glue
     )
     assert len(recs_glue) == 1
@@ -385,8 +467,15 @@ def test_rollout_async_raises_without_prompt_or_messages():
     submit, poll, busy = _fake_async_engine(_det_generate)
     with pytest.raises(KeyError, match="must include prompt or messages"):
         rollout_async(
-            examples=[{}], active_env=_NoPromptEnv(), render=render, submit=submit, poll=poll,
-            busy=busy, env_glue=env_glue, max_turns=4, per_turn_max_tokens=8,
+            examples=[{}],
+            active_env=_NoPromptEnv(),
+            render=render,
+            submit=submit,
+            poll=poll,
+            busy=busy,
+            env_glue=env_glue,
+            max_turns=4,
+            per_turn_max_tokens=8,
         )
 
 
@@ -435,17 +524,17 @@ def test_rollout_async_advance_env_branches():
     assert out_glue[0]["reward"] == 1.0
 
 
-# --- build_rollout_func: FINAL_ONLY output kind + skipping unfinished engine outputs -------------
+# --- build_rollout_func: cumulative output kind + skipping unfinished engine outputs -------------
 
 
 @pytest.fixture
 def _stub_vllm_full(monkeypatch):
     """Stub the GPU-only ``vllm`` module INCLUDING RequestOutputKind so build_rollout_func resolves
-    the FINAL_ONLY output kind (the sibling fixture omits it)."""
+    the cumulative output kind (the sibling fixture omits it)."""
     mod = types.ModuleType("vllm")
     mod.SamplingParams = lambda **kw: SimpleNamespace(**kw)
     sp_mod = types.ModuleType("vllm.sampling_params")
-    sp_mod.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final_only")
+    sp_mod.RequestOutputKind = SimpleNamespace(CUMULATIVE="cumulative")
     sp_mod.StructuredOutputsParams = lambda **kw: SimpleNamespace(kwargs=dict(kw))
     mod.sampling_params = sp_mod
     monkeypatch.setitem(sys.modules, "vllm", mod)
@@ -528,14 +617,22 @@ class _PartialEngine:
 
 
 @pytest.mark.usefixtures("_stub_vllm_full")
-def test_rollout_func_sets_final_only_kind_and_skips_unfinished():
+def test_rollout_func_sets_cumulative_kind_and_exposes_unfinished_progress():
     from flash.engine.multiturn_rollout import build_rollout_func
 
     engine = _PartialEngine()
     rf = build_rollout_func(
-        active_env=_OneTurnEngineEnv(), tok=_Tok(), examples_by_key={}, max_completion=8,
-        max_turns=4, temperature=0.7, top_p=1.0, stop=None, thinking=False,
-        engine_max_len=None, structured_outputs=None,
+        active_env=_OneTurnEngineEnv(),
+        tok=_Tok(),
+        examples_by_key={},
+        max_completion=8,
+        max_turns=4,
+        temperature=0.7,
+        top_p=1.0,
+        stop=None,
+        thinking=False,
+        engine_max_len=None,
+        structured_outputs=None,
     )
     trainer = SimpleNamespace(
         vllm_generation=SimpleNamespace(llm=engine),
@@ -546,6 +643,6 @@ def test_rollout_func_sets_final_only_kind_and_skips_unfinished():
     assert out["reward"] == [0.5]
     # the unfinished first step was skipped, so more than one engine step was needed
     assert engine.steps >= 2
-    # every submitted turn carried the resolved FINAL_ONLY output kind
+    # every submitted turn carried the resolved cumulative output kind
     assert engine.sampling
-    assert all(sp.output_kind == "final_only" for sp in engine.sampling)
+    assert all(sp.output_kind == "cumulative" for sp in engine.sampling)
