@@ -101,38 +101,40 @@ FIXED_SEED = 42
 
 @dataclass(frozen=True)
 class TrainSpec:
-    epochs: int | None = None
-    lora_rank: int = 32
-    lora_alpha: int = 64
+    epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    lora_rank: int = field(default=32, metadata={"introduced_in": "0.2.0"})
+    lora_alpha: int = field(default=64, metadata={"introduced_in": "0.2.0"})
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
-    init_from_adapter: str = ""
+    init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
-    hf_repo: str = ""
+    hf_repo: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # None -> worker's tuned recipe default.
-    learning_rate: float | None = None
-    batch_size: int | None = None
-    max_context_tokens: int | None = None
-    save_every: int | None = None
-    max_steps: int | None = None
-    max_examples: int | None = None
-    group_size: int | None = None
-    temperature: float | None = None
-    max_completion_tokens: int | None = None
-    kl_penalty_coef: float | None = None
-    advantage_clip: float | None = None
-    thinking_length_penalty_coef: float | None = None
+    learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
+    save_every: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    max_steps: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    max_examples: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    group_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
+    kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    advantage_clip: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    thinking_length_penalty_coef: float | None = field(
+        default=None, metadata={"introduced_in": "0.2.0"}
+    )
     # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
     # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
-    opd_eos_loss_coef: float | None = None
+    opd_eos_loss_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.55"})
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
-    teacher_model: str = ""
-    stop_sequences: tuple[str, ...] = ()
+    teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
+    stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
-    structured_outputs: str = ""
+    structured_outputs: str = field(default="", metadata={"introduced_in": "0.2.56"})
 
 
 @dataclass(frozen=True)

@@ -110,9 +110,10 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
     seen: dict = {}
 
     class _FakeClient:
-        def create_run(self, spec, runtime_secrets=None, dry_run=False):
+        def create_run(self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None):
             seen["dry_run"] = dry_run
             seen["runtime_secrets"] = runtime_secrets
+            seen["client_train_schema"] = client_train_schema
             return {"run_id": new_run_id(), "state": "dry_run", "spec": spec}
 
     monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())

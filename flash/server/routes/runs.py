@@ -10,6 +10,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 
 from flash.runner import cancel_run, new_run_id, runs_file_path
+from flash.schema import train_schema_metadata
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _parse_spec, _require_bool, _runtime_secrets, owned_run, require_key
@@ -18,6 +19,57 @@ from flash.spec import JobSpec
 _LOG = logging.getLogger("flash.server.runs")
 
 router = APIRouter()
+
+_MAX_SCHEMA_FIELDS = 256
+_MAX_SCHEMA_TEXT = 128
+
+
+def _client_train_schema(payload: dict) -> dict | None:
+    raw = payload.get("client_train_schema")
+    if not isinstance(raw, dict) or set(raw) != {"version", "fields", "authored_keys"}:
+        return None
+    version = raw.get("version")
+    fields = raw.get("fields")
+    authored_keys = raw.get("authored_keys")
+    if not isinstance(version, str) or not version or len(version) > _MAX_SCHEMA_TEXT:
+        return None
+    if not isinstance(fields, dict) or len(fields) > _MAX_SCHEMA_FIELDS:
+        return None
+    if not isinstance(authored_keys, list) or len(authored_keys) > _MAX_SCHEMA_FIELDS:
+        return None
+    if any(
+        not isinstance(key, str)
+        or not key
+        or len(key) > _MAX_SCHEMA_TEXT
+        or not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_SCHEMA_TEXT
+        for key, value in fields.items()
+    ):
+        return None
+    if any(
+        not isinstance(key, str) or not key or len(key) > _MAX_SCHEMA_TEXT for key in authored_keys
+    ):
+        return None
+    if len(authored_keys) != len(set(authored_keys)) or not set(authored_keys) <= set(fields):
+        return None
+    server_fields = train_schema_metadata()
+    shared = sorted(set(fields) & set(server_fields))
+    return {
+        "version": version,
+        "fields": dict(fields),
+        "authored_keys": tuple(authored_keys),
+        "compatibility": {
+            "status": "agreement" if fields == server_fields else "disagreement",
+            "client_only": sorted(set(fields) - set(server_fields)),
+            "server_only": sorted(set(server_fields) - set(fields)),
+            "introduced_in_differences": [
+                {"key": key, "client": fields[key], "server": server_fields[key]}
+                for key in shared
+                if fields[key] != server_fields[key]
+            ],
+        },
+    }
 
 
 def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
@@ -40,7 +92,9 @@ def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
 
         estimate_usd = float(estimate_for_spec(spec).total_usd)
     except Exception:
-        _LOG.warning("budget precheck skipped for %s: cost estimate failed", spec.run_id, exc_info=True)
+        _LOG.warning(
+            "budget precheck skipped for %s: cost estimate failed", spec.run_id, exc_info=True
+        )
         return
     try:
         from flash.server.billing import precheck_training_run
@@ -57,8 +111,36 @@ def _precheck_budget_or_block(spec: JobSpec, org_id: str) -> None:
 
 @router.post("/v1/runs")
 def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
-    spec = _parse_spec(payload, run_id=new_run_id())
     dry_run = _require_bool(payload, "dry_run", False)
+    schema = _client_train_schema(payload)
+    try:
+        spec = _parse_spec(payload, run_id=new_run_id())
+    except HTTPException as exc:
+        submitted = payload.get("spec")
+        submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
+        server_fields = train_schema_metadata()
+        unsupported = (
+            sorted(
+                name
+                for name in schema["authored_keys"]
+                if name in submitted_train and name not in server_fields
+            )
+            if exc.status_code == 400 and schema and isinstance(submitted_train, dict)
+            else []
+        )
+        if unsupported:
+            declared = ", ".join(
+                f"{name} (minimum released Flash version {schema['fields'][name]})"
+                for name in unsupported
+            )
+            client_only = ", ".join(schema["compatibility"]["client_only"]) or "none"
+            detail = (
+                f"{exc.detail}. Unsupported authored [train] key(s): {declared}; "
+                f"client/server [train] schemas disagree (client Flash {schema['version']}; "
+                f"client-only keys: {client_only})"
+            )
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise
     runtime_secrets = _runtime_secrets(payload, spec, require_environment_secrets=not dry_run)
     # Bill with operator key at completion; never persist the user's API key.
     bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
@@ -110,7 +192,10 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             spec.run_id,
             exc_info=True,
         )
-    return status.to_dict()
+    response = status.to_dict()
+    if dry_run and schema is not None:
+        response["train_schema_compatibility"] = schema["compatibility"]
+    return response
 
 
 @router.get("/v1/runs")
