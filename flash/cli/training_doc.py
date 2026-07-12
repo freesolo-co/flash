@@ -492,6 +492,8 @@ The three `rollout_request_*` / `rollout_stall_*` controls apply only when Flash
 `abort_request` loop. They do not cover synchronous OPD `LLM.generate`, TRL's native tool loop,
 or opaque environment calls. Flash never retries an environment call and does not impose a total
 episode elapsed-time cutoff; the existing turn, context, completion, and terminal bounds remain.
+Both deadlines are enforced cooperatively between engine polls: an expiry cannot interrupt one
+blocking engine step mid-flight and takes effect at the next poll boundary.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
