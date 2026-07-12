@@ -125,11 +125,6 @@ class TrainSpec:
     # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
     # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
     opd_eos_loss_coef: float | None = None
-    # OPD only: student-side entropy floor — weight and target (nats) of the hinge on the per-sample
-    # mean completion entropy (recipe defaults when None; coef 0 disables the term). counteracts
-    # reverse-KL over-sharpening on small students (the greedy repetition loop at temp=0).
-    opd_entropy_floor_coef: float | None = None
-    opd_entropy_floor: float | None = None
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
@@ -223,8 +218,6 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
-                opd_entropy_floor_coef=_opt_float(train.get("opd_entropy_floor_coef")),
-                opd_entropy_floor=_opt_float(train.get("opd_entropy_floor")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),

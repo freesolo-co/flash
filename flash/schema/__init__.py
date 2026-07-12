@@ -208,8 +208,6 @@ _TRAIN_KEYS = frozenset(
         "advantage_clip",
         "thinking_length_penalty_coef",
         "opd_eos_loss_coef",
-        "opd_entropy_floor_coef",
-        "opd_entropy_floor",
         "teacher_model",
         "stop_sequences",
         "structured_outputs",
@@ -217,7 +215,6 @@ _TRAIN_KEYS = frozenset(
         "max_examples",
     }
 )
-
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
@@ -359,10 +356,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             ),
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
-            # OPD-only student entropy floor (hinge weight + target nats); coef 0 disables the term.
-            # None -> recipe defaults (0.0 / 0.5, i.e. off until validated).
-            opd_entropy_floor_coef=_train_float(train_raw, "opd_entropy_floor_coef", minimum=0.0),
-            opd_entropy_floor=_train_float(train_raw, "opd_entropy_floor", minimum=0.0),
             # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
