@@ -20,6 +20,128 @@ INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_p
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 
 
+def _validate_checkpoint_intent_for_spec(spec: JobSpec, intent: dict) -> None:
+    initialization = spec.model_initialization
+    if initialization is None:
+        raise RuntimeError("checkpoint protocol v1 requires model interpolation")
+    metadata = intent.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("checkpoint intent metadata is missing")
+    expected = {
+        "base_model": spec.model,
+        "thinking": spec.thinking,
+        "structured_outputs": spec.train.structured_outputs or None,
+    }
+    mismatches = {
+        name: (intent.get(name), value)
+        for name, value in expected.items()
+        if intent.get(name) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"checkpoint intent does not match persisted run spec: {mismatches}")
+    metadata_expected = {
+        "canonical_model": spec.model,
+        "alpha": initialization.alpha,
+        "tokenizer_config_source": initialization.tokenizer_config_source,
+    }
+    metadata_mismatches = {
+        name: (metadata.get(name), value)
+        for name, value in metadata_expected.items()
+        if metadata.get(name) != value
+    }
+    parents = metadata.get("parents")
+    if not isinstance(parents, dict):
+        raise RuntimeError("checkpoint intent metadata parents are missing")
+    for name, model, revision in (
+        ("base", initialization.base_model, initialization.base_revision),
+        ("instruct", initialization.instruct_model, initialization.instruct_revision),
+    ):
+        parent = parents.get(name)
+        if not isinstance(parent, dict):
+            metadata_mismatches[f"parents.{name}"] = (parent, "object")
+            continue
+        for field, expected_value in (
+            ("model", model),
+            ("requested_revision", revision),
+            ("commit", revision),
+        ):
+            if parent.get(field) != expected_value:
+                metadata_mismatches[f"parents.{name}.{field}"] = (
+                    parent.get(field),
+                    expected_value,
+                )
+    if metadata_mismatches:
+        raise RuntimeError(
+            f"checkpoint metadata does not match persisted interpolation spec: {metadata_mismatches}"
+        )
+
+
+def _checkpoint_from_metrics(spec: JobSpec, metrics: dict) -> dict | None:
+    notes = metrics.get("notes")
+    notes = notes if isinstance(notes, dict) else {}
+    intent = notes.get("interpolated_checkpoint_intent")
+    legacy = notes.get("interpolated_checkpoint")
+    protocol_v1 = spec.checkpoint_protocol == "control_plane_v1"
+    if intent is not None and not protocol_v1:
+        raise RuntimeError("interpolated checkpoint intent is forbidden for an ordinary run")
+    if protocol_v1:
+        if spec.model_initialization is None:
+            raise RuntimeError("checkpoint protocol v1 requires model interpolation")
+        if intent is None:
+            raise RuntimeError("checkpoint protocol v1 completion is missing checkpoint intent")
+        if not isinstance(intent, dict):
+            raise RuntimeError("checkpoint protocol v1 intent must be an object")
+        _validate_checkpoint_intent_for_spec(spec, intent)
+        from flash.serve.model_checkpoints import build_checkpoint_outbox
+
+        return build_checkpoint_outbox(intent, run_id=spec.run_id, now=time.time())
+    if legacy is not None:
+        if spec.model_initialization is None or not isinstance(legacy, dict):
+            raise RuntimeError("legacy interpolated checkpoint is invalid for this run")
+        return dict(legacy)
+    return None
+
+
+def _complete_run(
+    spec: JobSpec,
+    metrics: dict,
+    *,
+    prior_cost: float,
+    log,
+) -> bool:
+    from flash.runner import (
+        _persist_metrics,
+        _status_estimated_charge,
+        _update,
+        artifacts_dir,
+        get_status,
+    )
+
+    checkpoint = _checkpoint_from_metrics(spec, metrics)
+    measured_cost = prior_cost + _persist_metrics(spec, metrics)
+    charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
+    applied = _update(
+        spec.run_id,
+        "done",
+        cost_usd=charge_usd,
+        artifacts_dir=artifacts_dir(spec),
+        checkpoint=checkpoint,
+    )
+    if not applied:
+        return False
+    if isinstance(checkpoint, dict) and checkpoint.get("activation_state") == "pending":
+        from flash.server.checkpoint_retry import request_checkpoint_reconciliation
+
+        request_checkpoint_reconciliation(spec.run_id)
+    _charge_completed_run_best_effort(spec, log)
+    _register_checkpoints_best_effort(spec, log)
+    if isinstance(checkpoint, dict) and checkpoint.get("activation_state") == "pending":
+        from flash.server.checkpoint_retry import reconcile_backend_mirrors
+
+        reconcile_backend_mirrors(spec.run_id)
+    return True
+
+
 @dataclass
 class _RetryBudget:
     infra_retries: int
@@ -476,12 +598,9 @@ def _run_training(
     from flash.runner import (
         FIXED_SEED,
         TERMINAL_STATES,
-        _persist_metrics,
         _RunCancelled,
-        _status_estimated_charge,
         _submit_seed_supervised,
         _update,
-        artifacts_dir,
         get_status,
     )
 
@@ -505,32 +624,16 @@ def _run_training(
     metrics = _submit_seed_supervised(
         spec, FIXED_SEED, log, runtime_secrets=runtime_secrets, code_prefix=code_prefix
     )
-    # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
-    measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
-    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
-    charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
-    # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
-    # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
+    # A cancel can land after the worker succeeded but before the atomic completion commit.
     with contextlib.suppress(FileNotFoundError):
         if get_status(spec.run_id).state == "cancelled":
             raise _RunCancelled(f"run {spec.run_id} was cancelled")
-    # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
-    applied = _update(
-        spec.run_id,
-        "done",
-        cost_usd=charge_usd,
-        artifacts_dir=artifacts_dir(spec),
-    )
+    applied = _complete_run(spec, metrics, prior_cost=prior_cost, log=log)
     print(
-        f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "
-        f"charge_usd={charge_usd:.4f}",
+        f"done: train_wall={metrics.get('wall_seconds')} completion_applied={applied}",
         file=log,
         flush=True,
     )
-    if applied:
-        _charge_completed_run_best_effort(spec, log)
-        _register_checkpoints_best_effort(spec, log)
 
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:

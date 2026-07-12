@@ -14,18 +14,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from flash.spec import ModelInterpolationSpec
+from flash.spec import SUPPORTED_MODEL_INTERPOLATION_PAIR, ModelInterpolationSpec
 
 _FORMULA = "W=(1-alpha)*W_base+alpha*W_instruct"
 _DEFAULT_MAX_SHARD_BYTES = 1024**3
 _MANIFEST_NAME = "flash_interpolation_manifest.json"
 _MANIFEST_VERSION = 2
-_ALLOWED_NAMESPACE_ENV = "FLASH_INTERPOLATION_ALLOWED_NAMESPACES"
-_SAFE_CATALOG_PAIRS = frozenset(
-    {
-        ("Qwen/Qwen3.5-4B-Base", "Qwen/Qwen3.5-4B"),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -370,38 +364,17 @@ def validate_materialized_interpolation(
         raise ValueError("materialized interpolation does not match its complete source fingerprint")
 
 
-def _allowed_parent_namespaces() -> frozenset[str]:
-    return frozenset(
-        value.strip()
-        for value in (os.environ.get(_ALLOWED_NAMESPACE_ENV) or "").split(",")
-        if value.strip()
-    )
-
-
 def parents_safe_for_shared_cache(spec: ModelInterpolationSpec) -> bool:
-    from flash.catalog import MODELS
-
     pair = (spec.base_model, spec.instruct_model)
-    return pair in _SAFE_CATALOG_PAIRS or all(parent in MODELS for parent in pair)
+    return pair == SUPPORTED_MODEL_INTERPOLATION_PAIR
 
 
 def validate_parent_policy(spec: ModelInterpolationSpec) -> bool:
-    """validate parent trust and return whether both are safe for the shared cache."""
-    from flash.catalog import MODELS
-
+    """validate the supported parent pair and return its shared-cache safety."""
     pair = (spec.base_model, spec.instruct_model)
-    pair_repositories = set(pair) if pair in _SAFE_CATALOG_PAIRS else set()
-    allowed = _allowed_parent_namespaces()
-    for parent in pair:
-        if parent in MODELS or parent in pair_repositories:
-            continue
-        namespace = parent.split("/", 1)[0] if "/" in parent else ""
-        if namespace not in allowed:
-            raise ValueError(
-                f"interpolation parent {parent!r} is not cataloged and its namespace is not "
-                f"approved by {_ALLOWED_NAMESPACE_ENV}"
-            )
-    return parents_safe_for_shared_cache(spec)
+    if pair != SUPPORTED_MODEL_INTERPOLATION_PAIR:
+        raise ValueError("interpolation parent pair is not supported")
+    return True
 
 
 def hub_repo_bytes(api: Any, repo_id: str, revision: str) -> int:

@@ -91,6 +91,19 @@ async def _repo_cleanup_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _checkpoint_reconcile_loop() -> None:
+    from flash.server.checkpoint_retry import reconcile_checkpoints_once
+
+    while True:
+        try:
+            await asyncio.to_thread(reconcile_checkpoints_once)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.debug("checkpoint reconciliation sweep failed; retrying next cycle", exc_info=True)
+        await asyncio.sleep(300.0)
+
+
 async def _charge_retry_startup() -> None:
     """Run ONE completion-charge recovery sweep off the startup critical path.
 

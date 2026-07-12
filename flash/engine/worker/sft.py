@@ -632,7 +632,7 @@ def run_sft():
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.finalize_interpolated_training(trainer.model, tok)
+        interpolated_checkpoint_intent = _w.finalize_interpolated_training(trainer.model, tok)
         # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
         if _final_step:
             _w.publish_deployable_checkpoint(adapter_dir, _final_step)
@@ -647,6 +647,7 @@ def run_sft():
         setup_seconds=setup_seconds,
         train_tokens=train_tokens,
         generated_tokens=0,
+        interpolated_checkpoint_intent=interpolated_checkpoint_intent,
         notes={
             "epochs": epochs,
             "resumed": bool(resume_ckpt),

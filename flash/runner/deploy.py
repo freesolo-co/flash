@@ -105,14 +105,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         FIXED_SEED,
         TERMINAL_STATES,
         _gc_run_endpoints,
-        _persist_metrics,
         _resolve_init_from_adapter,
         _run_training,
         _RunCancelled,
-        _status_estimated_charge,
         _status_org_id,
         _update,
-        artifacts_dir,
         get_status,
     )
 
@@ -208,18 +205,16 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             return get_status(run_id)
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
-        # Add the recovered run's cost to any already booked before the restart so recovery
-        # doesn't underreport spend.
-        measured = float(status.cost_usd or 0.0) + _persist_metrics(public_spec, res.metrics)
-        # Charge the submit-time QUOTE, not measured wall; recovery doesn't change the quote.
-        # Legacy runs without a persisted quote are re-priced from the spec.
-        charge_usd = _status_estimated_charge(get_status(run_id), public_spec, fallback=measured)
-        # A cancel can land while this thread persists the recovered metrics (after the late-cancel
-        # check above). Re-read before the terminal "done" so a late worker success can't resurrect
-        # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
-        _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(public_spec))
+        from flash.runner.lifecycle import _complete_run
+
+        _complete_run(
+            public_spec,
+            res.metrics,
+            prior_cost=float(status.cost_usd or 0.0),
+            log=log,
+        )
     except _RunCancelled:
         pass  # cancel_run already wrote terminal `cancelled`
     except Exception as exc:
@@ -234,24 +229,23 @@ def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     """Apply the lifecycle state for a final-adapter deployment."""
     # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
     if status.state == "done" and status.finished_at is None and not status.reconciled_at:
-        status.finished_at = status.updated_at
+        status.finished_at = getattr(status, "_mutation_previous_updated_at", status.updated_at)
     status.deployment = deployment
     status.state = "deployed"
 
 
 def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
-    from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
+    from flash.runner import _UNDEPLOYABLE_STATES, _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status):
         if status.state in _UNDEPLOYABLE_STATES:
-            return status
+            return False
         if expect_state is not None and status.state != expect_state:
-            return status
+            return False
         _promote_final_deployment(status, deployment)
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
+        return True
+
+    return _mutate_status(run_id, mutate)[0]
 
 
 def mark_checkpoint_deployed(
@@ -262,62 +256,55 @@ def mark_checkpoint_deployed(
     If training has finished by the time serving registration completes, the run behaves like any
     finished deployed run. Otherwise, keep the training state and only attach the deployment record.
     """
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status):
         if status.state == "dry_run":
-            return status
+            return False
         if expect_state is not None and status.state != expect_state:
-            return status
+            return False
         if status.state in _FINAL_DEPLOYMENT_STATES:
             _promote_final_deployment(status, deployment)
         else:
             status.deployment = deployment
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
+        return True
+
+    return _mutate_status(run_id, mutate)[0]
 
 
 def mark_deployment_pending(
     run_id: str, deployment: dict, expect_state: str | None = None
 ) -> RunStatus:
     """Attach an in-progress deployment record without changing the run lifecycle state."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status):
         if status.state == "dry_run":
-            return status
+            return False
         if expect_state is not None and status.state != expect_state:
-            return status
+            return False
         status.deployment = deployment
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
+        return True
+
+    return _mutate_status(run_id, mutate)[0]
 
 
 def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
     """Record a failed deployment attempt while preserving the run lifecycle state."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status):
         current = status.deployment or {}
-        # Don't clobber a newer deployment attempt or an explicit undeploy.
         if current.get("state") == "undeployed":
-            return status
+            return False
         if (
             current.get("requested_at") is not None
             and deployment.get("requested_at") is not None
             and current.get("requested_at") != deployment.get("requested_at")
         ):
-            return status
+            return False
         previous = deployment.get("previous_deployment")
-        if (
-            isinstance(previous, dict)
-            and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
-        ):
+        if isinstance(previous, dict) and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES:
             status.deployment = {
                 **previous,
                 "last_deploy_error": deployment.get("error") or "deployment failed",
@@ -327,24 +314,23 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             failed = dict(deployment)
             failed.pop("previous_deployment", None)
             status.deployment = {**failed, "state": "failed"}
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
+        return True
+
+    return _mutate_status(run_id, mutate)[0]
 
 
 def mark_undeployed(run_id: str) -> RunStatus:
     """Record an explicit undeploy; live final-adapter deployments return to `done`."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status):
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
         if status.state == "deployed":
             status.state = "done"
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
+        return True
+
+    return _mutate_status(run_id, mutate)[0]
 
 
 def mark_deployment_undeployed(run_id: str) -> RunStatus:
@@ -353,12 +339,12 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
     Used by cancel_run — unlike mark_undeployed, never asserts or changes the run state,
     so it works even after a racing mark_undeployed has already written terminal `done`.
     """
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _mutate_status
 
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment:
-            status.deployment = {**status.deployment, "state": "undeployed"}
-            status.updated_at = time.time()
-            _save_status(status)
-        return status
+    def mutate(status):
+        if not status.deployment:
+            return False
+        status.deployment = {**status.deployment, "state": "undeployed"}
+        return True
+
+    return _mutate_status(run_id, mutate)[0]

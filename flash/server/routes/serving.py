@@ -469,6 +469,18 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
+        if isinstance(status.checkpoint, dict):
+            from flash.server.checkpoint_retry import deactivate_checkpoint
+
+            try:
+                deactivated = deactivate_checkpoint(run_id)
+            except ServingError as exc:
+                raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+            return {
+                "run_id": run_id,
+                "deleted_endpoints": int(deactivated),
+                "serving_deregistered": deactivated,
+            }
         try:
             deleted = _app.undeploy_adapter(run_id)
         except ServingError as exc:

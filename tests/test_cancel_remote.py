@@ -263,10 +263,9 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
 
 def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):
-    # Regression: the deployed branch used a bare _save_status OUTSIDE _STATUS_LOCK, which
-    # persisted a stale pre-teardown snapshot and bypassed serialization. It must instead
-    # mark the deployment inactive through the lock-guarded mark_deployment_undeployed
-    # helper, and that write must happen while _STATUS_LOCK is held.
+    # Regression: the deployed branch used a bare _save_status outside serialized mutation,
+    # which persisted a stale pre-teardown snapshot. It must instead route through the shared
+    # cross-process status mutation helper.
     import inspect
 
     import flash.runner as orch
@@ -287,9 +286,8 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
-    # The undeploy write must route through the lock-guarded helper (not a bare _save_status
-    # outside _STATUS_LOCK, the old racy path); that helper holds _STATUS_LOCK.
-    assert "with _STATUS_LOCK" in inspect.getsource(orch.mark_deployment_undeployed)
+    # The undeploy write must route through the shared flock-backed mutation helper.
+    assert "_mutate_status" in inspect.getsource(orch.mark_deployment_undeployed)
 
     called = []
     real_helper = orch.mark_deployment_undeployed

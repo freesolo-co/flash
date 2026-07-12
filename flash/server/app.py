@@ -40,6 +40,7 @@ from ._runtime import (
     _RECOVERABLE,
     _charge_retry_loop,
     _charge_retry_startup,
+    _checkpoint_reconcile_loop,
     _reconcile_cost_loop,
     _repo_cleanup_loop,
     _worker_artifacts,
@@ -60,6 +61,7 @@ __all__ = [
     "_RECOVERABLE",
     "_charge_retry_loop",
     "_charge_retry_startup",
+    "_checkpoint_reconcile_loop",
     "_deploy_lock",
     "_reconcile_cost_loop",
     "_repo_cleanup_loop",
@@ -322,6 +324,7 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        checkpoint_task = asyncio.create_task(_checkpoint_reconcile_loop())
         serving.recover_deployments()
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
@@ -377,6 +380,7 @@ def create_app():
         finally:
             for task in (
                 startup_charge_task,
+                checkpoint_task,
                 cost_task,
                 charge_task,
                 reap_task,

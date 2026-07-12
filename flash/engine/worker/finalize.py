@@ -48,7 +48,10 @@ def _publish_private_full_model(root: Path, repo_id: str) -> str:
     api = _w.hf_api()
     api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
     api.update_repo_settings(repo_id=repo_id, repo_type="model", private=True)
-    parent_commit = api.repo_info(repo_id=repo_id, repo_type="model").sha
+    repo_info = api.repo_info(repo_id=repo_id, repo_type="model")
+    if getattr(repo_info, "private", None) is not True:
+        raise RuntimeError("full-model checkpoint repository is not private")
+    parent_commit = repo_info.sha
     commit = api.upload_folder(
         folder_path=str(root),
         repo_id=repo_id,
@@ -70,7 +73,7 @@ def _publish_private_full_model(root: Path, repo_id: str) -> str:
 
 
 def finalize_interpolated_training(model: Any, tokenizer: Any) -> dict[str, Any] | None:
-    """merge, publish, and register the exact trained interpolation when one is active."""
+    """merge, publish, verify, and describe the exact trained interpolation."""
     resolved = getattr(_w, "RESOLVED_MODEL_SOURCE", None)
     if resolved is None or resolved.interpolation is None:
         return None
@@ -81,8 +84,8 @@ def finalize_interpolated_training(model: Any, tokenizer: Any) -> dict[str, Any]
         validate_output_tree,
     )
     from flash.serve.model_checkpoints import (
+        INTERPOLATED_CHECKPOINT_INTENT_SCHEMA,
         canonical_interpolation_metadata,
-        register_evaluation_checkpoint,
     )
 
     source = Path(resolved.source)
@@ -107,20 +110,25 @@ def finalize_interpolated_training(model: Any, tokenizer: Any) -> dict[str, Any]
         interpolation_manifest=manifest,
         trained_tree_fingerprint=trained_tree_fingerprint,
     )
-    registered = register_evaluation_checkpoint(
-        model_id=_w.RUN_ID,
-        canonical_base_model=resolved.canonical_model,
-        model_repo_id=repo_id,
-        model_revision=revision,
-        thinking=_w.THINKING,
-        metadata=metadata,
-    )
+    structured_outputs = getattr(getattr(_w, "JOB_SPEC", None), "train", None)
+    structured_outputs = getattr(structured_outputs, "structured_outputs", "") or None
     return {
-        "model_id": registered.model_id,
-        "model_repo_id": registered.model_repo_id,
-        "model_revision": registered.model_revision,
-        "deployment_token": registered.deployment_token,
+        "schema": INTERPOLATED_CHECKPOINT_INTENT_SCHEMA,
+        "version": 1,
+        "model_id": _w.RUN_ID,
+        "base_model": resolved.canonical_model,
+        "model_repo_id": repo_id,
+        "model_revision": revision,
+        "tokenizer_repo_id": None,
+        "tokenizer_revision": None,
+        "thinking": bool(_w.THINKING),
+        "structured_outputs": structured_outputs,
+        "private": True,
         "metadata": metadata,
+        "output_fingerprint": metadata["trained_tree_fingerprint"],
+        "interpolation_output_fingerprint": metadata[
+            "interpolation_output_fingerprint"
+        ],
     }
 
 
@@ -135,6 +143,7 @@ def write_train_meta(
     notes,
     *,
     step=None,
+    interpolated_checkpoint_intent=None,
 ):
     env = _w.require_active_env()
     resolved = getattr(_w, "RESOLVED_MODEL_SOURCE", None)
@@ -146,6 +155,9 @@ def write_train_meta(
         if resolved is not None
         else {"model_source": model_id, "model_interpolation": None}
     )
+    finalized_notes = dict(notes or {})
+    if interpolated_checkpoint_intent is not None:
+        finalized_notes["interpolated_checkpoint_intent"] = interpolated_checkpoint_intent
     meta = {
         "phase": phase,
         "adapter_dir": adapter_dir,
@@ -155,11 +167,11 @@ def write_train_meta(
         "train_tokens": train_tokens,
         "generated_tokens": generated_tokens,
         **source_metadata,
-        "notes": notes or {},
+        "notes": finalized_notes,
     }
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
-    _w.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
+    _w.hf_upload_file("/tmp/train_meta.json", "train_meta.json", required=True)
     # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel between
     # here and DONE would otherwise re-price a fully-trained run to 0 steps (codex[bot]).
@@ -186,7 +198,7 @@ def write_train_meta(
         train_tokens=train_tokens,
         generated_tokens=generated_tokens,
         notes={
-            **(notes or {}),
+            **finalized_notes,
             "renderer": "flash_env",
             "thinking": _w.THINKING,
             "train_wall": train_wall,

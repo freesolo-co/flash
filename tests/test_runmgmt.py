@@ -388,6 +388,144 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     assert st.cost_usd == pytest.approx(7.77)
 
 
+def _protocol_v1_spec(run_id="interpolated"):
+    from flash.spec import JobSpec, ModelInterpolationSpec
+
+    return JobSpec(
+        run_id=run_id,
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        model_initialization=ModelInterpolationSpec(
+            base_model="Qwen/Qwen3.5-4B-Base",
+            instruct_model="Qwen/Qwen3.5-4B",
+            alpha=0.5,
+            base_revision="a" * 40,
+            instruct_revision="b" * 40,
+        ),
+        checkpoint_protocol="control_plane_v1",
+    )
+
+
+def _checkpoint_intent(run_id="interpolated"):
+    return {
+        "schema": "flash.interpolated_checkpoint_intent",
+        "version": 1,
+        "model_id": run_id,
+        "base_model": "Qwen/Qwen3.5-4B",
+        "model_repo_id": f"Freesolo-Co/flash-checkpoint-{run_id}",
+        "model_revision": "d" * 40,
+        "tokenizer_repo_id": None,
+        "tokenizer_revision": None,
+        "thinking": False,
+        "structured_outputs": None,
+        "private": True,
+        "metadata": {
+            "schema": "flash.model-interpolation",
+            "version": 1,
+            "canonical_model": "Qwen/Qwen3.5-4B",
+            "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+            "alpha": 0.5,
+            "parents": {
+                "base": {
+                    "model": "Qwen/Qwen3.5-4B-Base",
+                    "requested_revision": "a" * 40,
+                    "commit": "a" * 40,
+                    "config_fingerprint": "1" * 64,
+                },
+                "instruct": {
+                    "model": "Qwen/Qwen3.5-4B",
+                    "requested_revision": "b" * 40,
+                    "commit": "b" * 40,
+                    "config_fingerprint": "2" * 64,
+                },
+            },
+            "tokenizer_config_source": "instruct",
+            "interpolation_output_fingerprint": "f" * 64,
+            "interpolation_tree_fingerprint": "3" * 64,
+            "trained_tree_fingerprint": "e" * 64,
+        },
+        "output_fingerprint": "e" * 64,
+        "interpolation_output_fingerprint": "f" * 64,
+    }
+
+
+def test_run_training_persists_pending_interpolated_checkpoint(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner as runner
+    from flash.runner import lifecycle
+    from flash.server import checkpoint_retry
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = _protocol_v1_spec()
+    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    monkeypatch.setattr(
+        runner,
+        "_submit_seed_supervised",
+        lambda *a, **k: {
+            "wall_seconds": 1.0,
+            "cost_usd": 0.01,
+            "notes": {"interpolated_checkpoint_intent": _checkpoint_intent()},
+        },
+    )
+    requested = []
+    monkeypatch.setattr(checkpoint_retry, "request_checkpoint_reconciliation", requested.append)
+    monkeypatch.setattr(checkpoint_retry, "reconcile_backend_mirrors", lambda run_id: True)
+    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+
+    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0)
+
+    status = runner.get_status(spec.run_id)
+    assert status.state == "done"
+    assert status.checkpoint["activation_state"] == "pending"
+    assert status.checkpoint["deployment_token"]
+    assert requested == [spec.run_id]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alpha", 0.75),
+        ("base_commit", "c" * 40),
+        ("instruct_requested_revision", "c" * 40),
+    ],
+)
+def test_checkpoint_protocol_v1_intent_must_match_persisted_spec(field, value):
+    from flash.runner.lifecycle import _checkpoint_from_metrics
+
+    intent = _checkpoint_intent()
+    if field == "alpha":
+        intent["metadata"]["alpha"] = value
+    elif field == "base_commit":
+        intent["metadata"]["parents"]["base"]["commit"] = value
+    else:
+        intent["metadata"]["parents"]["instruct"]["requested_revision"] = value
+    with pytest.raises(RuntimeError, match="persisted interpolation spec"):
+        _checkpoint_from_metrics(
+            _protocol_v1_spec(), {"notes": {"interpolated_checkpoint_intent": intent}}
+        )
+
+
+def test_checkpoint_protocol_v1_missing_intent_fails_closed():
+    from flash.runner.lifecycle import _checkpoint_from_metrics
+
+    with pytest.raises(RuntimeError, match="missing checkpoint intent"):
+        _checkpoint_from_metrics(_protocol_v1_spec(), {"notes": {}})
+
+
+def test_ordinary_run_rejects_checkpoint_intent():
+    from flash.runner.lifecycle import _checkpoint_from_metrics
+    from flash.spec import JobSpec
+
+    spec = JobSpec(run_id="ordinary", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+    with pytest.raises(RuntimeError, match="forbidden"):
+        _checkpoint_from_metrics(
+            spec,
+            {"notes": {"interpolated_checkpoint_intent": _checkpoint_intent("ordinary")}},
+        )
+
+
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     """If a run flips terminal in the race window between the pre-check and the ``running`` CAS,
     _run_training must raise _RunCancelled and never reach the PAID supervised submit. The gate is

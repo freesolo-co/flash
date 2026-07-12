@@ -705,7 +705,7 @@ def run_rl():
         # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs
         # likewise deploy their single adapter directly).
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.finalize_interpolated_training(trainer.model, tok)
+        interpolated_checkpoint_intent = _w.finalize_interpolated_training(trainer.model, tok)
         # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
         # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
         # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
@@ -728,6 +728,7 @@ def run_rl():
         setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=gen_tokens,
+        interpolated_checkpoint_intent=interpolated_checkpoint_intent,
         notes={
             "steps": steps,
             "epochs": epochs,

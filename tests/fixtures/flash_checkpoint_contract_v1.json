@@ -1,0 +1,178 @@
+{
+  "active_response": {
+    "activated_at": "2026-07-11T00:00:00Z",
+    "base_model": "Qwen/Qwen3.5-4B",
+    "deployment_token": "2bd985b3-1dc7-5744-8b31-16888dab7e6b",
+    "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "metadata": {
+      "alpha": 0.5,
+      "canonical_model": "Qwen/Qwen3.5-4B",
+      "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+      "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "interpolation_tree_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+      "parents": {
+        "base": {
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "config_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+          "model": "Qwen/Qwen3.5-4B-Base",
+          "requested_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "instruct": {
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "model": "Qwen/Qwen3.5-4B",
+          "requested_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "schema": "flash.model-interpolation",
+      "tokenizer_config_source": "instruct",
+      "trained_tree_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "version": 1
+    },
+    "model_id": "flash-contract-v1",
+    "model_repo_id": "Freesolo-Co/flash-checkpoint-flash-contract-v1",
+    "model_revision": "dddddddddddddddddddddddddddddddddddddddd",
+    "output_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "payload_hash": "d14da3a99cb5c53f5b7971327dfeb53c038c69e5a77deba05b5decc328957ecd",
+    "private": true,
+    "protocol_version": 1,
+    "schema": "flash.interpolated_checkpoint_intent",
+    "status": "ready",
+    "structured_outputs": null,
+    "thinking": false,
+    "tokenizer_repo_id": null,
+    "tokenizer_revision": null,
+    "version": 1
+  },
+  "deployment_token": "2bd985b3-1dc7-5744-8b31-16888dab7e6b",
+  "intent": {
+    "base_model": "Qwen/Qwen3.5-4B",
+    "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "metadata": {
+      "alpha": 0.5,
+      "canonical_model": "Qwen/Qwen3.5-4B",
+      "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+      "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "interpolation_tree_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+      "parents": {
+        "base": {
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "config_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+          "model": "Qwen/Qwen3.5-4B-Base",
+          "requested_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "instruct": {
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "model": "Qwen/Qwen3.5-4B",
+          "requested_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "schema": "flash.model-interpolation",
+      "tokenizer_config_source": "instruct",
+      "trained_tree_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "version": 1
+    },
+    "model_id": "flash-contract-v1",
+    "model_repo_id": "Freesolo-Co/flash-checkpoint-flash-contract-v1",
+    "model_revision": "dddddddddddddddddddddddddddddddddddddddd",
+    "output_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "private": true,
+    "schema": "flash.interpolated_checkpoint_intent",
+    "structured_outputs": null,
+    "thinking": false,
+    "tokenizer_repo_id": null,
+    "tokenizer_revision": null,
+    "version": 1
+  },
+  "payload_hash": "d14da3a99cb5c53f5b7971327dfeb53c038c69e5a77deba05b5decc328957ecd",
+  "registration_payload": {
+    "base_model": "Qwen/Qwen3.5-4B",
+    "deployment_token": "2bd985b3-1dc7-5744-8b31-16888dab7e6b",
+    "expected_active_token": null,
+    "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "metadata": {
+      "alpha": 0.5,
+      "canonical_model": "Qwen/Qwen3.5-4B",
+      "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+      "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "interpolation_tree_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+      "parents": {
+        "base": {
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "config_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+          "model": "Qwen/Qwen3.5-4B-Base",
+          "requested_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "instruct": {
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "model": "Qwen/Qwen3.5-4B",
+          "requested_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "schema": "flash.model-interpolation",
+      "tokenizer_config_source": "instruct",
+      "trained_tree_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "version": 1
+    },
+    "model_id": "flash-contract-v1",
+    "model_repo_id": "Freesolo-Co/flash-checkpoint-flash-contract-v1",
+    "model_revision": "dddddddddddddddddddddddddddddddddddddddd",
+    "output_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "payload_hash": "d14da3a99cb5c53f5b7971327dfeb53c038c69e5a77deba05b5decc328957ecd",
+    "private": true,
+    "protocol_version": 1,
+    "schema": "flash.interpolated_checkpoint_intent",
+    "structured_outputs": null,
+    "thinking": false,
+    "tokenizer_repo_id": null,
+    "tokenizer_revision": null,
+    "version": 1
+  },
+  "run_mirror_checkpoint": {
+    "activatedAt": null,
+    "activationAttempts": 0,
+    "activationError": null,
+    "activationNextRetryAt": null,
+    "activationState": "pending",
+    "activationUpdatedAt": 1.0,
+    "baseModel": "Qwen/Qwen3.5-4B",
+    "deploymentToken": "2bd985b3-1dc7-5744-8b31-16888dab7e6b",
+    "interpolationOutputFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "metadata": {
+      "alpha": 0.5,
+      "canonical_model": "Qwen/Qwen3.5-4B",
+      "formula": "W=(1-alpha)*W_base+alpha*W_instruct",
+      "interpolation_output_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "interpolation_tree_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+      "parents": {
+        "base": {
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "config_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+          "model": "Qwen/Qwen3.5-4B-Base",
+          "requested_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "instruct": {
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "model": "Qwen/Qwen3.5-4B",
+          "requested_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "schema": "flash.model-interpolation",
+      "tokenizer_config_source": "instruct",
+      "trained_tree_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "version": 1
+    },
+    "modelId": "flash-contract-v1",
+    "modelRepoId": "Freesolo-Co/flash-checkpoint-flash-contract-v1",
+    "modelRevision": "dddddddddddddddddddddddddddddddddddddddd",
+    "outputFingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "payloadHash": "d14da3a99cb5c53f5b7971327dfeb53c038c69e5a77deba05b5decc328957ecd",
+    "schema": "flash.interpolated_checkpoint_intent",
+    "tokenizerRepoId": null,
+    "tokenizerRevision": null,
+    "version": 1
+  }
+}

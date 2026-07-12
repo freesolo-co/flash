@@ -258,7 +258,7 @@ def build_worker_env(
         env[str(k)] = str(v)
     allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
     for k, v in (runtime_secrets or {}).items():
-        if k in allowed_runtime_secrets and v:
+        if k in allowed_runtime_secrets and k not in _RESERVED_WORKER_ENV and v:
             env[k] = str(v)
     # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
     # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
@@ -266,14 +266,6 @@ def build_worker_env(
     # runtime_secret can override it.
     if str(getattr(spec, "algorithm", "")).lower() == "opd" and os.environ.get("FIREWORKS_API_KEY"):
         env["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
-    # interpolated runs finalize by registering an exact full checkpoint. this is a platform credential,
-    # scoped to those runs and applied last so user configuration cannot override it.
-    if getattr(spec, "model_initialization", None) is not None and os.environ.get(
-        "FREESOLO_CHECKPOINT_INTERNAL_KEY"
-    ):
-        env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] = os.environ[
-            "FREESOLO_CHECKPOINT_INTERNAL_KEY"
-        ]
     return env
 
 

@@ -69,6 +69,7 @@ def build_internal_request(
 
 
 UrlOpen = Callable[..., Any]
+ResponseValidator = Callable[[Any], bool]
 
 
 def request_internal_json(
@@ -79,15 +80,28 @@ def request_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
+    response_validator: ResponseValidator | None = None,
 ) -> bool:
-    """Best-effort internal JSON request; returns True on 2xx, False when disabled or failed."""
+    """best-effort internal json request with optional response acknowledgement validation."""
     key = internal_key()
     if not key:
         return False
     req = build_internal_request(path, body, token=key, method=method)
     try:
         with urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
-            return 200 <= resp.status < 300
+            if not 200 <= resp.status < 300:
+                return False
+            if response_validator is None:
+                return True
+            try:
+                response_body = json.load(resp)
+            except Exception as exc:
+                logger.warning("failed to %s: invalid json acknowledgement: %s", subject, exc)
+                return False
+            if not response_validator(response_body):
+                logger.warning("failed to %s: backend acknowledgement was not accepted", subject)
+                return False
+            return True
     except urllib.error.HTTPError as exc:
         detail = ""
         with suppress(Exception):
@@ -105,6 +119,7 @@ def post_internal_json(
     subject: str,
     logger: Logger,
     urlopen: UrlOpen = urllib.request.urlopen,
+    response_validator: ResponseValidator | None = None,
 ) -> bool:
     return request_internal_json(
         path,
@@ -113,6 +128,7 @@ def post_internal_json(
         subject=subject,
         logger=logger,
         urlopen=urlopen,
+        response_validator=response_validator,
     )
 
 

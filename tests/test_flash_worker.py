@@ -149,12 +149,12 @@ def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatc
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_build_worker_env_forwards_checkpoint_key_for_interpolation(monkeypatch, algorithm):
+def test_build_worker_env_never_forwards_checkpoint_key(monkeypatch, algorithm):
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("FREESOLO_CHECKPOINT_INTERNAL_KEY", "platform-checkpoint-key")
     env = build_worker_env(_interpolation_spec(algorithm), 0)
-    assert env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] == "platform-checkpoint-key"
+    assert "FREESOLO_CHECKPOINT_INTERNAL_KEY" not in env
 
 
 def test_build_worker_env_scopes_checkpoint_key_to_interpolation(monkeypatch):
@@ -164,7 +164,7 @@ def test_build_worker_env_scopes_checkpoint_key_to_interpolation(monkeypatch):
     assert "FREESOLO_CHECKPOINT_INTERNAL_KEY" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_checkpoint_key_is_platform_authoritative(monkeypatch):
+def test_build_worker_env_checkpoint_key_cannot_be_user_injected(monkeypatch):
     from dataclasses import replace
 
     from flash.providers.runpod.train import build_worker_env
@@ -183,7 +183,7 @@ def test_build_worker_env_checkpoint_key_is_platform_authoritative(monkeypatch):
         0,
         runtime_secrets={"FREESOLO_CHECKPOINT_INTERNAL_KEY": "runtime-user-key"},
     )
-    assert env["FREESOLO_CHECKPOINT_INTERNAL_KEY"] == "platform-checkpoint-key"
+    assert "FREESOLO_CHECKPOINT_INTERNAL_KEY" not in env
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -223,6 +223,42 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     )
     assert env["SERPAPI_API_KEY"] == "serp-user"
     assert "UNDECLARED_API_KEY" not in env
+
+
+def test_train_metadata_publication_failure_prevents_metrics_and_done(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.engine.worker import finalize
+    from flash.engine.worker.perf import RetriableInfraError
+
+    finalized = []
+    monkeypatch.setattr(finalize._w, "require_active_env", lambda: SimpleNamespace(id="acme/env"))
+    monkeypatch.setattr(finalize._w, "RESOLVED_MODEL_SOURCE", None)
+    monkeypatch.setattr(finalize._w, "JOB_SPEC", None)
+    monkeypatch.setattr(finalize._w, "SEED", 42)
+    monkeypatch.setattr(finalize._w, "THINKING", False)
+    monkeypatch.setattr(finalize._w, "_finalize", finalized.append)
+    monkeypatch.setattr(finalize, "gpu_diagnostics", lambda: {})
+
+    def fail_publication(*args, **kwargs):
+        assert kwargs["required"] is True
+        raise RetriableInfraError("train metadata publication failed")
+
+    monkeypatch.setattr(finalize._w, "hf_upload_file", fail_publication)
+
+    with pytest.raises(RetriableInfraError, match="train metadata publication failed"):
+        finalize.write_train_meta(
+            phase="sft",
+            adapter_dir="/tmp/adapter",
+            model_id="Qwen/Qwen3.5-4B",
+            train_wall=1.0,
+            setup_seconds=0.5,
+            train_tokens=10,
+            generated_tokens=0,
+            notes={},
+        )
+
+    assert finalized == []
 
 
 def test_worker_console_always_uploaded_and_no_flag(monkeypatch):

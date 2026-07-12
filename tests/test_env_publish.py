@@ -455,6 +455,52 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["model"] == "Qwen/Qwen3.5-4B"
 
 
+def test_record_training_run_checkpoint_requires_same_response_acknowledgement(monkeypatch):
+    from flash.runner import RunStatus
+    from flash.serve.model_checkpoints import build_checkpoint_outbox
+    from flash.server import run_registry
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    fixture_path = Path(__file__).parent / "fixtures" / "flash_checkpoint_contract_v1.json"
+    fixture = json.loads(fixture_path.read_text())
+    intent = fixture["intent"]
+    checkpoint = build_checkpoint_outbox(intent, run_id=intent["model_id"], now=1.0)
+    response_body = {}
+    seen = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(response_body).encode()
+
+    def urlopen(request, timeout=None):
+        seen.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(run_registry.urllib.request, "urlopen", urlopen)
+    status = RunStatus(
+        run_id=intent["model_id"],
+        state="done",
+        spec={"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "phase": "rl"},
+        platform_context={"org_id": "org-1"},
+        checkpoint=checkpoint,
+    )
+
+    assert run_registry.record_training_run(status=status) is False
+    assert seen[-1]["checkpoint"] == fixture["run_mirror_checkpoint"]
+    response_body["checkpointAccepted"] = True
+    assert run_registry.record_training_run(status=status) is True
+    assert seen[-1]["checkpoint"] == fixture["run_mirror_checkpoint"]
+
+
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     from flash import runner
     from flash.runner import RunStatus
@@ -474,6 +520,10 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
 
         def __exit__(self, *exc: object) -> bool:
             return False
+
+        def read(self):
+            body = {} if seen.get("legacy_response") else {"checkpointAccepted": True}
+            return json.dumps(body).encode()
 
     def fake_urlopen(req, timeout=None):
         seen["url"] = req.full_url
@@ -514,6 +564,16 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     assert body["checkpointId"] == "final"
     assert body["adapterRef"] == "Freesolo-Co/flashrun-flash-1:rl/flash-1"
     assert body["metrics"] == {"cost_usd": 0.25}
+
+    seen["legacy_response"] = True
+    assert (
+        run_registry.record_training_checkpoint(
+            spec=spec,
+            metrics={"cost_usd": 0.25},
+            artifact_path="/tmp/artifacts",
+        )
+        is False
+    )
 
 
 def test_redacts_raw_and_url_encoded_token():

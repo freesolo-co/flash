@@ -420,6 +420,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
     init_adapter_ref = _init_from_adapter_ref(train_raw)
+    if model_initialization is not None and model != model_initialization.instruct_model:
+        raise ConfigError(
+            "model must equal model_initialization.instruct_model for interpolation"
+        )
     if model_initialization is not None and init_adapter_ref:
         raise ConfigError(
             "train.init_from_adapter is not supported with model_initialization; continue from an "

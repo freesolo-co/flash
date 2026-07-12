@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -22,7 +23,17 @@ RESULTS_DIR = os.path.join(_STATE_DIR, "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 # `done` IS deployable, so excluded; cancelled/failed/dry_run must never flip to `deployed`.
 _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
-_STATUS_LOCK = threading.Lock()
+_STATUS_LOCKS_GUARD = threading.Lock()
+_STATUS_LOCKS: dict[str, threading.RLock] = {}
+
+_CHECKPOINT_TRANSITIONS = {
+    "pending": {"activating", "active", "failed"},
+    "activating": {"retry_wait", "active", "failed"},
+    "retry_wait": {"activating", "active", "failed"},
+    "active": {"disabled"},
+    "failed": set(),
+    "disabled": set(),
+}
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -155,6 +166,7 @@ class RunStatus:
     artifacts_dir: str | None = None
     adapter_ref: str | None = None
     deployment: dict | None = None
+    checkpoint: dict | None = None
     remote: dict | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
@@ -551,7 +563,10 @@ def submit_job(
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
-    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    submitted = {**_with_model_disk(spec, info), "run_id": run_id}
+    if spec.model_initialization is not None:
+        submitted["checkpoint_protocol"] = "control_plane_v1"
+    spec = JobSpec.from_dict(submitted)
     spec = _assign_managed_hf_repo(spec)
     spec = _assign_weight_cache_volume(spec, info)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
@@ -606,10 +621,8 @@ def submit_job(
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
         # deploy dry-run) — same contract as a real submit minus GPU allocation, provisioning, and
         # billing. Everything above already validated the spec; just flip the state and return.
-        status.state = "dry_run"
-        _save_status(status)
-        _report_status(status)
-        return status
+        _update(status.run_id, "dry_run")
+        return get_status(status.run_id)
     if background:
         threading.Thread(
             target=_run_job_background,
@@ -637,12 +650,88 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
 
 
-def get_status(run_id: str) -> RunStatus:
+def _read_status_unlocked(run_id: str) -> RunStatus:
     path = runs_file_path(run_id, ".json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
         return _runstatus_from_json(json.load(f))
+
+
+def get_status(run_id: str) -> RunStatus:
+    return _read_status_unlocked(run_id)
+
+
+def _run_process_lock(run_id: str) -> threading.RLock:
+    with _STATUS_LOCKS_GUARD:
+        return _STATUS_LOCKS.setdefault(run_id, threading.RLock())
+
+
+@contextlib.contextmanager
+def _locked_status(run_id: str):
+    process_lock = _run_process_lock(run_id)
+    with process_lock:
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        lock_path = runs_file_path(run_id, ".lock")
+        with open(lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield _read_status_unlocked(run_id)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_checkpoint_change(old: dict | None, new: dict | None) -> None:
+    if old is not None and new is None:
+        raise ValueError("checkpoint cannot be removed once persisted")
+    if old is None or new is None:
+        return
+    if old.get("deployment_token") != new.get("deployment_token"):
+        raise ValueError("checkpoint deployment token is immutable")
+    immutable = {
+        "schema",
+        "version",
+        "model_id",
+        "base_model",
+        "model_repo_id",
+        "model_revision",
+        "tokenizer_repo_id",
+        "tokenizer_revision",
+        "thinking",
+        "structured_outputs",
+        "private",
+        "metadata",
+        "output_fingerprint",
+        "interpolation_output_fingerprint",
+        "payload_hash",
+        "deployment_token",
+        "expected_active_token",
+    }
+    if any(old.get(key) != new.get(key) for key in immutable):
+        raise ValueError("checkpoint immutable fields cannot change")
+    before = old.get("activation_state")
+    after = new.get("activation_state")
+    if before != after and after not in _CHECKPOINT_TRANSITIONS.get(before, set()):
+        raise ValueError(f"checkpoint transition {before!r} -> {after!r} is not allowed")
+
+
+def _mutate_status(run_id: str, mutate, *, report: bool = True) -> tuple[RunStatus, bool]:
+    with _locked_status(run_id) as status:
+        old_checkpoint = json.loads(json.dumps(status.checkpoint)) if status.checkpoint else None
+        previous_updated_at = status.updated_at
+        status.updated_at = time.time()
+        status._mutation_previous_updated_at = previous_updated_at
+        try:
+            changed = bool(mutate(status))
+        finally:
+            del status._mutation_previous_updated_at
+        if not changed:
+            return status, False
+        _validate_checkpoint_change(old_checkpoint, status.checkpoint)
+        _save_status(status)
+    if report:
+        _report_status(status)
+    return status, True
 
 
 def list_runs() -> list[RunStatus]:
@@ -700,16 +789,15 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         return
     hb = _sanitize_status_value(heartbeat)
     gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
-    with _STATUS_LOCK:
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
+    def mutate(status: RunStatus) -> bool:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
-        status.updated_at = time.time()
-        _save_status(status)
-    _report_status(status)
+        return True
+
+    try:
+        _mutate_status(run_id, mutate)
+    except FileNotFoundError:
+        return
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
@@ -737,10 +825,6 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
             metrics["notes"]["runpod_gpu"] = gpu_type
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    with contextlib.suppress(Exception):
-        from flash.server.run_registry import record_training_checkpoint
-
-        record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
@@ -752,39 +836,37 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     that gate PAID work on a transition (e.g. the recovery path resuming ``_run_training``)
     must check this return so a run concurrently flipped terminal does not get resumed.
     """
-    report_status: RunStatus | None = None
-    with _STATUS_LOCK:
-        status = get_status(run_id)
+    def mutate(status: RunStatus) -> bool:
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
+        if state == "done" and status.spec.get("checkpoint_protocol") == "control_plane_v1":
+            checkpoint = updates.get("checkpoint", status.checkpoint)
+            if not isinstance(checkpoint, dict):
+                raise ValueError("control-plane-v1 interpolation completion requires checkpoint intent")
         was_terminal = status.state in TERMINAL_STATES
-        prev_updated_at = status.updated_at
+        prev_updated_at = status._mutation_previous_updated_at
         status.state = state
-        status.updated_at = time.time()
         if state in TERMINAL_STATES and status.finished_at is None:
-            # Legacy run already terminal: backfill from prior updated_at, not now.
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
-        _save_status(status)
-        report_status = status
-    if report_status is not None:
-        _report_status(report_status)
-    return True
+        return True
+
+    _, changed = _mutate_status(run_id, mutate)
+    return changed
 
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
-    with _STATUS_LOCK:
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
+    def mutate(status: RunStatus) -> bool:
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
-        status.updated_at = time.time()
-        _save_status(status)
-    _report_status(status)
+        return True
+
+    try:
+        _mutate_status(run_id, mutate)
+    except FileNotFoundError:
+        return
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
@@ -797,30 +879,100 @@ def record_billing_state(run_id: str, **fields) -> None:
     bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
-    with _STATUS_LOCK:
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
+    def mutate(status: RunStatus) -> bool:
         new_billing_state = fields.get("billing_state")
         if (
             status.billing_state == "charged"
             and "billing_state" in fields
             and new_billing_state != "charged"
         ):
-            return
-        # Backfill finished_at before bumping updated_at so reconcile._terminal_ts isn't skewed.
+            return False
         if (
             status.state in _FINISHED_AT_PRESERVED_STATES
             and status.finished_at is None
             and not status.reconciled_at
         ):
-            status.finished_at = status.updated_at
+            status.finished_at = getattr(
+                status, "_mutation_previous_updated_at", status.updated_at
+            )
         for key, value in fields.items():
             setattr(status, key, value)
-        status.updated_at = time.time()
-        _save_status(status)
-    _report_status(status)
+        return True
+
+    try:
+        _mutate_status(run_id, mutate)
+    except FileNotFoundError:
+        return
+
+
+def record_checkpoint_state(
+    run_id: str,
+    *,
+    deployment_token: str,
+    activation_state: str,
+    activation_error: str | None = None,
+    activation_next_retry_at: float | None = None,
+    increment_attempts: bool = False,
+    activated_at: float | None = None,
+) -> bool:
+    def mutate(status: RunStatus) -> bool:
+        checkpoint = status.checkpoint
+        if not isinstance(checkpoint, dict):
+            return False
+        if checkpoint.get("deployment_token") != deployment_token:
+            return False
+        before = checkpoint.get("activation_state")
+        if before == activation_state and not increment_attempts:
+            return False
+        updated = dict(checkpoint)
+        updated["activation_state"] = activation_state
+        updated["activation_error"] = activation_error
+        updated["activation_next_retry_at"] = activation_next_retry_at
+        updated["activation_updated_at"] = time.time()
+        if before != activation_state:
+            updated["backend_mirror_state"] = "pending"
+            updated["backend_mirror_error"] = None
+            updated["backend_mirrored_at"] = None
+        if increment_attempts:
+            updated["activation_attempts"] = int(updated.get("activation_attempts") or 0) + 1
+        if activation_state == "active":
+            updated["activated_at"] = activated_at or time.time()
+        status.checkpoint = updated
+        return True
+
+    return _mutate_status(run_id, mutate)[1]
+
+
+def record_checkpoint_mirror(
+    run_id: str,
+    *,
+    synced: bool,
+    expected_deployment_token: str,
+    expected_activation_state: str,
+    expected_activation_updated_at: float,
+    error: str | None = None,
+    mirrored_at: float | None = None,
+) -> bool:
+    def mutate(status: RunStatus) -> bool:
+        if not isinstance(status.checkpoint, dict):
+            return False
+        checkpoint = status.checkpoint
+        if (
+            checkpoint.get("deployment_token") != expected_deployment_token
+            or checkpoint.get("activation_state") != expected_activation_state
+            or checkpoint.get("activation_updated_at") != expected_activation_updated_at
+        ):
+            return False
+        updated = dict(checkpoint)
+        updated["backend_mirror_state"] = "synced" if synced else "pending"
+        updated["backend_mirror_error"] = None if synced else error
+        updated["backend_mirrored_at"] = (mirrored_at or time.time()) if synced else None
+        if updated == status.checkpoint:
+            return False
+        status.checkpoint = updated
+        return True
+
+    return _mutate_status(run_id, mutate, report=False)[1]
 
 
 def _report_status(status: RunStatus) -> None:

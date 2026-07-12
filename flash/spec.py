@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -14,6 +16,10 @@ from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 _HF_REPO_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
+)
+SUPPORTED_MODEL_INTERPOLATION_PAIR = (
+    "Qwen/Qwen3.5-4B-Base",
+    "Qwen/Qwen3.5-4B",
 )
 
 
@@ -205,10 +211,20 @@ class ModelInterpolationSpec:
                 raise ValueError(
                     f"model_initialization.{name} must be a strict Hugging Face namespace/name id"
                 )
-        if self.base_model == self.instruct_model:
-            raise ValueError("model_initialization parents must be distinct")
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError("model_initialization.alpha must be between 0 and 1")
+        pair = (self.base_model, self.instruct_model)
+        if pair != SUPPORTED_MODEL_INTERPOLATION_PAIR:
+            supported = " and ".join(SUPPORTED_MODEL_INTERPOLATION_PAIR)
+            raise ValueError(
+                "model_initialization only supports the parent pair "
+                f"{supported} in base/instruct order"
+            )
+        if (
+            isinstance(self.alpha, bool)
+            or not isinstance(self.alpha, numbers.Real)
+            or not math.isfinite(self.alpha)
+            or not 0.0 <= self.alpha <= 1.0
+        ):
+            raise ValueError("model_initialization.alpha must be a finite real number between 0 and 1")
         if self.tokenizer_config_source not in {"base", "instruct"}:
             raise ValueError(
                 "model_initialization.tokenizer_config_source must be 'base' or 'instruct'"
@@ -242,6 +258,20 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_initialization: ModelInterpolationSpec | None = None
+    checkpoint_protocol: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.model_initialization is not None
+            and self.model != self.model_initialization.instruct_model
+        ):
+            raise ValueError(
+                "model must equal model_initialization.instruct_model for interpolation"
+            )
+        if self.checkpoint_protocol not in {None, "control_plane_v1"}:
+            raise ValueError("checkpoint_protocol must be 'control_plane_v1' when set")
+        if self.checkpoint_protocol is not None and self.model_initialization is None:
+            raise ValueError("checkpoint_protocol is only valid with model_initialization")
 
     @property
     def phase(self) -> str:
@@ -340,6 +370,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             model_initialization=interpolation,
+            checkpoint_protocol=data.get("checkpoint_protocol"),
         )
 
     @classmethod
