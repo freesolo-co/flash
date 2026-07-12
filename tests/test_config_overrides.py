@@ -50,14 +50,46 @@ def test_composed_config_deep_merge():
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
-        override = _write(tmp, "prod.toml", '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\n')
+        override = _write(
+            tmp, "prod.toml", '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\n'
+        )
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
-        assert spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"  # untouched key preserved
+        assert (
+            spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
+        )  # untouched key preserved
         # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
         # VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB A100 PCIe @ $1.39), regardless
         # of the composed gpu.type.
         assert spec.gpu.type == "A100 PCIe"
+
+
+def test_authored_train_keys_follow_composed_config() -> None:
+    from flash.schema import spec_and_train_keys_from_file
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = _write(tmp, "base.toml", BASE)
+        extra = _write(tmp, "extra.toml", '[train]\nteacher_model = "GLM 5.2"\n')
+        spec, keys = spec_and_train_keys_from_file(
+            base,
+            run_id="x",
+            extra_configs=[extra],
+            overrides=["train.temperature=0", "train.stop_sequences=[]"],
+        )
+
+    assert keys == frozenset(
+        {
+            "epochs",
+            "max_examples",
+            "hf_repo",
+            "teacher_model",
+            "temperature",
+            "stop_sequences",
+        }
+    )
+    assert spec.train.temperature == 0.0
+    assert spec.train.stop_sequences == ()
+    assert spec.train.teacher_model.startswith("accounts/fireworks/models/")
 
 
 def test_set_requires_key_value():

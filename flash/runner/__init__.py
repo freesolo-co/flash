@@ -180,11 +180,24 @@ class RunStatus:
     gpu_status: dict | None = None
 
     def to_dict(self) -> dict:
-        data = asdict(self)
-        data["adapter_ref"] = (
-            _adapter_ref_from_status_spec(self.spec) if self.state in {"done", "deployed"} else None
-        )
+        """Return the public run status representation."""
+        from flash.serve.urls import public_deployment
+
+        data = _status_storage_dict(self)
+        if isinstance(self.deployment, dict):
+            data["deployment"] = public_deployment(self.deployment)
         return data
+
+
+def _status_storage_dict(status: RunStatus) -> dict:
+    """Serialize status for persistence without filtering internal deployment state."""
+    data = asdict(status)
+    data["adapter_ref"] = (
+        _adapter_ref_from_status_spec(status.spec)
+        if status.state in {"done", "deployed"}
+        else None
+    )
+    return data
 
 
 class _RunCancelled(RuntimeError):
@@ -808,7 +821,7 @@ def _save_status(status: RunStatus) -> None:
     fd, tmp = tempfile.mkstemp(dir=RUNS_DIR, prefix=f"{status.run_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(status.to_dict(), f, indent=2, sort_keys=True)
+            json.dump(_status_storage_dict(status), f, indent=2, sort_keys=True)
         os.replace(tmp, path)
     finally:
         with contextlib.suppress(FileNotFoundError):
