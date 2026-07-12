@@ -34,6 +34,14 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # Fireworks API, so there is NO local frozen-reference forward (GRPO's extra 2).
 OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 C14_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # detached score fwd (2) + policy fwd/bwd (6)
+GREEDY_SIDECAR_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # student fwd (2) + bwd (4) over sidecars
+
+# Objectives that drive the shared greedy loop-closing sidecar (an extra local-only greedy rollout +
+# a student forward+backward over those completions). Mirrors the worker registry's greedy_sidecar
+# requirement (flash.engine.worker.opd_objectives.OPD_OBJECTIVES); a cost test asserts this set equals
+# the registry-derived one so the two cannot drift. The requirement is UNIONED across a plan, so no
+# matter how many of these are selected the worker runs ONE sidecar — hence it is billed once here.
+OPD_GREEDY_SIDECAR_OBJECTIVES = frozenset({"c07", "c08", "c12"})
 
 # Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
@@ -91,6 +99,24 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
     return completions, completions * n.seq_len
 
 
+def _opd_greedy_sidecar_seconds(n: RunConfig, params: float, peak: float) -> tuple[float, float]:
+    """(sidecar generation seconds, sidecar forward+backward seconds) for the ONE greedy loop-closing
+    sidecar that c07/c08/c12 share (NORMALIZED config). A step generates one greedy completion per
+    prompt -- prompts_per_step (= n.batch_size) completions -- at the planned completion length, then
+    runs a student forward+backward over those sidecars to apply the loop-closing unlikelihood term.
+    The forward+backward is billed for EVERY sidecar (all-loop), not only the ones that actually close
+    a loop, because a fail-closed cost reservation must not assume loops are rare. Billed ONCE per step
+    regardless of how many greedy-sidecar objectives are selected (requirements union -> one sidecar)."""
+    sidecar_completions = n.batch_size  # prompts_per_step: one greedy completion per prompt
+    gen_tokens = sidecar_completions * n.completion_len  # decode at the planned completion length
+    fwdbwd_tokens = sidecar_completions * n.seq_len  # full prompt+completion student fwd+bwd
+    gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
+    update_s = (GREEDY_SIDECAR_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * fwdbwd_tokens) / (
+        peak * MFU_TRAIN
+    )
+    return gen_s, update_s
+
+
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
@@ -114,6 +140,15 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         if {"c06", "c11", "c12"} & set(n.opd_objective_ids):
             update_flops += 2.0  # one frozen SFT-reference forward on the same base model
         update_s = (update_flops * params * seq_tokens) / (peak * MFU_TRAIN)
+        # Greedy loop-closing sidecar (c07/c08/c12): one extra local greedy generation of
+        # prompts_per_step completions + an all-loop student fwd+bwd over those sidecars. Billed once
+        # (requirements union -> one sidecar); c12 keeps its +2 reference forward above independently.
+        # c08's sampled_primary changes the EXISTING primary rollout's sampling, not the completion
+        # count, so it adds NO extra primary generation here — only the shared sidecar.
+        sidecar_s = 0.0
+        if OPD_GREEDY_SIDECAR_OBJECTIVES & set(n.opd_objective_ids):
+            sidecar_gen_s, sidecar_update_s = _opd_greedy_sidecar_seconds(n, params, peak)
+            sidecar_s = sidecar_gen_s + sidecar_update_s
         teacher_lat = teacher_seconds_per_completion()
         # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
         # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
@@ -121,7 +156,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
         # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
         teacher_s = teacher_lat if completions else 0.0
-        return gen_s + teacher_s + update_s
+        return gen_s + teacher_s + update_s + sidecar_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
@@ -196,6 +231,14 @@ def _notes(
             f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + "
             f"{update_note} + {reference_note}"
         )
+        if OPD_GREEDY_SIDECAR_OBJECTIVES & set(n.opd_objective_ids):
+            # Diagnostic: name BOTH sidecar contributions (generation + forward/backward). Billed once
+            # for c07/c08/c12 (shared sidecar); the fwd+bwd assumes every sidecar closes a loop.
+            notes.append(
+                f"greedy loop-closing sidecar (c07/c08/c12, billed once): one greedy generation of "
+                f"{n.batch_size} completions @ {n.completion_len} tok + all-loop student fwd+bwd over "
+                f"those sidecars (conservative: every sidecar assumed to close a loop)"
+            )
     elif n.is_grpo:
         comps = n.batch_size * n.group_size
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)

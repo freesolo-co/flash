@@ -336,3 +336,106 @@ def test_opd_teacher_scoring_is_one_parallel_wave():
         "full-parallel teacher scoring bills one wave; doubling completions at equal total tokens "
         "must not add teacher latency"
     )
+
+
+def _opd_cfg(model, objectives, *, group=4):
+    return RunConfig(
+        model,
+        "opd",
+        1,
+        batch_size=8,
+        group_size=group,
+        seq_len=1024,
+        completion_len=256,
+        opd_objective_ids=objectives,
+    )
+
+
+def _expected_sidecar_seconds(cfg, gpu):
+    from flash.cost.analytical import _opd_greedy_sidecar_seconds
+    from flash.cost.facts import active_params_b, gpu_tflops
+
+    n = cfg.normalized()
+    params = active_params_b(n.model_id) * 1e9
+    peak = gpu_tflops(gpu) * 1e12
+    gen_s, update_s = _opd_greedy_sidecar_seconds(n, params, peak)
+    return gen_s + update_s
+
+
+def test_greedy_sidecar_objectives_cost_more_than_c0_and_c08_adds_no_extra_primary():
+    # c07/c08/c12 drive an extra greedy loop-closing sidecar (generation + all-loop student fwd+bwd),
+    # so each costs strictly more per step than the plain c0 baseline.
+    gpu = "RTX 5090"
+    c0 = seconds_per_step(_opd_cfg(MID, ("c0",)), gpu)
+    c07 = seconds_per_step(_opd_cfg(MID, ("c07",)), gpu)
+    c08 = seconds_per_step(_opd_cfg(MID, ("c08",)), gpu)
+    assert c07 > c0
+    assert c08 > c0
+    # c08's sampled_primary modifies the EXISTING primary rollout's sampling, not the completion
+    # count, so it adds NO extra primary generation -- c08 costs exactly the shared sidecar over c0,
+    # identical to c07.
+    assert c08 == pytest.approx(c07)
+    assert c07 - c0 == pytest.approx(_expected_sidecar_seconds(_opd_cfg(MID, ("c07",)), gpu))
+
+
+def test_c12_costs_more_than_c06_by_exactly_the_sidecar_and_keeps_reference_forward():
+    # c12 = c06's frozen +2 reference forward PLUS the greedy sidecar. c06 = reference forward only.
+    gpu = "RTX 5090"
+    c06 = seconds_per_step(_opd_cfg(MID, ("c06",)), gpu)
+    c12 = seconds_per_step(_opd_cfg(MID, ("c12",)), gpu)
+    assert c12 > c06
+    # the c12 - c06 delta is EXACTLY the shared sidecar: c12 retains its +2 reference forward (already
+    # counted in c06), so nothing else differs.
+    assert c12 - c06 == pytest.approx(_expected_sidecar_seconds(_opd_cfg(MID, ("c12",)), gpu))
+
+
+def test_greedy_sidecar_is_billed_once_for_deduped_objective_combinations():
+    # requirements union -> ONE sidecar no matter how many greedy-sidecar objectives are selected.
+    gpu = "RTX 5090"
+    c07 = seconds_per_step(_opd_cfg(MID, ("c07",)), gpu)
+    c07_c08 = seconds_per_step(_opd_cfg(MID, ("c07", "c08")), gpu)
+    c12 = seconds_per_step(_opd_cfg(MID, ("c12",)), gpu)
+    c07_c08_c12 = seconds_per_step(_opd_cfg(MID, ("c07", "c08", "c12")), gpu)
+    # c07 + c08 both only add the (deduped) sidecar -> same as c07 alone.
+    assert c07_c08 == pytest.approx(c07)
+    # c07 + c08 + c12: the sidecar is shared/deduped and c12 alone already carries it plus the
+    # reference forward, so the trio costs exactly what c12 costs alone.
+    assert c07_c08_c12 == pytest.approx(c12)
+
+
+@pytest.mark.parametrize("model", [SMALL, MID, BIG])
+@pytest.mark.parametrize("group", [1, 4, 8])
+def test_greedy_sidecar_estimate_matches_implemented_equation(model, group):
+    # The sidecar delta over c0 equals the exact implemented equation across models and group sizes.
+    gpu = "RTX 5090"
+    c0 = seconds_per_step(_opd_cfg(model, ("c0",), group=group), gpu)
+    c07 = seconds_per_step(_opd_cfg(model, ("c07",), group=group), gpu)
+    expected = _expected_sidecar_seconds(_opd_cfg(model, ("c07",), group=group), gpu)
+    assert c07 - c0 == pytest.approx(expected)
+    # the sidecar depends on prompts_per_step (batch) + completion length, NOT the group size, so it
+    # is identical across group sizes for a fixed batch/completion.
+    assert expected == pytest.approx(
+        _expected_sidecar_seconds(_opd_cfg(model, ("c07",), group=1), gpu)
+    )
+
+
+def test_cost_greedy_sidecar_set_matches_worker_registry():
+    # The hardcoded cost-model set must equal the worker registry's greedy_sidecar requirement so the
+    # analytical estimate and the runtime worker cannot drift on which objectives run the sidecar.
+    from flash.cost.analytical import OPD_GREEDY_SIDECAR_OBJECTIVES
+    from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
+
+    registry = frozenset(
+        definition.objective_id
+        for definition in OPD_OBJECTIVES.definitions.values()
+        if definition.requirements.greedy_sidecar
+    )
+    assert registry == OPD_GREEDY_SIDECAR_OBJECTIVES
+
+
+def test_greedy_sidecar_note_identifies_generation_and_update_contributions():
+    est = estimate_cost(_opd_cfg(MID, ("c07",)))
+    assert any(
+        "greedy loop-closing sidecar" in note and "greedy generation" in note and "fwd+bwd" in note
+        for note in est.notes
+    )

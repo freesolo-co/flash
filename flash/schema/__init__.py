@@ -465,6 +465,21 @@ def _validate_opd(spec: JobSpec) -> None:
 
     The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
     the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
+    # c14 owns the on-policy rollout + teacher-input policy, so it cannot compose with any objective
+    # that drives its own rollout/teacher policy (c07/c08/c12/c13). Reject at PARSE time — before a
+    # paid worker is provisioned — using the dependency-free shared predicate so the control plane and
+    # the runtime worker share one source of truth and cannot drift. The c14 + multi_turn conflict
+    # stays worker-only: whether the environment is multi-turn is only known after env resolution at
+    # runtime.
+    if "c14" in spec.train.opd_objective_ids:
+        from flash.opd_objectives import (
+            opd_c14_conflict_message,
+            opd_c14_conflicting_objective_ids,
+        )
+
+        conflicts = opd_c14_conflicting_objective_ids(spec.train.opd_objective_ids)
+        if conflicts:
+            raise ConfigError(opd_c14_conflict_message(conflicts))
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is

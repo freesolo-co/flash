@@ -573,3 +573,34 @@ def test_c14_conflicting_objectives_rejects_duplicate_rollout_policies():
     # c14 on its own (optionally with the c0 no-op) stays compatible.
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c14",))) == ()
     assert opd_mod._c14_conflicting_objectives(OPD_OBJECTIVES.plan(("c0", "c14"))) == ()
+
+
+def test_c14_shared_conflict_id_set_matches_registry_requirements():
+    from flash.engine.worker.opd_objectives import OPD_OBJECTIVES
+    from flash.opd_objectives import OPD_C14_CONFLICTING_OBJECTIVE_IDS
+
+    # the dependency-free conflict id list (used by the schema/spec validators AND the worker) must
+    # equal the set of registry objectives that own a rollout/teacher policy, so a new rollout-owning
+    # objective cannot silently slip past submission-time validation without updating the shared list.
+    registry = frozenset(
+        definition.objective_id
+        for definition in OPD_OBJECTIVES.definitions.values()
+        if definition.requirements.greedy_sidecar
+        or definition.requirements.sampled_primary
+        or definition.requirements.candidate_topk
+    )
+    assert frozenset(OPD_C14_CONFLICTING_OBJECTIVE_IDS) == registry
+
+
+def test_c14_conflict_message_lists_conflicts_and_does_not_claim_c14_must_be_alone():
+    from flash.opd_objectives import opd_c14_conflict_message
+
+    message = opd_c14_conflict_message(("c07", "c12"))
+    assert "rollout-owning" in message
+    assert "c07" in message
+    assert "c12" in message
+    # it must NOT tell users c14 has to run alone -- c14 composes with c0/c05/c06/c09/c10/c11.
+    assert "on its own" not in message
+    assert "may still be combined with" in message
+    for compatible in ("c0", "c05", "c06", "c09", "c10", "c11"):
+        assert compatible in message

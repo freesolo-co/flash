@@ -568,6 +568,56 @@ def test_opd_objective_ids_are_typed_opd_only_and_round_trip():
         )
 
 
+_C14_SCHEMA_BASE = {
+    "model": "Qwen/Qwen3.5-0.8B",
+    "algorithm": "opd",
+    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+}
+
+
+@pytest.mark.parametrize(
+    ("conflict", "train"),
+    [
+        ("c07", {"opd_objective_ids": ["c14", "c07"]}),
+        ("c08", {"opd_objective_ids": ["c14", "c08"]}),
+        ("c12", {"opd_objective_ids": ["c14", "c12"], "opd_reference_adapter": "sft-run"}),
+        ("c13", {"opd_objective_ids": ["c14", "c13"], "opd_topk_cadence": 4}),
+    ],
+)
+def test_c14_rollout_owning_conflicts_are_rejected_at_spec_validation(conflict, train):
+    # c14 owns the rollout + teacher-input policy, so pairing it with any rollout-owning objective
+    # (c07/c08/c12/c13) is rejected BEFORE a worker is provisioned. The reject must fire regardless of
+    # the other required knobs (c12's reference adapter, c13's cadence).
+    from flash.schema import spec_from_dict
+    from flash.schema.fields import ConfigError
+
+    with pytest.raises(ConfigError, match="cannot be combined with rollout-owning"):
+        spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{conflict}")
+    with pytest.raises(ConfigError, match=conflict):
+        spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{conflict}-named")
+
+
+@pytest.mark.parametrize(
+    ("compatible", "train"),
+    [
+        ("c0", {"opd_objective_ids": ["c14", "c0"]}),
+        ("c05", {"opd_objective_ids": ["c14", "c05"]}),
+        ("c06", {"opd_objective_ids": ["c14", "c06"], "opd_reference_adapter": "sft-run"}),
+        ("c09", {"opd_objective_ids": ["c14", "c09"]}),
+        ("c10", {"opd_objective_ids": ["c14", "c10"]}),
+        ("c11", {"opd_objective_ids": ["c14", "c11"], "opd_reference_adapter": "sft-run"}),
+    ],
+)
+def test_c14_accepts_non_rollout_owning_objective_combinations(compatible, train):
+    # c14 composes cleanly with objectives that only add a local forward / no extra rollout
+    # (c0/c05/c06/c09/c10/c11): these must PARSE, not be rejected.
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict({**_C14_SCHEMA_BASE, "train": train}, run_id=f"c14-{compatible}")
+    assert "c14" in spec.train.opd_objective_ids
+    assert compatible in spec.train.opd_objective_ids
+
+
 def test_c10_config_is_strict_and_round_trips():
     from flash.schema import spec_from_dict
     from flash.schema.fields import ConfigError
