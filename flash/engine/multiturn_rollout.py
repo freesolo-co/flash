@@ -18,7 +18,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 
 class RolloutResult(TypedDict):
@@ -31,15 +31,7 @@ class RolloutResult(TypedDict):
     reward: float
 
 
-class RolloutPollEvent(TypedDict):
-    """One physical vLLM request observation from the manual engine loop."""
-
-    request_id: str
-    finished: bool
-    cumulative_tokens: int
-    completion_ids: NotRequired[list[int]]
-    logprobs: NotRequired[list[float]]
-    text: NotRequired[str]
+RolloutCompletion = tuple[str, list[int], list[float], str]
 
 
 class RolloutRequestExhaustedError(RuntimeError):
@@ -465,7 +457,8 @@ def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
 
 _PHYSICAL_REQUEST_COUNTER = itertools.count()
 _PHYSICAL_REQUEST_COUNTER_LOCK = threading.Lock()
-_TOMBSTONE_LIMIT = 8192
+_ROLLOUT_REQUEST_TIMEOUT_MIN_SECONDS = 600.0
+_ROLLOUT_REQUEST_TIMEOUT_MAX_SECONDS = 3600.0
 
 
 def _next_physical_request_id() -> str:
@@ -474,11 +467,12 @@ def _next_physical_request_id() -> str:
         return f"flash-mt-{next(_PHYSICAL_REQUEST_COUNTER)}"
 
 
-def resolve_rollout_request_timeout_seconds(configured: float | None, engine_max_len: int) -> float:
-    """Resolve the one managed absolute timeout source of truth for pure multi-turn GRPO."""
-    if configured is not None:
-        return float(configured)
-    return max(600.0, 0.5 * float(engine_max_len))
+def resolve_rollout_request_timeout_seconds(engine_max_len: int) -> float:
+    """Resolve the platform-managed absolute timeout for one physical rollout request."""
+    return min(
+        _ROLLOUT_REQUEST_TIMEOUT_MAX_SECONDS,
+        max(_ROLLOUT_REQUEST_TIMEOUT_MIN_SECONDS, 0.5 * float(engine_max_len)),
+    )
 
 
 @dataclass
@@ -488,10 +482,7 @@ class _LogicalRequest:
     max_tokens: int
     initial: bool
     attempts: int = 0
-    physical_id: str | None = None
     started_at: float = 0.0
-    last_progress_at: float = 0.0
-    cumulative_tokens: int = 0
 
 
 def rollout_async(
@@ -500,16 +491,15 @@ def rollout_async(
     active_env,
     render: Callable[[list, bool], list[int]],
     submit: Callable[[str, list[int], int, bool], None],
-    poll: Callable[[], list[RolloutPollEvent]],
+    poll: Callable[[], list[RolloutCompletion]],
     busy: Callable[[], bool],
+    abort: Callable[[list[str]], None],
     env_glue: Callable[[list], list[int]],
     max_turns: int,
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
-    abort: Callable[[list[str]], None] | None = None,
     request_timeout_seconds: float | None = None,
     request_max_attempts: int = 2,
-    stall_timeout_seconds: float = 0.0,
     monotonic: Callable[[], float] = time.monotonic,
     request_id_factory: Callable[[], str] = _next_physical_request_id,
 ) -> list[RolloutResult]:
@@ -517,52 +507,31 @@ def rollout_async(
 
     A logical assistant turn snapshots its accepted prefix and sampling limits. A timed-out physical
     attempt is synchronously aborted before an identical retry gets a fresh process-unique id. Only a
-    successful final event reaches the environment worker, so retries never replay opaque env calls or
-    mutate transcript state. There is deliberately no episode wall-clock deadline. Deadlines are
-    checked cooperatively between engine polls: an expiry cannot interrupt one blocking engine call
-    mid-flight and fires on the next loop iteration instead.
+    successful completed result reaches the environment worker, so retries never replay opaque env
+    calls or mutate transcript state. There is deliberately no episode wall-clock deadline. Timeout
+    enforcement is cooperative between engine polls and cannot interrupt one blocking engine step.
     """
     if request_max_attempts < 1:
         raise ValueError("request_max_attempts must be at least 1")
     if request_timeout_seconds is not None and request_timeout_seconds <= 0:
         raise ValueError("request_timeout_seconds must be positive when set")
-    if stall_timeout_seconds < 0:
-        raise ValueError("stall_timeout_seconds must be nonnegative")
 
-    abort_requests = abort or (lambda ids: None)
     rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
     by_id: dict[str, _LogicalRequest] = {}
-    tombstones: OrderedDict[str, None] = OrderedDict()
     to_env: queue.Queue = queue.Queue()
     to_submit: queue.Queue = queue.Queue()
 
-    def tombstone(req_id: str) -> None:
-        tombstones[req_id] = None
-        tombstones.move_to_end(req_id)
-        if len(tombstones) > _TOMBSTONE_LIMIT:
-            tombstones.popitem(last=False)
-
     def start_attempt(logical: _LogicalRequest) -> None:
         req_id = request_id_factory()
-        now = monotonic()
         logical.attempts += 1
-        logical.physical_id = req_id
-        logical.started_at = now
-        logical.last_progress_at = now
-        logical.cumulative_tokens = 0
+        logical.started_at = monotonic()
         by_id[req_id] = logical
         try:
-            submit(
-                req_id,
-                list(logical.prefix_ids),
-                logical.max_tokens,
-                logical.initial,
-            )
+            submit(req_id, list(logical.prefix_ids), logical.max_tokens, logical.initial)
         except Exception:
             by_id.pop(req_id, None)
-            tombstone(req_id)
             with contextlib.suppress(Exception):
-                abort_requests([req_id])
+                abort([req_id])
             raise
 
     def start_logical(r: _RolloutState, prefix: list[int], max_new: int, initial: bool) -> None:
@@ -576,27 +545,17 @@ def rollout_async(
         )
 
     def expire_requests(now: float) -> None:
+        if request_timeout_seconds is None:
+            return
         for req_id, logical in list(by_id.items()):
-            absolute_expired = (
-                request_timeout_seconds is not None
-                and now - logical.started_at >= request_timeout_seconds
-            )
-            stall_expired = (
-                stall_timeout_seconds > 0
-                and now - logical.last_progress_at >= stall_timeout_seconds
-            )
-            if not absolute_expired and not stall_expired:
+            if now - logical.started_at < request_timeout_seconds:
                 continue
-            reason = (
-                "absolute request timeout" if absolute_expired else "token-progress stall timeout"
-            )
-            by_id.pop(req_id, None)
-            tombstone(req_id)
-            abort_requests([req_id])
+            by_id.pop(req_id)
+            abort([req_id])
             if logical.attempts >= request_max_attempts:
                 raise RolloutRequestExhaustedError(
                     attempts=logical.attempts,
-                    reason=reason,
+                    reason="absolute request timeout",
                 )
             start_attempt(logical)
 
@@ -656,35 +615,13 @@ def rollout_async(
             if completed >= n:
                 break
             if busy():
-                events = poll()
-                now = monotonic()
-                for event in events:
-                    if event["finished"]:
-                        continue
-                    logical = by_id.get(event["request_id"])
-                    if logical is None:
-                        continue
-                    cumulative = max(0, int(event["cumulative_tokens"]))
-                    if cumulative > logical.cumulative_tokens:
-                        logical.cumulative_tokens = cumulative
-                        logical.last_progress_at = now
-                # progress can extend only the optional stall deadline; the absolute deadline wins.
-                expire_requests(now)
-                for event in events:
-                    req_id = event["request_id"]
-                    if not event["finished"] or req_id in tombstones:
-                        continue
+                finished = poll()
+                expire_requests(monotonic())
+                for req_id, asst_ids, asst_lp, text in finished:
                     logical = by_id.pop(req_id, None)
                     if logical is None:
                         continue
-                    to_env.put(
-                        (
-                            logical.rollout,
-                            list(event.get("completion_ids", [])),
-                            list(event.get("logprobs", [])),
-                            str(event.get("text", "")),
-                        )
-                    )
+                    to_env.put((logical.rollout, asst_ids, asst_lp, text))
                     progressed = True
             else:
                 expire_requests(monotonic())
@@ -694,12 +631,10 @@ def rollout_async(
                         take(to_submit.get(timeout=0.1))
     finally:
         active = list(by_id)
-        for req_id in active:
-            tombstone(req_id)
         by_id.clear()
         if active:
             with contextlib.suppress(Exception):
-                abort_requests(active)
+                abort(active)
         to_env.put(None)
         worker.join()
 
@@ -793,7 +728,6 @@ def build_rollout_func(
     structured_outputs: dict | None = None,
     request_timeout_seconds: float | None = None,
     request_max_attempts: int = 2,
-    stall_timeout_seconds: float = 0.0,
     monotonic: Callable[[], float] = time.monotonic,
     request_id_factory: Callable[[], str] = _next_physical_request_id,
 ):
@@ -803,7 +737,7 @@ def build_rollout_func(
     try:
         from vllm.sampling_params import RequestOutputKind
 
-        _output_kind = RequestOutputKind.CUMULATIVE
+        _output_kind = RequestOutputKind.FINAL_ONLY
     except Exception:
         _output_kind = None
 
@@ -831,11 +765,6 @@ def build_rollout_func(
         return ids
 
     env_glue = make_env_glue(tok, thinking=thinking)
-    resolved_request_timeout = (
-        resolve_rollout_request_timeout_seconds(request_timeout_seconds, engine_max_len)
-        if engine_max_len is not None
-        else request_timeout_seconds
-    )
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
@@ -877,31 +806,23 @@ def build_rollout_func(
             )
             active_ids.add(req_id)
 
-        def poll() -> list[RolloutPollEvent]:
-            """Step the engine and expose cumulative progress plus final completion fields."""
-            events: list[RolloutPollEvent] = []
+        def poll() -> list[RolloutCompletion]:
+            """Step the engine and return explicit completed-result tuples."""
+            finished: list[RolloutCompletion] = []
             for out in llm_engine.step():
-                outputs = getattr(out, "outputs", None) or []
-                comp = outputs[0] if outputs else None
-                token_ids = list(getattr(comp, "token_ids", None) or [])
-                event: RolloutPollEvent = {
-                    "request_id": str(out.request_id),
-                    "finished": bool(getattr(out, "finished", False)),
-                    "cumulative_tokens": len(token_ids),
-                }
-                if event["finished"]:
-                    lps: list[float] = []
-                    comp_logprobs = getattr(comp, "logprobs", None) if comp is not None else None
-                    for pos, tid in enumerate(token_ids):
-                        entry = comp_logprobs[pos] if comp_logprobs else None
-                        lp = entry.get(tid) if entry else None
-                        lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
-                    event["completion_ids"] = token_ids
-                    event["logprobs"] = lps
-                    event["text"] = str(getattr(comp, "text", "") or "")
-                    active_ids.discard(event["request_id"])
-                events.append(event)
-            return events
+                if not getattr(out, "finished", False):
+                    continue
+                comp = out.outputs[0]
+                token_ids = list(comp.token_ids)
+                lps: list[float] = []
+                for pos, tid in enumerate(token_ids):
+                    entry = comp.logprobs[pos] if comp.logprobs else None
+                    lp = entry.get(tid) if entry else None
+                    lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
+                req_id = str(out.request_id)
+                active_ids.discard(req_id)
+                finished.append((req_id, token_ids, lps, str(comp.text)))
+            return finished
 
         def abort(ids: list[str]) -> None:
             if not ids:
@@ -930,9 +851,8 @@ def build_rollout_func(
                 per_turn_max_tokens=max_completion,
                 engine_max_len=engine_max_len,
                 abort=abort,
-                request_timeout_seconds=resolved_request_timeout,
+                request_timeout_seconds=request_timeout_seconds,
                 request_max_attempts=request_max_attempts,
-                stall_timeout_seconds=stall_timeout_seconds,
                 monotonic=monotonic,
                 request_id_factory=request_id_factory,
             )

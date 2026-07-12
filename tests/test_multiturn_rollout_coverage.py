@@ -4,15 +4,11 @@ Targets the branches the primary suite (``tests/test_multiturn_rollout.py``) lea
 the budget/engine-headroom early-exits and error paths in :func:`rollout_one`,
 :func:`rollout_one_records` and :func:`rollout_async` (plus their shared ``_advance_after_turn`` /
 ``_turn_budget`` helpers), the pure-function guards (``_prompt_key`` fallback, ``_LRUCache``
-constructor, ``_engine_vocab_size``), and the ``build_rollout_func`` final-only / skip-unfinished
-engine wiring. Uses the same fake chat-template + fake-engine mocking style as the sibling file; no
-torch/vLLM/GPU is executed (the GPU-only ``vllm`` import is stubbed per test).
+constructor, ``_engine_vocab_size``), and the pure rollout helpers. No torch, vLLM, or GPU code is executed.
 """
 
 from __future__ import annotations
 
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -199,16 +195,7 @@ def _fake_async_engine(gen):
         events = []
         for rid, ids, mt in batch:
             completion_ids, logprobs, text = gen(ids, mt)
-            events.append(
-                {
-                    "request_id": rid,
-                    "finished": True,
-                    "cumulative_tokens": len(completion_ids),
-                    "completion_ids": completion_ids,
-                    "logprobs": logprobs,
-                    "text": text,
-                }
-            )
+            events.append((rid, completion_ids, logprobs, text))
         return events
 
     def busy():
@@ -226,6 +213,7 @@ def _run_async(examples, active_env, **kw):
         submit=submit,
         poll=poll,
         busy=busy,
+        abort=lambda ids: None,
         env_glue=env_glue,
         max_turns=kw.get("max_turns", 8),
         per_turn_max_tokens=kw.get("per_turn_max_tokens", 8),
@@ -473,6 +461,7 @@ def test_rollout_async_raises_without_prompt_or_messages():
             submit=submit,
             poll=poll,
             busy=busy,
+            abort=lambda ids: None,
             env_glue=env_glue,
             max_turns=4,
             per_turn_max_tokens=8,
@@ -522,127 +511,3 @@ def test_rollout_async_advance_env_branches():
     out_glue = _run_async([{"max_model": 3}], _VarTurnEnv(), engine_max_len=PROMPT_LEN + 8 + 4)
     assert out_glue[0]["completion_ids"] == [CONTENT["a1"], END]
     assert out_glue[0]["reward"] == 1.0
-
-
-# --- build_rollout_func: cumulative output kind + skipping unfinished engine outputs -------------
-
-
-@pytest.fixture
-def _stub_vllm_full(monkeypatch):
-    """Stub the GPU-only ``vllm`` module INCLUDING RequestOutputKind so build_rollout_func resolves
-    the cumulative output kind (the sibling fixture omits it)."""
-    mod = types.ModuleType("vllm")
-    mod.SamplingParams = lambda **kw: SimpleNamespace(**kw)
-    sp_mod = types.ModuleType("vllm.sampling_params")
-    sp_mod.RequestOutputKind = SimpleNamespace(CUMULATIVE="cumulative")
-    sp_mod.StructuredOutputsParams = lambda **kw: SimpleNamespace(kwargs=dict(kw))
-    mod.sampling_params = sp_mod
-    monkeypatch.setitem(sys.modules, "vllm", mod)
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
-    return
-
-
-class _Tok:
-    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
-        text = "".join(f"<{m['role']}>{m['content']}" for m in messages)
-        return text + ("<assistant>" if add_generation_prompt else "")
-
-    def __call__(self, text, add_special_tokens=False):
-        return SimpleNamespace(input_ids=[ord(c) for c in text])
-
-
-class _OneTurnEngineEnv:
-    multi_turn = True
-
-    def new_rollout_state(self, example):
-        return {"prompt": [{"role": "user", "content": "hi"}], "completion": []}
-
-    def record_model_turn(self, state, content):
-        state["completion"].append({"role": "assistant", "content": content})
-
-    def rollout_done(self, state, max_turns):
-        return True
-
-    def env_reply(self, messages, state):
-        return []
-
-    def reward(self, completion, example, state=None):
-        return 0.5
-
-
-class _PartialEngine:
-    """Colocate-engine fake whose step() first returns the request UNFINISHED, then finished on the
-    next step -> exercises poll()'s skip-unfinished continue. Records each turn's SamplingParams."""
-
-    def __init__(self, vocab=100000):
-        self.sampling = []
-        self.steps = 0
-        self._pending = {}  # req_id -> steps remaining before it finishes
-        self.aborted = []
-        self.llm_engine = SimpleNamespace(
-            model_config=SimpleNamespace(get_vocab_size=lambda: vocab),
-            add_request=self._add,
-            step=self._step,
-            has_unfinished_requests=lambda: bool(self._pending),
-            abort_request=self._abort,
-        )
-
-    def _add(self, req_id, prompt, sampling_params):
-        self.sampling.append(sampling_params)
-        self._pending[req_id] = 2  # needs two step() rounds: unfinished, then finished
-
-    def _abort(self, ids):
-        self.aborted.extend(ids)
-        for i in ids:
-            self._pending.pop(i, None)
-
-    def _step(self):
-        self.steps += 1
-        outs = []
-        for rid in list(self._pending):
-            self._pending[rid] -= 1
-            if self._pending[rid] > 0:
-                outs.append(SimpleNamespace(request_id=rid, finished=False, outputs=[]))
-            else:
-                del self._pending[rid]
-                comp = SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")
-                outs.append(SimpleNamespace(request_id=rid, finished=True, outputs=[comp]))
-        return outs
-
-    def wake_up(self, tags=None):  # pragma: no cover - sleep_mode is off in this test
-        pass
-
-    def sleep(self, level=None):  # pragma: no cover
-        pass
-
-
-@pytest.mark.usefixtures("_stub_vllm_full")
-def test_rollout_func_sets_cumulative_kind_and_exposes_unfinished_progress():
-    from flash.engine.multiturn_rollout import build_rollout_func
-
-    engine = _PartialEngine()
-    rf = build_rollout_func(
-        active_env=_OneTurnEngineEnv(),
-        tok=_Tok(),
-        examples_by_key={},
-        max_completion=8,
-        max_turns=4,
-        temperature=0.7,
-        top_p=1.0,
-        stop=None,
-        thinking=False,
-        engine_max_len=None,
-        structured_outputs=None,
-    )
-    trainer = SimpleNamespace(
-        vllm_generation=SimpleNamespace(llm=engine),
-        args=SimpleNamespace(vllm_enable_sleep_mode=False),
-    )
-    out = rf([[{"role": "user", "content": "hi"}]], trainer)
-
-    assert out["reward"] == [0.5]
-    # the unfinished first step was skipped, so more than one engine step was needed
-    assert engine.steps >= 2
-    # every submitted turn carried the resolved cumulative output kind
-    assert engine.sampling
-    assert all(sp.output_kind == "cumulative" for sp in engine.sampling)

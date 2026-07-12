@@ -9,21 +9,16 @@ from __future__ import annotations
 
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 
 from flash.engine.multiturn_rollout import (
-    RolloutRequestExhaustedError,
     _LRUCache,
     _prompt_key,
     build_examples_index,
     index_collisions,
-    make_env_glue,
-    resolve_rollout_request_timeout_seconds,
     rollout_async,
     rollout_one,
-    rollout_one_records,
 )
 
 
@@ -371,6 +366,7 @@ class _FakeEngine:
 
     def __init__(self, vocab=1000, gen=None, finish="all"):
         self.events = []
+        self.sampling = []
         self._pending = []  # (req_id, prompt_ids, sampling_params)
         self._finish = (
             finish  # "all" -> finish every pending request per step; "one" -> one per step
@@ -388,6 +384,7 @@ class _FakeEngine:
 
     def _add_request(self, req_id, prompt, sampling_params):
         self.events.append(("add", req_id))
+        self.sampling.append(sampling_params)
         self._pending.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
 
     def _abort_request(self, ids):
@@ -440,6 +437,7 @@ def _stub_vllm():
     mod = types.ModuleType("vllm")
     mod.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
     sp_mod = types.ModuleType("vllm.sampling_params")
+    sp_mod.RequestOutputKind = types.SimpleNamespace(FINAL_ONLY="final_only")
     sp_mod.StructuredOutputsParams = _StubStructuredOutputsParams
     mod.sampling_params = sp_mod
     sys.modules["vllm"] = mod
@@ -503,6 +501,22 @@ def test_env_glue_fails_loud_when_template_drops_probe():
 
 
 @pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_rejects_finished_output_without_completion():
+    engine = _FakeEngine()
+
+    def malformed_step():
+        req_id = engine._pending[0][0]
+        return [types.SimpleNamespace(request_id=req_id, finished=True, outputs=[])]
+
+    engine.llm_engine.step = malformed_step
+    rf = _build(_FakeTok())
+
+    with pytest.raises(IndexError):
+        rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
+    assert len(engine.aborted) == 1
+
+
+@pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     # The bug (#162): TRL's rollout_func path wakes only the weights, never the KV cache, so the
     # first decode faults. The fix wakes tags=["kv_cache"] BEFORE any add_request/step and
@@ -514,6 +528,7 @@ def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     assert kinds == ["wake", "add", "step", "sleep"]
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
+    assert engine.sampling[0].output_kind == "final_only"
     assert out["reward"] == [0.5]
 
 
@@ -558,16 +573,7 @@ def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
         events = []
         for rid, ids, mt in batch:
             completion_ids, logprobs, text = gen(ids, mt)
-            events.append(
-                {
-                    "request_id": rid,
-                    "finished": True,
-                    "cumulative_tokens": len(completion_ids),
-                    "completion_ids": completion_ids,
-                    "logprobs": logprobs,
-                    "text": text,
-                }
-            )
+            events.append((rid, completion_ids, logprobs, text))
         return events
 
     def busy():
@@ -601,6 +607,7 @@ def test_rollout_async_equals_rollout_one():
         submit=submit,
         poll=poll,
         busy=busy,
+        abort=lambda ids: None,
         env_glue=env_glue,
         max_turns=8,
         per_turn_max_tokens=8,
@@ -635,6 +642,7 @@ def test_rollout_async_robust_to_arbitrary_finish_order():
         submit=submit,
         poll=poll,
         busy=busy,
+        abort=lambda ids: None,
         env_glue=env_glue,
         max_turns=8,
         per_turn_max_tokens=8,
@@ -686,6 +694,7 @@ def test_reward_many_batches_scoring():
         submit=submit,
         poll=poll,
         busy=busy,
+        abort=lambda ids: None,
         env_glue=env_glue,
         max_turns=8,
         per_turn_max_tokens=8,
@@ -705,6 +714,7 @@ def _run_async(examples, active_env):
         submit=submit,
         poll=poll,
         busy=busy,
+        abort=lambda ids: None,
         env_glue=env_glue,
         max_turns=8,
         per_turn_max_tokens=8,
@@ -945,104 +955,6 @@ def test_examples_index_and_collisions():
     assert idx[_prompt_key([{"role": "user", "content": "a"}])]["answer"] == "3"
 
 
-# --- rollout_one_records: the per-turn record driver OPD distils each turn from -----------------
-
-
-def _gen_obj(completion_ids, completion_text, *, truncated=False, skip=False):
-    """A minimal stand-in for OPD's _GenResult: the four attributes rollout_one_records reads."""
-    return SimpleNamespace(
-        completion_ids=completion_ids,
-        completion_text=completion_text,
-        gen_tokens=len(completion_ids or []),
-        truncated=truncated,
-        skip=skip,
-    )
-
-
-def _records_generator(turns):
-    """generate(prefix_ids, max_new) -> a _GenResult-shaped object, one per turn (list order)."""
-    seq = iter(turns)
-
-    def generate(prefix_ids, max_new):
-        return next(seq)
-
-    return generate
-
-
-def test_rollout_one_records_grows_prefix_with_verbatim_sampled_tokens():
-    """The multi-turn OPD prefix MUST be the accumulated on-policy TOKEN STREAM, not a re-render of the
-    message history — a re-render would strip prior-turn reasoning on non-round-tripping templates and
-    desync the student's loss prefix from what it actually sampled. Assert each turn's prefix_ids grows
-    and literally CONTAINS the previous turn's sampled ids + the deduped env glue."""
-    env = FakeEnv()  # 1 env (user) turn, stops after 2 assistant turns
-    gen = _records_generator(
-        [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
-    )
-    records = rollout_one_records(
-        example={"answer": "GOOD"},
-        active_env=env,
-        render=render,
-        generate=gen,
-        env_glue=realistic_env_glue,  # LEADS with END -> exercises the seam dedup
-        max_turns=8,
-        per_turn_max_tokens=16,
-    )
-    assert len(records) == 2
-    p0, p1 = records[0]["prefix_ids"], records[1]["prefix_ids"]
-    # turn 0 prefix = the initial rendered prompt (no completion yet).
-    assert p0 == render([{"role": "user", "content": "u1"}], True)
-    # turn 1 prefix strictly extends turn 0 with the VERBATIM sampled turn-0 ids, then the env glue with
-    # its duplicate LEADING terminator collapsed: realistic_env_glue([u2]) is [END, *render([u2],True)],
-    # and the leading END dups a1's own END so it is dropped, leaving exactly render([u2], True).
-    assert p1 == [*p0, CONTENT["a1"], END, *render([{"role": "user", "content": "u2"}], True)]
-    assert len(p1) > len(p0)
-    # context_messages is the parallel TEXT history the teacher conditions on, growing per turn.
-    assert records[0]["context_messages"] == [{"role": "user", "content": "u1"}]
-    assert {"role": "assistant", "content": "a1"} in records[1]["context_messages"]
-
-
-def test_rollout_one_records_truncated_turn_halts_episode():
-    """A turn that did not terminate naturally (truncated) is RECORDED (so the caller counts it) but
-    ENDS the episode — a student that can't end its turn shouldn't keep generating, and its broken turn
-    must not pollute a later turn's context. env_reply is never reached."""
-    calls = {"env_reply": 0}
-
-    class _Env(FakeEnv):
-        def env_reply(self, messages, state):
-            calls["env_reply"] += 1
-            return super().env_reply(messages, state)
-
-    env = _Env()
-    gen = _records_generator([_gen_obj(None, "", truncated=True)])
-    records = rollout_one_records(
-        example={"answer": "GOOD"},
-        active_env=env,
-        render=render,
-        generate=gen,
-        env_glue=realistic_env_glue,
-        max_turns=8,
-        per_turn_max_tokens=16,
-    )
-    assert len(records) == 1
-    assert records[0]["gen"].truncated is True
-    assert calls["env_reply"] == 0  # halted before the env stepped
-
-
-def test_make_env_glue_rejects_non_verbatim_template():
-    """make_env_glue's probe trick only works when the chat template inserts assistant content
-    verbatim; a template that doesn't (so the probe can't be located) must HARD-FAIL, never silently
-    produce skewed glue. This is the load-bearing guard that keeps a non-round-tripping model from
-    training/serving skew."""
-
-    class _BadTok:
-        def apply_chat_template(self, messages, **kw):
-            return "template-that-drops-assistant-content"
-
-    glue = make_env_glue(_BadTok(), thinking=False)
-    with pytest.raises(ValueError, match="could not uniquely locate its probe"):
-        glue([{"role": "user", "content": "obs"}])
-
-
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_constrains_every_turn_with_structured_outputs():
     """[train] structured_outputs must reach SamplingParams on EVERY assistant turn (mid-rollout
@@ -1078,565 +990,3 @@ def test_rollout_func_unconstrained_without_structured_outputs():
     rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
     assert captured
     assert all(not hasattr(sp, "structured_outputs") for sp in captured)
-
-
-class _FakeMonotonic:
-    def __init__(self):
-        self.value = 0.0
-
-    def __call__(self):
-        return self.value
-
-    def advance(self, seconds):
-        self.value += float(seconds)
-
-
-def _finished_event(request_id, token=5, text="ok"):
-    return {
-        "request_id": request_id,
-        "finished": True,
-        "cumulative_tokens": 1,
-        "completion_ids": [token],
-        "logprobs": [-0.1],
-        "text": text,
-    }
-
-
-class _CountingOneTurnEnv(FakeEnv):
-    def __init__(self):
-        self.record_calls = []
-
-    def record_model_turn(self, state, content):
-        self.record_calls.append(content)
-        super().record_model_turn(state, content)
-
-    def rollout_done(self, state, max_turns):
-        return bool(self.record_calls)
-
-
-def test_rollout_request_timeout_default_resolution():
-    assert resolve_rollout_request_timeout_seconds(None, 1024) == 600.0
-    assert resolve_rollout_request_timeout_seconds(None, 4096) == 2048.0
-    assert resolve_rollout_request_timeout_seconds(37.5, 4096) == 37.5
-
-
-def test_first_physical_attempt_succeeds_without_abort():
-    pending = []
-    submitted = []
-    aborted = []
-
-    def submit(req_id, prefix, max_tokens, initial):
-        submitted.append((req_id, list(prefix), max_tokens, initial))
-        pending.append(req_id)
-
-    def poll():
-        return [_finished_event(pending.pop())]
-
-    env = _CountingOneTurnEnv()
-    ids = iter(["attempt-1"])
-    out = rollout_async(
-        examples=[{}],
-        active_env=env,
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=lambda request_ids: aborted.extend(request_ids),
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert submitted == [("attempt-1", render([{"role": "user", "content": "u1"}], True), 8, True)]
-    assert aborted == []
-    assert env.record_calls == ["ok"]
-    assert out[0]["completion_ids"] == [5]
-
-
-def test_timeout_aborts_then_retries_identical_request_and_ignores_stale_output():
-    clock = _FakeMonotonic()
-    pending = {}
-    submitted = []
-    aborted = []
-    poll_count = 0
-
-    def submit(req_id, prefix, max_tokens, initial):
-        submitted.append((req_id, list(prefix), max_tokens, initial))
-        pending[req_id] = True
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        for req_id in request_ids:
-            pending.pop(req_id, None)
-
-    def poll():
-        nonlocal poll_count
-        poll_count += 1
-        if poll_count == 1:
-            clock.advance(6.0)
-            return []
-        clock.advance(0.1)
-        pending.pop("attempt-2", None)
-        return [
-            _finished_event("attempt-1", token=99, text="stale"),
-            _finished_event("attempt-2", token=7, text="accepted"),
-        ]
-
-    env = _CountingOneTurnEnv()
-    ids = iter(["attempt-1", "attempt-2"])
-    out = rollout_async(
-        examples=[{}],
-        active_env=env,
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=abort,
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        request_max_attempts=2,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert aborted == ["attempt-1"]
-    assert [row[0] for row in submitted] == ["attempt-1", "attempt-2"]
-    assert submitted[0][1:] == submitted[1][1:]
-    assert env.record_calls == ["accepted"]
-    assert out[0]["completion_ids"] == [7]
-
-
-def test_exhausted_physical_attempts_raise_dedicated_error():
-    clock = _FakeMonotonic()
-    pending = set()
-    aborted = []
-    ids = iter(["attempt-1", "attempt-2"])
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.add(req_id)
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        pending.difference_update(request_ids)
-
-    def poll():
-        clock.advance(6.0)
-        return []
-
-    with pytest.raises(RolloutRequestExhaustedError, match="exhausted 2 physical attempt"):
-        rollout_async(
-            examples=[{}],
-            active_env=_CountingOneTurnEnv(),
-            render=render,
-            submit=submit,
-            poll=poll,
-            busy=lambda: bool(pending),
-            abort=abort,
-            env_glue=env_glue,
-            max_turns=1,
-            per_turn_max_tokens=8,
-            request_timeout_seconds=5.0,
-            request_max_attempts=2,
-            monotonic=clock,
-            request_id_factory=lambda: next(ids),
-        )
-
-    assert aborted == ["attempt-1", "attempt-2"]
-
-
-def test_abort_precedes_retry_submission_in_shared_op_order():
-    clock = _FakeMonotonic()
-    ops = []
-    pending = set()
-    poll_count = 0
-    ids = iter(["attempt-1", "attempt-2"])
-
-    def submit(req_id, prefix, max_tokens, initial):
-        ops.append(("submit", req_id))
-        pending.add(req_id)
-
-    def abort(request_ids):
-        for req_id in request_ids:
-            ops.append(("abort", req_id))
-            pending.discard(req_id)
-
-    def poll():
-        nonlocal poll_count
-        poll_count += 1
-        if poll_count == 1:
-            clock.advance(6.0)
-            return []
-        clock.advance(0.1)
-        current = next(iter(pending))
-        pending.discard(current)
-        return [_finished_event(current)]
-
-    out = rollout_async(
-        examples=[{}],
-        active_env=_CountingOneTurnEnv(),
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=abort,
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        request_max_attempts=2,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert ops == [("submit", "attempt-1"), ("abort", "attempt-1"), ("submit", "attempt-2")]
-    assert out[0]["completion_ids"] == [5]
-
-
-def test_token_progress_never_extends_the_absolute_request_deadline():
-    clock = _FakeMonotonic()
-    pending = set()
-    aborted = []
-    poll_count = 0
-    ids = iter(["attempt-1", "attempt-2"])
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.add(req_id)
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        pending.difference_update(request_ids)
-
-    def poll():
-        nonlocal poll_count
-        poll_count += 1
-        current = next(iter(pending))
-        if poll_count <= 3:
-            # tokens grow on every poll, so the stall guard stays quiet the whole time.
-            clock.advance(2.0)
-            return [{"request_id": current, "finished": False, "cumulative_tokens": poll_count}]
-        clock.advance(0.1)
-        pending.discard(current)
-        return [_finished_event(current)]
-
-    out = rollout_async(
-        examples=[{}],
-        active_env=_CountingOneTurnEnv(),
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=abort,
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        request_max_attempts=2,
-        stall_timeout_seconds=100.0,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert aborted == ["attempt-1"]
-    assert out[0]["completion_ids"] == [5]
-
-
-def test_tombstone_eviction_is_bounded_and_still_suppresses_stale_output(monkeypatch):
-    import flash.engine.multiturn_rollout as mtr
-
-    monkeypatch.setattr(mtr, "_TOMBSTONE_LIMIT", 1)
-    clock = _FakeMonotonic()
-    pending = set()
-    aborted = []
-    poll_count = 0
-    ids = iter(["attempt-1", "attempt-2", "attempt-3"])
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.add(req_id)
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        pending.difference_update(request_ids)
-
-    def poll():
-        nonlocal poll_count
-        poll_count += 1
-        if poll_count <= 2:
-            clock.advance(6.0)
-            return []
-        clock.advance(0.1)
-        pending.discard("attempt-3")
-        # attempt-1's tombstone was evicted by the limit; attempt-2's is retained. neither
-        # stale completion may reach the environment, only the live third attempt.
-        return [
-            _finished_event("attempt-1", token=98, text="stale-evicted"),
-            _finished_event("attempt-2", token=99, text="stale-tombstoned"),
-            _finished_event("attempt-3", token=7, text="accepted"),
-        ]
-
-    env = _CountingOneTurnEnv()
-    out = rollout_async(
-        examples=[{}],
-        active_env=env,
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=abort,
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        request_max_attempts=3,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert aborted == ["attempt-1", "attempt-2"]
-    assert env.record_calls == ["accepted"]
-    assert out[0]["completion_ids"] == [7]
-
-
-def test_stall_timeout_tracks_only_cumulative_token_growth():
-    clock = _FakeMonotonic()
-    pending = set()
-    aborted = []
-    poll_count = 0
-    ids = iter(["attempt-1", "attempt-2"])
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.add(req_id)
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        pending.difference_update(request_ids)
-
-    def poll():
-        nonlocal poll_count
-        poll_count += 1
-        current = next(iter(pending))
-        if poll_count == 1:
-            clock.advance(4.0)
-            return [{"request_id": current, "finished": False, "cumulative_tokens": 1}]
-        if poll_count == 2:
-            clock.advance(4.0)
-            return [{"request_id": current, "finished": False, "cumulative_tokens": 1}]
-        if poll_count == 3:
-            clock.advance(2.0)
-            return [{"request_id": current, "finished": False, "cumulative_tokens": 1}]
-        clock.advance(1.0)
-        pending.remove(current)
-        return [_finished_event(current)]
-
-    out = rollout_async(
-        examples=[{}],
-        active_env=_CountingOneTurnEnv(),
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=abort,
-        env_glue=env_glue,
-        max_turns=1,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=100.0,
-        request_max_attempts=2,
-        stall_timeout_seconds=5.0,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-
-    assert aborted == ["attempt-1"]
-    assert out[0]["completion_ids"] == [5]
-
-
-def test_request_deadlines_do_not_create_episode_wall_clock_cutoff():
-    clock = _FakeMonotonic()
-    pending = []
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.append(req_id)
-
-    def poll():
-        clock.advance(4.0)
-        return [_finished_event(pending.pop(0))]
-
-    out = rollout_async(
-        examples=[{}],
-        active_env=FakeEnv(),
-        render=render,
-        submit=submit,
-        poll=poll,
-        busy=lambda: bool(pending),
-        abort=lambda ids: None,
-        env_glue=env_glue,
-        max_turns=2,
-        per_turn_max_tokens=8,
-        request_timeout_seconds=5.0,
-        monotonic=clock,
-    )
-
-    assert clock.value == 8.0
-    assert len(out[0]["completion_ids"]) > 1
-
-
-def test_rollout_exception_aborts_all_active_physical_requests():
-    pending = set()
-    aborted = []
-
-    def submit(req_id, prefix, max_tokens, initial):
-        pending.add(req_id)
-
-    def abort(request_ids):
-        aborted.extend(request_ids)
-        pending.difference_update(request_ids)
-
-    with pytest.raises(RuntimeError, match="engine step failed"):
-        rollout_async(
-            examples=[{}, {}],
-            active_env=_CountingOneTurnEnv(),
-            render=render,
-            submit=submit,
-            poll=lambda: (_ for _ in ()).throw(RuntimeError("engine step failed")),
-            busy=lambda: bool(pending),
-            abort=abort,
-            env_glue=env_glue,
-            max_turns=1,
-            per_turn_max_tokens=8,
-        )
-
-    assert len(aborted) == 2
-    assert pending == set()
-
-
-def test_submit_exception_aborts_the_attempt_id():
-    aborted = []
-
-    def submit(req_id, prefix, max_tokens, initial):
-        raise RuntimeError("submit failed")
-
-    with pytest.raises(RuntimeError, match="submit failed"):
-        rollout_async(
-            examples=[{}],
-            active_env=_CountingOneTurnEnv(),
-            render=render,
-            submit=submit,
-            poll=lambda: [],
-            busy=lambda: False,
-            abort=lambda request_ids: aborted.extend(request_ids),
-            env_glue=env_glue,
-            max_turns=1,
-            per_turn_max_tokens=8,
-            request_id_factory=lambda: "submit-failure-id",
-        )
-
-    assert aborted == ["submit-failure-id"]
-
-
-def test_concurrent_rollout_invocations_use_disjoint_physical_ids():
-    import threading
-
-    barrier = threading.Barrier(2)
-    all_ids = [[], []]
-    results = [None, None]
-    errors = []
-
-    def run(index):
-        pending = []
-
-        def submit(req_id, prefix, max_tokens, initial):
-            all_ids[index].append(req_id)
-            pending.append(req_id)
-            barrier.wait(timeout=2.0)
-
-        try:
-            results[index] = rollout_async(
-                examples=[{}],
-                active_env=_CountingOneTurnEnv(),
-                render=render,
-                submit=submit,
-                poll=lambda: [_finished_event(pending.pop())],
-                busy=lambda: bool(pending),
-                env_glue=env_glue,
-                max_turns=1,
-                per_turn_max_tokens=8,
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert errors == []
-    assert results[0] is not None
-    assert results[1] is not None
-    assert set(all_ids[0]).isdisjoint(all_ids[1])
-
-
-@pytest.mark.usefixtures("_stub_vllm")
-def test_retry_builds_fresh_sampling_and_structured_output_params():
-    clock = _FakeMonotonic()
-    submissions = []
-    pending = {}
-    aborted = []
-    first_step = True
-
-    def add_request(req_id, prompt, sampling_params):
-        submissions.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
-        pending[req_id] = sampling_params
-
-    def step():
-        nonlocal first_step
-        if first_step:
-            first_step = False
-            clock.advance(6.0)
-            return []
-        clock.advance(0.1)
-        req_id = next(iter(pending))
-        pending.pop(req_id)
-        comp = SimpleNamespace(token_ids=[5], logprobs=None, text="ok")
-        return [SimpleNamespace(request_id=req_id, finished=True, outputs=[comp])]
-
-    def abort_request(request_ids):
-        aborted.extend(request_ids)
-        for req_id in request_ids:
-            pending.pop(req_id, None)
-
-    llm_engine = SimpleNamespace(
-        model_config=SimpleNamespace(get_vocab_size=lambda: 1000),
-        add_request=add_request,
-        step=step,
-        has_unfinished_requests=lambda: bool(pending),
-        abort_request=abort_request,
-    )
-    engine = SimpleNamespace(llm_engine=llm_engine)
-    trainer = _fake_trainer(engine, sleep_mode=False)
-    ids = iter(["attempt-1", "attempt-2"])
-    spec = {"json": {"type": "object"}}
-    rf = _build(
-        _FakeTok(),
-        structured_outputs=spec,
-        engine_max_len=100,
-        request_timeout_seconds=5.0,
-        request_max_attempts=2,
-        monotonic=clock,
-        request_id_factory=lambda: next(ids),
-    )
-    rf([[{"role": "user", "content": "hi"}]], trainer)
-
-    assert aborted == ["attempt-1"]
-    assert [row[0] for row in submissions] == ["attempt-1", "attempt-2"]
-    assert submissions[0][1] == submissions[1][1]
-    first_params, second_params = submissions[0][2], submissions[1][2]
-    assert first_params is not second_params
-    assert first_params.max_tokens == second_params.max_tokens
-    assert first_params.temperature == second_params.temperature
-    assert first_params.top_p == second_params.top_p
-    assert first_params.structured_outputs is not second_params.structured_outputs
-    assert first_params.structured_outputs.kwargs == second_params.structured_outputs.kwargs == spec

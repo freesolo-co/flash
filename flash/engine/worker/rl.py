@@ -569,16 +569,8 @@ def run_rl():
             resolve_rollout_request_timeout_seconds,
         )
 
-        _rollout_request_timeout = resolve_rollout_request_timeout_seconds(
-            getattr(_t, "rollout_request_timeout_seconds", None) if _t else None,
-            vllm_max_len,
-        )
-        _rollout_request_max_attempts = int(
-            getattr(_t, "rollout_request_max_attempts", 2) if _t else 2
-        )
-        _rollout_stall_timeout = float(
-            getattr(_t, "rollout_stall_timeout_seconds", 0.0) if _t else 0.0
-        )
+        _rollout_request_timeout = resolve_rollout_request_timeout_seconds(vllm_max_len)
+        _rollout_request_max_attempts = 2
         examples_by_key = build_examples_index(train, env.prompt_messages)
         ncol = index_collisions(train, env.prompt_messages)
         if ncol:
@@ -600,13 +592,11 @@ def run_rl():
             structured_outputs=_so_spec,
             request_timeout_seconds=_rollout_request_timeout,
             request_max_attempts=_rollout_request_max_attempts,
-            stall_timeout_seconds=_rollout_stall_timeout,
         )
         print(
             f"[rl] multi-turn env: driving the turn loop via rollout_func; each physical vLLM "
-            f"request has timeout={_rollout_request_timeout:.1f}s, "
-            f"max_attempts={_rollout_request_max_attempts}, "
-            f"stall_timeout={_rollout_stall_timeout:.1f}s (0 disables stall detection)"
+            f"request has timeout={_rollout_request_timeout:.1f}s and "
+            f"max_attempts={_rollout_request_max_attempts}"
         )
     # GRPOTrainer.__init__ blocks 10-20 min on first use (vLLM build + FA2 compile); the side-thread
     # heartbeat must use the nvidia-smi-only path (include_torch=False) — torch.cuda calls would

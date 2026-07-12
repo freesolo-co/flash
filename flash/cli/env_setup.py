@@ -357,12 +357,6 @@ def cmd_env_setup(args) -> int:
             "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
             "# choice forms also parse) — see `flash train --doc`:\n"
             '# structured_outputs = \'{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}\'\n'
-            "# pure multi-turn grpo only: bound each flash-owned physical vllm request.\n"
-            "# unset timeout uses max(600s, 0.5 * vllm_max_len); attempts includes the first request.\n"
-            "# rollout_request_timeout_seconds = 600\n"
-            "# rollout_request_max_attempts = 2\n"
-            "# rollout_stall_timeout_seconds = 0  # disabled; positive values watch token progress\n"
-            "# these do not time out an episode, opd, trl native tool loops, or environment calls.\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
