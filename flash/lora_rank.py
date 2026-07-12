@@ -67,6 +67,10 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
     elif isinstance(value, float):
         if math.isfinite(value) and value.is_integer():
             parsed = int(value)
+    elif isinstance(value, Decimal):
+        # load_hf_adapter_config parses json floats as decimal for exact textual fidelity.
+        if value.is_finite() and value == value.to_integral_value():
+            parsed = int(value)
     elif isinstance(value, str):
         text = value.strip()
         if re.fullmatch(r"[+]?[0-9]+", text):
@@ -116,6 +120,13 @@ def resolve_hf_dataset_revision(repo: str, token: str | None = None) -> str:
     return revision.lower()
 
 
+def _canonical_json_default(value: Any) -> dict[str, str]:
+    """Digest ``parse_float=Decimal`` values exactly, without colliding with JSON strings."""
+    if isinstance(value, Decimal):
+        return {"__decimal__": str(value)}
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def adapter_artifact_identity(
     adapter_ref: str,
     config: Mapping[str, Any],
@@ -130,7 +141,11 @@ def adapter_artifact_identity(
         raise ValueError("source adapter reference is invalid")
     repo, prefix = resolved
     config_bytes = json.dumps(
-        config, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=_canonical_json_default,
     ).encode("utf-8")
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     paths = [f"{prefix}/adapter/{name}" for name in ADAPTER_WEIGHT_FILES]
