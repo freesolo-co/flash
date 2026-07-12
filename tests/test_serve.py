@@ -101,6 +101,7 @@ def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **d
             def json(self):
                 model = deploy_kwargs["model"]
                 return {
+                    "capabilities": ["thinking_structured_outputs_deferred_v1"],
                     "reasoning_parser_by_model": {model: "qwen3"},
                     "deferred_structured_outputs_by_model": {
                         model: {"status": "live", "verified": True}
@@ -975,7 +976,29 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("health_payload", [None, {}, {"capabilities": "bad"}, {"capabilities": []}])
+# valid parser + live/verified state, so each parametrized case is rejected purely by the field
+# under test (the capability handshake, or a not-live state), never the model-support gate.
+_LIVE_PARSER = {"Qwen/Qwen3.6-35B-A3B": "qwen3"}
+_LIVE_STATE = {"Qwen/Qwen3.6-35B-A3B": {"status": "live", "verified": True}}
+_CAP = ["thinking_structured_outputs_deferred_v1"]
+
+
+@pytest.mark.parametrize(
+    "health_payload",
+    [
+        None,  # probe unreachable
+        {},  # nothing advertised
+        # valid parser + state but the capability handshake is missing or malformed -> rejected
+        {"capabilities": "bad", "reasoning_parser_by_model": _LIVE_PARSER,
+         "deferred_structured_outputs_by_model": _LIVE_STATE},
+        {"capabilities": [], "reasoning_parser_by_model": _LIVE_PARSER,
+         "deferred_structured_outputs_by_model": _LIVE_STATE},
+        # capability advertised but the model is not live/verified -> still rejected
+        {"capabilities": _CAP, "reasoning_parser_by_model": _LIVE_PARSER,
+         "deferred_structured_outputs_by_model": {
+             "Qwen/Qwen3.6-35B-A3B": {"status": "cold", "verified": False}}},
+    ],
+)
 def test_thinking_structured_capability_fails_before_mutation(
     monkeypatch, health_payload
 ):
@@ -1007,7 +1030,7 @@ def test_thinking_structured_capability_fails_before_mutation(
     with pytest.raises(d.ServingError, match="No adapter registry mutation was attempted"):
         d.deploy_adapter(
             "r-cap",
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.6-35B-A3B",
             "org/repo",
             "rl/r-cap/seed0",
             thinking=True,
@@ -1041,6 +1064,7 @@ def test_thinking_structured_capability_precedes_registration(monkeypatch):
             events.append("healthz")
             return _Resp(
                 payload={
+                    "capabilities": ["thinking_structured_outputs_deferred_v1"],
                     "reasoning_parser_by_model": {"Qwen/Qwen3.6-35B-A3B": "qwen3"},
                     "deferred_structured_outputs_by_model": {
                         "Qwen/Qwen3.6-35B-A3B": {"status": "live", "verified": True}

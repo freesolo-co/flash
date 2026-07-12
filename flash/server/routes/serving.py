@@ -126,6 +126,13 @@ def recover_deployments() -> int:
                         and isinstance(target, int)
                         and current.get("revision") == target + 1
                     )
+                    # a completed prior-record rollback replays `previous`'s content one revision
+                    # past the mutation, so it is neither `mutation_landed` nor `current == previous`.
+                    rollback_prior_landed = (
+                        previous is not None
+                        and isinstance(target, int)
+                        and _app.restored_snapshot_matches(current, previous, target + 1)
+                    )
                     if mutation_landed:
                         try:
                             failed["rollback_revision"] = _app.restore_adapter_record(
@@ -142,7 +149,7 @@ def recover_deployments() -> int:
                             failed["detail"] = (
                                 "deployment interrupted; restored the prior serving registry state"
                             )
-                    elif current == previous or rollback_already_landed:
+                    elif current == previous or rollback_already_landed or rollback_prior_landed:
                         failed["detail"] = (
                             "deployment interrupted; registry mutation did not remain active"
                         )
@@ -157,13 +164,18 @@ def recover_deployments() -> int:
     return recovered
 
 
-def _answer_after_reasoning(content: str, *, thinking: bool) -> str:
+def _answer_after_reasoning(content: str, *, thinking: bool, require_closed: bool = False) -> str:
     if not thinking:
         return content.strip()
     opened = content.rfind("<think>")
     closed = content.rfind("</think>")
     if opened >= 0 and closed < opened:
         raise ServingError("smoke generation opened a <think> block but did not close it")
+    if require_closed and closed < 0:
+        raise ServingError(
+            "structured smoke generation for a thinking adapter never closed its reasoning with "
+            "</think>, so the deferred grammar was never exercised"
+        )
     return (content[closed + len("</think>") :] if closed >= 0 else content).strip()
 
 
@@ -207,7 +219,12 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     finish = choice.get("finish_reason")
     if finish == "length":
         raise ServingError("smoke generation was truncated at the maximum token length")
-    answer = _answer_after_reasoning(content, thinking=spec.thinking)
+    from flash.engine.structured_outputs import parse_structured_outputs
+
+    structured = bool(parse_structured_outputs(spec.train.structured_outputs))
+    answer = _answer_after_reasoning(
+        content, thinking=spec.thinking, require_closed=structured
+    )
     if not answer:
         raise ServingError(
             "smoke generation returned no answer content "
@@ -381,8 +398,13 @@ def _finish_deployment_unlocked(
                 if previous_registry_snapshot is not None:
                     failed["detail"] = "deployment failed; restored exact previous serving record"
                 else:
+                    # serving holds only a disabled tombstone, so there is no routable record to
+                    # pair a restored local deployment with. drop it so mark_deployment_failed
+                    # cannot resurrect an unroutable local ready state.
+                    failed.pop("previous_deployment", None)
                     failed["detail"] = (
-                        "deployment failed; restored an unroutable serving tombstone"
+                        "deployment failed; restored an unroutable serving tombstone; "
+                        "not restoring the previous local deployment"
                     )
         mark_deployment_failed(run_id, failed)
 

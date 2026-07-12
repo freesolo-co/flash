@@ -310,6 +310,19 @@ def _require_thinking_structured_outputs_capability(base: str, model: str) -> No
             "cannot safely deploy a thinking adapter with structured outputs because /healthz "
             "returned a malformed response. No adapter registry mutation was attempted"
         )
+    # the stable versioned handshake: serving only advertises this once a build has both the
+    # parser configured and request-level reasoning gating live, so it must be present before we
+    # trust the per-model liveness fields below.
+    capabilities = payload.get("capabilities")
+    if (
+        not isinstance(capabilities, list)
+        or THINKING_STRUCTURED_OUTPUTS_CAPABILITY not in capabilities
+    ):
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because serving does "
+            f"not advertise the {THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r} capability. No adapter "
+            "registry mutation was attempted"
+        )
     parsers = payload.get("reasoning_parser_by_model")
     states = payload.get("deferred_structured_outputs_by_model")
     parser = parsers.get(model) if isinstance(parsers, dict) else None
@@ -425,6 +438,20 @@ def snapshot_adapter_record(run_id: str) -> dict | None:
 def registry_snapshot_matches(snapshot: dict | None, expected: dict, revision: int) -> bool:
     """Return whether a privileged snapshot exactly represents a requested mutation."""
     return not _record_mismatches(snapshot, expected, revision)
+
+
+def restored_snapshot_matches(
+    snapshot: dict | None, previous_snapshot: dict | None, revision: int
+) -> bool:
+    """Return whether a snapshot equals a restored prior record at ``revision``.
+
+    A completed prior-record rollback replays ``previous_snapshot``'s content but lands one
+    revision past the mutation and bumps ``updated_at``, so this compares fields rather than
+    requiring exact dict equality.
+    """
+    if previous_snapshot is None:
+        return False
+    return not _restored_snapshot_mismatches(snapshot, previous_snapshot, revision)
 
 
 def restore_adapter_record(
@@ -584,14 +611,31 @@ def deploy_adapter(
             target_revision,
         )
     else:
-        committed_revision = _etag_revision(response)
+        # the post returned 2xx, so the mutation committed. any failure reading back or
+        # confirming it now leaves a live-but-unverified revision, so fail closed to
+        # reconciliation rather than a plain error that could restore a stale local record.
+        try:
+            committed_revision = _etag_revision(response)
+        except ServingError as exc:
+            raise ServingError(
+                f"serving accepted adapter {run_id} but returned an unusable ETag ({exc}); "
+                "the mutation may have committed; reconciliation required",
+                reconciliation_required=True,
+            ) from exc
         if committed_revision != target_revision:
             raise ServingError(
                 f"serving committed adapter {run_id} at revision {committed_revision}, expected "
                 f"{target_revision}; reconciliation required",
                 reconciliation_required=True,
             )
-        snapshot = _verify_adapter_registered(run_id, body, target_revision)
+        try:
+            snapshot = _verify_adapter_registered(run_id, body, target_revision)
+        except Exception as exc:
+            raise ServingError(
+                f"serving accepted adapter {run_id} at revision {target_revision} but readback "
+                f"did not confirm it ({exc}); reconciliation required",
+                reconciliation_required=True,
+            ) from exc
 
     dep.registry_revision = snapshot["revision"]
     logger.info(

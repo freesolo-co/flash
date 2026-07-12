@@ -36,6 +36,7 @@ from flash.serve.deploy import (
     deployment_record,
     registry_snapshot_matches,
     restore_adapter_record,
+    restored_snapshot_matches,
     snapshot_adapter_record,
     undeploy_adapter,
 )
@@ -80,6 +81,7 @@ __all__ = [
     "recover_runs",
     "registry_snapshot_matches",
     "restore_adapter_record",
+    "restored_snapshot_matches",
     "run_server",
     "serve_chat",
     "serve_chat_stream",
