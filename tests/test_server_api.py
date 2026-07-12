@@ -141,6 +141,149 @@ def test_requests_without_key_are_rejected(api):
     assert api.get("/v1/health").status_code == 200  # health stays open
 
 
+def test_dry_run_reports_schema_agreement_without_persisting_it(api) -> None:
+    from flash.schema import train_schema_metadata
+
+    metadata = {
+        "version": "0.2.56",
+        "fields": train_schema_metadata(),
+        "authored_keys": sorted(SPEC["train"]),
+    }
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": SPEC, "dry_run": True, "client_train_schema": metadata},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["train_schema_compatibility"] == {
+        "status": "agreement",
+        "client_only": [],
+        "server_only": [],
+        "introduced_in_differences": [],
+    }
+    status = api.get(f"/v1/runs/{body['run_id']}", headers=_bearer("fslo-internal-test")).json()
+    assert "train_schema_compatibility" not in status
+
+
+def test_dry_run_schema_disagreement_is_diagnostic_only(api) -> None:
+    from flash.schema import train_schema_metadata
+
+    fields = train_schema_metadata()
+    fields.pop("teacher_model")
+    fields.pop("structured_outputs")
+    fields["epochs"] = "0.2.1"
+    metadata = {
+        "version": "0.2.55",
+        "fields": fields,
+        "authored_keys": sorted(SPEC["train"]),
+    }
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": SPEC, "dry_run": True, "client_train_schema": metadata},
+    )
+
+    assert response.status_code == 200, response.text
+    compatibility = response.json()["train_schema_compatibility"]
+    assert compatibility["status"] == "disagreement"
+    assert compatibility["client_only"] == []
+    assert compatibility["server_only"] == ["structured_outputs", "teacher_model"]
+    assert compatibility["introduced_in_differences"] == [
+        {"key": "epochs", "client": "0.2.1", "server": "0.2.0"}
+    ]
+
+
+def test_missing_or_malformed_schema_metadata_does_not_change_parser_acceptance(api) -> None:
+    payloads = [
+        {"spec": SPEC, "dry_run": True},
+        {
+            "spec": SPEC,
+            "dry_run": True,
+            "client_train_schema": {
+                "version": "0.2.56",
+                "fields": ["not", "a", "mapping"],
+                "authored_keys": sorted(SPEC["train"]),
+            },
+        },
+    ]
+
+    for payload in payloads:
+        response = api.post("/v1/runs", headers=_bearer("fslo-internal-test"), json=payload)
+        assert response.status_code == 200, response.text
+        assert "train_schema_compatibility" not in response.json()
+
+
+def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
+    import flash.server.routes.runs as runs_route
+    from flash.schema import train_schema_metadata
+
+    original_parse = runs_route._parse_spec
+    calls = 0
+
+    def counted_parse(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(runs_route, "_parse_spec", counted_parse)
+    monkeypatch.setattr(
+        runs_route, "_runtime_secrets", lambda *_a, **_k: pytest.fail("secrets inspected")
+    )
+    monkeypatch.setattr(runs_route.db, "record_run", lambda *_a, **_k: pytest.fail("run persisted"))
+    monkeypatch.setattr(
+        runs_route._app, "submit_job", lambda *_a, **_k: pytest.fail("job submitted")
+    )
+    fields = train_schema_metadata()
+    fields["future_knob"] = "0.3.0"
+    spec = {**SPEC, "train": {**SPEC["train"], "future_knob": 1}}
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={
+            "spec": spec,
+            "dry_run": True,
+            "client_train_schema": {
+                "version": "0.3.0",
+                "fields": fields,
+                "authored_keys": sorted(spec["train"]),
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "unknown key(s): future_knob" in detail
+    assert "future_knob (minimum released Flash version 0.3.0)" in detail
+    assert "client/server [train] schemas disagree" in detail
+    assert calls == 1
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_malformed_schema_metadata_does_not_enrich_parser_rejection(api) -> None:
+    spec = {**SPEC, "train": {**SPEC["train"], "future_knob": 1}}
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={
+            "spec": spec,
+            "dry_run": True,
+            "client_train_schema": {
+                "version": "0.3.0",
+                "fields": {"future_knob": "0.3.0"},
+                "authored_keys": ["future_knob", "future_knob"],
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "unknown key(s): future_knob" in detail
+    assert "minimum released Flash version" not in detail
+    assert "schemas disagree" not in detail
+
+
 def test_internal_key_authenticates_as_service_identity(api, monkeypatch):
     # With FREESOLO_INTERNAL_KEY configured, the shared internal key works as a bearer and
     # owns the runs it submits — the freesolo SDK authenticates with the same credential the
@@ -1244,9 +1387,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
         )
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
-    monkeypatch.setattr(
-        app_mod, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}]
-    )
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}])
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
@@ -1794,7 +1935,9 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
     assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
-    assert reaped == ["nohandle-1"], "must force-reap the run's instance-provider label before resubmit"
+    assert reaped == ["nohandle-1"], (
+        "must force-reap the run's instance-provider label before resubmit"
+    )
     # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
     assert runner.get_status("nohandle-1").state != "failed"
 
@@ -1857,7 +2000,9 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
     assert reaped == ["phantom-1"], "must still attempt the force-reap"
     assert resubmitted == [], "must NOT resubmit while an instance for the run may still be live"
-    assert runner.get_status("phantom-1").state != "failed", "deferred, not failed (later recovery retries)"
+    assert runner.get_status("phantom-1").state != "failed", (
+        "deferred, not failed (later recovery retries)"
+    )
 
 
 def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, tmp_path):
@@ -1892,7 +2037,9 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
             state="provisioning",
             spec=spec,
             remote=None,
-            submitted_instance_providers=["vast"],  # Vast was configured when this run was submitted
+            submitted_instance_providers=[
+                "vast"
+            ],  # Vast was configured when this run was submitted
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "unconf-1"}])
@@ -1912,7 +2059,9 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     app_mod.recover_runs()
 
     assert resubmitted == [], "must NOT resubmit while an uncheckable Vast phantom may still bill"
-    assert runner.get_status("unconf-1").state != "failed", "deferred, not failed (later restart retries)"
+    assert runner.get_status("unconf-1").state != "failed", (
+        "deferred, not failed (later restart retries)"
+    )
 
 
 def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypatch, tmp_path):
@@ -1974,8 +2123,12 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "queued run must launch a resubmit thread, not defer on a phantom check"
-    assert resubmitted == ["queued-1"], "a never-provisioned queued run resubmits despite unconfigurable Vast"
+    assert done.wait(timeout=5), (
+        "queued run must launch a resubmit thread, not defer on a phantom check"
+    )
+    assert resubmitted == ["queued-1"], (
+        "a never-provisioned queued run resubmits despite unconfigurable Vast"
+    )
     assert runner.get_status("queued-1").state != "failed"
 
 
@@ -2026,7 +2179,9 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "a run that never recorded Vast must still recover on a Vast-less plane"
+    assert done.wait(timeout=5), (
+        "a run that never recorded Vast must still recover on a Vast-less plane"
+    )
     assert resubmitted == ["novast-1"]
 
 
@@ -2123,9 +2278,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
     done = threading.Event()
-    monkeypatch.setattr(
-        runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
-    )
+    monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
     monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_RETRY_S", 0.01)  # fast background retry
 
     calls = {"n": 0}
@@ -2149,7 +2302,9 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
 
     app_mod.recover_runs()  # first check sees the box -> defers + schedules the background retry
 
-    assert done.wait(timeout=5), "the background retry must resubmit once the run is confirmed clear"
+    assert done.wait(timeout=5), (
+        "the background retry must resubmit once the run is confirmed clear"
+    )
     assert resubmitted == ["retry-1"]
 
 

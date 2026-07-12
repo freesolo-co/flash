@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
+from collections.abc import Collection
+from dataclasses import fields as dataclass_fields
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
@@ -116,12 +118,30 @@ def spec_from_file(
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
 ) -> JobSpec:
+    spec, _ = spec_and_train_keys_from_file(
+        path,
+        run_id=run_id,
+        overrides=overrides,
+        extra_configs=extra_configs,
+    )
+    return spec
+
+
+def spec_and_train_keys_from_file(
+    path: str,
+    run_id: str | None = None,
+    overrides: list[str] | None = None,
+    extra_configs: list[str] | None = None,
+) -> tuple[JobSpec, frozenset[str]]:
+    """parse a config and retain the raw authored [train] keys for schema preflights."""
     raw = load_toml(path)
     for extra in extra_configs or []:
         _deep_merge(raw, load_toml(extra))
     for item in overrides or []:
         _apply_override(raw, item)
-    return spec_from_dict(raw, run_id=run_id)
+    train_raw = raw.get("train")
+    authored_train_keys = frozenset(train_raw) if isinstance(train_raw, dict) else frozenset()
+    return spec_from_dict(raw, run_id=run_id), authored_train_keys
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -190,31 +210,26 @@ _TOP_LEVEL_KEYS = frozenset(
         "run_id",
     }
 )
-_TRAIN_KEYS = frozenset(
-    {
-        "epochs",
-        "lora_rank",
-        "lora_alpha",
-        "init_from_adapter",
-        "hf_repo",
-        "learning_rate",
-        "batch_size",
-        "max_context_tokens",
-        "save_every",
-        "group_size",
-        "temperature",
-        "max_completion_tokens",
-        "kl_penalty_coef",
-        "advantage_clip",
-        "thinking_length_penalty_coef",
-        "opd_eos_loss_coef",
-        "teacher_model",
-        "stop_sequences",
-        "structured_outputs",
-        "max_steps",
-        "max_examples",
-    }
-)
+TRAIN_KEY_MIN_VERSIONS = {
+    item.name: str(item.metadata["introduced_in"]) for item in dataclass_fields(TrainSpec)
+}
+TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
+
+
+def train_schema_metadata() -> dict[str, str]:
+    """return the deterministic [train] field-to-release mapping."""
+    return {key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)}
+
+
+def validate_train_keys(keys: Collection[str]) -> None:
+    """reject names outside the canonical TrainSpec field surface."""
+    unknown = sorted(set(keys) - TRAIN_SCHEMA_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"[train] unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
+        )
+
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
@@ -276,12 +291,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
-    unknown_train = sorted(set(train_raw) - _TRAIN_KEYS)
-    if unknown_train:
-        raise ConfigError(
-            f"[train] unknown key(s): {', '.join(unknown_train)} "
-            f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
-        )
+    validate_train_keys(train_raw)
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}
