@@ -595,7 +595,7 @@ def model_required_vram_gb(
     group_size = _pos_int(_get(train, "group_size"), group_size_default)
     batch_size = _pos_int(_get(train, "batch_size"), batch_size_default)
     objective_ids = tuple(_get(train, "opd_objective_ids") or ())
-    frozen_reference = bool({"c06", "c11"} & set(objective_ids))
+    frozen_reference = bool({"c06", "c11", "c12"} & set(objective_ids))
     reference_lora_rank = (
         _pos_int(_get(train, "opd_reference_lora_rank"), None) if frozen_reference else None
     )

@@ -508,7 +508,12 @@ def _position0_eos_safety(row, eos_ids: Iterable[int], *, coef: float):
     }
 
 
-def _c05(view: ObjectiveView) -> ObjectiveResult:
+def _position0_eos_safety_result(view: ObjectiveView, *, coef: float):
+    """shared position-0 aggregate halting-eos probability safety term and its detached metrics.
+
+    reused verbatim by c05 (standalone) and c12 (composed) so the halting-eos safety math is defined
+    once. returns (term_or_none, metrics, empty_rollout) and never enables the c05 entropy floor,
+    empty-rollout recovery, or terminal-eos controller — those are governed elsewhere by config."""
     sample_logits = view.require("sample_logits")
     view.require("completion_logits")
     prompt_len = int(view.require("prompt_len"))
@@ -517,28 +522,29 @@ def _c05(view: ObjectiveView) -> ObjectiveResult:
     stop_sequences = tuple(view.require("stop_sequences") or ())
     eos_ids = tuple(view.require("eos_ids") or ())
 
-    terms: list[object] = []
+    safety_eligible = not stop_sequences and (not empty_rollout or termination_cause == "eos")
+    position0 = prompt_len - 1
+    if not (safety_eligible and 0 <= position0 < sample_logits.shape[0]):
+        return None, {}, empty_rollout
+    safety_term, safety_metrics = _position0_eos_safety(
+        sample_logits[position0], eos_ids, coef=coef
+    )
+    return safety_term, safety_metrics, empty_rollout
+
+
+def _c05(view: ObjectiveView) -> ObjectiveResult:
     metrics: dict[str, object] = {}
     entropy = view.require("entropy")
     if entropy is not None:
         metrics["entropy"] = entropy
         metrics["entropy_floor_active"] = float(view.require("entropy_floor_active"))
 
-    safety_eligible = not stop_sequences and (not empty_rollout or termination_cause == "eos")
-    position0 = prompt_len - 1
-    if safety_eligible and 0 <= position0 < sample_logits.shape[0]:
-        safety_term, safety_metrics = _position0_eos_safety(
-            sample_logits[position0], eos_ids, coef=_C05_CONFIG.position0_eos_coef
-        )
-        metrics.update(safety_metrics)
-        if safety_term is not None:
-            terms.append(safety_term)
-            if empty_rollout:
-                metrics["empty_recovery"] = 1.0
-
-    term = None
-    for addition in terms:
-        term = addition if term is None else term + addition
+    term, safety_metrics, empty_rollout = _position0_eos_safety_result(
+        view, coef=_C05_CONFIG.position0_eos_coef
+    )
+    metrics.update(safety_metrics)
+    if term is not None and empty_rollout:
+        metrics["empty_recovery"] = 1.0
     return ObjectiveResult(term=term, metrics=metrics)
 
 
@@ -587,6 +593,30 @@ def _c11(view: ObjectiveView) -> ObjectiveResult:
     policy, reference = _masked_rows(view)
     term = sft_relative_top2_margin(policy, reference)
     return ObjectiveResult(term=term, metrics={"margin_hinge": term.detach()})
+
+
+# c12 fixes the halting-eos safety coefficient; entropy_floor stays None, recover_empty_rollouts and
+# eos_in_rkl stay off, so selecting c12 enables ONLY the position-0 safety half of c05 (no entropy
+# floor 1.75, no empty-rollout recovery). the terminal-eos controller is governed by
+# opd_eos_loss_coef, independent of any objective, so c12 never touches it.
+_C12_CONFIG = ObjectiveConfig(position0_eos_coef=1.0)
+
+
+def _c12(view: ObjectiveView) -> ObjectiveResult:
+    """closed composition: c06 frozen top32+tail forward-kl anchor + c07 greedy-sidecar loop-closing
+    unlikelihood (applied once at batch level via the greedy_sidecar requirement) + standalone c05
+    position-0 aggregate halting-eos safety. reuses the reviewed reference and safety helpers so no
+    math is duplicated; the shared frozen-reference forward and greedy sidecar are requested once and
+    deduplicated by the plan even when c12 is composed with c06/c07/c11."""
+    policy, reference = _masked_rows(view)
+    anchor = forward_kl_topk_tail(policy, reference)
+    metrics: dict[str, object] = {"forward_kl": anchor.detach()}
+    safety_term, safety_metrics, _empty_rollout = _position0_eos_safety_result(
+        view, coef=_C12_CONFIG.position0_eos_coef
+    )
+    metrics.update(safety_metrics)
+    term = anchor if safety_term is None else anchor + safety_term
+    return ObjectiveResult(term=term, metrics=metrics)
 
 
 OPD_OBJECTIVES = ObjectiveRegistry(
@@ -642,6 +672,17 @@ OPD_OBJECTIVES = ObjectiveRegistry(
                 completion_mask=True,
             ),
             evaluate=_c11,
+        ),
+        ObjectiveDefinition(
+            objective_id="c12",
+            requirements=ObjectiveRequirements(
+                student_logits=True,
+                frozen_sft_reference=True,
+                completion_mask=True,
+                greedy_sidecar=True,
+            ),
+            evaluate=_c12,
+            config=_C12_CONFIG,
         ),
         ObjectiveDefinition(
             objective_id="c13",

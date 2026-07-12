@@ -694,3 +694,297 @@ def test_c11_composes_with_c10_on_one_shared_view():
     assert torch.isfinite(policy.grad).all()
     assert any(key.startswith("opd/objectives/c11/") for key in evaluated.metrics)
     assert evaluated.metrics["opd/objectives/c10/activation"] == 1.0
+
+
+# --- c12: frozen anchor (c06) + greedy-sidecar unlikelihood (c07) + position-0 eos safety (c05) ---
+
+
+def _c12_shared_view(torch, *, mask=None, eos_ids=(4, 5), termination_cause="eos"):
+    """one controlled per-sample view exposing exactly the inputs c06, c05, and c12 read.
+
+    prompt_len - 1 (the first completion row) is both the c06 anchor's leading row and the c05
+    position-0 halting row, so a single leaf tensor feeds every component and the additive
+    decomposition c12 == c06 + c05-safety can be checked on both value and gradient."""
+    vocab, prompt_len, comp_len = 6, 2, 3
+    seq_len = prompt_len - 1 + comp_len
+    generator = torch.Generator().manual_seed(19)
+    sample_logits = torch.randn(seq_len, vocab, generator=generator, requires_grad=True)
+    completion_logits = sample_logits[prompt_len - 1 : prompt_len - 1 + comp_len]
+    reference = torch.randn(comp_len, vocab, generator=generator)
+    if mask is None:
+        mask = torch.ones(comp_len, dtype=torch.bool)
+    return sample_logits, completion_logits, reference, ObjectiveView(
+        {
+            "sample_logits": sample_logits,
+            "completion_logits": completion_logits,
+            "reference_completion_logits": reference,
+            "completion_mask": mask,
+            "prompt_len": prompt_len,
+            "empty_rollout": False,
+            "termination_cause": termination_cause,
+            "stop_sequences": (),
+            "eos_ids": tuple(eos_ids),
+            "entropy": None,
+        }
+    )
+
+
+def test_c12_term_and_grad_equal_sum_of_c06_anchor_and_c05_position0_safety():
+    """c12's single term and its gradient equal, exactly, c06's frozen forward-kl anchor plus c05's
+    standalone position-0 eos safety evaluated on the same inputs (the c07 sidecar half is applied
+    once at batch level via the greedy_sidecar requirement, checked separately)."""
+    torch = pytest.importorskip("torch")
+    sample_logits, _completion, _reference, view = _c12_shared_view(torch)
+    base = torch.tensor(0.0, dtype=torch.float32)
+
+    c12_term = OPD_OBJECTIVES.evaluate(OPD_OBJECTIVES.plan(("c12",)), view, base_term=base).terms[0]
+    c06_term = OPD_OBJECTIVES.evaluate(OPD_OBJECTIVES.plan(("c06",)), view, base_term=base).terms[0]
+    c05_term = OPD_OBJECTIVES.evaluate(OPD_OBJECTIVES.plan(("c05",)), view, base_term=base).terms[0]
+
+    assert torch.allclose(c12_term, c06_term + c05_term, atol=1e-6)
+    grad_c12 = torch.autograd.grad(c12_term, sample_logits, retain_graph=True)[0]
+    grad_sum = torch.autograd.grad(c06_term + c05_term, sample_logits, retain_graph=True)[0]
+    assert torch.allclose(grad_c12, grad_sum, atol=1e-6)
+    # both halves are live: the anchor touches every completion row, the safety touches the
+    # position-0 row, so the composed gradient is strictly non-trivial.
+    assert torch.isfinite(grad_c12).all()
+    assert float(grad_c12.abs().sum()) > 0
+
+
+def test_c12_metrics_are_namespaced_and_do_not_collide_with_c06():
+    """c12 exposes the anchor and the safety submetrics under its own id; composing it with c06
+    keeps both forward_kl metrics distinct instead of colliding."""
+    torch = pytest.importorskip("torch")
+    _sample, _completion, _reference, view = _c12_shared_view(torch)
+    evaluated = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c12", "c06")), view, base_term=torch.tensor(0.0)
+    )
+    assert "opd/objectives/c12/forward_kl" in evaluated.metrics
+    assert "opd/objectives/c12/position0_eos_probability" in evaluated.metrics
+    assert "opd/objectives/c12/position0_eos_rank" in evaluated.metrics
+    assert "opd/objectives/c12/position0_eos_margin" in evaluated.metrics
+    assert "opd/objectives/c06/forward_kl" in evaluated.metrics
+    # same underlying anchor, reported once per objective id, no duplicate-key error.
+    assert evaluated.metrics["opd/objectives/c12/forward_kl"] == pytest.approx(
+        evaluated.metrics["opd/objectives/c06/forward_kl"]
+    )
+
+
+def test_c12_anchor_masks_grammar_forced_rows():
+    """the frozen forward-kl anchor honors the completion mask, so grammar-forced rows never
+    contribute — identical to c06's masking."""
+    torch = pytest.importorskip("torch")
+    mask = torch.tensor([True, False, True])
+    _sample, completion, reference, view = _c12_shared_view(torch, mask=mask)
+    evaluated = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c12",)), view, base_term=torch.tensor(0.0)
+    )
+    expected_anchor = forward_kl_topk_tail(completion[mask], reference[mask])
+    assert evaluated.metrics["opd/objectives/c12/forward_kl"] == pytest.approx(
+        float(expected_anchor.detach())
+    )
+
+
+def test_c12_position0_safety_aggregates_the_complete_eos_set():
+    """the position-0 halting probability sums over EVERY eos id, not just one — the aggregate
+    halting-eos mass matches the softmax mass on the full eos set."""
+    torch = pytest.importorskip("torch")
+    sample_logits, _completion, _reference, view = _c12_shared_view(torch, eos_ids=(3, 4, 5))
+    evaluated = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c12",)), view, base_term=torch.tensor(0.0)
+    )
+    expected = float(torch.softmax(sample_logits[1].detach(), dim=-1)[[3, 4, 5]].sum())
+    assert evaluated.metrics["opd/objectives/c12/position0_eos_probability"] == pytest.approx(
+        expected
+    )
+
+
+def test_c12_stop_sequences_disable_only_the_safety_half():
+    """with stop sequences present the position-0 safety is ineligible (as in c05), leaving c12 as
+    the pure frozen anchor — no safety term, no safety metrics."""
+    torch = pytest.importorskip("torch")
+    _sample, completion, reference, _view = _c12_shared_view(torch)
+    view = ObjectiveView(
+        {
+            **{
+                "sample_logits": _sample,
+                "completion_logits": completion,
+                "reference_completion_logits": reference,
+                "completion_mask": torch.ones(3, dtype=torch.bool),
+                "prompt_len": 2,
+                "empty_rollout": False,
+                "termination_cause": "stop_sequence",
+                "stop_sequences": ("</answer>",),
+                "eos_ids": (4, 5),
+                "entropy": None,
+            }
+        }
+    )
+    evaluated = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c12",)), view, base_term=torch.tensor(0.0)
+    )
+    anchor_only = forward_kl_topk_tail(completion, reference)
+    assert torch.allclose(evaluated.terms[0], anchor_only, atol=1e-6)
+    assert "opd/objectives/c12/position0_eos_probability" not in evaluated.metrics
+
+
+def test_c12_config_enables_only_position0_safety_no_floor_recovery_or_rkl_eos():
+    """c12 fixes only the halting-eos coefficient: no entropy floor 1.75, no empty-rollout recovery,
+    no reverse-kl eos boundary. worker-side aggregation (entropy floor / empty recovery derive from
+    per-definition config) therefore stays off for a c12-only plan."""
+    from flash.engine.worker.opd_objectives import ObjectiveConfig
+
+    definition = OPD_OBJECTIVES.definitions["c12"]
+    assert definition.config == ObjectiveConfig(position0_eos_coef=1.0)
+    assert definition.config.entropy_floor is None
+    assert definition.config.entropy_floor_coef == 0.0
+    assert definition.config.recover_empty_rollouts is False
+    assert definition.config.eos_in_rkl is False
+    assert definition.config.teacher_boundary_probability is None
+
+    plan = OPD_OBJECTIVES.plan(("c12",))
+    # mirror opd.py's aggregation: entropy floor is enabled only if some config sets entropy_floor.
+    assert not any(d.config.entropy_floor is not None for d in plan.definitions)
+    assert not any(d.config.recover_empty_rollouts for d in plan.definitions)
+
+
+def test_c12_requirements_are_component_union_without_c09_or_extra_work():
+    """c12 requests frozen reference, completion mask, student logits, and greedy sidecar — the union
+    of its c06/c07/c05 components — and NOT c09 sequence weighting or c10/c13 work."""
+    plan = OPD_OBJECTIVES.plan(("c12",))
+    req = plan.requirements
+    assert req.frozen_sft_reference
+    assert req.completion_mask
+    assert req.student_logits
+    assert req.greedy_sidecar
+    # explicitly not c09 sequence weighting, not empty-rollout recovery machinery, not c10/c13.
+    assert not req.repetition_weighting
+    assert not req.empty_rollouts
+    assert not req.position_statistics
+    assert not req.candidate_topk
+    assert not req.sampled_primary
+    assert not req.teacher_scores
+
+
+def test_c12_reference_and_sidecar_work_is_requested_once_when_composed():
+    """composing c12 with c06 (also frozen reference) and c07 (also greedy sidecar) still aggregates
+    to a single reference-forward flag and a single sidecar flag — the worker does that work once."""
+    solo = OPD_OBJECTIVES.plan(("c12",)).requirements
+    composed = OPD_OBJECTIVES.plan(("c12", "c06", "c07")).requirements
+    assert solo.frozen_sft_reference is composed.frozen_sft_reference is True
+    assert solo.greedy_sidecar is composed.greedy_sidecar is True
+    # aggregation is idempotent: no per-objective duplication of the shared boolean requirements.
+    assert composed.completion_mask is True
+
+
+def test_c12_composes_with_c10_and_c13_without_them_firing():
+    """c12 fires its anchor+safety while co-selected c10 (empty tail) and c13 (no candidate term)
+    produce metrics but no term; c12 remains the only contributed term."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd_objectives import CvarEntropyConfig, PositionStatistics
+
+    _sample_logits, _completion, _reference, base_view = _c12_shared_view(torch)
+    candidate = SimpleNamespace(
+        term=None,
+        selected_prefixes=0,
+        scored_prefixes=0,
+        duplicate_surfaces=0,
+        invalid_candidates=0,
+        budget_exhausted=False,
+        cache_hits=0,
+        requests=0,
+    )
+    view = ObjectiveView(
+        {
+            **dict(base_view.values),
+            "position_statistics": PositionStatistics(),
+            "entropy_for_rows": lambda _indices: None,
+            "cvar_entropy_config": CvarEntropyConfig(fraction=0.5, floor=0.0, coef=1.0),
+            "candidate_topk": candidate,
+        }
+    )
+    evaluated = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c12", "c10", "c13")), view, base_term=torch.tensor(0.0)
+    )
+    assert len(evaluated.terms) == 1  # only c12 contributed a term
+    assert evaluated.metrics["opd/objectives/c10/activation"] == 0.0
+    assert evaluated.metrics["opd/objectives/c13/selected_prefixes"] == 0.0
+    assert "opd/objectives/c12/forward_kl" in evaluated.metrics
+
+
+def test_c12_is_registered_in_canonical_order_between_c11_and_c13():
+    from flash.opd_objectives import OPD_OBJECTIVE_IDS
+
+    assert OPD_OBJECTIVES.objective_ids == OPD_OBJECTIVE_IDS
+    ids = list(OPD_OBJECTIVE_IDS)
+    assert ids.index("c11") + 1 == ids.index("c12")
+    assert ids.index("c12") + 1 == ids.index("c13")
+
+
+def test_c12_default_and_c0_paths_are_unchanged():
+    """selecting nothing or c0 still plans to no work and contributes no term, exactly as before."""
+    torch = pytest.importorskip("torch")
+    assert OPD_OBJECTIVES.plan(()).definitions == ()
+    c0_plan = OPD_OBJECTIVES.plan(("c0",))
+    assert c0_plan.requirements == type(c0_plan.requirements)()
+    evaluated = OPD_OBJECTIVES.evaluate(c0_plan, ObjectiveView({}), base_term=torch.tensor(0.0))
+    assert evaluated.terms == ()
+    assert evaluated.metrics == {}
+
+
+def test_c12_requires_reference_adapter_and_parses_raw_reference_lineage():
+    from flash.schema import spec_from_dict
+    from flash.schema.fields import ConfigError
+
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "opd",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+    }
+    with pytest.raises(ConfigError, match="opd_reference_adapter is required"):
+        spec_from_dict({**base, "train": {"opd_objective_ids": ["c12"]}})
+
+    raw = spec_from_dict(
+        {
+            **base,
+            "train": {"opd_objective_ids": ["c12"], "opd_reference_adapter": "sft-run"},
+        }
+    )
+    assert raw.train.opd_objective_ids == ("c12",)
+    assert raw.train.opd_reference_adapter == "sft-run"
+    assert raw.train.init_from_adapter == ""
+
+
+def test_c12_declares_reference_extra_cost_and_vram():
+    from flash.cost.analytical import seconds_per_step
+    from flash.cost.types import RunConfig
+    from flash.engine.vram import model_required_vram_gb
+
+    base = RunConfig(
+        model_id="Qwen/Qwen3.5-0.8B",
+        method="opd",
+        steps=1,
+        seq_len=1024,
+        completion_len=128,
+        batch_size=1,
+        group_size=1,
+    )
+    composed = RunConfig(
+        **{**base.__dict__, "opd_objective_ids": ("c12",), "opd_reference_lora_rank": 128}
+    )
+    assert seconds_per_step(composed, "A100-SXM-80GB") > seconds_per_step(base, "A100-SXM-80GB")
+
+    common = {
+        "max_context_tokens": 1024,
+        "max_completion_tokens": 128,
+        "batch_size": 1,
+        "group_size": 1,
+    }
+    plain_vram = model_required_vram_gb("Qwen/Qwen3.5-0.8B", "opd", train=common, headroom=1.0)
+    c12_vram = model_required_vram_gb(
+        "Qwen/Qwen3.5-0.8B",
+        "opd",
+        train={**common, "opd_objective_ids": ("c12",), "opd_reference_lora_rank": 128},
+        headroom=1.0,
+    )
+    assert c12_vram >= plain_vram

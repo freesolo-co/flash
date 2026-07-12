@@ -413,8 +413,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         thinking=thinking,
         wandb=wandb_spec,
     )
-    if {"c06", "c11"} & set(spec.train.opd_objective_ids) and not spec.train.opd_reference_adapter:
-        raise ConfigError("train.opd_reference_adapter is required when selecting c06 or c11")
+    if (
+        {"c06", "c11", "c12"} & set(spec.train.opd_objective_ids)
+        and not spec.train.opd_reference_adapter
+    ):
+        raise ConfigError("train.opd_reference_adapter is required when selecting c06, c11, or c12")
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
         # thinking + a constraint is supported: the rollout worker sets a reasoning parser on the vLLM
