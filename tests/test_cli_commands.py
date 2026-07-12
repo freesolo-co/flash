@@ -250,13 +250,13 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def _train_config(tmp_path):
+def _train_config(tmp_path, *, extra_train: str = ""):
     path = tmp_path / "train.toml"
     path.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\n'
-        '[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n'
+        f'[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n{extra_train}'
     )
     return path
 
@@ -320,6 +320,62 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[3] is True
     assert call[4]["authored_keys"] == ["epochs", "hf_repo", "max_examples"]
     assert call[1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+
+
+def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.client import ApiError
+
+    detail = "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)"
+
+    def reject(*_args, **_kwargs):
+        raise ApiError(400, detail)
+
+    monkeypatch.setattr(fake_client, "create_run", reject)
+    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+
+    assert _run(["train", str(config), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert detail in captured.err
+    assert "teacher_model (minimum released Flash version 0.2.56)" in captured.err
+    assert "client/server [train] schemas disagree" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (400, "budget precheck rejected this run"),
+        (
+            400,
+            "[train] unknown key(s): structured_outputs (allowed: epochs, hf_repo, max_examples)",
+        ),
+        (
+            400,
+            "[train] unknown key(s): future_knob (allowed: epochs, hf_repo, max_examples)",
+        ),
+        (
+            500,
+            "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)",
+        ),
+    ],
+)
+def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
+    fake_client, tmp_path, capsys, monkeypatch, status, detail
+) -> None:
+    from flash.client import ApiError
+
+    def reject(*_args, **_kwargs):
+        raise ApiError(status, detail)
+
+    monkeypatch.setattr(fake_client, "create_run", reject)
+    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+
+    assert _run(["train", str(config), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {detail}\n"
 
 
 def test_train_dry_run_authoritative_rejection_keeps_stdout_empty(

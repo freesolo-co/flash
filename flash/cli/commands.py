@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from flash._logging import get_logger
 from flash.catalog import public_model_rows
 from flash.client import (
     ApiClient,
+    ApiError,
     ClientError,
     client_from_config,
     save_credentials,
@@ -58,6 +60,11 @@ _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
 _SPINNER_FRAMES = "|/-\\"
 _SPINNER_TICK_SECONDS = 0.1
+_LEGACY_TRAIN_UNKNOWN_KEYS_RE = re.compile(
+    r"\A\[train\] unknown key\(s\): "
+    r"(?P<keys>[A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*) "
+    r"\(allowed: [A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*)*\)\Z"
+)
 
 
 class _LogFollowSpinner(TtyStatusLine):
@@ -232,6 +239,27 @@ def _cmd_train_cost(args) -> int:
     return 0
 
 
+def _legacy_train_key_rejection_detail(
+    exc: ApiError, authored_train_keys: frozenset[str]
+) -> str | None:
+    if exc.status != 400:
+        return None
+    match = _LEGACY_TRAIN_UNKNOWN_KEYS_RE.fullmatch(str(exc))
+    if match is None:
+        return None
+    metadata = train_schema_metadata()
+    unsupported = sorted(set(match.group("keys").split(", ")) & authored_train_keys & set(metadata))
+    if not unsupported:
+        return None
+    declared = ", ".join(
+        f"{key} (minimum released Flash version {metadata[key]})" for key in unsupported
+    )
+    return (
+        f"{exc}. Unsupported authored [train] key(s): {declared}; "
+        "client/server [train] schemas disagree"
+    )
+
+
 def _print_train_schema_compatibility(result: object) -> None:
     if not isinstance(result, dict):
         message = "client/server [train] schema compatibility is unverifiable (legacy server)"
@@ -281,15 +309,21 @@ def cmd_train(args) -> int:
         # relaxes the required-[environment].secrets check for a preview, so `--dry-run` works before
         # prod secrets are wired up. A rejection surfaces as the server's `error: ...` (exit 1),
         # exactly as a real submit would.
-        status = client.create_run(
-            payload,
-            dry_run=True,
-            client_train_schema={
-                "version": __version__,
-                "fields": train_schema_metadata(),
-                "authored_keys": sorted(authored_train_keys),
-            },
-        )
+        try:
+            status = client.create_run(
+                payload,
+                dry_run=True,
+                client_train_schema={
+                    "version": __version__,
+                    "fields": train_schema_metadata(),
+                    "authored_keys": sorted(authored_train_keys),
+                },
+            )
+        except ApiError as exc:
+            detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
+            if detail is None:
+                raise
+            raise ApiError(exc.status, detail) from exc
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
         if render.styled():
