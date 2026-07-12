@@ -110,15 +110,75 @@ def test_candidate_teacher_scoring_batches_and_caches_exact_requests():
         CandidateRequest("ctx", "b", 12),
     ]
 
-    first = scorer.score(requests)
-    second = scorer.score(requests)
+    first = scorer.score([tuple(requests)])
+    second = scorer.score([tuple(requests)])
 
     assert calls == [[("ctx", "a"), ("ctx", "b")]]
+    assert first.admitted_sets == (True,)
     assert first.requests == 2
     assert first.cache_hits == 0
+    assert second.admitted_sets == (True,)
     assert second.requests == 0
     assert second.cache_hits == 2
     assert meter.candidate_tokens == 22
+
+
+def test_candidate_teacher_scoring_rejects_entire_set_before_partial_charge():
+    calls = []
+
+    class _Teacher:
+        def score_many(self, items):
+            calls.append(items)
+            return [[SimpleNamespace(logprob=-0.25)] for _item in items]
+
+    meter = TeacherInputMeter()
+    meter.record_ordinary(70)
+    assert meter.reserve_candidate(40)
+    scorer = CandidateTeacherScorer(_Teacher(), meter, {})
+    request_set = tuple(CandidateRequest("ctx", surface, 10) for surface in "abcd")
+
+    scored = scorer.score([request_set])
+
+    assert scored.admitted_sets == (False,)
+    assert scored.budget_exhausted
+    assert scored.logprobs == {}
+    assert scored.requests == 0
+    assert calls == []
+    assert meter.candidate_tokens == 40
+    assert meter.cap_tokens - meter.total_tokens == 30
+
+
+def test_candidate_teacher_scoring_reserves_only_exact_uncached_members():
+    calls = []
+
+    class _Teacher:
+        def score_many(self, items):
+            calls.append(items)
+            return [[SimpleNamespace(logprob=-0.25)] for _item in items]
+
+    meter = TeacherInputMeter()
+    meter.record_ordinary(20)
+    cache = {("ctx", "a"): -0.1}
+    scorer = CandidateTeacherScorer(_Teacher(), meter, cache)
+    request_set = (
+        CandidateRequest("ctx", "a", 6),
+        CandidateRequest("ctx", "b", 7),
+        CandidateRequest("ctx", "c", 8),
+    )
+
+    first = scorer.score([request_set])
+    charged = meter.candidate_tokens
+    second = scorer.score([request_set])
+
+    assert first.admitted_sets == (True,)
+    assert first.cache_hits == 1
+    assert first.requests == 2
+    assert calls == [[("ctx", "b"), ("ctx", "c")]]
+    assert charged == 15
+    assert second.admitted_sets == (True,)
+    assert second.cache_hits == 3
+    assert second.requests == 0
+    assert meter.candidate_tokens == charged
 
 
 def test_candidate_teacher_scoring_rejects_invalid_responses():
@@ -131,8 +191,29 @@ def test_candidate_teacher_scoring_rejects_invalid_responses():
     scorer = CandidateTeacherScorer(_Teacher(), meter)
 
     with pytest.raises(TeacherError, match="no realized completion tokens") as exc:
-        scorer.score([CandidateRequest("ctx", "a", 10)])
+        scorer.score([(CandidateRequest("ctx", "a", 10),)])
     assert exc.value.permanent
+
+
+def test_invalid_candidate_batch_does_not_partially_populate_exact_cache():
+    class _Teacher:
+        def score_many(self, _items):
+            return [[SimpleNamespace(logprob=-0.25)], []]
+
+    meter = TeacherInputMeter()
+    meter.record_ordinary(100)
+    cache = {}
+    scorer = CandidateTeacherScorer(_Teacher(), meter, cache)
+    request_set = (
+        CandidateRequest("ctx", "a", 10),
+        CandidateRequest("ctx", "b", 10),
+    )
+
+    with pytest.raises(TeacherError, match="no realized completion tokens"):
+        scorer.score([request_set])
+
+    assert cache == {}
+    assert meter.candidate_tokens == 20
 
 
 def test_teacher_input_meter_refuses_request_before_crossing_hard_cap():
@@ -147,10 +228,156 @@ def test_teacher_input_meter_refuses_request_before_crossing_hard_cap():
 
 
 def test_selection_cadence_is_deterministic_and_positive():
-    assert selected_prefix_indices(10, 4) == (0, 4, 8)
+    assert selected_prefix_indices(10, 4) == (4, 8)
+    assert selected_prefix_indices(9, 3) == (3, 6)
+    assert selected_prefix_indices(1, 100) == ()
     assert selected_prefix_indices(0, 4) == ()
     with pytest.raises(ValueError, match="positive"):
         selected_prefix_indices(10, 0)
+
+
+def test_c13_cadence_larger_than_completion_does_no_candidate_work():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join(str(int(token_id)) for token_id in ids)
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            raise AssertionError("teacher must not be called")
+
+    teacher = _Teacher()
+    meter = TeacherInputMeter()
+    meter.record_ordinary(10)
+    outputs = opd_mod._candidate_objectives_for_chunk(
+        torch.zeros((1, 2, 6), requires_grad=True),
+        [
+            SimpleNamespace(
+                prompt_ids=[1],
+                student_ids=[2],
+                candidate_teacher_prompt="teacher:",
+            )
+        ],
+        _Tok(),
+        SimpleNamespace(topk_cadence=100),
+        teacher,
+        meter,
+        {},
+    )
+
+    assert teacher.calls == []
+    assert meter.candidate_tokens == 0
+    assert outputs[0].term is None
+    assert outputs[0].selected_prefixes == 0
+    assert outputs[0].scored_prefixes == 0
+
+
+def test_c13_candidate_set_admission_is_atomic_at_prefix_boundary():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            mapping = {0: "d", 1: "p", 2: "a", 3: "b", 4: "c", 5: ""}
+            return "".join(mapping[int(token_id)] for token_id in ids)
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            return [[SimpleNamespace(logprob=-0.25)] for _item in items]
+
+    logits = torch.zeros((1, 10, 6), requires_grad=True)
+    logits.data[0, 8] = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0, 9.0])
+    teacher = _Teacher()
+    meter = TeacherInputMeter()
+    meter.record_ordinary(70)
+    assert meter.reserve_candidate(40)
+    outputs = opd_mod._candidate_objectives_for_chunk(
+        logits,
+        [
+            SimpleNamespace(
+                prompt_ids=[1] * 8,
+                student_ids=[2, 3],
+                candidate_teacher_prompt="teacher:",
+            )
+        ],
+        _Tok(),
+        SimpleNamespace(topk_cadence=1),
+        teacher,
+        meter,
+        {},
+    )
+
+    assert teacher.calls == []
+    assert meter.candidate_tokens == 40
+    assert meter.cap_tokens - meter.total_tokens == 30
+    assert outputs[0].term is None
+    assert outputs[0].selected_prefixes == 1
+    assert outputs[0].scored_prefixes == 0
+    assert outputs[0].budget_exhausted
+
+
+def test_c13_rejects_single_surface_prefix_before_metering_or_calls():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        eos_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            mapping = {0: "", 1: "a", 2: "a", 3: "", 4: "�", 9: "p"}
+            return "".join(mapping.get(int(token_id), "z") for token_id in ids)
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            raise AssertionError("teacher must not be called")
+
+    logits = torch.full((1, 3, 10), -torch.inf, requires_grad=True)
+    logits.data[0, 1, 1:5] = torch.tensor([4.0, 3.0, 2.0, 1.0])
+    teacher = _Teacher()
+    meter = TeacherInputMeter()
+    meter.record_ordinary(100)
+    outputs = opd_mod._candidate_objectives_for_chunk(
+        logits,
+        [
+            SimpleNamespace(
+                prompt_ids=[9],
+                student_ids=[9, 9],
+                candidate_teacher_prompt="teacher:",
+            )
+        ],
+        _Tok(),
+        SimpleNamespace(topk_cadence=1),
+        teacher,
+        meter,
+        {},
+    )
+
+    assert teacher.calls == []
+    assert meter.candidate_tokens == 0
+    assert outputs[0].term is None
+    assert outputs[0].selected_prefixes == 1
+    assert outputs[0].scored_prefixes == 0
+    assert outputs[0].duplicate_surfaces == 1
+    assert outputs[0].invalid_candidates == 2
+    assert not outputs[0].budget_exhausted
 
 
 def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
@@ -169,7 +396,12 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
     class _Model:
         def __init__(self):
             self.weight = torch.tensor(
-                [[0.0, 0.0, 2.0, 1.0, 0.5, 9.0], [0.0] * 6], requires_grad=True
+                [
+                    [0.0, 0.0, 2.0, 1.0, 0.5, 9.0],
+                    [0.0, 0.0, 2.0, 1.0, 0.5, 9.0],
+                    [0.0] * 6,
+                ],
+                requires_grad=True,
             )
             self.config = SimpleNamespace(use_cache=True)
 
@@ -189,12 +421,15 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
 
         def score_many(self, items):
             self.calls.append(items)
-            return [[TeacherToken(surface, -0.1 * (index + 1), 0, len(surface))] for index, (_context, surface) in enumerate(items)]
+            return [
+                [TeacherToken(surface, -0.1 * (index + 1), 0, len(surface))]
+                for index, (_context, surface) in enumerate(items)
+            ]
 
     model = _Model()
     teacher = _Teacher()
     meter = TeacherInputMeter()
-    meter.record_ordinary(10)
+    meter.record_ordinary(20)
     knobs = SimpleNamespace(
         kl_coef=1.0,
         eos_loss_coef=0.0,
@@ -206,10 +441,8 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
     )
     samples = [
         (
-            opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
-            opd_mod._ScoreResult(
-                teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"
-            ),
+            opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
+            opd_mod._ScoreResult(teacher_toks=[TeacherToken("ab", -0.5, 0, 2)], status="ok"),
             [1],
         )
     ]

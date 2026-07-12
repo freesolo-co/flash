@@ -27,6 +27,7 @@ class CandidateRequest:
 @dataclass(frozen=True)
 class CandidateScoreBatch:
     logprobs: dict[tuple[str, str], float]
+    admitted_sets: tuple[bool, ...] = ()
     budget_exhausted: bool = False
     cache_hits: int = 0
     requests: int = 0
@@ -67,21 +68,25 @@ class TeacherInputMeter:
             raise ValueError("ordinary teacher input tokens must be non-negative")
         self.ordinary_tokens += value
 
-    def reserve_candidate(self, tokens: int) -> bool:
-        value = int(tokens)
-        if value < 0:
+    def reserve_candidate_set(self, tokens: tuple[int, ...]) -> bool:
+        values = tuple(int(value) for value in tokens)
+        if any(value < 0 for value in values):
             raise ValueError("candidate teacher input tokens must be non-negative")
-        if self.total_tokens + value > self.cap_tokens:
+        required = sum(values)
+        if self.total_tokens + required > self.cap_tokens:
             self.budget_exhausted = True
             return False
-        self.candidate_tokens += value
+        self.candidate_tokens += required
         return True
+
+    def reserve_candidate(self, tokens: int) -> bool:
+        return self.reserve_candidate_set((tokens,))
 
 
 def selected_prefix_indices(completion_length: int, cadence: int) -> tuple[int, ...]:
     if cadence <= 0:
         raise ValueError("opd top-k cadence must be positive")
-    return tuple(range(0, max(0, int(completion_length)), int(cadence)))
+    return tuple(range(int(cadence), max(0, int(completion_length)), int(cadence)))
 
 
 def decode_candidate_groups(tok, prefix_ids, logits_row, eos_ids, *, k: int = TOPK_CANDIDATES):
@@ -97,9 +102,7 @@ def decode_candidate_groups(tok, prefix_ids, logits_row, eos_ids, *, k: int = TO
     finite = torch.isfinite(row)
     available = int(finite.sum().item())
     if available < k:
-        raise RuntimeError(
-            f"c13 requires {k} finite non-eos student candidates, found {available}"
-        )
+        raise RuntimeError(f"c13 requires {k} finite non-eos student candidates, found {available}")
     candidate_ids = torch.topk(row, k=k).indices.tolist()
     prefix = [int(token_id) for token_id in prefix_ids]
     prefix_text = tok.decode(prefix, skip_special_tokens=True)
@@ -115,7 +118,9 @@ def decode_candidate_groups(tok, prefix_ids, logits_row, eos_ids, *, k: int = TO
             invalid += 1
             continue
         grouped.setdefault(surface, []).append(int(token_id))
-    groups = tuple(CandidateGroup(surface, tuple(token_ids)) for surface, token_ids in grouped.items())
+    groups = tuple(
+        CandidateGroup(surface, tuple(token_ids)) for surface, token_ids in grouped.items()
+    )
     duplicates = sum(len(group.token_ids) - 1 for group in groups)
     return groups, duplicates, invalid
 
@@ -148,33 +153,47 @@ class CandidateTeacherScorer:
         self.meter = meter
         self.cache: dict[tuple[str, str], float] = cache if cache is not None else {}
 
-    def score(self, requests: list[CandidateRequest]) -> CandidateScoreBatch:
+    def score(self, request_sets: list[tuple[CandidateRequest, ...]]) -> CandidateScoreBatch:
         values: dict[tuple[str, str], float] = {}
-        missing: list[CandidateRequest] = []
-        seen: set[tuple[str, str]] = set()
-        cache_hits = 0
+        missing: dict[tuple[str, str], CandidateRequest] = {}
+        cache_hit_keys: set[tuple[str, str]] = set()
+        admitted_sets: list[bool] = []
         exhausted = False
-        for request in requests:
-            key = (request.context, request.surface)
-            if key in values or key in seen:
-                continue
-            if key in self.cache:
-                values[key] = self.cache[key]
-                cache_hits += 1
-                continue
-            if not self.meter.reserve_candidate(request.input_tokens):
+        for request_set in request_sets:
+            unique: dict[tuple[str, str], CandidateRequest] = {}
+            for request in request_set:
+                unique.setdefault((request.context, request.surface), request)
+            uncached = [
+                request
+                for key, request in unique.items()
+                if key not in self.cache and key not in missing
+            ]
+            if not self.meter.reserve_candidate_set(
+                tuple(request.input_tokens for request in uncached)
+            ):
+                admitted_sets.append(False)
                 exhausted = True
                 continue
-            seen.add(key)
-            missing.append(request)
+            admitted_sets.append(True)
+            for key, request in unique.items():
+                if key in self.cache:
+                    values[key] = self.cache[key]
+                    cache_hit_keys.add(key)
+                else:
+                    missing.setdefault(key, request)
+
         if missing:
-            scored = self.teacher.score_many([(request.context, request.surface) for request in missing])
-            if not isinstance(scored, list) or len(scored) != len(missing):
+            requests = list(missing.values())
+            scored = self.teacher.score_many(
+                [(request.context, request.surface) for request in requests]
+            )
+            if not isinstance(scored, list) or len(scored) != len(requests):
                 raise TeacherError(
                     "candidate teacher batch returned the wrong number of scores",
                     permanent=True,
                 )
-            for request, tokens in zip(missing, scored, strict=True):
+            validated: dict[tuple[str, str], float] = {}
+            for request, tokens in zip(requests, scored, strict=True):
                 if not isinstance(tokens, list) or not tokens:
                     raise TeacherError(
                         "candidate teacher response contained no realized completion tokens",
@@ -192,12 +211,13 @@ class CandidateTeacherScorer:
                         f"candidate teacher response has invalid surface logprob {logprob!r}",
                         permanent=True,
                     )
-                key = (request.context, request.surface)
-                self.cache[key] = logprob
-                values[key] = logprob
+                validated[(request.context, request.surface)] = logprob
+            self.cache.update(validated)
+            values.update(validated)
         return CandidateScoreBatch(
             logprobs=values,
+            admitted_sets=tuple(admitted_sets),
             budget_exhausted=exhausted,
-            cache_hits=cache_hits,
+            cache_hits=len(cache_hit_keys),
             requests=len(missing),
         )

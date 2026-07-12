@@ -2329,7 +2329,7 @@ def _candidate_objectives_for_chunk(
     eos_ids = _generation_eos_ids(None, tok)
     cadence = int(knobs.topk_cadence)
     pending = []
-    requests: list[CandidateRequest] = []
+    request_sets: list[tuple[CandidateRequest, ...]] = []
     for row, prepared in enumerate(chunk):
         prompt_len = len(prepared.prompt_ids)
         comp_len = len(prepared.student_ids)
@@ -2337,7 +2337,9 @@ def _candidate_objectives_for_chunk(
         prefix_entries = []
         duplicates = 0
         invalid = 0
+        selected = 0
         for position in selected_prefix_indices(comp_len, cadence):
+            selected += 1
             groups, duplicate_count, invalid_count = decode_candidate_groups(
                 tok,
                 [*prepared.prompt_ids, *prepared.student_ids[:position]],
@@ -2346,34 +2348,37 @@ def _candidate_objectives_for_chunk(
             )
             duplicates += duplicate_count
             invalid += invalid_count
+            if len(groups) < 2:
+                continue
             completion_prefix = tok.decode(
                 list(prepared.student_ids[:position]), skip_special_tokens=True
             )
             context = prepared.candidate_teacher_prompt + completion_prefix
-            prefix_requests = []
-            for group in groups:
-                request = CandidateRequest(
+            prefix_requests = tuple(
+                CandidateRequest(
                     context=context,
                     surface=group.surface,
                     input_tokens=len(prepared.prompt_ids) + position + 1,
                 )
-                requests.append(request)
-                prefix_requests.append(request)
-            prefix_entries.append((position, rows[position], groups, tuple(prefix_requests)))
-        pending.append((prefix_entries, duplicates, invalid))
+                for group in groups
+            )
+            request_set_index = len(request_sets)
+            request_sets.append(prefix_requests)
+            prefix_entries.append((rows[position], groups, prefix_requests, request_set_index))
+        pending.append((prefix_entries, selected, duplicates, invalid))
 
-    scored = CandidateTeacherScorer(teacher, meter, cache).score(requests)
+    scored = CandidateTeacherScorer(teacher, meter, cache).score(request_sets)
     outputs = []
-    for sample_index, (prefix_entries, duplicates, invalid) in enumerate(pending):
+    for sample_index, (prefix_entries, selected, duplicates, invalid) in enumerate(pending):
         terms = []
         sample_exhausted = False
-        for _position, row, groups, prefix_requests in prefix_entries:
-            if len(groups) < 2:
+        for row, groups, prefix_requests, request_set_index in prefix_entries:
+            if not scored.admitted_sets[request_set_index]:
+                sample_exhausted = True
                 continue
             keys = [(request.context, request.surface) for request in prefix_requests]
             if not all(key in scored.logprobs for key in keys):
-                sample_exhausted = True
-                continue
+                raise RuntimeError("admitted c13 candidate set is missing a teacher score")
             teacher_logprobs = [scored.logprobs[key] for key in keys]
             term = candidate_set_cross_entropy(row, groups, teacher_logprobs)
             if term is not None:
@@ -2381,7 +2386,7 @@ def _candidate_objectives_for_chunk(
         outputs.append(
             CandidateObjectiveInput(
                 term=(sum(terms) / len(terms)) if terms else None,
-                selected_prefixes=len(prefix_entries),
+                selected_prefixes=selected,
                 scored_prefixes=len(terms),
                 duplicate_surfaces=duplicates,
                 invalid_candidates=invalid,
