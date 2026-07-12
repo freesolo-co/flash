@@ -3991,6 +3991,45 @@ def test_c05_empty_eos_rollout_gets_prompt_only_recovery_for_complete_eos_set():
     assert model.w.grad[0, 5] > 0
 
 
+def test_c05_empty_recovery_composes_with_c09_repetition_weighting():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = (3, 5)
+
+    model = _TinyLM(torch, T=1, V=8)
+    gen = opd_mod._GenResult(
+        completion_ids=[5],
+        completion_text="",
+        gen_tokens=1,
+        skip=True,
+        skip_reason="empty_completion",
+        termination_cause="eos",
+    )
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05", "c09"),
+    )
+
+    result = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", [(gen, None, [1])], knobs, microbatch=1
+    )[0]
+
+    assert result.loss is not None
+    assert result.empty_recovery is True
+    metrics = dict(result.objective_metrics)
+    assert metrics["opd/objectives/c05/empty_recovery"] == 1.0
+    assert metrics["opd/objectives/c09/repetition_weight"] == 1.0
+    assert metrics["opd/objectives/c09/repetition_severity"] == 0.0
+    assert metrics["opd/objectives/c09/loop_closing_tokens"] == 0.0
+
+
 def test_c05_recovers_empty_vllm_rollout_stopped_by_model_only_secondary_eos():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod

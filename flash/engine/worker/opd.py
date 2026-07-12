@@ -2338,6 +2338,11 @@ def _resolve_samples_batched(
                     gen_tokens=gen.gen_tokens,
                     teacher_tokens=0,
                     group_granularity=0.0,
+                    repetition_analysis=(
+                        analyze_repetition(())
+                        if objective_plan.requirements.repetition_weighting
+                        else None
+                    ),
                     empty_rollout=True,
                     termination_cause=gen.termination_cause,
                 )
