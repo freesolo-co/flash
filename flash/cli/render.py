@@ -7,6 +7,7 @@ import sys
 import time
 
 from flash._channel import CLI_NAME
+from flash.serve.urls import resolve_openai_base_url
 
 _ROWS = (
     ("email", "account"),
@@ -483,11 +484,11 @@ def deployments_table(rows: list[dict]) -> str:
             [
                 (r["run_id"], _ACCENT2),
                 (state, color),
-                (dep.get("endpoint_name", ""), _GREEN),
+                (resolve_openai_base_url(dep), _GREEN),
                 (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "STATE", "ENDPOINT", "DETAIL"], body)
+    table = _table(["RUN ID", "STATE", "OPENAI BASE URL", "DETAIL"], body)
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
@@ -627,8 +628,7 @@ def cancelled(payload: dict) -> str:
 def deployed(dep: dict) -> str:
     """`flash deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
-    # OpenAI clients need the /v1 base; older servers omit `url`, so derive it from the endpoint.
-    url = dep.get("url") or (f"{endpoint.rstrip('/')}/v1" if endpoint else None)
+    url = resolve_openai_base_url(dep)
     pairs = [
         ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
         ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),

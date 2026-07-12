@@ -68,6 +68,12 @@ def test_help_catalog_matches_registered_env_subcommands() -> None:
     assert _catalog_env_rows() == _registered_env_subcommands()
 
 
+def test_deployments_json_argparse_flag() -> None:
+    args = cli._build_parser().parse_args(["deployments", "--json"])
+    assert args.json is True
+    assert args.func is cli.cmd_deployments
+
+
 def test_help_styled_is_themed_and_exits_zero(monkeypatch, capsys) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")  # layout kept, color dropped — assert on contiguous text

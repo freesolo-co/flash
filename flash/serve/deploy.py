@@ -13,6 +13,11 @@ import httpx
 from flash._logging import get_logger
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
+from flash.serve.urls import (
+    normalize_deployment_urls,
+    openai_base_url,
+    serving_control_url,
+)
 
 logger = get_logger(__name__)
 
@@ -117,8 +122,14 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 
 
 def serving_base_url() -> str:
-    """Env-overridable serving base URL."""
-    return (os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL).rstrip("/")
+    """Env-overridable serving control root."""
+    configured = os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL
+    return serving_control_url(configured)
+
+
+def serving_openai_base_url() -> str:
+    """OpenAI-compatible base URL for the configured serving backend."""
+    return openai_base_url(serving_base_url())
 
 
 def _internal_key_header() -> dict[str, str]:
@@ -134,12 +145,13 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     state: str = "ready"
-    # The OpenAI-compatible base URL. endpoint_name is the bare serving root; OpenAI clients must
-    # be pointed at {endpoint_name}/v1 or their /chat/completions calls 404.
+    # the legacy openai-compatible base url field
     url: str = ""
+    # appended to preserve positional constructor compatibility
+    openai_base_url: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return normalize_deployment_urls(asdict(self))
 
 
 def deployment_record(
@@ -151,6 +163,7 @@ def deployment_record(
 ) -> Deployment:
     subfolder = f"{adapter_prefix}/adapter"
     base = serving_base_url()
+    openai_url = serving_openai_base_url()
     return Deployment(
         run_id=run_id,
         model=model,
@@ -158,7 +171,8 @@ def deployment_record(
         openai_model=run_id,
         endpoint_name=base,
         state=state,
-        url=f"{base}/v1",
+        url=openai_url,
+        openai_base_url=openai_url,
     )
 
 
@@ -474,7 +488,7 @@ def chat(
     thinking: bool = False,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving."""
-    base = serving_base_url()
+    base = serving_openai_base_url()
     body = {
         "model": run_id,
         "messages": messages,
@@ -485,7 +499,7 @@ def chat(
     # follow_redirects + max_redirects=100: Modal 303-redirects slow cold-start requests across
     # several poll cycles before the result is ready.
     with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
-        resp = client.post(f"{base}/v1/chat/completions", json=body, headers=_internal_key_header())
+        resp = client.post(f"{base}/chat/completions", json=body, headers=_internal_key_header())
     resp.raise_for_status()
     return resp.json()
 
@@ -515,7 +529,7 @@ def chat_stream(
     thinking: bool = False,
 ) -> Iterator[str]:
     """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint."""
-    base = serving_base_url()
+    base = serving_openai_base_url()
     body = {
         "model": run_id,
         "messages": messages,
@@ -527,7 +541,7 @@ def chat_stream(
     with (
         httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
         client.stream(
-            "POST", f"{base}/v1/chat/completions", json=body, headers=_internal_key_header()
+            "POST", f"{base}/chat/completions", json=body, headers=_internal_key_header()
         ) as resp,
     ):
         resp.raise_for_status()

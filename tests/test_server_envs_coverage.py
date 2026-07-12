@@ -246,8 +246,21 @@ def test_deployment_state_and_public_deployment():
     # The input is not mutated in place.
     assert original == {"a": 1, "state": "deploying"}
 
-    pub = serving._public_deployment({"state": "ready", "previous_deployment": {"x": 1}, "b": 2})
-    assert pub == {"state": "ready", "b": 2}
+    pub = serving._public_deployment(
+        {
+            "state": "ready",
+            "previous_deployment": {"x": 1},
+            "endpoint_name": "https://serve.example",
+            "b": 2,
+        }
+    )
+    assert pub == {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "openai_base_url": "https://serve.example/v1",
+        "url": "https://serve.example/v1",
+        "b": 2,
+    }
 
 
 def test_deployment_attempt_is_stale_branches():
