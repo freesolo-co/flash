@@ -13,11 +13,7 @@ import httpx
 from flash._logging import get_logger
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
-from flash.serve.urls import (
-    normalize_deployment_urls,
-    openai_base_url,
-    serving_control_url,
-)
+from flash.serve.urls import openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
 
@@ -144,14 +140,11 @@ class Deployment:
     adapter_hf_prefix: str
     openai_model: str
     endpoint_name: str
+    openai_base_url: str
     state: str = "ready"
-    # the legacy openai-compatible base url field
-    url: str = ""
-    # appended to preserve positional constructor compatibility
-    openai_base_url: str = ""
 
     def to_dict(self) -> dict:
-        return normalize_deployment_urls(asdict(self))
+        return asdict(self)
 
 
 def deployment_record(
@@ -170,9 +163,8 @@ def deployment_record(
         adapter_hf_prefix=subfolder,
         openai_model=run_id,
         endpoint_name=base,
-        state=state,
-        url=openai_url,
         openai_base_url=openai_url,
+        state=state,
     )
 
 

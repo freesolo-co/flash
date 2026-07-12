@@ -25,7 +25,6 @@ from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES
 from flash.schema import ConfigError, spec_from_file
-from flash.serve.urls import normalize_deployment_urls, resolve_openai_base_url
 
 from . import render
 from ._tty import TtyStatusLine
@@ -527,7 +526,7 @@ def cmd_deploy(args) -> int:
         print(json.dumps(dep, indent=2))
     # a dry run creates no deployment, so the billing / undeploy hint would be misleading.
     if dep.get("state") != "dry_run":
-        openai_base = resolve_openai_base_url(dep)
+        openai_base = str(dep.get("openai_base_url") or "")
         note = (
             f"serving is billed per token only; use `flash undeploy {base_run_id}` "
             "to deregister the adapter."
@@ -611,10 +610,7 @@ def cmd_undeploy(args) -> int:
 
 
 def cmd_deployments(args) -> int:
-    rows = [
-        {**row, "deployment": normalize_deployment_urls(row.get("deployment") or {})}
-        for row in client_from_config().deployments()
-    ]
+    rows = client_from_config().deployments()
     if getattr(args, "json", False):
         print(json.dumps(rows, indent=2))
         return 0
@@ -631,10 +627,8 @@ def cmd_deployments(args) -> int:
     for r in rows:
         d = r.get("deployment") or {}
         detail = str(d.get("error") or d.get("detail") or "")
-        print(
-            f"{r['run_id']:<32}  {d.get('state', '?'):<10}  "
-            f"{resolve_openai_base_url(d):<40}  {detail}"
-        )
+        openai_base = str(d.get("openai_base_url") or "")
+        print(f"{r['run_id']:<32}  {d.get('state', '?'):<10}  {openai_base:<40}  {detail}")
     return 0
 
 

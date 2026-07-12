@@ -10,7 +10,6 @@ from flash.serve.deploy import (
     serving_base_url,
     undeploy_adapter,
 )
-from flash.serve.urls import normalize_deployment_urls, resolve_openai_base_url
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
@@ -137,39 +136,14 @@ def test_deployment_roundtrip_dict():
         adapter_hf_prefix="p",
         openai_model="r",
         endpoint_name="https://serve.example",
+        openai_base_url="https://serve.example/v1",
     )
     data = d.to_dict()
     assert data["run_id"] == "r"
     assert data["openai_base_url"] == "https://serve.example/v1"
-    assert data["url"] == "https://serve.example/v1"
+    assert "url" not in data
     assert "gpu" not in data
     assert "mode" not in data
-
-
-def test_deployment_positional_constructor_keeps_legacy_url_slot():
-    d = Deployment("r", "m", "p", "r", "https://serve.example", "ready", "https://legacy/v1")
-    assert d.state == "ready"
-    assert d.url == "https://legacy/v1"
-    assert d.openai_base_url == ""
-    assert d.to_dict()["openai_base_url"] == "https://legacy/v1"
-
-
-@pytest.mark.parametrize(
-    ("deployment", "expected"),
-    [
-        ({"url": "https://legacy.example/v1"}, "https://legacy.example/v1"),
-        ({"endpoint_name": "https://serve.example"}, "https://serve.example/v1"),
-        ({"endpoint_name": "https://serve.example/v1"}, "https://serve.example/v1"),
-        ({"endpoint_name": "https://serve.example/v1/"}, "https://serve.example/v1"),
-    ],
-)
-def test_resolve_openai_base_url_supports_legacy_records(deployment, expected):
-    assert resolve_openai_base_url(deployment) == expected
-    assert normalize_deployment_urls(deployment) == {
-        **deployment,
-        "openai_base_url": expected,
-        "url": expected,
-    }
 
 
 def test_serving_prices_cover_catalog():
@@ -432,7 +406,7 @@ def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
-    assert data["url"] == "https://serve.example/v1"
+    assert "url" not in data
 
 
 def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
@@ -441,4 +415,4 @@ def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
-    assert data["url"] == "https://serve.example/v1"
+    assert "url" not in data

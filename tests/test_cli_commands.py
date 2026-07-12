@@ -88,6 +88,7 @@ class _FakeClient:
             "run_id": run_id,
             "openai_model": f"flash-{run_id}",
             "endpoint_name": "https://serve.example",
+            "openai_base_url": "https://serve.example/v1",
             "state": "deploying",
         }
 
@@ -102,6 +103,7 @@ class _FakeClient:
                 "deployment": {
                     "state": "ready",
                     "endpoint_name": "https://serve.example",
+                    "openai_base_url": "https://serve.example/v1",
                 },
             }
         ]
@@ -457,7 +459,7 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("undeploy", "flash-1") in fake_client.calls
 
 
-def test_deployments_json_normalizes_rows(fake_client, capsys) -> None:
+def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> None:
     assert _run(["deployments", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows == [
@@ -467,7 +469,6 @@ def test_deployments_json_normalizes_rows(fake_client, capsys) -> None:
                 "state": "ready",
                 "endpoint_name": "https://serve.example",
                 "openai_base_url": "https://serve.example/v1",
-                "url": "https://serve.example/v1",
             },
         }
     ]

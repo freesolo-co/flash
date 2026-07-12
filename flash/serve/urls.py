@@ -1,4 +1,4 @@
-"""Deployment URL compatibility helpers."""
+"""Deployment URL helpers."""
 
 from __future__ import annotations
 
@@ -17,28 +17,9 @@ def openai_base_url(control_url: str) -> str:
     return f"{control}/v1" if control else ""
 
 
-def resolve_openai_base_url(deployment: dict) -> str:
-    """Return the usable OpenAI base URL from current or legacy deployment records."""
-    for field in ("openai_base_url", "url"):
-        value = str(deployment.get(field) or "").rstrip("/")
-        if value:
-            return value
-
-    return openai_base_url(str(deployment.get("endpoint_name") or ""))
-
-
-def normalize_deployment_urls(deployment: dict) -> dict:
-    """Copy a deployment record with canonical and legacy OpenAI URL fields."""
-    out = dict(deployment)
-    openai_url = resolve_openai_base_url(out)
-    if openai_url:
-        out["openai_base_url"] = openai_url
-        out["url"] = openai_url
-    return out
-
-
 def public_deployment(deployment: dict) -> dict:
-    """Return a normalized public copy without private rollback state."""
-    out = normalize_deployment_urls(deployment)
+    """Return a public copy without private rollback state or the stale legacy URL field."""
+    out = dict(deployment)
     out.pop("previous_deployment", None)
+    out.pop("url", None)
     return out
