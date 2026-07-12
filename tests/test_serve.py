@@ -72,9 +72,42 @@ def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **d
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
     run_id = deploy_kwargs.get("run_id", "flash-7-abcd")
-    stub_serving_registry(
-        {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
-    )
+    record = {
+        "adapter_id": run_id,
+        "repo_id": deploy_kwargs["hf_repo"],
+        "base_model": deploy_kwargs["model"],
+        "repo_type": "dataset",
+        "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter",
+        "thinking": bool(deploy_kwargs.get("thinking", False)),
+    }
+    structured = json.loads(deploy_kwargs.get("structured_outputs") or "null")
+    if structured:
+        key = (
+            "structured_outputs_after_reasoning"
+            if deploy_kwargs.get("thinking")
+            else "structured_outputs"
+        )
+        record[key] = structured
+    stub_serving_registry(record)
+    if deploy_kwargs.get("thinking") and structured:
+        registry_get = d.httpx.get
+
+        class _HealthResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"capabilities": ["thinking_structured_outputs_deferred_v1"]}
+
+        monkeypatch.setattr(
+            d.httpx,
+            "get",
+            lambda url, **kwargs: _HealthResp()
+            if url.endswith("/healthz")
+            else registry_get(url, **kwargs),
+        )
     d.deploy_adapter(**deploy_kwargs)
     return seen["json"]
 
@@ -97,6 +130,28 @@ def test_deploy_dry_run():
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
     assert "mode" not in d
     assert "est_idle_cost_usd_per_day" not in d
+
+
+def test_thinking_structured_dry_run_does_not_probe_or_mutate(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setattr(
+        d.httpx, "get", lambda *a, **k: pytest.fail("dry-run must not probe serving")
+    )
+    monkeypatch.setattr(
+        d.httpx, "post", lambda *a, **k: pytest.fail("dry-run must not mutate serving")
+    )
+    dep = d.deploy_adapter(
+        run_id="r-dry-structured",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="rl/r-dry-structured/seed0",
+        dry_run=True,
+        thinking=True,
+        structured_outputs=json.dumps({"json_object": True}),
+    )
+    assert dep.state == "dry_run"
+    assert dep.previous_registry_record is None
 
 
 def test_deploy_9b_dry_run_is_not_rejected():
@@ -404,13 +459,10 @@ def test_deploy_omits_structured_outputs_when_unset(monkeypatch, tmp_path, stub_
     assert "structured_outputs" not in body
 
 
-def test_deploy_skips_structured_outputs_default_for_thinking(
+def test_deploy_registers_deferred_structured_outputs_for_thinking(
     monkeypatch, tmp_path, stub_serving_registry
 ):
-    """A THINKING run does NOT register a serving grammar default even if a constraint is set:
-    serving binds the grammar from token 0 (no reasoning-parser deferral), which would suppress the
-    <think> phase. (Training stays compatible via a deferred grammar; serving has no such deferral,
-    so the serve-time default is skipped rather than break reasoning.)"""
+    """A thinking constraint is registered only in the post-reasoning field."""
     spec = json.dumps({"json": {"type": "object"}})
     body = _capture_registration_body(
         monkeypatch,
@@ -424,21 +476,19 @@ def test_deploy_skips_structured_outputs_default_for_thinking(
         structured_outputs=spec,
     )
     assert "structured_outputs" not in body
+    assert body["structured_outputs_after_reasoning"] == {"json": {"type": "object"}}
     assert body["thinking"] is True
 
 
 def test_structured_outputs_body_helper():
-    """Unit-level contract of the deploy helper: unset/thinking -> None; non-thinking spec ->
-    parsed canonical dict; corrupt spec -> ValueError (fail loud, not silently unconstrained)."""
+    """The helper parses canonical constraints and fails loudly on corruption."""
     from flash.serve.deploy import _structured_outputs_body
 
-    assert _structured_outputs_body("r1", "", thinking=False) is None
-    assert _structured_outputs_body("r1", "", thinking=True) is None
+    assert _structured_outputs_body("") is None
     spec = json.dumps({"json": {"type": "object"}})
-    assert _structured_outputs_body("r1", spec, thinking=True) is None
-    assert _structured_outputs_body("r1", spec, thinking=False) == {"json": {"type": "object"}}
+    assert _structured_outputs_body(spec) == {"json": {"type": "object"}}
     with pytest.raises(ValueError, match="corrupt train"):
-        _structured_outputs_body("r1", "{not json", thinking=False)
+        _structured_outputs_body("{not json")
 
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
@@ -512,7 +562,11 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     monkeypatch.setattr(d.httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {
+            "adapter_id": "flash-7-abcd",
+            "subfolder": "sft/flash-7-abcd/seed0/adapter",
+            "thinking": True,
+        }
     )
 
     d.deploy_adapter(
@@ -524,8 +578,10 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     )
     assert seen["json"]["thinking"] is True
 
-    # A non-thinking run registers thinking=false so serving renders enable_thinking=false by
-    # default (else Qwen3.5's template default thinking-ON emits a reasoning preamble).
+    # a non-thinking run registers thinking=false.
+    stub_serving_registry(
+        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+    )
     d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
@@ -797,3 +853,221 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+@pytest.mark.parametrize("health_payload", [None, {}, {"capabilities": "bad"}, {"capabilities": []}])
+def test_thinking_structured_capability_fails_before_mutation(
+    monkeypatch, health_payload
+):
+    import httpx
+
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    posts = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return health_payload
+
+    def fake_get(url, **kwargs):
+        if health_payload is None:
+            raise httpx.ConnectError("offline", request=httpx.Request("GET", url))
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", lambda *a, **k: posts.append((a, k)))
+
+    with pytest.raises(d.ServingError, match="No adapter registry mutation was attempted"):
+        d.deploy_adapter(
+            "r-cap",
+            "Qwen/Qwen3.5-0.8B",
+            "org/repo",
+            "rl/r-cap/seed0",
+            thinking=True,
+            structured_outputs=json.dumps({"json_object": True}),
+        )
+    assert posts == []
+
+
+def test_thinking_structured_capability_precedes_registration(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    events = []
+    registry = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload=None):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/healthz"):
+            events.append("healthz")
+            return _Resp({"capabilities": ["thinking_structured_outputs_deferred_v1"]})
+        return _Resp({"adapters": registry})
+
+    def fake_post(url, json=None, **kwargs):
+        events.append("post")
+        registry[:] = [dict(json)]
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    d.deploy_adapter(
+        "r-cap",
+        "Qwen/Qwen3.5-0.8B",
+        "org/repo",
+        "rl/r-cap/seed0",
+        thinking=True,
+        structured_outputs=json.dumps({"choice": ["4"]}),
+    )
+    assert events == ["healthz", "post"]
+    assert registry[0]["structured_outputs_after_reasoning"] == {"choice": ["4"]}
+    assert "structured_outputs" not in registry[0]
+
+
+@pytest.mark.parametrize(
+    ("thinking", "structured_outputs"),
+    [(True, ""), (False, json.dumps({"regex": "4"}))],
+)
+def test_capability_probe_is_only_for_thinking_constraints(
+    monkeypatch, thinking, structured_outputs
+):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    registry = []
+    get_urls = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"adapters": registry}
+
+    def fake_get(url, **kwargs):
+        get_urls.append(url)
+        return _Resp()
+
+    def fake_post(url, json=None, **kwargs):
+        registry[:] = [dict(json)]
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    d.deploy_adapter(
+        "r-no-probe",
+        "Qwen/Qwen3.5-0.8B",
+        "org/repo",
+        "rl/r-no-probe/seed0",
+        thinking=thinking,
+        structured_outputs=structured_outputs,
+    )
+    assert all(not url.endswith("/healthz") for url in get_urls)
+
+
+@pytest.mark.parametrize(
+    "prior_constraint",
+    [{"structured_outputs": {"choice": ["old"]}}, {}],
+    ids=["constrained", "unconstrained"],
+)
+def test_failed_readback_restores_exact_prior_record(monkeypatch, prior_constraint):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    prior = {
+        "adapter_id": "r-rollback",
+        "repo_id": "org/old",
+        "repo_type": "dataset",
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "subfolder": "rl/old/adapter",
+        "thinking": False,
+        "status": "ready",
+        **prior_constraint,
+    }
+    registry = [dict(prior)]
+    posted = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"adapters": registry}
+
+    def fake_post(url, json=None, **kwargs):
+        posted.append(dict(json))
+        if json == prior:
+            registry[:] = [dict(prior)]
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    with pytest.raises(d.ServingError, match="restored to its exact pre-deploy state"):
+        d.deploy_adapter(
+            "r-rollback",
+            "Qwen/Qwen3.5-0.8B",
+            "org/new",
+            "rl/new",
+            structured_outputs=json.dumps({"choice": ["new"]}),
+        )
+    assert posted[-1] == prior
+    assert registry == [prior]
+
+
+def test_failed_readback_restores_exact_absence(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    registry = []
+    deleted = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"adapters": registry}
+
+    def fake_post(url, json=None, **kwargs):
+        registry[:] = [{**dict(json), "repo_id": "stale/repo"}]
+        return _Resp()
+
+    def fake_delete(url, **kwargs):
+        deleted.append(url)
+        registry.clear()
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(d.httpx, "delete", fake_delete)
+    with pytest.raises(d.ServingError, match="restored to its exact pre-deploy state"):
+        d.deploy_adapter("r-new", "Qwen/Qwen3.5-0.8B", "org/new", "rl/new")
+    assert deleted == ["https://serve.example/adapters/r-new"]
+    assert registry == []

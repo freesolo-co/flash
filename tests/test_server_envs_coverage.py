@@ -270,7 +270,7 @@ def test_deployment_attempt_is_stale_branches():
     )
 
 
-def test_previous_ready_deployment_and_adapter_prefix():
+def test_previous_ready_deployment():
     # A currently-ready deployment is its own "previous ready" (a copy).
     ready = {"state": "ready", "adapter_hf_prefix": "sft/r1/seed0/adapter"}
     got = serving._previous_ready_deployment(ready)
@@ -287,12 +287,6 @@ def test_previous_ready_deployment_and_adapter_prefix():
         )
         is None
     )
-
-    # _adapter_prefix_from_deployment strips the trailing "/adapter".
-    assert serving._adapter_prefix_from_deployment(ready) == "sft/r1/seed0"
-    for bad in ({"adapter_hf_prefix": "sft/r1/seed0"}, {}):
-        with pytest.raises(ServingError, match="adapter_hf_prefix"):
-            serving._adapter_prefix_from_deployment(bad)
 
 
 def test_chat_messages_from_payload_validation():
@@ -404,7 +398,9 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
 
 
 def test_run_deployment_smoke_success_and_empty(monkeypatch):
-    spec = types.SimpleNamespace(thinking=False)
+    spec = types.SimpleNamespace(
+        thinking=False, train=types.SimpleNamespace(structured_outputs="")
+    )
 
     def fake_serve_chat(**kwargs):
         assert kwargs["run_id"] == "run-1"
@@ -432,5 +428,63 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         "serve_chat",
         lambda **_k: {"choices": [{"message": {"content": "   "}, "finish_reason": "length"}]},
     )
-    with pytest.raises(ServingError, match="no content"):
+    with pytest.raises(ServingError, match="no answer content"):
+        serving._run_deployment_smoke("run-1", spec)
+
+
+@pytest.mark.parametrize(
+    ("constraint", "content", "sample"),
+    [
+        ({"json_object": True}, '<think>{"bad":</think>{"answer": 4}', '{"answer": 4}'),
+        ({"json": {"type": "object", "required": ["answer"]}}, '<think>x</think>{"answer": 4}', '{"answer": 4}'),
+        ({"choice": ["4", "four"]}, "<think>2+2</think>4", "4"),
+        ({"regex": "[0-9]+"}, "<think>2+2</think>4", "4"),
+    ],
+)
+def test_run_deployment_smoke_validates_only_answer_after_final_think(
+    monkeypatch, constraint, content, sample
+):
+    import json
+
+    spec = types.SimpleNamespace(
+        thinking=True,
+        train=types.SimpleNamespace(structured_outputs=json.dumps(constraint)),
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: {
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+        },
+    )
+    out = serving._run_deployment_smoke("run-1", spec)
+    assert out["verify_sample"] == sample
+    assert out["verify_finish_reason"] == "stop"
+    assert out["verify_latency_s"] >= 0.0
+
+
+@pytest.mark.parametrize(
+    ("constraint", "content"),
+    [
+        ({"json_object": True}, "<think>x</think>[]"),
+        ({"json": {"type": "object", "required": ["answer"]}}, "<think>x</think>{}"),
+        ({"choice": ["4"]}, "<think>x</think>5"),
+        ({"regex": "[0-9]+"}, "<think>x</think>four"),
+    ],
+)
+def test_run_deployment_smoke_rejects_structured_answer_violation(
+    monkeypatch, constraint, content
+):
+    import json
+
+    spec = types.SimpleNamespace(
+        thinking=True,
+        train=types.SimpleNamespace(structured_outputs=json.dumps(constraint)),
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: {"choices": [{"message": {"content": content}}]},
+    )
+    with pytest.raises(ServingError, match="structured smoke output"):
         serving._run_deployment_smoke("run-1", spec)

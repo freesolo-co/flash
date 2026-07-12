@@ -1113,13 +1113,27 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     status.deployment = previous
     runner._save_status(status)
 
+    prior_registry_record = {
+        "adapter_id": run_id,
+        "repo_id": "org/old",
+        "base_model": SPEC["model"],
+        "repo_type": "dataset",
+        "subfolder": "rl/old/adapter",
+        "thinking": False,
+    }
     registered_prefixes = []
+    restored = []
 
     def fake_deploy(**kwargs):
         registered_prefixes.append(kwargs["adapter_prefix"])
-        return _FakeDeployment(kwargs["adapter_prefix"])
+        return _FakeDeployment(kwargs["adapter_prefix"], prior_registry_record)
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "restore_adapter_record",
+        lambda adapter_id, record: restored.append((adapter_id, record)),
+    )
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -1129,11 +1143,44 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
     assert resp.status_code == 200, resp.text
-    assert registered_prefixes[-1] == "rl/old"
+    assert len(registered_prefixes) == 1
+    assert restored == [(run_id, prior_registry_record)]
     deployment = runner.get_status(run_id).deployment
     assert deployment["state"] == "ready"
     assert deployment["endpoint_name"] == "old"
-    assert "smoke generation returned no content" in deployment["last_deploy_error"]
+    assert "smoke generation returned no answer content" in deployment["last_deploy_error"]
+
+
+def test_failed_smoke_surfaces_operator_cleanup_when_exact_restore_fails(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    prior = {"adapter_id": run_id, "structured_outputs": {"choice": ["old"]}}
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **kwargs: _FakeDeployment(kwargs["adapter_prefix"], prior),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_k: {"choices": [{"message": {"content": ""}}]},
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "restore_adapter_record",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("restore rejected")),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "failed"
+    assert deployment["rollback_error"] == "restore rejected"
+    assert "operator cleanup required" in deployment["detail"]
 
 
 def test_recover_deployments_restores_previous_ready_record(api):
@@ -2543,8 +2590,9 @@ _FAKE_CKPTS = [
 
 
 class _FakeDeployment:
-    def __init__(self, adapter_prefix):
+    def __init__(self, adapter_prefix, previous_registry_record=None):
         self.adapter_prefix = adapter_prefix
+        self.previous_registry_record = previous_registry_record
 
     def to_dict(self):
         return {
@@ -2672,7 +2720,11 @@ def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch)
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     rollbacks = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+    monkeypatch.setattr(
+        app_mod,
+        "restore_adapter_record",
+        lambda run_id, record: rollbacks.append((run_id, record)),
+    )
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -2685,7 +2737,7 @@ def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch)
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
-    assert rollbacks == [run_id]
+    assert rollbacks == [(run_id, None)]
     status = runner.get_status(run_id)
     assert status.state == "deployed"
     assert status.deployment == {"state": "ready", "endpoint_name": "final"}
@@ -2714,7 +2766,11 @@ def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch)
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     rollbacks = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+    monkeypatch.setattr(
+        app_mod,
+        "restore_adapter_record",
+        lambda run_id, record: rollbacks.append((run_id, record)),
+    )
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -2730,7 +2786,7 @@ def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch)
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
-    assert rollbacks == [run_id]
+    assert rollbacks == [(run_id, None)]
     status = runner.get_status(run_id)
     assert status.state == "done"
     assert status.deployment["state"] == "undeployed"

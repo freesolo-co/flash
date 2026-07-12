@@ -7,6 +7,7 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import re
 import time
@@ -14,6 +15,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from jsonschema import SchemaError, ValidationError, validate
 
 from flash.runner import (
     adapter_prefix,
@@ -92,6 +94,38 @@ def recover_deployments() -> int:
     return recovered
 
 
+def _answer_after_reasoning(content: str, *, thinking: bool) -> str:
+    if not thinking:
+        return content.strip()
+    _before, separator, answer = content.rpartition("</think>")
+    return (answer if separator else content).strip()
+
+
+def _validate_structured_smoke(answer: str, structured_outputs: str) -> None:
+    from flash.engine.structured_outputs import parse_structured_outputs
+
+    constraint = parse_structured_outputs(structured_outputs)
+    if not constraint:
+        return
+    try:
+        if "json" in constraint:
+            validate(instance=json.loads(answer), schema=constraint["json"])
+        elif constraint.get("json_object") is True:
+            if not isinstance(json.loads(answer), dict):
+                raise ServingError("structured smoke output is valid JSON but not a JSON object")
+        elif "choice" in constraint:
+            if answer not in constraint["choice"]:
+                raise ServingError(
+                    f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
+                )
+        elif "regex" in constraint and re.fullmatch(str(constraint["regex"]), answer) is None:
+            raise ServingError("structured smoke output does not match the configured regex")
+    except json.JSONDecodeError as exc:
+        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
+    except (ValidationError, SchemaError) as exc:
+        raise ServingError(f"structured smoke output violates the configured JSON schema: {exc}") from exc
+
+
 def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     started = time.monotonic()
     result = _app.serve_chat(
@@ -105,17 +139,19 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
-    if not content.strip():
+    answer = _answer_after_reasoning(content, thinking=spec.thinking)
+    if not answer:
         raise ServingError(
-            "smoke generation returned no content "
+            "smoke generation returned no answer content "
             f"(finish_reason={finish!r}) after {latency:.1f}s"
         )
+    _validate_structured_smoke(answer, spec.train.structured_outputs)
     return {
         "verified_at": time.time(),
         "verify_latency_s": latency,
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
-        "verify_sample": content.strip()[:160],
+        "verify_sample": answer[:160],
     }
 
 
@@ -123,29 +159,10 @@ def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
     return state_guard is not None and _app.get_status(run_id).state != state_guard
 
 
-def _adapter_prefix_from_deployment(deployment: dict) -> str:
-    subfolder = deployment.get("adapter_hf_prefix")
-    if not isinstance(subfolder, str) or not subfolder.endswith("/adapter"):
-        raise ServingError(
-            "previous deployment record is missing adapter_hf_prefix; "
-            "cannot restore serving registry"
-        )
-    return subfolder[: -len("/adapter")]
-
-
 def _rollback_registered_deployment(
-    *, run_id: str, deploy_kwargs: dict, previous_deployment: dict | None
+    *, run_id: str, previous_registry_record: dict | None
 ) -> None:
-    if isinstance(previous_deployment, dict):
-        _app.deploy_adapter(
-            **{
-                **deploy_kwargs,
-                "adapter_prefix": _adapter_prefix_from_deployment(previous_deployment),
-                "dry_run": False,
-            }
-        )
-    else:
-        _app.undeploy_adapter(run_id)
+    _app.restore_adapter_record(run_id, previous_registry_record)
 
 
 def _finish_deployment_unlocked(
@@ -169,9 +186,11 @@ def _finish_deployment_unlocked(
     current = _deployment_state(deployment, "registering", detail="registering adapter")
     mark_deployment_pending(run_id, current)
     registered = False
+    previous_registry_record = None
     try:
         dep = _app.deploy_adapter(**deploy_kwargs)
         registered = True
+        previous_registry_record = dep.previous_registry_record
         previous_deployment = deployment.get("previous_deployment")
         current = dep.to_dict()
         if previous_deployment:
@@ -184,7 +203,10 @@ def _finish_deployment_unlocked(
             state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
         if _deployment_cas_lost(run_id, state_guard):
             with contextlib.suppress(Exception):
-                _app.undeploy_adapter(run_id)
+                _rollback_registered_deployment(
+                    run_id=run_id,
+                    previous_registry_record=previous_registry_record,
+                )
             return
         if verify:
             current = _deployment_state(current, "verifying", detail="running smoke generation")
@@ -203,7 +225,10 @@ def _finish_deployment_unlocked(
         )
         if state_guard is not None and cas_failed:
             with contextlib.suppress(Exception):
-                _app.undeploy_adapter(run_id)
+                _rollback_registered_deployment(
+                    run_id=run_id,
+                    previous_registry_record=previous_registry_record,
+                )
             return
     except Exception as exc:
         error = str(exc)
@@ -229,8 +254,7 @@ def _finish_deployment_unlocked(
             try:
                 _rollback_registered_deployment(
                     run_id=run_id,
-                    deploy_kwargs=deploy_kwargs,
-                    previous_deployment=previous_deployment,
+                    previous_registry_record=previous_registry_record,
                 )
             except Exception as rollback_exc:
                 rollback_error = str(rollback_exc)
@@ -241,10 +265,10 @@ def _finish_deployment_unlocked(
                     "deployment failed and serving rollback failed; "
                     "operator cleanup required"
                 )
-            elif isinstance(previous_deployment, dict):
-                failed["detail"] = "deployment failed; restored previous deployment"
+            elif previous_registry_record is not None:
+                failed["detail"] = "deployment failed; restored exact previous serving record"
             else:
-                failed["detail"] = "deployment failed; deregistered adapter"
+                failed["detail"] = "deployment failed; restored absent serving record"
         mark_deployment_failed(run_id, failed)
 
 

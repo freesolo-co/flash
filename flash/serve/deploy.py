@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import time
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import httpx
 
@@ -23,6 +24,7 @@ DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.ru
 # assumption (see _verify_adapter_registered).
 READBACK_ATTEMPTS = 5
 READBACK_DELAY_SECONDS = 2.0
+THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 
 
 class ServingError(RuntimeError):
@@ -134,12 +136,15 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     state: str = "ready"
-    # The OpenAI-compatible base URL. endpoint_name is the bare serving root; OpenAI clients must
-    # be pointed at {endpoint_name}/v1 or their /chat/completions calls 404.
+    # the openai-compatible base url. endpoint_name is the bare serving root.
     url: str = ""
+    # internal lifecycle state used to restore serving after a failed smoke or cas transition.
+    previous_registry_record: dict | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("previous_registry_record", None)
+        return data
 
 
 def deployment_record(
@@ -264,32 +269,111 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
-def _structured_outputs_body(
-    run_id: str, structured_outputs: str, *, thinking: bool
-) -> dict | None:
-    """The per-adapter structured-outputs serving default for the registration body, or None.
-
-    Returns the parsed canonical StructuredOutputsParams-kwargs dict when the run configured a
-    constraint AND is non-thinking; None otherwise (no default is registered). Non-thinking only:
-    serving sets no reasoning-parser, so a per-adapter grammar would bind from the very first
-    generated token and force a thinking adapter's ``<think>`` phase to open the schema (e.g. ``{``)
-    — strictly worse than serving it unconstrained. Training stays compatible with thinking via a
-    DEFERRED grammar (``reasoning_parser="deepseek_r1"`` holds the constraint until ``</think>``),
-    but serving has no such deferral, so we skip the serve-time default for thinking runs rather
-    than break reasoning. Raises ValueError on a corrupt spec — a wiring bug, since
-    ``[train].structured_outputs`` is already canonicalized at run creation (schema/fields.py), so
-    this cannot fire for a real run; it fails loudly rather than ever silently serving unconstrained."""
+def _structured_outputs_body(structured_outputs: str) -> dict | None:
+    """Return the canonical parsed serving constraint, or None when unconstrained."""
     if not structured_outputs:
         return None
-    if thinking:
-        logger.info(
-            "adapter %s trained with structured_outputs but thinking=True; not registering a "
-            "serving guided-decoding default — serving has no reasoning-parser deferral, so it "
-            "would bind the grammar from token 0 and suppress the <think> phase",
-            run_id,
-        )
-        return None
     return parse_structured_outputs(structured_outputs)
+
+
+def _require_thinking_structured_outputs_capability(base: str) -> None:
+    """Fail closed unless serving advertises deferred thinking constraint support."""
+    url = f"{base}/healthz"
+    try:
+        payload = _serving_request("GET", url).json()
+    except (ServingError, ValueError) as exc:
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because the serving "
+            "capability probe was unreachable or malformed. No adapter registry mutation was "
+            "attempted; serving must advertise "
+            f"{THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r} before Flash can preserve training/serving "
+            "exposure safety"
+        ) from exc
+    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because /healthz "
+            "returned a malformed capabilities list. No adapter registry mutation was attempted; "
+            f"serving must advertise {THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r}"
+        )
+    if THINKING_STRUCTURED_OUTPUTS_CAPABILITY not in capabilities:
+        raise ServingError(
+            "cannot safely deploy a thinking adapter with structured outputs because serving does "
+            "not advertise deferred structured-output enforcement. No adapter registry mutation "
+            "was attempted; deploying unconstrained would reintroduce training/serving exposure "
+            f"bias. Required capability: {THINKING_STRUCTURED_OUTPUTS_CAPABILITY}"
+        )
+
+
+def _record_value(record: dict, snake: str, camel: str | None = None):
+    value = record.get(snake)
+    if value is None and camel:
+        value = record.get(camel)
+    return value
+
+
+def _record_mismatches(record: dict | None, expected: dict) -> list[str]:
+    if not isinstance(record, dict):
+        return ["adapter record is absent"]
+    comparisons = {
+        "adapter_id": (_record_value(record, "adapter_id", "adapterId"), expected["adapter_id"]),
+        "subfolder": (record.get("subfolder"), expected["subfolder"]),
+        "base_model": (_record_value(record, "base_model", "baseModel"), expected["base_model"]),
+        "repo_id": (_record_value(record, "repo_id", "repoId"), expected["repo_id"]),
+        "repo_type": (_record_value(record, "repo_type", "repoType"), expected["repo_type"]),
+        "thinking": (record.get("thinking"), expected["thinking"]),
+        "structured_outputs": (record.get("structured_outputs"), expected.get("structured_outputs")),
+        "structured_outputs_after_reasoning": (
+            record.get("structured_outputs_after_reasoning"),
+            expected.get("structured_outputs_after_reasoning"),
+        ),
+    }
+    return [
+        f"{name}={actual!r}, expected {wanted!r}"
+        for name, (actual, wanted) in comparisons.items()
+        if actual != wanted
+    ]
+
+
+def snapshot_adapter_record(run_id: str) -> dict | None:
+    """Return a deep copy of the exact current registry record."""
+    record = _registered_adapter(run_id, strict=True)
+    return copy.deepcopy(record) if record is not None else None
+
+
+def restore_adapter_record(run_id: str, previous_record: dict | None) -> None:
+    """Restore the exact pre-deploy registry state and verify the result."""
+    base = serving_base_url()
+    if previous_record is None:
+        _serving_request("DELETE", f"{base}/adapters/{run_id}", ok_statuses=(404,))
+        if _registered_adapter(run_id, strict=True) is not None:
+            raise ServingError(
+                f"adapter {run_id} remains registered after rollback delete; operator cleanup required"
+            )
+        return
+
+    restored = copy.deepcopy(previous_record)
+    _serving_request("POST", f"{base}/adapters", json=restored)
+    readback = _registered_adapter(run_id, strict=True)
+    if readback != restored:
+        raise ServingError(
+            f"adapter {run_id} rollback readback did not exactly match the prior registry record; "
+            "operator cleanup required"
+        )
+
+
+def _restore_after_failure(run_id: str, previous_record: dict | None, exc: Exception) -> ServingError:
+    try:
+        restore_adapter_record(run_id, previous_record)
+    except Exception as rollback_exc:
+        return ServingError(
+            f"{exc}; serving rollback failed ({rollback_exc}); operator cleanup required",
+            status_code=getattr(exc, "status_code", None),
+        )
+    return ServingError(
+        f"{exc}; serving registry was restored to its exact pre-deploy state",
+        status_code=getattr(exc, "status_code", None),
+    )
 
 
 def deploy_adapter(
@@ -306,12 +390,12 @@ def deploy_adapter(
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
 
-    ``structured_outputs`` is the run's ``[train].structured_outputs`` spec (canonical
-    StructuredOutputsParams-kwargs JSON, or "" for none). When set, it is registered as the
-    adapter's per-adapter guided-decoding DEFAULT so every serve request is constrained by the
-    SAME grammar the adapter trained under — otherwise a structured-outputs run drifts at
-    unconstrained serving (train/serve exposure bias: it over-generates arrays that truncate to
-    invalid JSON and emits keys the training grammar had masked). See ``_structured_outputs_body``.
+    ``structured_outputs`` is the run's ``[train].structured_outputs`` spec as canonical
+    ``StructuredOutputsParams`` keyword arguments, or an empty string when disabled. Non-thinking
+    adapters register it under ``structured_outputs``. Thinking adapters require the deferred
+    serving capability and register it under ``structured_outputs_after_reasoning`` so guided
+    decoding begins only after the reasoning boundary. This preserves the training grammar without
+    constraining reasoning tokens or reintroducing train/serve exposure bias.
     """
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
@@ -325,127 +409,110 @@ def deploy_adapter(
     if dry_run:
         return dep
     base = serving_base_url()
+    so_default = _structured_outputs_body(structured_outputs)
+    if thinking and so_default is not None:
+        _require_thinking_structured_outputs_capability(base)
     body = {
         "adapter_id": run_id,
         "repo_id": hf_repo,
         "base_model": model,
         "subfolder": subfolder,
-        # Must be "dataset": trainer uploads to a dataset repo; serving defaults to "model" and 404s.
+        # trainer artifacts live in dataset repositories.
         "repo_type": "dataset",
         "status": "ready",
-        # Preserves thinking parity: without this, Qwen3.5 defaults to thinking ON regardless of training.
         "thinking": bool(thinking),
     }
-    so_default = _structured_outputs_body(run_id, structured_outputs, thinking=thinking)
     if so_default is not None:
-        body["structured_outputs"] = so_default
+        constraint_key = (
+            "structured_outputs_after_reasoning" if thinking else "structured_outputs"
+        )
+        body[constraint_key] = so_default
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["org_id"] = normalized_org_id
-    previous_record = _registered_adapter(run_id)
+
+    previous_record = snapshot_adapter_record(run_id)
+    dep.previous_registry_record = copy.deepcopy(previous_record)
     try:
         _serving_request("POST", f"{base}/adapters", json=body)
     except ServingError as exc:
-        # A 4xx means serving rejected the request outright and nothing changed. Anything else
-        # (5xx, timeout, unreachable) is ambiguous: the registry may or may not have switched to
-        # the new checkpoint. Read it back and report the actual state instead of guessing.
         if exc.status_code is not None and exc.status_code < 500:
-            raise
-        record = _registered_adapter(run_id)
-        recorded = _record_subfolder(record)
-        if record is not None and recorded == subfolder:
+            raise _restore_after_failure(run_id, previous_record, exc) from exc
+        try:
+            record = _registered_adapter(run_id, strict=True)
+        except ServingError:
+            raise _restore_after_failure(run_id, previous_record, exc) from exc
+        mismatches = _record_mismatches(record, body)
+        if not mismatches:
             logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
-                "registered; continuing",
+                "POST /adapters for %s failed (%s) but exact registry readback confirms the "
+                "requested adapter metadata; continuing",
                 run_id,
                 exc,
             )
-        elif record is not None and recorded is None and previous_record is None:
-            logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows a new adapter "
-                "record without subfolder details; continuing because no prior deployment was "
-                "registered",
-                run_id,
-                exc,
-            )
-        elif record is not None and recorded is None:
-            raise ServingError(
-                f"{exc} — the serving registry returned adapter {run_id} without a subfolder, "
-                f"so it cannot confirm that requested checkpoint {subfolder!r} replaced the "
-                "previous deployment. Retry `flash deploy` once serving recovers",
-                status_code=exc.status_code,
-            ) from exc
-        elif recorded is not None:
-            raise ServingError(
-                f"{exc} — the serving registry still shows adapter {run_id} at the previously "
-                f"deployed checkpoint ({recorded!r}, requested {subfolder!r}), so the OLD "
-                "checkpoint remains active. Retry `flash deploy` once serving recovers",
-                status_code=exc.status_code,
-            ) from exc
         else:
-            raise
+            ambiguous = ServingError(
+                f"{exc}; ambiguous registration readback for adapter {run_id}: "
+                + "; ".join(mismatches),
+                status_code=exc.status_code,
+            )
+            raise _restore_after_failure(run_id, previous_record, ambiguous) from exc
     else:
-        _verify_adapter_registered(run_id, subfolder)
+        try:
+            _verify_adapter_registered(run_id, body)
+        except ServingError as exc:
+            raise _restore_after_failure(run_id, previous_record, exc) from exc
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
 
 
-def _record_subfolder(record: dict | None) -> str | None:
-    if not isinstance(record, dict):
-        return None
-    value = record.get("subfolder")
-    return str(value) if value is not None else None
-
-
-def _registered_adapter(run_id: str) -> dict | None:
-    """The adapter's record in the serving registry, or None when absent or unreadable."""
+def _registered_adapter(run_id: str, *, strict: bool = False) -> dict | None:
+    """Return the adapter registry record, optionally failing on unreadable metadata."""
     try:
         resp = _serving_request("GET", f"{serving_base_url()}/adapters")
         payload = resp.json()
-    except (ServingError, ValueError):
+    except (ServingError, ValueError) as exc:
+        if strict:
+            raise ServingError(
+                f"could not read serving registry while checking adapter {run_id}: {exc}"
+            ) from exc
         return None
-    if not isinstance(payload, dict):
+    records = payload.get("adapters") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        if strict:
+            raise ServingError("serving registry returned malformed adapter metadata")
         return None
-    for record in payload.get("adapters") or []:
+    for record in records:
         if not isinstance(record, dict):
+            if strict:
+                raise ServingError("serving registry returned a malformed adapter record")
             continue
-        adapter_id = record.get("adapter_id") or record.get("adapterId")
+        adapter_id = _record_value(record, "adapter_id", "adapterId")
         if adapter_id == run_id:
             return record
     return None
 
 
-def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
-    """Poll the serving registry until the adapter is visible at the requested checkpoint.
-
-    A 2xx from POST /adapters only proves the registration request was accepted. If the record
-    never lands in the registry, /v1/chat/completions 404s with "Unknown adapter id" even though
-    the deployment record claims ready. Polling here makes "ready" a registry-backed claim.
-    """
-    recorded: str | None = None
-    seen = False
+def _verify_adapter_registered(run_id: str, expected: dict) -> None:
+    """Poll until every safety-relevant adapter field matches the requested registration."""
+    mismatches = ["adapter record is absent"]
     for attempt in range(READBACK_ATTEMPTS):
         if attempt:
             time.sleep(READBACK_DELAY_SECONDS * attempt)
-        record = _registered_adapter(run_id)
-        if record is None:
-            continue
-        seen = True
-        recorded = _record_subfolder(record)
-        # Older serving builds may omit subfolder from the record; presence then has to count.
-        if recorded is None or recorded == subfolder:
+        record = _registered_adapter(run_id, strict=True)
+        mismatches = _record_mismatches(record, expected)
+        if not mismatches:
             return
-    if seen:
+    if mismatches == ["adapter record is absent"]:
         raise ServingError(
-            f"adapter {run_id} is registered at checkpoint {recorded!r} instead of the requested "
-            f"{subfolder!r}; the previously deployed checkpoint is still active — retry "
-            "`flash deploy`"
+            f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
+            "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
+            "ready; retry `flash deploy`, and if this persists an operator must check serving"
         )
     raise ServingError(
-        f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
-        "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
-        "ready — retry `flash deploy`, and if this persists an operator must check the freesolo "
-        "serving app"
+        f"adapter {run_id} registry readback does not match the requested metadata: "
+        + "; ".join(mismatches)
+        + ". The deployment was not marked ready"
     )
 
 

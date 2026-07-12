@@ -31,7 +31,12 @@ from flash.runner import get_status, submit_job
 from flash.runner.checkpoints import list_checkpoints
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
-from flash.serve.deploy import deploy_adapter, deployment_record, undeploy_adapter
+from flash.serve.deploy import (
+    deploy_adapter,
+    deployment_record,
+    restore_adapter_record,
+    undeploy_adapter,
+)
 from flash.serve.export import export_adapter
 
 from . import db
@@ -71,6 +76,7 @@ __all__ = [
     "get_status",
     "list_checkpoints",
     "recover_runs",
+    "restore_adapter_record",
     "run_server",
     "serve_chat",
     "serve_chat_stream",

@@ -12,6 +12,21 @@ from flash.serve.deploy import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _offline_serving_registry(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: _registry_resp([]))
+
+    class _DeleteResp:
+        status_code = 404
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _DeleteResp())
+
+
 def test_serving_base_url_default_and_override(monkeypatch):
     from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
 
@@ -62,6 +77,19 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     resp = httpx.Response(401, text="invalid internal key", request=req)
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    deleted = []
+
+    class _DeleteResp:
+        status_code = 404
+
+        def raise_for_status(self):
+            return None
+
+    def fake_delete(url, **_kwargs):
+        deleted.append(url)
+        return _DeleteResp()
+
+    monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
@@ -71,6 +99,8 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     assert "FREESOLO_INTERNAL_KEY" in msg
     assert "no engine" not in msg
     assert "operator must check" not in msg
+    assert "restored to its exact pre-deploy state" in msg
+    assert deleted == ["https://serve.example/adapters/flash-1-abc"]
 
 
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
@@ -205,6 +235,18 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
         assert ei.value.status_code == 400, bad
 
 
+def _adapter_record(**overrides):
+    return {
+        "adapter_id": "flash-1-abc",
+        "repo_id": "repo",
+        "repo_type": "dataset",
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "subfolder": "rl/r1/seed0/adapter",
+        "thinking": False,
+        **overrides,
+    }
+
+
 def _registry_resp(records):
     class _Resp:
         status_code = 200
@@ -235,7 +277,7 @@ def test_deploy_reads_registry_back_before_ready(monkeypatch):
 
     def fake_get(url, **k):
         gets.append(url)
-        return _registry_resp([{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}])
+        return _registry_resp([_adapter_record()])
 
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
     monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
@@ -262,7 +304,7 @@ def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
         deploy_mod.httpx,
         "get",
         lambda *a, **k: _registry_resp(
-            [{"adapter_id": None, "adapterId": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+            [_adapter_record(adapter_id=None, adapterId="flash-1-abc")]
         ),
     )
 
@@ -312,13 +354,14 @@ def test_deploy_fails_when_registry_keeps_prior_checkpoint(monkeypatch):
         deploy_mod.httpx,
         "get",
         lambda *a, **k: _registry_resp(
-            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/checkpoints/step_100/adapter"}]
+            [_adapter_record(subfolder="rl/r1/seed0/checkpoints/step_100/adapter")]
         ),
     )
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert "previously deployed checkpoint" in str(ei.value)
+    assert "subfolder=" in str(ei.value)
+    assert "restored to its exact pre-deploy state" in str(ei.value)
 
 
 def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatch):
@@ -335,35 +378,42 @@ def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatc
     monkeypatch.setattr(
         deploy_mod.httpx,
         "get",
-        lambda *a, **k: _registry_resp(
-            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
-        ),
+        lambda *a, **k: _registry_resp([_adapter_record()]),
     )
 
     dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert dep.state == "ready"
 
 
-def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatch):
-    """Older serving builds omit subfolder; accept it only when there was no prior deployment."""
+def test_deploy_5xx_rejects_new_registry_record_with_missing_metadata(monkeypatch):
+    """Ambiguous registration fails closed when safety metadata is incomplete."""
     import httpx
 
     import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(502, text="bad gateway", request=req)
     monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
-    responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
+    responses = iter(
+        [
+            _registry_resp([]),
+            _registry_resp([{"adapter_id": "flash-1-abc"}]),
+            _registry_resp([]),
+        ]
+    )
     monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
 
-    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert dep.state == "ready"
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert "ambiguous registration readback" in str(ei.value)
+    assert "restored to its exact pre-deploy state" in str(ei.value)
 
 
-def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypatch):
-    """A checkpoint swap must not accept a subfolder-less record after an ambiguous POST failure."""
+def test_deploy_5xx_surfaces_cleanup_when_prior_record_restore_fails(monkeypatch):
+    """An ambiguous failure surfaces operator cleanup when exact restoration also fails."""
     import httpx
 
     import flash.serve.deploy as deploy_mod
@@ -384,7 +434,7 @@ def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypa
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
-    assert "cannot confirm" in str(ei.value)
+    assert "operator cleanup required" in str(ei.value)
 
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):

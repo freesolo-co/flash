@@ -70,6 +70,17 @@ def stub_serving_registry(monkeypatch):
     def _stub(*records: dict):
         import flash.serve.deploy as _deploy
 
+        normalized = [
+            {
+                "repo_id": "org/repo",
+                "base_model": "Qwen/Qwen3.5-0.8B",
+                "repo_type": "dataset",
+                "thinking": False,
+                **record,
+            }
+            for record in records
+        ]
+
         class _RegistryResp:
             status_code = 200
 
@@ -77,7 +88,7 @@ def stub_serving_registry(monkeypatch):
                 return None
 
             def json(self) -> dict:
-                return {"ok": True, "adapters": list(records)}
+                return {"ok": True, "adapters": normalized}
 
         monkeypatch.setattr(_deploy.httpx, "get", lambda *a, **k: _RegistryResp())
 
