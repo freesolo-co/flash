@@ -26,7 +26,7 @@ import random
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE, resolve_teacher
@@ -51,6 +51,12 @@ from flash.engine.worker.opd_objectives import (
     CvarEntropyConfig,
     ObjectiveView,
     PositionStatistics,
+)
+from flash.engine.worker.opd_repetition import (
+    LOOP_UNLIKELIHOOD_COEF,
+    analyze_repetition,
+    loop_closing_unlikelihood,
+    normalize_repetition_weights,
 )
 from flash.engine.worker.opd_vllm import (
     OpdVllmOutput,
@@ -446,9 +452,9 @@ def run_opd():
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
-    run_objective_plan = OPD_OBJECTIVES.plan(knobs.objective_ids)
+    objective_plan = OPD_OBJECTIVES.plan(knobs.objective_ids)
     recover_empty_rollouts = any(
-        definition.config.recover_empty_rollouts for definition in run_objective_plan.definitions
+        definition.config.recover_empty_rollouts for definition in objective_plan.definitions
     )
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
@@ -742,6 +748,11 @@ def run_opd():
     entropy_floor_active = 0
     objective_metric_sums: Counter[str] = Counter()
     objective_metric_counts: Counter[str] = Counter()
+    greedy_sidecars_generated = 0
+    greedy_sidecars_with_loops = 0
+    greedy_sidecar_closing_tokens = 0
+    greedy_sidecar_loss_sum = 0.0
+    greedy_sidecar_loss_steps = 0
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -776,6 +787,7 @@ def run_opd():
     mt_max_turns = 0
     mt_engine_max_len = 0
     generate_fn = env_glue_fn = render_fn = None
+    mt_generate_count = 0
     episodes_seen = 0
     mt_turn_records = 0  # total per-turn records produced across all episodes (multi-turn only)
     if multi_turn:
@@ -794,14 +806,24 @@ def run_opd():
 
         def generate_fn(prefix_ids, max_new):
             """One turn's generation through the colocated vLLM engine."""
-            return _generate_many_vllm(
-                vllm_rollout,
-                tok,
-                [prefix_ids],
-                knobs,
-                max_tokens=max(1, int(max_new)),
-                eos_ids=generation_eos_ids,
-            )[0]
+            nonlocal mt_generate_count
+            kwargs = {
+                "max_tokens": max(1, int(max_new)),
+                "eos_ids": generation_eos_ids,
+            }
+            if objective_plan.requirements.sampled_primary:
+                kwargs.update(
+                    temperature=(
+                        float(knobs.temperature)
+                        if float(knobs.temperature) > 0
+                        else float(RECIPE.opd.sampling_temperature)
+                    ),
+                    seed=_w.SEED + mt_generate_count,
+                )
+            if objective_plan.requirements.repetition_weighting:
+                kwargs["repetition_weighting"] = True
+            mt_generate_count += 1
+            return _generate_many_vllm(vllm_rollout, tok, [prefix_ids], knobs, **kwargs)[0]
 
     def _account(r, *, backward: bool = True):
         """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
@@ -931,6 +953,7 @@ def run_opd():
                 step_objective_metric_counts: Counter[str] = Counter()
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
+                step_sidecar_inputs = None
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
                 # handed to the resident teacher pool, and completed teacher futures are converted into
                 # differentiable GKD losses as soon as they finish. This preserves one optimizer update
@@ -1039,6 +1062,28 @@ def run_opd():
                         if fut.done():
                             _consume_teacher_future(fut)
 
+                if objective_plan.requirements.greedy_sidecar:
+                    sidecar_prompts = [prompt_ids for _ex, _messages, prompt_ids in batch]
+                    sidecars = _generate_greedy_sidecars(
+                        vllm_rollout,
+                        sidecar_prompts,
+                        max_tokens=knobs.max_completion,
+                        seed=_w.SEED + it * max(1, prompts_per_step),
+                    )
+                    greedy_sidecars_generated += len(sidecars)
+                    greedy_sidecars_with_loops += sum(
+                        1
+                        for sidecar in sidecars
+                        if sidecar.repetition_analysis is not None
+                        and sidecar.repetition_analysis.has_loop
+                    )
+                    greedy_sidecar_closing_tokens += sum(
+                        sum(sidecar.repetition_analysis.closing_mask)
+                        for sidecar in sidecars
+                        if sidecar.repetition_analysis is not None
+                    )
+                    step_sidecar_inputs = (sidecar_prompts, sidecars)
+
                 if multi_turn:
                     # Multi-turn Phase 1: drive an EPISODE per (prompt x group), each yielding one
                     # per-turn record. Every assistant turn becomes a _Pending distilled independently
@@ -1091,13 +1136,27 @@ def run_opd():
                             keepalive=True,
                         ):
                             rollout_started = time.perf_counter()
+                            primary_kwargs = {
+                                "max_tokens": knobs.max_completion,
+                                "eos_ids": generation_eos_ids,
+                            }
+                            if objective_plan.requirements.sampled_primary:
+                                primary_kwargs.update(
+                                    temperature=(
+                                        float(knobs.temperature)
+                                        if float(knobs.temperature) > 0
+                                        else float(RECIPE.opd.sampling_temperature)
+                                    ),
+                                    seed=_w.SEED + it * accum_target + start,
+                                )
+                            if objective_plan.requirements.repetition_weighting:
+                                primary_kwargs["repetition_weighting"] = True
                             gens = _generate_many_vllm(
                                 vllm_rollout,
                                 tok,
                                 chunk_prompts,
                                 knobs,
-                                max_tokens=knobs.max_completion,
-                                eos_ids=generation_eos_ids,
+                                **primary_kwargs,
                             )
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
@@ -1154,6 +1213,20 @@ def run_opd():
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
+            if step_sidecar_inputs is not None:
+                sidecar_prompts, sidecars = step_sidecar_inputs
+                sidecar_term, _loop_count, _closing_count = _greedy_sidecar_unlikelihood(
+                    model,
+                    tok,
+                    device,
+                    sidecar_prompts,
+                    sidecars,
+                    microbatch=loss_microbatch_size,
+                )
+                if sidecar_term is not None:
+                    sidecar_term.backward()
+                    greedy_sidecar_loss_sum += float(sidecar_term.detach())
+                    greedy_sidecar_loss_steps += 1
             optimizer_started = time.perf_counter()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
@@ -1345,6 +1418,14 @@ def run_opd():
             "mean_student_entropy": (entropy_sum / entropy_n) if entropy_n else None,
             "entropy_floor_active_samples": entropy_floor_active,
             **({"objective_metrics": objective_metric_means} if objective_metric_means else {}),
+            "greedy_sidecars_generated": greedy_sidecars_generated,
+            "greedy_sidecars_with_loops": greedy_sidecars_with_loops,
+            "greedy_sidecar_closing_tokens": greedy_sidecar_closing_tokens,
+            "mean_greedy_sidecar_loss": (
+                greedy_sidecar_loss_sum / greedy_sidecar_loss_steps
+                if greedy_sidecar_loss_steps
+                else None
+            ),
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
             "no_signal_resamples": no_signal_resamples,
@@ -1474,6 +1555,9 @@ class _GenResult:
     # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
     # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
     forced: tuple = ()
+    # detached local repetition analysis and bounded c09 gkd sequence weight.
+    repetition_analysis: object = None
+    sequence_weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1562,10 +1646,13 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _G
         )
     ):
         return _GenResult(
+            completion_ids=completion_ids,
+            completion_text=completion_text,
             truncated=True,
             gen_tokens=len(completion_ids),
             skip_reason="truncated_rollout",
             termination_cause=termination_cause,
+            forced=forced[: len(completion_ids)],
         )
     # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
     # delimiter is present; otherwise keep the already-stripped ids/text.
@@ -1608,11 +1695,120 @@ def _generate_many_vllm(
     *,
     max_tokens: int,
     eos_ids=None,
+    temperature: float | None = None,
+    seed: int | None = None,
+    repetition_weighting: bool = False,
 ) -> list[_GenResult]:
-    return [
+    generate_kwargs = {"max_tokens": max_tokens}
+    if temperature is not None:
+        generate_kwargs["temperature"] = temperature
+    if seed is not None:
+        generate_kwargs["seed"] = seed
+    generated = [
         _gen_from_vllm_output(out, tok, knobs, eos_ids=eos_ids)
-        for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
+        for out in rollout.generate(prompt_ids_batch, **generate_kwargs)
     ]
+    analyses = [analyze_repetition(gen.completion_ids) for gen in generated]
+    weights = (
+        normalize_repetition_weights([analysis.severity for analysis in analyses])
+        if repetition_weighting
+        else (1.0,) * len(generated)
+    )
+    return [
+        replace(gen, repetition_analysis=analysis, sequence_weight=weight)
+        for gen, analysis, weight in zip(generated, analyses, weights, strict=True)
+    ]
+
+
+def _generate_greedy_sidecars(
+    rollout: OpdVllmRolloutEngine,
+    prompt_ids_batch: list[list[int]],
+    *,
+    max_tokens: int,
+    seed: int,
+) -> list[_GenResult]:
+    """generate local-only greedy trajectories without teacher or environment calls."""
+
+    outputs = rollout.generate(
+        prompt_ids_batch,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        seed=seed,
+    )
+    sidecars = []
+    for out in outputs:
+        ids = [int(token_id) for token_id in out.token_ids]
+        sidecars.append(
+            _GenResult(
+                completion_ids=ids,
+                completion_text=str(out.text or ""),
+                gen_tokens=len(ids),
+                truncated=not out.terminated,
+                forced=tuple(bool(value) for value in (getattr(out, "forced", ()) or ()))[
+                    : len(ids)
+                ],
+                repetition_analysis=analyze_repetition(ids),
+            )
+        )
+    return sidecars
+
+
+def _greedy_sidecar_unlikelihood(
+    model,
+    tok,
+    device,
+    prompt_ids_batch: list[list[int]],
+    sidecars: list[_GenResult],
+    *,
+    microbatch: int,
+):
+    """compute one mean local loop-closing loss across greedy sidecars."""
+
+    import torch
+
+    selected = [
+        (prompt_ids, sidecar)
+        for prompt_ids, sidecar in zip(prompt_ids_batch, sidecars, strict=True)
+        if sidecar.completion_ids
+        and sidecar.repetition_analysis is not None
+        and sidecar.repetition_analysis.has_loop
+    ]
+    if not selected:
+        return None, 0, 0
+    model.train()
+    model.config.use_cache = False
+    pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
+    terms = []
+    closing_tokens = 0
+    for start in range(0, len(selected), max(1, int(microbatch))):
+        chunk = selected[start : start + max(1, int(microbatch))]
+        seqs = [list(prompt_ids) + list(sidecar.completion_ids) for prompt_ids, sidecar in chunk]
+        max_len = max(len(sequence) for sequence in seqs)
+        input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+        for row, sequence in enumerate(seqs):
+            input_ids[row, : len(sequence)] = torch.tensor(
+                sequence, dtype=torch.long, device=device
+            )
+            attention_mask[row, : len(sequence)] = 1
+        logits = _forward_logits(model, input_ids, attention_mask)
+        for row, (prompt_ids, sidecar) in enumerate(chunk):
+            completion_ids = list(sidecar.completion_ids)
+            rows = logits[
+                row,
+                len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(completion_ids),
+            ]
+            term = loop_closing_unlikelihood(
+                rows,
+                completion_ids,
+                forced=sidecar.forced,
+                coef=LOOP_UNLIKELIHOOD_COEF,
+                analysis=sidecar.repetition_analysis,
+            )
+            if term is not None:
+                terms.append(term)
+                closing_tokens += sum(sidecar.repetition_analysis.closing_mask)
+    return (sum(terms) / len(terms) if terms else None), len(selected), closing_tokens
 
 
 def _score_one(
@@ -1764,6 +1960,8 @@ class _PreparedLoss:
     group_granularity: float
     teacher_scores: tuple = ()
     forced: tuple[bool, ...] = ()
+    repetition_analysis: object = None
+    sequence_weight: float = 1.0
     empty_rollout: bool = False
     termination_cause: str = ""
 
@@ -2181,6 +2379,9 @@ def _resolve_samples_batched(
                     bool(gen.forced[i]) if i < len(gen.forced) else False
                     for i in range(len(student_ids))
                 ),
+                repetition_analysis=gen.repetition_analysis
+                or analyze_repetition(gen.completion_ids),
+                sequence_weight=float(gen.sequence_weight),
                 termination_cause=gen.termination_cause,
             )
         )
@@ -2223,6 +2424,8 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
+                    if loss is not None and objective_plan.requirements.repetition_weighting:
+                        loss = loss * p.sequence_weight
                     base_term = (
                         loss
                         if loss is not None
@@ -2255,6 +2458,7 @@ def _resolve_samples_batched(
                         objective_values = {
                             "prompt_len": prompt_len,
                             "student_ids": tuple(p.student_ids),
+                            "completion_ids": tuple(p.student_ids),
                             "gkd_groups": p.groups,
                             "eos_ids": eos_ids,
                             "stop_sequences": eos_stop_sequences,
@@ -2262,6 +2466,9 @@ def _resolve_samples_batched(
                             "termination_cause": p.termination_cause,
                             "entropy": entropy,
                             "entropy_floor_active": ent_term is not None,
+                            "forced": p.forced,
+                            "repetition_analysis": p.repetition_analysis,
+                            "sequence_weight": p.sequence_weight,
                         }
                         if objective_plan.requirements.student_logits:
                             objective_values.update(

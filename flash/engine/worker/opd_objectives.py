@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
+from flash.engine.worker.opd_repetition import loop_closing_unlikelihood
 from flash.opd_objectives import OPD_OBJECTIVE_IDS, validate_opd_objective_id
 
 _METRIC_NAME_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -21,12 +22,15 @@ def _immutable_mapping(values: Mapping[str, Any] | None = None) -> Mapping[str, 
 
 @dataclass(frozen=True)
 class ObjectiveRequirements:
-    """runtime values needed by one objective without extra model or network calls."""
+    """runtime values and rollout behavior needed by one objective."""
 
     student_logits: bool = False
     teacher_scores: bool = False
     position_statistics: bool = False
     empty_rollouts: bool = False
+    greedy_sidecar: bool = False
+    sampled_primary: bool = False
+    repetition_weighting: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,6 +260,9 @@ class ObjectiveRegistry:
                 teacher_scores=any(d.requirements.teacher_scores for d in definitions),
                 position_statistics=any(d.requirements.position_statistics for d in definitions),
                 empty_rollouts=any(d.requirements.empty_rollouts for d in definitions),
+                greedy_sidecar=any(d.requirements.greedy_sidecar for d in definitions),
+                sampled_primary=any(d.requirements.sampled_primary for d in definitions),
+                repetition_weighting=any(d.requirements.repetition_weighting for d in definitions),
             ),
         )
 
@@ -450,6 +457,26 @@ def _c05(view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult(term=term, metrics=metrics)
 
 
+def _sidecar(_view: ObjectiveView) -> ObjectiveResult:
+    return ObjectiveResult()
+
+
+def _c09(view: ObjectiveView) -> ObjectiveResult:
+    term = loop_closing_unlikelihood(
+        view.require("completion_logits"),
+        view.require("completion_ids"),
+        forced=view.values.get("forced", ()),
+    )
+    analysis = view.values.get("repetition_analysis")
+    metrics = {}
+    if analysis is not None:
+        metrics = {
+            "repetition_severity": analysis.severity,
+            "loop_closing_tokens": sum(analysis.closing_mask),
+        }
+    return ObjectiveResult(term=term, metrics=metrics)
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
@@ -462,6 +489,24 @@ OPD_OBJECTIVES = ObjectiveRegistry(
             requirements=ObjectiveRequirements(student_logits=True, empty_rollouts=True),
             evaluate=_c05,
             config=_C05_CONFIG,
+        ),
+        ObjectiveDefinition(
+            objective_id="c07",
+            requirements=ObjectiveRequirements(greedy_sidecar=True),
+            evaluate=_sidecar,
+        ),
+        ObjectiveDefinition(
+            objective_id="c08",
+            requirements=ObjectiveRequirements(greedy_sidecar=True, sampled_primary=True),
+            evaluate=_sidecar,
+        ),
+        ObjectiveDefinition(
+            objective_id="c09",
+            requirements=ObjectiveRequirements(
+                student_logits=True,
+                repetition_weighting=True,
+            ),
+            evaluate=_c09,
         ),
         ObjectiveDefinition(
             objective_id="c10",

@@ -383,13 +383,21 @@ class OpdVllmRolloutEngine:
                     return False
         return False
 
-    def _sampling_params(self, max_tokens: int):
+    def _sampling_params(
+        self,
+        max_tokens: int,
+        *,
+        temperature: float | None = None,
+        seed: int | None = None,
+    ):
         kwargs = {
             "max_tokens": max(1, int(max_tokens)),
-            "temperature": float(self.temperature),
+            "temperature": float(self.temperature if temperature is None else temperature),
             "top_p": float(self.top_p),
             "stop": list(self.stop_sequences) if self.stop_sequences else None,
         }
+        if seed is not None:
+            kwargs["seed"] = int(seed)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
         # matching the shared OPD stop-trimming path. Older vLLM builds ignore unsupported kwargs by
         # raising.
@@ -414,7 +422,12 @@ class OpdVllmRolloutEngine:
             return self._SamplingParams(**kwargs)
 
     def generate(
-        self, prompt_ids_batch: list[list[int]], *, max_tokens: int
+        self,
+        prompt_ids_batch: list[list[int]],
+        *,
+        max_tokens: int,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> list[OpdVllmOutput]:
         if not prompt_ids_batch:
             return []
@@ -432,10 +445,19 @@ class OpdVllmRolloutEngine:
             # every sequence after the first (same reason multiturn_rollout builds one per
             # request). Hand vLLM a fresh params per prompt when constrained; unconstrained runs
             # have no per-request state and share one cheaply.
+            chunk_seed = None if seed is None else int(seed) + start
+            per_prompt = self._StructuredOutputsParams is not None or chunk_seed is not None
             sampling_params = (
-                [self._sampling_params(max_tokens) for _ in prompts]
-                if self._StructuredOutputsParams is not None
-                else self._sampling_params(max_tokens)
+                [
+                    self._sampling_params(
+                        max_tokens,
+                        temperature=temperature,
+                        seed=None if chunk_seed is None else chunk_seed + index,
+                    )
+                    for index, _prompt in enumerate(prompts)
+                ]
+                if per_prompt
+                else self._sampling_params(max_tokens, temperature=temperature)
             )
             outputs = self.llm.generate(
                 prompts,

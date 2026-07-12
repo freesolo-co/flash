@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import Any
 
 _OBJECTIVE_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
-OPD_OBJECTIVE_IDS = ("c0", "c05", "c10")
+OPD_OBJECTIVE_IDS = ("c0", "c05", "c07", "c08", "c09", "c10")
 
 
 def validate_opd_objective_id(objective_id: str) -> str:
