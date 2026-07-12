@@ -125,6 +125,12 @@ class TrainSpec:
     kl_penalty_coef: float | None = None
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
+    # pure multi-turn grpo only: each flash-owned physical vllm request has an absolute deadline.
+    # none resolves on the worker from the engine context; attempts includes the initial request.
+    rollout_request_timeout_seconds: float | None = None
+    rollout_request_max_attempts: int = 2
+    # 0 disables the optional no-token-progress deadline; the absolute request deadline still applies.
+    rollout_stall_timeout_seconds: float = 0.0
     # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
     # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
     opd_eos_loss_coef: float | None = None
@@ -221,6 +227,13 @@ class JobSpec:
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
+                rollout_request_timeout_seconds=_opt_float(
+                    train.get("rollout_request_timeout_seconds")
+                ),
+                rollout_request_max_attempts=int(train.get("rollout_request_max_attempts", 2)),
+                rollout_stall_timeout_seconds=float(
+                    train.get("rollout_stall_timeout_seconds", 0.0)
+                ),
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),

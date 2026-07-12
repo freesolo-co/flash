@@ -483,6 +483,15 @@ in a sensible value, so only override with a reason.
 | `learning_rate` | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it. |
 | `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
 | `structured_outputs` | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then *cannot* emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
+| `rollout_request_timeout_seconds` | Absolute deadline for each Flash-owned physical vLLM generation request in a pure multi-turn GRPO rollout. Unset resolves to `max(600.0, 0.5 * vllm_max_len)` seconds. Progress never extends this deadline. |
+| `rollout_request_max_attempts` | Total physical attempts per logical assistant turn, including the first request. Default 2. A timed-out attempt is synchronously aborted before an identical retry is submitted with a fresh id. Exhaustion fails the run instead of scoring a zero-reward sample. |
+| `rollout_stall_timeout_seconds` | Optional no-token-progress deadline for the same physical requests. Default 0 disables it. Positive values reset only when the unfinished request's cumulative generated-token count grows; the absolute request deadline still wins. |
+
+The three `rollout_request_*` / `rollout_stall_*` controls apply only when Flash drives a
+**pure multi-turn GRPO** environment through its custom colocated vLLM `add_request` / `step` /
+`abort_request` loop. They do not cover synchronous OPD `LLM.generate`, TRL's native tool loop,
+or opaque environment calls. Flash never retries an environment call and does not impose a total
+episode elapsed-time cutoff; the existing turn, context, completion, and terminal bounds remain.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the

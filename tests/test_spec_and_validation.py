@@ -103,6 +103,34 @@ def test_opd_eos_loss_coef_accepted_by_schema() -> None:
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
 
+def test_rollout_request_controls_parse_validate_and_round_trip() -> None:
+    spec = spec_from_dict(
+        _raw(
+            **{
+                "train.rollout_request_timeout_seconds": 45.5,
+                "train.rollout_request_max_attempts": 3,
+                "train.rollout_stall_timeout_seconds": 12.0,
+            }
+        )
+    )
+    assert spec.train.rollout_request_timeout_seconds == 45.5
+    assert spec.train.rollout_request_max_attempts == 3
+    assert spec.train.rollout_stall_timeout_seconds == 12.0
+    assert JobSpec.from_json(spec.to_json()) == spec
+
+    defaults = spec_from_dict(_raw()).train
+    assert defaults.rollout_request_timeout_seconds is None
+    assert defaults.rollout_request_max_attempts == 2
+    assert defaults.rollout_stall_timeout_seconds == 0.0
+
+    with pytest.raises(ConfigError, match="rollout_request_timeout_seconds"):
+        spec_from_dict(_raw(**{"train.rollout_request_timeout_seconds": 0}))
+    with pytest.raises(ConfigError, match="rollout_request_max_attempts"):
+        spec_from_dict(_raw(**{"train.rollout_request_max_attempts": 0}))
+    with pytest.raises(ConfigError, match="rollout_stall_timeout_seconds"):
+        spec_from_dict(_raw(**{"train.rollout_stall_timeout_seconds": -1}))
+
+
 def test_falsy_algorithm_defaults_to_sft() -> None:
     # The type guard must preserve the `(value or "sft")` semantics: falsy values default.
     # Supply SFT-valid [train] fields so validation reaches the algorithm assertion instead of
