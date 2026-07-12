@@ -70,6 +70,7 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
+from flash.opd_objectives import deserialize_opd_objective_ids
 
 OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
@@ -210,8 +211,10 @@ def _resolve_opd_knobs() -> OpdKnobs:
         teacher = resolve_teacher(opt("teacher_model", ""))
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
-    objective_ids = tuple(getattr(t, "opd_objective_ids", ()) or ()) if t else ()
     try:
+        objective_ids = deserialize_opd_objective_ids(
+            getattr(t, "opd_objective_ids", None) if t else None
+        )
         OPD_OBJECTIVES.plan(objective_ids)
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e

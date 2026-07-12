@@ -36,15 +36,22 @@ def resolve_opd_objective_ids(objective_ids: Iterable[str]) -> tuple[str, ...]:
     return requested
 
 
-def normalize_opd_objective_ids(value: Any, *, algorithm: str) -> tuple[str, ...]:
-    """validate the typed, opd-only objective id list at serialization boundaries."""
+def deserialize_opd_objective_ids(value: Any) -> tuple[str, ...]:
+    """deserialize the typed id sequence without applying version-specific policy."""
     if value is None:
         return ()
-    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+    if not isinstance(value, (list, tuple)):
         raise ValueError("train.opd_objective_ids must be a list of strings")
-    if not all(isinstance(objective_id, str) and objective_id for objective_id in value):
+    if not all(isinstance(objective_id, str) for objective_id in value):
+        raise ValueError("train.opd_objective_ids entries must be strings")
+    return tuple(value)
+
+
+def normalize_opd_objective_ids(value: Any, *, algorithm: str) -> tuple[str, ...]:
+    """validate the typed, opd-only objective id list at submission boundaries."""
+    objective_ids = deserialize_opd_objective_ids(value)
+    if not all(objective_ids):
         raise ValueError("train.opd_objective_ids entries must be non-empty strings")
-    objective_ids = tuple(value)
     if objective_ids and algorithm != "opd":
         raise ValueError('train.opd_objective_ids is only valid when algorithm = "opd"')
     return resolve_opd_objective_ids(objective_ids)

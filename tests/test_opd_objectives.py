@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -248,21 +249,41 @@ assert "flash.engine.worker" not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_job_spec_persisted_reads_tolerate_future_objective_ids():
+@pytest.mark.parametrize(
+    ("objective_ids", "expected"),
+    [
+        (["c0"], ("c0",)),
+        (("c0",), ("c0",)),
+        (["future-objective"], ("future-objective",)),
+        (["c0", "c0"], ("c0", "c0")),
+    ],
+)
+def test_job_spec_persisted_reads_preserve_typed_objective_ids(objective_ids, expected):
     from flash.spec import JobSpec
 
     persisted = {
         "algorithm": "grpo",
-        "train": {"opd_objective_ids": ["future-objective", "future-objective"]},
+        "train": {"opd_objective_ids": objective_ids},
     }
 
-    restored = JobSpec.from_json(JobSpec.from_dict(persisted).to_json())
+    assert JobSpec.from_dict(persisted).train.opd_objective_ids == expected
+    json_persisted = {**persisted, "train": {"opd_objective_ids": list(objective_ids)}}
+    assert JobSpec.from_json(json.dumps(json_persisted)).train.opd_objective_ids == expected
 
-    assert restored.algorithm == "grpo"
-    assert restored.train.opd_objective_ids == (
-        "future-objective",
-        "future-objective",
-    )
+
+@pytest.mark.parametrize(
+    "objective_ids",
+    ["c0", {"c0": True}, ["c0", 1]],
+)
+def test_job_spec_persisted_reads_reject_malformed_objective_ids(objective_ids):
+    from flash.spec import JobSpec
+
+    persisted = {"algorithm": "opd", "train": {"opd_objective_ids": objective_ids}}
+
+    with pytest.raises(ValueError, match="opd_objective_ids"):
+        JobSpec.from_dict(persisted)
+    with pytest.raises(ValueError, match="opd_objective_ids"):
+        JobSpec.from_json(json.dumps(persisted))
 
 
 def test_opd_objective_ids_are_typed_opd_only_and_round_trip():

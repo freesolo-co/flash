@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
+from .opd_objectives import deserialize_opd_objective_ids
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
@@ -231,8 +232,8 @@ class JobSpec:
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
-                # persisted reads stay forward-compatible; schema and worker boundaries validate ids.
-                opd_objective_ids=_str_tuple(train.get("opd_objective_ids")),
+                # persisted reads preserve future ids but never coerce malformed containers or entries.
+                opd_objective_ids=deserialize_opd_objective_ids(train.get("opd_objective_ids")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

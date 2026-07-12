@@ -3319,11 +3319,14 @@ def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkey
 @pytest.mark.parametrize(
     ("objective_ids", "message"),
     [
-        (("future-objective",), "unknown opd objective id"),
-        (("c0", "c0"), "duplicate opd objective id"),
+        ("c0", "must be a list of strings"),
+        ({"c0": True}, "must be a list of strings"),
+        (["c0", 1], "entries must be strings"),
+        (["future-objective"], "unknown opd objective id"),
+        (["c0", "c0"], "duplicate opd objective id"),
     ],
 )
-def test_resolve_opd_knobs_strictly_validates_persisted_objective_ids(
+def test_resolve_opd_knobs_strictly_rejects_invalid_objective_ids(
     monkeypatch, objective_ids, message
 ):
     from flash.engine.worker import opd as opd_mod
@@ -3342,6 +3345,25 @@ def test_resolve_opd_knobs_strictly_validates_persisted_objective_ids(
 
     with pytest.raises(RuntimeError, match=message):
         opd_mod._resolve_opd_knobs()
+
+
+@pytest.mark.parametrize("objective_ids", [["c0"], ("c0",)])
+def test_resolve_opd_knobs_accepts_typed_objective_id_sequences(monkeypatch, objective_ids):
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        opd_objective_ids = objective_ids
+
+        def __getattr__(self, name):
+            return None
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train()), THINKING=False),
+    )
+
+    assert opd_mod._resolve_opd_knobs().objective_ids == ("c0",)
 
 
 def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
