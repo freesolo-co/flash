@@ -231,7 +231,6 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
-
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -359,6 +358,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             save_every=_train_int(train_raw, "save_every", minimum=1),
             group_size=_train_int(train_raw, "group_size", minimum=1),
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
+            top_p=_train_float(train_raw, "top_p", minimum=0.0, exclusive=True, maximum=1.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
@@ -367,6 +367,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             ),
             # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
             opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
+            opd_teacher_top_k=_train_int(train_raw, "opd_teacher_top_k", minimum=1),
+            opd_fkl_coef=_train_float(train_raw, "opd_fkl_coef", minimum=0.0),
             # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
@@ -406,6 +408,8 @@ def _validate_sft(spec: JobSpec) -> None:
             "train.max_examples must be set to a positive row count for SFT "
             "(use the full dataset row count for an uncapped run)"
         )
+    if spec.train.top_p is not None:
+        raise ConfigError("train.top_p is currently OPD-only")
     if spec.train.structured_outputs:
         # SFT never generates — a constraint here would silently do nothing; reject at parse time
         # like other no-op configs (see the opd kl_penalty_coef=0 guard).
@@ -417,6 +421,8 @@ def _validate_sft(spec: JobSpec) -> None:
 
 def _validate_grpo(spec: JobSpec) -> None:
     """GRPO contract: epochs derive passes over retained prompts."""
+    if spec.train.top_p is not None:
+        raise ConfigError("train.top_p is currently OPD-only")
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
@@ -429,6 +435,10 @@ def _validate_opd(spec: JobSpec) -> None:
 
     The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
     the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
+    if spec.train.opd_teacher_top_k is not None and spec.train.opd_teacher_top_k > 5:
+        raise ConfigError("train.opd_teacher_top_k must be between 1 and 5")
+    if (spec.train.opd_fkl_coef or 0.0) > 0 and (spec.train.opd_teacher_top_k or 1) < 2:
+        raise ConfigError("train.opd_fkl_coef > 0 requires train.opd_teacher_top_k >= 2")
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is

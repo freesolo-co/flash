@@ -788,7 +788,9 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     )
 
 
-def _opd_harness(monkeypatch, *, sample_result, beats=None, liveness=None, epochs=1, group=1):
+def _opd_harness(
+    monkeypatch, *, sample_result, beats=None, liveness=None, epochs=1, group=1, fkl_coef=0.0
+):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
     module."""
@@ -855,6 +857,7 @@ def _opd_harness(monkeypatch, *, sample_result, beats=None, liveness=None, epoch
             prompts_per_step=1,
             group_size=group,
             kl_coef=1.0,
+            fkl_coef=fkl_coef,
             save_every=0,
             max_length=0,
             stop_sequences=(),
@@ -1024,7 +1027,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
+            model,
+            tok_,
+            device,
+            samples,
+            knobs,
+            microbatch,
+            backward_scale=backward_scale,
+            **_kwargs,
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -1216,7 +1226,8 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
             loss=loss, teacher_status="ok", coverage=1.0, gen_tokens=1, teacher_tokens=1
         )
 
-    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=1, group=1)
+    beats = []
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, beats=beats, epochs=1, group=1)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -1224,6 +1235,45 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
 
     engine = opd_mod.OpdVllmRolloutEngine.instances[0]
     assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
+    assert not any(key.startswith("fkl_") for _stage, fields in beats for key in fields)
+
+
+def test_opd_fkl_term_metric_is_mean_over_distilled_sequences(monkeypatch):
+    torch = pytest.importorskip("torch")
+    results = iter([(1, 2.0), (3, 4.0)])
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        positions, term = next(results)
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+            fkl_positions=positions,
+            fkl_group_count=positions,
+            fkl_support_total=positions * 2,
+            fkl_term=term,
+        )
+
+    beats = []
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        beats=beats,
+        epochs=1,
+        group=2,
+        fkl_coef=0.5,
+    )
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    step_fields = [fields for stage, fields in beats if stage == "opd_step" and "loss" in fields]
+    assert step_fields[-1]["fkl_term"] == pytest.approx(3.0)
 
 
 def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
@@ -2283,7 +2333,9 @@ def test_student_model_continues_warmstart_adapter_in_place(monkeypatch):
     out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out is live  # the same live adapter, moved to device
     assert moved == ["cpu"]
-    assert rollout_model_source == "Qwen/Qwen3.5-4B"  # continued adapter deploys on the catalog base
+    assert (
+        rollout_model_source == "Qwen/Qwen3.5-4B"
+    )  # continued adapter deploys on the catalog base
     assert calls == []  # no base reload: neither causal nor VL loader is used
 
 
@@ -2456,7 +2508,9 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+    assert not supports_fp8_kv(
+        cheapest_gpu(need)
+    )  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
@@ -2638,10 +2692,15 @@ def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logpro
     assert toks[0].text == "hi"
     assert toks[0].start == 0
     assert toks[0].logprob == -0.5  # the realized-token logprob gkd consumes
-    # scoring must not pay for generation, and asks for the minimal logprobs that return token_logprobs.
-    assert capture["body"]["max_tokens"] == 0
-    assert capture["body"]["echo"] is True
-    assert capture["body"]["logprobs"] == 1
+    # scoring must not pay for generation, and the default request remains byte-for-byte compatible.
+    assert capture["body"] == {
+        "model": "glm",
+        "prompt": "P: hi",
+        "max_tokens": 0,
+        "echo": True,
+        "logprobs": 1,
+        "temperature": 0,
+    }
 
 
 def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatch):
@@ -2653,6 +2712,7 @@ def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatc
                     "tokens": ["Q", "2", "B"],
                     "token_logprobs": [0.0, -1.0, -0.2],
                     "text_offset": [0, 1, 2],
+                    "top_logprobs": [{}, {}, {"B": -0.2, "Y": -0.6}],
                 },
             },
             {
@@ -2661,6 +2721,7 @@ def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatc
                     "tokens": ["Q", "1", "A"],
                     "token_logprobs": [0.0, -1.0, -0.1],
                     "text_offset": [0, 1, 2],
+                    "top_logprobs": [{}, {}, {"A": -0.1, "X": -0.5}],
                 },
             },
         ]
@@ -2669,11 +2730,89 @@ def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatc
     _mock_urlopen(monkeypatch, payload, capture)
     client = TeacherClient("k", "https://api.example/v1", "glm")
 
-    out = client.score_many([("Q1", "A"), ("Q2", "B")])
+    out = client.score_many([("Q1", "A"), ("Q2", "B")], top_k=5)
 
     assert capture["body"]["prompt"] == ["Q1A", "Q2B"]
+    assert capture["body"]["logprobs"] == 5
     assert [[t.text for t in toks] for toks in out] == [["A"], ["B"]]
     assert [out[0][0].logprob, out[1][0].logprob] == [-0.1, -0.2]
+    assert out[0][0].alternatives == (("A", -0.1), ("X", -0.5))
+    assert out[1][0].alternatives == (("B", -0.2), ("Y", -0.6))
+
+
+def test_teacher_score_many_requests_and_parses_top_k_alternatives(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "a", "b"],
+                    "token_logprobs": [None, -0.2, -1.1],
+                    "text_offset": [0, 1, 2],
+                    "top_logprobs": [{}, {"a": -0.2, "x": -0.3}, {"z": -0.4}],
+                }
+            }
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+
+    out = client.score_many([("P", "ab")], top_k=5)
+
+    assert capture["body"]["logprobs"] == 5
+    assert [token.text for token in out[0]] == ["a", "b"]
+    assert out[0][0].alternatives == (("a", -0.2), ("x", -0.3))
+    # the realized "b" may be absent from top_logprobs; its realized logprob still anchors support.
+    assert out[0][1].logprob == -1.1
+    assert out[0][1].alternatives == (("z", -0.4),)
+
+
+@pytest.mark.parametrize(
+    "top_logprobs",
+    ["omitted", None, [{}, {}], [None, None, None], [{}, {}, {}]],
+)
+def test_teacher_score_ignores_unusable_top_logprobs_metadata(monkeypatch, top_logprobs):
+    logprobs = {
+        "tokens": ["P", "a", "b"],
+        "token_logprobs": [None, -0.2, -1.1],
+        "text_offset": [0, 1, 2],
+    }
+    if top_logprobs != "omitted":
+        logprobs["top_logprobs"] = top_logprobs
+    _mock_urlopen(monkeypatch, {"choices": [{"logprobs": logprobs}]})
+
+    out = TeacherClient("k", "https://api.example/v1", "glm").score("P", "ab", top_k=5)
+
+    assert [(token.text, token.logprob, token.alternatives) for token in out] == [
+        ("a", -0.2, ()),
+        ("b", -1.1, ()),
+    ]
+
+
+@pytest.mark.parametrize("top_k", [True, False, 1.5, 0, 6])
+def test_teacher_score_many_rejects_invalid_top_k(top_k):
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+    with pytest.raises(ValueError, match="top_k"):
+        client.score_many([], top_k=top_k)
+
+
+@pytest.mark.parametrize("top_k", [1, 5])
+def test_teacher_score_many_accepts_top_k_bounds(monkeypatch, top_k):
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "a"],
+                    "token_logprobs": [None, -0.2],
+                    "text_offset": [0, 1],
+                    "top_logprobs": [{}, {"a": -0.2}],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    out = TeacherClient("k", "https://api.example/v1", "glm").score_many([("P", "a")], top_k=top_k)
+    assert out[0][0].text == "a"
 
 
 def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
@@ -2703,6 +2842,8 @@ def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monke
     assert (toks[0].start, toks[0].end) == (0, 2)  # max(0, 2-3)=0 ; 5-3=2
     assert (toks[1].start, toks[1].end) == (2, 3)  # 5-3=2 ; 6-3=3
     assert toks[0].logprob == -0.5  # the merged token's realized logprob is preserved
+    assert toks[0].crosses_prompt is True
+    assert toks[1].crosses_prompt is False
 
 
 def test_teacher_score_raises_on_malformed_response(monkeypatch):
@@ -3314,6 +3455,71 @@ def test_resolve_opd_knobs_eos_loss_coef_override(monkeypatch):
     assert _resolve(opd_eos_loss_coef=-3.0) == 0.0  # clamped non-negative
 
 
+def test_resolve_opd_knobs_validates_top_k_fkl_and_top_p(monkeypatch):
+    from flash.engine.recipe import RECIPE
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def __getattr__(self, name):
+            return None
+
+    def _resolve(**train):
+        monkeypatch.setattr(
+            opd_mod,
+            "_w",
+            SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train(**train)), THINKING=False),
+        )
+        return opd_mod._resolve_opd_knobs()
+
+    defaults = _resolve()
+    assert defaults.teacher_top_k == 1
+    assert defaults.fkl_coef == 0.0
+    assert defaults.top_p == RECIPE.opd.sampling_top_p == 1.0
+    assert _resolve(opd_teacher_top_k=5, opd_fkl_coef=0.25, top_p=0.8).top_p == 0.8
+
+    for value in (0, 6):
+        with pytest.raises(RuntimeError, match="opd_teacher_top_k"):
+            _resolve(opd_teacher_top_k=value)
+    with pytest.raises(RuntimeError, match="opd_fkl_coef"):
+        _resolve(opd_fkl_coef=-1.0)
+    with pytest.raises(RuntimeError, match="requires opd_teacher_top_k"):
+        _resolve(opd_teacher_top_k=1, opd_fkl_coef=0.1)
+    for value in (0.0, 1.5):
+        with pytest.raises(RuntimeError, match="top_p"):
+            _resolve(top_p=value)
+
+
+def test_opd_top_p_flows_from_schema_to_vllm_sampling_params(monkeypatch):
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "freesolo/test"},
+            "train": {"epochs": 1, "max_examples": 1, "top_p": 0.73},
+        }
+    )
+    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(JOB_SPEC=spec, THINKING=False))
+    knobs = opd_mod._resolve_opd_knobs()
+    captured = {}
+    engine = object.__new__(OpdVllmRolloutEngine)
+    engine.temperature = knobs.temperature
+    engine.top_p = knobs.top_p
+    engine.stop_sequences = ()
+    engine._StructuredOutputsParams = None
+    engine._SamplingParams = lambda **kwargs: captured.update(kwargs) or kwargs
+
+    engine._sampling_params(17)
+
+    assert captured["top_p"] == 0.73
+
+
 def test_train_spec_parses_opd_eos_loss_coef():
     """The [train].opd_eos_loss_coef knob parses and round-trips; omitted -> None (recipe default)."""
     from flash.spec import JobSpec
@@ -3331,9 +3537,7 @@ def test_opd_loss_skips_empty_student_group_without_crashing():
     from flash.engine.worker import opd as opd_mod
 
     rows = torch.zeros(1, 8, requires_grad=True)
-    loss = opd_mod._gkd_loss_from_logits_rows(
-        rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0
-    )
+    loss = opd_mod._gkd_loss_from_logits_rows(rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0)
     assert loss is not None  # the empty group is ignored; the real group still trains
     loss.backward()
     assert rows.grad is not None
@@ -3360,6 +3564,22 @@ def test_teacher_client_requires_key():
 # --------------------------------------------------------------------------------------------------
 # spec + cost plumbing
 # --------------------------------------------------------------------------------------------------
+def test_opd_top_k_fkl_top_p_jobspec_dict_round_trip():
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {
+            "algorithm": "opd",
+            "train": {"opd_teacher_top_k": 5, "opd_fkl_coef": 0.25, "top_p": 0.73},
+        }
+    )
+    restored = JobSpec.from_dict(spec.to_dict())
+
+    assert restored.train.opd_teacher_top_k == 5
+    assert restored.train.opd_fkl_coef == 0.25
+    assert restored.train.top_p == 0.73
+
+
 def test_opd_spec_json_round_trip():
     from flash.schema import spec_from_dict
     from flash.spec import JobSpec
@@ -3482,6 +3702,48 @@ def test_resolve_samples_batched_returns_differentiable_gkd_losses():
     assert model.w.grad[0].abs().sum() > 0
 
 
+def test_resolve_samples_batched_defaults_ignore_teacher_alternatives():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "a"
+
+        def encode(self, text, add_special_tokens=False):
+            return {"a": [2], "x": [3]}[text]
+
+    samples = [
+        (
+            opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1),
+            opd_mod._ScoreResult(
+                teacher_toks=[TeacherToken("a", -0.5, 0, 1, alternatives=(("x", -0.2),))],
+                status="ok",
+            ),
+            [1],
+        )
+    ]
+    legacy = opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", samples, SimpleNamespace(kl_coef=1.0), 1
+    )[0]
+    defaults = opd_mod._resolve_samples_batched(
+        _TinyLM(torch, T=3, V=8),
+        _Tok(),
+        "cpu",
+        samples,
+        SimpleNamespace(kl_coef=1.0, fkl_coef=0.0),
+        1,
+    )[0]
+
+    assert legacy.loss is not None
+    assert defaults.loss is not None
+    assert torch.equal(legacy.loss, defaults.loss)
+    assert legacy.fkl_term is None
+    assert defaults.fkl_term is None
+
+
 def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
@@ -3539,7 +3801,9 @@ def test_runaway_eos_scale_maps_truncation_to_coef_fraction():
         _runaway_eos_scale,
     )
 
-    assert _runaway_eos_scale(0.0) == 0.0  # no truncation -> no push (this is what prevents collapse)
+    assert (
+        _runaway_eos_scale(0.0) == 0.0
+    )  # no truncation -> no push (this is what prevents collapse)
     assert _runaway_eos_scale(_EOS_RUNAWAY_LO) == 0.0  # boundary: still off
     assert _runaway_eos_scale(_EOS_RUNAWAY_HI) == 1.0  # clear runaway -> full coef
     assert _runaway_eos_scale(1.0) == 1.0  # saturates (never exceeds 1x)
@@ -3670,16 +3934,28 @@ def test_resolve_samples_batched_backs_off_eos_on_overcorrection(monkeypatch):
     # Full runaway BUT the student is already collapsing to empty -> damp to 0 -> term guarded out.
     seen_coefs.clear()
     opd_mod._resolve_samples_batched(
-        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
-        runaway_rate=1.0, overcorr_rate=opd_mod._EOS_OVERCORR_HI,
+        _TinyLM(torch, T=3, V=8),
+        _Tok(),
+        "cpu",
+        _samples(),
+        knobs,
+        microbatch=1,
+        runaway_rate=1.0,
+        overcorr_rate=opd_mod._EOS_OVERCORR_HI,
     )
     assert seen_coefs == []
 
     # Full runaway, no empties -> full coef still reaches the term (no regression to #482/#493 behaviour).
     seen_coefs.clear()
     opd_mod._resolve_samples_batched(
-        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
-        runaway_rate=1.0, overcorr_rate=0.0,
+        _TinyLM(torch, T=3, V=8),
+        _Tok(),
+        "cpu",
+        _samples(),
+        knobs,
+        microbatch=1,
+        runaway_rate=1.0,
+        overcorr_rate=0.0,
     )
     assert seen_coefs
     assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)
@@ -3785,7 +4061,10 @@ def test_eos_reinforce_term_returns_none_when_not_applicable():
     V, eos = 6, 5
     logits = torch.zeros(3, V, requires_grad=True)
     # stop-string env, content-only ids -> the delimiter terminated it, not eos.
-    assert opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset({eos}), eos, ("</a>",), 1.0) is None
+    assert (
+        opd_mod._eos_reinforce_term(logits, 1, [2, 3], frozenset({eos}), eos, ("</a>",), 1.0)
+        is None
+    )
     # disabled
     assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, (), 0.0) is None
     # no eos defined + content-only -> nothing to target
@@ -3793,7 +4072,10 @@ def test_eos_reinforce_term_returns_none_when_not_applicable():
     # empty completion
     assert opd_mod._eos_reinforce_term(logits, 1, [], frozenset({eos}), eos, (), 1.0) is None
     # a trailing eos is reinforced EVEN with stop_sequences (it ended on eos, not the delimiter)
-    assert opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, ("</a>",), 1.0) is not None
+    assert (
+        opd_mod._eos_reinforce_term(logits, 1, [2, eos], frozenset({eos}), eos, ("</a>",), 1.0)
+        is not None
+    )
 
 
 def test_resolve_samples_batched_reinforces_terminal_eos():
@@ -3856,12 +4138,14 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     groups = [([0, 1], -0.75), ([2], -0.25)]
 
     loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
-    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
-        rows, dim=-1
-    )
+    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(
+        1
+    ) - torch.logsumexp(rows, dim=-1)
     coeff0 = 0.5 * (manual_logps[:2].detach().sum() - groups[0][1]) / 2
     coeff1 = 0.5 * (manual_logps[2:].detach().sum() - groups[1][1])
-    expected = torch.stack([coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]).mean()
+    expected = torch.stack(
+        [coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]
+    ).mean()
 
     assert loss is not None
     torch.testing.assert_close(loss, expected)
@@ -3874,6 +4158,105 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     prepared_loss = opd_mod._gkd_loss_from_logits_rows(rows2, student_ids, prepared, kl_coef=0.5)
     assert prepared_loss is not None
     torch.testing.assert_close(prepared_loss, expected.detach())
+
+
+def test_fkl_support_projection_and_loss_match_manual_math():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return {
+                "a": [7],
+                "same": [2],
+                "split": [4, 5],
+                "x": [1],
+                "b": [3],
+                "y": [0],
+            }[text]
+
+    student_toks = [StudentToken(2, 0, 1), StudentToken(3, 1, 2)]
+    teacher_toks = [
+        TeacherToken(
+            "a",
+            -0.2,
+            0,
+            1,
+            alternatives=(("a", -0.2), ("same", -0.2), ("split", -0.1), ("x", -0.3)),
+        ),
+        TeacherToken("b", -1.0, 1, 2, alternatives=(("y", -0.4),)),
+    ]
+    positions, dropped = opd_mod._prepare_fkl_positions(
+        _Tok(), student_toks, teacher_toks, [([0], -0.2), ([1], -1.0)]
+    )
+
+    assert dropped == 1
+    assert [position.token_ids for position in positions] == [(2, 1), (3, 0)]
+    assert all(sum(position.teacher_probs) == pytest.approx(1.0) for position in positions)
+    merged = math.exp(-0.2) + math.exp(-0.2)
+    expected_q0 = [merged / (merged + math.exp(-0.3)), math.exp(-0.3) / (merged + math.exp(-0.3))]
+    assert positions[0].teacher_probs == pytest.approx(expected_q0)
+
+    rows = torch.tensor([[0.1, 0.7, -0.2, 0.0], [0.8, -0.1, 0.2, 0.4]], requires_grad=True)
+    term = opd_mod._fkl_term_from_logits_rows(rows, positions)
+    row_logps = torch.log_softmax(rows, dim=-1)
+    q0 = torch.tensor(expected_q0)
+    q1 = torch.softmax(torch.tensor([-1.0, -0.4]), dim=0)
+    expected = torch.stack(
+        [
+            -(q0 * row_logps[0, torch.tensor([2, 1])]).sum(),
+            -(q1 * row_logps[1, torch.tensor([3, 0])]).sum(),
+        ]
+    ).mean()
+    torch.testing.assert_close(term, expected)
+    term.backward()
+    assert rows.grad is not None
+    assert torch.isfinite(rows.grad).all()
+
+
+def test_fkl_skips_prompt_crossing_teacher_token():
+    from flash.engine.worker import opd as opd_mod
+
+    positions, dropped = opd_mod._prepare_fkl_positions(
+        SimpleNamespace(encode=lambda text, add_special_tokens=False: [3]),
+        [StudentToken(2, 0, 1)],
+        [TeacherToken(" a", -0.2, 0, 1, alternatives=(("x", -0.3),), crosses_prompt=True)],
+        [([0], -0.2)],
+    )
+
+    assert positions == ()
+    assert dropped == 0
+
+
+def test_fkl_skips_span_with_zero_width_teacher_fragment():
+    from flash.engine.worker import opd as opd_mod
+
+    positions, dropped = opd_mod._prepare_fkl_positions(
+        SimpleNamespace(encode=lambda text, add_special_tokens=False: [3]),
+        [StudentToken(2, 0, 1)],
+        [
+            TeacherToken("", -0.4, 0, 0),
+            TeacherToken("a", -0.2, 0, 1, alternatives=(("x", -0.3),)),
+        ],
+        [([0], -0.6)],
+    )
+
+    assert positions == ()
+    assert dropped == 0
+
+
+def test_fkl_zero_eligible_positions_is_exact_zero_with_finite_grads():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    rows = torch.randn(2, 5, requires_grad=True)
+    term = opd_mod._fkl_term_from_logits_rows(rows, ())
+    assert float(term.detach()) == 0.0
+    term.backward()
+    assert rows.grad is not None
+    assert torch.isfinite(rows.grad).all()
+    assert torch.count_nonzero(rows.grad) == 0
 
 
 def test_opd_loss_none_without_groups_or_tokens():
@@ -3895,12 +4278,8 @@ def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     student_ids = [2]
     rows_hi = torch.zeros(1, V, requires_grad=True)  # uniform logits -> student logprob = -log V
     rows_lo = torch.zeros(1, V, requires_grad=True)
-    hi = opd_mod._gkd_loss_from_logits_rows(
-        rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0
-    )
-    lo = opd_mod._gkd_loss_from_logits_rows(
-        rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0
-    )
+    hi = opd_mod._gkd_loss_from_logits_rows(rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0)
+    lo = opd_mod._gkd_loss_from_logits_rows(rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0)
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
     # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
     assert hi is not None

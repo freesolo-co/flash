@@ -156,6 +156,9 @@ class OPDConfig:
     num_epochs: int = 1
     sampling_temperature: float = 1.0
     sampling_top_p: float = 1.0
+    # fireworks echo returns up to five alternatives per token; the opt-in forward term uses them.
+    teacher_top_k: int = 1
+    fkl_coef: float = 0.0
     # Reverse-KL coefficient for the groupwise reverse-KL loss; scales the per-span
     # (student_logsum - teacher_logsum) advantage. 1.0 is plain reverse KL (Thinking Machines,
     # *On-Policy Distillation*). Overridable via [train].kl_penalty_coef.

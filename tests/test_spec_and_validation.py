@@ -108,6 +108,9 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["opd_eos_loss_coef"] == "0.2.55"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
+    assert TRAIN_KEY_MIN_VERSIONS["top_p"] == "0.2.57"
+    assert TRAIN_KEY_MIN_VERSIONS["opd_teacher_top_k"] == "0.2.57"
+    assert TRAIN_KEY_MIN_VERSIONS["opd_fkl_coef"] == "0.2.57"
     assert {
         value
         for key, value in TRAIN_KEY_MIN_VERSIONS.items()
@@ -118,6 +121,9 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "opd_eos_loss_coef",
             "teacher_model",
             "structured_outputs",
+            "top_p",
+            "opd_teacher_top_k",
+            "opd_fkl_coef",
         }
     } == {"0.2.0"}
 
@@ -163,7 +169,11 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    assert historical_shapes["861571e7"] == TRAIN_SCHEMA_KEYS
+    assert historical_shapes["861571e7"] == TRAIN_SCHEMA_KEYS - {
+        "top_p",
+        "opd_teacher_top_k",
+        "opd_fkl_coef",
+    }
     assert all(baseline <= shape for shape in historical_shapes.values())
     for key in ("structured_outputs", "teacher_model"):
         rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
@@ -184,6 +194,46 @@ def test_opd_eos_loss_coef_accepted_by_schema() -> None:
     )  # unset -> recipe default at resolve
     with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
+
+
+def test_opd_top_k_fkl_and_top_p_schema_validation() -> None:
+    spec = spec_from_dict(
+        _raw(
+            algorithm="opd",
+            **{
+                "train.opd_teacher_top_k": 5,
+                "train.opd_fkl_coef": 0.25,
+                "train.top_p": 0.8,
+            },
+        )
+    )
+    assert spec.train.opd_teacher_top_k == 5
+    assert spec.train.opd_fkl_coef == 0.25
+    assert spec.train.top_p == 0.8
+    defaults = spec_from_dict(_raw(algorithm="opd"))
+    assert defaults.train.opd_teacher_top_k is None
+    assert defaults.train.opd_fkl_coef is None
+    assert defaults.train.top_p is None
+
+    for value in (0, 6):
+        with pytest.raises(ConfigError, match="opd_teacher_top_k"):
+            spec_from_dict(_raw(algorithm="opd", **{"train.opd_teacher_top_k": value}))
+    with pytest.raises(ConfigError, match="opd_fkl_coef"):
+        spec_from_dict(_raw(algorithm="opd", **{"train.opd_fkl_coef": -1.0}))
+    with pytest.raises(ConfigError, match=r"requires train\.opd_teacher_top_k"):
+        spec_from_dict(_raw(algorithm="opd", **{"train.opd_fkl_coef": 0.1}))
+    for value in (0.0, 1.5):
+        with pytest.raises(ConfigError, match="top_p"):
+            spec_from_dict(_raw(algorithm="opd", **{"train.top_p": value}))
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
+def test_top_p_is_rejected_outside_opd(algorithm) -> None:
+    raw = _raw(algorithm=algorithm, **{"train.top_p": 0.8})
+    if algorithm == "sft":
+        raw["train"]["max_examples"] = 10
+    with pytest.raises(ConfigError, match=r"train\.top_p is currently OPD-only"):
+        spec_from_dict(raw)
 
 
 def test_falsy_algorithm_defaults_to_sft() -> None:

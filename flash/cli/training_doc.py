@@ -413,9 +413,11 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 - **The student (Qwen / MiniCPM) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
-  KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
-  and works for any student tokenizer. When the tokenizers happen to agree it reduces to plain
-  per-token reverse KL (Thinking Machines, *On-Policy Distillation*). Nothing to configure.
+  KL using realized-token logprobs, so the default path (`opd_fkl_coef = 0`) needs no vocabulary
+  projection, covers every token exactly, and works for any student tokenizer. When the tokenizers
+  happen to agree it reduces to plain per-token reverse KL (Thinking Machines, *On-Policy
+  Distillation*). An optional forward top-k term can add teacher distribution signal at exact
+  one-token alignment positions; configure it with the knobs below only when you need that tradeoff.
 - **Works for multi-turn envs too.** Against an `EnvironmentMultiTurn`, opd rolls out each episode
   (driving `step_episode` / observations just like GRPO) and distils EVERY assistant turn against the
   teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
@@ -442,6 +444,9 @@ lora_rank = 32
 #                                                       # glm-5.2 (default) | deepseek-v4-pro | kimi-k2.6
 #                                                       # (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
+# opd_teacher_top_k = 1                                 # teacher alternatives requested, 1..5
+# opd_fkl_coef = 0.0                                    # forward top-k term scale; >0 requires top_k >=2
+# top_p = 1.0                                           # OPD rollout sampling nucleus, in (0, 1]
 # opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
 #                                                       # student runs past the length cap without
 #                                                       # stopping, 0 to disable

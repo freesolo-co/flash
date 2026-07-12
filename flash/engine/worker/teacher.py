@@ -3,9 +3,9 @@
 Reaches the GLM-5.2 teacher over the OpenAI-compatible API using only the Python standard library (no
 ``openai``/``requests`` dependency — the worker runs on stdlib here). One operation:
 
-- ``score``: echo-score a student completion (``echo=true, logprobs=1, max_tokens=0``) to get the
-  teacher's per-token REALIZED logprobs + CHARACTER offsets over the completion region only. This is
-  the on-policy signal for the groupwise reverse-KL (gkd) loss — it pays for input tokens only.
+- ``score``: echo-score a student completion (``echo=true, logprobs=K, max_tokens=0``) to get the
+  teacher's per-token realized logprobs, optional top-k alternatives, and character offsets over the
+  completion region only. This is the on-policy distillation signal and pays for input tokens only.
 
 All heavy work is inside methods; importing this module is CPU/offline-safe.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import numbers
 import time
 import urllib.error
 import urllib.request
@@ -93,9 +94,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         if o < 0 or o > full_len:
             _bad(f"teacher echo response text_offset {o!r} is outside [0, {full_len}]")
         if prev_off is not None and o < prev_off:
-            _bad(
-                f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}"
-            )
+            _bad(f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}")
         prev_off = o
     # Tiling from offsets[0] only proves coverage of full[offsets[0]:], so the echo must START at 0.
     # A malformed 200 that DROPS a prompt prefix and echoes a clean-tiling SUFFIX (offsets[0] > 0)
@@ -232,13 +231,21 @@ class TeacherClient:
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------
-    def score_many(self, items: list[tuple[str, str]]) -> list[list[TeacherToken]]:
+    def score_many(
+        self, items: list[tuple[str, str]], *, top_k: int = 1
+    ) -> list[list[TeacherToken]]:
         """Batch echo-score ``[(prompt_text, completion_text), ...]``.
 
         Fireworks' OpenAI-compatible completions endpoint accepts ``prompt`` as a list while still
         honoring ``echo=true`` and ``max_tokens=0``. OPD's hot path uses this to collapse many remote
         teacher round-trips into one request without changing the per-sample GKD signal.
         """
+        if (
+            isinstance(top_k, bool)
+            or not isinstance(top_k, numbers.Integral)
+            or not 1 <= top_k <= 5
+        ):
+            raise ValueError("top_k must be an integer between 1 and 5")
         if not items:
             return []
         fulls = [prompt_text + completion_text for prompt_text, completion_text in items]
@@ -250,9 +257,9 @@ class TeacherClient:
                 "prompt": fulls if len(fulls) > 1 else fulls[0],
                 "max_tokens": 0,
                 "echo": True,
-                # logprobs=1 is the minimum that returns per-token `token_logprobs` from the echo
-                # endpoint; gkd uses only that realized logprob, not the top-k alternatives.
-                "logprobs": 1,
+                # logprobs=1 preserves the realized-token-only reverse-kl path; values up to 5 also
+                # return per-position top_logprobs for the opt-in forward top-k term.
+                "logprobs": int(top_k),
                 "temperature": 0,
             },
         )
@@ -286,15 +293,21 @@ class TeacherClient:
                 f"teacher echo response missing choice index(es): {missing}", permanent=True
             )
         return [
-            self._tokens_from_choice(by_index[i], full=fulls[i], plen=plens[i])
+            self._tokens_from_choice(
+                by_index[i], full=fulls[i], plen=plens[i], include_alternatives=top_k > 1
+            )
             for i in range(len(fulls))
         ]
 
-    def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
+    def score(
+        self, prompt_text: str, completion_text: str, *, top_k: int = 1
+    ) -> list[TeacherToken]:
         """Echo-score one completion and return completion-region teacher tokens."""
-        return self.score_many([(prompt_text, completion_text)])[0]
+        return self.score_many([(prompt_text, completion_text)], top_k=top_k)[0]
 
-    def _tokens_from_choice(self, choice: dict, *, full: str, plen: int) -> list[TeacherToken]:
+    def _tokens_from_choice(
+        self, choice: dict, *, full: str, plen: int, include_alternatives: bool = False
+    ) -> list[TeacherToken]:
         completion_text = full[plen:]
         try:
             lp = choice["logprobs"]
@@ -306,6 +319,12 @@ class TeacherClient:
                 f"teacher echo response missing logprobs: {e}", permanent=True
             ) from e
         spans = _validate_echo(tokens, token_logprobs, offsets, full)
+        # top_logprobs is additive metadata, not part of the realized-token echo contract above. Accept
+        # it only when it has the expected parallel-list shape; missing, malformed, or per-position
+        # empty entries simply provide no alternatives and never invalidate an otherwise usable score.
+        top_logprobs = lp.get("top_logprobs") if include_alternatives else None
+        if not isinstance(top_logprobs, list) or len(top_logprobs) != len(tokens):
+            top_logprobs = [None] * len(tokens)
         out: list[TeacherToken] = []
         for i, (start, end) in enumerate(spans):
             # Drop tokens that lie ENTIRELY in the prompt (end <= plen). KEEP a token that CROSSES
@@ -331,12 +350,25 @@ class TeacherClient:
                     permanent=True,
                 )
             logprob = float(token_logprobs[i])
+            alternatives: list[tuple[str, float]] = []
+            position_alternatives = top_logprobs[i]
+            if isinstance(position_alternatives, dict):
+                for text, alt_logprob in position_alternatives.items():
+                    if not isinstance(text, str) or isinstance(alt_logprob, bool):
+                        continue
+                    if not isinstance(alt_logprob, (int, float)):
+                        continue
+                    value = float(alt_logprob)
+                    if math.isfinite(value) and value <= 1e-6:
+                        alternatives.append((text, value))
             out.append(
                 TeacherToken(
                     text=tokens[i],
                     logprob=logprob,
                     start=max(0, start - plen),
                     end=end - plen,
+                    alternatives=tuple(alternatives),
+                    crosses_prompt=start < plen,
                 )
             )
         # A non-empty completion must produce at least one completion-region teacher token. An empty

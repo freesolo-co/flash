@@ -118,15 +118,19 @@ class TrainSpec:
     max_examples: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     group_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    top_p: float | None = field(default=None, metadata={"introduced_in": "0.2.57"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     advantage_clip: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
-    # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
+    # opd only: weight of the terminal-eos behaviour-cloning term (recipe default when none). 0
+    # disables it. raise it for a student that keeps running past the length cap without emitting eos.
     opd_eos_loss_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.55"})
+    # opd only: fireworks echo support width and the forward top-k cross-entropy weight.
+    opd_teacher_top_k: int | None = field(default=None, metadata={"introduced_in": "0.2.57"})
+    opd_fkl_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.57"})
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
@@ -215,11 +219,14 @@ class JobSpec:
                 max_examples=_opt_int(train.get("max_examples")),
                 group_size=_opt_int(train.get("group_size")),
                 temperature=_opt_float(train.get("temperature")),
+                top_p=_opt_float(train.get("top_p")),
                 max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
+                opd_teacher_top_k=_opt_int(train.get("opd_teacher_top_k")),
+                opd_fkl_coef=_opt_float(train.get("opd_fkl_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),

@@ -21,12 +21,15 @@ from dataclasses import dataclass
 class TeacherToken:
     """One teacher token over the completion string. ``start``/``end`` are character offsets rebased
     to the completion (0 = first completion char). ``logprob`` is the teacher's log-probability of
-    the realized token."""
+    the realized token. ``alternatives`` holds Fireworks top-k token-text/logprob pairs when requested;
+    it is empty on the default top-1 path."""
 
     text: str
     logprob: float
     start: int
     end: int
+    alternatives: tuple[tuple[str, float], ...] = ()
+    crosses_prompt: bool = False
 
 
 @dataclass(frozen=True)

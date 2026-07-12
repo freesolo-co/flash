@@ -8,9 +8,9 @@ Cross-tokenizer bridge (teacher GLM vocab != student Qwen3.5 / MiniCPM vocab): t
 tokenize the same completion string differently, so their per-token distributions can't be compared
 directly. We align by SHARED DECODED-TEXT SPANS — the coarsest common refinement of the two
 tokenizations (a group boundary is any character offset that begins a token in BOTH tokenizers) — and
-apply reverse-KL per span using only the REALIZED-token logprobs on each side (the collinear-ai
-*spider* / Tinker method). No top-k candidates, no surface->vocab projection, so it is exact across
-arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align``.
+apply reverse-KL per span using the realized-token logprobs on each side (the collinear-ai
+*spider* / Tinker method). An opt-in forward term also projects Fireworks top-k token text through the
+student tokenizer at exact one-token/one-token spans. See ``tokenizer_align``.
 
 There is NO local reference model: the teacher lives behind the API. Sampling uses a colocated vLLM
 engine loaded with the student LoRA and refreshed after each optimizer step, matching GRPO's rollout
@@ -21,6 +21,7 @@ is CPU/offline-safe.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import random
 import time
@@ -149,6 +150,8 @@ class OpdKnobs:
     learning_rate: float = 0.0
     temperature: float = 0.0
     top_p: float = 1.0
+    teacher_top_k: int = RECIPE.opd.teacher_top_k
+    fkl_coef: float = RECIPE.opd.fkl_coef
     max_completion: int = 0
     prompts_per_step: int = 0
     group_size: int = 0
@@ -201,6 +204,25 @@ def _resolve_opd_knobs() -> OpdKnobs:
         teacher = resolve_teacher(opt("teacher_model", ""))
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
+    teacher_top_k_raw = opt("opd_teacher_top_k", d.teacher_top_k)
+    if (
+        isinstance(teacher_top_k_raw, bool)
+        or not isinstance(teacher_top_k_raw, (int, float))
+        or not math.isfinite(teacher_top_k_raw)
+        or float(teacher_top_k_raw) != int(teacher_top_k_raw)
+    ):
+        raise RuntimeError("opd: [train] opd_teacher_top_k must be an integer between 1 and 5")
+    teacher_top_k = int(teacher_top_k_raw)
+    fkl_coef = float(opt("opd_fkl_coef", d.fkl_coef))
+    top_p = float(opt("top_p", d.sampling_top_p))
+    if not 1 <= teacher_top_k <= 5:
+        raise RuntimeError("opd: [train] opd_teacher_top_k must be an integer between 1 and 5")
+    if not math.isfinite(fkl_coef) or fkl_coef < 0:
+        raise RuntimeError("opd: [train] opd_fkl_coef must be >= 0")
+    if fkl_coef > 0 and teacher_top_k < 2:
+        raise RuntimeError("opd: [train] opd_fkl_coef > 0 requires opd_teacher_top_k >= 2")
+    if not math.isfinite(top_p) or not 0 < top_p <= 1.0:
+        raise RuntimeError("opd: [train] top_p must be > 0 and <= 1.0")
     return OpdKnobs(
         teacher_model=teacher.model_id,
         teacher_base_url=d.teacher_base_url,
@@ -211,7 +233,9 @@ def _resolve_opd_knobs() -> OpdKnobs:
             if (t and t.temperature is not None)
             else d.sampling_temperature
         ),
-        top_p=d.sampling_top_p,
+        top_p=top_p,
+        teacher_top_k=teacher_top_k,
+        fkl_coef=fkl_coef,
         max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
         prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
         group_size=int(opt("group_size", 0) or d.group_size),
@@ -315,7 +339,9 @@ def _student_model(model_id, model_init_kwargs, device):
 
     # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
     # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(device)
+    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(
+        device
+    )
     return get_peft_model(base, init_peft), str(init_model)
 
 
@@ -694,9 +720,17 @@ def run_opd():
         sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
         refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
         advanced by the caller once per generated rollout so its timing is unchanged."""
-        nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
+        nonlocal \
+            teacher_ok, \
+            teacher_transient, \
+            teacher_error, \
+            truncated_rollouts, \
+            step_loss, \
+            step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema, empty_ema
+        nonlocal step_fkl_positions, step_fkl_groups, step_fkl_support_total
+        nonlocal step_fkl_alt_dropped, step_fkl_term_sum, step_fkl_seqs
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -731,6 +765,14 @@ def run_opd():
         if r.eos_logprob is not None:
             eos_logprob_sum += r.eos_logprob
             eos_logprob_n += 1
+        if float(getattr(knobs, "fkl_coef", 0.0) or 0.0) > 0:
+            step_fkl_positions += r.fkl_positions
+            step_fkl_groups += r.fkl_group_count
+            step_fkl_support_total += r.fkl_support_total
+            step_fkl_alt_dropped += r.fkl_alt_dropped
+            if r.fkl_term is not None:
+                step_fkl_term_sum += r.fkl_term
+                step_fkl_seqs += 1
         nseq += 1
         # Non-liveness progress ping WITHIN the step (rationale in _opd_progress).
         _opd_progress(opt_steps, nseq)
@@ -757,6 +799,7 @@ def run_opd():
     max_teacher_workers = _opd_teacher_workers(
         knobs.prompts_per_step * knobs.group_size, teacher_batch_size
     )
+
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -780,11 +823,20 @@ def run_opd():
             for no_signal_attempt in range(1, max_no_signal_attempts + 1):
                 it = step  # data-slice + display index for THIS rollout attempt
                 step += 1  # advance up front so the nseq==0 retry path can't spin forever
-                batch = [examples[(it * prompts_per_step + i) % len(examples)] for i in range(prompts_per_step)]
+                batch = [
+                    examples[(it * prompts_per_step + i) % len(examples)]
+                    for i in range(prompts_per_step)
+                ]
                 accum_target = max(1, prompts_per_step * group)
                 step_loss = 0.0
                 step_cov = 0.0
                 nseq = 0
+                step_fkl_positions = 0
+                step_fkl_groups = 0
+                step_fkl_support_total = 0
+                step_fkl_alt_dropped = 0
+                step_fkl_term_sum = 0.0
+                step_fkl_seqs = 0
                 step_skip_counts: Counter[str] = Counter()
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
                 # handed to the resident teacher pool, and completed teacher futures are converted into
@@ -804,6 +856,7 @@ def run_opd():
                             teacher,
                             batch,
                             thinking_prefill=thinking_prefill,
+                            teacher_top_k=knobs.teacher_top_k,
                         )
                         return scores, time.perf_counter() - started
 
@@ -1002,6 +1055,19 @@ def run_opd():
                     opd_phase_counts["vllm_syncs"] += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
+            fkl_metrics = {}
+            if knobs.fkl_coef > 0:
+                fkl_metrics = {
+                    "fkl_positions": step_fkl_positions,
+                    "fkl_eligible_frac": (
+                        step_fkl_positions / step_fkl_groups if step_fkl_groups else 0.0
+                    ),
+                    "fkl_support_mean": (
+                        step_fkl_support_total / step_fkl_positions if step_fkl_positions else 0.0
+                    ),
+                    "fkl_alt_dropped": step_fkl_alt_dropped,
+                    "fkl_term": step_fkl_term_sum / step_fkl_seqs if step_fkl_seqs else 0.0,
+                }
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
             _w.heartbeat(
@@ -1015,6 +1081,7 @@ def run_opd():
                 step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
+                **fkl_metrics,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
             )
@@ -1023,11 +1090,27 @@ def run_opd():
                 with contextlib.suppress(Exception):
                     import wandb
 
-                    wandb.log({"opd/loss": avg_loss, "opd/coverage": avg_cov}, step=opt_steps)
+                    wandb.log(
+                        {
+                            "opd/loss": avg_loss,
+                            "opd/coverage": avg_cov,
+                            **{f"opd/{key}": value for key, value in fkl_metrics.items()},
+                        },
+                        step=opt_steps,
+                    )
             if it % 10 == 0:
                 print(
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
+                    + (
+                        f" fkl_positions={fkl_metrics['fkl_positions']} "
+                        f"fkl_eligible_frac={fkl_metrics['fkl_eligible_frac']:.1%} "
+                        f"fkl_support_mean={fkl_metrics['fkl_support_mean']:.2f} "
+                        f"fkl_alt_dropped={fkl_metrics['fkl_alt_dropped']} "
+                        f"fkl_term={fkl_metrics['fkl_term']:.4f}"
+                        if fkl_metrics
+                        else ""
+                    )
                 )
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
             # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
@@ -1183,7 +1266,9 @@ def run_opd():
                 else None
             ),
             "opd_rollout_pipeline_max_chunks": (
-                _opd_rollout_pipeline_max_chunks(prompts_per_step * group) if not multi_turn else None
+                _opd_rollout_pipeline_max_chunks(prompts_per_step * group)
+                if not multi_turn
+                else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
@@ -1232,6 +1317,12 @@ class SampleResult:
     # Detached log P(eos) at the reinforced terminal position, when the EOS behaviour-cloning term
     # was applied (else None). Surfaced as mean_eos_logprob so a run's rising termination is visible.
     eos_logprob: float | None = None
+    # forward top-k diagnostics are populated only when opd_fkl_coef is enabled.
+    fkl_positions: int = 0
+    fkl_group_count: int = 0
+    fkl_support_total: int = 0
+    fkl_alt_dropped: int = 0
+    fkl_term: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1345,7 +1436,13 @@ def _generate_many_vllm(
 
 
 def _score_one(
-    teacher, gen_result, *, prompt_messages, thinking_prefill, max_attempts: int = 2
+    teacher,
+    gen_result,
+    *,
+    prompt_messages,
+    thinking_prefill,
+    teacher_top_k: int = 1,
+    max_attempts: int = 2,
 ) -> _ScoreResult:
     """[THREAD POOL — network only] Build the teacher prompt and echo-score the completion over the
     API. MUST NOT touch the torch model or any shared mutable state — it reads only the completion
@@ -1359,7 +1456,11 @@ def _score_one(
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
-            teacher_toks = teacher.score(teacher_prompt, gen_result.completion_text)
+            teacher_toks = (
+                teacher.score(teacher_prompt, gen_result.completion_text)
+                if teacher_top_k == 1
+                else teacher.score(teacher_prompt, gen_result.completion_text, top_k=teacher_top_k)
+            )
         except TeacherError as e:
             if e.permanent:  # bad key / model id / malformed -> abort now, don't burn the whole run
                 raise
@@ -1381,7 +1482,12 @@ def _score_one(
 
 
 def _score_many(
-    teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
+    teacher,
+    pendings: list[_Pending],
+    *,
+    thinking_prefill,
+    teacher_top_k: int = 1,
+    max_attempts: int = 2,
 ) -> list[_ScoreResult]:
     """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
     if not pendings:
@@ -1393,7 +1499,11 @@ def _score_many(
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
-            scored = teacher.score_many(prompts)
+            scored = (
+                teacher.score_many(prompts)
+                if teacher_top_k == 1
+                else teacher.score_many(prompts, top_k=teacher_top_k)
+            )
         except AttributeError:
             return [
                 _score_one(
@@ -1401,6 +1511,7 @@ def _score_many(
                     p.gen,
                     prompt_messages=p.prompt_messages,
                     thinking_prefill=thinking_prefill,
+                    teacher_top_k=teacher_top_k,
                     max_attempts=max_attempts,
                 )
                 for p in pendings
@@ -1436,7 +1547,16 @@ def _score_many(
                 for _ in pendings
             ]
         return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
-    return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
+    return [
+        _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
+    ]
+
+
+@dataclass(frozen=True)
+class _PreparedFklPosition:
+    row_index: int
+    token_ids: tuple[int, ...]
+    teacher_probs: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -1485,10 +1605,92 @@ class _PreparedLoss:
     prompt_ids: object
     student_ids: object
     groups: _PreparedGkdGroups
+    fkl_positions: tuple[_PreparedFklPosition, ...]
+    fkl_group_count: int
+    fkl_alt_dropped: int
     coverage: float
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
+
+
+def _student_encode_plain_text(tok, text: str) -> list[int]:
+    encode = getattr(tok, "encode", None)
+    if callable(encode):
+        return [int(x) for x in encode(text, add_special_tokens=False)]
+    encoded = tok(text, add_special_tokens=False)
+    ids = getattr(encoded, "input_ids", None)
+    if ids is None and isinstance(encoded, dict):
+        ids = encoded.get("input_ids")
+    return [int(x) for x in (ids or ())]
+
+
+def _prepare_fkl_positions(tok, student_toks, teacher_toks, groups):
+    """Project teacher top-k text onto exact one-token/one-token student alignment groups."""
+    positions: list[_PreparedFklPosition] = []
+    dropped = 0
+    for student_indices, _teacher_logsum in groups:
+        if len(student_indices) != 1:
+            continue
+        row_index = int(student_indices[0])
+        student_token = student_toks[row_index]
+        start, end = student_token.start, student_token.end
+        teacher_members = [tt for tt in teacher_toks if start <= tt.start < end and tt.end <= end]
+        if len(teacher_members) != 1:
+            continue
+        teacher_token = teacher_members[0]
+        if (teacher_token.start, teacher_token.end) != (start, end):
+            continue
+        if teacher_token.crosses_prompt:
+            continue
+        support: dict[int, float] = {int(student_token.token_id): float(teacher_token.logprob)}
+        for text, logprob in teacher_token.alternatives:
+            if text == teacher_token.text:
+                continue
+            encoded = _student_encode_plain_text(tok, text)
+            if len(encoded) != 1:
+                dropped += 1
+                continue
+            token_id = encoded[0]
+            value = float(logprob)
+            if token_id in support:
+                existing = support[token_id]
+                maximum = max(existing, value)
+                support[token_id] = maximum + math.log(
+                    math.exp(existing - maximum) + math.exp(value - maximum)
+                )
+            else:
+                support[token_id] = value
+        token_ids = tuple(support)
+        teacher_logprobs = tuple(support.values())
+        max_logprob = max(teacher_logprobs)
+        masses = tuple(math.exp(value - max_logprob) for value in teacher_logprobs)
+        total_mass = sum(masses)
+        positions.append(
+            _PreparedFklPosition(
+                row_index=row_index,
+                token_ids=token_ids,
+                teacher_probs=tuple(mass / total_mass for mass in masses),
+            )
+        )
+    return tuple(positions), dropped
+
+
+def _fkl_term_from_logits_rows(rows, positions):
+    import torch
+    import torch.nn.functional as F
+
+    if not positions:
+        # keep an exact zero attached to the graph so feature-on batches with no eligible positions
+        # remain differentiable and finite without changing the realized-token objective.
+        return rows.sum() * 0.0
+    terms = []
+    for position in positions:
+        row_logps = F.log_softmax(rows[position.row_index].float(), dim=-1)
+        ids = torch.tensor(position.token_ids, dtype=torch.long, device=rows.device)
+        probs = torch.tensor(position.teacher_probs, dtype=row_logps.dtype, device=rows.device)
+        terms.append(-(probs * row_logps.index_select(0, ids)).sum())
+    return torch.stack(terms).mean()
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -1522,12 +1724,10 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     )
     student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
     student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
-    teacher_logsum_t = torch.tensor(
-        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
+    teacher_logsum_t = torch.tensor(prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device)
+    coeffs = (
+        kl_coef * (student_group_logsum - teacher_logsum_t) / group_lengths_t.to(dtype=sp_t.dtype)
     )
-    coeffs = kl_coef * (
-        student_group_logsum - teacher_logsum_t
-    ) / group_lengths_t.to(dtype=sp_t.dtype)
     coeff_vec = coeffs.index_select(0, group_ids_t)
     sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()
@@ -1633,7 +1833,9 @@ def _eos_reinforce_term(
 # rollouts, then an all-empty collapse by step ~55/63. Fix: scale the coef by how much the student is
 # CURRENTLY failing to terminate (an EMA of the per-rollout truncation rate), so a run that stops
 # reliably gets ~zero EOS push and cannot ratchet, while genuine runaway still drives full reinforcement.
-_EOS_RUNAWAY_LO = 0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
+_EOS_RUNAWAY_LO = (
+    0.02  # truncation rate <= this: student stops fine -> NO reinforcement (no ratchet)
+)
 _EOS_RUNAWAY_HI = 0.15  # truncation rate >= this: full opd_eos_loss_coef (clear runaway to correct)
 _EOS_TRUNC_EMA_DECAY = 0.97  # per-rollout EMA (~30-rollout window): responsive yet smoothed
 
@@ -1658,8 +1860,12 @@ def _runaway_eos_scale(runaway_rate: float) -> float:
 # over-correction — giving two-sided negative feedback: reinforce EOS when running away, but SHUT THE
 # PUSH OFF the moment the student starts emitting eos first. Empties are always a failure (never
 # task-length like a truncation), so damp aggressively.
-_EOS_OVERCORR_LO = 0.01  # empty-rate EMA <= this: no damping (full reinforcement per _runaway_eos_scale)
-_EOS_OVERCORR_HI = 0.05  # empty-rate EMA >= this: reinforcement fully suppressed (student over-stops)
+_EOS_OVERCORR_LO = (
+    0.01  # empty-rate EMA <= this: no damping (full reinforcement per _runaway_eos_scale)
+)
+_EOS_OVERCORR_HI = (
+    0.05  # empty-rate EMA >= this: reinforcement fully suppressed (student over-stops)
+)
 
 
 def _overcorrection_damp(empty_rate: float) -> float:
@@ -1731,6 +1937,12 @@ def _resolve_samples_batched(
         coverage = groupwise_coverage(groups, student_toks)
         n_align = sum(1 for st in student_toks if st.end > st.start)
         group_granularity = (n_align / len(groups)) if groups else 0.0
+        fkl_positions: tuple[_PreparedFklPosition, ...] = ()
+        fkl_alt_dropped = 0
+        if float(getattr(knobs, "fkl_coef", 0.0) or 0.0) > 0:
+            fkl_positions, fkl_alt_dropped = _prepare_fkl_positions(
+                tok, student_toks, score.teacher_toks, groups
+            )
         prepared_groups = _prepare_gkd_groups(groups)
         if prepared_groups is None:
             results[idx] = SampleResult(
@@ -1748,6 +1960,9 @@ def _resolve_samples_batched(
                 prompt_ids=prompt_ids,
                 student_ids=student_ids,
                 groups=prepared_groups,
+                fkl_positions=fkl_positions,
+                fkl_group_count=len(groups),
+                fkl_alt_dropped=fkl_alt_dropped,
                 coverage=coverage,
                 gen_tokens=gen.gen_tokens,
                 teacher_tokens=teacher_tokens,
@@ -1766,13 +1981,9 @@ def _resolve_samples_batched(
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros(
-                (len(seqs), max_len), dtype=torch.long, device=device
-            )
+            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(
-                    seq, dtype=torch.long, device=device
-                )
+                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
             losses = []
@@ -1793,6 +2004,11 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
+                    fkl_term_value = None
+                    if float(getattr(knobs, "fkl_coef", 0.0) or 0.0) > 0:
+                        fkl_term = _fkl_term_from_logits_rows(rows, p.fkl_positions)
+                        loss = loss + float(knobs.fkl_coef) * fkl_term
+                        fkl_term_value = float(fkl_term.detach())
                     # Behaviour-clone the terminal stop the reverse-KL alignment cannot reach. Added
                     # to the distilled samples only (loss is not None), so no-signal skip accounting is
                     # unchanged. logits[row] is this sample's per-position logits [max_len, V]; the term
@@ -1823,6 +2039,11 @@ def _resolve_samples_batched(
                         teacher_tokens=p.teacher_tokens,
                         group_granularity=p.group_granularity,
                         eos_logprob=eos_logprob,
+                        fkl_positions=len(p.fkl_positions),
+                        fkl_group_count=p.fkl_group_count,
+                        fkl_support_total=sum(len(pos.token_ids) for pos in p.fkl_positions),
+                        fkl_alt_dropped=p.fkl_alt_dropped,
+                        fkl_term=fkl_term_value,
                     )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
