@@ -766,3 +766,116 @@ def test_c13_requires_explicit_typed_cadence_and_round_trips():
             {**raw, "train": {"opd_objective_ids": ["c0"], "opd_topk_cadence": 4}},
             run_id="c0",
         )
+
+
+def test_c13_composes_with_another_objective_without_firing(monkeypatch):
+    """c13 selected alongside c05 but cadence exceeds the completion: c13 does no candidate
+    work (no teacher candidate calls, no metered tokens, no term) while c05 still evaluates and
+    the base gkd gradient is preserved."""
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.tokenizer_align import TeacherToken
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            mapping = {1: "p", 2: "a", 3: "b", 4: "c", 5: ""}
+            return "".join(mapping.get(int(token_id), "d") for token_id in ids)
+
+    class _Model:
+        def __init__(self):
+            self.weight = torch.tensor(
+                [
+                    [0.0, 0.0, 2.0, 1.0, 0.5, 9.0],
+                    [0.0, 0.0, 2.0, 1.0, 0.5, 9.0],
+                    [0.0] * 6,
+                ],
+                requires_grad=True,
+            )
+            self.config = SimpleNamespace(use_cache=True)
+
+        def __call__(self, input_ids, **_kwargs):
+            batch, length = input_ids.shape
+            return SimpleNamespace(logits=self.weight[:length].unsqueeze(0).expand(batch, -1, -1))
+
+        def parameters(self):
+            return [self.weight]
+
+        def train(self, mode=True):
+            return self
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            return [
+                [TeacherToken(surface, -0.1 * (index + 1), 0, len(surface))]
+                for index, (_context, surface) in enumerate(items)
+            ]
+
+    monkeypatch.setattr(
+        opd_mod, "_teacher_prompt_text", lambda prompt_messages, thinking_prefill="": "teacher:"
+    )
+    model = _Model()
+    teacher = _Teacher()
+    gen = opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2)
+    pending = opd_mod._Pending(
+        gen=gen,
+        prompt_ids=[1],
+        prompt_messages=[{"role": "user", "content": "p"}],
+    )
+    # cadence larger than the completion => no selected student prefixes, so no retention.
+    retain_teacher_prompts = opd_mod._retain_candidate_teacher_prompt(
+        [pending], cadence=100, candidate_topk=True
+    )
+    assert retain_teacher_prompts == (False,)
+    score = opd_mod._score_many(
+        teacher,
+        [pending],
+        thinking_prefill="",
+        retain_teacher_prompts=retain_teacher_prompts,
+    )[0]
+    assert score.teacher_prompt == ""
+    meter = TeacherInputMeter()
+    meter.record_ordinary(20)
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05", "c13"),
+        topk_cadence=100,
+    )
+    samples = [(gen, score, [1])]
+
+    result = opd_mod._resolve_samples_batched(
+        model,
+        _Tok(),
+        "cpu",
+        samples,
+        knobs,
+        microbatch=1,
+        teacher=teacher,
+        topk_meter=meter,
+        topk_cache={},
+    )[0]
+    result.loss.backward()
+
+    # only the base completion scoring hit the teacher; c13 never requested candidates.
+    assert len(teacher.calls) == 1
+    assert meter.candidate_tokens == 0
+    assert not meter.budget_exhausted
+    assert model.weight.grad is not None
+    assert float(model.weight.grad.abs().sum()) > 0
+    metrics = dict(result.objective_metrics)
+    # c13 is present but did not fire.
+    assert metrics["opd/objectives/c13/selected_prefixes"] == 0.0
+    assert metrics["opd/objectives/c13/scored_prefixes"] == 0.0
+    assert metrics["opd/objectives/c13/budget_exhausted"] == 0.0
+    # the co-selected objective still evaluated and emitted its own namespaced metrics.
+    assert any(key.startswith("opd/objectives/c05/") for key in metrics)
