@@ -1391,7 +1391,7 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     events: list[tuple[str, int, int]] = []
     first_score_started = threading.Event()
 
-    def _generate_many_vllm(_rollout, _tok, prompt_ids_batch, _knobs, *, max_tokens):
+    def _generate_many_vllm(_rollout, _tok, prompt_ids_batch, _knobs, *, max_tokens, eos_ids=None):
         call_idx = sum(1 for e in events if e[0] == "generate")
         if call_idx == 1:
             first_score_started.wait(timeout=1.0)
@@ -3886,6 +3886,52 @@ def test_c05_empty_eos_rollout_gets_prompt_only_recovery_for_complete_eos_set():
     result.loss.backward()
     assert model.w.grad[0, 3] > 0
     assert model.w.grad[0, 5] > 0
+
+
+def test_c05_recovers_empty_vllm_rollout_stopped_by_model_only_secondary_eos():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 3
+
+        def decode(self, ids, skip_special_tokens=True):
+            return ""
+
+    class _Rollout:
+        def generate(self, prompt_ids_batch, *, max_tokens):
+            assert prompt_ids_batch == [[1]]
+            assert max_tokens == 8
+            return [opd_mod.OpdVllmOutput([], "", finish_reason="stop", stop_reason=5)]
+
+    model = _TinyLM(torch, T=1, V=8)
+    model.generation_config = SimpleNamespace(eos_token_id=(3, 5))
+    eos_ids = opd_mod._generation_eos_ids(model, _Tok())
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05",),
+    )
+
+    gen = opd_mod._generate_many_vllm(
+        _Rollout(), _Tok(), [[1]], knobs, max_tokens=8, eos_ids=eos_ids
+    )[0]
+    result = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", [(gen, None, [1])], knobs, microbatch=1
+    )[0]
+
+    assert eos_ids == frozenset({3, 5})
+    assert gen.skip_reason == "empty_completion"
+    assert gen.termination_cause == "eos"
+    assert result.loss is not None
+    assert result.empty_recovery is True
+    assert result.teacher_status is None
+    assert result.termination_cause == "eos"
+    assert dict(result.objective_metrics)["opd/objectives/c05/empty_recovery"] == 1.0
 
 
 def test_c05_empty_recovery_is_default_off_and_c0_parity_is_unchanged():

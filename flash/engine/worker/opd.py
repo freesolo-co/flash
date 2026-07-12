@@ -642,7 +642,9 @@ def run_opd():
             model.enable_input_require_grads()
             print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
     # The HF/PEFT model only handles differentiable loss forwards; the colocated vLLM engine owns
-    # KV-cached student rollout generation.
+    # KV-cached student rollout generation. Resolve every generation-halting eos id once while both the
+    # model and tokenizer configs are available, then reuse the same set for all rollout classification.
+    generation_eos_ids = _generation_eos_ids(model, tok)
     model.config.use_cache = False
 
     # vLLM's EngineCore starts in a separate process and cannot reuse CUDA blocks PyTorch is only
@@ -793,7 +795,12 @@ def run_opd():
         def generate_fn(prefix_ids, max_new):
             """One turn's generation through the colocated vLLM engine."""
             return _generate_many_vllm(
-                vllm_rollout, tok, [prefix_ids], knobs, max_tokens=max(1, int(max_new))
+                vllm_rollout,
+                tok,
+                [prefix_ids],
+                knobs,
+                max_tokens=max(1, int(max_new)),
+                eos_ids=generation_eos_ids,
             )[0]
 
     def _account(r, *, backward: bool = True):
@@ -1090,6 +1097,7 @@ def run_opd():
                                 chunk_prompts,
                                 knobs,
                                 max_tokens=knobs.max_completion,
+                                eos_ids=generation_eos_ids,
                             )
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
@@ -1530,7 +1538,7 @@ def _termination_cause(out: OpdVllmOutput, completion_ids, stop_text: str, eos_i
     return "unknown"
 
 
-def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
+def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
     forced = tuple(bool(f) for f in (getattr(out, "forced", ()) or ()))
@@ -1539,7 +1547,8 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         decode(completion_ids, skip_special_tokens=True) if decode else ""
     )
     stop_text = decode(completion_ids, skip_special_tokens=False) if decode else completion_text
-    eos_ids = _generation_eos_ids(None, tok)
+    if eos_ids is None:
+        eos_ids = _generation_eos_ids(None, tok)
     termination_cause = _termination_cause(
         out, completion_ids, stop_text, eos_ids, knobs.stop_sequences
     )
@@ -1592,10 +1601,16 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
 
 
 def _generate_many_vllm(
-    rollout: OpdVllmRolloutEngine, tok, prompt_ids_batch: list[list[int]], knobs, *, max_tokens: int
+    rollout: OpdVllmRolloutEngine,
+    tok,
+    prompt_ids_batch: list[list[int]],
+    knobs,
+    *,
+    max_tokens: int,
+    eos_ids=None,
 ) -> list[_GenResult]:
     return [
-        _gen_from_vllm_output(out, tok, knobs)
+        _gen_from_vllm_output(out, tok, knobs, eos_ids=eos_ids)
         for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
     ]
 
