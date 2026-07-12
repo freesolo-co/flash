@@ -263,7 +263,7 @@ def test_c13_cadence_larger_than_completion_does_no_candidate_work():
             SimpleNamespace(
                 prompt_ids=[1],
                 student_ids=[2],
-                candidate_teacher_prompt="teacher:",
+                score_result=SimpleNamespace(teacher_prompt="teacher:"),
             )
         ],
         _Tok(),
@@ -311,7 +311,7 @@ def test_c13_candidate_set_admission_is_atomic_at_prefix_boundary():
             SimpleNamespace(
                 prompt_ids=[1] * 8,
                 student_ids=[2, 3],
-                candidate_teacher_prompt="teacher:",
+                score_result=SimpleNamespace(teacher_prompt="teacher:"),
             )
         ],
         _Tok(),
@@ -360,7 +360,7 @@ def test_c13_rejects_single_surface_prefix_before_metering_or_calls():
             SimpleNamespace(
                 prompt_ids=[9],
                 student_ids=[9, 9],
-                candidate_teacher_prompt="teacher:",
+                score_result=SimpleNamespace(teacher_prompt="teacher:"),
             )
         ],
         _Tok(),
@@ -380,7 +380,109 @@ def test_c13_rejects_single_surface_prefix_before_metering_or_calls():
     assert not outputs[0].budget_exhausted
 
 
-def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
+@pytest.mark.parametrize("objective_ids", [(), ("c0",), ("c13",)])
+def test_nonfiring_objectives_do_not_render_or_allocate_candidate_prompts(
+    monkeypatch, objective_ids
+):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.tokenizer_align import TeacherToken
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 5
+
+        def decode(self, ids, skip_special_tokens=True):
+            mapping = {1: "p", 2: "a", 5: ""}
+            return "".join(mapping.get(int(token_id), "d") for token_id in ids)
+
+    class _Model:
+        def __init__(self):
+            self.weight = torch.tensor(
+                [[0.0, 0.0, 2.0, 1.0, 0.5, 9.0], [0.0] * 6], requires_grad=True
+            )
+            self.config = SimpleNamespace(use_cache=True)
+
+        def __call__(self, input_ids, **_kwargs):
+            batch, length = input_ids.shape
+            return SimpleNamespace(logits=self.weight[:length].unsqueeze(0).expand(batch, -1, -1))
+
+        def parameters(self):
+            return [self.weight]
+
+        def train(self, mode=True):
+            return self
+
+    class _Teacher:
+        def __init__(self):
+            self.calls = []
+
+        def score_many(self, items):
+            self.calls.append(items)
+            return [[TeacherToken(surface, -0.5, 0, len(surface))] for _context, surface in items]
+
+    rendered = []
+
+    def _render_teacher_prompt(prompt_messages, thinking_prefill=""):
+        rendered.append((prompt_messages, thinking_prefill))
+        return "teacher:"
+
+    monkeypatch.setattr(opd_mod, "_teacher_prompt_text", _render_teacher_prompt)
+    teacher = _Teacher()
+    gen = opd_mod._GenResult(completion_ids=[2], completion_text="a", gen_tokens=1)
+    pending = opd_mod._Pending(
+        gen=gen,
+        prompt_ids=[1],
+        prompt_messages=[{"role": "user", "content": "p"}],
+    )
+    candidate_topk = objective_ids == ("c13",)
+    retain_teacher_prompt = opd_mod._retain_candidate_teacher_prompt(
+        [pending], cadence=100, candidate_topk=candidate_topk
+    )
+    score = opd_mod._score_many(
+        teacher,
+        [pending],
+        thinking_prefill="",
+        retain_teacher_prompt=retain_teacher_prompt,
+    )[0]
+
+    assert not retain_teacher_prompt
+    assert len(rendered) == 1
+    assert score.teacher_prompt == ""
+    meter = TeacherInputMeter() if candidate_topk else None
+    if meter is not None:
+        meter.record_ordinary(2)
+    results = opd_mod._resolve_samples_batched(
+        _Model(),
+        _Tok(),
+        "cpu",
+        [(gen, score, [1])],
+        SimpleNamespace(
+            kl_coef=1.0,
+            eos_loss_coef=0.0,
+            entropy_floor_coef=0.0,
+            entropy_floor=0.0,
+            stop_sequences=(),
+            objective_ids=objective_ids,
+            topk_cadence=100,
+        ),
+        microbatch=1,
+        teacher=teacher if meter is not None else None,
+        topk_meter=meter,
+        topk_cache={} if meter is not None else None,
+    )
+
+    assert len(rendered) == 1
+    assert len(teacher.calls) == 1
+    assert results[0].loss is not None
+    if meter is not None:
+        assert meter.candidate_tokens == 0
+        metrics = dict(results[0].objective_metrics)
+        assert metrics["opd/objectives/c13/selected_prefixes"] == 0.0
+        assert metrics["opd/objectives/c13/scored_prefixes"] == 0.0
+
+
+def test_c13_integrates_candidate_teacher_scores_into_loss_gradient(monkeypatch):
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
     from flash.engine.worker.tokenizer_align import TeacherToken
@@ -426,8 +528,33 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
                 for index, (_context, surface) in enumerate(items)
             ]
 
+    rendered = []
+
+    def _render_teacher_prompt(prompt_messages, thinking_prefill=""):
+        rendered.append((prompt_messages, thinking_prefill))
+        return "teacher:"
+
+    monkeypatch.setattr(opd_mod, "_teacher_prompt_text", _render_teacher_prompt)
     model = _Model()
     teacher = _Teacher()
+    gen = opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2)
+    pending = opd_mod._Pending(
+        gen=gen,
+        prompt_ids=[1],
+        prompt_messages=[{"role": "user", "content": "p"}],
+    )
+    retain_teacher_prompt = opd_mod._retain_candidate_teacher_prompt(
+        [pending], cadence=1, candidate_topk=True
+    )
+    score = opd_mod._score_many(
+        teacher,
+        [pending],
+        thinking_prefill="",
+        retain_teacher_prompt=retain_teacher_prompt,
+    )[0]
+    assert retain_teacher_prompt
+    assert len(rendered) == 1
+    assert score.teacher_prompt == "teacher:"
     meter = TeacherInputMeter()
     meter.record_ordinary(20)
     knobs = SimpleNamespace(
@@ -439,13 +566,7 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
         objective_ids=("c13",),
         topk_cadence=1,
     )
-    samples = [
-        (
-            opd_mod._GenResult(completion_ids=[2, 3], completion_text="ab", gen_tokens=2),
-            opd_mod._ScoreResult(teacher_toks=[TeacherToken("ab", -0.5, 0, 2)], status="ok"),
-            [1],
-        )
-    ]
+    samples = [(gen, score, [1])]
 
     result = opd_mod._resolve_samples_batched(
         model,
@@ -455,14 +576,14 @@ def test_c13_integrates_candidate_teacher_scores_into_loss_gradient():
         knobs,
         microbatch=1,
         teacher=teacher,
-        candidate_teacher_prompts=["teacher:"],
         topk_meter=meter,
         topk_cache={},
     )[0]
     result.loss.backward()
 
-    assert len(teacher.calls) == 1
-    assert len(teacher.calls[0]) >= 2
+    assert len(rendered) == 1
+    assert len(teacher.calls) == 2
+    assert len(teacher.calls[1]) >= 2
     assert model.weight.grad is not None
     assert float(model.weight.grad.abs().sum()) > 0
     metrics = dict(result.objective_metrics)

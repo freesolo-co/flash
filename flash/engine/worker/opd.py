@@ -981,7 +981,6 @@ def run_opd():
                 # exact mean one over the aligned samples contributing to this optimizer update.
                 teacher_futures: dict[Future, list[_Pending]] = {}
                 step_scored_samples: list[tuple[_GenResult, _ScoreResult, object]] = []
-                step_scored_candidate_teacher_prompts: list[str] = []
 
                 def _queue_teacher_batch(
                     pendings: list[_Pending],
@@ -990,10 +989,16 @@ def run_opd():
                 ) -> None:
                     def _score_many_timed(batch: list[_Pending]):
                         started = time.perf_counter()
+                        retain_teacher_prompt = _retain_candidate_teacher_prompt(
+                            batch,
+                            cadence=knobs.topk_cadence,
+                            candidate_topk=topk_meter is not None,
+                        )
                         scores = _score_many(
                             teacher,
                             batch,
                             thinking_prefill=thinking_prefill,
+                            retain_teacher_prompt=retain_teacher_prompt,
                         )
                         return scores, time.perf_counter() - started
 
@@ -1064,16 +1069,11 @@ def run_opd():
                             f"opd teacher batch returned {len(scores)} score(s) for {len(batch)} sample(s)"
                         )
                     scored_samples = []
-                    candidate_teacher_prompts = []
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
-                        candidate_teacher_prompts.append(
-                            _teacher_prompt_text(p.prompt_messages, thinking_prefill)
-                        )
                     if objective_plan.requirements.repetition_weighting:
                         _step_scored_samples.extend(scored_samples)
-                        step_scored_candidate_teacher_prompts.extend(candidate_teacher_prompts)
                         return
                     loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
@@ -1087,7 +1087,6 @@ def run_opd():
                         runaway_rate=trunc_ema,
                         overcorr_rate=empty_ema,
                         teacher=teacher,
-                        candidate_teacher_prompts=candidate_teacher_prompts,
                         topk_meter=topk_meter,
                         topk_cache=topk_cache,
                     )
@@ -1240,7 +1239,6 @@ def run_opd():
                         runaway_rate=trunc_ema,
                         overcorr_rate=empty_ema,
                         teacher=teacher,
-                        candidate_teacher_prompts=step_scored_candidate_teacher_prompts,
                         topk_meter=topk_meter,
                         topk_cache=topk_cache,
                     )
@@ -1640,6 +1638,7 @@ class _ScoreResult:
     teacher_toks: object = None
     status: str = "ok"
     error: str = ""
+    teacher_prompt: str = ""
 
 
 def _sample_skip_reason(r: SampleResult) -> str:
@@ -1881,7 +1880,14 @@ def _greedy_sidecar_unlikelihood(
 
 
 def _score_one(
-    teacher, gen_result, *, prompt_messages, thinking_prefill, max_attempts: int = 2
+    teacher,
+    gen_result,
+    *,
+    prompt_messages,
+    thinking_prefill,
+    max_attempts: int = 2,
+    teacher_prompt: str | None = None,
+    retain_teacher_prompt: bool = False,
 ) -> _ScoreResult:
     """[THREAD POOL — network only] Build the teacher prompt and echo-score the completion over the
     API. MUST NOT touch the torch model or any shared mutable state — it reads only the completion
@@ -1891,7 +1897,9 @@ def _score_one(
     Error semantics are the shared OPD teacher semantics: a PERMANENT ``TeacherError`` propagates (the
     run aborts), a transient one -> status "transient", any other exception -> status "error"; both
     leave the sample skipped with no teacher signal."""
-    teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
+    if teacher_prompt is None:
+        teacher_prompt = _teacher_prompt_text(prompt_messages, thinking_prefill)
+    result_prompt = teacher_prompt if retain_teacher_prompt else ""
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
@@ -1905,26 +1913,43 @@ def _score_one(
                 )
                 continue
             print(f"[opd] teacher score failed (transient, skipping sample): {e}")
-            return _ScoreResult(status="transient", error=str(e))
+            return _ScoreResult(status="transient", error=str(e), teacher_prompt=result_prompt)
         except Exception as e:
             if attempt < attempts:
                 print(f"[opd] teacher score failed (retrying sample {attempt}/{attempts}): {e}")
                 continue
             print(f"[opd] teacher score failed (skipping sample): {e}")
-            return _ScoreResult(status="error", error=str(e))
-        return _ScoreResult(teacher_toks=teacher_toks, status="ok")
-    return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
+            return _ScoreResult(status="error", error=str(e), teacher_prompt=result_prompt)
+        return _ScoreResult(teacher_toks=teacher_toks, status="ok", teacher_prompt=result_prompt)
+    return _ScoreResult(
+        status="error", error="teacher scoring attempts exhausted", teacher_prompt=result_prompt
+    )
+
+
+def _retain_candidate_teacher_prompt(
+    pendings: list[_Pending], *, cadence: int | None, candidate_topk: bool
+) -> bool:
+    if not candidate_topk:
+        return False
+    value = int(cadence)
+    return any(selected_prefix_indices(len(p.gen.completion_ids or ()), value) for p in pendings)
 
 
 def _score_many(
-    teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
+    teacher,
+    pendings: list[_Pending],
+    *,
+    thinking_prefill,
+    max_attempts: int = 2,
+    retain_teacher_prompt: bool = False,
 ) -> list[_ScoreResult]:
     """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
     if not pendings:
         return []
+    teacher_prompts = [_teacher_prompt_text(p.prompt_messages, thinking_prefill) for p in pendings]
     prompts = [
-        (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
-        for p in pendings
+        (teacher_prompt, p.gen.completion_text)
+        for teacher_prompt, p in zip(teacher_prompts, pendings, strict=True)
     ]
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
@@ -1938,8 +1963,10 @@ def _score_many(
                     prompt_messages=p.prompt_messages,
                     thinking_prefill=thinking_prefill,
                     max_attempts=max_attempts,
+                    teacher_prompt=teacher_prompt,
+                    retain_teacher_prompt=retain_teacher_prompt,
                 )
-                for p in pendings
+                for p, teacher_prompt in zip(pendings, teacher_prompts, strict=True)
             ]
         except TeacherError as e:
             if e.permanent:
@@ -1953,7 +1980,14 @@ def _score_many(
             print(
                 f"[opd] teacher batch failed (transient, skipping batch, samples={len(pendings)}): {e}"
             )
-            return [_ScoreResult(status="transient", error=str(e)) for _ in pendings]
+            return [
+                _ScoreResult(
+                    status="transient",
+                    error=str(e),
+                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
+                )
+                for teacher_prompt in teacher_prompts
+            ]
         except Exception as e:
             if attempt < attempts:
                 print(
@@ -1962,18 +1996,38 @@ def _score_many(
                 )
                 continue
             print(f"[opd] teacher batch failed (skipping batch, samples={len(pendings)}): {e}")
-            return [_ScoreResult(status="error", error=str(e)) for _ in pendings]
+            return [
+                _ScoreResult(
+                    status="error",
+                    error=str(e),
+                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
+                )
+                for teacher_prompt in teacher_prompts
+            ]
         if len(scored) != len(pendings):
             return [
                 _ScoreResult(
                     status="error",
                     error=f"teacher batch returned {len(scored)} score(s) for {len(pendings)} sample(s)",
+                    teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
                 )
-                for _ in pendings
+                for teacher_prompt in teacher_prompts
             ]
-        return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
+        return [
+            _ScoreResult(
+                teacher_toks=toks,
+                status="ok",
+                teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
+            )
+            for toks, teacher_prompt in zip(scored, teacher_prompts, strict=True)
+        ]
     return [
-        _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
+        _ScoreResult(
+            status="error",
+            error="teacher batch attempts exhausted",
+            teacher_prompt=teacher_prompt if retain_teacher_prompt else "",
+        )
+        for teacher_prompt in teacher_prompts
     ]
 
 
@@ -2033,7 +2087,7 @@ class _PreparedLoss:
     sequence_weight: float = 1.0
     empty_rollout: bool = False
     termination_cause: str = ""
-    candidate_teacher_prompt: str = ""
+    score_result: object = None
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -2350,10 +2404,13 @@ def _candidate_objectives_for_chunk(
             invalid += invalid_count
             if len(groups) < 2:
                 continue
+            teacher_prompt = getattr(prepared.score_result, "teacher_prompt", "")
+            if not teacher_prompt:
+                raise RuntimeError("opd c13 requires the ordinary teacher prompt")
             completion_prefix = tok.decode(
                 list(prepared.student_ids[:position]), skip_special_tokens=True
             )
-            context = prepared.candidate_teacher_prompt + completion_prefix
+            context = teacher_prompt + completion_prefix
             prefix_requests = tuple(
                 CandidateRequest(
                     context=context,
@@ -2410,7 +2467,6 @@ def _resolve_samples_batched(
     runaway_rate: float = 1.0,
     overcorr_rate: float = 0.0,
     teacher=None,
-    candidate_teacher_prompts: list[str] | None = None,
     topk_meter: TeacherInputMeter | None = None,
     topk_cache: dict[tuple[str, str], float] | None = None,
 ) -> list[SampleResult]:
@@ -2418,11 +2474,8 @@ def _resolve_samples_batched(
 
     objective_ids = tuple(getattr(knobs, "objective_ids", ()) or ())
     objective_plan = OPD_OBJECTIVES.plan(objective_ids)
-    if objective_plan.requirements.candidate_topk:
-        if teacher is None or topk_meter is None:
-            raise RuntimeError("opd c13 requires a teacher client and teacher-input meter")
-        if candidate_teacher_prompts is None or len(candidate_teacher_prompts) != len(samples):
-            raise RuntimeError("opd c13 requires one teacher prompt per sample")
+    if objective_plan.requirements.candidate_topk and (teacher is None or topk_meter is None):
+        raise RuntimeError("opd c13 requires a teacher client and teacher-input meter")
     if not samples:
         return []
     results: list[SampleResult | None] = [None] * len(samples)
@@ -2549,11 +2602,7 @@ def _resolve_samples_batched(
                 or analyze_repetition(gen.completion_ids, forced=gen.forced or ()),
                 sequence_weight=1.0,
                 termination_cause=gen.termination_cause,
-                candidate_teacher_prompt=(
-                    candidate_teacher_prompts[idx]
-                    if objective_plan.requirements.candidate_topk and candidate_teacher_prompts
-                    else ""
-                ),
+                score_result=score if objective_plan.requirements.candidate_topk else None,
             )
         )
 
