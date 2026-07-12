@@ -334,7 +334,8 @@ def estimate_vram_gb(
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
-    MoE: active_params_b drives activations/KV/LoRA; weights term uses full params_b.
+    MoE: active_params_b drives activations, KV, and trainable policy LoRA; full params_b drives
+    weights and the all-linear frozen-reference LoRA residency.
     """
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
@@ -343,10 +344,11 @@ def estimate_vram_gb(
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
-    # peft may autocast adapter weights to fp32. A frozen adapter has no gradient or adam states,
-    # so reserve one quarter of the empirical trainable-lora state estimate at its independent rank.
+    # peft may autocast adapter weights to fp32. A frozen all-linear adapter is resident across every
+    # expert, so reserve from total params rather than the per-token active backbone. It has no gradient
+    # or adam states, hence one quarter of the empirical trainable-lora state estimate.
     reference_lora = (
-        (reference_lora_rank / 16.0) * (0.3 + 0.04 * eff_b) / 4.0
+        (reference_lora_rank / 16.0) * (0.3 + 0.04 * params_b) / 4.0
         if frozen_reference and reference_lora_rank
         else 0.0
     )

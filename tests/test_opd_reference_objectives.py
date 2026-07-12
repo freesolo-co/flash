@@ -412,6 +412,72 @@ def test_reference_rank_increases_vram_and_changes_boundary_routing():
     assert cheapest_gpu(high_rank_need) != cheapest_gpu(low_rank_need)
 
 
+def test_moe_reference_rank_uses_total_resident_params_and_rejects_b200_boundary():
+    from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
+    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+
+    common = {
+        "seq_len": 2048,
+        "max_tokens": 512,
+        "lora_rank": 8,
+        "batch_size": 2,
+        "group_size": 16,
+        "active_params_b": 3.0,
+        "frozen_reference": True,
+        "reference_lora_rank": 64,
+    }
+    with_reference = estimate_vram_gb(35.0, "opd", **common)
+    without_reference = estimate_vram_gb(
+        35.0,
+        "opd",
+        **{**common, "reference_lora_rank": None},
+    )
+    expected_total_residency = (64 / 16.0) * (0.3 + 0.04 * 35.0) / 4.0
+    active_only_residency = (64 / 16.0) * (0.3 + 0.04 * 3.0) / 4.0
+
+    assert with_reference - without_reference == pytest.approx(expected_total_residency)
+    assert with_reference - without_reference > active_only_residency
+
+    train = {
+        "lora_rank": 8,
+        "max_context_tokens": 2048,
+        "max_completion_tokens": 512,
+        "batch_size": 2,
+        "group_size": 16,
+        "opd_objective_ids": ("c06",),
+        "opd_reference_lora_rank": 64,
+    }
+    assert model_required_vram_gb("Qwen/Qwen3.6-35B-A3B", "opd", train=train) == 181
+    with pytest.raises(UnsupportedGpuError):
+        provisional_gpu("Qwen/Qwen3.6-35B-A3B", "opd", train=train)
+
+
+def test_dense_reference_residency_is_counted_once_and_active_hint_is_neutral():
+    from flash.engine.vram import estimate_vram_gb
+
+    common = {
+        "seq_len": 1024,
+        "max_tokens": 128,
+        "lora_rank": 8,
+        "batch_size": 1,
+        "group_size": 1,
+        "frozen_reference": True,
+        "reference_lora_rank": 64,
+    }
+    dense = estimate_vram_gb(4.0, "opd", active_params_b=None, **common)
+    dense_with_hint = estimate_vram_gb(4.0, "opd", active_params_b=4.0, **common)
+    no_reference = estimate_vram_gb(
+        4.0,
+        "opd",
+        active_params_b=None,
+        **{**common, "reference_lora_rank": None},
+    )
+    expected_residency = (64 / 16.0) * (0.3 + 0.04 * 4.0) / 4.0
+
+    assert dense == pytest.approx(dense_with_hint)
+    assert dense - no_reference == pytest.approx(expected_residency)
+
+
 def test_raw_and_warm_reference_lineage_parse_and_round_trip():
     from flash.cost.spec import runconfig_from_spec
     from flash.schema import spec_from_dict
