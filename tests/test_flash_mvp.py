@@ -21,7 +21,12 @@ def test_catalog_validation():
     from flash.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
-        id="test/sft-only", display_name="x", params="1B", params_b=1.0, algos=("sft",), min_vram_gb=12
+        id="test/sft-only",
+        display_name="x",
+        params="1B",
+        params_b=1.0,
+        algos=("sft",),
+        min_vram_gb=12,
     )
     try:
         with pytest.raises(ValueError, match="not grpo"):
@@ -104,8 +109,11 @@ def test_cli_train_dry_run(monkeypatch, capsys):
         seen = {}
 
         class _FakeClient:
-            def create_run(self, spec, runtime_secrets=None, dry_run=False):
+            def create_run(
+                self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None
+            ):
                 seen["dry_run"] = dry_run
+                seen["client_train_schema"] = client_train_schema
                 return {"run_id": "flash-dry-1", "state": "dry_run", "spec": spec}
 
         monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())

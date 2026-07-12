@@ -430,6 +430,11 @@ def _build_parser() -> argparse.ArgumentParser:
     export.set_defaults(func=cmd_export)
 
     deployments = sub.add_parser("deployments", help="list active serving deployments")
+    deployments.add_argument(
+        "--json",
+        action="store_true",
+        help="emit active deployment rows as JSON",
+    )
     deployments.set_defaults(func=cmd_deployments)
 
     chat = sub.add_parser("chat", help="chat with a deployed adapter")

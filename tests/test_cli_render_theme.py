@@ -154,7 +154,9 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
             "r", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
         ),
         render.cancelled({"run_id": "r", "state": "cancelled"}),
-        render.deployed({"run_id": "r", "state": "deployed", "endpoint_name": "ep", "url": "u"}),
+        render.deployed(
+            {"run_id": "r", "state": "deployed", "endpoint_name": "ep", "openai_base_url": "u"}
+        ),
         render.undeployed({"run_id": "r", "deleted_endpoints": ["ep"]}),
         render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
         render.error("config invalid — bad [environment] id"),
@@ -181,7 +183,12 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     assert "flash-1/step-8" in ck  # the canonical short checkpoint ref
 
     dep = render.deployed(
-        {"run_id": "flash-1", "state": "deployed", "endpoint_name": "ep", "url": "https://x"}
+        {
+            "run_id": "flash-1",
+            "state": "deployed",
+            "endpoint_name": "ep",
+            "openai_base_url": "https://x",
+        }
     )
     # curated card, not a raw json dump
     assert "deployed" in dep
