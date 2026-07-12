@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -149,6 +151,51 @@ def test_rank_metadata_rejects_inexact_decimal_string():
         rank_from_adapter_config(_config(r="1.0000000000000001"), source="adapter")
 
 
+@pytest.mark.parametrize("value", [Decimal("1"), Decimal("1.0"), Decimal("1E0")])
+def test_rank_metadata_accepts_integral_decimal_values(value):
+    # load_hf_adapter_config parses json floats as decimal, so decimal instances reach the parser.
+    assert rank_from_adapter_config(_config(r=value), source="adapter") == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("1.5"), Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity")],
+)
+def test_rank_metadata_rejects_non_integral_decimal_values(value):
+    with pytest.raises(ValueError, match="invalid r"):
+        rank_from_adapter_config(_config(r=value), source="adapter")
+
+
+@pytest.mark.parametrize("value", [Decimal("0"), Decimal("-1")])
+def test_rank_metadata_rejects_non_positive_decimal_values(value):
+    with pytest.raises(ValueError, match="non-positive r"):
+        rank_from_adapter_config(_config(r=value), source="adapter")
+
+
+_FLOAT_CONFIG_JSON = (
+    '{"peft_type": "LORA", "task_type": "CAUSAL_LM",'
+    ' "base_model_name_or_path": "Qwen/Qwen3.5-4B",'
+    ' "r": 16.0, "lora_alpha": 64.0, "lora_dropout": 0.05}'
+)
+
+
+def _parsed_config(text: str = _FLOAT_CONFIG_JSON):
+    # mirror load_hf_adapter_config: floats arrive as decimal, not float.
+    return json.loads(text, parse_float=Decimal)
+
+
+def test_preflight_parses_decimal_typed_topology_from_real_json():
+    config = _parsed_config()
+    assert isinstance(config["r"], Decimal)
+    assert isinstance(config["lora_alpha"], Decimal)
+    metadata = preflight_init_adapter_lora_rank(
+        _spec(), config_loader=lambda _ref, _token, _revision: config
+    )
+    assert metadata is not None
+    assert metadata.rank == 16
+    assert metadata.alpha == 64
+
+
 def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
     import huggingface_hub
 
@@ -181,6 +228,44 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
     state["oid"] = "sha256:weights-v2"
     changed_weight = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
     assert changed_weight.digest != first.digest
+
+
+def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
+    import huggingface_hub
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_paths_info(self, repo_id, paths, repo_type, revision=None):
+            return [
+                SimpleNamespace(
+                    path="sft/sft-run/adapter/adapter_model.safetensors",
+                    blob_id=None,
+                    size=123,
+                    lfs={"sha256": "sha256:weights-v1", "size": 123},
+                )
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    first = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
+    second = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
+    assert first == second
+    changed_float = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(_FLOAT_CONFIG_JSON.replace("0.05", "0.10")),
+        token="token",
+    )
+    assert changed_float.digest != first.digest
+    # a json string spelling the same numeral must not collide with the decimal value.
+    string_typed = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(
+            _FLOAT_CONFIG_JSON.replace('"lora_dropout": 0.05', '"lora_dropout": "0.05"')
+        ),
+        token="token",
+    )
+    assert string_typed.digest != first.digest
 
 
 def test_lora_rank_uses_schema_adapter_storage_ref_parser():
