@@ -279,6 +279,7 @@ class ApiClient:
         spec: dict,
         runtime_secrets: dict[str, str] | None = None,
         dry_run: bool = False,
+        client_train_schema: dict | None = None,
     ) -> dict:
         body: dict = {"spec": spec}
         if runtime_secrets:
@@ -287,6 +288,8 @@ class ApiClient:
             # Server-side preview: runs the same validation/preflights as a real submit and records a
             # state=dry_run run, but allocates no GPU and charges nothing. Returns that status.
             body["dry_run"] = True
+            if client_train_schema is not None:
+                body["client_train_schema"] = client_train_schema
         return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:
@@ -380,9 +383,7 @@ class ApiClient:
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
             body["step"] = step
-        return self._request(
-            "POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60
-        )
+        return self._request("POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60)
 
     def undeploy(self, run_id: str) -> dict:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
@@ -454,7 +455,7 @@ class ApiClient:
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
                 payload = json.loads(resp.read() or b"{}")
-                content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
                 if content:
                     yield str(content)
                 return

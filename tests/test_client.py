@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
+from flash.client.specs import spec_payload
+from flash.schema import spec_from_dict
 
 
 @pytest.fixture
@@ -123,6 +125,73 @@ def test_create_run_dry_run_flag_travels_in_body(stub):
     # Default omits it, so existing (non-dry-run) callers send an unchanged body.
     client.create_run({"model": "m"})
     assert seen["body"] == {"spec": {"model": "m"}}
+
+
+def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None:
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {"id": "owner/env"},
+            "train": {
+                "epochs": 1,
+                "hf_repo": "user/ignored",
+                "max_examples": 1,
+                "temperature": 0,
+                "opd_eos_loss_coef": 0,
+                "stop_sequences": [],
+                "teacher_model": "GLM 5.2",
+                "structured_outputs": False,
+            },
+        }
+    )
+    authored = {
+        "epochs",
+        "hf_repo",
+        "max_examples",
+        "temperature",
+        "opd_eos_loss_coef",
+        "stop_sequences",
+        "teacher_model",
+        "structured_outputs",
+    }
+
+    full = spec_payload(spec)
+    sparse = spec_payload(spec, authored_train_keys=authored)
+
+    assert set(full["train"]) > authored
+    assert sparse["train"] == {
+        "epochs": 1,
+        "hf_repo": "",
+        "max_examples": 1,
+        "temperature": 0.0,
+        "opd_eos_loss_coef": 0.0,
+        "stop_sequences": (),
+        "teacher_model": "accounts/fireworks/models/glm-5p2",
+        "structured_outputs": "",
+    }
+    assert spec_payload(spec, authored_train_keys=set())["train"] == {}
+
+
+def test_create_run_sends_schema_metadata_only_for_dry_run(stub) -> None:
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    spec = {"model": "m", "train": {"epochs": 1}}
+    metadata = {
+        "version": "0.2.56",
+        "fields": {"epochs": "0.2.0"},
+        "authored_keys": ["epochs"],
+    }
+
+    client.create_run(spec, dry_run=True, client_train_schema=metadata)
+    assert seen["body"] == {
+        "spec": spec,
+        "dry_run": True,
+        "client_train_schema": metadata,
+    }
+
+    client.create_run(spec, client_train_schema=metadata)
+    assert seen["body"] == {"spec": spec}
 
 
 def test_api_error_carries_server_detail(stub):
