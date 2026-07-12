@@ -6,10 +6,9 @@ import re
 import sys
 import tomllib
 from collections.abc import Collection
+from dataclasses import fields as dataclass_fields
 from typing import Any
 
-from flash import __version__
-from flash._update_check import compare_pep440_versions
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.providers.base import (
     UnsupportedGpuError,
@@ -212,82 +211,24 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 TRAIN_KEY_MIN_VERSIONS = {
-    "epochs": "0.2.0",
-    "lora_rank": "0.2.0",
-    "lora_alpha": "0.2.0",
-    "init_from_adapter": "0.2.0",
-    "hf_repo": "0.2.0",
-    "learning_rate": "0.2.0",
-    "batch_size": "0.2.0",
-    "max_context_tokens": "0.2.49",
-    "save_every": "0.2.0",
-    "group_size": "0.2.0",
-    "temperature": "0.2.0",
-    "max_completion_tokens": "0.2.49",
-    "kl_penalty_coef": "0.2.0",
-    "advantage_clip": "0.2.0",
-    "thinking_length_penalty_coef": "0.2.0",
-    "opd_eos_loss_coef": "0.2.55",
-    "teacher_model": "0.2.56",
-    "stop_sequences": "0.2.0",
-    "structured_outputs": "0.2.56",
-    "max_steps": "0.2.0",
-    "max_examples": "0.2.0",
+    item.name: str(item.metadata["introduced_in"]) for item in dataclass_fields(TrainSpec)
 }
 TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
 
 
-def train_schema_metadata() -> dict[str, object]:
-    """return deterministic metadata for exact client/server [train] schema comparison."""
-    keys = sorted(TRAIN_SCHEMA_KEYS)
-    return {
-        "supported_keys": keys,
-        "minimum_versions": {key: TRAIN_KEY_MIN_VERSIONS[key] for key in keys},
-    }
+def train_schema_metadata() -> dict[str, str]:
+    """return the deterministic [train] field-to-release mapping."""
+    return {key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)}
 
 
-def validate_train_keys(
-    keys: Collection[str],
-    *,
-    supported_keys: Collection[str] = TRAIN_SCHEMA_KEYS,
-    installed_version: str | None = None,
-) -> None:
-    """reject unknown keys and known keys unsupported by an installed schema."""
-    key_set = set(keys)
-    supported = set(supported_keys)
-    displayed_version = __version__ if installed_version is None else installed_version
-
-    def requires_newer_version(key: str) -> bool:
-        if installed_version is None or installed_version == "0+unknown":
-            return False
-        comparison = compare_pep440_versions(installed_version, TRAIN_KEY_MIN_VERSIONS[key])
-        return comparison == -1
-
-    unsupported = sorted(
-        key
-        for key in key_set & TRAIN_SCHEMA_KEYS
-        if key not in supported or requires_newer_version(key)
-    )
-    unknown = sorted(key_set - TRAIN_SCHEMA_KEYS)
-    errors = []
-    if unsupported:
-        details = ", ".join(
-            f"{key} (requires Flash >= {TRAIN_KEY_MIN_VERSIONS[key]}; "
-            f"installed Flash {displayed_version})"
-            for key in unsupported
-        )
-        errors.append(f"unsupported key(s): {details}")
+def validate_train_keys(keys: Collection[str]) -> None:
+    """reject names outside the canonical TrainSpec field surface."""
+    unknown = sorted(set(keys) - TRAIN_SCHEMA_KEYS)
     if unknown:
-        errors.append(
-            f"unknown key(s): {', '.join(unknown)} (allowed: {', '.join(sorted(supported))})"
+        raise ConfigError(
+            f"[train] unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
         )
-    if errors:
-        agreement = (
-            ". client/server [train] schema agreement was not checked because local validation failed"
-            if unsupported
-            else ""
-        )
-        raise ConfigError(f"[train] {'; '.join(errors)}{agreement}")
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:

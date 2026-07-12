@@ -7,16 +7,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import fields
 
 import pytest
 
 from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
+    TRAIN_SCHEMA_KEYS,
     ConfigError,
     spec_from_dict,
+    train_schema_metadata,
     validate_train_keys,
 )
-from flash.spec import JobSpec, load_job_spec_from_env
+from flash.spec import JobSpec, TrainSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -85,110 +88,86 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
-def test_train_key_registry_records_minimum_released_versions() -> None:
-    assert TRAIN_KEY_MIN_VERSIONS == {
-        "epochs": "0.2.0",
-        "lora_rank": "0.2.0",
-        "lora_alpha": "0.2.0",
-        "init_from_adapter": "0.2.0",
-        "hf_repo": "0.2.0",
-        "learning_rate": "0.2.0",
-        "batch_size": "0.2.0",
-        "max_context_tokens": "0.2.49",
-        "save_every": "0.2.0",
-        "group_size": "0.2.0",
-        "temperature": "0.2.0",
-        "max_completion_tokens": "0.2.49",
-        "kl_penalty_coef": "0.2.0",
-        "advantage_clip": "0.2.0",
-        "thinking_length_penalty_coef": "0.2.0",
-        "opd_eos_loss_coef": "0.2.55",
-        "teacher_model": "0.2.56",
-        "stop_sequences": "0.2.0",
-        "structured_outputs": "0.2.56",
-        "max_steps": "0.2.0",
-        "max_examples": "0.2.0",
+def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
+    train_fields = fields(TrainSpec)
+
+    assert all(item.metadata.get("introduced_in") for item in train_fields)
+    assert frozenset(item.name for item in train_fields) == TRAIN_SCHEMA_KEYS
+    assert {
+        item.name: item.metadata["introduced_in"] for item in train_fields
+    } == TRAIN_KEY_MIN_VERSIONS
+    assert train_schema_metadata() == {
+        key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)
     }
+    assert TRAIN_KEY_MIN_VERSIONS["hf_repo"] == "0.2.0"
+    assert TRAIN_KEY_MIN_VERSIONS["max_context_tokens"] == "0.2.49"
+    assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
+    assert TRAIN_KEY_MIN_VERSIONS["opd_eos_loss_coef"] == "0.2.55"
+    assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
+    assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
+    assert {
+        value
+        for key, value in TRAIN_KEY_MIN_VERSIONS.items()
+        if key
+        not in {
+            "max_context_tokens",
+            "max_completion_tokens",
+            "opd_eos_loss_coef",
+            "teacher_model",
+            "structured_outputs",
+        }
+    } == {"0.2.0"}
 
 
-def test_train_key_validator_reports_known_key_requiring_newer_flash() -> None:
-    supported = set(TRAIN_KEY_MIN_VERSIONS) - {"opd_eos_loss_coef"}
+def test_train_key_validator_rejects_unknown_names_only() -> None:
+    validate_train_keys(TRAIN_SCHEMA_KEYS)
     with pytest.raises(ConfigError) as excinfo:
-        validate_train_keys(
-            {"epochs", "opd_eos_loss_coef"},
-            supported_keys=supported,
-            installed_version="0.2.54",
-        )
-    message = str(excinfo.value)
-    assert "unsupported key" in message
-    assert "opd_eos_loss_coef" in message
-    assert "requires Flash >= 0.2.55" in message
-    assert "installed Flash 0.2.54" in message
-    assert "schema agreement was not checked because local validation failed" in message
+        validate_train_keys({"epochs", "removed_spelling"})
 
-
-def test_train_key_validator_checks_minimum_version_even_if_key_is_listed_supported() -> None:
-    with pytest.raises(ConfigError, match=r"teacher_model.*0\.2\.56.*0\.2\.55"):
-        validate_train_keys(
-            {"teacher_model"},
-            supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
-            installed_version="0.2.55",
-        )
-
-
-@pytest.mark.parametrize("installed_version", ["0.2.55rc1", "0.2.55.dev4"])
-def test_train_key_validator_treats_prerelease_as_older(installed_version: str) -> None:
-    with pytest.raises(ConfigError, match=r"opd_eos_loss_coef.*0\.2\.55"):
-        validate_train_keys(
-            {"opd_eos_loss_coef"},
-            supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
-            installed_version=installed_version,
-        )
-
-
-def test_train_key_validator_accepts_local_final_version() -> None:
-    validate_train_keys(
-        {"opd_eos_loss_coef"},
-        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
-        installed_version="0.2.55+local.1",
-    )
-
-
-def test_train_key_validator_does_not_guess_for_malformed_version() -> None:
-    validate_train_keys(
-        {"teacher_model"},
-        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
-        installed_version="0.2.55garbage",
-    )
-
-
-@pytest.mark.parametrize("metadata_version", ["0+unknown", "0.2.55"])
-def test_train_key_validator_uses_imported_schema_for_local_validation(
-    monkeypatch, metadata_version: str
-) -> None:
-    import flash.schema as schema
-
-    monkeypatch.setattr(schema, "__version__", metadata_version)
-    schema.validate_train_keys(
-        {"teacher_model"},
-        supported_keys=set(TRAIN_KEY_MIN_VERSIONS),
-    )
-    assert spec_from_dict(_raw(**{"train.teacher_model": "glm-5.2"})).train.teacher_model.endswith(
-        "/glm-5p2"
-    )
-
-
-def test_train_key_validator_keeps_unknown_key_diagnostic_and_allowed_list() -> None:
-    supported = {"epochs", "lora_rank"}
-    with pytest.raises(ConfigError) as excinfo:
-        validate_train_keys(
-            {"removed_spelling"},
-            supported_keys=supported,
-            installed_version="0.2.13",
-        )
     message = str(excinfo.value)
     assert "unknown key(s): removed_spelling" in message
-    assert "allowed: epochs, lora_rank" in message
+    assert "allowed:" in message
+
+
+def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None:
+    established = frozenset(
+        {
+            "advantage_clip",
+            "batch_size",
+            "epochs",
+            "group_size",
+            "hf_repo",
+            "init_from_adapter",
+            "kl_penalty_coef",
+            "learning_rate",
+            "lora_alpha",
+            "lora_rank",
+            "max_completion_tokens",
+            "max_context_tokens",
+            "max_examples",
+            "max_steps",
+            "opd_eos_loss_coef",
+            "save_every",
+            "stop_sequences",
+            "temperature",
+            "thinking_length_penalty_coef",
+        }
+    )
+    historical_shapes = {
+        "20c4452c": established,
+        "699a8aab": established | {"structured_outputs"},
+        "861571e7": established | {"structured_outputs", "teacher_model"},
+    }
+    baseline = {"epochs", "hf_repo", "max_examples"}
+
+    assert historical_shapes["861571e7"] == TRAIN_SCHEMA_KEYS
+    assert all(baseline <= shape for shape in historical_shapes.values())
+    for key in ("structured_outputs", "teacher_model"):
+        rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
+        assert rejected_by == {
+            "20c4452c",
+            *({"699a8aab"} if key == "teacher_model" else set()),
+        }
 
 
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:

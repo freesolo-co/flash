@@ -40,11 +40,9 @@ _SAFE_VERSION = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}\Z")
 _VERSION_RE = re.compile(
     r"""\A\s*v?
         (?P<release>\d+(?:\.\d+)*)
-        (?P<pre>[._-]?(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?)?
+        (?P<pre>[._-]?(?:alpha|beta|preview|pre|rc|a|b|c)\d*)?
         (?P<post>[._-]?(?:post|rev|r)\d*|-\d+)?
         (?P<dev>[._-]?dev\d*)?
-        (?:\+(?P<local>[a-z0-9]+(?:[._-][a-z0-9]+)*))?
-        \s*\Z
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -68,71 +66,28 @@ def _normalize_release(release: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def _version_number(value: str | None) -> int:
-    digits = re.search(r"\d+", value or "")
-    return int(digits.group()) if digits else 0
-
-
-def _version_key(version: str) -> tuple | None:
-    """Return a comparable key for the supported PEP 440 subset, or None."""
-    match = _VERSION_RE.fullmatch(version or "")
+def _version_key(version: str) -> tuple[tuple[int, ...], int, int]:
+    """Sort key ``(release, final_rank, post)`` where higher means newer."""
+    match = _VERSION_RE.match(version or "")
     if not match:
-        return None
-    try:
-        release = _normalize_release(tuple(int(part) for part in match.group("release").split(".")))
-        pre = (match.group("pre") or "").lower().lstrip("._-")
-        post = match.group("post")
-        dev = match.group("dev")
-        if pre:
-            label_match = re.match(r"[a-z]+", pre)
-            label = label_match.group() if label_match else ""
-            normalized = {
-                "alpha": "a",
-                "beta": "b",
-                "c": "rc",
-                "pre": "rc",
-                "preview": "rc",
-            }
-            pre_key = (
-                0,
-                {"a": 0, "b": 1, "rc": 2}[normalized.get(label, label)],
-                _version_number(pre),
-            )
-        elif dev and not post:
-            pre_key = (-1, 0, 0)
-        else:
-            pre_key = (1, 0, 0)
-        post_key = (0, _version_number(post)) if post else (-1, 0)
-        dev_key = (0, _version_number(dev)) if dev else (1, 0)
-        local = match.group("local")
-        local_key = tuple(
-            (1, int(part)) if part.isdigit() else (0, part.lower())
-            for part in re.split(r"[._-]", local or "")
-            if part
-        )
-    except ValueError:
-        return None
-    return (release, pre_key, post_key, dev_key, bool(local), local_key)
-
-
-def compare_pep440_versions(left: str, right: str) -> int | None:
-    """Compare two versions in the supported PEP 440 subset."""
-    left_key = _version_key(left)
-    right_key = _version_key(right)
-    if left_key is None or right_key is None:
-        return None
-    return (left_key > right_key) - (left_key < right_key)
+        return ((), 1, 0)
+    release = _normalize_release(tuple(int(part) for part in match.group("release").split(".")))
+    is_pre = bool(match.group("pre") or match.group("dev"))
+    post_digits = re.search(r"\d+", match.group("post") or "")
+    post = int(post_digits.group()) if post_digits else 0
+    return (release, 0 if is_pre else 1, post)
 
 
 def _is_prerelease(version: str) -> bool:
     """True when the version carries a pre-release or dev marker (a/b/c/rc/alpha/beta/dev)."""
-    match = _VERSION_RE.fullmatch(version or "")
+    match = _VERSION_RE.match(version or "")
     return bool(match and (match.group("pre") or match.group("dev")))
 
 
 def _is_newer(latest: str, current: str) -> bool:
     """True only when ``latest`` is a strictly newer version than ``current`` (PEP 440 order)."""
-    return compare_pep440_versions(latest, current) == 1
+    latest_key = _version_key(latest)
+    return bool(latest_key[0]) and latest_key > _version_key(current)
 
 
 def _clean_version(value: object) -> str | None:

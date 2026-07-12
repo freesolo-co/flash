@@ -21,7 +21,6 @@ from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 from flash import __version__
-from flash.schema import train_schema_metadata
 from flash.server.routes import meta
 
 
@@ -42,9 +41,4 @@ def test_health_returns_ok():
     with TestClient(app) as client:
         resp = client.get("/v1/health")
     assert resp.status_code == 200
-    assert resp.json() == {
-        "ok": True,
-        "service": "flash",
-        "version": __version__,
-        "train_schema": train_schema_metadata(),
-    }
+    assert resp.json() == {"ok": True, "service": "flash", "version": __version__}

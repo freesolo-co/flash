@@ -11,7 +11,6 @@ from pathlib import Path
 from flash import __version__
 from flash._channel import CLI_NAME
 from flash._logging import get_logger
-from flash._update_check import compare_pep440_versions
 from flash.catalog import public_model_rows
 from flash.client import (
     ApiClient,
@@ -26,11 +25,10 @@ from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES
 from flash.schema import (
-    TRAIN_KEY_MIN_VERSIONS,
-    TRAIN_SCHEMA_KEYS,
     ConfigError,
     spec_and_train_keys_from_file,
     spec_from_file,
+    train_schema_metadata,
 )
 
 from . import render
@@ -234,165 +232,34 @@ def _cmd_train_cost(args) -> int:
     return 0
 
 
-def _print_train_schema_status(message: str) -> None:
+def _print_train_schema_compatibility(result: object) -> None:
+    if not isinstance(result, dict):
+        message = "client/server [train] schema compatibility is unverifiable (legacy server)"
+    elif result.get("status") == "agreement":
+        message = "client/server [train] schemas agree exactly"
+    else:
+        differences = []
+        for label, key in (
+            ("client-only keys", "client_only"),
+            ("server-only keys", "server_only"),
+        ):
+            values = result.get(key)
+            if isinstance(values, list) and values:
+                differences.append(f"{label}: {', '.join(str(value) for value in values)}")
+        metadata = result.get("introduced_in_differences")
+        if isinstance(metadata, list) and metadata:
+            rendered = ", ".join(
+                f"{item['key']} (client {item['client']}, server {item['server']})"
+                for item in metadata
+                if isinstance(item, dict)
+                and all(isinstance(item.get(key), str) for key in ("key", "client", "server"))
+            )
+            if rendered:
+                differences.append(f"introduced_in differences: {rendered}")
+        suffix = f"; {'; '.join(differences)}" if differences else ""
+        message = f"client/server [train] schemas disagree{suffix}"
     text = f"train schema: {message}"
     print(render.note(text) if render.styled() else text, file=sys.stderr)
-
-
-def _server_schema_metadata(
-    schema: object,
-) -> tuple[frozenset[str], dict[str, str]] | None:
-    if not isinstance(schema, dict):
-        return None
-    supported = schema.get("supported_keys")
-    minimums = schema.get("minimum_versions")
-    if (
-        not isinstance(supported, list)
-        or not all(isinstance(key, str) for key in supported)
-        or len(supported) != len(set(supported))
-        or not isinstance(minimums, dict)
-        or not all(
-            isinstance(key, str)
-            and isinstance(value, str)
-            and compare_pep440_versions(value, value) is not None
-            for key, value in minimums.items()
-        )
-        or set(minimums) != set(supported)
-    ):
-        return None
-    return frozenset(supported), dict(minimums)
-
-
-def _unsupported_authored_keys(
-    authored_keys: frozenset[str],
-    server_version: str,
-    server_keys: frozenset[str] | None,
-    server_minimums: dict[str, str] | None,
-) -> list[tuple[str, str]]:
-    unsupported = []
-    for key in sorted(authored_keys & TRAIN_SCHEMA_KEYS):
-        minimum = (server_minimums or {}).get(key, TRAIN_KEY_MIN_VERSIONS[key])
-        version_comparison = (
-            None
-            if server_version == "0+unknown"
-            else compare_pep440_versions(server_version, minimum)
-        )
-        if (server_keys is not None and key not in server_keys) or version_comparison == -1:
-            unsupported.append((key, minimum))
-    return unsupported
-
-
-def _report_unsupported_authored_keys(
-    unsupported: list[tuple[str, str]], server_version: str
-) -> None:
-    if not unsupported:
-        return
-    details = ", ".join(
-        f"{key} (minimum Flash version {minimum}; installed server Flash {server_version})"
-        for key, minimum in unsupported
-    )
-    _print_train_schema_status(
-        f"unsupported [train] key(s) on the server: {details}; the dry-run POST will still "
-        "perform authoritative server validation"
-    )
-
-
-def _dry_run_train_schema_preflight(client: ApiClient, authored_keys: frozenset[str]) -> None:
-    client_version = __version__
-    try:
-        health = client.health()
-    except Exception as exc:
-        # this lookup is advisory; the create_run dry-run POST remains authoritative.
-        _print_train_schema_status(
-            "exact client/server [train] schema agreement cannot be verified because the "
-            f"health lookup failed ({exc}); client Flash {client_version}, server Flash unknown"
-        )
-        return
-
-    if not isinstance(health, dict):
-        _print_train_schema_status(
-            "exact client/server [train] schema agreement cannot be verified because the health "
-            f"response was not an object; client Flash {client_version}, server Flash unknown"
-        )
-        return
-    server_version = health.get("version")
-    if (
-        not isinstance(server_version, str)
-        or compare_pep440_versions(server_version, server_version) is None
-    ):
-        displayed_version = server_version if isinstance(server_version, str) else "unknown"
-        _print_train_schema_status(
-            "exact client/server [train] schema agreement cannot be verified because the server "
-            f"version is malformed or unknown ({displayed_version}); client Flash {client_version}"
-        )
-        return
-
-    schema = health.get("train_schema")
-    metadata = _server_schema_metadata(schema)
-    if metadata is None:
-        reason = (
-            "does not expose schema metadata"
-            if schema is None
-            else "exposes malformed schema metadata"
-        )
-        _print_train_schema_status(
-            "exact client/server [train] schema agreement cannot be verified because server "
-            f"Flash {server_version} {reason}; client Flash {client_version}"
-        )
-        unsupported = _unsupported_authored_keys(authored_keys, server_version, None, None)
-        if unsupported:
-            _print_train_schema_status(
-                f"client/server [train] schemas disagree by version inference (client Flash "
-                f"{client_version}, server Flash {server_version})"
-            )
-            _report_unsupported_authored_keys(unsupported, server_version)
-        return
-
-    server_keys, server_minimums = metadata
-    unsupported = _unsupported_authored_keys(
-        authored_keys, server_version, server_keys, server_minimums
-    )
-    client_only = sorted(TRAIN_SCHEMA_KEYS - server_keys)
-    server_only = sorted(server_keys - TRAIN_SCHEMA_KEYS)
-    minimum_differences = sorted(
-        key
-        for key in TRAIN_SCHEMA_KEYS & server_keys
-        if TRAIN_KEY_MIN_VERSIONS[key] != server_minimums[key]
-    )
-    if not client_only and not server_only and not minimum_differences:
-        _print_train_schema_status(
-            f"client/server [train] schemas agree exactly ({len(server_keys)} keys; "
-            f"client Flash {client_version}, server Flash {server_version})"
-        )
-        if server_version == "0+unknown":
-            _print_train_schema_status(
-                "server-version compatibility cannot be verified because the server reports "
-                "Flash 0+unknown; explicit schema metadata remains authoritative"
-            )
-        _report_unsupported_authored_keys(unsupported, server_version)
-        return
-
-    differences = []
-    if client_only:
-        differences.append(f"client-only keys: {', '.join(client_only)}")
-    if server_only:
-        differences.append(f"server-only keys: {', '.join(server_only)}")
-    if minimum_differences:
-        details = ", ".join(
-            f"{key} (client {TRAIN_KEY_MIN_VERSIONS[key]}, server {server_minimums[key]})"
-            for key in minimum_differences
-        )
-        differences.append(f"minimum-version differences: {details}")
-    _print_train_schema_status(
-        f"client/server [train] schemas disagree (client Flash {client_version}, "
-        f"server Flash {server_version}); {'; '.join(differences)}"
-    )
-    if server_version == "0+unknown":
-        _print_train_schema_status(
-            "server-version compatibility cannot be verified because the server reports "
-            "Flash 0+unknown; explicit schema metadata remains authoritative"
-        )
-    _report_unsupported_authored_keys(unsupported, server_version)
 
 
 def cmd_train(args) -> int:
@@ -404,9 +271,9 @@ def cmd_train(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
     if args.dry_run:
-        _dry_run_train_schema_preflight(client, authored_train_keys)
         # Dry-run is a faithful server-side preview: the control plane runs the SAME config
         # validation and warm-start/serving preflights it would at real submit (serving rank/context
         # caps, the continued warm-start rank match, cost quote) and records a state=dry_run run, but
@@ -414,7 +281,17 @@ def cmd_train(args) -> int:
         # relaxes the required-[environment].secrets check for a preview, so `--dry-run` works before
         # prod secrets are wired up. A rejection surfaces as the server's `error: ...` (exit 1),
         # exactly as a real submit would.
-        status = client.create_run(spec_payload(spec), dry_run=True)
+        status = client.create_run(
+            payload,
+            dry_run=True,
+            client_train_schema={
+                "version": __version__,
+                "fields": train_schema_metadata(),
+                "authored_keys": sorted(authored_train_keys),
+            },
+        )
+        compatibility = status.pop("train_schema_compatibility", None)
+        _print_train_schema_compatibility(compatibility)
         if render.styled():
             print(
                 render.object_panel(
@@ -425,7 +302,7 @@ def cmd_train(args) -> int:
             print(json.dumps(status, indent=2))
         return 0
     status = client.create_run(
-        spec_payload(spec),
+        payload,
         runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),
     )
     run_id = status["run_id"]

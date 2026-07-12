@@ -28,30 +28,21 @@ def cache_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("version", "parseable"),
+    ("version", "expected"),
     [
-        ("0.2.12", True),
-        ("v1.0", True),
-        ("  1.0.0  ", True),
-        ("0.3.0rc1", True),
-        ("0.3.0a-1", True),
-        ("1.0.0.dev4", True),
-        ("0.2.18.post1", True),
-        ("0.2.18-1", True),
-        ("0.2.55+local.1", True),
-        ("not-a-version", False),
-        ("0.2.55garbage", False),
-        ("", False),
+        ("0.2.12", ((0, 2, 12), 1, 0)),
+        ("v1.0", ((1,), 1, 0)),  # trailing zeros stripped
+        ("  1.0.0  ", ((1,), 1, 0)),
+        ("0.3.0rc1", ((0, 3), 0, 0)),  # pre-release ranks below final
+        ("1.0.0.dev4", ((1,), 0, 0)),
+        ("0.2.18.post1", ((0, 2, 18), 1, 1)),  # post ranks above final
+        ("0.2.18-1", ((0, 2, 18), 1, 1)),  # implicit post
+        ("not-a-version", ((), 1, 0)),
+        ("", ((), 1, 0)),
     ],
 )
-def test_version_key(version, parseable):
-    assert (uc._version_key(version) is not None) is parseable
-
-
-def test_version_key_rejects_huge_numeric_component_without_raising():
-    huge = "9" * 5000
-    assert uc._version_key(f"1.{huge}") is None
-    assert uc.compare_pep440_versions(f"1.{huge}", "1.0") is None
+def test_version_key(version, expected):
+    assert uc._version_key(version) == expected
 
 
 @pytest.mark.parametrize(
@@ -69,31 +60,11 @@ def test_version_key_rejects_huge_numeric_component_without_raising():
         ("0.2.18", "0.2.18.post1", False),  # ...and the reverse is not
         ("0.3.0", "0.3.0rc1", True),  # final beats its own rc
         ("0.3.0rc1", "0.3.0", False),  # rc does not beat the final
-        ("0.3.0", "0.3.0.dev4", True),  # final beats its own dev release
-        ("0.3.0+local.1", "0.3.0", True),
-        ("0.3.0", "0.3.0+local.1", False),
         ("garbage", "0.2.12", False),  # unparseable latest never nags
-        ("0.3.0", "0.2.12garbage", False),  # malformed current is unverifiable
     ],
 )
 def test_is_newer(latest, current, expected):
     assert uc._is_newer(latest, current) is expected
-
-
-@pytest.mark.parametrize(
-    ("left", "right", "expected"),
-    [
-        ("1.0.post1.dev1", "1.0", 1),
-        ("1.0", "1.0.post1.dev1", -1),
-        ("1.0.post1.dev1", "1.0.post1", -1),
-        ("1.0rc1.post1", "1.0rc1", 1),
-        ("1.0rc1", "1.0rc1.post1", -1),
-        ("0.2.56a-1", "0.2.56a.post1", 1),
-        ("0.2.56a_1", "0.2.56a1", 0),
-    ],
-)
-def test_compare_pep440_post_dev_and_pre_post_ordering(left, right, expected):
-    assert uc.compare_pep440_versions(left, right) == expected
 
 
 @pytest.mark.parametrize(

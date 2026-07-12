@@ -109,14 +109,11 @@ def test_cli_train_dry_run(monkeypatch, capsys):
         seen = {}
 
         class _FakeClient:
-            def health(self):
-                from flash import __version__
-                from flash.schema import train_schema_metadata
-
-                return {"version": __version__, "train_schema": train_schema_metadata()}
-
-            def create_run(self, spec, runtime_secrets=None, dry_run=False):
+            def create_run(
+                self, spec, runtime_secrets=None, dry_run=False, client_train_schema=None
+            ):
                 seen["dry_run"] = dry_run
+                seen["client_train_schema"] = client_train_schema
                 return {"run_id": "flash-dry-1", "state": "dry_run", "spec": spec}
 
         monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())
