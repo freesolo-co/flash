@@ -5,17 +5,24 @@ from __future__ import annotations
 import math
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from statistics import median
 from typing import Any
 
 C14_STUDENT_CONTINUATIONS = 2
 C14_TEACHER_CANDIDATES = 2
 C14_TEACHER_INPUT_MULTIPLIER = 2.0
+C14_TEACHER_SCORE_CACHE_MAX_ENTRIES = 4096
 _BOXED_RE = re.compile(r"\\boxed\s*\{([^{}]+)\}", re.IGNORECASE)
-_PUBMED_ANSWER_RE = re.compile(r"\b(yes|no|maybe)\b", re.IGNORECASE)
-_PUBMED_KEYS = ("final_answer", "answer", "label", "answer_key", "correct_answer")
+_PUBMED_ANSWER_RE = re.compile(r"^(yes|no|maybe)$", re.IGNORECASE)
+_PUBMED_FINAL_RE = re.compile(
+    r"(?:final\s+answer|answer)\s*[:=-]\s*(yes|no|maybe)[.!]?\s*$",
+    re.IGNORECASE,
+)
+_PUBMED_SCHEMA_KEYS = frozenset({"question", "context", "long_answer", "final_decision"})
 
 
 @dataclass(frozen=True)
@@ -56,19 +63,29 @@ class TeacherScoreCacheKey:
 
 
 class ExactTeacherScoreCache:
-    """thread-safe exact cache keyed by model and byte-identical request strings."""
+    """thread-safe bounded lru cache keyed by byte-identical teacher requests."""
 
-    def __init__(self) -> None:
-        self._values: dict[TeacherScoreCacheKey, object] = {}
+    def __init__(self, max_entries: int = C14_TEACHER_SCORE_CACHE_MAX_ENTRIES) -> None:
+        limit = int(max_entries)
+        if limit < 1:
+            raise ValueError("teacher score cache max_entries must be positive")
+        self.max_entries = limit
+        self._values: OrderedDict[TeacherScoreCacheKey, object] = OrderedDict()
         self._lock = threading.Lock()
 
     def get(self, key: TeacherScoreCacheKey) -> object | None:
         with self._lock:
-            return self._values.get(key)
+            value = self._values.get(key)
+            if value is not None:
+                self._values.move_to_end(key)
+            return value
 
     def put(self, key: TeacherScoreCacheKey, value: object) -> None:
         with self._lock:
             self._values[key] = value
+            self._values.move_to_end(key)
+            while len(self._values) > self.max_entries:
+                self._values.popitem(last=False)
 
     def __len__(self) -> int:
         with self._lock:
@@ -76,7 +93,10 @@ class ExactTeacherScoreCache:
 
 
 class TeacherInputBudget:
-    """hard teacher-input budget measured against an ordinary-run token baseline."""
+    """hard input cap over a conservative planned c0/group-size-one token proxy.
+
+    the baseline uses planned prompt plus maximum-completion tokens, not provider-realized billing.
+    """
 
     def __init__(
         self,
@@ -130,7 +150,9 @@ def robust_within_prompt_normalize(values: Sequence[float]) -> tuple[float, ...]
     return tuple(value / scale for value in deviations)
 
 
-def detached_target_distribution(records: Sequence[ContinuationRecord], *, temperature: float = 1.0):
+def detached_target_distribution(
+    records: Sequence[ContinuationRecord], *, temperature: float = 1.0
+):
     """build a detached prompt-local target from normalized teacher and local utilities."""
     import torch
 
@@ -193,30 +215,39 @@ def teacher_sequence_logprob(teacher_tokens: Sequence[Any]) -> float:
 
 
 def _canonical_pubmed_answer(value: object) -> str | None:
-    if isinstance(value, str):
-        match = _PUBMED_ANSWER_RE.search(value)
-        return match.group(1).lower() if match else None
-    return None
+    if not isinstance(value, str):
+        return None
+    match = _PUBMED_ANSWER_RE.fullmatch(value.strip())
+    return match.group(1).lower() if match else None
+
+
+def _pubmedqa_reference(example: object) -> str | None:
+    if isinstance(example, dict):
+        if not _PUBMED_SCHEMA_KEYS.issubset(example):
+            return None
+        return _canonical_pubmed_answer(example.get("final_decision"))
+    if not all(hasattr(example, key) for key in _PUBMED_SCHEMA_KEYS):
+        return None
+    return _canonical_pubmed_answer(example.final_decision)
+
+
+def _pubmedqa_candidate(completion_text: str) -> str | None:
+    boxed = _BOXED_RE.findall(completion_text)
+    if boxed:
+        return _canonical_pubmed_answer(boxed[-1])
+    stripped = completion_text.strip()
+    if candidate := _canonical_pubmed_answer(stripped):
+        return candidate
+    match = _PUBMED_FINAL_RE.search(stripped)
+    return match.group(1).lower() if match else None
 
 
 def pubmedqa_correctness(example: object, completion_text: str) -> float | None:
-    """return exact yes/no/maybe correctness when a PubMedQA-style label is available."""
-    reference = None
-    if isinstance(example, dict):
-        for key in _PUBMED_KEYS:
-            if key in example and (reference := _canonical_pubmed_answer(example[key])) is not None:
-                break
-    else:
-        for key in _PUBMED_KEYS:
-            if hasattr(example, key) and (
-                reference := _canonical_pubmed_answer(getattr(example, key))
-            ) is not None:
-                break
+    """score only canonical PubMedQA rows and deterministic final answers."""
+    reference = _pubmedqa_reference(example)
     if reference is None:
         return None
-    boxed = _BOXED_RE.findall(completion_text)
-    candidate_source = boxed[-1] if boxed else completion_text
-    candidate = _canonical_pubmed_answer(candidate_source)
+    candidate = _pubmedqa_candidate(completion_text)
     return float(candidate == reference) if candidate is not None else 0.0
 
 
@@ -225,15 +256,22 @@ def has_boxed_format(text: str) -> bool:
 
 
 def has_repetition(text: str) -> bool:
-    """detect repeated lines or repeated 3-grams without penalizing ordinary word reuse."""
-    normalized_lines = [" ".join(line.lower().split()) for line in text.splitlines() if line.strip()]
-    if len(normalized_lines) != len(set(normalized_lines)):
-        return True
+    """detect local repetition loops without penalizing distant ordinary phrase reuse."""
+    normalized_lines = [
+        " ".join(line.lower().split()) for line in text.splitlines() if line.strip()
+    ]
+    for previous, current in pairwise(normalized_lines):
+        if previous == current and len(previous.split()) >= 3:
+            return True
     tokens = re.findall(r"\w+|[^\w\s]", text.lower())
-    if len(tokens) < 6:
-        return False
-    trigrams = [tuple(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
-    return len(trigrams) != len(set(trigrams))
+    for index in range(len(tokens) - 3):
+        if len(set(tokens[index : index + 4])) == 1:
+            return True
+    for width in range(3, min(16, len(tokens) // 2) + 1):
+        for index in range(len(tokens) - (2 * width) + 1):
+            if tokens[index : index + width] == tokens[index + width : index + (2 * width)]:
+                return True
+    return False
 
 
 def build_continuation_record(

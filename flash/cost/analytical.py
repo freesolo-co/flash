@@ -33,6 +33,7 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # OPD's update is policy fwd+bwd ONLY (6): the teacher's per-token logprobs come from the
 # Fireworks API, so there is NO local frozen-reference forward (GRPO's extra 2).
 OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
+C14_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # detached score fwd (2) + policy fwd/bwd (6)
 
 # Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
@@ -105,7 +106,11 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
         completions, seq_tokens = _opd_step_shape(n)
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
-        update_flops = OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM
+        update_flops = (
+            C14_UPDATE_FLOPS_PER_TOKEN_PER_PARAM
+            if "c14" in n.opd_objective_ids
+            else OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM
+        )
         if {"c06", "c11", "c12"} & set(n.opd_objective_ids):
             update_flops += 2.0  # one frozen SFT-reference forward on the same base model
         update_s = (update_flops * params * seq_tokens) / (peak * MFU_TRAIN)
@@ -132,6 +137,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         math.ceil(completions / REWARD_CONCURRENCY) * latency
     )  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
+
 
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
     """SFT steady-state wall time for an actual token count on ``gpu``."""
@@ -175,14 +181,20 @@ def _notes(
         from flash.engine.recipe import resolve_teacher
 
         teacher_name = resolve_teacher(n.teacher_model).display_name
+        update_note = (
+            "detached listwise score forward + policy update"
+            if "c14" in n.opd_objective_ids
+            else "policy update"
+        )
+        reference_note = (
+            "frozen SFT-reference forward"
+            if {"c06", "c11", "c12"} & set(n.opd_objective_ids)
+            else "no local reference forward"
+        )
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + policy "
-            + (
-                "update + frozen SFT-reference forward"
-                if {"c06", "c11", "c12"} & set(n.opd_objective_ids)
-                else "update (no local reference forward)"
-            )
+            f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + "
+            f"{update_note} + {reference_note}"
         )
     elif n.is_grpo:
         comps = n.batch_size * n.group_size
@@ -207,7 +219,11 @@ def _notes(
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
     # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
-    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    cap_s = (
+        max(60.0, float(config.max_wall_seconds))
+        if config.max_wall_seconds is not None
+        else wall_cap_s
+    )
     # Vast market duration filter: price against offers that outlast the run, using the SAME semantics
     # ``usable_offers`` applies at LAUNCH (not the 60s-floored billing cap_s) — a non-positive wall means
     # NO filter, a positive one is floored at 60s by usable_offers itself:

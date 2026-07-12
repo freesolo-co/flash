@@ -11,6 +11,7 @@ from flash.engine.worker.opd_listwise import (
     TeacherScoreCacheKey,
     build_continuation_record,
     detached_target_distribution,
+    has_repetition,
     listwise_sequence_score_loss,
     pubmedqa_correctness,
     robust_within_prompt_normalize,
@@ -100,10 +101,22 @@ def test_local_utility_composes_available_correctness_and_format_features():
     assert without_correctness.local_utility == 4.0
 
 
-def test_pubmedqa_correctness_when_label_is_available():
-    assert pubmedqa_correctness({"final_answer": "yes"}, "therefore \\boxed{yes}") == 1.0
-    assert pubmedqa_correctness({"label": "no"}, "maybe") == 0.0
-    assert pubmedqa_correctness({"question": "unknown"}, "yes") is None
+def _pubmed_example(answer: str):
+    return {
+        "pubid": "1",
+        "question": "question",
+        "context": {"contexts": ["study"]},
+        "long_answer": "long answer",
+        "final_decision": answer,
+    }
+
+
+def test_pubmedqa_correctness_is_schema_gated_and_uses_the_final_answer():
+    assert pubmedqa_correctness(_pubmed_example("yes"), "therefore \\boxed{yes}") == 1.0
+    assert pubmedqa_correctness(_pubmed_example("no"), "maybe") == 0.0
+    assert pubmedqa_correctness(_pubmed_example("yes"), "No at first. Final answer: yes") == 1.0
+    assert pubmedqa_correctness({"answer": "yes"}, "yes") is None
+    assert pubmedqa_correctness({"label": "no", "question": "unrelated"}, "no") is None
 
 
 def test_record_features_cover_box_eos_repetition_and_length():
@@ -115,7 +128,7 @@ def test_record_features_cover_box_eos_repetition_and_length():
         completion_ids=(2,),
         completion_text="\\boxed{yes}",
         teacher_tokens=(token,),
-        example={"answer": "yes"},
+        example=_pubmed_example("yes"),
         terminal_eos=True,
         length_terminated=False,
     )
@@ -135,6 +148,20 @@ def test_record_features_cover_box_eos_repetition_and_length():
     assert repeated.no_repetition == 0.0
     assert repeated.terminal_eos == 0.0
     assert repeated.no_length_termination == 0.0
+
+
+def test_repetition_detector_is_local_and_conservative_for_long_text():
+    ordinary = " ".join(
+        [
+            "the study reports a clinically meaningful result",
+            "the analysis compares the study result with prior evidence",
+            "the conclusion explains why the result matters for care",
+        ]
+        * 12
+    )
+    assert not has_repetition(ordinary)
+    assert has_repetition("the result is clear the result is clear")
+    assert has_repetition("yes yes yes yes")
 
 
 def test_robust_normalization_ties_are_zero_and_target_is_uniform():
@@ -176,9 +203,11 @@ def test_c14_resolver_groups_two_continuations_and_backpropagates_listwise_term(
         def __init__(self):
             self.weight = torch.zeros(2, 8, requires_grad=True)
             self.config = SimpleNamespace(use_cache=True)
+            self.max_batch = 0
 
         def __call__(self, input_ids, **_kwargs):
             batch, length = input_ids.shape
+            self.max_batch = max(self.max_batch, batch)
             return SimpleNamespace(logits=self.weight[:length].unsqueeze(0).expand(batch, -1, -1))
 
         def parameters(self):
@@ -200,7 +229,7 @@ def test_c14_resolver_groups_two_continuations_and_backpropagates_listwise_term(
                 teacher_toks=[TeacherToken("\\boxed{yes}", -0.2, 0, 11)], status="ok"
             ),
             prompt_ids=[1],
-            example={"answer": "yes"},
+            example=_pubmed_example("yes"),
             prompt_key="prompt",
             candidate_index=0,
         ),
@@ -208,11 +237,9 @@ def test_c14_resolver_groups_two_continuations_and_backpropagates_listwise_term(
             gen=opd_mod._GenResult(
                 completion_ids=[3], completion_text="no", gen_tokens=1, terminal_eos=True
             ),
-            score=opd_mod._ScoreResult(
-                teacher_toks=[TeacherToken("no", -1.0, 0, 2)], status="ok"
-            ),
+            score=opd_mod._ScoreResult(teacher_toks=[TeacherToken("no", -1.0, 0, 2)], status="ok"),
             prompt_ids=[1],
-            example={"answer": "yes"},
+            example=_pubmed_example("yes"),
             prompt_key="prompt",
             candidate_index=1,
         ),
@@ -243,16 +270,101 @@ def test_c14_resolver_groups_two_continuations_and_backpropagates_listwise_term(
     assert model.weight.grad is not None
     assert bool(torch.isfinite(model.weight.grad).all())
     assert not torch.equal(model.weight.grad, torch.zeros_like(model.weight.grad))
+    assert model.max_batch == 1
+    assert model._flash_opd_c14_score_batches == 2
+    assert model._flash_opd_full_logits_batches == 2
 
 
-def test_c14_resolver_skips_prompt_when_one_candidate_fails():
+def test_c14_groups_interleaved_teacher_batches_by_prompt_identity():
+    torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return {2: "yes", 3: "no"}.get(int(ids[0]), "")
+
+    class _Model:
+        def __init__(self):
+            self.weight = torch.zeros(2, 8, requires_grad=True)
+            self.config = SimpleNamespace(use_cache=True)
+
+        def __call__(self, input_ids, **_kwargs):
+            batch, length = input_ids.shape
+            return SimpleNamespace(logits=self.weight[:length].unsqueeze(0).expand(batch, -1, -1))
+
+        def parameters(self):
+            return [self.weight]
+
+        def train(self, mode=True):
+            return self
+
+    def sample(prompt_key, candidate_index, token_id, logprob):
+        text = {2: "yes", 3: "no"}[token_id]
+        return opd_mod._ScoredContinuation(
+            gen=opd_mod._GenResult(completion_ids=[token_id], completion_text=text, gen_tokens=1),
+            score=opd_mod._ScoreResult(
+                teacher_toks=[TeacherToken(text, logprob, 0, len(text))], status="ok"
+            ),
+            prompt_ids=[1],
+            prompt_key=prompt_key,
+            candidate_index=candidate_index,
+        )
+
+    # this ordering models two teacher futures that each hold half of both prompt pairs.
+    samples = [
+        sample("a", 0, 2, -0.2),
+        sample("b", 0, 2, -0.3),
+        sample("a", 1, 3, -1.0),
+        sample("b", 1, 3, -1.1),
+    ]
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c14",),
+    )
+
+    resolved = opd_mod._resolve_samples_batched(
+        _Model(), _Tok(), "cpu", samples, knobs, microbatch=2
+    )
+
+    metric_rows = [result for result in resolved if result.objective_metrics]
+    assert len(metric_rows) == 2
+    assert all(result.loss is not None for result in resolved)
+
+
+def test_c14_incomplete_pair_keeps_successful_candidate_gkd():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "yes", 3: "no"}.get(int(token_id), "") for token_id in ids)
+
+    class _Model:
+        def __init__(self):
+            self.weight = torch.zeros(2, 8, requires_grad=True)
+            self.config = SimpleNamespace(use_cache=True)
+
+        def __call__(self, input_ids, **_kwargs):
+            batch, length = input_ids.shape
+            return SimpleNamespace(logits=self.weight[:length].unsqueeze(0).expand(batch, -1, -1))
+
+        def parameters(self):
+            return [self.weight]
+
+        def train(self, mode=True):
+            return self
 
     successful = opd_mod._ScoredContinuation(
         gen=opd_mod._GenResult(completion_ids=[2], completion_text="yes", gen_tokens=1),
-        score=opd_mod._ScoreResult(
-            teacher_toks=[TeacherToken("yes", -0.2, 0, 3)], status="ok"
-        ),
+        score=opd_mod._ScoreResult(teacher_toks=[TeacherToken("yes", -0.2, 0, 3)], status="ok"),
         prompt_ids=[1],
         prompt_key="prompt",
         candidate_index=0,
@@ -274,13 +386,71 @@ def test_c14_resolver_skips_prompt_when_one_candidate_fails():
     )
 
     resolved = opd_mod._resolve_samples_batched(
-        object(), object(), "cpu", [successful, failed], knobs, microbatch=1
+        _Model(), _Tok(), "cpu", [successful, failed], knobs, microbatch=1
     )
 
-    assert resolved[0].loss is None
-    assert resolved[0].skip_reason == "listwise_group_incomplete"
+    assert resolved[0].loss is not None
+    assert resolved[0].objective_metrics == ()
     assert resolved[1].loss is None
     assert resolved[1].skip_reason == "teacher_error"
+
+
+def test_c14_ordinary_baseline_is_group_size_one_and_cap_is_two_equivalents():
+    from flash.engine.worker import opd as opd_mod
+
+    examples = [(None, None, [1, 2]), (None, None, [3])]
+    ordinary = opd_mod._c14_planned_ordinary_input_tokens(
+        examples, steps=2, prompts_per_step=2, max_completion=5
+    )
+    budget = TeacherInputBudget(ordinary)
+
+    assert ordinary == (2 + 5) + (1 + 5) + (2 + 5) + (1 + 5)
+    assert budget.cap_tokens == 2 * ordinary
+
+
+def test_c14_budget_exhaustion_raises_immediately():
+    from flash.engine.worker import opd as opd_mod
+
+    with pytest.raises(RuntimeError, match="budget_exhausted"):
+        opd_mod._raise_if_c14_budget_exhausted([opd_mod._ScoreResult(status="budget_exhausted")])
+
+
+def test_c14_keeps_35b_loss_microbatch_serial(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker import opd as opd_mod
+
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 35.0)
+    assert opd_mod._opd_loss_microbatch_size("large-model", 16) == 1
+
+
+def test_terminal_eos_uses_preserved_vllm_cause_and_complete_eos_set():
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker.opd_vllm import OpdVllmOutput
+
+    tok = SimpleNamespace(eos_token_id=2, decode=lambda ids, skip_special_tokens=True: "answer")
+    knobs = SimpleNamespace(stop_sequences=())
+    stripped = opd_mod._gen_from_vllm_output(
+        OpdVllmOutput(token_ids=[8], text="answer", finish_reason="stop", stop_reason=None),
+        tok,
+        knobs,
+        eos_ids={2, 7},
+    )
+    secondary = opd_mod._gen_from_vllm_output(
+        OpdVllmOutput(token_ids=[8], text="answer", finish_reason="stop", stop_reason=7),
+        tok,
+        knobs,
+        eos_ids={2, 7},
+    )
+    stopped_on_text = opd_mod._gen_from_vllm_output(
+        OpdVllmOutput(token_ids=[8], text="answer", finish_reason="stop", stop_reason="<stop>"),
+        tok,
+        knobs,
+        eos_ids={2, 7},
+    )
+
+    assert stripped.terminal_eos
+    assert secondary.terminal_eos
+    assert not stopped_on_text.terminal_eos
 
 
 def test_teacher_input_cap_refuses_before_crossing_and_reports_exhausted():
@@ -304,6 +474,22 @@ def test_preflight_does_not_assume_cache_hits():
     assert not budget.preflight((5,))
     assert budget.used_tokens == 0
     assert budget.budget_exhausted
+
+
+def test_exact_teacher_cache_is_bounded_lru_with_exact_keys():
+    cache = ExactTeacherScoreCache(max_entries=2)
+    first = TeacherScoreCacheKey("teacher", "prompt", "a")
+    second = TeacherScoreCacheKey("teacher", "prompt", "b")
+    third = TeacherScoreCacheKey("teacher", "prompt", "c")
+    cache.put(first, "first")
+    cache.put(second, "second")
+    assert cache.get(first) == "first"
+    cache.put(third, "third")
+
+    assert cache.get(second) is None
+    assert cache.get(first) == "first"
+    assert cache.get(third) == "third"
+    assert len(cache) == 2
 
 
 def test_c14_exact_cache_deduplicates_identical_requests():

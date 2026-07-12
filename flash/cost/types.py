@@ -45,6 +45,7 @@ class RunConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
+        object.__setattr__(self, "opd_objective_ids", tuple(self.opd_objective_ids or ()))
         # Normalize like the allocator (case/whitespace, empty -> "auto") and reject an unknown
         # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
@@ -103,6 +104,8 @@ class RunConfig:
             )
             batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
             group = self.group_size if self.group_size is not None else rc.group_size
+            if self.is_opd and "c14" in self.opd_objective_ids:
+                group = 2
         else:
             seq = self.seq_len
             if seq is None:

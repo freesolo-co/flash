@@ -162,6 +162,20 @@ def _opd_teacher_workers(total_samples: int, batch_size: int) -> int:
     return max(1, (total + max(1, int(batch_size)) - 1) // max(1, int(batch_size)))
 
 
+def _c14_planned_ordinary_input_tokens(
+    examples, *, steps: int, prompts_per_step: int, max_completion: int
+) -> int:
+    """planned c0/group-size-one input proxy for the same retained prompt visits."""
+    total = 0
+    for planned_step in range(max(0, int(steps))):
+        for prompt_offset in range(max(0, int(prompts_per_step))):
+            _, _, prompt_ids = examples[
+                (planned_step * prompts_per_step + prompt_offset) % len(examples)
+            ]
+            total += len(prompt_ids) + max(0, int(max_completion))
+    return total
+
+
 def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
     total = max(1, int(total_samples))
     try:
@@ -501,7 +515,9 @@ def run_opd():
     )
     c14_enabled = "c14" in knobs.objective_ids
     if c14_enabled and multi_turn:
-        raise RuntimeError("opd c14 continuation-level listwise distillation requires a single-turn environment")
+        raise RuntimeError(
+            "opd c14 continuation-level listwise distillation requires a single-turn environment"
+        )
     if c14_enabled:
         knobs = replace(knobs, group_size=C14_STUDENT_CONTINUATIONS)
 
@@ -657,15 +673,14 @@ def run_opd():
     teacher_score_cache = ExactTeacherScoreCache() if c14_enabled else None
     teacher_input_budget = None
     if c14_enabled:
-        ordinary_run_tokens = 0
-        for planned_step in range(steps):
-            for prompt_offset in range(prompts_per_step):
-                _, _, planned_prompt_ids = examples[
-                    (planned_step * prompts_per_step + prompt_offset) % len(examples)
-                ]
-                ordinary_run_tokens += C14_STUDENT_CONTINUATIONS * (
-                    len(planned_prompt_ids) + knobs.max_completion
-                )
+        # baseline is c0/group-size-one for the same visits. it is a conservative planned
+        # prompt-plus-max-completion proxy, not provider-realized token billing.
+        ordinary_run_tokens = _c14_planned_ordinary_input_tokens(
+            examples,
+            steps=steps,
+            prompts_per_step=prompts_per_step,
+            max_completion=knobs.max_completion,
+        )
         teacher_input_budget = TeacherInputBudget(ordinary_run_tokens)
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
@@ -1031,6 +1046,9 @@ def run_opd():
                 # exact mean one over the aligned samples contributing to this optimizer update.
                 teacher_futures: dict[Future, list[_Pending]] = {}
                 step_scored_samples: list[tuple[_GenResult, _ScoreResult, object]] = []
+                # c14 must resolve one optimizer attempt as a whole so teacher-future slicing cannot
+                # split a prompt pair. c0 keeps the lower-latency per-future loss path unchanged.
+                c14_scored_samples: list[_ScoredContinuation] = []
 
                 def _queue_teacher_batch(
                     pendings: list[_Pending],
@@ -1114,6 +1132,7 @@ def run_opd():
                         tuple[_GenResult, _ScoreResult, object]
                     ] = step_scored_samples,
                     _accum_target=accum_target,
+                    _c14_scored_samples=c14_scored_samples,
                 ) -> None:
                     batch = _teacher_futures.pop(fut)
                     try:
@@ -1143,6 +1162,19 @@ def run_opd():
                             )
                         else:
                             scored_samples.append((p.gen, score, p.prompt_ids))
+                    if c14_enabled:
+                        exhausted = [
+                            sample
+                            for sample in scored_samples
+                            if sample.score.status == "budget_exhausted"
+                        ]
+                        if exhausted:
+                            for sample in exhausted:
+                                _account(_resolve_no_loss_sample(sample.gen, sample.score))
+                            _cancel_pending_teacher_futures()
+                            _raise_if_c14_budget_exhausted(scores)
+                        _c14_scored_samples.extend(scored_samples)
+                        return
                     if objective_plan.requirements.repetition_weighting:
                         _step_scored_samples.extend(scored_samples)
                         return
@@ -1248,8 +1280,7 @@ def run_opd():
                     if c14_enabled:
                         chunk_size = max(
                             C14_STUDENT_CONTINUATIONS,
-                            chunk_size
-                            - (chunk_size % C14_STUDENT_CONTINUATIONS),
+                            chunk_size - (chunk_size % C14_STUDENT_CONTINUATIONS),
                         )
                     for start in range(0, len(prompts), chunk_size):
                         end = start + chunk_size
@@ -1342,6 +1373,23 @@ def run_opd():
                     for r in resolved:
                         _account(r, backward=False)
                 _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
+                if c14_enabled and c14_scored_samples:
+                    loss_started = time.perf_counter()
+                    resolved = _resolve_samples_batched(
+                        model,
+                        tok,
+                        device,
+                        c14_scored_samples,
+                        knobs,
+                        loss_microbatch_size,
+                        backward_scale=1.0 / accum_target,
+                        runaway_rate=trunc_ema,
+                        overcorr_rate=empty_ema,
+                    )
+                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
+                    opd_phase_counts["loss_batches"] += 1
+                    for r in resolved:
+                        _account(r, backward=False)
 
                 if nseq:
                     break
@@ -1828,8 +1876,16 @@ def _termination_cause(out: OpdVllmOutput, completion_ids, stop_text: str, eos_i
     return "unknown"
 
 
+def _raise_if_c14_budget_exhausted(scores) -> None:
+    if any(score.status == "budget_exhausted" for score in scores):
+        raise RuntimeError(
+            "opd c14 budget_exhausted: the hard 2.0 planned ordinary-run teacher-input cap "
+            "refused the next call before crossing"
+        )
+
+
 def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _GenResult:
-    """Apply OPD's pre-scoring gates to one vLLM completion."""
+    """apply opd gates while preserving the rollout engine's termination cause."""
     completion_ids = [int(t) for t in out.token_ids]
     forced = tuple(bool(f) for f in (getattr(out, "forced", ()) or ()))
     decode = getattr(tok, "decode", None)
@@ -1837,14 +1893,15 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs, *, eos_ids=None) -> _G
         decode(completion_ids, skip_special_tokens=True) if decode else ""
     )
     stop_text = decode(completion_ids, skip_special_tokens=False) if decode else completion_text
-    if eos_ids is None:
-        eos_ids = _generation_eos_ids(None, tok)
+    eos_ids = frozenset(eos_ids) if eos_ids is not None else _generation_eos_ids(None, tok)
     termination_cause = _termination_cause(
         out, completion_ids, stop_text, eos_ids, knobs.stop_sequences
     )
     stop_reason = getattr(out, "stop_reason", None)
+    finish_reason = (out.finish_reason or "").lower()
     terminal_eos = bool(
-        ((out.finish_reason or "").lower() == "eos")
+        finish_reason == "eos"
+        or (finish_reason == "stop" and stop_reason is None)
         or (completion_ids and int(completion_ids[-1]) in eos_ids)
         or (
             isinstance(stop_reason, int)
@@ -2234,7 +2291,10 @@ def _score_many_c14(
                 thinking_prefill=thinking_prefill,
                 max_attempts=1,
             )
-            if not any(result.status == "transient" for result in scored) or attempt + 1 >= max_attempts:
+            if (
+                not any(result.status == "transient" for result in scored)
+                or attempt + 1 >= max_attempts
+            ):
                 break
         assert scored is not None
         for (first_index, pending), result in zip(missing, scored, strict=True):
@@ -2743,22 +2803,6 @@ def _resolve_samples_batched(
     )
     if not samples:
         return []
-    valid_c14_prompt_keys: set[str] | None = None
-    if c14_plan.definitions:
-        c14_group_counts: Counter[str] = Counter()
-        c14_ok_counts: Counter[str] = Counter()
-        for sample in samples:
-            if not isinstance(sample, _ScoredContinuation):
-                continue
-            c14_group_counts[sample.prompt_key] += 1
-            if sample.score is not None and sample.score.status == "ok":
-                c14_ok_counts[sample.prompt_key] += 1
-        valid_c14_prompt_keys = {
-            prompt_key
-            for prompt_key, count in c14_group_counts.items()
-            if count == C14_STUDENT_CONTINUATIONS
-            and c14_ok_counts[prompt_key] == C14_STUDENT_CONTINUATIONS
-        }
     results: list[SampleResult | None] = [None] * len(samples)
     prepared: list[_PreparedLoss] = []
     # Terminal-EOS supervision config (see _eos_reinforce_term). Resolved once — the model/tokenizer
@@ -2808,26 +2852,6 @@ def _resolve_samples_batched(
             example = None
             prompt_key = str(tuple(int(token_id) for token_id in prompt_ids))
             candidate_index = idx
-        if (
-            valid_c14_prompt_keys is not None
-            and isinstance(sample, _ScoredContinuation)
-            and prompt_key not in valid_c14_prompt_keys
-            and not gen.truncated
-            and not gen.skip
-            and score is not None
-            and score.status == "ok"
-        ):
-            results[idx] = SampleResult(
-                teacher_status="ok",
-                gen_tokens=gen.gen_tokens,
-                teacher_tokens=(
-                    score.input_tokens
-                    if score.input_tokens is not None
-                    else len(prompt_ids) + gen.gen_tokens
-                ),
-                skip_reason="listwise_group_incomplete",
-            )
-            continue
         recover_empty = (
             objective_plan.requirements.empty_rollouts
             and objective_empty_recovery
@@ -2877,27 +2901,6 @@ def _resolve_samples_batched(
                 skip_reason="student_tokens_empty",
             )
             continue
-        groups = groupwise_alignment(student_toks, score.teacher_toks)
-        # Drop fully grammar-forced groups, THEN let the loss's per-token mean (_gkd_loss_from_logps)
-        # re-normalize over the SURVIVING tokens: masking removes the spurious forced-position teacher
-        # signal without shrinking the content-token gradient. A fully-forced completion drops to zero
-        # groups -> alignment_empty (below), and such samples are excluded from the step's 1/nseq mean
-        # (_account skips r.loss is None), so the batch stays normalized too.
-        groups = _drop_fully_forced_groups(groups, gen.forced or ())
-        coverage = groupwise_coverage(groups, student_toks)
-        n_align = sum(1 for st in student_toks if st.end > st.start)
-        group_granularity = (n_align / len(groups)) if groups else 0.0
-        prepared_groups = _prepare_gkd_groups(groups)
-        if prepared_groups is None:
-            results[idx] = SampleResult(
-                teacher_status="ok",
-                coverage=coverage,
-                gen_tokens=gen.gen_tokens,
-                teacher_tokens=teacher_tokens,
-                group_granularity=group_granularity,
-                skip_reason="alignment_empty",
-            )
-            continue
         continuation_record = None
         if objective_plan.requirements.continuation_records:
             continuation_record = build_continuation_record(
@@ -2911,6 +2914,23 @@ def _resolve_samples_batched(
                 terminal_eos=gen.terminal_eos,
                 length_terminated=gen.length_terminated,
             )
+        groups = groupwise_alignment(student_toks, score.teacher_toks)
+        # drop fully grammar-forced groups, then let the surviving gkd tokens renormalize.
+        groups = _drop_fully_forced_groups(groups, gen.forced or ())
+        coverage = groupwise_coverage(groups, student_toks)
+        n_align = sum(1 for st in student_toks if st.end > st.start)
+        group_granularity = (n_align / len(groups)) if groups else 0.0
+        prepared_groups = _prepare_gkd_groups(groups)
+        if prepared_groups is None and continuation_record is None:
+            results[idx] = SampleResult(
+                teacher_status="ok",
+                coverage=coverage,
+                gen_tokens=gen.gen_tokens,
+                teacher_tokens=teacher_tokens,
+                group_granularity=group_granularity,
+                skip_reason="alignment_empty",
+            )
+            continue
         prepared.append(
             _PreparedLoss(
                 idx=idx,
@@ -2953,10 +2973,94 @@ def _resolve_samples_batched(
         model.config.use_cache = False
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
         mb = max(1, int(microbatch))
+        c14_components: dict[int, tuple[object, object, tuple[tuple[str, float], ...]]] = {}
         if c14_plan.definitions:
-            mb = max(mb, C14_STUDENT_CONTINUATIONS)
-        for start in range(0, len(prepared), mb):
+            # compute prompt-local student softmax coefficients without retaining activation graphs.
+            # the differentiable pass below replays each configured memory-safe microbatch and applies
+            # the exact cross-entropy derivative coefficient to each live sequence score.
+            detached_scores: dict[int, object] = {}
+            c14_rng_states: list[tuple[object, object]] = []
+            with torch.no_grad():
+                for start in range(0, len(prepared), mb):
+                    chunk = prepared[start : start + mb]
+                    c14_rng_states.append(
+                        (
+                            torch.get_rng_state(),
+                            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                        )
+                    )
+                    _bump_model_counter(model, "_flash_opd_c14_score_batches")
+                    seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
+                    max_len = max(len(seq) for seq in seqs)
+                    input_ids = torch.full(
+                        (len(seqs), max_len), pad_id, dtype=torch.long, device=device
+                    )
+                    attention_mask = torch.zeros(
+                        (len(seqs), max_len), dtype=torch.long, device=device
+                    )
+                    for row, seq in enumerate(seqs):
+                        input_ids[row, : len(seq)] = torch.tensor(
+                            seq, dtype=torch.long, device=device
+                        )
+                        attention_mask[row, : len(seq)] = 1
+                    score_logits = _forward_logits(model, input_ids, attention_mask)
+                    for row, p in enumerate(chunk):
+                        prompt_len = len(p.prompt_ids)
+                        comp_len = len(p.student_ids)
+                        score_rows = score_logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+                        detached_scores[p.idx] = student_sequence_score(
+                            score_rows, p.student_ids
+                        ).detach()
+            prompt_groups: dict[str, list[_PreparedLoss]] = defaultdict(list)
+            for p in prepared:
+                if p.continuation_record is not None:
+                    prompt_groups[p.prompt_key].append(p)
+            for prompt_group in prompt_groups.values():
+                prompt_group.sort(key=lambda item: item.candidate_index)
+                records = select_teacher_candidates(
+                    [item.continuation_record for item in prompt_group]
+                )
+                if len(records) != C14_STUDENT_CONTINUATIONS:
+                    continue
+                selected = [item for item in prompt_group if item.continuation_record in records]
+                selected.sort(key=lambda item: records.index(item.continuation_record))
+                if len(selected) != C14_STUDENT_CONTINUATIONS:
+                    continue
+                sequence_scores = torch.stack([detached_scores[item.idx] for item in selected])
+                target = detached_target_distribution(records).to(
+                    device=sequence_scores.device, dtype=sequence_scores.dtype
+                )
+                listwise_loss = listwise_sequence_score_loss(sequence_scores, target).detach()
+                coefficients = (torch.softmax(sequence_scores, dim=0) - target).detach()
+                correction = (listwise_loss - (coefficients * sequence_scores).sum()).detach()
+                target_entropy = float((-(target * target.clamp_min(1e-12).log()).sum()).detach())
+                evaluation = OPD_OBJECTIVES.evaluate(
+                    c14_plan,
+                    ObjectiveView(
+                        {
+                            "completion_logits": sequence_scores,
+                            "teacher_scores": tuple(record.teacher_logprob for record in records),
+                            "continuation_records": records,
+                            "listwise_loss": listwise_loss,
+                            "target_entropy": target_entropy,
+                        }
+                    ),
+                    base_term=listwise_loss,
+                )
+                metrics = tuple(evaluation.metrics.items())
+                for position, item in enumerate(selected):
+                    c14_components[item.idx] = (
+                        coefficients[position],
+                        correction if position == 0 else correction.new_zeros(()),
+                        metrics if position == 0 else (),
+                    )
+        for chunk_index, start in enumerate(range(0, len(prepared), mb)):
             chunk = prepared[start : start + mb]
+            if c14_plan.definitions:
+                cpu_rng_state, cuda_rng_states = c14_rng_states[chunk_index]
+                torch.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
             _bump_model_counter(model, "_flash_opd_full_logits_batches")
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
@@ -2980,59 +3084,6 @@ def _resolve_samples_batched(
             reference_logits = None
             if objective_plan.requirements.frozen_sft_reference:
                 reference_logits = _reference_forward_logits(model, input_ids, attention_mask)
-            c14_terms: dict[int, tuple[object, tuple[tuple[str, float], ...]]] = {}
-            if c14_plan.definitions:
-                prompt_groups: dict[str, list[tuple[_PreparedLoss, object]]] = defaultdict(list)
-                for row, prepared_loss in enumerate(chunk):
-                    prompt_len = len(prepared_loss.prompt_ids)
-                    comp_len = len(prepared_loss.student_ids)
-                    rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                    prompt_groups[prepared_loss.prompt_key].append(
-                        (
-                            prepared_loss,
-                            student_sequence_score(rows, prepared_loss.student_ids),
-                        )
-                    )
-                for prompt_group in prompt_groups.values():
-                    prompt_group.sort(key=lambda item: item[0].candidate_index)
-                    records = select_teacher_candidates(
-                        [item[0].continuation_record for item in prompt_group]
-                    )
-                    if len(records) != C14_STUDENT_CONTINUATIONS:
-                        continue
-                    selected = [
-                        item
-                        for item in prompt_group
-                        if item[0].continuation_record in records
-                    ]
-                    selected.sort(key=lambda item: records.index(item[0].continuation_record))
-                    target = detached_target_distribution(records)
-                    sequence_scores = torch.stack([item[1] for item in selected])
-                    listwise_loss = listwise_sequence_score_loss(sequence_scores, target)
-                    target_entropy = float(
-                        (-(target * target.clamp_min(1e-12).log()).sum()).detach()
-                    )
-                    evaluation = OPD_OBJECTIVES.evaluate(
-                        c14_plan,
-                        ObjectiveView(
-                            {
-                                "completion_logits": sequence_scores,
-                                "teacher_scores": tuple(
-                                    record.teacher_logprob for record in records
-                                ),
-                                "continuation_records": records,
-                                "listwise_loss": listwise_loss,
-                                "target_entropy": target_entropy,
-                            }
-                        ),
-                        base_term=listwise_loss,
-                    )
-                    first = selected[0][0]
-                    if evaluation.terms:
-                        c14_terms[first.idx] = (
-                            sum(evaluation.terms),
-                            tuple(evaluation.metrics.items()),
-                        )
             losses = []
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
@@ -3045,7 +3096,8 @@ def _resolve_samples_batched(
                         rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
                     )
                 )
-                if loss is None and not p.empty_rollout:
+                c14_component = c14_components.get(p.idx)
+                if loss is None and not p.empty_rollout and c14_component is None:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",
                         coverage=p.coverage,
@@ -3152,9 +3204,14 @@ def _resolve_samples_batched(
                             termination_cause=p.termination_cause,
                         )
                         continue
-                    if p.idx in c14_terms:
-                        c14_term, c14_metrics = c14_terms[p.idx]
-                        auxiliary_terms.append(c14_term)
+                    if c14_component is not None:
+                        coefficient, correction, c14_metrics = c14_component
+                        live_score = student_sequence_score(rows, p.student_ids)
+                        auxiliary_terms.append(
+                            coefficient.to(device=live_score.device, dtype=live_score.dtype)
+                            * live_score
+                            + correction.to(device=live_score.device, dtype=live_score.dtype)
+                        )
                         objective_metrics = (*objective_metrics, *c14_metrics)
                     # preserve addition order and compose every auxiliary term exactly once before the
                     # existing normalization, backward, clipping, optimizer, and vllm sync path.
