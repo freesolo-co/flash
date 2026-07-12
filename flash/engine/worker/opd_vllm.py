@@ -357,7 +357,9 @@ class OpdVllmRolloutEngine:
         self._version += 1
         adapter_dir = os.path.join(self.adapter_root, f"adapter-{self._version:06d}")
         os.makedirs(adapter_dir, exist_ok=True)
-        model.save_pretrained(adapter_dir)
+        from flash.engine.worker.adapter import save_policy_adapter
+
+        save_policy_adapter(model, adapter_dir)
         self._sync_dirs.append(adapter_dir)
         self._lora_int_id = self._version
         self._lora_request = self._LoRARequest(

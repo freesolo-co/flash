@@ -401,15 +401,17 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
         return False
 
 
-def _resolve_init_from_adapter(
-    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+def _resolve_adapter_field(
+    spec: JobSpec,
+    field: str,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+    require_sft: bool = False,
 ) -> JobSpec:
-    """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
-
-    The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
-    the source run's hf_repo + phase key the artifact location the worker downloads from.
-    """
-    ref = spec.train.init_from_adapter
+    """Resolve one public adapter ref before provisioning and enforce source compatibility."""
+    label = f"train.{field}"
+    ref = getattr(spec.train, field)
     if not ref:
         return spec
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
@@ -417,30 +419,33 @@ def _resolve_init_from_adapter(
     parsed = parse_checkpoint_ref(ref)
     if parsed is None:
         raise ValueError(
-            "train.init_from_adapter must be `<run_id>` or `<run_id>/step-N` "
+            f"{label} must be `<run_id>` or `<run_id>/step-N` "
             f"(a checkpoint listed by `flash checkpoints`); got {ref!r}"
         )
     src_run_id, step = parsed
     try:
         src_status = get_status(src_run_id)
     except FileNotFoundError:
-        raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
+        raise ValueError(f"{label} references unknown run {src_run_id!r}") from None
     owner_org_id = owner_org_id.strip()
     if owner_org_id:
         src_org_id = _status_org_id(src_status)
-        if src_org_id:
-            owner_ok = src_org_id == owner_org_id
-        else:
-            owner_ok = _source_owned_by_key(src_run_id, owner_key_id)
-        if not owner_ok:
-            raise ValueError(
-                "train.init_from_adapter source run must belong to the same Freesolo org"
-            )
-    src_spec = JobSpec.from_dict(src_status.spec)
-    if not src_spec.train.hf_repo:
-        raise ValueError(
-            f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
+        owner_ok = (
+            src_org_id == owner_org_id
+            if src_org_id
+            else _source_owned_by_key(src_run_id, owner_key_id)
         )
+        if not owner_ok:
+            raise ValueError(f"{label} source run must belong to the same Freesolo org")
+    src_spec = JobSpec.from_dict(src_status.spec)
+    if require_sft and src_spec.algorithm != "sft":
+        raise ValueError(f"{label} must reference an SFT run, got {src_spec.algorithm!r}")
+    if require_sft and src_spec.model != spec.model:
+        raise ValueError(
+            f"{label} source model {src_spec.model!r} does not match target model {spec.model!r}"
+        )
+    if not src_spec.train.hf_repo:
+        raise ValueError(f"{label} run {src_run_id!r} has no stored adapter artifacts")
     if step is not None:
         from flash.runner.checkpoints import CheckpointListingError, checkpoint_step_exists
 
@@ -450,15 +455,14 @@ def _resolve_init_from_adapter(
             raise ValueError(str(exc)) from exc
         if not exists:
             raise ValueError(
-                f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
-                "deployable checkpoint was not found"
+                f"{label} references {src_run_id}/step-{step}, but that deployable checkpoint "
+                "was not found"
             )
     else:
         if src_status.state not in {"done", "deployed"}:
             raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but that run is "
-                f"{src_status.state!r}; use a completed source run or a concrete "
-                f"{src_run_id}/step-N checkpoint"
+                f"{label} references run {src_run_id!r}, but that run is {src_status.state!r}; "
+                f"use a completed source run or a concrete {src_run_id}/step-N checkpoint"
             )
         from flash.runner.checkpoints import CheckpointListingError, final_adapter_exists
 
@@ -468,12 +472,34 @@ def _resolve_init_from_adapter(
             raise ValueError(str(exc)) from exc
         if not exists:
             raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but its final "
-                "adapter was not found; use a concrete checkpoint ref like "
-                f"{src_run_id}/step-N if one exists"
+                f"{label} references run {src_run_id!r}, but its final adapter was not found; "
+                f"use a concrete checkpoint ref like {src_run_id}/step-N if one exists"
             )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
-    return replace(spec, train=replace(spec.train, init_from_adapter=storage))
+    return replace(spec, train=replace(spec.train, **{field: storage}))
+
+
+def _resolve_init_from_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
+    return _resolve_adapter_field(
+        spec,
+        "init_from_adapter",
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+    )
+
+
+def _resolve_opd_reference_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
+    return _resolve_adapter_field(
+        spec,
+        "opd_reference_adapter",
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+        require_sft=True,
+    )
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
@@ -489,21 +515,29 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
     child recovered across restarts keeps its source's marker fresh past the age window."""
     import io
 
-    ref = worker_spec.train.init_from_adapter
-    if not ref or ":" not in ref or not child_run_id or child_run_id == "local":
+    if not child_run_id or child_run_id == "local":
         return
-    source_repo = ref.split(":", 1)[0].strip()
-    if not source_repo:
-        return
-    with contextlib.suppress(Exception):
-        from huggingface_hub import HfApi
-
-        HfApi().upload_file(
-            path_or_fileobj=io.BytesIO(b""),
-            path_in_repo=f"referenced_by/{child_run_id}",
-            repo_id=source_repo,
-            repo_type="dataset",
+    refs = {
+        ref
+        for ref in (
+            getattr(worker_spec.train, "init_from_adapter", ""),
+            getattr(worker_spec.train, "opd_reference_adapter", ""),
         )
+        if ref and ":" in ref
+    }
+    for ref in refs:
+        source_repo = ref.split(":", 1)[0].strip()
+        if not source_repo:
+            continue
+        with contextlib.suppress(Exception):
+            from huggingface_hub import HfApi
+
+            HfApi().upload_file(
+                path_or_fileobj=io.BytesIO(b""),
+                path_in_repo=f"referenced_by/{child_run_id}",
+                repo_id=source_repo,
+                repo_type="dataset",
+            )
 
 
 def submit_job(
@@ -546,6 +580,11 @@ def submit_job(
     owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
     worker_spec = _resolve_init_from_adapter(
         public_spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+    )
+    worker_spec = _resolve_opd_reference_adapter(
+        worker_spec,
         owner_org_id=owner_org_id,
         owner_key_id=owner_key_id,
     )

@@ -147,6 +147,79 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def _tokenizer_signature(tokenizer) -> tuple[object, ...]:
+    size = len(tokenizer)
+    vocab_size = int(getattr(tokenizer, "vocab_size", size))
+    special = tuple(
+        (name, getattr(tokenizer, name, None))
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+    )
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    vocab = tuple(sorted(get_vocab().items())) if callable(get_vocab) else ()
+    return size, vocab_size, special, vocab
+
+
+def load_frozen_sft_reference(model, model_id: str, tokenizer):
+    """Load the configured SFT adapter beside trainable default and freeze it completely."""
+    ref = _w.JOB_SPEC.train.opd_reference_adapter if _w.JOB_SPEC else ""
+    if not ref:
+        raise RuntimeError(
+            "opd objectives requiring a frozen SFT reference need train.opd_reference_adapter"
+        )
+    adir = _download_adapter(ref)
+    if not adir:
+        raise RuntimeError(f"train.opd_reference_adapter={ref!r} could not be downloaded")
+
+    from transformers import AutoTokenizer
+
+    reference_tokenizer = AutoTokenizer.from_pretrained(adir, trust_remote_code=True)
+    if _tokenizer_signature(reference_tokenizer) != _tokenizer_signature(tokenizer):
+        raise RuntimeError(
+            "opd frozen-reference tokenizer/vocabulary does not match the policy tokenizer"
+        )
+
+    base = getattr(model, "get_base_model", lambda: model)()
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    previous = getattr(model, "active_adapter", "default")
+    try:
+        load_result = model.load_adapter(
+            adir,
+            adapter_name="sft_reference",
+            is_trainable=False,
+            key_mapping=key_mapping,
+        )
+        assert_adapter_load_clean(load_result, model_id)
+    finally:
+        model.set_adapter(previous or "default")
+
+    reference_params = [
+        param for name, param in model.named_parameters() if ".sft_reference." in name
+    ]
+    if not reference_params:
+        raise RuntimeError("frozen SFT reference adapter loaded no named parameters")
+    if any(param.requires_grad for param in reference_params):
+        raise RuntimeError("frozen SFT reference adapter contains trainable parameters")
+    return model
+
+
+def assert_reference_absent_from_optimizer(model, optimizer) -> None:
+    reference_ids = {
+        id(param) for name, param in model.named_parameters() if ".sft_reference." in name
+    }
+    optimized_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    if reference_ids & optimized_ids:
+        raise RuntimeError("frozen SFT reference parameters must be absent from the optimizer")
+
+
+def save_policy_adapter(model, adapter_dir: str) -> None:
+    """Serialize only the trainable policy adapter, never the frozen anchor."""
+    adapters = getattr(model, "peft_config", {}) or {}
+    if "sft_reference" in adapters:
+        model.save_pretrained(adapter_dir, selected_adapters=["default"])
+    else:
+        model.save_pretrained(adapter_dir)
+
+
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve the INTERNAL adapter storage reference into (repo, prefix).
 

@@ -105,7 +105,10 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
         completions, seq_tokens = _opd_step_shape(n)
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
-        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
+        update_flops = OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM
+        if {"c06", "c11"} & set(n.opd_objective_ids):
+            update_flops += 2.0  # one frozen SFT-reference forward on the same base model
+        update_s = (update_flops * params * seq_tokens) / (peak * MFU_TRAIN)
         teacher_lat = teacher_seconds_per_completion()
         # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
         # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
@@ -175,7 +178,11 @@ def _notes(
         notes.append(
             f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
             f"@ {n.completion_len} tok + {teacher_name} teacher scoring ({tsec:.2f}s/completion) + policy "
-            "update (no local reference forward)"
+            + (
+                "update + frozen SFT-reference forward"
+                if {"c06", "c11"} & set(n.opd_objective_ids)
+                else "update (no local reference forward)"
+            )
         )
     elif n.is_grpo:
         comps = n.batch_size * n.group_size

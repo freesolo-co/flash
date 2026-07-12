@@ -108,6 +108,8 @@ class TrainSpec:
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = ""
+    # opd only: frozen sft anchor, independently resolved from policy initialization.
+    opd_reference_adapter: str = ""
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
@@ -222,6 +224,7 @@ class JobSpec:
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
+                opd_reference_adapter=str(train.get("opd_reference_adapter") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),

@@ -107,6 +107,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _gc_run_endpoints,
         _persist_metrics,
         _resolve_init_from_adapter,
+        _resolve_opd_reference_adapter,
         _run_training,
         _RunCancelled,
         _status_estimated_charge,
@@ -190,6 +191,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 owner_key_id = db.run_owner(run_id)
             worker_spec = _resolve_init_from_adapter(
                 public_spec,
+                owner_org_id=_status_org_id(status),
+                owner_key_id=owner_key_id,
+            )
+            worker_spec = _resolve_opd_reference_adapter(
+                worker_spec,
                 owner_org_id=_status_org_id(status),
                 owner_key_id=owner_key_id,
             )

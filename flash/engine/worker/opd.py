@@ -39,6 +39,11 @@ from flash.engine.structured_outputs import (
 )
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.adapter import (
+    assert_reference_absent_from_optimizer,
+    load_frozen_sft_reference,
+    save_policy_adapter,
+)
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
@@ -261,6 +266,11 @@ def _resolve_opd_knobs() -> OpdKnobs:
                 else d.cvar_entropy_coef
             ),
         )
+        reference_adapter = getattr(t, "opd_reference_adapter", "") if t else ""
+        if objective_plan.requirements.frozen_sft_reference and not reference_adapter:
+            raise ValueError(
+                "train.opd_reference_adapter is required by the selected OPD objective(s)"
+            )
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
     objective_entropy = next(
@@ -646,6 +656,9 @@ def run_opd():
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
     with liveness_heartbeat("opd_initializing"):
         model, rollout_model_source = _student_model(model_id, model_init_kwargs, device)
+        objective_plan = OPD_OBJECTIVES.plan(knobs.objective_ids)
+        if objective_plan.requirements.frozen_sft_reference:
+            load_frozen_sft_reference(model, model_id, tok)
         # Apply chalk standalone kernels to the student, exactly as sft/rl do after building their
         # trainer. The HF/PEFT student remains the GKD loss target, so without this the default
         # Qwen3.5/3.6 catalog model silently falls back to eager GDN/RMSNorm/RoPE/LoRA kernels and a
@@ -724,6 +737,8 @@ def run_opd():
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=knobs.learning_rate
     )
+    if objective_plan.requirements.frozen_sft_reference:
+        assert_reference_absent_from_optimizer(model, optimizer)
 
     # Initialize W&B if configured ([wandb] config + WANDB_API_KEY). wandb_report_to() CREATES the run
     # as a side effect -- sft/rl get this for free by passing report_to into the HF Trainer, but opd's
@@ -2150,6 +2165,21 @@ def _forward_logits(
         raise
 
 
+def _reference_forward_logits(model, input_ids, attention_mask=None):
+    """Run the frozen anchor and restore the trainable policy adapter even on failure."""
+    import torch
+
+    previous = getattr(model, "active_adapter", "default") or "default"
+    try:
+        model.set_adapter("sft_reference", inference_mode=True)
+        model.eval()
+        with torch.no_grad():
+            return _forward_logits(model, input_ids, attention_mask).detach()
+    finally:
+        model.set_adapter(previous, inference_mode=False)
+        model.train()
+
+
 def _bump_model_counter(model, name: str, inc: int = 1) -> None:
     with contextlib.suppress(Exception):
         setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
@@ -2642,6 +2672,9 @@ def _resolve_samples_batched(
                     topk_meter,
                     topk_cache,
                 )
+            reference_logits = None
+            if objective_plan.requirements.frozen_sft_reference:
+                reference_logits = _reference_forward_logits(model, input_ids, attention_mask)
             losses = []
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
@@ -2693,7 +2726,7 @@ def _resolve_samples_batched(
                     ent_term, entropy = _entropy_floor_term(rows, ent_coef, ent_floor)
                     if ent_term is not None:
                         auxiliary_terms.append(ent_term)
-                    objective_metrics = ()
+                    objective_metrics: tuple[tuple[str, float], ...] = ()
                     if objective_plan.definitions:
                         objective_values = {
                             "prompt_len": prompt_len,
@@ -2713,6 +2746,23 @@ def _resolve_samples_batched(
                         if objective_plan.requirements.student_logits:
                             objective_values.update(
                                 sample_logits=logits[row], completion_logits=rows
+                            )
+                        if objective_plan.requirements.frozen_sft_reference:
+                            if reference_logits is None:
+                                raise RuntimeError("frozen-reference logits were not computed")
+                            reference_rows = reference_logits[
+                                row, prompt_len - 1 : prompt_len - 1 + comp_len
+                            ]
+                            objective_values.update(
+                                reference_completion_logits=reference_rows,
+                                completion_mask=torch.tensor(
+                                    [
+                                        not (index < len(p.forced) and p.forced[index])
+                                        for index in range(comp_len)
+                                    ],
+                                    dtype=torch.bool,
+                                    device=rows.device,
+                                ),
                             )
                         if objective_plan.requirements.teacher_scores:
                             objective_values["teacher_scores"] = p.teacher_scores
@@ -2818,7 +2868,7 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
-    model.save_pretrained(adapter_dir)
+    save_policy_adapter(model, adapter_dir)
     tok.save_pretrained(adapter_dir)
 
 

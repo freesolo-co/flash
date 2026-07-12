@@ -158,21 +158,29 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
-def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
-    ref_raw = train_raw.get("init_from_adapter")
+def _adapter_ref(train_raw: dict[str, Any], name: str) -> str:
+    ref_raw = train_raw.get(name)
     if ref_raw is None:
         return ""
+    field = f"train.{name}"
     if not isinstance(ref_raw, str):
-        raise ConfigError("train.init_from_adapter must be a string")
+        raise ConfigError(f"{field} must be a string")
     ref = ref_raw.strip()
     if not ref:
         return ""
     if parse_checkpoint_ref(ref) is not None:
         return ref
     raise ConfigError(
-        "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        "`<run_id>/step-N` (warm-start from a checkpoint listed by `flash checkpoints`)"
+        f"{field} must be `<run_id>` or `<run_id>/step-N` "
+        "(a checkpoint listed by `flash checkpoints`)"
     )
+
+
+def _opd_reference_adapter_ref(train_raw: dict[str, Any], algorithm: str) -> str:
+    ref = _adapter_ref(train_raw, "opd_reference_adapter")
+    if ref and algorithm != "opd":
+        raise ConfigError('train.opd_reference_adapter is only valid when algorithm = "opd"')
+    return ref
 
 
 # Unknown tables are rejected loudly: a stray [grpo] table silently dropped GRPO knobs and trained
@@ -198,6 +206,7 @@ _TRAIN_KEYS = frozenset(
         "lora_rank",
         "lora_alpha",
         "init_from_adapter",
+        "opd_reference_adapter",
         "hf_repo",
         "learning_rate",
         "batch_size",
@@ -352,7 +361,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=_init_from_adapter_ref(train_raw),
+            init_from_adapter=_adapter_ref(train_raw, "init_from_adapter"),
+            opd_reference_adapter=_opd_reference_adapter_ref(train_raw, algorithm),
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
@@ -403,6 +413,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         thinking=thinking,
         wandb=wandb_spec,
     )
+    if {"c06", "c11"} & set(spec.train.opd_objective_ids) and not spec.train.opd_reference_adapter:
+        raise ConfigError("train.opd_reference_adapter is required when selecting c06 or c11")
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
         # thinking + a constraint is supported: the rollout worker sets a reasoning parser on the vLLM

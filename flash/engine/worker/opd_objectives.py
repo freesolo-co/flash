@@ -32,6 +32,7 @@ class ObjectiveRequirements:
     sampled_primary: bool = False
     repetition_weighting: bool = False
     candidate_topk: bool = False
+    frozen_sft_reference: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,6 +266,7 @@ class ObjectiveRegistry:
                 sampled_primary=any(d.requirements.sampled_primary for d in definitions),
                 repetition_weighting=any(d.requirements.repetition_weighting for d in definitions),
                 candidate_topk=any(d.requirements.candidate_topk for d in definitions),
+                frozen_sft_reference=any(d.requirements.frozen_sft_reference for d in definitions),
             ),
         )
 
@@ -286,6 +288,8 @@ class ObjectiveRegistry:
                 view.require("position_statistics")
             if definition.requirements.candidate_topk:
                 view.require("candidate_topk")
+            if definition.requirements.frozen_sft_reference:
+                view.require("reference_completion_logits")
             result = definition.evaluate(view)
             if not isinstance(result, ObjectiveResult):
                 raise TypeError(
@@ -310,6 +314,77 @@ class ObjectiveRegistry:
                     raise ValueError(f"duplicate opd objective metric: {key}")
                 metrics[key] = _detached_float(value, context=f"opd objective metric {key!r}")
         return ObjectiveEvaluation(terms=tuple(terms), metrics=metrics)
+
+
+_REFERENCE_TOP_K = 32
+_REFERENCE_ROW_CHUNK = 64
+
+
+def _masked_rows(view: ObjectiveView):
+    policy = view.require("completion_logits")
+    reference = view.require("reference_completion_logits")
+    if policy.shape != reference.shape:
+        raise RuntimeError(
+            "policy and frozen-reference completion logits must have identical shapes"
+        )
+    mask = view.values.get("completion_mask")
+    if mask is None:
+        return policy, reference
+    if mask.ndim != 1 or mask.shape[0] != policy.shape[0]:
+        raise RuntimeError("completion_mask must be one-dimensional and match completion rows")
+    return policy[mask], reference[mask]
+
+
+def forward_kl_topk_tail(policy_logits, reference_logits, *, top_k: int = _REFERENCE_TOP_K):
+    """reference-to-policy kl with exact top-k atoms and one aggregated tail atom."""
+    import torch
+    import torch.nn.functional as F
+
+    if policy_logits.shape != reference_logits.shape:
+        raise ValueError("policy and reference logits must have identical shapes")
+    if policy_logits.ndim != 2:
+        raise ValueError("forward kl expects [rows, vocab] logits")
+    if policy_logits.shape[0] == 0:
+        return policy_logits.sum() * 0.0
+    vocab = policy_logits.shape[-1]
+    k = max(1, min(int(top_k), vocab))
+    total = torch.zeros((), dtype=torch.float32, device=policy_logits.device)
+    for start in range(0, policy_logits.shape[0], _REFERENCE_ROW_CHUNK):
+        policy = policy_logits[start : start + _REFERENCE_ROW_CHUNK].float()
+        reference = reference_logits[start : start + _REFERENCE_ROW_CHUNK].float()
+        reference_lp = F.log_softmax(reference, dim=-1)
+        policy_lp = F.log_softmax(policy, dim=-1)
+        top_ref_lp, top_idx = torch.topk(reference_lp, k=k, dim=-1)
+        top_policy_lp = policy_lp.gather(-1, top_idx)
+        top_ref_p = top_ref_lp.exp()
+        chunk_kl = (top_ref_p * (top_ref_lp - top_policy_lp)).sum(dim=-1)
+        if k < vocab:
+            ref_tail = (1.0 - top_ref_p.sum(dim=-1)).clamp_min(1e-12)
+            policy_top_p = top_policy_lp.exp().sum(dim=-1)
+            policy_tail = (1.0 - policy_top_p).clamp_min(1e-12)
+            chunk_kl = chunk_kl + ref_tail * (ref_tail.log() - policy_tail.log())
+        total = total + chunk_kl.sum()
+    return (total / policy_logits.shape[0]).to(dtype=policy_logits.dtype)
+
+
+def sft_relative_top2_margin(policy_logits, reference_logits):
+    """hinge policy ordering against the frozen reference's top-1/top-2 logit margin."""
+    import torch.nn.functional as F
+
+    if policy_logits.shape != reference_logits.shape or policy_logits.ndim != 2:
+        raise ValueError("margin objective expects matching [rows, vocab] logits")
+    if policy_logits.shape[0] == 0:
+        return policy_logits.sum() * 0.0
+    if policy_logits.shape[-1] < 2:
+        raise ValueError("margin objective requires a vocabulary of at least two tokens")
+    ref_top, ref_idx = reference_logits.float().topk(k=2, dim=-1)
+    policy_top = policy_logits.float().gather(-1, ref_idx)
+    ref_margin = (ref_top[:, 0] - ref_top[:, 1]).detach()
+    active = ref_margin > 0
+    if not bool(active.any().item()):
+        return policy_logits.sum() * 0.0
+    policy_margin = policy_top[:, 0] - policy_top[:, 1]
+    return F.relu(ref_margin[active] - policy_margin[active]).mean().to(dtype=policy_logits.dtype)
 
 
 def _c0(_view: ObjectiveView) -> ObjectiveResult:
@@ -496,6 +571,18 @@ def _c13(view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult(term=candidate.term, metrics=metrics)
 
 
+def _c06(view: ObjectiveView) -> ObjectiveResult:
+    policy, reference = _masked_rows(view)
+    term = forward_kl_topk_tail(policy, reference)
+    return ObjectiveResult(term=term, metrics={"forward_kl": term.detach()})
+
+
+def _c11(view: ObjectiveView) -> ObjectiveResult:
+    policy, reference = _masked_rows(view)
+    term = sft_relative_top2_margin(policy, reference)
+    return ObjectiveResult(term=term, metrics={"margin_hinge": term.detach()})
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
@@ -508,6 +595,11 @@ OPD_OBJECTIVES = ObjectiveRegistry(
             requirements=ObjectiveRequirements(student_logits=True, empty_rollouts=True),
             evaluate=_c05,
             config=_C05_CONFIG,
+        ),
+        ObjectiveDefinition(
+            objective_id="c06",
+            requirements=ObjectiveRequirements(student_logits=True, frozen_sft_reference=True),
+            evaluate=_c06,
         ),
         ObjectiveDefinition(
             objective_id="c07",
@@ -531,6 +623,11 @@ OPD_OBJECTIVES = ObjectiveRegistry(
             objective_id="c10",
             requirements=ObjectiveRequirements(student_logits=True, position_statistics=True),
             evaluate=_c10,
+        ),
+        ObjectiveDefinition(
+            objective_id="c11",
+            requirements=ObjectiveRequirements(student_logits=True, frozen_sft_reference=True),
+            evaluate=_c11,
         ),
         ObjectiveDefinition(
             objective_id="c13",

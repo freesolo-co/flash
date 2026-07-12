@@ -329,6 +329,7 @@ def estimate_vram_gb(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     sft_fused_ce: bool | None = None,
+    frozen_reference: bool = False,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
@@ -398,7 +399,9 @@ def estimate_vram_gb(
         logits_fwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
         logits_bwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
         logits = (logits_fwd + logits_bwd) / 1e9
-        return base + rollout + activations + logits
+        # reference objectives run a sequential no-grad forward while policy logits remain live.
+        reference_logits = loss_mb * seq_len * 2 * vocab / 1e9 if frozen_reference else 0.0
+        return base + rollout + activations + logits + reference_logits
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
     # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
     # comparisons; the default must mirror the worker.
@@ -581,6 +584,8 @@ def model_required_vram_gb(
         group_size_default = 8
     group_size = _pos_int(_get(train, "group_size"), group_size_default)
     batch_size = _pos_int(_get(train, "batch_size"), batch_size_default)
+    objective_ids = tuple(_get(train, "opd_objective_ids") or ())
+    frozen_reference = bool({"c06", "c11"} & set(objective_ids))
 
     def _need(
         params_b: float,
@@ -607,6 +612,7 @@ def model_required_vram_gb(
             active_params_b=active_params_b,
             fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
+            frozen_reference=frozen_reference,
         )
         return math.ceil(est * headroom)
 

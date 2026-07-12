@@ -31,6 +31,8 @@ class RunConfig:
     # Prices the teacher-API estimate; an empty value resolves to the default GLM 5.2 teacher (an
     # omitted [train].teacher_model).
     teacher_model: str = ""
+    # opd only: selected auxiliary objectives; reference objectives add a frozen local forward.
+    opd_objective_ids: tuple[str, ...] = ()
 
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
@@ -108,12 +110,12 @@ class RunConfig:
             lora_rank=lora,
         )
 
-    def train_knobs(self) -> dict[str, int]:
+    def train_knobs(self) -> dict[str, object]:
         """The knob dict ``model_required_vram_gb`` consumes. Only an EXPLICIT batch_size is
         forwarded -- an omitted SFT batch sizes as the worker's micro-batch (4), not the recipe's
         effective batch (32), which would over-provision."""
         n = self.normalized()
-        knobs: dict[str, int] = {"lora_rank": n.lora_rank}
+        knobs: dict[str, object] = {"lora_rank": int(n.lora_rank or RECIPE.lora.rank)}
         if self.batch_size is not None:
             knobs["batch_size"] = self.batch_size
         if n.seq_len is not None:
@@ -122,6 +124,8 @@ class RunConfig:
             knobs["max_completion_tokens"] = n.completion_len
         if n.group_size is not None:
             knobs["group_size"] = n.group_size
+        if self.opd_objective_ids:
+            knobs["opd_objective_ids"] = self.opd_objective_ids
         return knobs
 
 
