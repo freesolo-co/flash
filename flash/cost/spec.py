@@ -118,7 +118,8 @@ def spec_steps(spec) -> int:
 
     SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by ``max_steps``. GRPO/OPD:
     ``epochs`` means passes over ``max_examples`` rows when pinned, otherwise the estimate uses one
-    prompt batch per epoch.
+    prompt batch per epoch. OPD also applies a positive ``max_steps`` as a planned-success ceiling;
+    GRPO keeps its existing epoch-derived behavior.
     """
     if spec.algorithm in ("grpo", "opd"):
         examples = _on_policy_example_count(spec)
@@ -126,6 +127,7 @@ def spec_steps(spec) -> int:
             epochs=_on_policy_epochs(spec),
             prompt_count=examples,
             prompts_per_step=_on_policy_prompts_per_step(spec, examples),
+            max_steps=spec.train.max_steps if spec.algorithm == "opd" else None,
         )
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.

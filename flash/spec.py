@@ -115,6 +115,7 @@ class TrainSpec:
     batch_size: int | None = None
     max_context_tokens: int | None = None
     save_every: int | None = None
+    # sft cap and opd planned-success ceiling; none or 0 leaves the algorithm uncapped.
     max_steps: int | None = None
     max_examples: int | None = None
     group_size: int | None = None

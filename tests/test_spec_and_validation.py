@@ -86,7 +86,9 @@ def test_opd_eos_loss_coef_accepted_by_schema() -> None:
     # key at submit — the documented override never reached the worker. It must round-trip here.
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
     assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
-    assert spec_from_dict(_raw()).train.opd_eos_loss_coef is None  # unset -> recipe default at resolve
+    assert (
+        spec_from_dict(_raw()).train.opd_eos_loss_coef is None
+    )  # unset -> recipe default at resolve
     with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
         spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
@@ -342,19 +344,26 @@ def test_jobspec_from_dict_rejects_path() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sft_caps_parse_from_toml() -> None:
-    # [train].max_steps / max_examples are read by the worker; ensure spec_from_dict actually
-    # parses them (they were defined on TrainSpec but silently dropped at parse time).
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_train_caps_parse_strictly_for_every_algorithm(algorithm) -> None:
     spec = spec_from_dict(
-        _raw(**{"train.max_steps": 50, "train.max_examples": 200}), run_id="caps-1"
+        _raw(
+            **{
+                "algorithm": algorithm,
+                "train.max_steps": 20,
+                "train.max_examples": 200,
+            }
+        ),
+        run_id="caps-1",
     )
-    assert spec.train.max_steps == 50
+    assert spec.train.max_steps == 20
     assert spec.train.max_examples == 200
-    # explicit 0 means "no cap" (not rejected); negatives are rejected.
-    spec0 = spec_from_dict(_raw(**{"train.max_steps": 0}), run_id="caps-0")
+    spec0 = spec_from_dict(_raw(**{"algorithm": algorithm, "train.max_steps": 0}), run_id="caps-0")
     assert spec0.train.max_steps == 0
+    with pytest.raises(ConfigError, match="max_steps must be >= 0"):
+        spec_from_dict(_raw(**{"algorithm": algorithm, "train.max_steps": -1}))
     with pytest.raises(ConfigError, match="max_examples must be >= 0"):
-        spec_from_dict(_raw(**{"train.max_examples": -5}))
+        spec_from_dict(_raw(**{"algorithm": algorithm, "train.max_examples": -5}))
 
 
 def test_job_spec_json_round_trip() -> None:
@@ -436,10 +445,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     d = spec.to_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = JobSpec.from_dict(d)
-    assert (
-        orch.adapter_ref(spec_with_repo)
-        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
-    )
+    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------

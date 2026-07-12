@@ -159,6 +159,7 @@ class OpdKnobs:
     max_completion: int = 0
     prompts_per_step: int = 0
     group_size: int = 0
+    max_steps: int = 0
     # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
     kl_coef: float = 1.0
     # Weight of the terminal-EOS behaviour-cloning term (see _eos_reinforce_term). The reverse-KL
@@ -258,6 +259,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
         prompts_per_step=int(opt("batch_size", 0) or d.prompts_per_step),
         group_size=int(opt("group_size", 0) or d.group_size),
+        max_steps=int(opt("max_steps", 0) or 0),
         kl_coef=kl_coef,
         # 0 is a VALID explicit value here (disable EOS reinforcement), unlike kl_coef, so only fall
         # back to the recipe default when the field is UNSET (None) — a plain `or` would swallow 0.0.
@@ -553,14 +555,25 @@ def run_opd():
             "only that many prompt(s) fit after filtering"
         )
         prompts_per_step = len(examples)
-    steps = on_policy_steps(
+    uncapped_steps = on_policy_steps(
         epochs=knobs.epochs,
         prompt_count=len(examples),
         prompts_per_step=prompts_per_step,
     )
+    steps = on_policy_steps(
+        epochs=knobs.epochs,
+        prompt_count=len(examples),
+        prompts_per_step=prompts_per_step,
+        max_steps=knobs.max_steps,
+    )
+    ceiling_applied = knobs.max_steps > 0 and steps < uncapped_steps
+    terminal_reason = (
+        "planned_max_steps_reached" if ceiling_applied else "planned_epoch_steps_completed"
+    )
     print(
         f"[opd] epochs={knobs.epochs} over {len(examples)} retained prompt(s) at "
         f"{prompts_per_step} prompts/step -> steps={steps}"
+        + (f" (planned ceiling from {uncapped_steps})" if ceiling_applied else "")
     )
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
@@ -1207,7 +1220,13 @@ def run_opd():
     # adapter publish but before DONE is persisted reads a STEPLESS opd_trained/opd_train_done as the
     # last heartbeat, and actual_steps_run floors a fully-trained run to 0 (opd_trained isn't a training
     # stage) -- re-pricing paid work as $0 (codex[bot]).
-    _w.heartbeat("opd_trained", step=opt_steps, train_wall=train_wall, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "opd_trained",
+        step=opt_steps,
+        train_wall=train_wall,
+        terminal_reason=terminal_reason,
+        gpu=gpu_diagnostics(),
+    )
     objective_metric_means = {
         name: objective_metric_sums[name] / count
         for name, count in sorted(objective_metric_counts.items())
@@ -1224,6 +1243,9 @@ def run_opd():
         generated_tokens=generated_tokens,
         notes={
             "steps": steps,
+            "uncapped_steps": uncapped_steps,
+            "max_steps": knobs.max_steps,
+            "terminal_reason": terminal_reason,
             "epochs": knobs.epochs,
             "retained_prompts": len(examples),
             # Optimizer steps actually applied; < steps if any iteration had no usable teacher
@@ -1889,8 +1911,12 @@ def _runaway_eos_scale(runaway_rate: float) -> float:
 # over-correction — giving two-sided negative feedback: reinforce EOS when running away, but SHUT THE
 # PUSH OFF the moment the student starts emitting eos first. Empties are always a failure (never
 # task-length like a truncation), so damp aggressively.
-_EOS_OVERCORR_LO = 0.01  # empty-rate EMA <= this: no damping (full reinforcement per _runaway_eos_scale)
-_EOS_OVERCORR_HI = 0.05  # empty-rate EMA >= this: reinforcement fully suppressed (student over-stops)
+_EOS_OVERCORR_LO = (
+    0.01  # empty-rate EMA <= this: no damping (full reinforcement per _runaway_eos_scale)
+)
+_EOS_OVERCORR_HI = (
+    0.05  # empty-rate EMA >= this: reinforcement fully suppressed (student over-stops)
+)
 
 
 def _overcorrection_damp(empty_rate: float) -> float:

@@ -378,7 +378,8 @@ lora_alpha = 64
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
-optimizer-step counts are derived from those epochs.
+optimizer-step counts are derived from those epochs. For OPD, a positive `max_steps` is a planned-success
+optimizer-step ceiling applied after derivation; `0` or omission is uncapped. GRPO behavior is unchanged.
 
 ---
 

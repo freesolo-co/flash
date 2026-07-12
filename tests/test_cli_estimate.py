@@ -80,6 +80,27 @@ def test_opd_epochs_derive_steps_from_max_examples():
     assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
 
 
+@pytest.mark.parametrize(("max_steps", "expected"), [(0, 40), (1, 1), (20, 20)])
+def test_opd_max_steps_caps_estimated_optimizer_steps(max_steps, expected):
+    raw = copy.deepcopy(GRPO_RAW)
+    raw["algorithm"] = "opd"
+    raw["train"].update(
+        {
+            "epochs": 40,
+            "max_examples": 10,
+            "batch_size": 10,
+            "group_size": 1,
+            "max_steps": max_steps,
+        }
+    )
+    assert _spec_steps(spec_from_dict(raw)) == expected
+
+
+def test_grpo_max_steps_keeps_existing_epoch_derived_semantics():
+    spec = _spec(**{"train.epochs": 40, "train.max_examples": 10, "train.max_steps": 1})
+    assert _spec_steps(spec) == 40
+
+
 def test_opd_runconfig_carries_selected_teacher_and_prices_it():
     """runconfig_from_spec resolves [train].teacher_model to the Fireworks model id so the estimate
     prices the CHOSEN teacher; a cheaper teacher lowers teacher_api_usd vs the default GLM 5.2, and
@@ -228,7 +249,10 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
             "hf_repo": "owner/runs",
-            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_context_tokens": 1024,
+            "max_examples": 320,
+            "batch_size": 6,
+            "epochs": 2,
+            "max_context_tokens": 1024,
         },
         "gpu": {"type": "RTX 4090"},
     }

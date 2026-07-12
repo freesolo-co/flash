@@ -788,7 +788,9 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     )
 
 
-def _opd_harness(monkeypatch, *, sample_result, beats=None, liveness=None, epochs=1, group=1):
+def _opd_harness(
+    monkeypatch, *, sample_result, beats=None, liveness=None, epochs=1, group=1, max_steps=0
+):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
     module."""
@@ -854,6 +856,7 @@ def _opd_harness(monkeypatch, *, sample_result, beats=None, liveness=None, epoch
             max_completion=8,
             prompts_per_step=1,
             group_size=group,
+            max_steps=max_steps,
             kl_coef=1.0,
             save_every=0,
             max_length=0,
@@ -877,6 +880,80 @@ def _opd_harness(monkeypatch, *, sample_result, beats=None, liveness=None, epoch
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
     monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
     return opd_mod
+
+
+@pytest.mark.parametrize("max_steps", [1, 20])
+def test_opd_max_steps_is_planned_success_after_actual_accumulated_updates(monkeypatch, max_steps):
+    calls = []
+    metas = []
+    beats = []
+
+    def _alternating_signal(*, model, **_kw):
+        calls.append(1)
+        if len(calls) % 2 == 0:
+            return opd_mod.SampleResult(
+                loss=None,
+                teacher_status="ok",
+                gen_tokens=1,
+                teacher_tokens=1,
+                skip_reason="empty_completion",
+            )
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_alternating_signal,
+        beats=beats,
+        epochs=25,
+        group=2,
+        max_steps=max_steps,
+    )
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kw: metas.append(kw))
+
+    opd_mod.run_opd()
+
+    notes = metas[-1]["notes"]
+    assert metas[-1]["step"] == max_steps
+    assert notes["steps"] == max_steps
+    assert notes["uncapped_steps"] == 25
+    assert notes["max_steps"] == max_steps
+    assert notes["opt_steps"] == max_steps
+    assert notes["terminal_reason"] == "planned_max_steps_reached"
+    assert notes["skip_reasons"] == {"empty_completion": max_steps}
+    assert len(calls) == max_steps * 2
+    trained = [kw for stage, kw in beats if stage == "opd_trained"]
+    assert trained[-1]["step"] == max_steps
+    assert trained[-1]["terminal_reason"] == "planned_max_steps_reached"
+
+
+def test_opd_uncapped_completion_reports_epoch_terminal_reason(monkeypatch):
+    metas = []
+
+    def _update(*, model, **_kw):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, sample_result=_update, epochs=1, max_steps=0)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **kw: metas.append(kw))
+
+    opd_mod.run_opd()
+
+    assert metas[-1]["notes"]["terminal_reason"] == "planned_epoch_steps_completed"
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
@@ -3972,16 +4049,28 @@ def test_resolve_samples_batched_backs_off_eos_on_overcorrection(monkeypatch):
     # Full runaway BUT the student is already collapsing to empty -> damp to 0 -> term guarded out.
     seen_coefs.clear()
     opd_mod._resolve_samples_batched(
-        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
-        runaway_rate=1.0, overcorr_rate=opd_mod._EOS_OVERCORR_HI,
+        _TinyLM(torch, T=3, V=8),
+        _Tok(),
+        "cpu",
+        _samples(),
+        knobs,
+        microbatch=1,
+        runaway_rate=1.0,
+        overcorr_rate=opd_mod._EOS_OVERCORR_HI,
     )
     assert seen_coefs == []
 
     # Full runaway, no empties -> full coef still reaches the term (no regression to #482/#493 behaviour).
     seen_coefs.clear()
     opd_mod._resolve_samples_batched(
-        _TinyLM(torch, T=3, V=8), _Tok(), "cpu", _samples(), knobs, microbatch=1,
-        runaway_rate=1.0, overcorr_rate=0.0,
+        _TinyLM(torch, T=3, V=8),
+        _Tok(),
+        "cpu",
+        _samples(),
+        knobs,
+        microbatch=1,
+        runaway_rate=1.0,
+        overcorr_rate=0.0,
     )
     assert seen_coefs
     assert all(abs(c - 0.5) < 1e-9 for c in seen_coefs)

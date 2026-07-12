@@ -66,7 +66,9 @@ def test_grpo_batching_matches_requested_prompts_when_per_device_does_not_divide
             assert b["generations_per_step"] == prompts * 8, (prompts, per_device, b)
             assert b["unique_prompts_per_step"] == prompts, (prompts, per_device, b)
             assert b["per_device_train_batch_size"] <= max(1, min(per_device, prompts * 8)), (
-                prompts, per_device, b,
+                prompts,
+                per_device,
+                b,
             )
             assert b["divisible_by_group"] is True, (prompts, per_device, b)
 
@@ -74,14 +76,20 @@ def test_grpo_batching_matches_requested_prompts_when_per_device_does_not_divide
 def test_on_policy_epochs_resolve_to_prompt_pool_passes():
     from flash.engine.steps import on_policy_steps
 
-    assert (
-        on_policy_steps(
-            epochs=2,
-            prompt_count=33,
-            prompts_per_step=16,
-        )
-        == 5
-    )
+    plan = {"epochs": 40, "prompt_count": 10, "prompts_per_step": 10}
+    assert on_policy_steps(**plan) == 40
+    assert on_policy_steps(**plan, max_steps=0) == 40
+    assert on_policy_steps(**plan, max_steps=1) == 1
+    assert on_policy_steps(**plan, max_steps=20) == 20
+
+
+def test_on_policy_max_steps_rejects_negative_internal_values():
+    import pytest
+
+    from flash.engine.steps import on_policy_steps
+
+    with pytest.raises(ValueError, match="max_steps must be non-negative"):
+        on_policy_steps(epochs=2, prompt_count=33, prompts_per_step=16, max_steps=-1)
 
 
 def test_reward_heartbeat_callback_accumulates_history():
@@ -194,7 +202,9 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
 
     import flash.engine.worker as ne
 
-    monkeypatch.setenv("HF_REPO", "")  # scoped to this test (auto-restored), not a raw os.environ write
+    monkeypatch.setenv(
+        "HF_REPO", ""
+    )  # scoped to this test (auto-restored), not a raw os.environ write
 
     # Clear stale upload temp files up front so the end-of-test "no temp files" assertion isn't a false
     # failure against cruft from a prior failed run or another process on the same host.
