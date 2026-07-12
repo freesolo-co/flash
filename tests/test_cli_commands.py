@@ -453,7 +453,9 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["deployments"]) == 0
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
-    assert "https://serve.example/v1" in deployments_out
+    # the deployments table is revision-centric (run/step/revision/state/verified/model);
+    # the openai base url is printed by `flash deploy` itself and by the json record.
+    assert "OPENAI MODEL" in deployments_out
 
     assert _run(["undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls

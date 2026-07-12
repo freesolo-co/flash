@@ -614,17 +614,16 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
-    def fake_get(url, **kwargs):
-        seen["verification_url"] = url
-        return _Resp(200)
-
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
-    monkeypatch.setattr(d.httpx, "get", fake_get)
+    # no registry-readback get: the structured undeploy response (disabled_aliases /
+    # disabled_revisions / serving_deregistered) is authoritative.
+    monkeypatch.setattr(
+        d.httpx, "get", lambda *a, **k: pytest.fail("undeploy must not read the registry back")
+    )
     out = d.undeploy_adapter("flash-7-abcd")
     assert out["disabled_aliases"] == ["flash-7-abcd"]
     assert out["serving_deregistered"] is True
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
-    assert seen["verification_url"] == "https://serve.example/adapters"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
     assert seen["follow_redirects"] is True
