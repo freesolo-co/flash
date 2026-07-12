@@ -31,6 +31,7 @@ class ObjectiveRequirements:
     greedy_sidecar: bool = False
     sampled_primary: bool = False
     repetition_weighting: bool = False
+    candidate_topk: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,7 @@ class ObjectiveRegistry:
                 greedy_sidecar=any(d.requirements.greedy_sidecar for d in definitions),
                 sampled_primary=any(d.requirements.sampled_primary for d in definitions),
                 repetition_weighting=any(d.requirements.repetition_weighting for d in definitions),
+                candidate_topk=any(d.requirements.candidate_topk for d in definitions),
             ),
         )
 
@@ -282,6 +284,8 @@ class ObjectiveRegistry:
                 view.require("teacher_scores")
             if definition.requirements.position_statistics:
                 view.require("position_statistics")
+            if definition.requirements.candidate_topk:
+                view.require("candidate_topk")
             result = definition.evaluate(view)
             if not isinstance(result, ObjectiveResult):
                 raise TypeError(
@@ -478,6 +482,20 @@ def _c09(view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult(term=term, metrics=metrics)
 
 
+def _c13(view: ObjectiveView) -> ObjectiveResult:
+    candidate = view.require("candidate_topk")
+    metrics = {
+        "selected_prefixes": candidate.selected_prefixes,
+        "scored_prefixes": candidate.scored_prefixes,
+        "duplicate_surfaces": candidate.duplicate_surfaces,
+        "invalid_candidates": candidate.invalid_candidates,
+        "budget_exhausted": float(candidate.budget_exhausted),
+        "cache_hits": candidate.cache_hits,
+        "teacher_requests": candidate.requests,
+    }
+    return ObjectiveResult(term=candidate.term, metrics=metrics)
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
@@ -513,6 +531,11 @@ OPD_OBJECTIVES = ObjectiveRegistry(
             objective_id="c10",
             requirements=ObjectiveRequirements(student_logits=True, position_statistics=True),
             evaluate=_c10,
+        ),
+        ObjectiveDefinition(
+            objective_id="c13",
+            requirements=ObjectiveRequirements(student_logits=True, candidate_topk=True),
+            evaluate=_c13,
         ),
     )
 )

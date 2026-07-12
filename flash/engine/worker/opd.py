@@ -9,8 +9,9 @@ tokenize the same completion string differently, so their per-token distribution
 directly. We align by SHARED DECODED-TEXT SPANS — the coarsest common refinement of the two
 tokenizations (a group boundary is any character offset that begins a token in BOTH tokenizers) — and
 apply reverse-KL per span using only the REALIZED-token logprobs on each side (the collinear-ai
-*spider* / Tinker method). No top-k candidates, no surface->vocab projection, so it is exact across
-arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_align``.
+*spider* / Tinker method). The default path has no surface->vocab projection and stays exact across
+arbitrary tokenizer mismatch; optional c13 adds decoded-surface candidate distillation at selected
+student prefixes. See ``tokenizer_align`` and ``opd_topk``.
 
 There is NO local reference model: the teacher lives behind the API. Sampling uses a colocated vLLM
 engine loaded with the student LoRA and refreshed after each optimizer step, matching GRPO's rollout
@@ -57,6 +58,15 @@ from flash.engine.worker.opd_repetition import (
     analyze_repetition,
     loop_closing_unlikelihood,
     normalize_repetition_weights,
+)
+from flash.engine.worker.opd_topk import (
+    CandidateObjectiveInput,
+    CandidateRequest,
+    CandidateTeacherScorer,
+    TeacherInputMeter,
+    candidate_set_cross_entropy,
+    decode_candidate_groups,
+    selected_prefix_indices,
 )
 from flash.engine.worker.opd_vllm import (
     OpdVllmOutput,
@@ -193,6 +203,8 @@ class OpdKnobs:
     structured_outputs: str = ""
     # closed auxiliary objective ids. empty keeps the exact c0 path.
     objective_ids: tuple[str, ...] = ()
+    # c13 only: explicit cadence for selecting realized student prefixes.
+    topk_cadence: int | None = None
 
 
 def _resolve_opd_knobs() -> OpdKnobs:
@@ -259,6 +271,14 @@ def _resolve_opd_knobs() -> OpdKnobs:
         ),
         None,
     )
+    topk_cadence = getattr(t, "opd_topk_cadence", None) if t else None
+    if "c13" in objective_ids:
+        if isinstance(topk_cadence, bool) or not isinstance(topk_cadence, int) or topk_cadence < 1:
+            raise RuntimeError(
+                "opd: train.opd_topk_cadence is required and must be a positive integer when c13 is selected"
+            )
+    elif topk_cadence is not None:
+        raise RuntimeError("opd: train.opd_topk_cadence is only valid when c13 is selected")
     return OpdKnobs(
         teacher_model=teacher.model_id,
         teacher_base_url=d.teacher_base_url,
@@ -314,6 +334,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
         structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
         objective_ids=objective_ids,
+        topk_cadence=topk_cadence,
     )
 
 
@@ -475,6 +496,8 @@ def run_opd():
             "FIREWORKS_API_KEY configured in its environment."
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    topk_meter = TeacherInputMeter() if "c13" in knobs.objective_ids else None
+    topk_cache: dict[tuple[str, str], float] | None = {} if topk_meter is not None else None
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
@@ -958,6 +981,7 @@ def run_opd():
                 # exact mean one over the aligned samples contributing to this optimizer update.
                 teacher_futures: dict[Future, list[_Pending]] = {}
                 step_scored_samples: list[tuple[_GenResult, _ScoreResult, object]] = []
+                step_scored_candidate_teacher_prompts: list[str] = []
 
                 def _queue_teacher_batch(
                     pendings: list[_Pending],
@@ -976,6 +1000,10 @@ def run_opd():
                     for i in range(0, len(pendings), teacher_batch_size):
                         batch = pendings[i : i + teacher_batch_size]
                         if batch:
+                            if topk_meter is not None:
+                                topk_meter.record_ordinary(
+                                    sum(len(p.prompt_ids) + p.gen.gen_tokens for p in batch)
+                                )
                             _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
                 def _resolve_unscored(p: _Pending, *, _accum_target=accum_target) -> None:
@@ -1036,11 +1064,16 @@ def run_opd():
                             f"opd teacher batch returned {len(scores)} score(s) for {len(batch)} sample(s)"
                         )
                     scored_samples = []
+                    candidate_teacher_prompts = []
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
+                        candidate_teacher_prompts.append(
+                            _teacher_prompt_text(p.prompt_messages, thinking_prefill)
+                        )
                     if objective_plan.requirements.repetition_weighting:
                         _step_scored_samples.extend(scored_samples)
+                        step_scored_candidate_teacher_prompts.extend(candidate_teacher_prompts)
                         return
                     loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
@@ -1053,6 +1086,10 @@ def run_opd():
                         backward_scale=1.0 / _accum_target,
                         runaway_rate=trunc_ema,
                         overcorr_rate=empty_ema,
+                        teacher=teacher,
+                        candidate_teacher_prompts=candidate_teacher_prompts,
+                        topk_meter=topk_meter,
+                        topk_cache=topk_cache,
                     )
                     opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
                     opd_phase_counts["loss_batches"] += 1
@@ -1202,6 +1239,10 @@ def run_opd():
                         backward_scale=1.0 / accum_target,
                         runaway_rate=trunc_ema,
                         overcorr_rate=empty_ema,
+                        teacher=teacher,
+                        candidate_teacher_prompts=step_scored_candidate_teacher_prompts,
+                        topk_meter=topk_meter,
+                        topk_cache=topk_cache,
                     )
                     opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
                     opd_phase_counts["loss_batches"] += 1
@@ -1454,6 +1495,17 @@ def run_opd():
             # for a degenerate collapsed alignment, so it can't flag that failure mode.
             "mean_align_granularity": (granularity_sum / granularity_n) if granularity_n else 0.0,
             "teacher_input_tokens": teacher_input_tokens,
+            **(
+                {
+                    "topk_teacher_input_tokens": topk_meter.candidate_tokens,
+                    "topk_teacher_input_cap_tokens": topk_meter.cap_tokens,
+                    "topk_budget_exhausted": topk_meter.budget_exhausted,
+                    "topk_cache_entries": len(topk_cache or {}),
+                    "opd_topk_cadence": knobs.topk_cadence,
+                }
+                if topk_meter is not None
+                else {}
+            ),
             "temperature": knobs.temperature,
             "group_size": group,
             "prompts_per_step": prompts_per_step,
@@ -1981,6 +2033,7 @@ class _PreparedLoss:
     sequence_weight: float = 1.0
     empty_rollout: bool = False
     termination_cause: str = ""
+    candidate_teacher_prompt: str = ""
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -2263,6 +2316,83 @@ def _overcorrection_damp(empty_rate: float) -> float:
     return 1.0 - (empty_rate - _EOS_OVERCORR_LO) / (_EOS_OVERCORR_HI - _EOS_OVERCORR_LO)
 
 
+def _candidate_objectives_for_chunk(
+    logits,
+    chunk,
+    tok,
+    knobs,
+    teacher,
+    meter: TeacherInputMeter,
+    cache: dict[tuple[str, str], float] | None,
+):
+    """build and score c13 candidate sets for one student forward microbatch."""
+    eos_ids = _generation_eos_ids(None, tok)
+    cadence = int(knobs.topk_cadence)
+    pending = []
+    requests: list[CandidateRequest] = []
+    for row, prepared in enumerate(chunk):
+        prompt_len = len(prepared.prompt_ids)
+        comp_len = len(prepared.student_ids)
+        rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
+        prefix_entries = []
+        duplicates = 0
+        invalid = 0
+        for position in selected_prefix_indices(comp_len, cadence):
+            groups, duplicate_count, invalid_count = decode_candidate_groups(
+                tok,
+                [*prepared.prompt_ids, *prepared.student_ids[:position]],
+                rows[position],
+                eos_ids,
+            )
+            duplicates += duplicate_count
+            invalid += invalid_count
+            completion_prefix = tok.decode(
+                list(prepared.student_ids[:position]), skip_special_tokens=True
+            )
+            context = prepared.candidate_teacher_prompt + completion_prefix
+            prefix_requests = []
+            for group in groups:
+                request = CandidateRequest(
+                    context=context,
+                    surface=group.surface,
+                    input_tokens=len(prepared.prompt_ids) + position + 1,
+                )
+                requests.append(request)
+                prefix_requests.append(request)
+            prefix_entries.append((position, rows[position], groups, tuple(prefix_requests)))
+        pending.append((prefix_entries, duplicates, invalid))
+
+    scored = CandidateTeacherScorer(teacher, meter, cache).score(requests)
+    outputs = []
+    for sample_index, (prefix_entries, duplicates, invalid) in enumerate(pending):
+        terms = []
+        sample_exhausted = False
+        for _position, row, groups, prefix_requests in prefix_entries:
+            if len(groups) < 2:
+                continue
+            keys = [(request.context, request.surface) for request in prefix_requests]
+            if not all(key in scored.logprobs for key in keys):
+                sample_exhausted = True
+                continue
+            teacher_logprobs = [scored.logprobs[key] for key in keys]
+            term = candidate_set_cross_entropy(row, groups, teacher_logprobs)
+            if term is not None:
+                terms.append(term)
+        outputs.append(
+            CandidateObjectiveInput(
+                term=(sum(terms) / len(terms)) if terms else None,
+                selected_prefixes=len(prefix_entries),
+                scored_prefixes=len(terms),
+                duplicate_surfaces=duplicates,
+                invalid_candidates=invalid,
+                budget_exhausted=sample_exhausted,
+                cache_hits=scored.cache_hits if sample_index == 0 else 0,
+                requests=scored.requests if sample_index == 0 else 0,
+            )
+        )
+    return outputs
+
+
 def _resolve_samples_batched(
     model,
     tok,
@@ -2274,11 +2404,20 @@ def _resolve_samples_batched(
     backward_scale: float | None = None,
     runaway_rate: float = 1.0,
     overcorr_rate: float = 0.0,
+    teacher=None,
+    candidate_teacher_prompts: list[str] | None = None,
+    topk_meter: TeacherInputMeter | None = None,
+    topk_cache: dict[tuple[str, str], float] | None = None,
 ) -> list[SampleResult]:
     import torch
 
     objective_ids = tuple(getattr(knobs, "objective_ids", ()) or ())
     objective_plan = OPD_OBJECTIVES.plan(objective_ids)
+    if objective_plan.requirements.candidate_topk:
+        if teacher is None or topk_meter is None:
+            raise RuntimeError("opd c13 requires a teacher client and teacher-input meter")
+        if candidate_teacher_prompts is None or len(candidate_teacher_prompts) != len(samples):
+            raise RuntimeError("opd c13 requires one teacher prompt per sample")
     if not samples:
         return []
     results: list[SampleResult | None] = [None] * len(samples)
@@ -2405,6 +2544,11 @@ def _resolve_samples_batched(
                 or analyze_repetition(gen.completion_ids, forced=gen.forced or ()),
                 sequence_weight=1.0,
                 termination_cause=gen.termination_cause,
+                candidate_teacher_prompt=(
+                    candidate_teacher_prompts[idx]
+                    if objective_plan.requirements.candidate_topk and candidate_teacher_prompts
+                    else ""
+                ),
             )
         )
 
@@ -2433,6 +2577,17 @@ def _resolve_samples_batched(
                 input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
+            candidate_inputs = None
+            if objective_plan.requirements.candidate_topk:
+                candidate_inputs = _candidate_objectives_for_chunk(
+                    logits,
+                    chunk,
+                    tok,
+                    knobs,
+                    teacher,
+                    topk_meter,
+                    topk_cache,
+                )
             losses = []
             for row, p in enumerate(chunk):
                 prompt_len = len(p.prompt_ids)
@@ -2520,6 +2675,8 @@ def _resolve_samples_batched(
                                 ),
                                 base_term=loss,
                             )
+                        if objective_plan.requirements.candidate_topk:
+                            objective_values["candidate_topk"] = candidate_inputs[row]
                         objective_evaluation = OPD_OBJECTIVES.evaluate(
                             objective_plan,
                             ObjectiveView(objective_values),

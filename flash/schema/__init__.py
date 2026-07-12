@@ -21,6 +21,7 @@ from flash.schema.fields import (
     _train_float,
     _train_int,
     _train_opd_objective_ids,
+    _train_opd_topk_cadence,
     _train_stops,
     _train_structured_outputs,
     _train_teacher,
@@ -215,6 +216,7 @@ _TRAIN_KEYS = frozenset(
         "opd_cvar_entropy_floor",
         "opd_cvar_entropy_coef",
         "opd_objective_ids",
+        "opd_topk_cadence",
         "teacher_model",
         "stop_sequences",
         "structured_outputs",
@@ -334,6 +336,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
+    opd_objective_ids = _train_opd_objective_ids(train_raw, algorithm)
+    opd_topk_cadence = _train_opd_topk_cadence(train_raw, opd_objective_ids)
 
     spec = JobSpec(
         model=model,
@@ -386,7 +390,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
-            opd_objective_ids=_train_opd_objective_ids(train_raw, algorithm),
+            opd_objective_ids=opd_objective_ids,
+            opd_topk_cadence=opd_topk_cadence,
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),

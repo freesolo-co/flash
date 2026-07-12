@@ -147,6 +147,9 @@ class TrainSpec:
     structured_outputs: str = ""
     # opd only: closed auxiliary objective ids. empty keeps the exact c0 training path.
     opd_objective_ids: tuple[str, ...] = ()
+    # c13 only: select every nth realized student prefix for fixed-k candidate distillation.
+    # required when c13 is selected; None otherwise.
+    opd_topk_cadence: int | None = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +246,7 @@ class JobSpec:
                 structured_outputs=str(train.get("structured_outputs") or ""),
                 # persisted reads preserve future ids but never coerce malformed containers or entries.
                 opd_objective_ids=deserialize_opd_objective_ids(train.get("opd_objective_ids")),
+                opd_topk_cadence=_opt_int(train.get("opd_topk_cadence")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

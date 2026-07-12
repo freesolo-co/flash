@@ -110,6 +110,17 @@ def _train_opd_objective_ids(train_raw: dict, algorithm: str) -> tuple[str, ...]
         raise ConfigError(str(exc)) from exc
 
 
+def _train_opd_topk_cadence(train_raw: dict, objective_ids: tuple[str, ...]) -> int | None:
+    """validate c13's required explicit student-prefix selection cadence."""
+    cadence = _train_int(train_raw, "opd_topk_cadence", minimum=1)
+    selected = "c13" in objective_ids
+    if selected and cadence is None:
+        raise ConfigError("train.opd_topk_cadence is required when opd objective c13 is selected")
+    if not selected and cadence is not None:
+        raise ConfigError("train.opd_topk_cadence is only valid when opd objective c13 is selected")
+    return cadence
+
+
 class ConfigError(ValueError):
     pass
 
