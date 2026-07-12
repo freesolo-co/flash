@@ -26,6 +26,35 @@ class ObjectiveRequirements:
     student_logits: bool = False
     teacher_scores: bool = False
     position_statistics: bool = False
+    empty_rollouts: bool = False
+
+
+@dataclass(frozen=True)
+class ObjectiveConfig:
+    """typed constants and boundary assumptions for one closed objective."""
+
+    entropy_floor: float | None = None
+    entropy_floor_coef: float = 0.0
+    position0_eos_coef: float = 0.0
+    recover_empty_rollouts: bool = False
+    eos_in_rkl: bool = False
+    teacher_boundary_probability: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("entropy_floor_coef", "position0_eos_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.entropy_floor is not None:
+            floor = float(self.entropy_floor)
+            if not math.isfinite(floor) or floor < 0:
+                raise ValueError("entropy_floor must be finite and non-negative")
+        if self.teacher_boundary_probability is not None:
+            probability = float(self.teacher_boundary_probability)
+            if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                raise ValueError("teacher_boundary_probability must be in [0, 1]")
+        if self.eos_in_rkl and self.teacher_boundary_probability is None:
+            raise ValueError("eos_in_rkl requires teacher_boundary_probability")
 
 
 @dataclass(frozen=True)
@@ -90,6 +119,7 @@ class ObjectiveDefinition:
     objective_id: str
     requirements: ObjectiveRequirements
     evaluate: ObjectiveFunction
+    config: ObjectiveConfig = field(default_factory=ObjectiveConfig)
 
     def __post_init__(self) -> None:
         validate_opd_objective_id(self.objective_id)
@@ -225,6 +255,7 @@ class ObjectiveRegistry:
                 student_logits=any(d.requirements.student_logits for d in definitions),
                 teacher_scores=any(d.requirements.teacher_scores for d in definitions),
                 position_statistics=any(d.requirements.position_statistics for d in definitions),
+                empty_rollouts=any(d.requirements.empty_rollouts for d in definitions),
             ),
         )
 
@@ -346,12 +377,91 @@ def _c10(view: ObjectiveView) -> ObjectiveResult:
     return ObjectiveResult(term=term, metrics=metrics)
 
 
+_C05_CONFIG = ObjectiveConfig(
+    entropy_floor=1.75,
+    entropy_floor_coef=1.0,
+    position0_eos_coef=1.0,
+    recover_empty_rollouts=True,
+    eos_in_rkl=False,
+)
+
+
+def _position0_eos_safety(row, eos_ids: Iterable[int], *, coef: float):
+    torch = _torch_module()
+    if torch is None or row is None or coef <= 0:
+        return None, {}
+    logits = row.float()
+    vocab_size = int(logits.shape[-1])
+    valid_ids = tuple(
+        sorted({int(token_id) for token_id in eos_ids if 0 <= int(token_id) < vocab_size})
+    )
+    if not valid_ids or len(valid_ids) >= vocab_size:
+        return None, {}
+    eos_index = torch.tensor(valid_ids, dtype=torch.long, device=logits.device)
+    eos_logits = logits.index_select(0, eos_index)
+    keep = torch.ones(vocab_size, dtype=torch.bool, device=logits.device)
+    keep[eos_index] = False
+    non_eos_logits = logits[keep]
+    logsum_all = torch.logsumexp(logits, dim=-1)
+    logsum_non_eos = torch.logsumexp(non_eos_logits, dim=-1)
+    penalty = float(coef) * (logsum_all - logsum_non_eos)
+    max_eos = eos_logits.max()
+    max_non_eos = non_eos_logits.max()
+    probability = torch.exp(torch.logsumexp(eos_logits, dim=-1) - logsum_all)
+    rank = 1 + (non_eos_logits > max_eos).sum()
+    return penalty, {
+        "position0_eos_probability": probability,
+        "position0_eos_rank": rank,
+        "position0_eos_margin": max_eos - max_non_eos,
+    }
+
+
+def _c05(view: ObjectiveView) -> ObjectiveResult:
+    sample_logits = view.require("sample_logits")
+    view.require("completion_logits")
+    prompt_len = int(view.require("prompt_len"))
+    empty_rollout = bool(view.require("empty_rollout"))
+    termination_cause = str(view.require("termination_cause") or "")
+    stop_sequences = tuple(view.require("stop_sequences") or ())
+    eos_ids = tuple(view.require("eos_ids") or ())
+
+    terms: list[object] = []
+    metrics: dict[str, object] = {}
+    entropy = view.require("entropy")
+    if entropy is not None:
+        metrics["entropy"] = entropy
+        metrics["entropy_floor_active"] = float(view.require("entropy_floor_active"))
+
+    safety_eligible = not stop_sequences and (not empty_rollout or termination_cause == "eos")
+    position0 = prompt_len - 1
+    if safety_eligible and 0 <= position0 < sample_logits.shape[0]:
+        safety_term, safety_metrics = _position0_eos_safety(
+            sample_logits[position0], eos_ids, coef=_C05_CONFIG.position0_eos_coef
+        )
+        metrics.update(safety_metrics)
+        if safety_term is not None:
+            terms.append(safety_term)
+            if empty_rollout:
+                metrics["empty_recovery"] = 1.0
+
+    term = None
+    for addition in terms:
+        term = addition if term is None else term + addition
+    return ObjectiveResult(term=term, metrics=metrics)
+
+
 OPD_OBJECTIVES = ObjectiveRegistry(
     (
         ObjectiveDefinition(
             objective_id="c0",
             requirements=ObjectiveRequirements(),
             evaluate=_c0,
+        ),
+        ObjectiveDefinition(
+            objective_id="c05",
+            requirements=ObjectiveRequirements(student_logits=True, empty_rollouts=True),
+            evaluate=_c05,
+            config=_C05_CONFIG,
         ),
         ObjectiveDefinition(
             objective_id="c10",

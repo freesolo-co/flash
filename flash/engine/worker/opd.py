@@ -225,7 +225,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         objective_ids = deserialize_opd_objective_ids(
             getattr(t, "opd_objective_ids", None) if t else None
         )
-        OPD_OBJECTIVES.plan(objective_ids)
+        objective_plan = OPD_OBJECTIVES.plan(objective_ids)
         cvar_config = CvarEntropyConfig(
             fraction=float(
                 _cf
@@ -245,6 +245,14 @@ def _resolve_opd_knobs() -> OpdKnobs:
         )
     except ValueError as e:
         raise RuntimeError(f"opd: {e}") from e
+    objective_entropy = next(
+        (
+            definition.config
+            for definition in objective_plan.definitions
+            if definition.config.entropy_floor is not None
+        ),
+        None,
+    )
     return OpdKnobs(
         teacher_model=teacher.model_id,
         teacher_base_url=d.teacher_base_url,
@@ -269,18 +277,28 @@ def _resolve_opd_knobs() -> OpdKnobs:
                 _eos if (_eos := opt("opd_eos_loss_coef", None)) is not None else d.eos_loss_coef
             ),
         ),
-        # like eos_loss_coef: explicit 0 is valid (disable), only None falls back to the recipe.
-        entropy_floor_coef=max(
-            0.0,
-            float(
-                _ec
-                if (_ec := opt("opd_entropy_floor_coef", None)) is not None
-                else d.entropy_floor_coef
-            ),
+        # selected closed objectives carry fixed config; otherwise preserve the legacy explicit knobs.
+        entropy_floor_coef=(
+            objective_entropy.entropy_floor_coef
+            if objective_entropy is not None
+            else max(
+                0.0,
+                float(
+                    _ec
+                    if (_ec := opt("opd_entropy_floor_coef", None)) is not None
+                    else d.entropy_floor_coef
+                ),
+            )
         ),
-        entropy_floor=max(
-            0.0,
-            float(_ef if (_ef := opt("opd_entropy_floor", None)) is not None else d.entropy_floor),
+        entropy_floor=(
+            float(objective_entropy.entropy_floor)
+            if objective_entropy is not None
+            else max(
+                0.0,
+                float(
+                    _ef if (_ef := opt("opd_entropy_floor", None)) is not None else d.entropy_floor
+                ),
+            )
         ),
         cvar_entropy_fraction=cvar_config.fraction,
         cvar_entropy_floor=cvar_config.floor,
@@ -428,6 +446,10 @@ def run_opd():
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
+    run_objective_plan = OPD_OBJECTIVES.plan(knobs.objective_ids)
+    recover_empty_rollouts = any(
+        definition.config.recover_empty_rollouts for definition in run_objective_plan.definitions
+    )
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
@@ -703,6 +725,7 @@ def run_opd():
     # truncated=False, so it reads as "terminated fine" and keeps the coef pinned high; empty_ema damps
     # the coef back down as empties appear, closing the feedback loop.
     empty_ema = 0.0
+    empty_recovery_samples = 0
     granularity_sum = 0.0
     granularity_n = 0
     # Running mean of the reinforced terminal log P(eos): should RISE over a run as the student learns
@@ -786,7 +809,7 @@ def run_opd():
             step_loss, \
             step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
-        nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema, empty_ema
+        nonlocal eos_logprob_sum, eos_logprob_n, trunc_ema, empty_ema, empty_recovery_samples
         nonlocal entropy_sum, entropy_n, entropy_floor_active, step_ent_sum, step_ent_n
         if r.teacher_status == "ok":
             teacher_ok += 1
@@ -801,8 +824,12 @@ def run_opd():
         trunc_ema += (1.0 - _EOS_TRUNC_EMA_DECAY) * ((1.0 if r.truncated else 0.0) - trunc_ema)
         # An empty completion terminates (truncated=False), so trunc_ema reads it as healthy; track it
         # separately so the controller can back OFF when its own EOS push starts collapsing rollouts.
-        _is_empty = r.loss is None and _sample_skip_reason(r) == "empty_completion"
+        _is_empty = r.empty_recovery or (
+            r.loss is None and _sample_skip_reason(r) == "empty_completion"
+        )
         empty_ema += (1.0 - _EOS_TRUNC_EMA_DECAY) * ((1.0 if _is_empty else 0.0) - empty_ema)
+        if r.empty_recovery:
+            empty_recovery_samples += 1
         if r.loss is None:
             reason = _sample_skip_reason(r)
             skip_counts[reason] += 1
@@ -923,11 +950,33 @@ def run_opd():
                         if batch:
                             _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
+                def _resolve_unscored(p: _Pending, *, _accum_target=accum_target) -> None:
+                    loss_started = time.perf_counter()
+                    resolved = _resolve_samples_batched(
+                        model,
+                        tok,
+                        device,
+                        [(p.gen, None, p.prompt_ids)],
+                        knobs,
+                        loss_microbatch_size,
+                        backward_scale=1.0 / _accum_target,
+                        runaway_rate=trunc_ema,
+                        overcorr_rate=empty_ema,
+                    )
+                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
+                    if any(result.loss is not None for result in resolved):
+                        opd_phase_counts["loss_batches"] += 1
+                    for result in resolved:
+                        _account(result, backward=False)
+
                 def _queue_or_account(
                     p: _Pending, *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
                 ) -> None:
                     if p.gen.skip or p.gen.truncated:
-                        _account(_resolve_no_loss_sample(p.gen, None))
+                        if recover_empty_rollouts and p.gen.skip_reason == "empty_completion":
+                            _resolve_unscored(p)
+                        else:
+                            _account(_resolve_no_loss_sample(p.gen, None))
                         return
                     _queue_teacher_batch([p])
 
@@ -1054,7 +1103,10 @@ def run_opd():
                                 gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
                             )
                             if gen.skip or gen.truncated:
-                                _account(_resolve_no_loss_sample(gen, None))
+                                if recover_empty_rollouts and gen.skip_reason == "empty_completion":
+                                    _resolve_unscored(p)
+                                else:
+                                    _account(_resolve_no_loss_sample(gen, None))
                             else:
                                 scorable.append(p)
                             samples_seen += 1  # advances the liveness-thread progress signal
@@ -1275,6 +1327,7 @@ def run_opd():
             # Final EMA of the empty-completion rate (_overcorrection_damp input). A non-trivial value
             # means the controller detected its own EOS push collapsing rollouts and damped the coef.
             "final_empty_rate_ema": round(empty_ema, 5),
+            "empty_recovery_samples": empty_recovery_samples,
             # Student entropy floor (see _entropy_floor_term): the knobs, the run-mean per-sample
             # completion entropy (nats), and how many distilled samples tripped the hinge. A
             # collapsing run shows mean_student_entropy FALLING step over step (opd/entropy in
@@ -1388,6 +1441,10 @@ class SampleResult:
     entropy: float | None = None
     # namespaced, detached metrics emitted by selected registry objectives.
     objective_metrics: tuple[tuple[str, float], ...] = ()
+    # true when an eos-terminated empty rollout contributed a prompt-only auxiliary update.
+    empty_recovery: bool = False
+    # original rollout termination cause, retained through skip and recovery paths.
+    termination_cause: str = ""
 
 
 @dataclass(frozen=True)
@@ -1404,6 +1461,8 @@ class _GenResult:
     truncated: bool = False
     skip: bool = False
     skip_reason: str = ""
+    # eos, stop_sequence, stop, length, or unknown; preserved for objective gating and telemetry.
+    termination_cause: str = ""
     # Grammar-forced mask (parallel to completion_ids): True where guided decoding left one legal
     # token. Threaded from OpdVllmOutput.forced (sliced in lockstep with stop-trimming); () = none.
     forced: tuple = ()
@@ -1448,6 +1507,29 @@ class _Pending:
     score: object = None
 
 
+def _termination_cause(out: OpdVllmOutput, completion_ids, stop_text: str, eos_ids, stops) -> str:
+    """retain the concrete generation boundary instead of collapsing every natural stop to a bool."""
+    stop_reason = out.stop_reason
+    if completion_ids and int(completion_ids[-1]) in eos_ids:
+        return "eos"
+    if (
+        isinstance(stop_reason, int)
+        and not isinstance(stop_reason, bool)
+        and stop_reason in eos_ids
+    ):
+        return "eos"
+    if stops and any(stop_text.endswith(stop) or stop_reason == stop for stop in stops):
+        return "stop_sequence"
+    reason = (out.finish_reason or "").lower()
+    if reason in {"length", "max_tokens"}:
+        return "length"
+    if reason in {"eos"}:
+        return "eos"
+    if out.terminated:
+        return "stop"
+    return "unknown"
+
+
 def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
     """Apply OPD's pre-scoring gates to one vLLM completion."""
     completion_ids = [int(t) for t in out.token_ids]
@@ -1457,17 +1539,24 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         decode(completion_ids, skip_special_tokens=True) if decode else ""
     )
     stop_text = decode(completion_ids, skip_special_tokens=False) if decode else completion_text
+    eos_ids = _generation_eos_ids(None, tok)
+    termination_cause = _termination_cause(
+        out, completion_ids, stop_text, eos_ids, knobs.stop_sequences
+    )
     if not (
         out.terminated
         or _rollout_terminated(
             completion_ids,
             stop_text,
-            _generation_eos_ids(None, tok),
+            eos_ids,
             knobs.stop_sequences,
         )
     ):
         return _GenResult(
-            truncated=True, gen_tokens=len(completion_ids), skip_reason="truncated_rollout"
+            truncated=True,
+            gen_tokens=len(completion_ids),
+            skip_reason="truncated_rollout",
+            termination_cause=termination_cause,
         )
     # vLLM may strip stop strings unless include_stop_str_in_output is supported. Trim when the
     # delimiter is present; otherwise keep the already-stripped ids/text.
@@ -1479,13 +1568,24 @@ def _gen_from_vllm_output(out: OpdVllmOutput, tok, knobs) -> _GenResult:
         )
     gen_tokens = len(completion_ids)
     if not completion_text.strip():
-        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="empty_completion")
+        return _GenResult(
+            skip=True,
+            gen_tokens=gen_tokens,
+            skip_reason="empty_completion",
+            termination_cause=termination_cause,
+        )
     if "\ufffd" in completion_text:
-        return _GenResult(skip=True, gen_tokens=gen_tokens, skip_reason="replacement_char")
+        return _GenResult(
+            skip=True,
+            gen_tokens=gen_tokens,
+            skip_reason="replacement_char",
+            termination_cause=termination_cause,
+        )
     return _GenResult(
         completion_ids=completion_ids,
         completion_text=completion_text,
         gen_tokens=gen_tokens,
+        termination_cause=termination_cause,
         # Trimming drops a trailing stop suffix, so the kept ids are a prefix -> slice forced to match.
         forced=forced[: len(completion_ids)],
     )
@@ -1642,13 +1742,15 @@ class _PreparedLoss:
     idx: int
     prompt_ids: object
     student_ids: object
-    groups: _PreparedGkdGroups
+    groups: _PreparedGkdGroups | None
     coverage: float
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
     teacher_scores: tuple = ()
     forced: tuple[bool, ...] = ()
+    empty_rollout: bool = False
+    termination_cause: str = ""
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -1965,10 +2067,52 @@ def _resolve_samples_batched(
     # working with the penalty OFF; the detached mean entropy is computed either way for logging.
     ent_coef = float(getattr(knobs, "entropy_floor_coef", 0.0) or 0.0)
     ent_floor = float(getattr(knobs, "entropy_floor", 0.0) or 0.0)
+    objective_entropy = next(
+        (
+            definition.config
+            for definition in objective_plan.definitions
+            if definition.config.entropy_floor is not None
+        ),
+        None,
+    )
+    if objective_entropy is not None:
+        ent_coef = objective_entropy.entropy_floor_coef
+        ent_floor = float(objective_entropy.entropy_floor)
     eos_stop_sequences = tuple(getattr(knobs, "stop_sequences", ()) or ())
-    eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 else frozenset()
+    objective_eos = any(
+        definition.config.position0_eos_coef > 0 for definition in objective_plan.definitions
+    )
+    objective_empty_recovery = any(
+        definition.config.recover_empty_rollouts for definition in objective_plan.definitions
+    )
+    eos_ids = _generation_eos_ids(model, tok) if eos_coef > 0 or objective_eos else frozenset()
     eos_primary = _primary_eos_id(tok, eos_ids) if eos_coef > 0 else None
     for idx, (gen, score, prompt_ids) in enumerate(samples):
+        recover_empty = (
+            objective_plan.requirements.empty_rollouts
+            and objective_empty_recovery
+            and gen.skip_reason == "empty_completion"
+            and gen.termination_cause == "eos"
+            and not eos_stop_sequences
+            and bool(prompt_ids)
+            and bool(eos_ids)
+        )
+        if recover_empty:
+            prepared.append(
+                _PreparedLoss(
+                    idx=idx,
+                    prompt_ids=prompt_ids,
+                    student_ids=(),
+                    groups=None,
+                    coverage=0.0,
+                    gen_tokens=gen.gen_tokens,
+                    teacher_tokens=0,
+                    group_granularity=0.0,
+                    empty_rollout=True,
+                    termination_cause=gen.termination_cause,
+                )
+            )
+            continue
         if gen.truncated or gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
@@ -2022,6 +2166,7 @@ def _resolve_samples_batched(
                     bool(gen.forced[i]) if i < len(gen.forced) else False
                     for i in range(len(student_ids))
                 ),
+                termination_cause=gen.termination_cause,
             )
         )
 
@@ -2046,10 +2191,14 @@ def _resolve_samples_batched(
                 prompt_len = len(p.prompt_ids)
                 comp_len = len(p.student_ids)
                 rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                loss = _gkd_loss_from_logits_rows(
-                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                loss = (
+                    None
+                    if p.empty_rollout
+                    else _gkd_loss_from_logits_rows(
+                        rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                    )
                 )
-                if loss is None:
+                if loss is None and not p.empty_rollout:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",
                         coverage=p.coverage,
@@ -2059,6 +2208,11 @@ def _resolve_samples_batched(
                         skip_reason="alignment_empty",
                     )
                 else:
+                    base_term = (
+                        loss
+                        if loss is not None
+                        else logits[row, prompt_len - 1].float().sum() * 0.0
+                    )
                     auxiliary_terms = []
                     # behaviour-clone the terminal stop the reverse-kl alignment cannot reach. added
                     # to distilled samples only, so no-signal skip accounting stays unchanged.
@@ -2087,6 +2241,12 @@ def _resolve_samples_batched(
                             "prompt_len": prompt_len,
                             "student_ids": tuple(p.student_ids),
                             "gkd_groups": p.groups,
+                            "eos_ids": eos_ids,
+                            "stop_sequences": eos_stop_sequences,
+                            "empty_rollout": p.empty_rollout,
+                            "termination_cause": p.termination_cause,
+                            "entropy": entropy,
+                            "entropy_floor_active": ent_term is not None,
                         }
                         if objective_plan.requirements.student_logits:
                             objective_values.update(
@@ -2110,12 +2270,20 @@ def _resolve_samples_batched(
                         objective_evaluation = OPD_OBJECTIVES.evaluate(
                             objective_plan,
                             ObjectiveView(objective_values),
-                            base_term=loss,
+                            base_term=base_term,
                         )
                         auxiliary_terms.extend(objective_evaluation.terms)
                         objective_metrics = tuple(objective_evaluation.metrics.items())
+                    if p.empty_rollout and not auxiliary_terms:
+                        results[p.idx] = SampleResult(
+                            gen_tokens=p.gen_tokens,
+                            skip_reason="empty_completion",
+                            termination_cause=p.termination_cause,
+                        )
+                        continue
                     # preserve addition order and compose every auxiliary term exactly once before the
                     # existing normalization, backward, clipping, optimizer, and vllm sync path.
+                    loss = base_term
                     for auxiliary_term in auxiliary_terms:
                         loss = loss + auxiliary_term
                     loss_for_result = loss
@@ -2124,7 +2292,7 @@ def _resolve_samples_batched(
                         loss_for_result = loss.detach()
                     results[p.idx] = SampleResult(
                         loss=loss_for_result,
-                        teacher_status="ok",
+                        teacher_status=None if p.empty_rollout else "ok",
                         coverage=p.coverage,
                         gen_tokens=p.gen_tokens,
                         teacher_tokens=p.teacher_tokens,
@@ -2132,6 +2300,8 @@ def _resolve_samples_batched(
                         eos_logprob=eos_logprob,
                         entropy=entropy,
                         objective_metrics=objective_metrics,
+                        empty_recovery=p.empty_rollout,
+                        termination_cause=p.termination_cause,
                     )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
@@ -2150,29 +2320,34 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
             truncated=True,
             gen_tokens=gen.gen_tokens,
             skip_reason=gen.skip_reason or "truncated_rollout",
+            termination_cause=gen.termination_cause,
         )
     if gen.skip:  # empty completion or U+FFFD — skipped before scoring
         return SampleResult(
             gen_tokens=gen.gen_tokens,
             skip_reason=gen.skip_reason or "pre_teacher_skip",
+            termination_cause=gen.termination_cause,
         )
     if score is None:
         return SampleResult(
             teacher_status="error",
             gen_tokens=gen.gen_tokens,
             skip_reason="teacher_missing_score",
+            termination_cause=gen.termination_cause,
         )
     if score.status == "transient":  # retryable teacher outage — skipped + counted
         return SampleResult(
             teacher_status="transient",
             gen_tokens=gen.gen_tokens,
             skip_reason="teacher_transient",
+            termination_cause=gen.termination_cause,
         )
     if score.status != "ok":  # any other teacher exception — skipped, teacher uncounted
         return SampleResult(
             teacher_status="error",
             gen_tokens=gen.gen_tokens,
             skip_reason="teacher_error",
+            termination_cause=gen.termination_cause,
         )
     raise RuntimeError("opd scored samples must be resolved through _resolve_samples_batched")
 

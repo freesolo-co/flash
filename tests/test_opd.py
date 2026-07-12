@@ -3424,8 +3424,13 @@ def test_resolve_opd_knobs_strictly_rejects_invalid_objective_ids(
         opd_mod._resolve_opd_knobs()
 
 
-@pytest.mark.parametrize("objective_ids", [["c0"], ("c0",)])
-def test_resolve_opd_knobs_accepts_typed_objective_id_sequences(monkeypatch, objective_ids):
+@pytest.mark.parametrize(
+    ("objective_ids", "expected"),
+    [(["c0"], ("c0",)), (("c0",), ("c0",)), (["c05"], ("c05",))],
+)
+def test_resolve_opd_knobs_accepts_typed_objective_id_sequences(
+    monkeypatch, objective_ids, expected
+):
     from flash.engine.worker import opd as opd_mod
 
     class _Train:
@@ -3440,7 +3445,33 @@ def test_resolve_opd_knobs_accepts_typed_objective_id_sequences(monkeypatch, obj
         SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train()), THINKING=False),
     )
 
-    assert opd_mod._resolve_opd_knobs().objective_ids == ("c0",)
+    resolved = opd_mod._resolve_opd_knobs()
+    assert resolved.objective_ids == expected
+    if expected == ("c05",):
+        assert resolved.entropy_floor_coef == 1.0
+        assert resolved.entropy_floor == 1.75
+
+
+def test_c05_fixed_entropy_config_overrides_legacy_entropy_knobs(monkeypatch):
+    from flash.engine.worker import opd as opd_mod
+
+    class _Train:
+        opd_objective_ids = ("c05",)
+        opd_entropy_floor_coef = 9.0
+        opd_entropy_floor = 0.25
+
+        def __getattr__(self, name):
+            return None
+
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(JOB_SPEC=SimpleNamespace(train=_Train()), THINKING=False),
+    )
+
+    resolved = opd_mod._resolve_opd_knobs()
+    assert resolved.entropy_floor_coef == 1.0
+    assert resolved.entropy_floor == 1.75
 
 
 def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
@@ -3807,6 +3838,224 @@ class _TinyLM:
 
     def train(self, mode=True):  # _resolve_samples_batched flips the model into train mode
         return self
+
+
+def test_c05_empty_eos_rollout_gets_prompt_only_recovery_for_complete_eos_set():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = (3, 5)
+
+        def decode(self, ids, skip_special_tokens=True):
+            return ""
+
+    model = _TinyLM(torch, T=1, V=8)
+    model.w.data[0, 3] = 2.0
+    model.w.data[0, 5] = 1.0
+    gen = opd_mod._GenResult(
+        completion_ids=[5],
+        completion_text="",
+        gen_tokens=1,
+        skip=True,
+        skip_reason="empty_completion",
+        termination_cause="eos",
+    )
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05",),
+    )
+
+    result = opd_mod._resolve_samples_batched(
+        model, _Tok(), "cpu", [(gen, None, [1])], knobs, microbatch=1
+    )[0]
+
+    assert result.loss is not None
+    assert result.empty_recovery is True
+    assert result.teacher_status is None
+    assert result.termination_cause == "eos"
+    metrics = dict(result.objective_metrics)
+    assert metrics["opd/objectives/c05/empty_recovery"] == 1.0
+    expected = float(torch.softmax(model.w[0].detach(), dim=-1)[[3, 5]].sum())
+    assert metrics["opd/objectives/c05/position0_eos_probability"] == pytest.approx(expected)
+    result.loss.backward()
+    assert model.w.grad[0, 3] > 0
+    assert model.w.grad[0, 5] > 0
+
+
+def test_c05_empty_recovery_is_default_off_and_c0_parity_is_unchanged():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = (3, 5)
+
+    class _CountingLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=1, V=8)
+            self.forward_calls = 0
+
+        def __call__(self, input_ids):
+            self.forward_calls += 1
+            return super().__call__(input_ids)
+
+    gen = opd_mod._GenResult(
+        completion_ids=[3],
+        completion_text="",
+        gen_tokens=1,
+        skip=True,
+        skip_reason="empty_completion",
+        termination_cause="eos",
+    )
+
+    def _run(objective_ids):
+        model = _CountingLM()
+        knobs = SimpleNamespace(
+            kl_coef=1.0,
+            eos_loss_coef=0.0,
+            entropy_floor_coef=0.0,
+            entropy_floor=0.0,
+            stop_sequences=(),
+            objective_ids=objective_ids,
+        )
+        result = opd_mod._resolve_samples_batched(
+            model, _Tok(), "cpu", [(gen, None, [1])], knobs, microbatch=1
+        )[0]
+        return result, model
+
+    default, default_model = _run(())
+    c0, c0_model = _run(("c0",))
+    assert default.loss is c0.loss is None
+    assert default.skip_reason == c0.skip_reason == "empty_completion"
+    assert default.empty_recovery is c0.empty_recovery is False
+    assert default_model.forward_calls == c0_model.forward_calls == 0
+
+
+def test_c05_nonempty_rollout_composes_with_separate_terminal_eos_controller():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = (3, 5)
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({2: "a", 3: "", 5: ""}.get(int(i), "x") for i in ids)
+
+    model = _TinyLM(torch, T=2, V=8)
+    sample = (
+        opd_mod._GenResult(
+            completion_ids=[2],
+            completion_text="a",
+            gen_tokens=1,
+            termination_cause="eos",
+        ),
+        opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+        [1],
+    )
+    knobs = SimpleNamespace(
+        kl_coef=1.0,
+        eos_loss_coef=0.5,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05",),
+    )
+
+    result = opd_mod._resolve_samples_batched(model, _Tok(), "cpu", [sample], knobs, microbatch=1)[
+        0
+    ]
+
+    assert result.loss is not None
+    assert result.empty_recovery is False
+    assert result.eos_logprob is not None
+    assert "opd/objectives/c05/position0_eos_probability" in dict(result.objective_metrics)
+    assert "opd/objectives/c05/entropy" in dict(result.objective_metrics)
+
+
+def test_c05_fixed_entropy_floor_composes_with_position0_safety_gradient():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = (3, 5)
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "a"
+
+    model = _TinyLM(torch, T=1, V=8)
+    model.w.data.fill_(-4.0)
+    model.w.data[0, 2] = 4.0
+    sample = (
+        opd_mod._GenResult(
+            completion_ids=[2],
+            completion_text="a",
+            gen_tokens=1,
+            termination_cause="eos",
+        ),
+        opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
+        [1],
+    )
+    knobs = SimpleNamespace(
+        kl_coef=0.0,
+        eos_loss_coef=0.0,
+        entropy_floor_coef=0.0,
+        entropy_floor=0.0,
+        stop_sequences=(),
+        objective_ids=("c05",),
+    )
+
+    result = opd_mod._resolve_samples_batched(model, _Tok(), "cpu", [sample], knobs, microbatch=1)[
+        0
+    ]
+    metrics = dict(result.objective_metrics)
+    assert metrics["opd/objectives/c05/entropy"] < 1.75
+    assert metrics["opd/objectives/c05/entropy_floor_active"] == 1.0
+    assert "opd/objectives/c05/position0_eos_probability" in metrics
+
+    before = float(
+        -(F.softmax(model.w[0].detach(), dim=-1) * F.log_softmax(model.w[0].detach(), dim=-1)).sum()
+    )
+    result.loss.backward()
+    stepped = (model.w - 0.1 * model.w.grad).detach()
+    after = float(-(F.softmax(stepped[0], dim=-1) * F.log_softmax(stepped[0], dim=-1)).sum())
+    assert after > before
+
+
+def test_gen_result_preserves_eos_and_stop_sequence_termination_causes():
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        eos_token_id = (3, 5)
+
+        def decode(self, ids, skip_special_tokens=True):
+            if ids and int(ids[-1]) == 5:
+                return "" if skip_special_tokens else "<eos5>"
+            return "done</answer>"
+
+    eos = opd_mod._gen_from_vllm_output(
+        opd_mod.OpdVllmOutput([5], "", finish_reason="stop", stop_reason=5),
+        _Tok(),
+        SimpleNamespace(stop_sequences=()),
+    )
+    stopped = opd_mod._gen_from_vllm_output(
+        opd_mod.OpdVllmOutput([2], "done</answer>", finish_reason="stop", stop_reason="</answer>"),
+        _Tok(),
+        SimpleNamespace(stop_sequences=("</answer>",)),
+    )
+
+    assert eos.skip_reason == "empty_completion"
+    assert eos.termination_cause == "eos"
+    assert stopped.termination_cause == "stop_sequence"
 
 
 def test_opd_loss_backpropagates_over_grouped_spans():

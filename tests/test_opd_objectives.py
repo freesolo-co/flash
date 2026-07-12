@@ -13,6 +13,7 @@ import pytest
 from flash.engine.worker.opd_objectives import (
     OPD_OBJECTIVES,
     CvarEntropyConfig,
+    ObjectiveConfig,
     ObjectiveDefinition,
     ObjectiveRegistry,
     ObjectiveRequirements,
@@ -243,9 +244,7 @@ def _evaluate_c10(rows, *, fraction=0.5, floor=1.0, coef=1.0, forced=(), base_te
                 "entropy_for_rows": lambda indices: opd_mod._chunked_row_entropies(
                     rows, indices, grad=True
                 ),
-                "cvar_entropy_config": CvarEntropyConfig(
-                    fraction=fraction, floor=floor, coef=coef
-                ),
+                "cvar_entropy_config": CvarEntropyConfig(fraction=fraction, floor=floor, coef=coef),
                 "base_term": base_term,
             }
         ),
@@ -265,9 +264,9 @@ def test_c10_quantile_ties_include_every_row_at_threshold():
             {
                 "completion_logits": rows,
                 "position_statistics": stats,
-                "entropy_for_rows": lambda indices: selected.extend(indices)
-                or rows.sum() * 0.0
-                + 0.2,
+                "entropy_for_rows": lambda indices: (
+                    selected.extend(indices) or rows.sum() * 0.0 + 0.2
+                ),
                 "cvar_entropy_config": CvarEntropyConfig(fraction=0.5, floor=1.0, coef=1.0),
                 "base_term": rows.sum(),
             }
@@ -375,6 +374,93 @@ def test_c10_nonfinite_rows_are_excluded_from_selection():
     assert all(math.isfinite(value) for value in evaluated.metrics.values())
 
 
+def test_c05_is_fixed_default_off_composition_without_teacher_boundary_assumption():
+    definition = OPD_OBJECTIVES.definitions["c05"]
+
+    assert OPD_OBJECTIVES.plan(()).definitions == ()
+    assert definition.requirements == ObjectiveRequirements(
+        student_logits=True, empty_rollouts=True
+    )
+    assert definition.config == ObjectiveConfig(
+        entropy_floor=1.75,
+        entropy_floor_coef=1.0,
+        position0_eos_coef=1.0,
+        recover_empty_rollouts=True,
+        eos_in_rkl=False,
+    )
+    assert definition.config.teacher_boundary_probability is None
+
+
+def test_objective_config_rejects_eos_in_rkl_without_teacher_boundary_probability():
+    with pytest.raises(ValueError, match="requires teacher_boundary_probability"):
+        ObjectiveConfig(eos_in_rkl=True)
+
+
+def test_c05_multiple_eos_safety_reports_set_probability_rank_and_margin():
+    torch = pytest.importorskip("torch")
+    logits = torch.zeros(2, 8, requires_grad=True)
+    logits.data[0, 3] = 2.0
+    logits.data[0, 5] = 1.0
+    plan = OPD_OBJECTIVES.plan(("c05",))
+    result = OPD_OBJECTIVES.evaluate(
+        plan,
+        ObjectiveView(
+            {
+                "sample_logits": logits,
+                "completion_logits": logits[1:2],
+                "prompt_len": 1,
+                "student_ids": (2,),
+                "gkd_groups": object(),
+                "eos_ids": frozenset({3, 5}),
+                "stop_sequences": (),
+                "empty_rollout": False,
+                "termination_cause": "eos",
+                "entropy": 2.0,
+                "entropy_floor_active": False,
+            }
+        ),
+        base_term=logits.sum() * 0.0,
+    )
+
+    expected_probability = float(torch.softmax(logits[0].detach(), dim=-1)[[3, 5]].sum())
+    assert result.metrics["opd/objectives/c05/position0_eos_probability"] == pytest.approx(
+        expected_probability
+    )
+    assert result.metrics["opd/objectives/c05/position0_eos_rank"] == 1.0
+    assert result.metrics["opd/objectives/c05/position0_eos_margin"] == 2.0
+    assert len(result.terms) == 1
+    result.terms[0].backward()
+    assert logits.grad[0, 3] > 0
+    assert logits.grad[0, 5] > 0
+
+
+def test_c05_stop_sequences_disable_position0_eos_safety():
+    torch = pytest.importorskip("torch")
+    logits = torch.zeros(1, 8, requires_grad=True)
+    result = OPD_OBJECTIVES.evaluate(
+        OPD_OBJECTIVES.plan(("c05",)),
+        ObjectiveView(
+            {
+                "sample_logits": logits,
+                "completion_logits": logits[:0],
+                "prompt_len": 1,
+                "student_ids": (),
+                "gkd_groups": None,
+                "eos_ids": frozenset({3}),
+                "stop_sequences": ("</answer>",),
+                "empty_rollout": True,
+                "termination_cause": "stop_sequence",
+                "entropy": None,
+                "entropy_floor_active": False,
+            }
+        ),
+        base_term=logits.sum() * 0.0,
+    )
+
+    assert result.terms == ()
+    assert result.metrics == {}
+
+
 def test_job_spec_parsing_does_not_import_worker_package():
     script = """
 import sys
@@ -405,6 +491,7 @@ assert "flash.engine.worker" not in sys.modules
     [
         (["c0"], ("c0",)),
         (("c0",), ("c0",)),
+        (["c05"], ("c05",)),
         (["future-objective"], ("future-objective",)),
         (["c0", "c0"], ("c0", "c0")),
     ],
