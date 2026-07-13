@@ -233,7 +233,6 @@ def validate_train_keys(keys: Collection[str]) -> None:
         )
 
 
-
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
     unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
@@ -333,6 +332,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError(
             "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
             "SFT adapter continuation is not supported"
+        )
+    if init_from_adapter and "lora_rank" in train_raw:
+        raise ConfigError(
+            "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
+            "rank metadata is authoritative"
         )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)

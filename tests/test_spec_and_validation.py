@@ -168,14 +168,54 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
             "20c4452c",
             *({"699a8aab"} if key == "teacher_model" else set()),
         }
+
+
 def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
     with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
         spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
 
 
-def test_warmstart_child_rank_above_cap_is_deferred_to_source_metadata() -> None:
-    spec = spec_from_dict(_raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": 256}))
-    assert spec.train.lora_rank == 256
+@pytest.mark.parametrize(
+    "lora_rank",
+    [
+        pytest.param(256, id="non-default"),
+        pytest.param(32, id="default"),
+        pytest.param(8, id="matching"),
+        pytest.param(None, id="null"),
+        pytest.param(0, id="invalid"),
+    ],
+)
+def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"train\.lora_rank cannot be set with train\.init_from_adapter because source adapter "
+            r"rank metadata is authoritative"
+        ),
+    ):
+        spec_from_dict(
+            _raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": lora_rank})
+        )
+
+
+def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> None:
+    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw["train"].pop("lora_rank")
+
+    spec = spec_from_dict(raw)
+
+    assert spec.train.init_from_adapter == "source-run"
+    assert spec.train.lora_rank == 32
+
+
+@pytest.mark.parametrize("init_from_adapter", [None, "", "   "])
+def test_blank_or_null_init_adapter_preserves_explicit_rank(init_from_adapter) -> None:
+    spec = spec_from_dict(
+        _raw(**{"train.init_from_adapter": init_from_adapter, "train.lora_rank": 8})
+    )
+
+    assert spec.train.init_from_adapter == ""
+    assert spec.train.lora_rank == 8
 
 
 def test_opd_eos_loss_coef_accepted_by_schema() -> None:

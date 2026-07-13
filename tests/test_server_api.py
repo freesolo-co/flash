@@ -380,6 +380,46 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     assert not row.get("email")
 
 
+def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    calls = {"prepare": 0, "persist": 0}
+
+    def unexpected_prepare(*args, **kwargs):
+        calls["prepare"] += 1
+        raise AssertionError("prepare_job must not run")
+
+    def unexpected_persist(*args, **kwargs):
+        calls["persist"] += 1
+        raise AssertionError("record_run must not run")
+
+    monkeypatch.setattr(app_mod, "prepare_job", unexpected_prepare)
+    monkeypatch.setattr(app_mod.db, "record_run", unexpected_persist)
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+            "lora_rank": 32,
+        },
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec},
+    )
+
+    assert resp.status_code == 400
+    assert (
+        resp.json()["detail"]
+        == "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
+        "rank metadata is authoritative"
+    )
+    assert calls == {"prepare": 0, "persist": 0}
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
 def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch):
     import flash.lora_rank as rank_mod
     import flash.runner as runner
