@@ -188,19 +188,54 @@ def test_create_instance_non_2xx_uncertain_response_is_ambiguous(monkeypatch, st
     assert vast_api.create_error_is_ambiguous(exc_info.value) is True
 
 
-def test_create_instance_non_2xx_contradictory_response_is_ambiguous(monkeypatch):
+@pytest.mark.parametrize("contract", [777, "not-an-int", [7], {"id": 7}])
+def test_create_instance_non_2xx_contradictory_response_is_ambiguous(monkeypatch, contract):
+    # any non-empty new_contract evidence in a false body is contradictory: the contract may
+    # exist and bill, so it must be ambiguous even when the id is unparseable.
+    import json as _json
+
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    _capture_urlopen(
-        monkeypatch,
-        [_http_error(410, b'{"success": false, "new_contract": 777}')],
-    )
+    body = _json.dumps({"success": False, "new_contract": contract}).encode()
+    _capture_urlopen(monkeypatch, [_http_error(410, body)])
     kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
 
     with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
         vast_api.create_instance(123, **kwargs)
     assert vast_api.create_error_is_ambiguous(exc_info.value) is True
+    if contract == 777:
+        assert exc_info.value.contract_id == 777
+
+
+def test_create_instance_non_2xx_long_false_body_is_still_rejected(monkeypatch):
+    # restclient truncates the display message at 500 chars; the full body is preserved as
+    # structured metadata, so a long definitive rejection must still classify as rejected.
+    import json as _json
+
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    body = _json.dumps({"success": False, "error": "x" * 800}).encode()
+    _capture_urlopen(monkeypatch, [_http_error(410, body)])
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastCreateRejected) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is False
+
+
+def test_create_instance_missing_key_is_not_sent(monkeypatch):
+    # a missing api key raises locally before any http request: the create was provably never
+    # sent, so it must surface as an actionable config error, not a possibly-billed create.
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastCreateNotSent) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is False
 
 
 @pytest.mark.parametrize(
@@ -318,9 +353,11 @@ def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
-    for bad in ("not-a-number", {"id": 1}, [7]):  # truthy but non-intable shapes
+    # "²" is a unicode digit str.isdigit() accepts but int() rejects — the parser must stay
+    # total and non-throwing so it flows to ambiguous instead of escaping as a valueerror.
+    for bad in ("not-a-number", {"id": 1}, [7], "²", True, -3, 0):
         _capture_urlopen(monkeypatch, [{"success": True, "new_contract": bad}])
-        with pytest.raises(vast_api.VastApiError, match="no instance id") as ei:
+        with pytest.raises(vast_api.VastAmbiguousCreate, match="no instance id") as ei:
             vast_api.create_instance(123, **kwargs)
         assert vast_api.create_error_is_ambiguous(ei.value) is True
 
@@ -371,8 +408,10 @@ def test_get_instance_returns_dict_and_gone_signal(monkeypatch):
 
 
 def test_create_error_is_ambiguous_classification():
-    # Codex Mr72L: classify create_instance failures so the walk only reconciles-by-label on the
-    # AMBIGUOUS ones (a billed contract may exist), and walks straight past DEFINITIVE rejections.
+    # classification is now purely by type: only the typed definitive outcomes (explicit
+    # success:false rejection, local not-sent failure) permit walking to another offer.
+    # representative untyped errors stand in for the http/socket/decode failures that used to
+    # be cause-inspected — all of them must stay ambiguous because the request may have landed.
     from flash.providers.vast import api as vast_api
 
     def err(cause=None, msg="x"):
@@ -381,46 +420,18 @@ def test_create_error_is_ambiguous_classification():
             e.__cause__ = cause
         return e
 
-    def http(code):
-        return urllib.error.HTTPError("u", code, "m", None, io.BytesIO(b""))
-
-    # only the typed explicit success:false rejection is definitive
     assert vast_api.create_error_is_ambiguous(vast_api.VastCreateRejected("success:false")) is False
-    # every other create failure is ambiguous because the non-idempotent request may have landed
-    assert vast_api.create_error_is_ambiguous(err(http(404))) is True
-    assert vast_api.create_error_is_ambiguous(err(http(400))) is True
-    assert vast_api.create_error_is_ambiguous(err(msg="untyped rejection")) is True
-    assert vast_api.create_error_is_ambiguous(err(http(503))) is True
-    assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
-    assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
-    # a create that couldn't return a usable id raises VastAmbiguousCreate -> classified by type
+    assert vast_api.create_error_is_ambiguous(vast_api.VastCreateNotSent("no api key")) is False
     assert vast_api.create_error_is_ambiguous(vast_api.VastAmbiguousCreate("no instance id")) is True
-    # Codex MtrgJ: json.loads on bytes with invalid UTF-8 raises UnicodeDecodeError (a SIBLING of
-    # JSONDecodeError under ValueError, NOT caught by the JSONDecodeError clause) — an unreadable
-    # response on the non-idempotent create, so it MUST be ambiguous (else the contract leaks).
-    _utf8_err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
-    assert vast_api.create_error_is_ambiguous(err(_utf8_err)) is True
-    assert vast_api.create_error_is_ambiguous(_utf8_err) is True  # bare cause too (defensive)
-    # Codex MsMPk: the _http RestClient also chains BARE socket errors (TimeoutError ==
-    # socket.timeout, ConnectionError, generic OSError) — a RESPONSE-leg timeout of the non-idempotent
-    # PUT /asks AFTER the host billed a contract surfaces as one of these, NOT a URLError. They MUST be
-    # ambiguous (else the walk treats a real billed instance as a clean rejection and leaks it).
+    assert vast_api.create_error_is_ambiguous(err(msg="untyped rejection")) is True
+    assert (
+        vast_api.create_error_is_ambiguous(
+            err(urllib.error.HTTPError("u", 503, "m", None, io.BytesIO(b"")))
+        )
+        is True
+    )
     assert vast_api.create_error_is_ambiguous(err(TimeoutError("read timed out"))) is True
-    assert vast_api.create_error_is_ambiguous(err(ConnectionResetError("peer reset"))) is True
-    assert vast_api.create_error_is_ambiguous(err(OSError("socket error"))) is True
-    # Codex Msvbz: a 200 whose body is unreadable (truncated read / non-JSON) on the non-idempotent
-    # create -> AMBIGUOUS. JSONDecodeError (a ValueError) and IncompleteRead (an HTTPException) are
-    # NOT OSErrors, so they miss the branches above and must be classified explicitly — both when
-    # create_instance wraps them as a VastApiError-from-cause AND if a bare one ever reaches here.
-    # bare name: the local http() helper above shadows the module
-    from http.client import IncompleteRead
-
-    jde = json.JSONDecodeError("Expecting value", "x", 0)
-    assert vast_api.create_error_is_ambiguous(err(jde)) is True  # wrapped (cause is JSONDecodeError)
-    assert vast_api.create_error_is_ambiguous(jde) is True  # bare
-    inc = IncompleteRead(b"partial")
-    assert vast_api.create_error_is_ambiguous(err(inc)) is True  # wrapped (cause is IncompleteRead)
-    assert vast_api.create_error_is_ambiguous(inc) is True  # bare
+    assert vast_api.create_error_is_ambiguous(json.JSONDecodeError("Expecting value", "x", 0)) is True
 
 
 def test_destroy_instance_never_raises(monkeypatch):

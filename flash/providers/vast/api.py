@@ -35,6 +35,10 @@ class VastCreateRejected(VastApiError):
     """an explicit ``success: false`` create rejection that allocated nothing."""
 
 
+class VastCreateNotSent(VastApiError):
+    """a local failure (e.g. missing api key) raised before the create request was sent."""
+
+
 # env-only key (like runpod_api_key): never written to config files or shipped to workers.
 _CLIENT = RestClient(
     env_var="VAST_API_KEY",
@@ -100,40 +104,62 @@ def search_offers(
 # Instances
 # ---------------------------------------------------------------------------
 def _usable_contract_id(value: Any) -> int | None:
+    # total and non-throwing: str.isdigit() accepts unicode digits int() rejects (e.g. "²"),
+    # so the int() itself stays guarded — an unusable id must flow to ambiguous, not raise.
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         parsed = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        parsed = int(value.strip())
+    elif isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        try:
+            parsed = int(text)
+        except ValueError:
+            return None
     else:
         return None
     return parsed if parsed > 0 else None
 
 
-def _http_error_response(error: VastApiError, *, method: str, target: str) -> dict | None:
+def _rejection_from_body(offer_id: int, body: dict) -> VastApiError | None:
+    """classify an explicit ``success: false`` create body; shared by the 200 and non-2xx paths.
+
+    a false body carrying ANY non-empty ``new_contract`` evidence is contradictory — the
+    contract may exist and bill — so it must be ambiguous, never a definitive rejection."""
+    if body.get("success") is not False:
+        return None
+    contract = body.get("new_contract")
+    if contract:
+        err = VastAmbiguousCreate(
+            f"create_instance({offer_id}) returned contradictory rejection with contract "
+            f"evidence {contract!r} (possible billed contract): {body}"
+        )
+        err.contract_id = _usable_contract_id(contract)
+        return err
+    return VastCreateRejected(f"create_instance({offer_id}) rejected: {body}")
+
+
+def _http_error_response(error: VastApiError) -> dict | None:
     cause = getattr(error, "__cause__", None)
     if not isinstance(cause, urllib.error.HTTPError):
         return None
     if cause.code >= 500 or cause.code == 429:
         return None
 
-    raw: bytes | str | None = None
-    with contextlib.suppress(Exception):
-        raw = cause.read()
+    # _http attaches the full consumed body as structured metadata (the message truncates it);
+    # fall back to reading the response only for errors raised outside that wrapper.
+    raw: bytes | str | None = getattr(error, "response_body", None)
     if not raw:
-        prefix = f"{method} {target} -> HTTP {cause.code}: {cause.reason}"
-        message = str(error)
-        if not message.startswith(prefix):
-            return None
-        suffix = message[len(prefix) :]
-        if not suffix.startswith(": "):
-            return None
-        raw = suffix[2:]
+        with contextlib.suppress(Exception):
+            raw = cause.read()
+    if not raw:
+        return None
 
     try:
         decoded = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
         return None
     return decoded if isinstance(decoded, dict) else None
 
@@ -168,17 +194,15 @@ def create_instance(
     try:
         out = request_with_retries(target, method="PUT", body=body, retries=0)
     except VastApiError as e:
-        response = _http_error_response(e, method="PUT", target=target)
-        if response is not None and response.get("success") is False:
-            parsed_id = _usable_contract_id(response.get("new_contract"))
-            if parsed_id is not None:
-                raise VastAmbiguousCreate(
-                    f"create_instance({offer_id}) returned contradictory rejection with contract "
-                    f"{parsed_id} (possible billed contract): {response}"
-                ) from getattr(e, "__cause__", e)
-            raise VastCreateRejected(
-                f"create_instance({offer_id}) rejected: {response}"
-            ) from getattr(e, "__cause__", e)
+        if getattr(e, "__cause__", None) is None and str(e) == _CLIENT.missing_key_message:
+            # raised locally before any http request: the create was definitively never sent,
+            # so surface it as an actionable config error rather than a possibly-billed create.
+            raise VastCreateNotSent(str(e)) from None
+        response = _http_error_response(e)
+        if response is not None:
+            classified = _rejection_from_body(offer_id, response)
+            if classified is not None:
+                raise classified from getattr(e, "__cause__", e)
         cause = getattr(e, "__cause__", None)
         if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)):
             raise VastAmbiguousCreate(
@@ -197,14 +221,10 @@ def create_instance(
             f"create_instance({offer_id}) returned an ambiguous response "
             f"(possible billed contract): {out}"
         )
+    classified = _rejection_from_body(offer_id, out)
+    if classified is not None:
+        raise classified
     parsed_id = _usable_contract_id(out.get("new_contract"))
-    if out.get("success") is False:
-        if parsed_id is not None:
-            raise VastAmbiguousCreate(
-                f"create_instance({offer_id}) returned contradictory rejection with contract "
-                f"{parsed_id} (possible billed contract): {out}"
-            )
-        raise VastCreateRejected(f"create_instance({offer_id}) rejected: {out}")
     if out.get("success") is not True:
         raise VastAmbiguousCreate(
             f"create_instance({offer_id}) returned an ambiguous response "
@@ -219,8 +239,11 @@ def create_instance(
 
 
 def create_error_is_ambiguous(err: Exception) -> bool:
-    """return false only for an explicit ``success: false`` create response."""
-    return not isinstance(err, VastCreateRejected)
+    """return false only when the create provably allocated nothing.
+
+    that is an explicit ``success: false`` rejection with no contract evidence, or a local
+    failure raised before the request was sent. everything else may have billed a contract."""
+    return not isinstance(err, (VastCreateRejected, VastCreateNotSent))
 
 
 def get_instance(instance_id: int) -> dict | None:
