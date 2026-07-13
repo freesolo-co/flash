@@ -605,23 +605,20 @@ def _activate_revision(
             raise exc from read_exc
         target = _alias_target(alias)
         if target == revision:
-            reconciled = {
+            return {
                 "adapter_id": run_id,
                 "target_adapter_revision": revision,
                 "previous_adapter_revision": expected_adapter_revision,
                 "checkpoint": checkpoint,
                 "updated_at": alias.get("updated_at") if alias else None,
             }
-            return _validate_activation_response(
-                reconciled,
-                run_id=run_id,
-                revision=revision,
-                checkpoint=checkpoint,
-                expected_adapter_revision=expected_adapter_revision,
-            )
-        if target == expected_adapter_revision:
+        if expected_adapter_revision is not None and target == expected_adapter_revision:
             raise ServingError(
                 f"alias activation was not committed; {run_id} still targets {target!r}"
+            ) from exc
+        if target is None:
+            raise ServingError(
+                f"alias activation outcome is ambiguous; {run_id} did not expose an alias target"
             ) from exc
         raise ServingError(
             f"alias activation was superseded; {run_id} authoritatively targets {target!r}"

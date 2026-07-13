@@ -142,8 +142,11 @@ def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) 
 
 
 def _previous_ready_deployment(deployment: dict) -> dict | None:
-    if deployment.get("state") in _DEPLOYMENT_READY_STATES:
+    state = deployment.get("state")
+    if state in _DEPLOYMENT_READY_STATES:
         return dict(deployment)
+    if state not in _DEPLOYMENT_BUSY_STATES:
+        return None
     previous = deployment.get("previous_deployment")
     if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
         return dict(previous)
@@ -481,14 +484,22 @@ def _finish_deployment_unlocked(
         if activated:
             try:
                 latest = _app.get_status(run_id)
-                if (latest.deployment or {}).get("adapter_revision") == current.get(
-                    "adapter_revision"
+                latest_deployment = latest.deployment or {}
+                if (
+                    latest_deployment.get("adapter_revision")
+                    == current.get("adapter_revision")
+                    and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
                 ):
                     return
                 if not _commit_ready():
                     _reconcile_commit_miss()
-            except Exception:
-                pass
+            except Exception as recovery_exc:
+                divergence = (
+                    "deployment_record_diverged: serving alias was activated for "
+                    f"{current.get('adapter_revision')} but ready-state recovery failed after "
+                    f"{exc!r}: {recovery_exc!r}"
+                )
+                print(f"deploy[{run_id}]: {divergence}", flush=True)
             return
         error = str(exc)
         if not is_checkpoint and isinstance(exc, AdapterConfigMissing):

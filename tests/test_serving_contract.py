@@ -449,6 +449,51 @@ def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypat
     assert out["updated_at"] == "2026-07-12T12:00:15Z"
 
 
+def test_activation_reconciliation_accepts_alias_without_updated_at(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "metadata": {"record_type": "alias", "alias_of": revision},
+        },
+    )
+
+    out = deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
+
+    assert out["target_adapter_revision"] == revision
+    assert out["updated_at"] is None
+
+
+def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {"adapter_id": adapter_id, "metadata": {"record_type": "alias"}},
+    )
+
+    with pytest.raises(deploy.ServingError, match="outcome is ambiguous"):
+        deploy._activate_revision(
+            "flash-1", revision, "flash-1", expected_adapter_revision=None
+        )
+
+
 def test_activation_response_mismatch_reconciles_authoritative_previous_alias(monkeypatch):
     import flash.serve.deploy as deploy
 

@@ -310,6 +310,9 @@ def test_previous_ready_deployment():
     # A busy deployment falls back to a ready `previous_deployment`.
     nested = {"state": "deploying", "previous_deployment": {"state": "deployed", "b": 2}}
     assert serving._previous_ready_deployment(nested) == {"state": "deployed", "b": 2}
+    # terminal states never resurrect a preserved previous deployment.
+    undeployed = {"state": "undeployed", "previous_deployment": {"state": "ready"}}
+    assert serving._previous_ready_deployment(undeployed) is None
     # Nothing ready anywhere -> None.
     assert serving._previous_ready_deployment({"state": "deploying"}) is None
     assert (

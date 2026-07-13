@@ -1399,6 +1399,51 @@ def test_commit_miss_superseded_records_divergence_without_alias_revert(api, mon
     assert deployment["state"] == "undeployed"
 
 
+def test_post_activation_recovery_failure_logs_divergence(api, monkeypatch):
+    import builtins
+
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+
+    class BrokenDeployment:
+        def to_dict(self):
+            raise RuntimeError("serialization failed after activation")
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return BrokenDeployment()
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod, "serve_chat", lambda **kwargs: _smoke_chat_result(revision, run_id)
+    )
+    divergences = []
+    real_print = print
+
+    def capture_print(*args, **kwargs):
+        text = " ".join(str(arg) for arg in args)
+        if "deployment_record_diverged" in text:
+            divergences.append(text)
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", capture_print)
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert divergences
+    assert "ready-state recovery failed" in divergences[0]
+
+
 def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1888,6 +1933,37 @@ def test_chat_cancelled_run_without_deployment_is_409(api):
     )
     assert r.status_code == 409
     assert "deploy a checkpoint" in r.json()["detail"]
+
+
+def test_chat_rejects_undeployed_record_with_previous_ready_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.deployment = {
+        "state": "undeployed",
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+    }
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("undeployed aliases must never be served"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    assert "not deployed" in response.json()["detail"]
 
 
 def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
