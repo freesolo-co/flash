@@ -1352,7 +1352,7 @@ def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch
 
     _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
     posts = []
-    disabled = []
+    reads = []
 
     def delayed_deploy(**kwargs):
         desired = _fake_registry_record(kwargs)
@@ -1370,22 +1370,153 @@ def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch
 
     monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
     monkeypatch.setattr(
-        "flash.serve.deploy.disable_owned_adapter",
-        lambda cancelled_run_id, revision, mutation_id: disabled.append(
-            (cancelled_run_id, revision, mutation_id)
-        )
-        or False,
+        "flash.serve.deploy.read_adapter_record",
+        lambda cancelled_run_id: reads.append(cancelled_run_id) or None,
     )
     target, kwargs = jobs[0]
     target(**kwargs)
 
     status = runner.get_status(run_id)
     assert posts == []
-    assert disabled == [(run_id, 1, kwargs["deploy_kwargs"]["mutation_id"])]
+    assert reads == [run_id]
     assert status.state == "done"
     assert status.deployment["state"] == "undeployed"
     assert status.deployment_attempt is None
     assert status.deployment_cleanup is None
+
+
+def test_cancel_redeploy_after_intent_disables_expected_prior_without_post(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy
+    import flash.server.app as app_mod
+
+    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    target, kwargs = jobs[0]
+    target_mutation = kwargs["deploy_kwargs"]["mutation_id"]
+    prior = {
+        "adapter_id": run_id,
+        "registry_revision": 7,
+        "mutation_id": "m7",
+        "status": "ready",
+    }
+    registry = {run_id: dict(prior)}
+    posts = []
+    disabled = []
+
+    def delayed_deploy(**deploy_kwargs):
+        desired = _fake_registry_record(deploy_kwargs)
+        deploy_kwargs["before_registry_mutation"](
+            7,
+            desired,
+            8,
+            desired["mutation_id"],
+            desired["repo_revision"],
+            prior_mutation_id="m7",
+        )
+        runner.cancel_run(run_id)
+        with deploy_kwargs["registry_mutation_guard"]():
+            posts.append(desired)
+        return _FakeDeployment(deploy_kwargs["adapter_prefix"], desired, target_revision=8)
+
+    def disable_exact(disable_run_id, revision, mutation_id):
+        assert registry[disable_run_id]["registry_revision"] == revision
+        assert registry[disable_run_id]["mutation_id"] == mutation_id
+        disabled.append((disable_run_id, revision, mutation_id))
+        registry[disable_run_id] = {
+            **registry[disable_run_id],
+            "registry_revision": revision + 1,
+            "status": "disabled",
+        }
+        return True
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    monkeypatch.setattr(deploy, "read_adapter_record", lambda adapter_id: registry.get(adapter_id))
+    monkeypatch.setattr(deploy, "disable_owned_adapter", disable_exact)
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert posts == []
+    assert disabled == [(run_id, 7, "m7")]
+    assert registry[run_id] == {
+        **prior,
+        "registry_revision": 8,
+        "status": "disabled",
+    }
+    assert registry[run_id]["mutation_id"] != target_mutation
+    assert status.state == "cancelled"
+    assert status.deployment["state"] == "undeployed"
+    assert status.deployment_cleanup is None
+
+
+def test_cancel_redeploy_retains_prior_cleanup_until_recurring_recovery(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy
+    import flash.server.app as app_mod
+    import flash.server.routes.serving as serving
+    from flash.serve.deploy import ServingError
+
+    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    target, kwargs = jobs[0]
+    target_mutation = kwargs["deploy_kwargs"]["mutation_id"]
+    prior = {
+        "adapter_id": run_id,
+        "registry_revision": 7,
+        "mutation_id": "m7",
+        "status": "ready",
+    }
+    registry = {run_id: dict(prior)}
+    posts = []
+    attempts = []
+
+    def delayed_deploy(**deploy_kwargs):
+        desired = _fake_registry_record(deploy_kwargs)
+        deploy_kwargs["before_registry_mutation"](
+            7,
+            desired,
+            8,
+            desired["mutation_id"],
+            desired["repo_revision"],
+            prior_mutation_id="m7",
+        )
+        runner.cancel_run(run_id)
+        with deploy_kwargs["registry_mutation_guard"]():
+            posts.append(desired)
+        return _FakeDeployment(deploy_kwargs["adapter_prefix"], desired, target_revision=8)
+
+    def fail_disable(disable_run_id, revision, mutation_id):
+        attempts.append((disable_run_id, revision, mutation_id, "failed"))
+        raise ServingError("delete readback unavailable")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    monkeypatch.setattr(deploy, "read_adapter_record", lambda adapter_id: registry.get(adapter_id))
+    monkeypatch.setattr(deploy, "disable_owned_adapter", fail_disable)
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    cleanup = status.deployment_cleanup
+    assert posts == []
+    assert cleanup["target"] == {"revision": 8, "mutation_id": target_mutation}
+    assert cleanup["prior"] == {"revision": 7, "mutation_id": "m7"}
+    assert attempts == [(run_id, 7, "m7", "failed")]
+
+    def complete_disable(disable_run_id, revision, mutation_id):
+        attempts.append((disable_run_id, revision, mutation_id, "completed"))
+        registry[disable_run_id] = {
+            **registry[disable_run_id],
+            "registry_revision": revision + 1,
+            "status": "disabled",
+        }
+        return True
+
+    monkeypatch.setattr(deploy, "disable_owned_adapter", complete_disable)
+    assert serving._recover_deployment(run_id) is True
+
+    recovered = runner.get_status(run_id)
+    assert attempts[-1] == (run_id, 7, "m7", "completed")
+    assert registry[run_id]["registry_revision"] == 8
+    assert registry[run_id]["mutation_id"] == "m7"
+    assert registry[run_id]["status"] == "disabled"
+    assert recovered.deployment_cleanup is None
 
 
 def test_active_worker_prevents_age_based_attempt_replacement(api, monkeypatch):

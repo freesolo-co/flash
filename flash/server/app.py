@@ -35,6 +35,7 @@ from flash.serve.deploy import (
     deployment_record,
     disable_owned_adapter,
     read_adapter_record,
+    reconcile_owned_adapter_cleanup,
     record_matches,
     undeploy_adapter,
 )
@@ -81,6 +82,7 @@ __all__ = [
     "get_status",
     "list_checkpoints",
     "read_adapter_record",
+    "reconcile_owned_adapter_cleanup",
     "record_matches",
     "recover_runs",
     "run_server",

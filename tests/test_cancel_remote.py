@@ -261,7 +261,7 @@ def test_cancel_retains_exact_cleanup_identity_until_disable_is_confirmed(
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
-        "disable_owned_adapter",
+        "reconcile_owned_adapter_cleanup",
         lambda *_args: (_ for _ in ()).throw(cleanup_error),
     )
 
@@ -269,8 +269,11 @@ def test_cancel_retains_exact_cleanup_identity_until_disable_is_confirmed(
 
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
-    assert out.deployment_cleanup["target_revision"] == 7
-    assert out.deployment_cleanup["mutation_id"] == "mutation-7"
+    assert out.deployment_cleanup["target"] == {
+        "revision": 7,
+        "mutation_id": "mutation-7",
+    }
+    assert out.deployment_cleanup["prior"] is None
     assert "deployment_cleanup" not in out.to_dict()
 
 
@@ -298,13 +301,16 @@ def test_cancel_clears_exact_cleanup_identity_after_confirmed_disable(tmp_path, 
     disabled = []
     monkeypatch.setattr(
         deploy,
-        "disable_owned_adapter",
+        "reconcile_owned_adapter_cleanup",
         lambda *args: disabled.append(args) or True,
     )
 
     out = orch.cancel_run(spec.run_id)
 
-    assert disabled == [(spec.run_id, 8, "mutation-8")]
+    assert len(disabled) == 1
+    assert disabled[0][0] == spec.run_id
+    assert disabled[0][1]["target"] == {"revision": 8, "mutation_id": "mutation-8"}
+    assert disabled[0][1]["prior"] is None
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
     assert out.deployment_cleanup is None

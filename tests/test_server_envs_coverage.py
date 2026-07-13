@@ -334,14 +334,18 @@ def _recovering_status(deployment, deployment_attempt=None, deployment_cleanup=N
 
 
 def test_recovery_retries_persisted_cleanup_after_disable_failure(monkeypatch):
-    cleanup = {"target_revision": 7, "mutation_id": "old", "requested_at": 1.0}
+    cleanup = {
+        "target": {"revision": 7, "mutation_id": "old"},
+        "prior": None,
+        "requested_at": 1.0,
+    }
     status = _recovering_status(
         {"state": "undeployed", "mutation_id": "old"}, deployment_cleanup=cleanup
     )
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
     monkeypatch.setattr(
         serving._app,
-        "disable_owned_adapter",
+        "reconcile_owned_adapter_cleanup",
         lambda *_args: (_ for _ in ()).throw(ServingError("delete failed")),
     )
     monkeypatch.setattr(
@@ -353,18 +357,21 @@ def test_recovery_retries_persisted_cleanup_after_disable_failure(monkeypatch):
     assert serving._recover_deployment("run-1") is False
 
 
-def test_recovery_clears_cleanup_without_disabling_newer_mutation(monkeypatch):
-    cleanup = {"target_revision": 7, "mutation_id": "old", "requested_at": 1.0}
+def test_recovery_clears_cleanup_after_forward_supersession(monkeypatch):
+    cleanup = {
+        "target": {"revision": 7, "mutation_id": "old"},
+        "prior": None,
+        "requested_at": 1.0,
+    }
     newer = {"state": "deploying", "target_revision": 8, "mutation_id": "new"}
     status = _recovering_status(newer, deployment_cleanup=cleanup)
     completed = []
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
-
-    def reject_old(run_id, revision, mutation_id):
-        assert (run_id, revision, mutation_id) == ("run-1", 7, "old")
-        raise serving._app.DeploymentSuperseded("newer mutation owns the registry row")
-
-    monkeypatch.setattr(serving._app, "disable_owned_adapter", reject_old)
+    monkeypatch.setattr(
+        serving._app,
+        "reconcile_owned_adapter_cleanup",
+        lambda run_id, owned: (run_id, owned) == ("run-1", cleanup),
+    )
     monkeypatch.setattr(
         serving,
         "complete_deployment_cleanup",

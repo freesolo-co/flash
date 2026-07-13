@@ -379,7 +379,7 @@ def deploy_adapter(
     thinking: bool = False,
     structured_outputs: str = "",
     org_id: str | None = None,
-    before_registry_mutation: Callable[[int | None, dict, int, str, str], None] | None = None,
+    before_registry_mutation: Callable[..., None] | None = None,
     registry_mutation_guard: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> Deployment:
     """Create a new immutable serving record through compare-and-swap."""
@@ -423,14 +423,29 @@ def deploy_adapter(
             f"adapter {run_id} belongs to another org; replacement cannot change owner"
         )
     target_revision = 1 if prior_revision is None else int(prior_revision) + 1
+    prior_mutation_id = None
+    if prior is not None:
+        raw_prior_mutation_id = prior.get("mutation_id")
+        if not isinstance(raw_prior_mutation_id, str) or not raw_prior_mutation_id.strip():
+            raise ServingError(
+                f"adapter {run_id} prior registry mutation identity was missing or malformed"
+            )
+        prior_mutation_id = raw_prior_mutation_id
     if before_registry_mutation is not None:
-        before_registry_mutation(
+        callback_args = (
             prior_revision,
             dict(desired),
             target_revision,
             mutation_id,
             repo_revision,
         )
+        if prior_mutation_id is None:
+            before_registry_mutation(*callback_args)
+        else:
+            before_registry_mutation(
+                *callback_args,
+                prior_mutation_id=prior_mutation_id,
+            )
     headers = {"If-Match": str(prior_revision)} if prior_revision is not None else None
     response: httpx.Response | None = None
     mutation_error: ServingError | None = None
@@ -527,6 +542,65 @@ def disable_owned_adapter(run_id: str, revision: int, mutation_id: str) -> bool:
     if _same_observed_record(last, before):
         raise error or ServingError(f"adapter {run_id} disable did not commit")
     raise ServingError(f"adapter {run_id} disable readback was inconclusive")
+
+
+def _cleanup_identity(cleanup: dict, name: str) -> tuple[int, str] | None:
+    raw = cleanup.get(name)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ServingError(f"deployment cleanup {name} identity was malformed")
+    revision = raw.get("revision")
+    mutation_id = raw.get("mutation_id")
+    if (
+        not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(mutation_id, str)
+        or not mutation_id.strip()
+    ):
+        raise ServingError(f"deployment cleanup {name} identity was malformed")
+    return revision, mutation_id
+
+
+def reconcile_owned_adapter_cleanup(run_id: str, cleanup: dict) -> bool:
+    """Disable an owned target or prior row while protecting forward supersession."""
+    target = _cleanup_identity(cleanup, "target")
+    if target is None:
+        raise ServingError("deployment cleanup target identity was missing")
+    prior = _cleanup_identity(cleanup, "prior")
+    target_revision, target_mutation = target
+    if prior is not None and prior[0] + 1 != target_revision:
+        raise ServingError("deployment cleanup prior identity was not the target predecessor")
+    current = read_adapter_record(run_id)
+    if current is None:
+        return True
+
+    current_revision = current.get("registry_revision")
+    current_mutation = current.get("mutation_id")
+    if (
+        not isinstance(current_revision, int)
+        or current_revision < 1
+        or not isinstance(current_mutation, str)
+        or not current_mutation.strip()
+    ):
+        raise ServingError(f"adapter {run_id} cleanup observed a malformed registry identity")
+    current_identity = (current_revision, current_mutation)
+    if current_identity == target:
+        disable_owned_adapter(run_id, target_revision, target_mutation)
+        return True
+    if prior is not None and current_identity == prior:
+        disable_owned_adapter(run_id, prior[0], prior[1])
+        return True
+
+    if current.get("status") == "disabled":
+        if current_identity == (target_revision + 1, target_mutation):
+            return True
+        if prior is not None and current_identity == (prior[0] + 1, prior[1]):
+            return True
+
+    if isinstance(current_revision, int) and current_revision >= target_revision:
+        return True
+    raise ServingError(f"adapter {run_id} cleanup observed an unexpected older registry identity")
 
 
 def undeploy_adapter(run_id: str) -> list[str]:

@@ -54,19 +54,14 @@ def cancel_run(run_id: str) -> RunStatus:
         cleanup = status.deployment_cleanup
         if isinstance(cleanup, dict):
             try:
-                from flash.serve.deploy import DeploymentSuperseded, disable_owned_adapter
+                from flash.serve.deploy import reconcile_owned_adapter_cleanup
 
-                disable_owned_adapter(
-                    run_id,
-                    int(cleanup["target_revision"]),
-                    str(cleanup["mutation_id"]),
-                )
-            except DeploymentSuperseded:
-                complete_deployment_cleanup(run_id, cleanup)
+                reconciled = reconcile_owned_adapter_cleanup(run_id, cleanup)
             except Exception:
                 pass
             else:
-                complete_deployment_cleanup(run_id, cleanup)
+                if reconciled:
+                    complete_deployment_cleanup(run_id, cleanup)
         status = get_status(run_id)
         if status.state in TERMINAL_STATES and not entered_deployed:
             return status
@@ -447,17 +442,25 @@ def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
     with _STATUS_LOCK:
         status = get_status(run_id)
         deployment = status.deployment or {}
-        if (
-            deployment.get("state") != "deploying"
-            or deployment.get("mutation_id") != mutation_id
-        ):
+        if deployment.get("state") != "deploying" or deployment.get("mutation_id") != mutation_id:
             return status
         target_revision = deployment.get("target_revision")
         if not isinstance(target_revision, int):
             return status
+        prior_revision = deployment.get("prior_revision")
+        prior_mutation_id = deployment.get("prior_mutation_id")
+        prior = None
+        if prior_revision is not None:
+            prior = {
+                "revision": prior_revision,
+                "mutation_id": prior_mutation_id,
+            }
         status.deployment_cleanup = {
-            "target_revision": target_revision,
-            "mutation_id": mutation_id,
+            "target": {
+                "revision": target_revision,
+                "mutation_id": mutation_id,
+            },
+            "prior": prior,
             "requested_at": time.time(),
         }
         status.deployment = {**deployment, "state": "undeployed"}

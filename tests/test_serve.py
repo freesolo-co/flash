@@ -184,6 +184,73 @@ def test_registry_mutation_guard_covers_post_and_exact_readback(monkeypatch, tmp
     assert events == ["enter", "post", "readback", "exit"]
 
 
+def test_initial_intent_callback_keeps_five_argument_contract(monkeypatch, tmp_path):
+    _stub_artifact(monkeypatch, tmp_path)
+    state = {"record": None}
+    captured = []
+
+    def persist(*args):
+        captured.append(args)
+
+    def request(_method, _url, *, json=None, **_kwargs):
+        state["record"] = {**json, "registry_revision": 1}
+        return Response(etag=1)
+
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: state["record"])
+    monkeypatch.setattr(d, "_serving_request", request)
+    d.deploy_adapter(
+        "r1",
+        MODEL,
+        "org/repo",
+        "sft/r1",
+        mutation_id="m1",
+        org_id=ORG,
+        before_registry_mutation=persist,
+    )
+
+    assert len(captured) == 1
+    assert len(captured[0]) == 5
+    assert captured[0][0] is None
+
+
+def test_redeploy_intent_callback_receives_exact_prior_mutation(monkeypatch, tmp_path):
+    _stub_artifact(monkeypatch, tmp_path)
+    prior = {
+        "adapter_id": "r1",
+        "registry_revision": 7,
+        "mutation_id": "m7",
+        "org_id": ORG,
+        "status": "ready",
+    }
+    state = {"record": prior}
+    captured = []
+
+    def persist(*args, **kwargs):
+        captured.append((args, kwargs))
+
+    def request(_method, _url, *, json=None, **_kwargs):
+        state["record"] = {**json, "registry_revision": 8}
+        return Response(etag=8)
+
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: state["record"])
+    monkeypatch.setattr(d, "_serving_request", request)
+    d.deploy_adapter(
+        "r1",
+        MODEL,
+        "org/repo",
+        "sft/r1",
+        mutation_id="m8",
+        org_id=ORG,
+        before_registry_mutation=persist,
+    )
+
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    assert args[0] == 7
+    assert args[2:4] == (8, "m8")
+    assert kwargs == {"prior_mutation_id": "m7"}
+
+
 def test_lost_post_response_is_committed_by_exact_readback(monkeypatch, tmp_path):
     _stub_artifact(monkeypatch, tmp_path)
     state = {"record": None}
@@ -307,6 +374,171 @@ def test_disable_never_touches_superseding_mutation(monkeypatch):
     monkeypatch.setattr(d, "_serving_request", lambda *_a, **_k: pytest.fail("must not delete"))
     with pytest.raises(d.DeploymentSuperseded):
         d.disable_owned_adapter("r1", 3, "old")
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (
+            {"registry_revision": 8, "mutation_id": "m8", "status": "ready"},
+            ("r1", 8, "m8"),
+        ),
+        (
+            {"registry_revision": 7, "mutation_id": "m7", "status": "ready"},
+            ("r1", 7, "m7"),
+        ),
+    ],
+    ids=["target", "prior"],
+)
+def test_cleanup_reconciliation_disables_exact_owned_row(monkeypatch, current, expected):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    disabled = []
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: current)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *args: disabled.append(args) or True,
+    )
+
+    assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
+    assert disabled == [expected]
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        {"registry_revision": 8, "mutation_id": "m8", "status": "ready"},
+        {"registry_revision": 7, "mutation_id": "m7", "status": "ready"},
+    ],
+    ids=["target", "prior"],
+)
+def test_cleanup_reconciliation_retains_ownership_after_transient_disable_failure(
+    monkeypatch, current
+):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: current)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: (_ for _ in ()).throw(d.ServingError("delete readback unavailable")),
+    )
+
+    with pytest.raises(d.ServingError, match="readback unavailable"):
+        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        {"registry_revision": 9, "mutation_id": "m8", "status": "disabled"},
+        {"registry_revision": 8, "mutation_id": "m7", "status": "disabled"},
+    ],
+    ids=["disabled-target", "disabled-prior"],
+)
+def test_cleanup_reconciliation_accepts_confirmed_owned_disable(monkeypatch, current):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: current)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("confirmed disable must not issue another delete"),
+    )
+
+    assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
+
+
+def test_cleanup_reconciliation_protects_true_forward_supersession(monkeypatch):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    newer = {"registry_revision": 9, "mutation_id": "m9", "status": "ready"}
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: newer)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("newer deployment must not be disabled"),
+    )
+
+    assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
+
+
+def test_cleanup_reconciliation_rejects_unexpected_older_identity(monkeypatch):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    unexpected = {"registry_revision": 6, "mutation_id": "m6", "status": "ready"}
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: unexpected)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("unexpected older deployment must not be disabled"),
+    )
+
+    with pytest.raises(d.ServingError, match="unexpected older"):
+        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+
+
+def test_cleanup_reconciliation_rejects_nonpredecessor_prior(monkeypatch):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 6, "mutation_id": "m6"},
+    }
+    monkeypatch.setattr(
+        d,
+        "read_adapter_record",
+        lambda _run_id: pytest.fail("malformed cleanup must fail before registry access"),
+    )
+
+    with pytest.raises(d.ServingError, match="target predecessor"):
+        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+
+
+def test_cleanup_reconciliation_rejects_malformed_current_identity(monkeypatch):
+    cleanup = {
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": {"revision": 7, "mutation_id": "m7"},
+    }
+    monkeypatch.setattr(
+        d,
+        "read_adapter_record",
+        lambda _run_id: {"registry_revision": 9, "status": "ready"},
+    )
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("malformed registry row must not be disabled"),
+    )
+
+    with pytest.raises(d.ServingError, match="malformed registry identity"):
+        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+
+
+def test_redeploy_rejects_prior_without_exact_mutation_identity(monkeypatch, tmp_path):
+    prior = {"registry_revision": 7, "org_id": ORG, "status": "ready"}
+    _stub_artifact(monkeypatch, tmp_path)
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: prior)
+    monkeypatch.setattr(d, "_serving_request", lambda *_a, **_k: pytest.fail("must not post"))
+
+    with pytest.raises(d.ServingError, match="prior registry mutation identity"):
+        d.deploy_adapter(
+            "r1",
+            MODEL,
+            "org/repo",
+            "sft/r1",
+            mutation_id=str(uuid4()),
+            org_id=ORG,
+        )
 
 
 def test_smoke_chat_sends_complete_deployment_fence(monkeypatch):

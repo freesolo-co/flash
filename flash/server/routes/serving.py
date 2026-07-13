@@ -120,19 +120,13 @@ def _recover_deployment(run_id: str) -> bool:
         cleanup = getattr(status, "deployment_cleanup", None)
         if isinstance(cleanup, dict):
             try:
-                _app.disable_owned_adapter(
-                    run_id,
-                    int(cleanup["target_revision"]),
-                    str(cleanup["mutation_id"]),
-                )
-            except _app.DeploymentSuperseded:
-                complete_deployment_cleanup(run_id, cleanup)
-                return True
+                reconciled = _app.reconcile_owned_adapter_cleanup(run_id, cleanup)
             except Exception as exc:
                 logger.warning("deployment cleanup retry deferred for %s: %s", run_id, exc)
                 return False
-            complete_deployment_cleanup(run_id, cleanup)
-            return True
+            if reconciled:
+                complete_deployment_cleanup(run_id, cleanup)
+            return reconciled
         deployment_attempt = getattr(status, "deployment_attempt", None)
         if isinstance(deployment_attempt, dict):
             queued = deployment_attempt.get("deployment") or {}
@@ -490,6 +484,8 @@ def _finish_deployment_unlocked(
         target_revision: int,
         persisted_mutation_id: str,
         repo_revision: str,
+        *,
+        prior_mutation_id: str | None = None,
     ) -> None:
         nonlocal intent_persisted
         if persisted_mutation_id != mutation_id:
@@ -500,6 +496,7 @@ def _finish_deployment_unlocked(
             detail="persisting deployment intent",
             desired_record=desired,
             prior_revision=prior_revision,
+            prior_mutation_id=prior_mutation_id,
             target_revision=target_revision,
             mutation_id=mutation_id,
             repo_revision=repo_revision,
