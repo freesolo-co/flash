@@ -221,7 +221,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
+    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     out = orch.cancel_run(spec.run_id)
@@ -332,7 +332,9 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     undeployed: list[str] = []
     monkeypatch.setattr(
-        deploy, "undeploy_adapter", lambda rid, *a, **k: undeployed.append(rid) or ["x"]
+        deploy,
+        "owned_adapter_cleanup",
+        lambda rid, _deployment=None: undeployed.append(rid) or None,
     )
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
@@ -373,7 +375,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
+    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
@@ -383,9 +385,9 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     called = []
     real_helper = orch.mark_deployment_undeployed
 
-    def spy(run_id):
+    def spy(run_id, **kwargs):
         called.append(run_id)
-        return real_helper(run_id)
+        return real_helper(run_id, **kwargs)
 
     monkeypatch.setattr(orch, "mark_deployment_undeployed", spy)
 
@@ -416,17 +418,16 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
+    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # Inject the race: a concurrent mark_undeployed flips the run to terminal `done` AFTER
     # cancel_run's initial get_status (state="deployed") but BEFORE the deployment is retired.
-    def racing_undeploy(*a, **k):
+    def racing_undeploy(_run_id, _deployment=None):
         # mark_undeployed moves a live `deployed` run to terminal `done`.
         orch.mark_undeployed(spec.run_id)
-        return ["flash-serve-5090-x"]
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
+    monkeypatch.setattr(deploy, "owned_adapter_cleanup", racing_undeploy)
 
     out = orch.cancel_run(spec.run_id)
     # Explicit cancel WINS over the racing undeploy: even though mark_undeployed flipped the
@@ -463,12 +464,11 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
 
     # The racing undeploy flips the run to terminal `done` mid-cancel (after cancel_run's
     # initial non-terminal read, before its final `cancelled` write).
-    def racing_undeploy(*a, **k):
+    def racing_undeploy(_run_id, _deployment=None):
         orch.mark_undeployed(spec.run_id)
         assert orch.get_status(spec.run_id).state == "done"  # the race landed
-        return ["flash-serve-5090-x"]
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
+    monkeypatch.setattr(deploy, "owned_adapter_cleanup", racing_undeploy)
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled", "explicit cancel must win over a racing undeploy `done`"

@@ -840,6 +840,7 @@ from flash.runner.deploy import (  # noqa: E402,F401
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,
+    mark_deployment_cleanup,
     mark_deployment_failed,
     mark_deployment_intent,
     mark_deployment_pre_intent_failed,

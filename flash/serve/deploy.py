@@ -541,6 +541,54 @@ def disable_owned_adapter(run_id: str, revision: int, mutation_id: str) -> bool:
     raise ServingError(f"adapter {run_id} disable readback was inconclusive")
 
 
+def persisted_adapter_cleanup(run_id: str, deployment: dict) -> dict:
+    """Recover authoritative identity retained from deployment finalization."""
+    revision = deployment.get("target_revision")
+    mutation_id = deployment.get("mutation_id")
+    if (
+        not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(mutation_id, str)
+        or not mutation_id.strip()
+    ):
+        raise ServingError(f"adapter {run_id} persisted registry identity was malformed")
+    return {
+        "adapter_id": run_id,
+        "target": {"revision": revision, "mutation_id": mutation_id},
+        "prior": None,
+    }
+
+
+def owned_adapter_cleanup(run_id: str, persisted_deployment: dict | None = None) -> dict | None:
+    """Read authoritative cleanup ownership, with exact persisted identity fallback."""
+    try:
+        current = read_adapter_record(run_id)
+    except Exception:
+        if persisted_deployment is None:
+            raise
+        return persisted_adapter_cleanup(run_id, persisted_deployment)
+    if current is None:
+        return None
+    if current.get("adapter_id") != run_id:
+        raise ServingError(f"adapter {run_id} registry identity was malformed")
+    revision = current.get("registry_revision")
+    mutation_id = current.get("mutation_id")
+    if (
+        not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(mutation_id, str)
+        or not mutation_id.strip()
+    ):
+        raise ServingError(f"adapter {run_id} registry identity was malformed")
+    if current.get("status") == "disabled":
+        return None
+    return {
+        "adapter_id": run_id,
+        "target": {"revision": revision, "mutation_id": mutation_id},
+        "prior": None,
+    }
+
+
 def _cleanup_identity(cleanup: dict, name: str) -> tuple[int, str] | None:
     raw = cleanup.get(name)
     if raw is None:
@@ -561,6 +609,8 @@ def _cleanup_identity(cleanup: dict, name: str) -> tuple[int, str] | None:
 
 def reconcile_owned_adapter_cleanup(run_id: str, cleanup: dict) -> bool:
     """Disable an owned target or prior row while protecting forward supersession."""
+    if cleanup.get("adapter_id") != run_id:
+        raise ServingError("deployment cleanup adapter identity was missing or malformed")
     target = _cleanup_identity(cleanup, "target")
     if target is None:
         raise ServingError("deployment cleanup target identity was missing")
@@ -595,8 +645,12 @@ def reconcile_owned_adapter_cleanup(run_id: str, cleanup: dict) -> bool:
         if prior is not None and current_identity == (prior[0] + 1, prior[1]):
             return True
 
-    if isinstance(current_revision, int) and current_revision >= target_revision:
+    if current_revision > target_revision:
         return True
+    if prior is not None and current_revision == target_revision:
+        return True
+    if current_revision == target_revision:
+        raise ServingError(f"adapter {run_id} cleanup observed a conflicting target identity")
     raise ServingError(f"adapter {run_id} cleanup observed an unexpected older registry identity")
 
 

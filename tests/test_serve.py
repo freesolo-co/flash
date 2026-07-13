@@ -380,6 +380,44 @@ def test_disable_never_touches_superseding_mutation(monkeypatch):
         d.disable_owned_adapter("r1", 3, "old")
 
 
+def test_owned_cleanup_uses_exact_persisted_identity_after_transient_read(monkeypatch):
+    monkeypatch.setattr(
+        d,
+        "read_adapter_record",
+        lambda _run_id: (_ for _ in ()).throw(d.ServingError("read unavailable")),
+    )
+
+    cleanup = d.owned_adapter_cleanup(
+        "r1",
+        {"state": "ready", "target_revision": 8, "mutation_id": "m8"},
+    )
+
+    assert cleanup == {
+        "adapter_id": "r1",
+        "target": {"revision": 8, "mutation_id": "m8"},
+        "prior": None,
+    }
+
+
+def test_owned_cleanup_rejects_malformed_authoritative_identity(monkeypatch):
+    monkeypatch.setattr(
+        d,
+        "read_adapter_record",
+        lambda _run_id: {
+            "adapter_id": "other",
+            "registry_revision": 8,
+            "mutation_id": "m8",
+            "status": "ready",
+        },
+    )
+
+    with pytest.raises(d.ServingError, match="registry identity was malformed"):
+        d.owned_adapter_cleanup(
+            "r1",
+            {"state": "ready", "target_revision": 8, "mutation_id": "m8"},
+        )
+
+
 @pytest.mark.parametrize(
     ("current", "expected"),
     [
@@ -396,6 +434,7 @@ def test_disable_never_touches_superseding_mutation(monkeypatch):
 )
 def test_cleanup_reconciliation_disables_exact_owned_row(monkeypatch, current, expected):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }
@@ -423,6 +462,7 @@ def test_cleanup_reconciliation_retains_ownership_after_transient_disable_failur
     monkeypatch, current
 ):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }
@@ -447,6 +487,7 @@ def test_cleanup_reconciliation_retains_ownership_after_transient_disable_failur
 )
 def test_cleanup_reconciliation_accepts_confirmed_owned_disable(monkeypatch, current):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }
@@ -462,6 +503,7 @@ def test_cleanup_reconciliation_accepts_confirmed_owned_disable(monkeypatch, cur
 
 def test_cleanup_reconciliation_protects_true_forward_supersession(monkeypatch):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }
@@ -476,8 +518,27 @@ def test_cleanup_reconciliation_protects_true_forward_supersession(monkeypatch):
     assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
 
 
+def test_cleanup_reconciliation_rejects_same_revision_newer_mutation(monkeypatch):
+    cleanup = {
+        "adapter_id": "r1",
+        "target": {"revision": 8, "mutation_id": "old"},
+        "prior": None,
+    }
+    current = {"registry_revision": 8, "mutation_id": "new", "status": "ready"}
+    monkeypatch.setattr(d, "read_adapter_record", lambda _run_id: current)
+    monkeypatch.setattr(
+        d,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("different mutation must not be disabled"),
+    )
+
+    with pytest.raises(d.ServingError, match="conflicting target"):
+        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+
+
 def test_cleanup_reconciliation_rejects_unexpected_older_identity(monkeypatch):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }
@@ -495,6 +556,7 @@ def test_cleanup_reconciliation_rejects_unexpected_older_identity(monkeypatch):
 
 def test_cleanup_reconciliation_rejects_nonpredecessor_prior(monkeypatch):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 6, "mutation_id": "m6"},
     }
@@ -510,6 +572,7 @@ def test_cleanup_reconciliation_rejects_nonpredecessor_prior(monkeypatch):
 
 def test_cleanup_reconciliation_rejects_malformed_current_identity(monkeypatch):
     cleanup = {
+        "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "m8"},
         "prior": {"revision": 7, "mutation_id": "m7"},
     }

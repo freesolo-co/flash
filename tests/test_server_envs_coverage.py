@@ -335,6 +335,7 @@ def _recovering_status(deployment, deployment_attempt=None, deployment_cleanup=N
 
 def test_recovery_retries_persisted_cleanup_after_disable_failure(monkeypatch):
     cleanup = {
+        "adapter_id": "run-1",
         "target": {"revision": 7, "mutation_id": "old"},
         "prior": None,
         "requested_at": 1.0,
@@ -359,6 +360,7 @@ def test_recovery_retries_persisted_cleanup_after_disable_failure(monkeypatch):
 
 def test_recovery_clears_cleanup_after_forward_supersession(monkeypatch):
     cleanup = {
+        "adapter_id": "run-1",
         "target": {"revision": 7, "mutation_id": "old"},
         "prior": None,
         "requested_at": 1.0,

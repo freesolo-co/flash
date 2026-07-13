@@ -400,12 +400,11 @@ def _finalize_registered_deployment(
     if not _app.record_matches(current, desired, target):
         raise ServingError("serving registry changed during smoke")
     ready = _deployment_state(deployment, "ready", **smoke)
-    public_ready = _public_deployment(ready)
     if is_checkpoint:
         state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
         mark_checkpoint_deployed(
             run_id,
-            public_ready,
+            ready,
             expect_state=state_guard,
             expect_mutation_id=mutation_id,
             expect_deployment_state="deploying",
@@ -413,7 +412,7 @@ def _finalize_registered_deployment(
     else:
         mark_deployed(
             run_id,
-            public_ready,
+            ready,
             expect_state=prev_state,
             expect_mutation_id=mutation_id,
             expect_deployment_state="deploying",

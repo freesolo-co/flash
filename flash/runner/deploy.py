@@ -56,6 +56,7 @@ def cancel_run(run_id: str) -> RunStatus:
         charge_usd_for_spec,
         complete_deployment_cleanup,
         get_status,
+        mark_deployment_cleanup,
         mark_deployment_undeployed,
         revoke_deployment_attempt,
         revoke_deployment_intent,
@@ -75,6 +76,31 @@ def cancel_run(run_id: str) -> RunStatus:
                 revoke_deployment_intent(run_id, mutation_id)
         status = get_status(run_id)
         cleanup = status.deployment_cleanup
+        if not isinstance(cleanup, dict):
+            deployment = status.deployment or {}
+            if deployment.get("state") in {"ready", "deployed"}:
+                authoritative_absence = False
+                try:
+                    from flash.serve.deploy import owned_adapter_cleanup
+
+                    ownership = owned_adapter_cleanup(run_id, deployment)
+                    authoritative_absence = ownership is None
+                except Exception:
+                    ownership = None
+                if authoritative_absence:
+                    mark_deployment_undeployed(run_id, expect_deployment=deployment)
+                elif ownership is not None:
+                    cleanup = {
+                        **ownership,
+                        "local_deployment": deployment,
+                        "requested_at": time.time(),
+                    }
+                    marked = mark_deployment_cleanup(
+                        run_id,
+                        cleanup,
+                        expect_deployment=deployment,
+                    )
+                    cleanup = marked.deployment_cleanup
         if isinstance(cleanup, dict):
             try:
                 from flash.serve.deploy import reconcile_owned_adapter_cleanup
@@ -103,15 +129,6 @@ def cancel_run(run_id: str) -> RunStatus:
     # undercounted.
     bill_cancel = bool(status.billing_context) and not entered_deployed
     remote = status.remote or {}
-    if status.state == "deployed":
-        try:
-            from flash.serve.deploy import undeploy_adapter
-
-            undeploy_adapter(run_id)
-            if status.deployment:
-                mark_deployment_undeployed(run_id)
-        except Exception:
-            pass
     if remote:
         try:
             from flash.providers import get_provider
@@ -137,13 +154,6 @@ def cancel_run(run_id: str) -> RunStatus:
         # charges the run from cost_usd (idempotent by runId).
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
-        final = get_status(run_id)
-        if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
-            with contextlib.suppress(Exception):
-                from flash.serve.deploy import undeploy_adapter
-
-                undeploy_adapter(run_id)
-                mark_deployment_undeployed(run_id)
         with contextlib.suppress(Exception):
             from flash.server.checkpoints import register_checkpoints_best_effort
 
@@ -492,6 +502,7 @@ def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
                 "mutation_id": prior_mutation_id,
             }
         status.deployment_cleanup = {
+            "adapter_id": run_id,
             "target": {
                 "revision": target_revision,
                 "mutation_id": mutation_id,
@@ -508,14 +519,36 @@ def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
         return status
 
 
+def mark_deployment_cleanup(
+    run_id: str,
+    cleanup: dict,
+    *,
+    expect_deployment: dict,
+) -> RunStatus:
+    """Persist exact cleanup ownership for an unchanged active deployment."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment != expect_deployment or status.deployment_cleanup is not None:
+            return status
+        status.deployment_cleanup = cleanup
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
 def complete_deployment_cleanup(run_id: str, cleanup: dict) -> RunStatus:
-    """Clear exact private cleanup ownership after confirmed remote disablement."""
+    """Complete exact cleanup and deactivate only its matching local deployment."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
         if status.deployment_cleanup != cleanup:
             return status
+        local_deployment = cleanup.get("local_deployment")
+        if isinstance(local_deployment, dict) and status.deployment == local_deployment:
+            status.deployment = {**local_deployment, "state": "undeployed"}
         status.deployment_cleanup = None
         status.updated_at = time.time()
         _save_status(status)
@@ -589,16 +622,18 @@ def mark_undeployed(run_id: str) -> RunStatus:
         return status
 
 
-def mark_deployment_undeployed(run_id: str) -> RunStatus:
-    """Flip ONLY the deployment field to ``undeployed``, leaving the run's state untouched.
-
-    Used by cancel_run — unlike mark_undeployed, never asserts or changes the run state,
-    so it works even after a racing mark_undeployed has already written terminal `done`.
-    """
+def mark_deployment_undeployed(
+    run_id: str,
+    *,
+    expect_deployment: dict | None = None,
+) -> RunStatus:
+    """Flip only an optionally exact deployment field to ``undeployed``."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
+        if expect_deployment is not None and status.deployment != expect_deployment:
+            return status
         changed = False
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}

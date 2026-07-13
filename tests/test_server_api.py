@@ -1332,7 +1332,10 @@ def test_cancel_revokes_queued_redeploy_before_registry_intent(api, monkeypatch)
         return _FakeDeployment(kwargs["adapter_prefix"], desired)
 
     monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr("flash.serve.deploy.undeploy_adapter", lambda _run_id: [])
+    monkeypatch.setattr(
+        "flash.serve.deploy.owned_adapter_cleanup",
+        lambda _run_id, _deployment=None: None,
+    )
     cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
     assert cancelled.status_code == 200, cancelled.text
 
@@ -1462,13 +1465,26 @@ def test_cancel_revokes_redeploy_queued_during_unlocked_teardown(api, monkeypatc
         "start_deployment_job",
         lambda target, **kwargs: jobs.append((target, kwargs)) or False,
     )
-    undeploy_attempts = []
+    registry = {
+        run_id: {
+            "adapter_id": run_id,
+            "registry_revision": 7,
+            "mutation_id": "ready-mutation",
+            "status": "ready",
+        }
+    }
+    cleanup_attempts = []
 
-    def fail_undeploy(_run_id):
-        undeploy_attempts.append(_run_id)
+    monkeypatch.setattr(
+        "flash.serve.deploy.read_adapter_record",
+        lambda adapter_id: registry.get(adapter_id),
+    )
+
+    def fail_disable(disable_run_id, revision, mutation_id):
+        cleanup_attempts.append((disable_run_id, revision, mutation_id, "failed"))
         raise ServingError("transient undeploy failure")
 
-    monkeypatch.setattr("flash.serve.deploy.undeploy_adapter", fail_undeploy)
+    monkeypatch.setattr("flash.serve.deploy.disable_owned_adapter", fail_disable)
     queued = False
 
     def queue_redeploy_during_teardown(_spec):
@@ -1504,14 +1520,118 @@ def test_cancel_revokes_redeploy_queued_during_unlocked_teardown(api, monkeypatc
     target, kwargs = jobs[0]
     target(**kwargs)
 
-    final = runner.get_status(run_id)
-    assert undeploy_attempts == [run_id, run_id]
+    pending = runner.get_status(run_id)
+    assert cleanup_attempts == [
+        (run_id, 7, "ready-mutation", "failed"),
+        (run_id, 7, "ready-mutation", "failed"),
+    ]
     assert posts == []
+    assert pending.state == "cancelled"
+    assert pending.deployment_attempt is None
+    assert pending.deployment_cleanup["adapter_id"] == run_id
+    assert pending.deployment_cleanup["target"] == {
+        "revision": 7,
+        "mutation_id": "ready-mutation",
+    }
+    assert pending.deployment_cleanup["prior"] is None
+    assert (pending.deployment or {}).get("state") == "ready"
+    assert (pending.deployment or {}).get("mutation_id") != queued_mutation
+
+    def complete_disable(disable_run_id, revision, mutation_id):
+        cleanup_attempts.append((disable_run_id, revision, mutation_id, "completed"))
+        registry[disable_run_id] = {
+            **registry[disable_run_id],
+            "registry_revision": revision + 1,
+            "status": "disabled",
+        }
+        return True
+
+    monkeypatch.setattr("flash.serve.deploy.disable_owned_adapter", complete_disable)
+    import flash.server.routes.serving as serving
+
+    assert serving._recover_deployment(run_id) is True
+    final = runner.get_status(run_id)
+    assert cleanup_attempts[-1] == (run_id, 7, "ready-mutation", "completed")
     assert final.state == "cancelled"
-    assert final.deployment_attempt is None
     assert final.deployment_cleanup is None
-    assert (final.deployment or {}).get("state") == "ready"
-    assert (final.deployment or {}).get("mutation_id") != queued_mutation
+    assert (final.deployment or {}).get("state") == "undeployed"
+
+    listed = api.get("/v1/deployments", headers=_bearer(key))
+    assert listed.status_code == 200
+    assert listed.json()["deployments"] == []
+    chat = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+    assert chat.status_code == 409
+    assert "was cancelled" in chat.json()["detail"]
+
+
+def test_repeated_cancel_retries_pending_ready_cleanup(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "deployed"
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://old.example",
+        "target_revision": 4,
+        "mutation_id": "ready-mutation",
+    }
+    runner._save_status(status)
+    registry = {
+        run_id: {
+            "adapter_id": run_id,
+            "registry_revision": 4,
+            "mutation_id": "ready-mutation",
+            "status": "ready",
+        }
+    }
+    attempts = []
+    reads = 0
+
+    def read_adapter(adapter_id):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise ServingError("registry read unavailable")
+        return registry.get(adapter_id)
+
+    monkeypatch.setattr(deploy, "read_adapter_record", read_adapter)
+
+    def fail_disable(disable_run_id, revision, mutation_id):
+        attempts.append((disable_run_id, revision, mutation_id, "failed"))
+        raise ServingError("delete unavailable")
+
+    monkeypatch.setattr(deploy, "disable_owned_adapter", fail_disable)
+    first = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert first.status_code == 200
+    assert runner.get_status(run_id).deployment_cleanup is not None
+
+    def complete_disable(disable_run_id, revision, mutation_id):
+        attempts.append((disable_run_id, revision, mutation_id, "completed"))
+        registry[disable_run_id] = {
+            **registry[disable_run_id],
+            "registry_revision": revision + 1,
+            "status": "disabled",
+        }
+        return True
+
+    monkeypatch.setattr(deploy, "disable_owned_adapter", complete_disable)
+    repeated = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert repeated.status_code == 200
+    final = runner.get_status(run_id)
+    assert attempts[-1] == (run_id, 4, "ready-mutation", "completed")
+    assert final.state == "cancelled"
+    assert final.deployment_cleanup is None
+    assert final.deployment["state"] == "undeployed"
 
 
 def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch):
