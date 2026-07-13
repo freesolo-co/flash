@@ -148,8 +148,85 @@ def test_create_instance_success_and_rejection(monkeypatch):
     assert url.endswith("/asks/123/")
     assert body["label"] == "flash-x"
     assert body["env"] == {"A": "1"}
-    with pytest.raises(vast_api.VastApiError, match="rejected"):
+    with pytest.raises(vast_api.VastApiError, match="rejected") as exc_info:
         vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is False
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_create_instance_non_2xx_explicit_false_is_rejected(monkeypatch, status):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(
+        monkeypatch,
+        [_http_error(status, b'{"success": false, "error": "offer unavailable"}')],
+    )
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastCreateRejected) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is False
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (404, b"not-json"),
+        (503, b'{"success": false, "error": "upstream unavailable"}'),
+    ],
+)
+def test_create_instance_non_2xx_uncertain_response_is_ambiguous(monkeypatch, status, body):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [_http_error(status, body)])
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastApiError) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is True
+
+
+def test_create_instance_non_2xx_contradictory_response_is_ambiguous(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(
+        monkeypatch,
+        [_http_error(410, b'{"success": false, "new_contract": 777}')],
+    )
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [],
+        {},
+        {"detail": "offer state unknown"},
+        {"error": "upstream response lost"},
+        {"success": None},
+        {"success": 0},
+        {"success": False, "new_contract": 777},
+        {"success": 1, "new_contract": 777},
+        {"success": "true", "new_contract": 777},
+    ],
+)
+def test_create_instance_malformed_response_is_ambiguous(monkeypatch, body):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [body])
+    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+
+    with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    assert vast_api.create_error_is_ambiguous(exc_info.value) is True
 
 
 def test_create_instance_is_not_retried(monkeypatch):
@@ -307,11 +384,12 @@ def test_create_error_is_ambiguous_classification():
     def http(code):
         return urllib.error.HTTPError("u", code, "m", None, io.BytesIO(b""))
 
-    # DEFINITIVE (created nothing) -> not ambiguous
-    assert vast_api.create_error_is_ambiguous(err(http(404))) is False
-    assert vast_api.create_error_is_ambiguous(err(http(400))) is False
-    assert vast_api.create_error_is_ambiguous(err(msg="rejected: {'success': False}")) is False
-    # AMBIGUOUS (a contract may exist) -> reconcile by label
+    # only the typed explicit success:false rejection is definitive
+    assert vast_api.create_error_is_ambiguous(vast_api.VastCreateRejected("success:false")) is False
+    # every other create failure is ambiguous because the non-idempotent request may have landed
+    assert vast_api.create_error_is_ambiguous(err(http(404))) is True
+    assert vast_api.create_error_is_ambiguous(err(http(400))) is True
+    assert vast_api.create_error_is_ambiguous(err(msg="untyped rejection")) is True
     assert vast_api.create_error_is_ambiguous(err(http(503))) is True
     assert vast_api.create_error_is_ambiguous(err(http(429))) is True  # Cursor MsA6e: rate-limit
     assert vast_api.create_error_is_ambiguous(err(urllib.error.URLError("timed out"))) is True
@@ -349,16 +427,14 @@ def test_destroy_instance_never_raises(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    _capture_urlopen(monkeypatch, [{}])
+    _capture_urlopen(monkeypatch, [{"success": True}])
     assert vast_api.destroy_instance(777) is True
     _capture_urlopen(monkeypatch, [_http_error(500)] * 3)
     assert vast_api.destroy_instance(777) is False
 
 
 def test_destroy_instance_respects_success_flag(monkeypatch):
-    """Codex MsXoJ: Vast's 200 DELETE carries a `success` bool — `success: false` means the box is
-    still billable, so it must NOT be reported destroyed (destroy_run_instances/sweep_orphans would
-    count it reaped and stop the immediate cleanup). A body without the key stays success (prior shape)."""
+    """only explicit success:true confirms deletion; explicit false remains unconfirmed."""
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -366,8 +442,87 @@ def test_destroy_instance_respects_success_flag(monkeypatch):
     assert vast_api.destroy_instance(5) is True
     _capture_urlopen(monkeypatch, [{"success": False}])
     assert vast_api.destroy_instance(5) is False
-    _capture_urlopen(monkeypatch, [{"detail": "ok, no success key"}])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        [],
+        {"detail": "delete state unknown"},
+        {"error": "permission denied"},
+        {"success": None},
+        {"success": 0},
+        {"success": 1},
+        {"success": "true"},
+    ],
+)
+def test_destroy_instance_malformed_response_is_unconfirmed(monkeypatch, body):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [body, {"instances": {"id": 5, "actual_status": "running"}}])
+    assert vast_api.destroy_instance(5) is False
+
+
+def test_destroy_instance_exact_followup_can_confirm_absence(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{}, {"instances": None}])
     assert vast_api.destroy_instance(5) is True
+    assert [call[0] for call in calls] == ["DELETE", "GET"]
+
+
+def test_destroy_instance_followup_error_envelope_is_unconfirmed(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    _capture_urlopen(monkeypatch, [{}, {"instances": None, "detail": "lookup failed"}])
+    assert vast_api.destroy_instance(5) is False
+
+
+def test_destroy_instance_unreadable_body_is_unconfirmed(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    class _UnreadableResponse:
+        def read(self):
+            return b"<html>upstream error</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    responses = iter(
+        [
+            _UnreadableResponse(),
+            _UnreadableResponse(),
+            _UnreadableResponse(),
+            _FakeResponse({"instances": {"id": 5}}),
+        ]
+    )
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.get_method())
+        return next(responses)
+
+    monkeypatch.setattr(vast_api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vast_api.time, "sleep", lambda seconds: None)
+    assert vast_api.destroy_instance(5) is False
+    assert calls == ["DELETE", "DELETE", "DELETE", "GET"]
+
+
+def test_destroy_instance_permission_failure_is_unconfirmed(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [_http_error(403, b'{"detail":"forbidden"}')])
+    assert vast_api.destroy_instance(9) is False
+    assert len(calls) == 1
 
 
 def test_destroy_instance_404_is_confirmed_gone(monkeypatch):

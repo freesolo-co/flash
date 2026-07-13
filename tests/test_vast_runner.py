@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import itertools
 import json
+import urllib.error
 
 import pytest
 
@@ -178,7 +180,7 @@ def test_deploy_walks_taken_offers(monkeypatch):
 
     def fake_create(offer_id, **kw):
         if offer_id < 3:
-            raise vast_api.VastApiError(f"offer {offer_id} taken")
+            raise vast_api.VastCreateRejected(f"offer {offer_id} taken")
         rented.append(offer_id)
         return 4242
 
@@ -191,11 +193,71 @@ def test_deploy_walks_taken_offers(monkeypatch):
     assert h.label == "flash-1700000000-abcd1234-s0-a2"
 
 
+def test_deploy_walks_documented_non_2xx_rejection(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    cause = urllib.error.HTTPError(
+        "https://console.vast.ai/api/v0/asks/1/",
+        404,
+        "not found",
+        None,
+        io.BytesIO(b'{"success": false, "error": "offer unavailable"}'),
+    )
+    first = vast_api.VastApiError("vast request failed: HTTP 404: offer unavailable")
+    first.__cause__ = cause
+    responses = iter([first, {"success": True, "new_contract": 4242}])
+    requested = []
+
+    def request(path, **kwargs):
+        requested.append(path)
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(vast_api, "request_with_retries", request)
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+
+    handle = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=0)
+
+    assert handle.instance_id == 4242
+    assert handle.offer_id == 2
+    assert requested == ["/v0/asks/1/", "/v0/asks/2/"]
+
+
+def test_deploy_stops_on_contradictory_create_response(monkeypatch):
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    responses = iter(
+        [
+            {"success": False, "new_contract": 777},
+            {"success": True, "new_contract": 888},
+        ]
+    )
+    requested = []
+
+    def request(path, **kwargs):
+        requested.append(path)
+        return next(responses)
+
+    monkeypatch.setattr(vast_api, "request_with_retries", request)
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [])
+    destroyed_for = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: destroyed_for.append(run_id) or [])
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+
+    with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
+        vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=0)
+
+    assert requested == ["/v0/asks/1/"]
+    assert destroyed_for == [_spec().run_id]
+
+
 def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
-    # Codex: once create_instance rents the box (billing), a raising SUCCESS log (closed stream / disk
-    # error) BEFORE the handle is returned would skip submit_run_vast's teardown finally and leak the
-    # instance while the runner retries the "deploy error". The success say is suppressed, so the handle
-    # is ALWAYS returned once the instance exists.
+    # once create_instance rents the box, a raising success log before handle return must not leak it
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -209,7 +271,93 @@ def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
 
     monkeypatch.setattr(vast, "make_say", raising_say)
     h = vast.deploy_and_submit(_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
-    assert h.instance_id == 4242  # handle still returned despite the logging failure
+    assert h.instance_id == 4242
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("destroy_confirmed", [True, False])
+def test_post_create_baseexception_cleans_and_never_walks_offers(
+    monkeypatch, interrupt_type, destroy_confirmed
+):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec()
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+    created = []
+
+    def create(offer_id, **kwargs):
+        created.append(offer_id)
+        return 4242
+
+    monkeypatch.setattr(vast_api, "create_instance", create)
+    monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: offers)
+    monkeypatch.setattr(vast.time, "time", lambda: (_ for _ in ()).throw(interrupt_type("stop")))
+    destroyed_ids = []
+    monkeypatch.setattr(
+        vast_api,
+        "destroy_instance",
+        lambda instance_id: destroyed_ids.append(instance_id) or destroy_confirmed,
+    )
+    reconciled_runs = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: reconciled_runs.append(run_id) or [])
+
+    with pytest.raises(interrupt_type):
+        vast.submit_run_vast(spec, seed=0)
+
+    assert created == [1]
+    assert destroyed_ids == [4242]
+    assert reconciled_runs == [spec.run_id]
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_post_create_preserves_original_baseexception_when_cleanup_raises(
+    monkeypatch, interrupt_type
+):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    class ExactCleanupFailure(BaseException):
+        pass
+
+    class LabelCleanupFailure(BaseException):
+        pass
+
+    spec = _spec()
+    offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
+    created = []
+
+    def create(offer_id, **kwargs):
+        created.append(offer_id)
+        return 4242
+
+    original = interrupt_type("original interruption")
+    exact_cleanup = ExactCleanupFailure("exact cleanup failed")
+    label_cleanup = LabelCleanupFailure("label cleanup failed")
+    destroyed_ids = []
+    reconciled_runs = []
+
+    def destroy_exact(instance_id):
+        destroyed_ids.append(instance_id)
+        raise exact_cleanup
+
+    def destroy_label(run_id):
+        reconciled_runs.append(run_id)
+        raise label_cleanup
+
+    monkeypatch.setattr(vast_api, "create_instance", create)
+    monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: offers)
+    monkeypatch.setattr(vast.time, "time", lambda: (_ for _ in ()).throw(original))
+    monkeypatch.setattr(vast_api, "destroy_instance", destroy_exact)
+    monkeypatch.setattr(vast, "destroy_run_instances", destroy_label)
+
+    with pytest.raises(interrupt_type) as exc_info:
+        vast.submit_run_vast(spec, seed=0)
+
+    assert exc_info.value is original
+    assert created == [1]
+    assert destroyed_ids == [4242]
+    assert reconciled_runs == [spec.run_id]
 
 
 def test_deploy_refreshes_once_when_all_taken(monkeypatch):
@@ -218,7 +366,7 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
 
     def fake_create(offer_id, **kw):
         if offer_id != 99:
-            raise vast_api.VastApiError("taken")
+            raise vast_api.VastCreateRejected("taken")
         return 7
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
@@ -348,7 +496,7 @@ def test_deploy_raises_when_pool_exhausted(monkeypatch):
     monkeypatch.setattr(
         vast_api,
         "create_instance",
-        lambda *a, **k: (_ for _ in ()).throw(vast_api.VastApiError("taken")),
+        lambda *a, **k: (_ for _ in ()).throw(vast_api.VastCreateRejected("taken")),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
     with pytest.raises(vast_api.VastApiError, match="rejected the job"):

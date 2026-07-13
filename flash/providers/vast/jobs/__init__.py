@@ -293,23 +293,28 @@ def deploy_and_submit(
                     if o.gpu in allowed
                 ][:5]
             continue
-        # suppress: a raising log before we return would skip the teardown finally and leak the box.
-        with contextlib.suppress(Exception):
-            say(
-                f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
-                f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
-                f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
+        # guard the accepted create before any fallible post-create work can lose the exact id
+        try:
+            with contextlib.suppress(Exception):
+                say(
+                    f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
+                    f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
+                    f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
+                )
+            return VastJobHandle(
+                instance_id=instance_id,
+                offer_id=offer.offer_id,
+                machine_id=offer.machine_id,
+                label=label,
+                gpu=offer.gpu,
+                hourly_usd=offer.dph_total,
+                attempt=attempt,
+                started_ts=time.time(),
             )
-        return VastJobHandle(
-            instance_id=instance_id,
-            offer_id=offer.offer_id,
-            machine_id=offer.machine_id,
-            label=label,
-            gpu=offer.gpu,
-            hourly_usd=offer.dph_total,
-            attempt=attempt,
-            started_ts=time.time(),
-        )
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                _best_effort_destroy(instance_id, context="post-create handle acquisition")
+            raise
     raise vast_api.VastApiError(f"all {len(tried)} vast offers rejected the job: {last_err}")
 
 
@@ -480,18 +485,27 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    handle = deploy_and_submit(
-        spec, seed, offers, attempt=attempt, log=log, runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
-    )
-    # The instance is billing the MOMENT deploy_and_submit returns; the teardown ``finally`` must guard
-    # EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself raise).
+    handle = None
     try:
+        try:
+            handle = deploy_and_submit(
+                spec,
+                seed,
+                offers,
+                attempt=attempt,
+                log=log,
+                runtime_secrets=runtime_secrets,
+                code_prefix=code_prefix,
+            )
+        except BaseException:
+            # the deterministic run label survives a pre-handle interruption for immediate and restart recovery
+            with contextlib.suppress(BaseException):
+                destroy_run_instances(spec.run_id)
+            raise
         if on_handle is not None:
             on_handle(handle.to_dict())
         reader = heartbeat_reader_for(spec)
-        # Wall cap + provision/cold-start grace; Vast has no server-side execution timeout, so the
-        # client deadline (and the bootstrap's own cap) bound spend.
+        # wall cap plus provision/cold-start grace bounds spend because vast has no server-side timeout
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_vast_job(
             handle,
@@ -502,11 +516,10 @@ def submit_run_vast(
             deadline_s=deadline,
         )
     finally:
-        # An UNCONFIRMED single-instance destroy (success:false / breakdown) on a retriable run is
-        # dangerous: while the run stays ``running`` the active-run sweep SHIELDS its label, so this
-        # attempt's possibly-billing box could survive into the next attempt handle-less. Escalate to a
-        # run-scoped reap by label (not active-shielded) so it's cleared before the next launch.
-        if not _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown"):
+        if handle is not None and not _best_effort_destroy(
+            handle.instance_id, context="submit_run_vast teardown"
+        ):
+            # an unconfirmed exact-id destroy must retain the run-label recovery path before any retry
             with contextlib.suppress(Exception):
                 destroy_run_instances(spec.run_id)
 
