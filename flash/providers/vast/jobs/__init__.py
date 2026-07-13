@@ -279,17 +279,20 @@ def deploy_and_submit(
                 )
             except vast_api.VastApiError as e:
                 last_err = e
+                # classify first (a pure isinstance check that cannot raise): a definitive rejection
+                # provably allocated nothing, so clear the reap flag BEFORE any baseexception-transparent
+                # operation (say only suppresses exception) can escape with it still set.
+                ambiguous = vast_api.create_error_is_ambiguous(e)
+                if not ambiguous:
+                    create_attempted = False
                 # suppress: a raising log here must not abort before the ambiguous-create reconcile below.
                 with contextlib.suppress(Exception):
                     say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
                 # An AMBIGUOUS failure (5xx/429/timeout/unreadable body on the non-idempotent PUT /asks) may
                 # have billed a contract that never surfaced -> reconcile by label (adopt or abort) before
                 # renting another offer. A DEFINITIVE 4xx / success=false rejection created nothing: walk on.
-                if vast_api.create_error_is_ambiguous(e):
+                if ambiguous:
                     return _reconcile_ambiguous_create(spec, offer, label, attempt, e, say)
-                # this create provably allocated nothing, so an escaping failure later in the walk
-                # must not trigger a run-label reap on its account.
-                create_attempted = False
                 # Market is live: refresh the search ONCE, re-excluding the machines that just rejected us
                 # and staying within the allocator-approved class pool (``offers`` is already class-filtered).
                 if not candidates and not refreshed:

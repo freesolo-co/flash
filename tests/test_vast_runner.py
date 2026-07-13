@@ -1402,6 +1402,37 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     assert reaped == [], "a confirmed teardown must NOT trigger the run-scoped reap"
 
 
+def test_submit_no_reap_when_rejection_log_raises_baseexception(monkeypatch):
+    # bugbot: a keyboardinterrupt raised by the rejection log escapes the exception-only
+    # suppress; the reap flag must already be cleared for the definitive rejection so the
+    # escaping interrupt does not trigger a run-label reap that could hit other seeds' boxes.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    original = KeyboardInterrupt("interrupt during rejection log")
+
+    def raising_say(_log):
+        def _say(_msg):
+            raise original
+
+        return _say
+
+    monkeypatch.setattr(
+        vast_api,
+        "create_instance",
+        lambda *a, **k: (_ for _ in ()).throw(vast_api.VastCreateRejected("taken")),
+    )
+    monkeypatch.setattr(vast, "make_say", raising_say)
+    monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
+    reaped = []
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: reaped.append(rid) or [])
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        vast.submit_run_vast(_spec(), seed=0)
+    assert exc_info.value is original
+    assert reaped == []  # definitive rejection rented nothing: no run-label reap
+
+
 def test_submit_no_reap_when_failure_precedes_any_create(monkeypatch):
     # a failure before any create request (empty offer pool) must not run-label reap:
     # a concurrent worker for the same run could own a live instance under that label.
