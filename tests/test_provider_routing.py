@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import threading
 
 import pytest
 
@@ -103,6 +104,250 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
     assert remote["allocated_gpu"] == "RTX 4090"
+
+
+def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    original_spec_with_gpu = orch._spec_with_gpu
+
+    def cancel_after_allocation(run_spec, gpu_type):
+        selected = original_spec_with_gpu(run_spec, gpu_type)
+        assert orch._update(run_spec.run_id, "cancelled")
+        return selected
+
+    provider_calls = []
+
+    def fake_runpod_submit(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(orch, "_spec_with_gpu", cancel_after_allocation)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    with pytest.raises(orch._RunCancelled):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    status = orch.get_status(spec.run_id)
+    assert status.state == "cancelled"
+    assert status.effective_preparation is None
+    assert not orch._persist_effective_worker_spec(spec)
+    assert provider_calls == []
+
+
+def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(run_id="flash-provider-handshake-cancel", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+    resource_created = threading.Event()
+    allow_handle = threading.Event()
+    handle_persisted = threading.Event()
+    polling = threading.Event()
+    allow_poll = threading.Event()
+    cancellation_started = threading.Event()
+    cancellation_finished = threading.Event()
+    resource_live = {"value": False}
+    cancelled_handles = []
+    destroyed_handles = []
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        resource_live["value"] = True
+        resource_created.set()
+        assert allow_handle.wait(timeout=5)
+        on_handle(_runpod_handle("ep-handshake", "job-handshake"))
+        persisted_remote = orch.get_status(spec.run_id).remote
+        assert persisted_remote["endpoint_id"] == "ep-handshake"
+        assert persisted_remote["job_id"] == "job-handshake"
+        handle_persisted.set()
+        polling.set()
+        assert allow_poll.wait(timeout=5)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    def cancel_job(endpoint_id, job_id):
+        cancelled_handles.append((endpoint_id, job_id))
+
+    def delete_endpoint(endpoint_id):
+        destroyed_handles.append(endpoint_id)
+        resource_live["value"] = False
+        return True
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+
+    submit_errors = []
+
+    def submit():
+        try:
+            orch._submit_seed_supervised(spec, 0, io.StringIO())
+        except Exception as exc:
+            submit_errors.append(exc)
+
+    cancel_results = []
+
+    def cancel():
+        cancellation_started.set()
+        cancel_results.append(orch.cancel_run(spec.run_id))
+        cancellation_finished.set()
+
+    submit_thread = threading.Thread(target=submit)
+    submit_thread.start()
+    assert resource_created.wait(timeout=5)
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert cancellation_started.wait(timeout=5)
+    cancel_thread.join(timeout=0.1)
+    assert cancel_thread.is_alive()
+    assert not cancellation_finished.is_set()
+    assert orch.get_status(spec.run_id).remote is None
+    assert resource_live["value"]
+
+    allow_handle.set()
+    assert handle_persisted.wait(timeout=5)
+    assert polling.wait(timeout=5)
+    assert cancellation_finished.wait(timeout=5)
+    cancel_thread.join(timeout=5)
+
+    assert not cancel_thread.is_alive()
+    assert submit_thread.is_alive()
+    assert cancel_results[0].state == "cancelled"
+    status = orch.get_status(spec.run_id)
+    assert status.state == "cancelled"
+    assert status.remote["endpoint_id"] == "ep-handshake"
+    assert status.remote["job_id"] == "job-handshake"
+    assert cancelled_handles == [("ep-handshake", "job-handshake")]
+    assert "ep-handshake" in destroyed_handles
+    assert not resource_live["value"]
+
+    allow_poll.set()
+    submit_thread.join(timeout=5)
+    assert not submit_thread.is_alive()
+    assert len(submit_errors) == 1
+    assert isinstance(submit_errors[0], orch._RunCancelled)
+    assert not resource_live["value"]
+
+
+def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(run_id="flash-concurrent-supervisors", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+
+    def allocate_for_supervisor(*args, **kwargs):
+        gpu = "RTX 4090" if threading.current_thread().name == "supervisor-a" else "RTX 5090"
+        return _alloc(gpu=gpu)
+
+    monkeypatch.setattr(allocator, "allocate", allocate_for_supervisor)
+
+    resource_created = threading.Event()
+    allow_handle = threading.Event()
+    polling = threading.Event()
+    allow_poll = threading.Event()
+    provider_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        provider_gpus.append(run_spec.gpu.type)
+        resource_created.set()
+        assert allow_handle.wait(timeout=5)
+        on_handle(_runpod_handle("ep-first", "job-first"))
+        polling.set()
+        assert allow_poll.wait(timeout=5)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    results = {}
+
+    def submit(name):
+        try:
+            results[name] = orch._submit_seed_supervised(spec, 0, io.StringIO())
+        except Exception as exc:
+            results[name] = exc
+
+    first = threading.Thread(target=submit, args=("first",), name="supervisor-a")
+    second = threading.Thread(target=submit, args=("second",), name="supervisor-b")
+    first.start()
+    assert resource_created.wait(timeout=5)
+    second.start()
+    second.join(timeout=0.1)
+    assert second.is_alive()
+
+    allow_handle.set()
+    assert polling.wait(timeout=5)
+    second.join(timeout=5)
+    assert not second.is_alive()
+    assert isinstance(results["second"], orch._RunCancelled)
+    assert provider_gpus == ["RTX 4090"]
+
+    status = orch.get_status(spec.run_id)
+    worker_spec = status.effective_preparation["worker_spec"]
+    assert worker_spec["gpu"]["type"] == "RTX 4090"
+    assert status.remote["endpoint_id"] == "ep-first"
+
+    allow_poll.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert results["first"]["train_tokens"] == 4096
+    assert provider_gpus == ["RTX 4090"]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["provider_exception", "provider_without_callback", "callback_persistence_exception"],
+)
+def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_mode):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.server._locks import _deploy_lock
+
+    spec = _spec(run_id=f"flash-lock-release-{failure_mode}", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    original_update = orch._update
+
+    def fail_remote_persistence(run_id, state, **updates):
+        if failure_mode == "callback_persistence_exception" and updates.get("remote") is not None:
+            raise RuntimeError("remote persistence failed")
+        return original_update(run_id, state, **updates)
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        if failure_mode == "provider_exception":
+            raise RuntimeError("provider create failed")
+        if failure_mode == "callback_persistence_exception":
+            on_handle({"provider": "runpod", "job_id": "job-no-persist"})
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(orch, "_update", fail_remote_persistence)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    if failure_mode == "provider_without_callback":
+        metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+        assert metrics["train_tokens"] == 4096
+    else:
+        with pytest.raises(RuntimeError, match="failed after retries"):
+            orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    lock = _deploy_lock(spec.run_id)
+    assert lock.acquire(blocking=False)
+    lock.release()
 
 
 def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, monkeypatch):
@@ -309,6 +554,57 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "L4", 0.39, 24),
+        Candidate("runpod", "H100", 0.49, 48),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+
+    submitted_attempts = []
+    deleted_endpoints = []
+    gc_calls = []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint",
+        lambda endpoint_id: deleted_endpoints.append(endpoint_id) or False,
+    )
+    monkeypatch.setattr(
+        RunpodProvider,
+        "gc",
+        lambda self, cleanup_spec: gc_calls.append(cleanup_spec.run_id),
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_attempts.append(attempt)
+        on_handle(_runpod_handle("ep-unconfirmed", "job-unconfirmed"))
+        return PollResult(False, failure="stalled", detail="no worker progress")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-unconfirmed-runpod-teardown")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submitted_attempts == [0]
+    assert deleted_endpoints
+    assert set(deleted_endpoints) == {"ep-unconfirmed"}
+    assert gc_calls == [spec.run_id]
+    status = orch.get_status(spec.run_id)
+    assert status.remote["endpoint_id"] == "ep-unconfirmed"
+    assert status.remote["job_id"] == "job-unconfirmed"
+    assert "teardown UNCONFIRMED" in log.getvalue()
 
 
 def _oom_candidates():

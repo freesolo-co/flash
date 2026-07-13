@@ -34,73 +34,68 @@ def cancel_run(run_id: str) -> RunStatus:
         get_status,
         mark_deployment_undeployed,
     )
-
-    status = get_status(run_id)
-    if status.state in TERMINAL_STATES:
-        return status
-    # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
-    entered_deployed = status.state == "deployed"
-    public_spec = JobSpec.from_dict(status.spec)
-    effective_spec = None
-    with contextlib.suppress(Exception):
-        effective_spec = effective_spec_from_status(status)
-    cleanup_spec = effective_spec or public_spec
-    # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
-    # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
-    # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here. The price
-    # is snapshotted AFTER the remote worker is torn down (below), from the freshest persisted
-    # heartbeat, so a step the worker finished between this cancel request and teardown isn't
-    # undercounted.
-    bill_cancel = bool(status.billing_context) and not entered_deployed
-    remote = status.remote or {}
-    if status.state == "deployed":
-        try:
-            from flash.serve.deploy import undeploy_adapter
-
-            undeploy_adapter(run_id)
-            if status.deployment:
-                mark_deployment_undeployed(run_id)
-        except Exception:
-            pass
-    if remote:
-        try:
-            from flash.providers import get_provider
-            from flash.providers.base import JobHandle
-
-            handle = JobHandle.from_dict(remote)
-            provider = get_provider(handle.provider)
-            provider.cancel(handle)
-            provider.destroy(handle)
-        except Exception:
-            pass
-    with contextlib.suppress(Exception):
-        _gc_run_endpoints(cleanup_spec)
-    # price only from the validated effective snapshot. a missing or malformed private snapshot must
-    # never make the public child rank authoritative, but it also must never block teardown.
-    cancel_charge_usd: float | None = None
-    billing_diagnostic: dict = {}
-    if bill_cancel:
-        if effective_spec is not None:
-            cancel_charge_usd = charge_usd_for_spec(
-                effective_spec,
-                steps=actual_steps_run(get_status(run_id)),
-                fallback=0.0,
-            )
-        else:
-            cancel_charge_usd = 0.0
-            billing_diagnostic = {
-                "billing_state": "failed",
-                "billing_error": (
-                    "cancellation charge was not computed because the private preparation "
-                    "snapshot was unavailable or invalid; teardown was still attempted"
-                ),
-            }
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):
-        # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
-        # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
-        # charges the run from cost_usd (idempotent by runId).
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return status
+        # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
+        entered_deployed = status.state == "deployed"
+        public_spec = JobSpec.from_dict(status.spec)
+        effective_spec = None
+        with contextlib.suppress(Exception):
+            effective_spec = effective_spec_from_status(status)
+        cleanup_spec = effective_spec or public_spec
+        # a run cancelled mid-training is re-priced to how far it got. a deployed run already
+        # completed training, so it keeps the full quoted cost. pricing happens after teardown from
+        # the freshest persisted heartbeat.
+        bill_cancel = bool(status.billing_context) and not entered_deployed
+        remote = status.remote or {}
+        if status.state == "deployed":
+            try:
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                if status.deployment:
+                    mark_deployment_undeployed(run_id)
+            except Exception:
+                pass
+        if remote:
+            try:
+                from flash.providers import get_provider
+                from flash.providers.base import JobHandle
+
+                handle = JobHandle.from_dict(remote)
+                provider = get_provider(handle.provider)
+                provider.cancel(handle)
+                provider.destroy(handle)
+            except Exception:
+                pass
+        with contextlib.suppress(Exception):
+            _gc_run_endpoints(cleanup_spec)
+        # price only from the validated effective snapshot. a missing or malformed private snapshot
+        # must never make the public child rank authoritative, but it also must never block teardown.
+        cancel_charge_usd: float | None = None
+        billing_diagnostic: dict = {}
+        if bill_cancel:
+            if effective_spec is not None:
+                cancel_charge_usd = charge_usd_for_spec(
+                    effective_spec,
+                    steps=actual_steps_run(get_status(run_id)),
+                    fallback=0.0,
+                )
+            else:
+                cancel_charge_usd = 0.0
+                billing_diagnostic = {
+                    "billing_state": "failed",
+                    "billing_error": (
+                        "cancellation charge was not computed because the private preparation "
+                        "snapshot was unavailable or invalid; teardown was still attempted"
+                    ),
+                }
+        # set the cancel charge when re-pricing a mid-training cancel. a deployed-then-cancelled run
+        # keeps its already-quoted cost_usd. the billing retry sweep is idempotent by run id.
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
         _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
@@ -115,7 +110,7 @@ def cancel_run(run_id: str) -> RunStatus:
             from flash.server.checkpoints import register_checkpoints_best_effort
 
             register_checkpoints_best_effort(get_status(run_id))
-    return get_status(run_id)
+        return get_status(run_id)
 
 
 def attach_run(run_id: str, log_stream=None) -> RunStatus:

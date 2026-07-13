@@ -698,6 +698,8 @@ def prepare_job(
 def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     """Persist the selected worker spec before provider provisioning starts."""
     status = get_status(worker_spec.run_id)
+    if status.state in TERMINAL_STATES:
+        return False
     snapshot = status.effective_preparation
     public_spec = JobSpec.from_dict(status.spec)
     if public_spec.train.init_from_adapter:
@@ -1004,7 +1006,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         status.state = state
         status.updated_at = time.time()
         if state in TERMINAL_STATES and status.finished_at is None:
-            # Legacy run already terminal: backfill from prior updated_at, not now.
+            # legacy run already terminal: backfill from prior updated_at, not now.
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)

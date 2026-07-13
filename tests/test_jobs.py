@@ -1334,7 +1334,9 @@ def _fresh_orchestrator(tmp, monkeypatch):
 
     runner = fresh_runner(tmp, monkeypatch)
     import flash.lora_rank as rank_mod
+    from flash.providers.runpod import api as runpod_api
 
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda endpoint_id: True)
     monkeypatch.setattr(
         rank_mod,
         "adapter_artifact_identity",
