@@ -52,7 +52,9 @@ def run_rl():
             import torch._dynamo
 
             torch._dynamo.config.suppress_errors = True
-            print("[rl] multi-turn: torch._dynamo suppress_errors=True (dynamic-shape compiled helpers fall back)")
+            print(
+                "[rl] multi-turn: torch._dynamo suppress_errors=True (dynamic-shape compiled helpers fall back)"
+            )
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
@@ -118,9 +120,7 @@ def run_rl():
 
         # TRL 1.5's GRPOConfig doesn't truncate prompts, so drop over-budget prompts up front (applies
         # to both string and conversational prompts) before the paid worker rolls out.
-        _oai_tools = (
-            getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
-        )
+        _oai_tools = getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
 
         def _render_for_budget(p) -> str:
             """Render a prompt to text EXACTLY as the rollout does (incl. tool schemas)."""
@@ -399,6 +399,7 @@ def run_rl():
         vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
         vllm_enable_sleep_mode=sleep_mode,
     )
+
     def _set_vllm_field(names, value, label):
         for _f in names:
             if _f in _grpo_fields:
@@ -417,9 +418,7 @@ def run_rl():
     _kv_dtype = "fp8" if _cc >= (8, 9) else None
     _mnbt = max(8192, vllm_max_len) if _card_gb >= 140 else None
     if _kv_dtype or _mnbt:
-        _w.patch_trl_colocate_llm_kwargs(
-            kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt
-        )
+        _w.patch_trl_colocate_llm_kwargs(kv_cache_dtype=_kv_dtype, max_num_batched_tokens=_mnbt)
     _set_vllm_field(
         ("vllm_enable_prefix_caching", "enable_prefix_caching"),
         True,
@@ -540,7 +539,9 @@ def run_rl():
         grpo_kwargs[_tis_clip_field] = _tis_c
         print(f"[rl] tis clip c_max={_tis_c} ({_tis_clip_field})")
     else:
-        print("[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl")
+        print(
+            "[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl"
+        )
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -565,8 +566,11 @@ def run_rl():
             build_examples_index,
             build_rollout_func,
             index_collisions,
+            resolve_rollout_request_timeout_seconds,
         )
 
+        _rollout_request_timeout = resolve_rollout_request_timeout_seconds(vllm_max_len)
+        _rollout_request_max_attempts = 2
         examples_by_key = build_examples_index(train, env.prompt_messages)
         ncol = index_collisions(train, env.prompt_messages)
         if ncol:
@@ -586,8 +590,14 @@ def run_rl():
             thinking=_w.THINKING,
             engine_max_len=vllm_max_len,
             structured_outputs=_so_spec,
+            request_timeout_seconds=_rollout_request_timeout,
+            request_max_attempts=_rollout_request_max_attempts,
         )
-        print("[rl] multi-turn env: driving the turn loop via rollout_func")
+        print(
+            f"[rl] multi-turn env: driving the turn loop via rollout_func; each physical vLLM "
+            f"request has timeout={_rollout_request_timeout:.1f}s and "
+            f"max_attempts={_rollout_request_max_attempts}"
+        )
     # GRPOTrainer.__init__ blocks 10-20 min on first use (vLLM build + FA2 compile); the side-thread
     # heartbeat must use the nvidia-smi-only path (include_torch=False) — torch.cuda calls would
     # serialize on the CUDA/allocator locks held by the init thread and false-flag a hang.

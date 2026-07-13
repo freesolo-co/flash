@@ -24,6 +24,19 @@ class _FakeClient:
     def me(self) -> dict:
         return {"key_prefix": "freesolo", "email": "t@example.com"}
 
+    def create_run(
+        self,
+        spec: dict,
+        runtime_secrets=None,
+        dry_run: bool = False,
+        client_train_schema=None,
+    ) -> dict:
+        self.calls.append(("create_run", spec, runtime_secrets, dry_run, client_train_schema))
+        response = {"run_id": "flash-dry", "state": "dry_run", "spec": spec}
+        if dry_run:
+            response["train_schema_compatibility"] = {"status": "agreement"}
+        return response
+
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
             {
@@ -235,6 +248,174 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "lambda" not in out.lower()
     assert "You can still tune" not in out
     assert "[gpu] config table" not in out
+
+
+def _train_config(tmp_path, *, extra_train: str = ""):
+    path = tmp_path / "train.toml"
+    path.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "owner/env"\n'
+        f'[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n{extra_train}'
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("compatibility", "expected"),
+    [
+        (
+            {
+                "status": "agreement",
+                "client_only": [],
+                "server_only": [],
+                "introduced_in_differences": [],
+            },
+            "schemas agree exactly",
+        ),
+        (
+            {
+                "status": "disagreement",
+                "client_only": ["future_knob"],
+                "server_only": ["server_knob"],
+                "introduced_in_differences": [
+                    {"key": "epochs", "client": "0.2.1", "server": "0.2.0"}
+                ],
+            },
+            "client-only keys: future_knob",
+        ),
+        (None, "unverifiable (legacy server)"),
+    ],
+)
+def test_train_dry_run_keeps_compatibility_on_stderr(
+    fake_client, tmp_path, capsys, compatibility, expected
+) -> None:
+    if compatibility is None:
+        original_create_run = fake_client.create_run
+
+        def create_run_without_compatibility(*args, **kwargs):
+            response = original_create_run(*args, **kwargs)
+            response.pop("train_schema_compatibility", None)
+            return response
+
+        fake_client.create_run = create_run_without_compatibility
+    else:
+        original_create_run = fake_client.create_run
+
+        def create_run_with_compatibility(*args, **kwargs):
+            response = original_create_run(*args, **kwargs)
+            response["train_schema_compatibility"] = compatibility
+            return response
+
+        fake_client.create_run = create_run_with_compatibility
+
+    assert _run(["train", str(_train_config(tmp_path)), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    call = next(call for call in fake_client.calls if call[0] == "create_run")
+
+    assert "train_schema_compatibility" not in payload
+    assert expected in captured.err
+    assert call[2] is None
+    assert call[3] is True
+    assert call[4]["authored_keys"] == ["epochs", "hf_repo", "max_examples"]
+    assert call[1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+
+
+def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.client import ApiError
+
+    detail = "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)"
+
+    def reject(*_args, **_kwargs):
+        raise ApiError(400, detail)
+
+    monkeypatch.setattr(fake_client, "create_run", reject)
+    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+
+    assert _run(["train", str(config), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert detail in captured.err
+    assert "teacher_model (minimum released Flash version 0.2.56)" in captured.err
+    assert "client/server [train] schemas disagree" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (400, "budget precheck rejected this run"),
+        (
+            400,
+            "[train] unknown key(s): structured_outputs (allowed: epochs, hf_repo, max_examples)",
+        ),
+        (
+            400,
+            "[train] unknown key(s): future_knob (allowed: epochs, hf_repo, max_examples)",
+        ),
+        (
+            500,
+            "[train] unknown key(s): teacher_model (allowed: epochs, hf_repo, max_examples)",
+        ),
+    ],
+)
+def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
+    fake_client, tmp_path, capsys, monkeypatch, status, detail
+) -> None:
+    from flash.client import ApiError
+
+    def reject(*_args, **_kwargs):
+        raise ApiError(status, detail)
+
+    monkeypatch.setattr(fake_client, "create_run", reject)
+    config = _train_config(tmp_path, extra_train='teacher_model = "glm-5.2"\n')
+
+    assert _run(["train", str(config), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {detail}\n"
+
+
+def test_train_dry_run_authoritative_rejection_keeps_stdout_empty(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    from flash.client import ApiError
+
+    def reject(*_args, **_kwargs):
+        raise ApiError(
+            400,
+            "unknown key(s): future_knob. Unsupported authored [train] key(s): "
+            "future_knob (minimum released Flash version 0.3.0); "
+            "client/server [train] schemas disagree",
+        )
+
+    monkeypatch.setattr(fake_client, "create_run", reject)
+
+    assert _run(["train", str(_train_config(tmp_path)), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "future_knob" in captured.err
+    assert "minimum released Flash version 0.3.0" in captured.err
+    assert "schemas disagree" in captured.err
+
+
+def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path, capsys) -> None:
+    config = _train_config(tmp_path)
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    capsys.readouterr()
+    assert _run(["train", str(config), "--background"]) == 0
+    capsys.readouterr()
+    calls = [call for call in fake_client.calls if call[0] == "create_run"]
+
+    assert calls[0][1] == calls[1][1]
+    assert calls[0][1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+    assert calls[0][3] is True
+    assert calls[0][4] is not None
+    assert calls[1][3] is False
+    assert calls[1][4] is None
 
 
 def test_status_runs_and_log_command(fake_client, capsys) -> None:

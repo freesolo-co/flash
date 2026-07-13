@@ -484,6 +484,12 @@ in a sensible value, so only override with a reason.
 | `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
 | `structured_outputs` | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then *cannot* emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
+For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
+10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is
+aborted before retry. Enforcement is cooperative between engine polls, and there is no total
+episode elapsed-time cutoff. This policy does not time out OPD, TRL-native tool loops, or
+environment calls.
+
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
 > gate by scoring a few truncated or opener-only probe responses — they should score low.
