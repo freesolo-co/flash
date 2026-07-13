@@ -1384,15 +1384,37 @@ def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch
     assert status.deployment_attempt is None
 
 
-def test_newer_queued_mutation_replaces_stale_attempt(api, monkeypatch):
+def test_active_worker_prevents_age_based_attempt_replacement(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.routes.serving as serving
 
     key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
     status = runner.get_status(run_id)
     status.deployment_attempt["deployment"]["updated_at"] = 0.0
     status.deployment_attempt["deployment"]["requested_at"] = 0.0
     runner._save_status(status)
+
+    duplicate = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert duplicate.status_code == 409
+    assert len(jobs) == 1
+    assert runner.get_status(run_id).deployment_attempt == status.deployment_attempt
+    serving._clear_deployment_worker_active(
+        run_id, status.deployment_attempt["deployment"]["mutation_id"]
+    )
+
+
+def test_newer_queued_mutation_replaces_stale_attempt(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    import flash.server.routes.serving as serving
+
+    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    status = runner.get_status(run_id)
+    status.deployment_attempt["deployment"]["updated_at"] = 0.0
+    status.deployment_attempt["deployment"]["requested_at"] = 0.0
+    runner._save_status(status)
+    old_mutation = status.deployment_attempt["deployment"]["mutation_id"]
+    serving._clear_deployment_worker_active(run_id, old_mutation)
 
     newer = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert newer.status_code == 200, newer.text
@@ -1458,6 +1480,61 @@ def test_redeploy_post_intent_failure_is_forward_only(api, monkeypatch):
     assert status.deployment["mutation_id"] == new_mutation
     assert status.deployment.get("endpoint_name") != "https://old.example"
     assert status.deployment_attempt is None
+
+
+@pytest.mark.parametrize("is_checkpoint", [False, True], ids=["initial", "checkpoint"])
+def test_finalization_does_not_resurrect_revoked_deployment(api, monkeypatch, is_checkpoint):
+    import flash.runner as runner
+    import flash.server.routes.serving as serving
+    from flash.spec import JobSpec
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "running" if is_checkpoint else "done"
+    desired = {"adapter_id": run_id, "checkpoint": run_id, "mutation_id": "mutation-1"}
+    status.deployment = {
+        "state": "deploying",
+        "mutation_id": "mutation-1",
+        "target_revision": 1,
+        "desired_record": desired,
+    }
+    runner._save_status(status)
+    spec = JobSpec.from_dict(status.spec)
+    original = runner.mark_checkpoint_deployed if is_checkpoint else runner.mark_deployed
+
+    def revoke_then_finalize(*args, **kwargs):
+        runner.mark_undeployed(run_id)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
+    monkeypatch.setattr(
+        serving._app,
+        "read_adapter_record",
+        lambda _run_id: {**desired, "registry_revision": 1},
+    )
+    monkeypatch.setattr(
+        serving,
+        "mark_checkpoint_deployed" if is_checkpoint else "mark_deployed",
+        revoke_then_finalize,
+    )
+
+    serving._finalize_registered_deployment(
+        run_id,
+        spec,
+        status.deployment,
+        checkpoint_step=1 if is_checkpoint else None,
+        is_checkpoint=is_checkpoint,
+        prev_state=status.state,
+        verify=False,
+    )
+
+    final = runner.get_status(run_id)
+    assert final.state == ("running" if is_checkpoint else "done")
+    assert final.deployment["state"] == "undeployed"
+    assert final.deployment["mutation_id"] == "mutation-1"
 
 
 def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):

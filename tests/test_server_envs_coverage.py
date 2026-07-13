@@ -322,12 +322,69 @@ def test_resolve_deploy_step_branches(monkeypatch):
         assert exc.value.status_code == 400, bad
 
 
-def _recovering_status(deployment):
+def _recovering_status(deployment, deployment_attempt=None):
     return types.SimpleNamespace(
         run_id="run-1",
         spec={"model": "Qwen/Qwen3.5-0.8B"},
         deployment=deployment,
+        deployment_attempt=deployment_attempt,
     )
+
+
+def test_recovery_preserves_active_slow_pre_intent_worker(monkeypatch):
+    queued = {"state": "deploying", "mutation_id": "mine", "requested_at": 1.0}
+    attempt = {"phase": "initial", "deployment": queued, "active_deployment": None}
+    status = _recovering_status(queued, attempt)
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving,
+        "mark_deployment_pre_intent_failed",
+        lambda *_args: pytest.fail("active deployment worker must retain ownership"),
+    )
+
+    serving._mark_deployment_worker_active("run-1", "mine")
+    try:
+        assert serving._recover_deployment("run-1") is False
+    finally:
+        serving._clear_deployment_worker_active("run-1", "mine")
+
+
+def test_recovery_fails_orphaned_pre_intent_attempt(monkeypatch):
+    queued = {"state": "deploying", "mutation_id": "orphan", "requested_at": 1.0}
+    attempt = {"phase": "initial", "deployment": queued, "active_deployment": None}
+    status = _recovering_status(queued, attempt)
+    marked = []
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving,
+        "mark_deployment_pre_intent_failed",
+        lambda run_id, owned_attempt, failed: marked.append((run_id, owned_attempt, failed)),
+    )
+
+    assert serving._recover_deployment("run-1") is True
+    assert marked[0][0] == "run-1"
+    assert marked[0][1] is attempt
+    assert marked[0][2]["state"] == "failed"
+    assert "before registry intent" in marked[0][2]["error"]
+
+
+def test_deployment_worker_liveness_clears_when_worker_exits(monkeypatch):
+    attempt = {
+        "phase": "initial",
+        "deployment": {"state": "deploying", "mutation_id": "mine"},
+        "active_deployment": None,
+    }
+
+    def finish(**_kwargs):
+        assert serving._deployment_worker_is_active("run-1", "mine") is True
+        raise RuntimeError("worker stopped")
+
+    monkeypatch.setattr(serving, "_finish_deployment_unlocked", finish)
+    serving._mark_deployment_worker_active("run-1", "mine")
+
+    with pytest.raises(RuntimeError, match="worker stopped"):
+        serving._finish_deployment(run_id="run-1", deployment_attempt=attempt)
+    assert serving._deployment_worker_is_active("run-1", "mine") is False
 
 
 @pytest.mark.parametrize(
@@ -859,7 +916,11 @@ def test_finalization_write_carries_the_local_attempt_fence(monkeypatch):
         verify=False,
     )
 
-    assert seen["expect_mutation_id"] == "m1"
+    assert seen == {
+        "expect_mutation_id": "m1",
+        "expect_state": "done",
+        "expect_deployment_state": "deploying",
+    }
 
 
 def test_stale_same_checkpoint_smoke_fence_retries_while_exact_target_is_current(monkeypatch):

@@ -262,6 +262,7 @@ def mark_deployed(
     deployment: dict,
     expect_state: str | None = None,
     expect_mutation_id: str | None = None,
+    expect_deployment_state: str | None = None,
 ) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
@@ -271,9 +272,15 @@ def mark_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        current_deployment = status.deployment or {}
         if (
             expect_mutation_id is not None
-            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+            and current_deployment.get("mutation_id") != expect_mutation_id
+        ):
+            return status
+        if (
+            expect_deployment_state is not None
+            and current_deployment.get("state") != expect_deployment_state
         ):
             return status
         _promote_final_deployment(status, deployment)
@@ -287,6 +294,7 @@ def mark_checkpoint_deployed(
     deployment: dict,
     expect_state: str | None = None,
     expect_mutation_id: str | None = None,
+    expect_deployment_state: str | None = None,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -301,9 +309,15 @@ def mark_checkpoint_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        current_deployment = status.deployment or {}
         if (
             expect_mutation_id is not None
-            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+            and current_deployment.get("mutation_id") != expect_mutation_id
+        ):
+            return status
+        if (
+            expect_deployment_state is not None
+            and current_deployment.get("state") != expect_deployment_state
         ):
             return status
         if status.state in _FINAL_DEPLOYMENT_STATES:

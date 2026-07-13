@@ -54,6 +54,28 @@ _DEPLOYMENT_STALE_SECONDS = 30 * 60
 _RECOVERY_READ_ATTEMPTS = 3
 _RECOVERY_RETRY_DELAY_SECONDS = 1.0
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+# process-local exact owners; restart clears them so persisted attempts recover as orphaned.
+_ACTIVE_DEPLOYMENT_WORKERS: set[tuple[str, str]] = set()
+_ACTIVE_DEPLOYMENT_WORKERS_LOCK = Lock()
+
+
+def _deployment_worker_key(run_id: str, mutation_id: str) -> tuple[str, str]:
+    return run_id, mutation_id
+
+
+def _mark_deployment_worker_active(run_id: str, mutation_id: str) -> None:
+    with _ACTIVE_DEPLOYMENT_WORKERS_LOCK:
+        _ACTIVE_DEPLOYMENT_WORKERS.add(_deployment_worker_key(run_id, mutation_id))
+
+
+def _clear_deployment_worker_active(run_id: str, mutation_id: str) -> None:
+    with _ACTIVE_DEPLOYMENT_WORKERS_LOCK:
+        _ACTIVE_DEPLOYMENT_WORKERS.discard(_deployment_worker_key(run_id, mutation_id))
+
+
+def _deployment_worker_is_active(run_id: str, mutation_id: str) -> bool:
+    with _ACTIVE_DEPLOYMENT_WORKERS_LOCK:
+        return _deployment_worker_key(run_id, mutation_id) in _ACTIVE_DEPLOYMENT_WORKERS
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -97,6 +119,9 @@ def _recover_deployment(run_id: str) -> bool:
         deployment_attempt = getattr(status, "deployment_attempt", None)
         if isinstance(deployment_attempt, dict):
             queued = deployment_attempt.get("deployment") or {}
+            mutation_id = str(queued.get("mutation_id") or "")
+            if mutation_id and _deployment_worker_is_active(run_id, mutation_id):
+                return False
             failed = _deployment_state(
                 queued,
                 "failed",
@@ -364,6 +389,7 @@ def _finalize_registered_deployment(
             public_ready,
             expect_state=state_guard,
             expect_mutation_id=mutation_id,
+            expect_deployment_state="deploying",
         )
     else:
         mark_deployed(
@@ -371,6 +397,7 @@ def _finalize_registered_deployment(
             public_ready,
             expect_state=prev_state,
             expect_mutation_id=mutation_id,
+            expect_deployment_state="deploying",
         )
 
 
@@ -537,7 +564,12 @@ def _finish_deployment_unlocked(
 
 
 def _finish_deployment(**kwargs) -> None:
-    _finish_deployment_unlocked(**kwargs)
+    run_id = str(kwargs["run_id"])
+    mutation_id = str(kwargs["deployment_attempt"]["deployment"]["mutation_id"])
+    try:
+        _finish_deployment_unlocked(**kwargs)
+    finally:
+        _clear_deployment_worker_active(run_id, mutation_id)
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
@@ -642,11 +674,19 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             current_attempt.get("deployment") if isinstance(current_attempt, dict) else None
         )
         busy_deployment = pending_deployment or current_deployment
+        busy_mutation_id = (
+            str(busy_deployment.get("mutation_id") or "")
+            if isinstance(busy_deployment, dict)
+            else ""
+        )
         if (
             not dry_run
             and isinstance(busy_deployment, dict)
             and busy_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
-            and not _deployment_attempt_is_stale(busy_deployment)
+            and (
+                _deployment_worker_is_active(run_id, busy_mutation_id)
+                or not _deployment_attempt_is_stale(busy_deployment)
+            )
         ):
             raise HTTPException(
                 status_code=409,
@@ -767,7 +807,12 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "prev_state": prev_state,
             "verify": verify,
         }
-    ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+        _mark_deployment_worker_active(run_id, mutation_id)
+    try:
+        ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
+    except BaseException:
+        _clear_deployment_worker_active(run_id, mutation_id)
+        raise
     if ran_sync:
         return _public_deployment(_app.get_status(run_id).deployment or expected_visible)
     return _public_deployment(expected_visible)
