@@ -31,13 +31,34 @@ def cancel_run(run_id: str) -> RunStatus:
         charge_usd_for_spec,
         get_status,
         mark_deployment_undeployed,
+        revoke_deployment_attempt,
+        revoke_deployment_intent,
     )
+    from flash.server._locks import _deploy_lock
 
-    status = get_status(run_id)
-    if status.state in TERMINAL_STATES:
-        return status
+    with _deploy_lock(run_id):
+        status = get_status(run_id)
+        entered_deployed = status.state == "deployed"
+        deployment = status.deployment or {}
+        durable_mutation = (
+            str(deployment.get("mutation_id") or "")
+            if deployment.get("state") == "deploying"
+            else ""
+        )
+        if status.deployment_attempt is not None:
+            revoke_deployment_attempt(run_id, status.deployment_attempt)
+        elif durable_mutation:
+            revoke_deployment_intent(run_id, durable_mutation)
+        if durable_mutation:
+            with contextlib.suppress(Exception):
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                mark_deployment_undeployed(run_id)
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES and not entered_deployed:
+            return status
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
-    entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
     # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
     # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
@@ -74,8 +95,6 @@ def cancel_run(run_id: str) -> RunStatus:
         if bill_cancel
         else None
     )
-    from flash.server._locks import _deploy_lock
-
     with _deploy_lock(run_id):
         # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
         # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
@@ -296,27 +315,149 @@ def mark_checkpoint_deployed(
         return status
 
 
-def mark_deployment_pending(
+def mark_deployment_attempt_queued(
     run_id: str,
-    deployment: dict,
-    expect_state: str | None = None,
-    expect_mutation_id: str | None = None,
+    attempt: dict,
+    *,
+    expect_state: str,
+    expect_deployment: dict | None,
+    expect_attempt: dict | None,
 ) -> RunStatus:
-    """Attach an in-progress deployment record without changing the run lifecycle state."""
+    """Persist exact queued ownership without hiding an active ready deployment."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if status.state == "dry_run":
+        if status.state != expect_state:
             return status
-        if expect_state is not None and status.state != expect_state:
+        if status.deployment != expect_deployment or status.deployment_attempt != expect_attempt:
             return status
+        phase = attempt.get("phase")
+        queued = attempt.get("deployment")
         if (
-            expect_mutation_id is not None
-            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+            phase not in {"initial", "redeploy"}
+            or not isinstance(queued, dict)
+            or not queued.get("mutation_id")
+        ):
+            raise ValueError("invalid deployment attempt")
+        if phase == "redeploy":
+            if attempt.get("active_deployment") != expect_deployment:
+                raise ValueError("redeploy attempt active deployment mismatch")
+        else:
+            status.deployment = queued
+        status.deployment_attempt = attempt
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_deployment_intent(
+    run_id: str,
+    intent: dict,
+    *,
+    expect_attempt: dict,
+) -> RunStatus:
+    """Replace exact queued ownership with durable forward-only registry intent."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment_attempt != expect_attempt:
+            return status
+        queued = expect_attempt.get("deployment")
+        phase = expect_attempt.get("phase")
+        if (
+            not isinstance(queued, dict)
+            or not queued.get("mutation_id")
+            or intent.get("mutation_id") != queued.get("mutation_id")
         ):
             return status
-        status.deployment = deployment
+        if phase == "initial":
+            current = status.deployment or {}
+            if (
+                current != queued
+                or current.get("state") != "deploying"
+                or current.get("mutation_id") != queued.get("mutation_id")
+            ):
+                return status
+        elif phase == "redeploy":
+            if status.deployment != expect_attempt.get("active_deployment"):
+                return status
+        else:
+            return status
+        status.deployment = intent
+        status.deployment_attempt = None
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def revoke_deployment_attempt(run_id: str, attempt: dict) -> RunStatus:
+    """Revoke exact queued ownership without disturbing a prior active redeploy."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment_attempt != attempt:
+            return status
+        queued = attempt.get("deployment")
+        if attempt.get("phase") == "redeploy":
+            if status.deployment != attempt.get("active_deployment"):
+                return status
+        elif attempt.get("phase") == "initial" and status.deployment == queued:
+            status.deployment = {**queued, "state": "undeployed"}
+        else:
+            return status
+        status.deployment_attempt = None
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
+    """Revoke an exact durable deployment intent before registry mutation."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        deployment = status.deployment or {}
+        if (
+            deployment.get("state") != "deploying"
+            or deployment.get("mutation_id") != mutation_id
+        ):
+            return status
+        status.deployment = {**deployment, "state": "undeployed"}
+        status.deployment_attempt = None
+        if status.state == "deployed":
+            status.state = "done"
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_deployment_pre_intent_failed(
+    run_id: str,
+    attempt: dict,
+    failed: dict,
+) -> RunStatus:
+    """Fail an initial attempt or privately clear an exact queued redeploy."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment_attempt != attempt:
+            return status
+        queued = attempt.get("deployment")
+        phase = attempt.get("phase")
+        if phase == "redeploy":
+            if status.deployment != attempt.get("active_deployment"):
+                return status
+            status.deployment_attempt = None
+        elif phase == "initial" and status.deployment == queued:
+            status.deployment = {**failed, "state": "failed"}
+            status.deployment_attempt = None
+        else:
+            return status
         status.updated_at = time.time()
         _save_status(status)
         return status
@@ -352,6 +493,7 @@ def mark_undeployed(run_id: str) -> RunStatus:
         status = get_status(run_id)
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
+        status.deployment_attempt = None
         if status.state == "deployed":
             status.state = "done"
         status.updated_at = time.time()
@@ -369,8 +511,14 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
 
     with _STATUS_LOCK:
         status = get_status(run_id)
+        changed = False
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
+            changed = True
+        if status.deployment_attempt is not None:
+            status.deployment_attempt = None
+            changed = True
+        if changed:
             status.updated_at = time.time()
             _save_status(status)
         return status

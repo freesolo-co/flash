@@ -12,6 +12,7 @@ import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Event, Lock
 from typing import Annotated
 from uuid import uuid4
@@ -25,8 +26,10 @@ from flash.runner import (
     adapter_prefix,
     mark_checkpoint_deployed,
     mark_deployed,
+    mark_deployment_attempt_queued,
     mark_deployment_failed,
-    mark_deployment_pending,
+    mark_deployment_intent,
+    mark_deployment_pre_intent_failed,
     mark_undeployed,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
@@ -91,6 +94,17 @@ def _recover_deployment(run_id: str) -> bool:
             status = _app.get_status(run_id)
         except FileNotFoundError:
             return False
+        deployment_attempt = getattr(status, "deployment_attempt", None)
+        if isinstance(deployment_attempt, dict):
+            queued = deployment_attempt.get("deployment") or {}
+            failed = _deployment_state(
+                queued,
+                "failed",
+                error="deployment lifecycle interrupted before registry intent was persisted",
+                detail="deployment interrupted; retry `flash deploy`",
+            )
+            mark_deployment_pre_intent_failed(run_id, deployment_attempt, failed)
+            return True
         deployment = status.deployment or {}
         if deployment.get("state") != "deploying":
             return False
@@ -270,8 +284,13 @@ def _run_deployment_smoke(
 
 
 def _attempt_owned(run_id: str, mutation_id: str) -> bool:
-    active = _app.get_status(run_id).deployment or {}
-    return active.get("state") == "deploying" and active.get("mutation_id") == mutation_id
+    status = _app.get_status(run_id)
+    active = status.deployment or {}
+    if active.get("state") == "deploying" and active.get("mutation_id") == mutation_id:
+        return True
+    pending = getattr(status, "deployment_attempt", None) or {}
+    queued = pending.get("deployment") or {}
+    return queued.get("mutation_id") == mutation_id
 
 
 def _smoke_with_retries(run_id: str, spec: JobSpec, deployment: dict) -> dict:
@@ -406,12 +425,14 @@ def _finish_deployment_unlocked(
     checkpoint_step: int | None,
     is_checkpoint: bool,
     deploy_kwargs: dict,
-    deployment: dict,
+    deployment_attempt: dict,
     prev_state: str,
     verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
+    deployment = deployment_attempt["deployment"]
     mutation_id = str(deployment["mutation_id"])
+    intent_persisted = False
 
     def persist_intent(
         prior_revision: int | None,
@@ -420,6 +441,7 @@ def _finish_deployment_unlocked(
         persisted_mutation_id: str,
         repo_revision: str,
     ) -> None:
+        nonlocal intent_persisted
         if persisted_mutation_id != mutation_id:
             raise ServingError("deployment mutation identity changed before registry mutation")
         intent = _deployment_state(
@@ -433,15 +455,33 @@ def _finish_deployment_unlocked(
             repo_revision=repo_revision,
             prev_state=prev_state,
         )
-        marked = mark_deployment_pending(run_id, intent, expect_mutation_id=mutation_id)
-        active = marked.deployment or {}
-        if active.get("mutation_id") != mutation_id:
-            raise ServingError("deployment ownership changed before registry mutation")
-        deployment.clear()
-        deployment.update(intent)
+        with _app._deploy_lock(run_id):
+            marked = mark_deployment_intent(run_id, intent, expect_attempt=deployment_attempt)
+            active = marked.deployment or {}
+            if active != intent or getattr(marked, "deployment_attempt", None) is not None:
+                raise ServingError("deployment ownership changed before registry mutation")
+            deployment.clear()
+            deployment.update(intent)
+            intent_persisted = True
+
+    @contextmanager
+    def registry_mutation_guard():
+        with _app._deploy_lock(run_id):
+            status = _app.get_status(run_id)
+            active = status.deployment or {}
+            if (
+                active.get("state") != "deploying"
+                or active.get("mutation_id") != mutation_id
+            ):
+                raise ServingError("deployment ownership changed before registry mutation")
+            yield
 
     try:
-        dep = _app.deploy_adapter(**deploy_kwargs, before_registry_mutation=persist_intent)
+        dep = _app.deploy_adapter(
+            **deploy_kwargs,
+            before_registry_mutation=persist_intent,
+            registry_mutation_guard=registry_mutation_guard,
+        )
         if not dep.desired_record or dep.target_revision is None or not dep.mutation_id:
             raise ServingError("serving registration did not return deployment identity")
         deployment.update(
@@ -462,13 +502,17 @@ def _finish_deployment_unlocked(
             verify=verify,
         )
     except Exception as exc:
-        if not _attempt_owned(run_id, mutation_id):
-            return
-        if (
-            deployment.get("target_revision") is not None
-            and deployment.get("mutation_id")
-            and not _disable_failed_attempt(run_id, deployment)
-        ):
+        if intent_persisted:
+            with _app._deploy_lock(run_id):
+                if not _attempt_owned(run_id, mutation_id):
+                    return
+                if (
+                    deployment.get("target_revision") is not None
+                    and deployment.get("mutation_id")
+                    and not _disable_failed_attempt(run_id, deployment)
+                ):
+                    return
+        elif not _attempt_owned(run_id, mutation_id):
             return
         error = str(exc)
         if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
@@ -480,20 +524,20 @@ def _finish_deployment_unlocked(
                     f"`flash deploy {run_id}/step-{steps[-1]}` "
                     f"(available steps: {', '.join(str(step) for step in steps)})"
                 )
-        mark_deployment_failed(
-            run_id,
-            _deployment_state(
-                deployment,
-                "failed",
-                error=error,
-                detail="deployment failed; retry `flash deploy` after fixing the error",
-            ),
+        failed = _deployment_state(
+            deployment,
+            "failed",
+            error=error,
+            detail="deployment failed; retry `flash deploy` after fixing the error",
         )
+        if intent_persisted:
+            mark_deployment_failed(run_id, failed)
+        else:
+            mark_deployment_pre_intent_failed(run_id, deployment_attempt, failed)
 
 
 def _finish_deployment(**kwargs) -> None:
-    with _app._deploy_lock(kwargs["run_id"]):
-        _finish_deployment_unlocked(**kwargs)
+    _finish_deployment_unlocked(**kwargs)
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
@@ -593,16 +637,22 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         verify = _require_bool(payload, "verify", True)
         mutation_id = str(uuid4())
         current_deployment = status.deployment or {}
+        current_attempt = status.deployment_attempt
+        pending_deployment = (
+            current_attempt.get("deployment") if isinstance(current_attempt, dict) else None
+        )
+        busy_deployment = pending_deployment or current_deployment
         if (
             not dry_run
-            and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
-            and not _deployment_attempt_is_stale(current_deployment)
+            and isinstance(busy_deployment, dict)
+            and busy_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
+            and not _deployment_attempt_is_stale(busy_deployment)
         ):
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"run {run_id} already has a deployment in "
-                    f"{current_deployment.get('state')} state; run `flash deployments` "
+                    f"{busy_deployment.get('state')} state; run `flash deployments` "
                     "to check progress"
                 ),
             )
@@ -636,9 +686,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
-            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
-            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
-            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            # a run trained with structured_outputs serves under the same grammar for both thinking
+            # and non-thinking adapters; serving owns when the constraint begins applying.
             "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
         }
@@ -681,8 +730,28 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         )
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
-        marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
-        if marked.deployment != dep_dict:
+        active_deployment = (
+            current_deployment
+            if current_deployment.get("state") in {"ready", "deployed"}
+            else None
+        )
+        deployment_attempt = {
+            "phase": "redeploy" if active_deployment is not None else "initial",
+            "deployment": dep_dict,
+            "active_deployment": active_deployment,
+        }
+        marked = mark_deployment_attempt_queued(
+            run_id,
+            deployment_attempt,
+            expect_state=prev_state,
+            expect_deployment=status.deployment,
+            expect_attempt=current_attempt,
+        )
+        expected_visible = active_deployment if active_deployment is not None else dep_dict
+        if (
+            marked.deployment != expected_visible
+            or marked.deployment_attempt != deployment_attempt
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
@@ -694,14 +763,14 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "checkpoint_step": checkpoint_step,
             "is_checkpoint": is_checkpoint,
             "deploy_kwargs": deploy_kwargs,
-            "deployment": dep_dict,
+            "deployment_attempt": deployment_attempt,
             "prev_state": prev_state,
             "verify": verify,
         }
     ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
     if ran_sync:
-        return _public_deployment(_app.get_status(run_id).deployment or dep_dict)
-    return _public_deployment(dep_dict)
+        return _public_deployment(_app.get_status(run_id).deployment or expected_visible)
+    return _public_deployment(expected_visible)
 
 
 @router.delete("/v1/runs/{run_id}/deploy")
@@ -713,7 +782,7 @@ def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
         except ServingError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         # Idempotent: clear local record even if serving side already had no adapter.
-        if status.deployment:
+        if status.deployment or status.deployment_attempt:
             mark_undeployed(run_id)
         # serving_deregistered=False means serving had nothing to delete (already gone or never
         # actually registered) — the record teardown above still happened either way.

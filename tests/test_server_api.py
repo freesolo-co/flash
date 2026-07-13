@@ -1184,6 +1184,282 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "deploying"
 
 
+def _queue_deploy_job(api, monkeypatch, *, active=False):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "deployed" if active else "done"
+    if active:
+        status.deployment = {
+            "state": "ready",
+            "endpoint_name": "https://old.example",
+            "openai_base_url": "https://old.example/v1",
+        }
+    runner._save_status(status)
+    jobs = []
+    monkeypatch.setattr(
+        app_mod,
+        "start_deployment_job",
+        lambda target, **kwargs: jobs.append((target, kwargs)) or False,
+    )
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert response.status_code == 200, response.text
+    return key, run_id, jobs
+
+
+@pytest.mark.parametrize("failure", ["artifact missing", "revision unavailable"])
+def test_redeploy_pre_intent_failure_preserves_ready_deployment_and_chat(
+    api, monkeypatch, failure
+):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    queued = runner.get_status(run_id)
+    assert queued.deployment["state"] == "ready"
+    assert queued.deployment_attempt["phase"] == "redeploy"
+    public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert public["deployment"]["state"] == "ready"
+    assert "deployment_attempt" not in public
+
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(ServingError(failure)),
+    )
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert status.deployment["state"] == "ready"
+    assert status.deployment["endpoint_name"] == "https://old.example"
+    assert status.deployment_attempt is None
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: {"choices": [{"message": {"content": "still live"}}]},
+    )
+    chat = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert chat.status_code == 200, chat.text
+
+
+def test_duplicate_private_redeploy_attempt_is_rejected(api, monkeypatch):
+    import flash.runner as runner
+
+    key, run_id, _jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    status = runner.get_status(run_id)
+    assert status.deployment["state"] == "ready"
+    assert status.deployment_attempt["deployment"]["state"] == "deploying"
+
+    duplicate = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert duplicate.status_code == 409, duplicate.text
+    assert runner.get_status(run_id).deployment_attempt == status.deployment_attempt
+
+
+def test_initial_pre_intent_failure_remains_failed(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(ServingError("artifact missing")),
+    )
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert status.deployment["state"] == "failed"
+    assert status.deployment_attempt is None
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_undeploy_before_registry_intent_revokes_worker(api, monkeypatch, active):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=active)
+    posts = []
+
+    def delayed_deploy(**kwargs):
+        desired = _fake_registry_record(kwargs)
+        kwargs["before_registry_mutation"](
+            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
+        )
+        posts.append(desired)
+        return _FakeDeployment(kwargs["adapter_prefix"], desired)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda _run_id: [])
+    undeployed = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert undeployed.status_code == 200, undeployed.text
+
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert posts == []
+    assert status.deployment["state"] == "undeployed"
+    assert status.deployment_attempt is None
+
+
+def test_cancel_revokes_queued_redeploy_before_registry_intent(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    posts = []
+
+    def delayed_deploy(**kwargs):
+        desired = _fake_registry_record(kwargs)
+        kwargs["before_registry_mutation"](
+            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
+        )
+        posts.append(desired)
+        return _FakeDeployment(kwargs["adapter_prefix"], desired)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    monkeypatch.setattr("flash.serve.deploy.undeploy_adapter", lambda _run_id: [])
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+    assert cancelled.status_code == 200, cancelled.text
+
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert posts == []
+    assert status.state == "cancelled"
+    assert status.deployment["state"] == "undeployed"
+    assert status.deployment_attempt is None
+
+
+def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
+    posts = []
+    undeployed = []
+
+    def delayed_deploy(**kwargs):
+        desired = _fake_registry_record(kwargs)
+        kwargs["before_registry_mutation"](
+            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
+        )
+        persisted = runner.get_status(run_id)
+        assert persisted.deployment["state"] == "deploying"
+        assert persisted.deployment_attempt is None
+
+        runner.cancel_run(run_id)
+        with kwargs["registry_mutation_guard"]():
+            posts.append(desired)
+        return _FakeDeployment(kwargs["adapter_prefix"], desired)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    monkeypatch.setattr(
+        "flash.serve.deploy.undeploy_adapter",
+        lambda cancelled_run_id: undeployed.append(cancelled_run_id) or [],
+    )
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert posts == []
+    assert undeployed == [run_id]
+    assert status.state == "done"
+    assert status.deployment["state"] == "undeployed"
+    assert status.deployment_attempt is None
+
+
+def test_newer_queued_mutation_replaces_stale_attempt(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    status = runner.get_status(run_id)
+    status.deployment_attempt["deployment"]["updated_at"] = 0.0
+    status.deployment_attempt["deployment"]["requested_at"] = 0.0
+    runner._save_status(status)
+
+    newer = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert newer.status_code == 200, newer.text
+    assert len(jobs) == 2
+    current_attempt = runner.get_status(run_id).deployment_attempt
+    assert current_attempt["deployment"]["mutation_id"] != jobs[0][1]["deploy_kwargs"]["mutation_id"]
+
+    posts = []
+
+    def delayed_deploy(**kwargs):
+        desired = _fake_registry_record(kwargs)
+        kwargs["before_registry_mutation"](
+            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
+        )
+        posts.append(desired)
+        return _FakeDeployment(kwargs["adapter_prefix"], desired)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
+    target, kwargs = jobs[0]
+    target(**kwargs)
+
+    assert posts == []
+    assert runner.get_status(run_id).deployment_attempt == current_attempt
+
+
+def test_redeploy_post_intent_failure_is_forward_only(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import DeploymentSuperseded, ServingError
+
+    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
+    target, kwargs = jobs[0]
+    new_mutation = kwargs["deploy_kwargs"]["mutation_id"]
+    prior = {
+        "adapter_id": run_id,
+        "registry_revision": 7,
+        "mutation_id": "prior-mutation",
+        "status": "ready",
+    }
+    registry = {run_id: dict(prior)}
+    cleanup = []
+
+    def fail_after_intent(**deploy_kwargs):
+        desired = _fake_registry_record(deploy_kwargs)
+        deploy_kwargs["before_registry_mutation"](
+            7, desired, 8, desired["mutation_id"], desired["repo_revision"]
+        )
+        assert registry[run_id] == prior
+        raise ServingError("registration failed after intent")
+
+    def reject_cleanup(cleanup_run_id, revision, mutation_id):
+        cleanup.append((cleanup_run_id, revision, mutation_id, dict(registry[run_id])))
+        raise DeploymentSuperseded("the prior registry row still owns this adapter")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fail_after_intent)
+    monkeypatch.setattr(app_mod, "disable_owned_adapter", reject_cleanup)
+    target(**kwargs)
+
+    status = runner.get_status(run_id)
+    assert cleanup == [(run_id, 8, new_mutation, prior)]
+    assert registry[run_id] == prior
+    assert status.deployment["state"] == "failed"
+    assert status.deployment["mutation_id"] == new_mutation
+    assert status.deployment.get("endpoint_name") != "https://old.example"
+    assert status.deployment_attempt is None
+
+
 def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod

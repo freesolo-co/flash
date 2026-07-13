@@ -7,6 +7,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 
 import httpx
@@ -379,6 +380,7 @@ def deploy_adapter(
     structured_outputs: str = "",
     org_id: str | None = None,
     before_registry_mutation: Callable[[int | None, dict, int, str, str], None] | None = None,
+    registry_mutation_guard: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> Deployment:
     """Create a new immutable serving record through compare-and-swap."""
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
@@ -432,21 +434,23 @@ def deploy_adapter(
     headers = {"If-Match": str(prior_revision)} if prior_revision is not None else None
     response: httpx.Response | None = None
     mutation_error: ServingError | None = None
-    try:
-        response = _serving_request(
-            "POST", f"{serving_base_url()}/adapters", json=desired, headers=headers
-        )
-    except ServingError as exc:
-        mutation_error = exc
-        if (
-            exc.status_code is not None
-            and exc.status_code < 500
-            and exc.status_code not in {409, 412}
-        ):
-            raise
-    _readback_target(run_id, desired, target_revision, prior)
-    if response is not None and _etag_revision(response) != target_revision:
-        raise ServingError(f"adapter {run_id} POST returned an unexpected registry revision")
+    guard = registry_mutation_guard() if registry_mutation_guard is not None else nullcontext()
+    with guard:
+        try:
+            response = _serving_request(
+                "POST", f"{serving_base_url()}/adapters", json=desired, headers=headers
+            )
+        except ServingError as exc:
+            mutation_error = exc
+            if (
+                exc.status_code is not None
+                and exc.status_code < 500
+                and exc.status_code not in {409, 412}
+            ):
+                raise
+        _readback_target(run_id, desired, target_revision, prior)
+        if response is not None and _etag_revision(response) != target_revision:
+            raise ServingError(f"adapter {run_id} POST returned an unexpected registry revision")
     if mutation_error is not None:
         logger.warning(
             "adapter registration for %s returned %s but exact readback confirmed revision %d",

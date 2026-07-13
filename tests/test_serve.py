@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from contextlib import contextmanager
 from uuid import uuid4
 
 import httpx
@@ -139,6 +140,48 @@ def test_nonthinking_record_uses_same_structured_outputs_field(monkeypatch, tmp_
     )
     assert deployment.desired_record["thinking"] is False
     assert deployment.desired_record["structured_outputs"] == {"json_object": True}
+
+
+def test_registry_mutation_guard_covers_post_and_exact_readback(monkeypatch, tmp_path):
+    _stub_artifact(monkeypatch, tmp_path)
+    state = {"record": None, "guarded": False}
+    events = []
+
+    def read(_run_id):
+        if state["record"] is not None:
+            assert state["guarded"] is True
+            events.append("readback")
+        return state["record"]
+
+    def request(_method, _url, *, json=None, **_kwargs):
+        assert state["guarded"] is True
+        events.append("post")
+        state["record"] = {**json, "registry_revision": 1}
+        return Response(etag=1)
+
+    @contextmanager
+    def guard():
+        state["guarded"] = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+            state["guarded"] = False
+
+    monkeypatch.setattr(d, "read_adapter_record", read)
+    monkeypatch.setattr(d, "_serving_request", request)
+    d.deploy_adapter(
+        "r1",
+        MODEL,
+        "org/repo",
+        "sft/r1",
+        mutation_id=str(uuid4()),
+        org_id=ORG,
+        registry_mutation_guard=guard,
+    )
+
+    assert events == ["enter", "post", "readback", "exit"]
 
 
 def test_lost_post_response_is_committed_by_exact_readback(monkeypatch, tmp_path):

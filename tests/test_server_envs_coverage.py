@@ -488,21 +488,24 @@ def test_failed_attempt_stays_recoverable_when_disable_readback_is_unavailable(m
 def test_registry_intent_write_rejects_a_replaced_local_attempt(monkeypatch):
     old = {"state": "deploying", "mutation_id": "old", "requested_at": 1.0}
     newer = {"state": "deploying", "mutation_id": "new", "requested_at": 2.0}
+    old_attempt = {"phase": "initial", "deployment": old, "active_deployment": None}
+    newer_attempt = {"phase": "initial", "deployment": newer, "active_deployment": None}
     status = _recovering_status(newer)
+    status.deployment_attempt = newer_attempt
     seen = {}
 
     def deploy_adapter(**kwargs):
         kwargs["before_registry_mutation"](None, {"mutation_id": "old"}, 1, "old", "a" * 40)
         pytest.fail("superseded local attempt must stop before POST")
 
-    def mark_pending(_run_id, _intent, **kwargs):
+    def mark_intent(_run_id, _intent, **kwargs):
         seen.update(kwargs)
         return status
 
     monkeypatch.setattr(serving.JobSpec, "from_dict", lambda _spec: object())
     monkeypatch.setattr(serving._app, "deploy_adapter", deploy_adapter)
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
-    monkeypatch.setattr(serving, "mark_deployment_pending", mark_pending)
+    monkeypatch.setattr(serving, "mark_deployment_intent", mark_intent)
     monkeypatch.setattr(
         serving, "mark_deployment_failed", lambda *_args: pytest.fail("must not fail newer")
     )
@@ -513,12 +516,12 @@ def test_registry_intent_write_rejects_a_replaced_local_attempt(monkeypatch):
         checkpoint_step=None,
         is_checkpoint=False,
         deploy_kwargs={"mutation_id": "old"},
-        deployment=old,
+        deployment_attempt=old_attempt,
         prev_state="done",
         verify=True,
     )
 
-    assert seen == {"expect_mutation_id": "old"}
+    assert seen == {"expect_attempt": old_attempt}
 
 
 def test_lifespan_runs_recovery_after_readiness_and_awaits_shutdown(monkeypatch):
