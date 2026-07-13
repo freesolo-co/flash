@@ -8,6 +8,7 @@ the remaining commands are covered without a server.
 from __future__ import annotations
 
 import io
+import json
 import types
 
 import pytest
@@ -87,6 +88,7 @@ class _FakeClient:
             "run_id": run_id,
             "openai_model": f"flash-{run_id}",
             "endpoint_name": "https://serve.example",
+            "openai_base_url": "https://serve.example/v1",
             "state": "deploying",
         }
 
@@ -95,7 +97,16 @@ class _FakeClient:
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
+        return [
+            {
+                "run_id": "flash-1",
+                "deployment": {
+                    "state": "ready",
+                    "endpoint_name": "https://serve.example",
+                    "openai_base_url": "https://serve.example/v1",
+                },
+            }
+        ]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -440,10 +451,33 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert "flash undeploy flash-1/step-40`" not in err
 
     assert _run(["deployments"]) == 0
-    assert "flash-1" in capsys.readouterr().out
+    deployments_out = capsys.readouterr().out
+    assert "flash-1" in deployments_out
+    assert "https://serve.example/v1" in deployments_out
 
     assert _run(["undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
+
+
+def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> None:
+    assert _run(["deployments", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows == [
+        {
+            "run_id": "flash-1",
+            "deployment": {
+                "state": "ready",
+                "endpoint_name": "https://serve.example",
+                "openai_base_url": "https://serve.example/v1",
+            },
+        }
+    ]
+
+
+def test_deployments_json_empty_list(fake_client, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(fake_client, "deployments", lambda: [])
+    assert _run(["deployments", "--json"]) == 0
+    assert capsys.readouterr().out.strip() == "[]"
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
@@ -544,9 +578,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "TRAINING.md" in out
 
 
-def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(
-    monkeypatch, tmp_path, capsys
-) -> None:
+def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
     """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd). opd now supports
     multi-turn (it rolls out each episode and distils every assistant turn), so the multi-turn opd.toml
     and the starter env docstring must NOT warn it is single-turn only / fails fast."""

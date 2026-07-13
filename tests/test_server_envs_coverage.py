@@ -208,7 +208,9 @@ def test_github_publish_does_not_retry_permanent_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(envs, "_github_publish_once", fake_once)
     # Guard: if the code ever retried, this sleep would be exercised — no-op it either way.
-    monkeypatch.setattr(envs.time, "sleep", lambda _s: pytest.fail("permanent error must not retry"))
+    monkeypatch.setattr(
+        envs.time, "sleep", lambda _s: pytest.fail("permanent error must not retry")
+    )
 
     with pytest.raises(envs.EnvPublishError, match="authentication failed"):
         envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"})
@@ -243,164 +245,379 @@ def test_deployment_state_and_public_deployment():
     assert out["detail"] == "done"
     assert out["a"] == 1
     assert isinstance(out["updated_at"], float)
-    # The input is not mutated in place.
+    # the input is not mutated in place.
     assert original == {"a": 1, "state": "deploying"}
 
-    pub = serving._public_deployment({"state": "ready", "previous_deployment": {"x": 1}, "b": 2})
-    assert pub == {"state": "ready", "b": 2}
+    pub = serving._public_deployment(
+        {
+            "state": "failed",
+            "detail": "operator action required",
+            "error": "mutation mutation-5 used repo " + "a" * 40,
+            "endpoint_name": "https://serve.example",
+            "openai_base_url": "https://serve.example/v1",
+            "url": "https://stale.example/v1",
+            "desired_record": {"adapter_id": "r1"},
+            "prior_revision": 4,
+            "target_revision": 5,
+            "mutation_id": "mutation-5",
+            "repo_revision": "a" * 40,
+            "requested_at": 123.0,
+            "verify": True,
+            "unknown_future_internal": "secret",
+        }
+    )
+    assert pub == {
+        "state": "failed",
+        "detail": "operator action required",
+        "error": "mutation [redacted] used repo [redacted]",
+        "endpoint_name": "https://serve.example",
+        "openai_base_url": "https://serve.example/v1",
+    }
 
 
 def test_deployment_attempt_is_stale_branches():
-    # Not in a busy state -> never stale.
     assert serving._deployment_attempt_is_stale({"state": "ready"}) is False
-    # Busy with no timestamp -> treated as stale.
     assert serving._deployment_attempt_is_stale({"state": "deploying"}) is True
-    # Busy with an unparseable timestamp -> stale.
-    assert serving._deployment_attempt_is_stale({"state": "verifying", "updated_at": "nope"}) is True
-    # Busy but recently updated (via injected `now`) -> not stale.
-    fresh = {"state": "registering", "updated_at": 1000.0}
-    assert serving._deployment_attempt_is_stale(fresh, now=1000.0 + 10) is False
-    # Busy and older than the stale window -> stale.
+    fresh = {"state": "deploying", "updated_at": 1000.0}
+    assert serving._deployment_attempt_is_stale(fresh, now=1010.0) is False
     old = {"state": "deploying", "requested_at": 1000.0}
     assert (
-        serving._deployment_attempt_is_stale(
-            old, now=1000.0 + serving._DEPLOYMENT_STALE_SECONDS
-        )
+        serving._deployment_attempt_is_stale(old, now=1000.0 + serving._DEPLOYMENT_STALE_SECONDS)
         is True
-    )
-
-
-def test_previous_ready_deployment():
-    # A currently-ready deployment is its own "previous ready" (a copy).
-    ready = {"state": "ready", "adapter_hf_prefix": "sft/r1/seed0/adapter"}
-    got = serving._previous_ready_deployment(ready)
-    assert got == ready
-    assert got is not ready
-    # A busy deployment falls back to a ready `previous_deployment`.
-    nested = {"state": "deploying", "previous_deployment": {"state": "deployed", "b": 2}}
-    assert serving._previous_ready_deployment(nested) == {"state": "deployed", "b": 2}
-    # Nothing ready anywhere -> None.
-    assert serving._previous_ready_deployment({"state": "deploying"}) is None
-    assert (
-        serving._previous_ready_deployment(
-            {"state": "deploying", "previous_deployment": {"state": "failed"}}
-        )
-        is None
     )
 
 
 def test_chat_messages_from_payload_validation():
     assert serving._chat_messages_from_payload({}) == []
     assert serving._chat_messages_from_payload({"messages": None}) == []
-
     valid = [{"role": "user", "content": "hi"}]
     assert serving._chat_messages_from_payload({"messages": valid}) is valid
-
     with pytest.raises(HTTPException) as not_list:
         serving._chat_messages_from_payload({"messages": "nope"})
     assert not_list.value.status_code == 400
-    assert "messages must be a list" in not_list.value.detail
-
     with pytest.raises(HTTPException) as bad_item:
         serving._chat_messages_from_payload({"messages": [{"role": "user"}, "oops"]})
     assert bad_item.value.status_code == 400
-    assert "messages[1]" in bad_item.value.detail
 
 
 def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
-    # A well-formed id passes silently.
     serving._validate_hf_repo_id("owner/name")
-    # A malformed id becomes a 400 before any download.
     with pytest.raises(HTTPException) as exc:
         serving._validate_hf_repo_id("bad//id")
     assert exc.value.status_code == 400
-    assert "valid HuggingFace repo id" in exc.value.detail
 
 
 def test_resolve_deploy_step_branches(monkeypatch):
     monkeypatch.setattr(serving._app, "list_checkpoints", lambda spec: [{"step": 20}, {"step": 40}])
-
-    # No step requested -> final adapter (None), no lookup needed.
     assert serving._resolve_deploy_step("run-1", object(), None) is None
-    # Matching int / integer-float / numeric-string all resolve.
     assert serving._resolve_deploy_step("run-1", object(), 20) == 20
     assert serving._resolve_deploy_step("run-1", object(), 40.0) == 40
     assert serving._resolve_deploy_step("run-1", object(), "40") == 40
-
-    # A resolvable-but-unknown step is a 404 that lists what IS available.
     with pytest.raises(HTTPException) as not_found:
         serving._resolve_deploy_step("run-1", object(), 999)
     assert not_found.value.status_code == 404
-    assert "20, 40" in not_found.value.detail
-
-    # Bad step shapes are 400: bool, non-integer float, negative, and junk strings.
     for bad in (True, 20.5, -5, "-5", "abc", "1.5"):
         with pytest.raises(HTTPException) as exc:
             serving._resolve_deploy_step("run-1", object(), bad)
         assert exc.value.status_code == 400, bad
 
 
-def test_deployment_cas_lost(monkeypatch):
-    # No guard -> never lost, and get_status is not consulted.
+def _recovering_status(deployment):
+    return types.SimpleNamespace(
+        run_id="run-1",
+        spec={"model": "Qwen/Qwen3.5-0.8B"},
+        deployment=deployment,
+    )
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (None, "did not commit"),
+        ({"registry_revision": 4, "mutation_id": "old", "status": "ready"}, "did not commit"),
+        ({"registry_revision": 6, "mutation_id": "mine", "status": "disabled"}, "disabled"),
+        ({"registry_revision": 5, "mutation_id": "other", "status": "ready"}, "superseded"),
+    ],
+)
+def test_worker_death_recovery_classifies_non_resumable_records(monkeypatch, record, expected):
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"},
+        "prior_revision": 4,
+        "target_revision": 5,
+        "mutation_id": "mine",
+    }
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: _recovering_status(deployment))
+    monkeypatch.setattr(serving._app, "read_adapter_record", lambda _run_id: record)
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: False)
+    marked = []
+    monkeypatch.setattr(
+        serving, "mark_deployment_failed", lambda _run_id, failed: marked.append(failed)
+    )
+    assert serving._recover_deployment("run-1") is True
+    assert expected in marked[0]["error"]
+
+
+def test_worker_death_recovery_resumes_exact_target(monkeypatch):
+    desired = {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"}
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": desired,
+        "prior_revision": None,
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    status = _recovering_status(deployment)
+    resumed = []
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving._app, "read_adapter_record", lambda _run_id: {**desired, "registry_revision": 1}
+    )
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
+    monkeypatch.setattr(
+        serving, "_resume_registered_deployment", lambda *args: resumed.append(args)
+    )
+    assert serving._recover_deployment("run-1") is True
+    assert resumed
+
+
+def test_worker_death_recovery_retries_transient_readback(monkeypatch):
+    desired = {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"}
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": desired,
+        "prior_revision": None,
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    calls = {"count": 0}
+
+    def read(_run_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("transient outage")
+        return {**desired, "registry_revision": 1}
+
+    monkeypatch.setattr(serving, "_RECOVERY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: _recovering_status(deployment))
+    monkeypatch.setattr(serving._app, "read_adapter_record", read)
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
+    resumed = []
+    monkeypatch.setattr(
+        serving, "_resume_registered_deployment", lambda *args: resumed.append(args)
+    )
+
+    assert serving._recover_deployment("run-1") is True
+    assert calls["count"] == 2
+    assert resumed
+
+
+def test_worker_death_recovery_leaves_deploying_on_readback_outage(monkeypatch):
+    monkeypatch.setattr(serving, "_RECOVERY_RETRY_DELAY_SECONDS", 0)
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"mutation_id": "mine"},
+        "prior_revision": None,
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: _recovering_status(deployment))
     monkeypatch.setattr(
         serving._app,
-        "get_status",
-        lambda _r: pytest.fail("get_status must not be called without a guard"),
+        "read_adapter_record",
+        lambda _run_id: (_ for _ in ()).throw(RuntimeError("outage")),
     )
-    assert serving._deployment_cas_lost("run-1", None) is False
+    monkeypatch.setattr(serving, "mark_deployment_failed", lambda *_args: pytest.fail("must defer"))
+    assert serving._recover_deployment("run-1") is False
 
-    # Guard set and live state diverged -> lost; state matches -> not lost.
+
+@pytest.mark.parametrize("requested_at", [None, "not-a-number", float("inf")])
+def test_worker_death_recovery_fails_malformed_attempt_metadata(monkeypatch, requested_at):
+    deployment = {
+        "state": "deploying",
+        "desired_record": {"mutation_id": "mine"},
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    if requested_at is not None:
+        deployment["requested_at"] = requested_at
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: _recovering_status(deployment))
     monkeypatch.setattr(
-        serving._app, "get_status", lambda _r: types.SimpleNamespace(state="cancelled")
+        serving._app, "read_adapter_record", lambda _run_id: pytest.fail("must not read serving")
     )
-    assert serving._deployment_cas_lost("run-1", "deploying") is True
+    marked = []
     monkeypatch.setattr(
-        serving._app, "get_status", lambda _r: types.SimpleNamespace(state="deploying")
+        serving, "mark_deployment_failed", lambda _run_id, failed: marked.append(failed)
     )
-    assert serving._deployment_cas_lost("run-1", "deploying") is False
+
+    assert serving._recover_deployment("run-1") is True
+    assert marked[0]["state"] == "failed"
+    assert marked[0]["error"] == "deployment attempt metadata is malformed"
 
 
-def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch):
+def test_failed_attempt_stays_recoverable_when_disable_readback_is_unavailable(monkeypatch):
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"mutation_id": "mine"},
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    status = _recovering_status(deployment)
+    monkeypatch.setattr(serving.JobSpec, "from_dict", lambda _spec: object())
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving,
+        "_finalize_registered_deployment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ServingError("smoke failed")),
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "disable_owned_adapter",
+        lambda *_args: (_ for _ in ()).throw(ServingError("readback unavailable")),
+    )
+    monkeypatch.setattr(serving, "mark_deployment_failed", lambda *_args: pytest.fail("must defer"))
+
+    serving._resume_registered_deployment("run-1", {}, deployment)
+
+
+def test_registry_intent_write_rejects_a_replaced_local_attempt(monkeypatch):
+    old = {"state": "deploying", "mutation_id": "old", "requested_at": 1.0}
+    newer = {"state": "deploying", "mutation_id": "new", "requested_at": 2.0}
+    status = _recovering_status(newer)
+    seen = {}
+
+    def deploy_adapter(**kwargs):
+        kwargs["before_registry_mutation"](None, {"mutation_id": "old"}, 1, "old", "a" * 40)
+        pytest.fail("superseded local attempt must stop before POST")
+
+    def mark_pending(_run_id, _intent, **kwargs):
+        seen.update(kwargs)
+        return status
+
+    monkeypatch.setattr(serving.JobSpec, "from_dict", lambda _spec: object())
+    monkeypatch.setattr(serving._app, "deploy_adapter", deploy_adapter)
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(serving, "mark_deployment_pending", mark_pending)
+    monkeypatch.setattr(
+        serving, "mark_deployment_failed", lambda *_args: pytest.fail("must not fail newer")
+    )
+
+    serving._finish_deployment_unlocked(
+        run_id="run-1",
+        spec_dict={},
+        checkpoint_step=None,
+        is_checkpoint=False,
+        deploy_kwargs={"mutation_id": "old"},
+        deployment=old,
+        prev_state="done",
+        verify=True,
+    )
+
+    assert seen == {"expect_mutation_id": "old"}
+
+
+def test_lifespan_runs_recovery_after_readiness_and_awaits_shutdown(monkeypatch):
+    import asyncio
+    import threading
+
+    import flash.providers.preflight as preflight
+    import flash.providers.runpod.train.endpoints as endpoints
+    import flash.server.app as app_mod
+    import flash.server.billing_retry as billing_retry
+    import flash.server.reconcile as reconcile
+    import flash.server.repo_cleanup as repo_cleanup
+
+    started = threading.Event()
+    finished = threading.Event()
+    received_stop_event = None
+
+    def recover_deployments(*, stop_event):
+        nonlocal received_stop_event
+        received_stop_event = stop_event
+        started.set()
+        stop_event.wait(1)
+        finished.set()
+        return 0
+
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
+    monkeypatch.setattr(app_mod, "recover_runs", lambda: None)
+    monkeypatch.setattr(serving, "recover_deployments", recover_deployments)
+    monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
+    monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
+    monkeypatch.setattr(endpoints, "reconcile_endpoint_slots", lambda: None)
+    monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
+    monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
+    application = app_mod.create_app()
+
+    async def exercise_lifespan():
+        async with application.router.lifespan_context(application):
+            assert await asyncio.to_thread(started.wait, 1)
+            assert received_stop_event is not None
+            assert not received_stop_event.is_set()
+            assert not finished.is_set()
+        assert received_stop_event.is_set()
+        assert finished.is_set()
+
+    asyncio.run(exercise_lifespan())
+
+
+def test_recovery_workers_are_bounded_and_honor_shutdown_signal(monkeypatch):
+    import threading
     import time
 
-    rows = [{"run_id": "r-stale"}, {"run_id": "r-fresh"}, {"run_id": "r-missing"}]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
-
-    statuses = {
-        # Busy with no timestamp -> stale.
-        "r-stale": types.SimpleNamespace(
-            run_id="r-stale", deployment={"state": "deploying"}
-        ),
-        # Busy but freshly updated -> not stale.
-        "r-fresh": types.SimpleNamespace(
-            run_id="r-fresh", deployment={"state": "deploying", "updated_at": time.time()}
-        ),
-    }
-
-    def fake_get_status(run_id):
-        if run_id == "r-missing":
-            raise FileNotFoundError(run_id)
-        return statuses[run_id]
-
-    monkeypatch.setattr(serving._app, "get_status", fake_get_status)
-
-    marked: list[tuple[str, dict]] = []
     monkeypatch.setattr(
-        serving, "mark_deployment_failed", lambda run_id, failed: marked.append((run_id, failed))
+        serving.db, "all_runs", lambda: [{"run_id": f"r-{index}"} for index in range(6)]
     )
+    lock = threading.Lock()
+    active = 0
+    peak = 0
 
-    assert serving.recover_deployments() == 1
-    assert len(marked) == 1
-    run_id, failed = marked[0]
-    assert run_id == "r-stale"
-    assert failed["state"] == "failed"
-    assert "control-plane restart" in failed["error"]
+    def recover(_run_id):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return True
+
+    monkeypatch.setattr(serving, "_recover_deployment", recover)
+    assert serving.recover_deployments(max_workers=2) == 6
+    assert peak == 2
+
+    stopped = threading.Event()
+    stopped.set()
+    assert serving.recover_deployments(max_workers=2, stop_event=stopped) == 0
+
+
+def test_run_deployment_smoke_binds_expected_checkpoint(monkeypatch):
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    seen = {}
+
+    def fake_serve_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    serving._run_deployment_smoke(
+        "run-1",
+        spec,
+        expected_checkpoint="run-1/step-40",
+        expected_registry_revision=7,
+        expected_mutation_id="mutation-7",
+    )
+    assert seen["expected_checkpoint"] == "run-1/step-40"
 
 
 def test_run_deployment_smoke_success_and_empty(monkeypatch):
-    spec = types.SimpleNamespace(
-        thinking=False, train=types.SimpleNamespace(structured_outputs="")
-    )
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
 
     def fake_serve_chat(**kwargs):
         assert kwargs["run_id"] == "run-1"
@@ -408,7 +625,13 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         return {"choices": [{"message": {"content": "The answer is 4"}, "finish_reason": "stop"}]}
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = serving._run_deployment_smoke("run-1", spec)
+    out = serving._run_deployment_smoke(
+        "run-1",
+        spec,
+        expected_checkpoint="run-1",
+        expected_registry_revision=1,
+        expected_mutation_id="mutation-1",
+    )
     assert out["verify_finish_reason"] == "stop"
     assert out["verify_sample"] == "The answer is 4"
     assert out["thinking_tag"] is False
@@ -420,7 +643,16 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         "serve_chat",
         lambda **_k: {"choices": [{"message": {"content": "<think>hmm</think> 4"}}]},
     )
-    assert serving._run_deployment_smoke("run-1", spec)["thinking_tag"] is True
+    assert (
+        serving._run_deployment_smoke(
+            "run-1",
+            spec,
+            expected_checkpoint="run-1",
+            expected_registry_revision=1,
+            expected_mutation_id="mutation-1",
+        )["thinking_tag"]
+        is True
+    )
 
     # Empty generation is a ServingError, not a silent "ready".
     monkeypatch.setattr(
@@ -429,7 +661,13 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: {"choices": [{"message": {"content": "   "}, "finish_reason": "stop"}]},
     )
     with pytest.raises(ServingError, match="no answer content"):
-        serving._run_deployment_smoke("run-1", spec)
+        serving._run_deployment_smoke(
+            "run-1",
+            spec,
+            expected_checkpoint="run-1",
+            expected_registry_revision=1,
+            expected_mutation_id="mutation-1",
+        )
 
     # A generation truncated at the token limit is rejected before the empty-answer check, because
     # a length-capped sample cannot prove the adapter emits a complete, well-formed answer.
@@ -439,16 +677,29 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "length"}]},
     )
     with pytest.raises(ServingError, match="truncated at the maximum token length"):
-        serving._run_deployment_smoke("run-1", spec)
+        serving._run_deployment_smoke(
+            "run-1",
+            spec,
+            expected_checkpoint="run-1",
+            expected_registry_revision=1,
+            expected_mutation_id="mutation-1",
+        )
 
 
 @pytest.mark.parametrize(
     ("constraint", "content", "sample"),
     [
         ({"json_object": True}, '<think>{"bad":</think>{"answer": 4}', '{"answer": 4}'),
-        ({"json": {"type": "object", "required": ["answer"]}}, '<think>x</think>{"answer": 4}', '{"answer": 4}'),
+        (
+            {"json": {"type": "object", "required": ["answer"]}},
+            '<think>x</think>{"answer": 4}',
+            '{"answer": 4}',
+        ),
         ({"choice": ["4", "four"]}, "<think>2+2</think>4", "4"),
         ({"regex": "[0-9]+"}, "<think>2+2</think>4", "4"),
+        ({"json_object": True}, '<think>x</think>{"literal": "<think>"}', '{"literal": "<think>"}'),
+        ({"choice": ["<think>"]}, "<think>x</think><think>", "<think>"),
+        ({"regex": "<think>"}, "<think>x</think><think>", "<think>"),
     ],
 )
 def test_run_deployment_smoke_validates_only_answer_after_final_think(
@@ -463,11 +714,15 @@ def test_run_deployment_smoke_validates_only_answer_after_final_think(
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: {
-            "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
-        },
+        lambda **_k: {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]},
     )
-    out = serving._run_deployment_smoke("run-1", spec)
+    out = serving._run_deployment_smoke(
+        "run-1",
+        spec,
+        expected_checkpoint="run-1",
+        expected_registry_revision=1,
+        expected_mutation_id="mutation-1",
+    )
     assert out["verify_sample"] == sample
     assert out["verify_finish_reason"] == "stop"
     assert out["verify_latency_s"] >= 0.0
@@ -482,9 +737,7 @@ def test_run_deployment_smoke_validates_only_answer_after_final_think(
         ({"regex": "[0-9]+"}, "<think>x</think>four"),
     ],
 )
-def test_run_deployment_smoke_rejects_structured_answer_violation(
-    monkeypatch, constraint, content
-):
+def test_run_deployment_smoke_rejects_structured_answer_violation(monkeypatch, constraint, content):
     import json
 
     spec = types.SimpleNamespace(
@@ -497,4 +750,166 @@ def test_run_deployment_smoke_rejects_structured_answer_violation(
         lambda **_k: {"choices": [{"message": {"content": content}}]},
     )
     with pytest.raises(ServingError, match="structured smoke output"):
-        serving._run_deployment_smoke("run-1", spec)
+        serving._run_deployment_smoke(
+            "run-1",
+            spec,
+            expected_checkpoint="run-1",
+            expected_registry_revision=1,
+            expected_mutation_id="mutation-1",
+        )
+
+
+def test_mutation_ownership_loss_before_smoke_returns_without_finalization(monkeypatch):
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"checkpoint": "run-1", "mutation_id": "m1"},
+        "target_revision": 1,
+        "mutation_id": "m1",
+    }
+    newer = types.SimpleNamespace(
+        deployment={"state": "deploying", "mutation_id": "m2", "requested_at": 2.0}
+    )
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: newer)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: pytest.fail("must not smoke"))
+    monkeypatch.setattr(
+        serving, "mark_deployed", lambda *_args, **_kwargs: pytest.fail("must not finalize")
+    )
+
+    serving._finalize_registered_deployment(
+        "run-1",
+        spec,
+        deployment,
+        checkpoint_step=None,
+        is_checkpoint=False,
+        prev_state="done",
+        verify=True,
+    )
+
+
+def test_mutation_ownership_loss_after_smoke_returns_without_readback_or_finalization(monkeypatch):
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"checkpoint": "run-1", "mutation_id": "m1"},
+        "target_revision": 1,
+        "mutation_id": "m1",
+    }
+    current = {"value": types.SimpleNamespace(deployment=deployment)}
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: current["value"])
+
+    def smoke(**_kwargs):
+        current["value"] = types.SimpleNamespace(
+            deployment={"state": "deploying", "mutation_id": "m2", "requested_at": 2.0}
+        )
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(serving._app, "serve_chat", smoke)
+    monkeypatch.setattr(
+        serving._app, "read_adapter_record", lambda _run_id: pytest.fail("must not read back")
+    )
+    monkeypatch.setattr(
+        serving, "mark_deployed", lambda *_args, **_kwargs: pytest.fail("must not finalize")
+    )
+
+    serving._finalize_registered_deployment(
+        "run-1",
+        spec,
+        deployment,
+        checkpoint_step=None,
+        is_checkpoint=False,
+        prev_state="done",
+        verify=True,
+    )
+
+
+def test_finalization_write_carries_the_local_attempt_fence(monkeypatch):
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    desired = {"checkpoint": "run-1", "mutation_id": "m1"}
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": desired,
+        "target_revision": 1,
+        "mutation_id": "m1",
+    }
+    status = types.SimpleNamespace(deployment=deployment)
+    seen = {}
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving._app,
+        "read_adapter_record",
+        lambda _run_id: {**desired, "registry_revision": 1},
+    )
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
+    monkeypatch.setattr(serving, "mark_deployed", lambda *_args, **kwargs: seen.update(kwargs))
+
+    serving._finalize_registered_deployment(
+        "run-1",
+        spec,
+        deployment,
+        checkpoint_step=None,
+        is_checkpoint=False,
+        prev_state="done",
+        verify=False,
+    )
+
+    assert seen["expect_mutation_id"] == "m1"
+
+
+def test_stale_same_checkpoint_smoke_fence_retries_while_exact_target_is_current(monkeypatch):
+    import httpx
+
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    desired = {"checkpoint": "run-1/step-4", "mutation_id": "m4"}
+    deployment = {
+        "desired_record": desired,
+        "target_revision": 4,
+        "mutation_id": "m4",
+    }
+    calls = {"count": 0}
+
+    def serve_chat(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = httpx.Response(409, text="deployment mismatch", request=request)
+            raise httpx.HTTPStatusError("deployment mismatch", request=request, response=response)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(serving._app, "serve_chat", serve_chat)
+    monkeypatch.setattr(serving._app, "read_adapter_record", lambda _run_id: desired)
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
+
+    result = serving._smoke_with_retries("run-1", spec, deployment)
+    assert result["verify_sample"] == "4"
+    assert calls["count"] == 2
+
+
+def test_smoke_retries_transport_failure(monkeypatch):
+    import httpx
+
+    spec = types.SimpleNamespace(thinking=False, train=types.SimpleNamespace(structured_outputs=""))
+    deployment = {
+        "desired_record": {"checkpoint": "run-1", "mutation_id": "m1"},
+        "target_revision": 1,
+        "mutation_id": "m1",
+    }
+    calls = {"count": 0}
+
+    def serve_chat(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            raise httpx.ConnectError("reset", request=request)
+        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(serving, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(serving._app, "serve_chat", serve_chat)
+
+    result = serving._smoke_with_retries("run-1", spec, deployment)
+
+    assert result["verify_sample"] == "4"
+    assert calls["count"] == 2

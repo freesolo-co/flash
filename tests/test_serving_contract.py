@@ -11,6 +11,8 @@ from flash.serve.deploy import (
     undeploy_adapter,
 )
 
+MUTATION_ID = "00000000-0000-4000-8000-000000000001"
+
 
 def test_serving_base_url_default_and_override(monkeypatch):
     from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
@@ -19,27 +21,34 @@ def test_serving_base_url_default_and_override(monkeypatch):
     assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
     assert serving_base_url() == "https://serve.example"
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    assert serving_base_url() == "https://serve.example"
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    dep = deploy_adapter(
+        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
+    )
     data = dep.to_dict()
-    assert data["state"] == "dry_run"
-    assert "gpu" not in data
-    assert "mode" not in data
-    assert "idle_timeout_s" not in data
-    assert "est_idle_cost_usd_per_day" not in data
-    assert "previous_registry_snapshot" not in data
-    assert "registry_revision" not in data
+    assert data == {
+        "run_id": "r1",
+        "model": "Qwen/Qwen3.5-0.8B",
+        "adapter_hf_prefix": "rl/r1/seed0/adapter",
+        "openai_model": "r1",
+        "endpoint_name": serving_base_url(),
+        "openai_base_url": f"{serving_base_url()}/v1",
+        "state": "dry_run",
+    }
 
 
-def test_undeploy_absent_snapshot_is_clean(monkeypatch):
+def test_undeploy_absent_record_is_clean(monkeypatch):
     import flash.serve.deploy as deploy_mod
 
-    monkeypatch.setattr(deploy_mod, "snapshot_adapter_record", lambda _run_id: None)
-    monkeypatch.setattr(deploy_mod, "_read_registry_snapshot", lambda _run_id: None)
+    monkeypatch.setattr(deploy_mod, "read_adapter_record", lambda _run_id: None)
     monkeypatch.setattr(
-        deploy_mod.httpx, "delete", lambda *a, **k: pytest.fail("absent adapter must not delete")
+        deploy_mod,
+        "_serving_request",
+        lambda *a, **k: pytest.fail("absent adapter must not delete"),
     )
     assert undeploy_adapter("flash-1-gone") == []
 
@@ -51,9 +60,12 @@ def test_deployment_roundtrip_dict():
         adapter_hf_prefix="p",
         openai_model="r",
         endpoint_name="https://serve.example",
+        openai_base_url="https://serve.example/v1",
     )
     data = d.to_dict()
     assert data["run_id"] == "r"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
     assert "gpu" not in data
     assert "mode" not in data
 
@@ -124,7 +136,21 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    dep = deploy_adapter(
+        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
+    )
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
-    assert data["url"] == "https://serve.example/v1"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data
+
+
+def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    dep = deploy_adapter(
+        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
+    )
+    data = dep.to_dict()
+    assert data["endpoint_name"] == "https://serve.example"
+    assert data["openai_base_url"] == "https://serve.example/v1"
+    assert "url" not in data

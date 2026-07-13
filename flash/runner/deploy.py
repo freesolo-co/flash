@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from flash.runner import RunStatus
 
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
-_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -239,7 +238,12 @@ def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     status.state = "deployed"
 
 
-def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
+def mark_deployed(
+    run_id: str,
+    deployment: dict,
+    expect_state: str | None = None,
+    expect_mutation_id: str | None = None,
+) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
     with _STATUS_LOCK:
@@ -248,6 +252,11 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        if (
+            expect_mutation_id is not None
+            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+        ):
+            return status
         _promote_final_deployment(status, deployment)
         status.updated_at = time.time()
         _save_status(status)
@@ -255,7 +264,10 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
 
 
 def mark_checkpoint_deployed(
-    run_id: str, deployment: dict, expect_state: str | None = None
+    run_id: str,
+    deployment: dict,
+    expect_state: str | None = None,
+    expect_mutation_id: str | None = None,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -270,6 +282,11 @@ def mark_checkpoint_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        if (
+            expect_mutation_id is not None
+            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+        ):
+            return status
         if status.state in _FINAL_DEPLOYMENT_STATES:
             _promote_final_deployment(status, deployment)
         else:
@@ -280,7 +297,10 @@ def mark_checkpoint_deployed(
 
 
 def mark_deployment_pending(
-    run_id: str, deployment: dict, expect_state: str | None = None
+    run_id: str,
+    deployment: dict,
+    expect_state: str | None = None,
+    expect_mutation_id: str | None = None,
 ) -> RunStatus:
     """Attach an in-progress deployment record without changing the run lifecycle state."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
@@ -290,6 +310,11 @@ def mark_deployment_pending(
         if status.state == "dry_run":
             return status
         if expect_state is not None and status.state != expect_state:
+            return status
+        if (
+            expect_mutation_id is not None
+            and (status.deployment or {}).get("mutation_id") != expect_mutation_id
+        ):
             return status
         status.deployment = deployment
         status.updated_at = time.time()
@@ -308,27 +333,12 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         if current.get("state") == "undeployed":
             return status
         if (
-            current.get("requested_at") is not None
-            and deployment.get("requested_at") is not None
-            and current.get("requested_at") != deployment.get("requested_at")
+            current.get("mutation_id") is not None
+            and deployment.get("mutation_id") is not None
+            and current.get("mutation_id") != deployment.get("mutation_id")
         ):
             return status
-        previous = deployment.get("previous_deployment")
-        if (
-            isinstance(previous, dict)
-            and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
-            and not deployment.get("reconciliation_required")
-            and not deployment.get("rollback_error")
-        ):
-            status.deployment = {
-                **previous,
-                "last_deploy_error": deployment.get("error") or "deployment failed",
-                "last_deploy_failed_at": time.time(),
-            }
-        else:
-            failed = dict(deployment)
-            failed.pop("previous_deployment", None)
-            status.deployment = {**failed, "state": "failed"}
+        status.deployment = {**deployment, "state": "failed"}
         status.updated_at = time.time()
         _save_status(status)
         return status

@@ -29,17 +29,17 @@ import threading
 from flash import __version__
 from flash.runner import get_status, submit_job
 from flash.runner.checkpoints import list_checkpoints
-from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.deploy import (
+    DeploymentSuperseded,
     deploy_adapter,
     deployment_record,
-    registry_snapshot_matches,
-    restore_adapter_record,
-    restored_snapshot_matches,
-    snapshot_adapter_record,
+    disable_owned_adapter,
+    read_adapter_record,
+    record_matches,
     undeploy_adapter,
 )
+from flash.serve.deploy import chat as serve_chat
+from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.export import export_adapter
 
 from . import db
@@ -66,6 +66,7 @@ _log = logging.getLogger("flash.server")
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
+    "DeploymentSuperseded",
     "_charge_retry_loop",
     "_charge_retry_startup",
     "_deploy_lock",
@@ -75,17 +76,16 @@ __all__ = [
     "create_app",
     "deploy_adapter",
     "deployment_record",
+    "disable_owned_adapter",
     "export_adapter",
     "get_status",
     "list_checkpoints",
+    "read_adapter_record",
+    "record_matches",
     "recover_runs",
-    "registry_snapshot_matches",
-    "restore_adapter_record",
-    "restored_snapshot_matches",
     "run_server",
     "serve_chat",
     "serve_chat_stream",
-    "snapshot_adapter_record",
     "start_deployment_job",
     "submit_job",
     "undeploy_adapter",
@@ -269,9 +269,7 @@ def _sweep_orphan_instances_once() -> int:
     torn = 0
     for prov in configured_providers():
         try:
-            deleted = prov.sweep_orphans(
-                active_labels=_active_run_ids, known_labels=_known_run_ids
-            )
+            deleted = prov.sweep_orphans(active_labels=_active_run_ids, known_labels=_known_run_ids)
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
             # (the loop docstring promises failures are logged + retried next cycle), so a
@@ -334,7 +332,25 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
-        serving.recover_deployments()
+
+        deployment_recovery_stop = threading.Event()
+
+        async def recover_deployments_background() -> None:
+            while not deployment_recovery_stop.is_set():
+                try:
+                    recovered = await asyncio.to_thread(
+                        serving.recover_deployments, stop_event=deployment_recovery_stop
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.exception("deployment recovery scan failed")
+                else:
+                    if recovered:
+                        _log.info("recovered %d interrupted deployment(s)", recovered)
+                await asyncio.to_thread(deployment_recovery_stop.wait, 30.0)
+
+        deployment_recovery_task = asyncio.create_task(recover_deployments_background())
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
         # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
@@ -356,9 +372,7 @@ def create_app():
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
         # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
         # so it can't leak revenue. Same internal-key gate as the charge itself.
-        charge_task = (
-            asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
-        )
+        charge_task = asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
         # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
         # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
         # Only when this plane manages RunPod (its API key is configured).
@@ -381,12 +395,13 @@ def create_app():
         # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
         from flash.server.repo_cleanup import repo_cleanup_enabled
 
-        cleanup_task = (
-            asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        )
+        cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
         try:
             yield
         finally:
+            deployment_recovery_stop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await deployment_recovery_task
             for task in (
                 startup_charge_task,
                 cost_task,
