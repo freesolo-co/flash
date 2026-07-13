@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 
@@ -18,10 +17,8 @@ from flash.engine.multiturn_rollout import (
     _prompt_key,
     build_examples_index,
     index_collisions,
-    make_env_glue,
     rollout_async,
     rollout_one,
-    rollout_one_records,
 )
 
 
@@ -36,6 +33,7 @@ def test_prompt_key_is_insensitive_to_arrow_null_injection():
 
     index = build_examples_index([{"prompt": raw, "answer": "GOOD"}], lambda r: r["prompt"])
     assert index.get(_prompt_key(arrow_materialized)) == {"prompt": raw, "answer": "GOOD"}
+
 
 # Fake vocab: role headers, an end-of-turn token, and one token per message "content" key.
 HDR = {"user": 100, "assistant": 101, "system": 102}
@@ -140,7 +138,9 @@ class _VarTurnEnv:
 
     def reward(self, completion, example, state=None):
         # distinct per rollout -> proves per-rollout scoring survives batching
-        return float(sum(1 for m in (state or {}).get("completion", []) if m["role"] == "assistant"))
+        return float(
+            sum(1 for m in (state or {}).get("completion", []) if m["role"] == "assistant")
+        )
 
 
 def _det_generate(prefix_ids, max_tokens):
@@ -353,7 +353,9 @@ def _mk_logprobs(token_ids, lps):
     """vLLM's per-position [{token_id: Logprob}] structure (or None when lps is None)."""
     if lps is None:
         return None
-    return [{tid: types.SimpleNamespace(logprob=lp)} for tid, lp in zip(token_ids, lps, strict=True)]
+    return [
+        {tid: types.SimpleNamespace(logprob=lp)} for tid, lp in zip(token_ids, lps, strict=True)
+    ]
 
 
 class _FakeEngine:
@@ -364,8 +366,11 @@ class _FakeEngine:
 
     def __init__(self, vocab=1000, gen=None, finish="all"):
         self.events = []
+        self.sampling = []
         self._pending = []  # (req_id, prompt_ids, sampling_params)
-        self._finish = finish  # "all" -> finish every pending request per step; "one" -> one per step
+        self._finish = (
+            finish  # "all" -> finish every pending request per step; "one" -> one per step
+        )
         self.aborted = []
         # default generation: two tokens, no logprobs, text 'ok' (matches the prior fake)
         self._gen = gen or (lambda ids, sp: ([5, 6], None, "ok"))
@@ -379,6 +384,7 @@ class _FakeEngine:
 
     def _add_request(self, req_id, prompt, sampling_params):
         self.events.append(("add", req_id))
+        self.sampling.append(sampling_params)
         self._pending.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
 
     def _abort_request(self, ids):
@@ -431,6 +437,7 @@ def _stub_vllm():
     mod = types.ModuleType("vllm")
     mod.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
     sp_mod = types.ModuleType("vllm.sampling_params")
+    sp_mod.RequestOutputKind = types.SimpleNamespace(FINAL_ONLY="final_only")
     sp_mod.StructuredOutputsParams = _StubStructuredOutputsParams
     mod.sampling_params = sp_mod
     sys.modules["vllm"] = mod
@@ -445,7 +452,7 @@ def _stub_vllm():
                 sys.modules[name] = prev_mod
 
 
-def _build(tok, active_env=None, structured_outputs=None):
+def _build(tok, active_env=None, structured_outputs=None, **kwargs):
     from flash.engine.multiturn_rollout import build_rollout_func
 
     return build_rollout_func(
@@ -458,8 +465,9 @@ def _build(tok, active_env=None, structured_outputs=None):
         top_p=1.0,
         stop=None,
         thinking=False,
-        engine_max_len=None,
+        engine_max_len=kwargs.pop("engine_max_len", None),
         structured_outputs=structured_outputs,
+        **kwargs,
     )
 
 
@@ -493,6 +501,22 @@ def test_env_glue_fails_loud_when_template_drops_probe():
 
 
 @pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_rejects_finished_output_without_completion():
+    engine = _FakeEngine()
+
+    def malformed_step():
+        req_id = engine._pending[0][0]
+        return [types.SimpleNamespace(request_id=req_id, finished=True, outputs=[])]
+
+    engine.llm_engine.step = malformed_step
+    rf = _build(_FakeTok())
+
+    with pytest.raises(IndexError):
+        rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
+    assert len(engine.aborted) == 1
+
+
+@pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     # The bug (#162): TRL's rollout_func path wakes only the weights, never the KV cache, so the
     # first decode faults. The fix wakes tags=["kv_cache"] BEFORE any add_request/step and
@@ -504,6 +528,7 @@ def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     assert kinds == ["wake", "add", "step", "sleep"]
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
+    assert engine.sampling[0].output_kind == "final_only"
     assert out["reward"] == [0.5]
 
 
@@ -514,8 +539,11 @@ def test_rollout_func_returns_one_completion_per_prompt():
     # PER prompt would over-generate and trip a CUDA device-side assert in shuffle_sequence_dict.
     engine = _FakeEngine()
     rf = _build(_FakeTok())
-    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
-               [{"role": "user", "content": "c"}]]
+    prompts = [
+        [{"role": "user", "content": "a"}],
+        [{"role": "user", "content": "b"}],
+        [{"role": "user", "content": "c"}],
+    ]
     trainer = _fake_trainer(engine, sleep_mode=False)
     trainer.num_generations = 4  # must be IGNORED by rollout_func (the sampler already repeated)
     out = rf(prompts, trainer)
@@ -542,7 +570,11 @@ def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
         else:
             batch = pending[:]
             pending.clear()
-        return [(rid, *gen(ids, mt)) for rid, ids, mt in batch]
+        events = []
+        for rid, ids, mt in batch:
+            completion_ids, logprobs, text = gen(ids, mt)
+            events.append((rid, completion_ids, logprobs, text))
+        return events
 
     def busy():
         return bool(pending)
@@ -556,13 +588,30 @@ def test_rollout_async_equals_rollout_one():
     order. Only the SCHEDULING differs from the pure single-rollout reference."""
     examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
     ones = [
-        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
-                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        rollout_one(
+            example=e,
+            active_env=_VarTurnEnv(),
+            render=render,
+            generate=_det_generate,
+            env_glue=env_glue,
+            max_turns=8,
+            per_turn_max_tokens=8,
+        )
         for e in examples
     ]
     submit, poll, busy = _fake_async_engine(_det_generate)
-    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
-                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    out = rollout_async(
+        examples=examples,
+        active_env=_VarTurnEnv(),
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
     assert out == ones
     assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
 
@@ -574,13 +623,30 @@ def test_rollout_async_robust_to_arbitrary_finish_order():
     any single rollout's transcript — and a finished rollout's slot is free for others' next turns."""
     examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}, {"max_model": 1}]
     ones = [
-        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
-                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        rollout_one(
+            example=e,
+            active_env=_VarTurnEnv(),
+            render=render,
+            generate=_det_generate,
+            env_glue=env_glue,
+            max_turns=8,
+            per_turn_max_tokens=8,
+        )
         for e in examples
     ]
     submit, poll, busy = _fake_async_engine(_det_generate, one_at_a_time=True, lifo=True)
-    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
-                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    out = rollout_async(
+        examples=examples,
+        active_env=_VarTurnEnv(),
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
     assert out == ones  # input order + byte-identical despite LIFO one-at-a-time finishing
     assert [r["reward"] for r in out] == [1.0, 3.0, 2.0, 1.0]
 
@@ -608,14 +674,31 @@ def test_reward_many_batches_scoring():
     reward win — at the same per-rollout values + input order as one rollout_one per example."""
     examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
     ones = [
-        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
-                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        rollout_one(
+            example=e,
+            active_env=_VarTurnEnv(),
+            render=render,
+            generate=_det_generate,
+            env_glue=env_glue,
+            max_turns=8,
+            per_turn_max_tokens=8,
+        )
         for e in examples
     ]
     env = _BatchRewardEnv()
     submit, poll, busy = _fake_async_engine(_det_generate)
-    out = rollout_async(examples=examples, active_env=env, render=render, submit=submit, poll=poll,
-                        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    out = rollout_async(
+        examples=examples,
+        active_env=env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
     assert env.reward_many_calls == 1  # ONE batched scoring call...
     assert env.per_rollout_reward_calls == 0  # ...not one reward() per rollout
     assert out == ones  # byte-identical to the single-rollout reference (reward_many only batches)
@@ -625,8 +708,16 @@ def test_reward_many_batches_scoring():
 def _run_async(examples, active_env):
     submit, poll, busy = _fake_async_engine(_det_generate)
     return rollout_async(
-        examples=examples, active_env=active_env, render=render, submit=submit, poll=poll,
-        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        examples=examples,
+        active_env=active_env,
+        render=render,
+        submit=submit,
+        poll=poll,
+        busy=busy,
+        abort=lambda ids: None,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
     )
 
 
@@ -694,12 +785,16 @@ def test_async_reward_failure_drains_not_backgrounds():
                 finished.append(example["rid"])  # records ONLY if the call ran to completion
             return 1.0
 
-    examples = [{"max_model": 1, "rid": i} for i in range(8)]  # 8 <= max_workers(=8): all start at once
+    examples = [
+        {"max_model": 1, "rid": i} for i in range(8)
+    ]  # 8 <= max_workers(=8): all start at once
     with pytest.raises(RuntimeError, match="judge 500"):
         _run_async(examples, _FailEnv())
     # Every scorer that STARTED has also FINISHED by the time we get here (drained, not backgrounded);
     # nothing is still running. With wait=False the slow peers would still be sleeping -> finished < started.
-    assert sorted(finished) == sorted(s for s in started if s != 0), "in-flight rewards were not drained"
+    assert sorted(finished) == sorted(s for s in started if s != 0), (
+        "in-flight rewards were not drained"
+    )
 
 
 @pytest.mark.usefixtures("_stub_vllm")
@@ -737,8 +832,11 @@ def test_rollout_func_no_inflight_leak_on_error():
     # leftover requests were aborted in the finally or had already finished.
     engine = _FakeEngine(finish="one")
     rf = _build(_FakeTok(), active_env=_RaiseEnvReplyEnv())
-    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
-               [{"role": "user", "content": "c"}]]
+    prompts = [
+        [{"role": "user", "content": "a"}],
+        [{"role": "user", "content": "b"}],
+        [{"role": "user", "content": "c"}],
+    ]
     with pytest.raises(RuntimeError, match="boom in env_reply"):
         rf(prompts, _fake_trainer(engine, sleep_mode=False))
     assert not engine.llm_engine.has_unfinished_requests()  # nothing leaked into the engine
@@ -754,7 +852,9 @@ class _CountingTok(_FakeTok):
     def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
         if any("flash-env-glue-probe" in str(m.get("content", "")) for m in messages):
             self.glue_renders += 1
-        return super().apply_chat_template(messages, add_generation_prompt, tokenize, enable_thinking)
+        return super().apply_chat_template(
+            messages, add_generation_prompt, tokenize, enable_thinking
+        )
 
 
 @pytest.mark.usefixtures("_stub_vllm")
@@ -764,8 +864,11 @@ def test_env_glue_render_is_cached_across_repeated_env_messages():
     tok = _CountingTok()
     engine = _FakeEngine()
     rf = _build(tok, active_env=_TwoTurnEnv())
-    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
-               [{"role": "user", "content": "c"}]]
+    prompts = [
+        [{"role": "user", "content": "a"}],
+        [{"role": "user", "content": "b"}],
+        [{"role": "user", "content": "c"}],
+    ]
     rf(prompts, _fake_trainer(engine, sleep_mode=False))
     assert tok.glue_renders == 1  # 3 rollouts' identical env-glue rendered once, not 3x
 
@@ -850,104 +953,6 @@ def test_examples_index_and_collisions():
     from flash.engine.multiturn_rollout import _prompt_key
 
     assert idx[_prompt_key([{"role": "user", "content": "a"}])]["answer"] == "3"
-
-
-# --- rollout_one_records: the per-turn record driver OPD distils each turn from -----------------
-
-
-def _gen_obj(completion_ids, completion_text, *, truncated=False, skip=False):
-    """A minimal stand-in for OPD's _GenResult: the four attributes rollout_one_records reads."""
-    return SimpleNamespace(
-        completion_ids=completion_ids,
-        completion_text=completion_text,
-        gen_tokens=len(completion_ids or []),
-        truncated=truncated,
-        skip=skip,
-    )
-
-
-def _records_generator(turns):
-    """generate(prefix_ids, max_new) -> a _GenResult-shaped object, one per turn (list order)."""
-    seq = iter(turns)
-
-    def generate(prefix_ids, max_new):
-        return next(seq)
-
-    return generate
-
-
-def test_rollout_one_records_grows_prefix_with_verbatim_sampled_tokens():
-    """The multi-turn OPD prefix MUST be the accumulated on-policy TOKEN STREAM, not a re-render of the
-    message history — a re-render would strip prior-turn reasoning on non-round-tripping templates and
-    desync the student's loss prefix from what it actually sampled. Assert each turn's prefix_ids grows
-    and literally CONTAINS the previous turn's sampled ids + the deduped env glue."""
-    env = FakeEnv()  # 1 env (user) turn, stops after 2 assistant turns
-    gen = _records_generator(
-        [_gen_obj([CONTENT["a1"], END], "a1"), _gen_obj([CONTENT["GOOD"], END], "GOOD")]
-    )
-    records = rollout_one_records(
-        example={"answer": "GOOD"},
-        active_env=env,
-        render=render,
-        generate=gen,
-        env_glue=realistic_env_glue,  # LEADS with END -> exercises the seam dedup
-        max_turns=8,
-        per_turn_max_tokens=16,
-    )
-    assert len(records) == 2
-    p0, p1 = records[0]["prefix_ids"], records[1]["prefix_ids"]
-    # turn 0 prefix = the initial rendered prompt (no completion yet).
-    assert p0 == render([{"role": "user", "content": "u1"}], True)
-    # turn 1 prefix strictly extends turn 0 with the VERBATIM sampled turn-0 ids, then the env glue with
-    # its duplicate LEADING terminator collapsed: realistic_env_glue([u2]) is [END, *render([u2],True)],
-    # and the leading END dups a1's own END so it is dropped, leaving exactly render([u2], True).
-    assert p1 == [*p0, CONTENT["a1"], END, *render([{"role": "user", "content": "u2"}], True)]
-    assert len(p1) > len(p0)
-    # context_messages is the parallel TEXT history the teacher conditions on, growing per turn.
-    assert records[0]["context_messages"] == [{"role": "user", "content": "u1"}]
-    assert {"role": "assistant", "content": "a1"} in records[1]["context_messages"]
-
-
-def test_rollout_one_records_truncated_turn_halts_episode():
-    """A turn that did not terminate naturally (truncated) is RECORDED (so the caller counts it) but
-    ENDS the episode — a student that can't end its turn shouldn't keep generating, and its broken turn
-    must not pollute a later turn's context. env_reply is never reached."""
-    calls = {"env_reply": 0}
-
-    class _Env(FakeEnv):
-        def env_reply(self, messages, state):
-            calls["env_reply"] += 1
-            return super().env_reply(messages, state)
-
-    env = _Env()
-    gen = _records_generator([_gen_obj(None, "", truncated=True)])
-    records = rollout_one_records(
-        example={"answer": "GOOD"},
-        active_env=env,
-        render=render,
-        generate=gen,
-        env_glue=realistic_env_glue,
-        max_turns=8,
-        per_turn_max_tokens=16,
-    )
-    assert len(records) == 1
-    assert records[0]["gen"].truncated is True
-    assert calls["env_reply"] == 0  # halted before the env stepped
-
-
-def test_make_env_glue_rejects_non_verbatim_template():
-    """make_env_glue's probe trick only works when the chat template inserts assistant content
-    verbatim; a template that doesn't (so the probe can't be located) must HARD-FAIL, never silently
-    produce skewed glue. This is the load-bearing guard that keeps a non-round-tripping model from
-    training/serving skew."""
-
-    class _BadTok:
-        def apply_chat_template(self, messages, **kw):
-            return "template-that-drops-assistant-content"
-
-    glue = make_env_glue(_BadTok(), thinking=False)
-    with pytest.raises(ValueError, match="could not uniquely locate its probe"):
-        glue([{"role": "user", "content": "obs"}])
 
 
 @pytest.mark.usefixtures("_stub_vllm")
