@@ -25,6 +25,7 @@ from jsonschema import SchemaError, ValidationError, validate
 from flash.runner import (
     adapter_prefix,
     complete_deployment_cleanup,
+    deployment_lifecycle_allows_intent,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,
@@ -35,6 +36,7 @@ from flash.runner import (
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
 from flash.serve.deploy import (
+    _PRIOR_MUTATION_ID_CONTEXT_KEY,
     READBACK_ATTEMPTS,
     READBACK_DELAY_SECONDS,
     AdapterConfigMissing,
@@ -484,17 +486,21 @@ def _finish_deployment_unlocked(
         target_revision: int,
         persisted_mutation_id: str,
         repo_revision: str,
-        *,
-        prior_mutation_id: str | None = None,
     ) -> None:
         nonlocal intent_persisted
         if persisted_mutation_id != mutation_id:
             raise ServingError("deployment mutation identity changed before registry mutation")
+        desired_record = dict(desired)
+        prior_mutation_id = desired_record.pop(_PRIOR_MUTATION_ID_CONTEXT_KEY, None)
+        if prior_revision is not None and (
+            not isinstance(prior_mutation_id, str) or not prior_mutation_id
+        ):
+            raise ServingError("prior deployment mutation identity changed before registry mutation")
         intent = _deployment_state(
             deployment,
             "deploying",
             detail="persisting deployment intent",
-            desired_record=desired,
+            desired_record=desired_record,
             prior_revision=prior_revision,
             prior_mutation_id=prior_mutation_id,
             target_revision=target_revision,
@@ -503,7 +509,12 @@ def _finish_deployment_unlocked(
             prev_state=prev_state,
         )
         with _app._deploy_lock(run_id):
-            marked = mark_deployment_intent(run_id, intent, expect_attempt=deployment_attempt)
+            marked = mark_deployment_intent(
+                run_id,
+                intent,
+                expect_attempt=deployment_attempt,
+                expect_state=prev_state,
+            )
             active = marked.deployment or {}
             if active != intent or getattr(marked, "deployment_attempt", None) is not None:
                 raise ServingError("deployment ownership changed before registry mutation")
@@ -517,7 +528,12 @@ def _finish_deployment_unlocked(
             status = _app.get_status(run_id)
             active = status.deployment or {}
             if (
-                active.get("state") != "deploying"
+                not deployment_lifecycle_allows_intent(
+                    status.state,
+                    expected_state=prev_state,
+                    is_checkpoint=is_checkpoint,
+                )
+                or active.get("state") != "deploying"
                 or active.get("mutation_id") != mutation_id
             ):
                 raise ServingError("deployment ownership changed before registry mutation")

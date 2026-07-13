@@ -19,6 +19,31 @@ if TYPE_CHECKING:
     from flash.runner import RunStatus
 
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
+_CHECKPOINT_DEPLOYMENT_STATES = frozenset(
+    {"queued", "provisioning", "running", "done", "deployed", "failed", "cancelled"}
+)
+_CHECKPOINT_FORWARD_STATES = {
+    "queued": frozenset({"provisioning", "running", "done"}),
+    "provisioning": frozenset({"running", "done"}),
+    "running": frozenset({"done"}),
+}
+
+
+def deployment_lifecycle_allows_intent(
+    current_state: str,
+    *,
+    expected_state: str,
+    is_checkpoint: bool,
+) -> bool:
+    """Return whether exact queued lifecycle ownership still permits registry intent."""
+    allowed_states = _CHECKPOINT_DEPLOYMENT_STATES if is_checkpoint else _FINAL_DEPLOYMENT_STATES
+    if expected_state not in allowed_states or current_state not in allowed_states:
+        return False
+    if current_state == expected_state:
+        return True
+    if not is_checkpoint:
+        return False
+    return current_state in _CHECKPOINT_FORWARD_STATES.get(expected_state, frozenset())
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -37,19 +62,17 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
-    with _deploy_lock(run_id):
+    def revoke_current_deployment_ownership() -> RunStatus:
         status = get_status(run_id)
-        entered_deployed = status.state == "deployed"
+        attempt = status.deployment_attempt
+        if isinstance(attempt, dict):
+            revoke_deployment_attempt(run_id, attempt)
+        status = get_status(run_id)
         deployment = status.deployment or {}
-        durable_mutation = (
-            str(deployment.get("mutation_id") or "")
-            if deployment.get("state") == "deploying"
-            else ""
-        )
-        if status.deployment_attempt is not None:
-            revoke_deployment_attempt(run_id, status.deployment_attempt)
-        elif durable_mutation:
-            revoke_deployment_intent(run_id, durable_mutation)
+        if deployment.get("state") == "deploying":
+            mutation_id = str(deployment.get("mutation_id") or "")
+            if mutation_id:
+                revoke_deployment_intent(run_id, mutation_id)
         status = get_status(run_id)
         cleanup = status.deployment_cleanup
         if isinstance(cleanup, dict):
@@ -62,7 +85,12 @@ def cancel_run(run_id: str) -> RunStatus:
             else:
                 if reconciled:
                     complete_deployment_cleanup(run_id, cleanup)
+        return get_status(run_id)
+
+    with _deploy_lock(run_id):
         status = get_status(run_id)
+        entered_deployed = status.state == "deployed"
+        status = revoke_current_deployment_ownership()
         if status.state in TERMINAL_STATES and not entered_deployed:
             return status
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
@@ -103,6 +131,7 @@ def cancel_run(run_id: str) -> RunStatus:
         else None
     )
     with _deploy_lock(run_id):
+        revoke_current_deployment_ownership()
         # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
         # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
         # charges the run from cost_usd (idempotent by runId).
@@ -377,6 +406,7 @@ def mark_deployment_intent(
     intent: dict,
     *,
     expect_attempt: dict,
+    expect_state: str,
 ) -> RunStatus:
     """Replace exact queued ownership with durable forward-only registry intent."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
@@ -391,6 +421,12 @@ def mark_deployment_intent(
             not isinstance(queued, dict)
             or not queued.get("mutation_id")
             or intent.get("mutation_id") != queued.get("mutation_id")
+        ):
+            return status
+        if not deployment_lifecycle_allows_intent(
+            status.state,
+            expected_state=expect_state,
+            is_checkpoint=queued.get("checkpoint_step") is not None,
         ):
             return status
         if phase == "initial":

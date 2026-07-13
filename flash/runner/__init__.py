@@ -836,6 +836,7 @@ from flash.runner.deploy import (  # noqa: E402,F401
     attach_run,
     cancel_run,
     complete_deployment_cleanup,
+    deployment_lifecycle_allows_intent,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,

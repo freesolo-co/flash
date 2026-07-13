@@ -213,7 +213,7 @@ def test_initial_intent_callback_keeps_five_argument_contract(monkeypatch, tmp_p
     assert captured[0][0] is None
 
 
-def test_redeploy_intent_callback_receives_exact_prior_mutation(monkeypatch, tmp_path):
+def test_redeploy_intent_callback_keeps_five_argument_contract(monkeypatch, tmp_path):
     _stub_artifact(monkeypatch, tmp_path)
     prior = {
         "adapter_id": "r1",
@@ -225,10 +225,13 @@ def test_redeploy_intent_callback_receives_exact_prior_mutation(monkeypatch, tmp
     state = {"record": prior}
     captured = []
 
-    def persist(*args, **kwargs):
-        captured.append((args, kwargs))
+    def persist(prior_revision, desired, target_revision, mutation_id, repo_revision):
+        captured.append(
+            (prior_revision, desired, target_revision, mutation_id, repo_revision)
+        )
 
     def request(_method, _url, *, json=None, **_kwargs):
+        assert d._PRIOR_MUTATION_ID_CONTEXT_KEY not in json
         state["record"] = {**json, "registry_revision": 8}
         return Response(etag=8)
 
@@ -245,10 +248,11 @@ def test_redeploy_intent_callback_receives_exact_prior_mutation(monkeypatch, tmp
     )
 
     assert len(captured) == 1
-    args, kwargs = captured[0]
-    assert args[0] == 7
-    assert args[2:4] == (8, "m8")
-    assert kwargs == {"prior_mutation_id": "m7"}
+    prior_revision, desired, target_revision, mutation_id, _repo_revision = captured[0]
+    assert prior_revision == 7
+    assert target_revision == 8
+    assert mutation_id == "m8"
+    assert desired[d._PRIOR_MUTATION_ID_CONTEXT_KEY] == "m7"
 
 
 def test_lost_post_response_is_committed_by_exact_readback(monkeypatch, tmp_path):

@@ -663,7 +663,7 @@ def test_registry_intent_write_rejects_a_replaced_local_attempt(monkeypatch):
         verify=True,
     )
 
-    assert seen == {"expect_attempt": old_attempt}
+    assert seen == {"expect_attempt": old_attempt, "expect_state": "done"}
 
 
 def test_lifespan_runs_recovery_after_readiness_and_awaits_shutdown(monkeypatch):

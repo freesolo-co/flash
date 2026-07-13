@@ -23,6 +23,7 @@ DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.ru
 READBACK_ATTEMPTS = 5
 READBACK_DELAY_SECONDS = 2.0
 _FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_PRIOR_MUTATION_ID_CONTEXT_KEY = "_flash_prior_mutation_id"
 
 
 class ServingError(RuntimeError):
@@ -379,7 +380,7 @@ def deploy_adapter(
     thinking: bool = False,
     structured_outputs: str = "",
     org_id: str | None = None,
-    before_registry_mutation: Callable[..., None] | None = None,
+    before_registry_mutation: Callable[[int | None, dict, int, str, str], None] | None = None,
     registry_mutation_guard: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> Deployment:
     """Create a new immutable serving record through compare-and-swap."""
@@ -432,20 +433,16 @@ def deploy_adapter(
             )
         prior_mutation_id = raw_prior_mutation_id
     if before_registry_mutation is not None:
-        callback_args = (
+        desired_context = dict(desired)
+        if prior_mutation_id is not None:
+            desired_context[_PRIOR_MUTATION_ID_CONTEXT_KEY] = prior_mutation_id
+        before_registry_mutation(
             prior_revision,
-            dict(desired),
+            desired_context,
             target_revision,
             mutation_id,
             repo_revision,
         )
-        if prior_mutation_id is None:
-            before_registry_mutation(*callback_args)
-        else:
-            before_registry_mutation(
-                *callback_args,
-                prior_mutation_id=prior_mutation_id,
-            )
     headers = {"If-Match": str(prior_revision)} if prior_revision is not None else None
     response: httpx.Response | None = None
     mutation_error: ServingError | None = None
