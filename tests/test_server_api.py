@@ -3121,10 +3121,21 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, "cancelled")
+    revision = f"{run_id}@step-80." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, f"{run_id}/step-80")
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, f"{run_id}/step-80"),
+    )
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 80}, headers=_bearer(key))
     assert r.status_code == 200, r.text
     assert r.json()["checkpoint_step"] == 80
@@ -3142,10 +3153,21 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, state)
+    revision = f"{run_id}@step-40." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, f"{run_id}/step-40")
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, f"{run_id}/step-40"),
+    )
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
     assert r.json()["checkpoint_step"] == 40

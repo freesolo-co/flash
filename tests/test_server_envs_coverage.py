@@ -605,6 +605,31 @@ def test_run_deployment_smoke_passes_remaining_budget_to_serve_chat(monkeypatch)
     assert timeouts[1] < timeouts[0]  # turn 2 only gets what turn 1 left over
 
 
+def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
+    revision = "run-1@final." + "a" * 40
+    spec = types.SimpleNamespace(
+        thinking=False,
+        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
+    )
+    monkeypatch.setattr(
+        serving,
+        "load_environment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+
+    def slow_serve_chat(**kwargs):
+        time.sleep(1.0)
+        return _smoke_result(revision, "run-1")
+
+    monkeypatch.setattr(serving._app, "serve_chat", slow_serve_chat)
+    started = time.monotonic()
+    with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
+        serving._run_deployment_smoke(
+            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.05
+        )
+    assert time.monotonic() - started < 0.5
+
+
 def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):
     # once the deadline expires no further generation starts, and expiry never falls back to the
     # fixed prompt.

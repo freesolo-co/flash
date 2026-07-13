@@ -272,14 +272,18 @@ def _run_deployment_smoke(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _smoke_timeout_error(budget_s)
-        result = _app.serve_chat(
-            run_id=serving_model,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=256,
-            thinking=spec.thinking,
-            expected_checkpoint=expected_checkpoint,
-            timeout_s=remaining,
+        result = _bounded_call(
+            lambda messages=messages, remaining=remaining: _app.serve_chat(
+                run_id=serving_model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=256,
+                thinking=spec.thinking,
+                expected_checkpoint=expected_checkpoint,
+                timeout_s=remaining,
+            ),
+            deadline=deadline,
+            budget_s=budget_s,
         )
         turns += 1
         last_content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
@@ -389,7 +393,10 @@ def _finish_deployment_unlocked(
                 raise ServingError(
                     f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
                 )
-            if latest.state in {"cancelled", "failed", "dry_run"}:
+            if (
+                latest.state in {"cancelled", "failed", "dry_run"}
+                and latest.state != prev_state
+            ):
                 raise ServingError(
                     f"run became {latest.state!r} before checkpoint alias activation"
                 )
