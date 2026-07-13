@@ -171,7 +171,7 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                 ) from exc
             raise
         run_id = prepared.public_spec.run_id
-        if affordability_org_id:
+        if bill_on_completion:
             _precheck_budget_or_block(
                 run_id=run_id,
                 estimate_usd=prepared.estimated_cost_usd,

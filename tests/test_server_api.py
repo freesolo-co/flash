@@ -1241,7 +1241,7 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert seen["lora_rank"] == 64
     public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
-    assert public["spec"]["train"]["lora_rank"] == 8
+    assert "lora_rank" not in public["spec"]["train"]
     assert public["spec"]["train"]["init_from_adapter"] == "source-run"
     assert "effective_preparation" not in public
 

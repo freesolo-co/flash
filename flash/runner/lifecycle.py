@@ -81,7 +81,7 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     """The spec the workers/loggers see for THIS attempt's allocated class."""
     if spec.gpu.type == gpu_type:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "type": gpu_type}
     return JobSpec.from_dict(d)
 
@@ -96,7 +96,7 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
 
     if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "network_volume": None}
     return JobSpec.from_dict(d)
 
@@ -143,6 +143,7 @@ def _submit_seed_supervised(
     from flash.providers.base import PollResult
     from flash.runner import (
         TERMINAL_STATES,
+        _persist_effective_worker_spec,
         _RunCancelled,
         _spec_with_gpu,
         _update,
@@ -348,6 +349,8 @@ def _submit_seed_supervised(
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             if drop_weight_cache:
                 run_spec = _drop_weight_cache(run_spec)
+            if not _persist_effective_worker_spec(run_spec):
+                raise _cancel()
             current_gpu["name"] = chosen.gpu
             current_attempt["value"] = attempt
             provider = get_provider(chosen.provider)
@@ -366,7 +369,9 @@ def _submit_seed_supervised(
                 from flash.providers.base import UnreconciledCreateError
 
                 if isinstance(exc, UnreconciledCreateError):
-                    res = PollResult(False, failure="job_failed", detail=f"unreconciled create: {exc}")
+                    res = PollResult(
+                        False, failure="job_failed", detail=f"unreconciled create: {exc}"
+                    )
                 else:
                     res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
                     if attempt < infra_budget:
@@ -620,11 +625,14 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner import get_status
+    from flash.runner import effective_spec_from_status, get_status
 
     status = None
     with contextlib.suppress(Exception):
         status = get_status(spec.run_id)
+    if status is not None:
+        with contextlib.suppress(Exception):
+            spec = effective_spec_from_status(status)
     if status is not None and status.remote:
         try:
             from flash.providers import get_provider

@@ -120,11 +120,54 @@ def resolve_hf_dataset_revision(repo: str, token: str | None = None) -> str:
     return revision.lower()
 
 
-def _canonical_json_default(value: Any) -> dict[str, str]:
-    """Digest ``parse_float=Decimal`` values exactly, without colliding with JSON strings."""
+def _contains_decimal(value: Any) -> bool:
     if isinstance(value, Decimal):
-        return {"__decimal__": str(value)}
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_decimal(key) or _contains_decimal(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_decimal(item) for item in value)
+    return False
+
+
+def _typed_canonical_tree(value: Any) -> Any:
+    """Encode JSON values and decimals into an injective, type-aware canonical tree."""
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, Decimal):
+        return ["decimal", str(value)]
+    if isinstance(value, int):
+        return ["int", str(value)]
+    if isinstance(value, float):
+        return ["float", value]
+    if isinstance(value, str):
+        return ["string", value]
+    if isinstance(value, Mapping):
+        return [
+            "object",
+            [
+                [_typed_canonical_tree(key), _typed_canonical_tree(item)]
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            ],
+        ]
+    if isinstance(value, (list, tuple)):
+        return ["array", [_typed_canonical_tree(item) for item in value]]
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _canonical_config_bytes(config: Mapping[str, Any]) -> bytes:
+    if not _contains_decimal(config):
+        return json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    tree = _typed_canonical_tree(config)
+    encoded = json.dumps(tree, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return b"typed-json-decimal-v1\0" + encoded
 
 
 def adapter_artifact_identity(
@@ -140,13 +183,7 @@ def adapter_artifact_identity(
     if resolved is None:
         raise ValueError("source adapter reference is invalid")
     repo, prefix = resolved
-    config_bytes = json.dumps(
-        config,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=_canonical_json_default,
-    ).encode("utf-8")
+    config_bytes = _canonical_config_bytes(config)
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     paths = [f"{prefix}/adapter/{name}" for name in ADAPTER_WEIGHT_FILES]
     try:

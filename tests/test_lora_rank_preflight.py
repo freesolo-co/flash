@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from decimal import Decimal
@@ -266,6 +267,28 @@ def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
         token="token",
     )
     assert string_typed.digest != first.digest
+    magic_object = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(
+            _FLOAT_CONFIG_JSON.replace(
+                '"lora_dropout": 0.05',
+                '"lora_dropout": {"__decimal__": "0.05"}',
+            )
+        ),
+        token="token",
+    )
+    assert magic_object.digest != first.digest
+    assert magic_object.config_sha256 != first.config_sha256
+
+    integer_config = _config()
+    integer_identity = adapter_artifact_identity(_ADAPTER_REF, integer_config, token="token")
+    legacy_bytes = json.dumps(
+        integer_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert integer_identity.config_sha256 == hashlib.sha256(legacy_bytes).hexdigest()
 
 
 def test_lora_rank_uses_schema_adapter_storage_ref_parser():

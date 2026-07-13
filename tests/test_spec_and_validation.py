@@ -211,6 +211,41 @@ def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> Non
     assert spec.train.lora_rank == 32
 
 
+def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
+    spec = JobSpec.from_dict(
+        {
+            **BASE_RAW,
+            "train": {
+                **BASE_RAW["train"],
+                "init_from_adapter": "owner/runs:rl/source-run",
+                "init_from_adapter_revision": "a" * 40,
+                "lora_rank": 64,
+                "lora_alpha": 128,
+            },
+        }
+    )
+
+    public = spec.to_dict()
+    internal = spec.to_internal_dict()
+
+    assert "init_from_adapter_revision" not in public["train"]
+    assert "lora_rank" not in public["train"]
+    assert internal["train"]["init_from_adapter_revision"] == "a" * 40
+    assert internal["train"]["lora_rank"] == 64
+    assert JobSpec.from_dict(internal) == spec
+
+
+def test_public_warmstart_status_spec_round_trips_through_schema() -> None:
+    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw["train"].pop("lora_rank")
+    public = spec_from_dict(raw).to_dict()
+
+    restored = spec_from_dict(public)
+
+    assert restored.train.init_from_adapter == "source-run"
+    assert restored.train.lora_rank == 32
+
+
 @pytest.mark.parametrize("init_from_adapter", [None, "", "   "])
 def test_blank_or_null_init_adapter_preserves_explicit_rank(init_from_adapter) -> None:
     spec = spec_from_dict(

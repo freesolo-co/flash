@@ -185,6 +185,7 @@ class RunStatus:
         from flash.serve.urls import public_deployment
 
         data = _status_storage_dict(self)
+        data["spec"] = _public_status_spec(data.get("spec"))
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
         if isinstance(self.deployment, dict):
@@ -192,13 +193,30 @@ class RunStatus:
         return data
 
 
+def _public_status_spec(raw):
+    """Canonicalize valid specs and safely redact malformed legacy shapes."""
+    if not isinstance(raw, dict):
+        return raw
+    try:
+        return JobSpec.from_dict(raw).to_dict()
+    except Exception:
+        data = dict(raw)
+        train = data.get("train")
+        if isinstance(train, dict):
+            train = dict(train)
+            train.pop("init_from_adapter_revision", None)
+            init_ref = train.get("init_from_adapter")
+            if init_ref is not None and (not isinstance(init_ref, str) or init_ref.strip()):
+                train.pop("lora_rank", None)
+            data["train"] = train
+        return data
+
+
 def _status_storage_dict(status: RunStatus) -> dict:
     """Serialize status for persistence without filtering internal deployment state."""
     data = asdict(status)
     data["adapter_ref"] = (
-        _adapter_ref_from_status_spec(status.spec)
-        if status.state in {"done", "deployed"}
-        else None
+        _adapter_ref_from_status_spec(status.spec) if status.state in {"done", "deployed"} else None
     )
     return data
 
@@ -232,7 +250,7 @@ def runs_file_path(run_id: str, suffix: str) -> str:
 
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     """Spec dict with gpu.disk_gb raised to the model's catalog min_disk_gb."""
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     need = int(getattr(info, "min_disk_gb", 0) or 0)
     if need > int(d["gpu"].get("disk_gb") or 0):
         d["gpu"] = {**d["gpu"], "disk_gb": need}
@@ -292,7 +310,7 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     if not spec.run_id or spec.run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
     repo = managed_hf_repo_for_environment(spec.environment.id)
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
     return JobSpec.from_dict(d)
 
@@ -326,7 +344,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         return spec
     if not sha:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["environment"] = {**d["environment"], "resolved_sha": sha}
     return JobSpec.from_dict(d)
 
@@ -360,7 +378,7 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     attach = is_catalog and (info is None or _fits_weight_cache(info))
     if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     if attach:
         d["gpu"] = {
             **d["gpu"],
@@ -566,7 +584,7 @@ def _preparation_digest(
     payload = {
         "version": 1,
         "public_spec": public_spec.to_dict(),
-        "worker_spec": worker_spec.to_dict(),
+        "worker_spec": worker_spec.to_internal_dict(),
         "adapter_identity": adapter_identity,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -574,8 +592,8 @@ def _preparation_digest(
 
 
 def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None:
-    public = public_spec.to_dict()
-    effective = worker_spec.to_dict()
+    public = public_spec.to_internal_dict()
+    effective = worker_spec.to_internal_dict()
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -588,6 +606,14 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     ):
         effective_train[train_field] = public_train.get(train_field)
     effective["train"] = effective_train
+    public_gpu = dict(public["gpu"])
+    effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    if (
+        public_gpu.get("network_volume") == WEIGHT_CACHE_VOLUME_NAME
+        and effective_gpu.get("network_volume") is None
+    ):
+        effective_gpu["network_volume"] = WEIGHT_CACHE_VOLUME_NAME
+    effective["gpu"] = effective_gpu
     if effective != public:
         raise ValueError("persisted effective preparation does not match the public run")
     if not public_ref:
@@ -659,6 +685,31 @@ def prepare_job(
     )
 
 
+def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
+    """Persist the selected worker spec before provider provisioning starts."""
+    status = get_status(worker_spec.run_id)
+    snapshot = status.effective_preparation
+    public_spec = JobSpec.from_dict(status.spec)
+    if public_spec.train.init_from_adapter:
+        if not isinstance(snapshot, dict):
+            raise ValueError("persisted effective preparation is malformed")
+        effective_spec_from_status(status)
+        adapter_identity = snapshot.get("adapter_identity")
+    else:
+        adapter_identity = None
+    _validate_effective_spec(public_spec, worker_spec)
+    effective_preparation = {
+        "worker_spec": worker_spec.to_internal_dict(),
+        "adapter_identity": adapter_identity,
+        "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
+    }
+    return _update(
+        worker_spec.run_id,
+        status.state,
+        effective_preparation=effective_preparation,
+    )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -697,7 +748,7 @@ def submit_job(
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
         effective_preparation={
-            "worker_spec": worker_spec.to_dict(),
+            "worker_spec": worker_spec.to_internal_dict(),
             "adapter_identity": prepared.adapter_identity,
             "preparation_digest": _preparation_digest(
                 public_spec, worker_spec, prepared.adapter_identity

@@ -178,10 +178,20 @@ class JobSpec:
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the public/API representation of this job specification."""
+        data = asdict(self)
+        train = data["train"]
+        train.pop("init_from_adapter_revision", None)
+        if train.get("init_from_adapter"):
+            train.pop("lora_rank", None)
+        return data
+
+    def to_internal_dict(self) -> dict[str, Any]:
+        """Return the complete control-plane and worker representation."""
         return asdict(self)
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True)
+        return json.dumps(self.to_internal_dict(), sort_keys=True)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:

@@ -149,7 +149,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.providers.base import JobHandle
 
     try:
-        worker_spec = effective_spec_from_status(status, verify_source=True)
+        worker_spec = effective_spec_from_status(status)
         remote = dict(status.remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
@@ -164,6 +164,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
+            # job ended not-ok, so any replacement must revalidate the pinned source before paid work.
+            worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume from
             # the last HF checkpoint (fresh allocation, worker resumes mid-training) instead of
             # failing; _run_training still terminates a genuinely broken run when it re-fails.

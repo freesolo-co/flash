@@ -1477,7 +1477,8 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
 
         st = orch.get_status("warm-run")
         assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
-        assert (st.spec["train"]["lora_rank"], st.spec["train"]["lora_alpha"]) == (8, 16)
+        assert "lora_rank" not in st.spec["train"]
+        assert st.spec["train"]["lora_alpha"] == 16
         assert (
             launched["init_from_adapter"]
             == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
@@ -1575,7 +1576,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         assert status.state == "dry_run"
 
 
-def test_submit_dry_run_preserves_public_warmstart_rank_and_alpha(monkeypatch):
+def test_submit_dry_run_omits_public_warmstart_rank_and_preserves_alpha(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         from flash.spec import JobSpec
@@ -1624,8 +1625,10 @@ def test_submit_dry_run_preserves_public_warmstart_rank_and_alpha(monkeypatch):
         status = orch.submit_job(spec, dry_run=True, background=False)
 
         assert status.state == "dry_run"
-        assert status.spec["train"]["lora_rank"] == 8
+        assert "lora_rank" not in status.spec["train"]
+        assert "init_from_adapter_revision" not in status.spec["train"]
         assert status.spec["train"]["lora_alpha"] == 16
+        assert status.to_dict()["spec"] == status.spec
 
 
 def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
@@ -1819,6 +1822,77 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             )
 
 
+def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
+        import flash.providers as providers
+        from flash.providers.base import PollResult
+        from flash.spec import JobSpec
+
+        base = _spec("warm-recover").to_dict()
+        public_spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
+            }
+        )
+        worker_dict = public_spec.to_internal_dict()
+        worker_dict["train"].update(
+            {
+                "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+                "init_from_adapter_revision": "a" * 40,
+                "lora_rank": 64,
+            }
+        )
+        worker_spec = JobSpec.from_dict(worker_dict)
+        identity = rank_mod.AdapterArtifactIdentity(
+            "digest-v1", "config-v1", "adapter_model.safetensors", "weights-v1:123"
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-recover",
+                state="running",
+                spec=public_spec.to_dict(),
+                remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+                effective_preparation={
+                    "worker_spec": worker_spec.to_internal_dict(),
+                    "adapter_identity": identity.to_dict(),
+                    "preparation_digest": orch._preparation_digest(
+                        public_spec, worker_spec, identity.to_dict()
+                    ),
+                },
+            )
+        )
+        monkeypatch.setattr(
+            rank_mod,
+            "load_hf_adapter_config",
+            lambda *a, **k: pytest.fail("live handle recovery must not reread the source"),
+        )
+        polled = {}
+
+        class Provider:
+            def poll(self, handle, spec, seed, **kwargs):
+                polled.update(
+                    init_from_adapter=spec.train.init_from_adapter,
+                    revision=spec.train.init_from_adapter_revision,
+                    lora_rank=spec.train.lora_rank,
+                )
+                return PollResult(True, metrics={"wall_seconds": 1.0})
+
+        monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+        status = orch.attach_run("warm-recover", log_stream=sys.stderr)
+
+        assert status.state == "done"
+        assert polled == {
+            "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+            "revision": "a" * 40,
+            "lora_rank": 64,
+        }
+
+
 def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -1857,7 +1931,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                 billing_context={"org_id": "org-a"},
                 remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
                 effective_preparation={
-                    "worker_spec": worker_spec.to_dict(),
+                    "worker_spec": worker_spec.to_internal_dict(),
                     "adapter_identity": identity.to_dict(),
                     "preparation_digest": orch._preparation_digest(
                         public_spec, worker_spec, identity.to_dict()
@@ -1897,7 +1971,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
         }
 
 
-def test_attach_rejects_artifact_drift_before_poll(monkeypatch):
+def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.lora_rank as rank_mod
@@ -1947,15 +2021,25 @@ def test_attach_rejects_artifact_drift_before_poll(monkeypatch):
                 "changed", "config-v2", "adapter_model.safetensors", "weights-v2:123"
             ),
         )
+        polls = []
         monkeypatch.setattr(
             jobs,
             "poll_job",
-            lambda *a, **k: pytest.fail("drifted source must be rejected before provider polling"),
+            lambda *a, **k: (
+                polls.append("polled")
+                or jobs.PollResult(False, failure="stalled", detail="stalled")
+            ),
         )
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orch,
+            "_run_training",
+            lambda *a, **k: pytest.fail("drifted source must block resubmission"),
+        )
 
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
+        assert polls == ["polled"]
         assert status.state == "failed"
         assert "source-run/step-40" in (status.error or "")
         assert "changed after submission" in (status.error or "")
@@ -2661,7 +2745,7 @@ def test_cancel_tears_down_legacy_or_malformed_warmstart_without_child_pricing(
         assert "cancel" in calls
         assert "destroy" in calls
         assert "undeploy" in calls
-        assert ("gc", 8) in calls
+        assert ("gc", 32) in calls
 
 
 def test_cancel_uses_rest_handle(monkeypatch):

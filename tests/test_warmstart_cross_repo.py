@@ -323,7 +323,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
         state="queued",
         spec=public_dict,
         effective_preparation={
-            "worker_spec": worker.to_dict(),
+            "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity,
             "preparation_digest": R._preparation_digest(public, worker, identity),
         },
@@ -331,12 +331,152 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     R._save_status(status)
 
     assert "effective_preparation" not in status.to_dict()
+    legacy_status = R.RunStatus(
+        run_id="legacy-child",
+        state="queued",
+        spec=public.to_internal_dict(),
+    )
+    public_status_spec = legacy_status.to_dict()["spec"]
+    assert "init_from_adapter_revision" not in public_status_spec["train"]
+    assert "lora_rank" not in public_status_spec["train"]
     with open(R.runs_file_path("child-run", ".json")) as f:
         stored = json.load(f)
     assert stored["effective_preparation"]["worker_spec"]["train"]["lora_rank"] == 64
     loaded = R.get_status("child-run")
-    assert loaded.spec["train"]["lora_rank"] == 8
+    assert "lora_rank" not in loaded.spec["train"]
     assert loaded.effective_preparation == stored["effective_preparation"]
+
+
+@pytest.mark.parametrize(
+    "raw_spec",
+    [
+        None,
+        "legacy-spec",
+        {"train": "legacy-train", "gpu": {}},
+        {"train": {}, "gpu": "legacy-gpu"},
+    ],
+)
+def test_public_status_tolerates_malformed_legacy_spec_shapes(raw_spec):
+    import flash.runner as R
+
+    status = R.RunStatus(
+        run_id="legacy-run",
+        state="running",
+        spec=raw_spec,
+        effective_preparation={"private": "snapshot"},
+    )
+
+    public = status.to_dict()
+
+    assert public["spec"] == raw_spec
+    assert "effective_preparation" not in public
+
+
+@pytest.mark.parametrize("init_ref", ["source-run", 123, 0, {}])
+def test_public_status_redacts_identifiable_warmstart_fields_from_malformed_spec(init_ref):
+    import flash.runner as R
+
+    raw_spec = {
+        "train": {
+            "init_from_adapter": init_ref,
+            "init_from_adapter_revision": _REVISION,
+            "lora_rank": 64,
+        },
+        "gpu": "legacy-gpu",
+    }
+    status = R.RunStatus(run_id="legacy-run", state="running", spec=raw_spec)
+
+    public_spec = status.to_dict()["spec"]
+
+    assert public_spec["train"] == {"init_from_adapter": init_ref}
+    assert raw_spec["train"]["init_from_adapter_revision"] == _REVISION
+    assert raw_spec["train"]["lora_rank"] == 64
+
+
+@pytest.mark.parametrize("snapshot", [None, []])
+def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_path, snapshot):
+    import flash.runner as R
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = JobSpec.from_dict(
+        {
+            "run_id": "legacy-child",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=public.to_dict(),
+            effective_preparation=snapshot,
+        )
+    )
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        R._persist_effective_worker_spec(public)
+
+
+def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path):
+    import flash.providers as providers
+    import flash.runner as R
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    public = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX 4090"},
+            "train": {"init_from_adapter": "source-run", "lora_rank": 8},
+        }
+    )
+    worker_dict = public.to_internal_dict()
+    worker_dict["train"].update(
+        {
+            "init_from_adapter": "owner/source:rl/source-run",
+            "init_from_adapter_revision": _REVISION,
+            "lora_rank": 64,
+        }
+    )
+    worker = JobSpec.from_dict(worker_dict)
+    identity = {"digest": "immutable-v1"}
+    R._save_status(
+        R.RunStatus(
+            run_id=public.run_id,
+            state="provisioning",
+            spec=public.to_dict(),
+            effective_preparation={
+                "worker_spec": worker.to_internal_dict(),
+                "adapter_identity": identity,
+                "preparation_digest": R._preparation_digest(public, worker, identity),
+            },
+        )
+    )
+    selected_dict = worker.to_internal_dict()
+    selected_dict["gpu"]["type"] = "RTX 5090"
+    selected = JobSpec.from_dict(selected_dict)
+
+    assert R._persist_effective_worker_spec(selected)
+    stored = R.get_status(public.run_id)
+    assert stored.effective_preparation["worker_spec"]["gpu"]["type"] == "RTX 5090"
+    assert R.effective_spec_from_status(stored).gpu.type == "RTX 5090"
+
+    cleaned = []
+
+    class Provider:
+        def gc(self, spec):
+            cleaned.append(spec)
+
+    monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
+    monkeypatch.setattr(providers, "available_providers", lambda: [])
+    R._gc_run_endpoints(public)
+
+    assert [spec.gpu.type for spec in cleaned] == ["RTX 5090"]
 
 
 def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeypatch):
@@ -370,7 +510,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
         state="running",
         spec=public.to_dict(),
         effective_preparation={
-            "worker_spec": worker.to_dict(),
+            "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity.to_dict(),
             "preparation_digest": R._preparation_digest(public, worker, identity.to_dict()),
         },
@@ -435,7 +575,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     worker = JobSpec.from_dict(worker_dict)
     identity = {"digest": "artifact-v1"}
     snapshot = {
-        "worker_spec": copy.deepcopy(worker.to_dict()),
+        "worker_spec": copy.deepcopy(worker.to_internal_dict()),
         "adapter_identity": identity,
         "preparation_digest": R._preparation_digest(public, worker, identity),
     }
