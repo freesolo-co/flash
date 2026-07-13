@@ -29,6 +29,7 @@ def cancel_run(run_id: str) -> RunStatus:
         _update,
         actual_steps_run,
         charge_usd_for_spec,
+        complete_deployment_cleanup,
         get_status,
         mark_deployment_undeployed,
         revoke_deployment_attempt,
@@ -49,12 +50,23 @@ def cancel_run(run_id: str) -> RunStatus:
             revoke_deployment_attempt(run_id, status.deployment_attempt)
         elif durable_mutation:
             revoke_deployment_intent(run_id, durable_mutation)
-        if durable_mutation:
-            with contextlib.suppress(Exception):
-                from flash.serve.deploy import undeploy_adapter
+        status = get_status(run_id)
+        cleanup = status.deployment_cleanup
+        if isinstance(cleanup, dict):
+            try:
+                from flash.serve.deploy import DeploymentSuperseded, disable_owned_adapter
 
-                undeploy_adapter(run_id)
-                mark_deployment_undeployed(run_id)
+                disable_owned_adapter(
+                    run_id,
+                    int(cleanup["target_revision"]),
+                    str(cleanup["mutation_id"]),
+                )
+            except DeploymentSuperseded:
+                complete_deployment_cleanup(run_id, cleanup)
+            except Exception:
+                pass
+            else:
+                complete_deployment_cleanup(run_id, cleanup)
         status = get_status(run_id)
         if status.state in TERMINAL_STATES and not entered_deployed:
             return status
@@ -440,10 +452,32 @@ def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
             or deployment.get("mutation_id") != mutation_id
         ):
             return status
+        target_revision = deployment.get("target_revision")
+        if not isinstance(target_revision, int):
+            return status
+        status.deployment_cleanup = {
+            "target_revision": target_revision,
+            "mutation_id": mutation_id,
+            "requested_at": time.time(),
+        }
         status.deployment = {**deployment, "state": "undeployed"}
         status.deployment_attempt = None
         if status.state == "deployed":
             status.state = "done"
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def complete_deployment_cleanup(run_id: str, cleanup: dict) -> RunStatus:
+    """Clear exact private cleanup ownership after confirmed remote disablement."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment_cleanup != cleanup:
+            return status
+        status.deployment_cleanup = None
         status.updated_at = time.time()
         _save_status(status)
         return status
@@ -508,6 +542,7 @@ def mark_undeployed(run_id: str) -> RunStatus:
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
         status.deployment_attempt = None
+        status.deployment_cleanup = None
         if status.state == "deployed":
             status.state = "done"
         status.updated_at = time.time()
@@ -531,6 +566,9 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
             changed = True
         if status.deployment_attempt is not None:
             status.deployment_attempt = None
+            changed = True
+        if status.deployment_cleanup is not None:
+            status.deployment_cleanup = None
             changed = True
         if changed:
             status.updated_at = time.time()

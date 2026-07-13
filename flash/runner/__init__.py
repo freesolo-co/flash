@@ -157,6 +157,8 @@ class RunStatus:
     deployment: dict | None = None
     # private queued serving work; never exposed through public status serialization
     deployment_attempt: dict | None = None
+    # private exact remote cleanup ownership; retained until disablement is confirmed
+    deployment_cleanup: dict | None = None
     remote: dict | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
@@ -187,6 +189,7 @@ class RunStatus:
 
         data = _status_storage_dict(self)
         data.pop("deployment_attempt", None)
+        data.pop("deployment_cleanup", None)
         if isinstance(self.deployment, dict):
             data["deployment"] = public_deployment(self.deployment)
         return data
@@ -832,6 +835,7 @@ def _save_status(status: RunStatus) -> None:
 from flash.runner.deploy import (  # noqa: E402,F401
     attach_run,
     cancel_run,
+    complete_deployment_cleanup,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,

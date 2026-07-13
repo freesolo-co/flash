@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 import flash.providers.runpod.train as ftrain
 from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
 
@@ -225,6 +227,87 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        pytest.param(RuntimeError("delete failed"), id="delete-failure"),
+        pytest.param(RuntimeError("disable readback was inconclusive"), id="ambiguous-readback"),
+    ],
+)
+def test_cancel_retains_exact_cleanup_identity_until_disable_is_confirmed(
+    tmp_path, monkeypatch, cleanup_error
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cleanup-keep"})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={
+                "state": "deploying",
+                "mutation_id": "mutation-7",
+                "target_revision": 7,
+            },
+        )
+    )
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "disable_owned_adapter",
+        lambda *_args: (_ for _ in ()).throw(cleanup_error),
+    )
+
+    out = orch.cancel_run(spec.run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert out.deployment_cleanup["target_revision"] == 7
+    assert out.deployment_cleanup["mutation_id"] == "mutation-7"
+    assert "deployment_cleanup" not in out.to_dict()
+
+
+def test_cancel_clears_exact_cleanup_identity_after_confirmed_disable(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cleanup-done"})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={
+                "state": "deploying",
+                "mutation_id": "mutation-8",
+                "target_revision": 8,
+            },
+        )
+    )
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    disabled = []
+    monkeypatch.setattr(
+        deploy,
+        "disable_owned_adapter",
+        lambda *args: disabled.append(args) or True,
+    )
+
+    out = orch.cancel_run(spec.run_id)
+
+    assert disabled == [(spec.run_id, 8, "mutation-8")]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert out.deployment_cleanup is None
 
 
 def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path, monkeypatch):

@@ -322,13 +322,58 @@ def test_resolve_deploy_step_branches(monkeypatch):
         assert exc.value.status_code == 400, bad
 
 
-def _recovering_status(deployment, deployment_attempt=None):
+def _recovering_status(deployment, deployment_attempt=None, deployment_cleanup=None):
     return types.SimpleNamespace(
         run_id="run-1",
+        state="done",
         spec={"model": "Qwen/Qwen3.5-0.8B"},
         deployment=deployment,
         deployment_attempt=deployment_attempt,
+        deployment_cleanup=deployment_cleanup,
     )
+
+
+def test_recovery_retries_persisted_cleanup_after_disable_failure(monkeypatch):
+    cleanup = {"target_revision": 7, "mutation_id": "old", "requested_at": 1.0}
+    status = _recovering_status(
+        {"state": "undeployed", "mutation_id": "old"}, deployment_cleanup=cleanup
+    )
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        serving._app,
+        "disable_owned_adapter",
+        lambda *_args: (_ for _ in ()).throw(ServingError("delete failed")),
+    )
+    monkeypatch.setattr(
+        serving,
+        "complete_deployment_cleanup",
+        lambda *_args: pytest.fail("failed cleanup must remain retryable"),
+    )
+
+    assert serving._recover_deployment("run-1") is False
+
+
+def test_recovery_clears_cleanup_without_disabling_newer_mutation(monkeypatch):
+    cleanup = {"target_revision": 7, "mutation_id": "old", "requested_at": 1.0}
+    newer = {"state": "deploying", "target_revision": 8, "mutation_id": "new"}
+    status = _recovering_status(newer, deployment_cleanup=cleanup)
+    completed = []
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+
+    def reject_old(run_id, revision, mutation_id):
+        assert (run_id, revision, mutation_id) == ("run-1", 7, "old")
+        raise serving._app.DeploymentSuperseded("newer mutation owns the registry row")
+
+    monkeypatch.setattr(serving._app, "disable_owned_adapter", reject_old)
+    monkeypatch.setattr(
+        serving,
+        "complete_deployment_cleanup",
+        lambda run_id, owned: completed.append((run_id, owned)),
+    )
+
+    assert serving._recover_deployment("run-1") is True
+    assert completed == [("run-1", cleanup)]
+    assert status.deployment == newer
 
 
 def test_recovery_preserves_active_slow_pre_intent_worker(monkeypatch):
@@ -368,7 +413,10 @@ def test_recovery_fails_orphaned_pre_intent_attempt(monkeypatch):
     assert "before registry intent" in marked[0][2]["error"]
 
 
-def test_deployment_worker_liveness_clears_when_worker_exits(monkeypatch):
+@pytest.mark.parametrize(
+    "worker_error", [None, RuntimeError("worker stopped")], ids=["success", "error"]
+)
+def test_deployment_worker_liveness_clears_on_all_exits(monkeypatch, worker_error):
     attempt = {
         "phase": "initial",
         "deployment": {"state": "deploying", "mutation_id": "mine"},
@@ -377,14 +425,43 @@ def test_deployment_worker_liveness_clears_when_worker_exits(monkeypatch):
 
     def finish(**_kwargs):
         assert serving._deployment_worker_is_active("run-1", "mine") is True
-        raise RuntimeError("worker stopped")
+        if worker_error is not None:
+            raise worker_error
 
     monkeypatch.setattr(serving, "_finish_deployment_unlocked", finish)
     serving._mark_deployment_worker_active("run-1", "mine")
 
-    with pytest.raises(RuntimeError, match="worker stopped"):
+    if worker_error is None:
         serving._finish_deployment(run_id="run-1", deployment_attempt=attempt)
+    else:
+        with pytest.raises(RuntimeError, match="worker stopped"):
+            serving._finish_deployment(run_id="run-1", deployment_attempt=attempt)
     assert serving._deployment_worker_is_active("run-1", "mine") is False
+
+
+def test_recovery_preserves_active_post_intent_worker(monkeypatch):
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": {"adapter_id": "run-1", "mutation_id": "mine"},
+        "prior_revision": None,
+        "target_revision": 1,
+        "mutation_id": "mine",
+    }
+    monkeypatch.setattr(
+        serving._app, "get_status", lambda _run_id: _recovering_status(deployment)
+    )
+    monkeypatch.setattr(
+        serving._app,
+        "read_adapter_record",
+        lambda _run_id: pytest.fail("active deployment worker owns post-intent recovery"),
+    )
+
+    serving._mark_deployment_worker_active("run-1", "mine")
+    try:
+        assert serving._recover_deployment("run-1") is False
+    finally:
+        serving._clear_deployment_worker_active("run-1", "mine")
 
 
 @pytest.mark.parametrize(
@@ -416,7 +493,7 @@ def test_worker_death_recovery_classifies_non_resumable_records(monkeypatch, rec
     assert expected in marked[0]["error"]
 
 
-def test_worker_death_recovery_resumes_exact_target(monkeypatch):
+def test_post_intent_orphan_resumes_without_live_worker(monkeypatch):
     desired = {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"}
     deployment = {
         "state": "deploying",
@@ -436,6 +513,7 @@ def test_worker_death_recovery_resumes_exact_target(monkeypatch):
     monkeypatch.setattr(
         serving, "_resume_registered_deployment", lambda *args: resumed.append(args)
     )
+    assert serving._deployment_worker_is_active("run-1", "mine") is False
     assert serving._recover_deployment("run-1") is True
     assert resumed
 
@@ -655,6 +733,91 @@ def test_recovery_workers_are_bounded_and_honor_shutdown_signal(monkeypatch):
     stopped = threading.Event()
     stopped.set()
     assert serving.recover_deployments(max_workers=2, stop_event=stopped) == 0
+
+
+def test_transient_final_registry_read_preserves_deploying_for_recovery(monkeypatch):
+    desired = {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"}
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": desired,
+        "prior_revision": None,
+        "target_revision": 1,
+        "mutation_id": "mine",
+        "verify": True,
+    }
+    status = _recovering_status(deployment)
+    reads = []
+    monkeypatch.setattr(serving, "_RECOVERY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(serving.JobSpec, "from_dict", lambda _spec: object())
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(serving, "_smoke_with_retries", lambda *_args: {"verified_at": 2.0})
+
+    def transient_read(run_id):
+        reads.append(run_id)
+        raise ServingError("registry unavailable")
+
+    monkeypatch.setattr(serving._app, "read_adapter_record", transient_read)
+    monkeypatch.setattr(
+        serving._app,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("inconclusive readback must not disable"),
+    )
+    monkeypatch.setattr(
+        serving,
+        "mark_deployment_failed",
+        lambda *_args: pytest.fail("inconclusive readback must remain deploying"),
+    )
+
+    serving._resume_registered_deployment("run-1", {}, deployment)
+
+    assert reads == ["run-1"] * serving._RECOVERY_READ_ATTEMPTS
+    assert status.deployment["state"] == "deploying"
+
+
+def test_authoritative_final_registry_mismatch_uses_exact_owned_cleanup(monkeypatch):
+    desired = {"adapter_id": "run-1", "mutation_id": "mine", "status": "ready"}
+    deployment = {
+        "state": "deploying",
+        "requested_at": 1.0,
+        "desired_record": desired,
+        "prior_revision": None,
+        "target_revision": 5,
+        "mutation_id": "mine",
+        "verify": True,
+    }
+    status = _recovering_status(deployment)
+    disabled = []
+    failed = []
+    monkeypatch.setattr(serving.JobSpec, "from_dict", lambda _spec: object())
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(serving, "_smoke_with_retries", lambda *_args: {"verified_at": 2.0})
+    monkeypatch.setattr(
+        serving._app,
+        "read_adapter_record",
+        lambda _run_id: {
+            "adapter_id": "run-1",
+            "mutation_id": "newer",
+            "registry_revision": 6,
+            "status": "ready",
+        },
+    )
+    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: False)
+
+    def reject_superseded(run_id, revision, mutation_id):
+        disabled.append((run_id, revision, mutation_id))
+        raise serving._app.DeploymentSuperseded("newer mutation owns the registry row")
+
+    monkeypatch.setattr(serving._app, "disable_owned_adapter", reject_superseded)
+    monkeypatch.setattr(
+        serving, "mark_deployment_failed", lambda _run_id, record: failed.append(record)
+    )
+
+    serving._resume_registered_deployment("run-1", {}, deployment)
+
+    assert disabled == [("run-1", 5, "mine")]
+    assert failed[0]["state"] == "failed"
+    assert "registry changed" in failed[0]["error"]
 
 
 def test_run_deployment_smoke_binds_expected_checkpoint(monkeypatch):

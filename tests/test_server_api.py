@@ -1352,7 +1352,7 @@ def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch
 
     _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
     posts = []
-    undeployed = []
+    disabled = []
 
     def delayed_deploy(**kwargs):
         desired = _fake_registry_record(kwargs)
@@ -1370,18 +1370,22 @@ def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch
 
     monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
     monkeypatch.setattr(
-        "flash.serve.deploy.undeploy_adapter",
-        lambda cancelled_run_id: undeployed.append(cancelled_run_id) or [],
+        "flash.serve.deploy.disable_owned_adapter",
+        lambda cancelled_run_id, revision, mutation_id: disabled.append(
+            (cancelled_run_id, revision, mutation_id)
+        )
+        or False,
     )
     target, kwargs = jobs[0]
     target(**kwargs)
 
     status = runner.get_status(run_id)
     assert posts == []
-    assert undeployed == [run_id]
+    assert disabled == [(run_id, 1, kwargs["deploy_kwargs"]["mutation_id"])]
     assert status.state == "done"
     assert status.deployment["state"] == "undeployed"
     assert status.deployment_attempt is None
+    assert status.deployment_cleanup is None
 
 
 def test_active_worker_prevents_age_based_attempt_replacement(api, monkeypatch):

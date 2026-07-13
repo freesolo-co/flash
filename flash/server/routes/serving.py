@@ -24,6 +24,7 @@ from jsonschema import SchemaError, ValidationError, validate
 
 from flash.runner import (
     adapter_prefix,
+    complete_deployment_cleanup,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,
@@ -116,6 +117,22 @@ def _recover_deployment(run_id: str) -> bool:
             status = _app.get_status(run_id)
         except FileNotFoundError:
             return False
+        cleanup = getattr(status, "deployment_cleanup", None)
+        if isinstance(cleanup, dict):
+            try:
+                _app.disable_owned_adapter(
+                    run_id,
+                    int(cleanup["target_revision"]),
+                    str(cleanup["mutation_id"]),
+                )
+            except _app.DeploymentSuperseded:
+                complete_deployment_cleanup(run_id, cleanup)
+                return True
+            except Exception as exc:
+                logger.warning("deployment cleanup retry deferred for %s: %s", run_id, exc)
+                return False
+            complete_deployment_cleanup(run_id, cleanup)
+            return True
         deployment_attempt = getattr(status, "deployment_attempt", None)
         if isinstance(deployment_attempt, dict):
             queued = deployment_attempt.get("deployment") or {}
@@ -133,10 +150,12 @@ def _recover_deployment(run_id: str) -> bool:
         deployment = status.deployment or {}
         if deployment.get("state") != "deploying":
             return False
+        mutation_id = deployment.get("mutation_id")
+        if mutation_id and _deployment_worker_is_active(run_id, str(mutation_id)):
+            return False
         desired = deployment.get("desired_record")
         target = deployment.get("target_revision")
         prior = deployment.get("prior_revision")
-        mutation_id = deployment.get("mutation_id")
         try:
             requested_at = float(deployment["requested_at"])
             if not math.isfinite(requested_at):
@@ -377,7 +396,11 @@ def _finalize_registered_deployment(
         smoke = {"detail": "registered; smoke skipped"}
     if not _attempt_owned(run_id, mutation_id):
         return
-    current = _app.read_adapter_record(run_id)
+    try:
+        current = _read_adapter_for_recovery(run_id)
+    except Exception as exc:
+        logger.warning("final deployment readback deferred for %s: %s", run_id, exc)
+        return
     if not _app.record_matches(current, desired, target):
         raise ServingError("serving registry changed during smoke")
     ready = _deployment_state(deployment, "ready", **smoke)
