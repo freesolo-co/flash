@@ -1963,7 +1963,7 @@ def test_chat_rejects_undeployed_record_with_previous_ready_deployment(api, monk
     )
 
     assert response.status_code == 409
-    assert "not deployed" in response.json()["detail"]
+    assert "no active deployment" in response.json()["detail"]
 
 
 def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
