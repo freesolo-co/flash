@@ -105,6 +105,167 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     assert remote["allocated_gpu"] == "RTX 4090"
 
 
+def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, monkeypatch):
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    resolved_sha = "a" * 40
+    resolved_refs = []
+    submitted = []
+
+    def fake_resolve(parsed, *args, **kwargs):
+        resolved_refs.append(parsed.canonical())
+        return resolved_sha
+
+    def fake_runpod_submit(run_spec, seed, **kwargs):
+        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        assert persisted["environment"]["resolved_sha"] == resolved_sha
+        assert persisted["gpu"]["type"] == "RTX 5090"
+        assert persisted["gpu"]["network_volume"] == "flash-weights"
+        submitted.append(
+            {
+                "resolved_sha": run_spec.environment.resolved_sha,
+                "gpu_type": run_spec.gpu.type,
+                "network_volume": run_spec.gpu.network_volume,
+            }
+        )
+        return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+
+    status = orch.submit_job(public)
+
+    assert status.state == "done"
+    assert resolved_refs == ["github:owner/repo@main:env/environment.py"]
+    assert submitted == [
+        {
+            "resolved_sha": resolved_sha,
+            "gpu_type": "RTX 5090",
+            "network_volume": "flash-weights",
+        }
+    ]
+    stored = orch.get_status(public.run_id)
+    assert stored.spec["environment"]["resolved_sha"] == ""
+    worker = stored.effective_preparation["worker_spec"]
+    assert worker["environment"]["resolved_sha"] == resolved_sha
+    assert worker["gpu"]["type"] == "RTX 5090"
+    assert worker["gpu"]["network_volume"] == "flash-weights"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("id", "other/environment@main", id="id"),
+        pytest.param("params", {"difficulty": "hard"}, id="kwargs"),
+        pytest.param("id", "owner/environment@dev", id="revision"),
+        pytest.param(
+            "params",
+            {"difficulty": "easy", "arbitrary": "value"},
+            id="arbitrary-field",
+        ),
+        pytest.param("pip", ["dep==2"], id="pip"),
+        pytest.param("secrets", ["OTHER_TOKEN"], id="secrets"),
+    ],
+)
+def test_effective_spec_rejects_other_environment_mutations(field, value):
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {
+                "id": "owner/environment@main",
+                "params": {"difficulty": "easy"},
+                "pip": ["dep==1"],
+                "secrets": ["TOKEN"],
+            },
+        }
+    )
+    worker_dict = public.to_internal_dict()
+    worker_dict["environment"][field] = value
+    worker = JobSpec.from_dict(worker_dict)
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
+
+
+@pytest.mark.parametrize(
+    "resolved_sha",
+    [
+        pytest.param("main", id="symbolic-ref"),
+        pytest.param("not-a-commit", id="arbitrary-string"),
+        pytest.param("a" * 39, id="short-hex"),
+        pytest.param("g" * 40, id="non-hex"),
+        pytest.param(123, id="non-string"),
+    ],
+)
+def test_effective_spec_rejects_malformed_worker_resolved_sha(resolved_sha):
+    from dataclasses import replace
+
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+    worker = replace(
+        public,
+        environment=replace(public.environment, resolved_sha=resolved_sha),
+    )
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
+
+
+@pytest.mark.parametrize(
+    "resolved_sha",
+    [
+        pytest.param("", id="removal"),
+        pytest.param("b" * 40, id="replacement"),
+    ],
+)
+def test_effective_spec_rejects_changing_existing_resolved_env_sha(resolved_sha):
+    from dataclasses import replace
+
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "resolved_sha": "a" * 40,
+            },
+        }
+    )
+    worker = replace(
+        public,
+        environment=replace(public.environment, resolved_sha=resolved_sha),
+    )
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
+
+
 def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
@@ -358,7 +519,9 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
         # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
         # fallback attempt -> success.
         if vol == WEIGHT_CACHE_VOLUME_NAME:
-            return PollResult(False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)")
+            return PollResult(
+                False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -383,8 +546,12 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
-        Candidate("runpod", "H100", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
-        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # the GPU-walk target the real retry must reach
+        Candidate(
+            "runpod", "H100", 0.49, 48
+        ),  # cheapest -> cache attempt, then cache-less same class
+        Candidate(
+            "runpod", "RTX 6000 Ada", 0.50, 48
+        ),  # the GPU-walk target the real retry must reach
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)

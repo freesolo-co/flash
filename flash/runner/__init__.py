@@ -606,6 +606,16 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     ):
         effective_train[train_field] = public_train.get(train_field)
     effective["train"] = effective_train
+    public_environment = dict(public["environment"])
+    effective_environment = dict(effective["environment"])
+    public_sha = public_environment.get("resolved_sha")
+    effective_sha = effective_environment.get("resolved_sha")
+    if not public_sha and isinstance(effective_sha, str):
+        from flash.envs.loader import _is_commit_sha
+
+        if _is_commit_sha(effective_sha):
+            effective_environment["resolved_sha"] = ""
+    effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
     if (
