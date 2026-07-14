@@ -65,35 +65,18 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
-    status = get_status(run_id)
-    retry_revocation = (
-        status.state == "cancelled"
-        and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
+    initial_status = get_status(run_id)
+    initial_retry_revocation = (
+        initial_status.state == "cancelled"
+        and (initial_status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
     )
-    if status.state in TERMINAL_STATES and not retry_revocation:
-        return status
-    # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
-    entered_deployed = status.state == "deployed"
-    public_spec = JobSpec.from_dict(status.spec)
-    effective_spec = None
-    with contextlib.suppress(Exception):
-        effective_spec = effective_spec_from_status(status)
-    cleanup_spec = effective_spec or public_spec
-    # a mid-training cancel is re-priced to the work actually completed. deployed runs retain the
-    # completed training quote, and revocation retries never alter billing.
-    bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
-    remote = status.remote or {}
+    if initial_status.state in TERMINAL_STATES and not initial_retry_revocation:
+        return initial_status
+    entered_deployed = initial_status.state == "deployed"
+
+    # revoke serving authority before waiting on a deployment smoke that holds the deploy lock.
     teardown_error: Exception | None = None
     initial_teardown_confirmed = False
-    if status.state == "deployed":
-        try:
-            from flash.serve.deploy import undeploy_adapter
-
-            undeploy_adapter(run_id)
-            mark_deployment_undeployed(run_id)
-            initial_teardown_confirmed = True
-        except Exception as exc:
-            teardown_error = exc
 
     def teardown_remote(remote_handle: dict) -> None:
         if not remote_handle:
@@ -108,33 +91,60 @@ def cancel_run(run_id: str) -> RunStatus:
             provider.destroy(handle)
         except Exception:
             pass
+    if initial_status.state == "deployed":
+        try:
+            from flash.serve.deploy import undeploy_adapter
 
-    teardown_remote(remote)
-    with contextlib.suppress(Exception):
-        _gc_run_endpoints(cleanup_spec)
-    # price only from the validated effective snapshot. a missing or malformed private snapshot
-    # must never make the public child rank authoritative, but it also must never block teardown.
-    cancel_charge_usd: float | None = None
-    billing_diagnostic: dict = {}
-    if bill_cancel:
-        if effective_spec is not None:
-            cancel_charge_usd = charge_usd_for_spec(
-                effective_spec,
-                steps=actual_steps_run(get_status(run_id)),
-                fallback=0.0,
-            )
-        else:
-            cancel_charge_usd = 0.0
-            billing_diagnostic = {
-                "billing_state": "failed",
-                "billing_error": (
-                    "cancellation charge was not computed because the private preparation "
-                    "snapshot was unavailable or invalid; teardown was still attempted"
-                ),
-            }
+            undeploy_adapter(run_id)
+            mark_deployment_undeployed(run_id)
+            initial_teardown_confirmed = True
+        except Exception as exc:
+            teardown_error = exc
+
     with _deploy_lock(run_id):
+        # reread after the submission handshake releases the lock so a newly durable provider
+        # handle is cancelled and destroyed rather than leaving an untracked paid resource.
+        status = get_status(run_id)
+        retry_revocation = (
+            status.state == "cancelled"
+            and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
+        )
+        if status.state in TERMINAL_STATES and not retry_revocation and not entered_deployed:
+            return status
+        # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
+        entered_deployed = entered_deployed or status.state == "deployed"
+        public_spec = JobSpec.from_dict(status.spec)
+        effective_spec = None
+        with contextlib.suppress(Exception):
+            effective_spec = effective_spec_from_status(status)
+        cleanup_spec = effective_spec or public_spec
+        # a mid-training cancel is re-priced from the authoritative prepared spec. deployed runs
+        # retain the completed quote, and revocation retries never alter billing.
+        bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
+        remote = status.remote or {}
+        teardown_remote(remote)
+        with contextlib.suppress(Exception):
+            _gc_run_endpoints(cleanup_spec)
         if not remote:
             teardown_remote(get_status(run_id).remote or {})
+        cancel_charge_usd: float | None = None
+        billing_diagnostic: dict = {}
+        if bill_cancel:
+            if effective_spec is not None:
+                cancel_charge_usd = charge_usd_for_spec(
+                    effective_spec,
+                    steps=actual_steps_run(get_status(run_id)),
+                    fallback=0.0,
+                )
+            else:
+                cancel_charge_usd = 0.0
+                billing_diagnostic = {
+                    "billing_state": "failed",
+                    "billing_error": (
+                        "cancellation charge was not computed because the private preparation "
+                        "snapshot was unavailable or invalid; teardown was still attempted"
+                    ),
+                }
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
         if not retry_revocation:
