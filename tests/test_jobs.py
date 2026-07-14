@@ -2865,6 +2865,119 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
         assert gc_calls == [run_id], "terminal endpoint cleanup must still run"
 
 
+def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-confirmed-cancel"
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote={
+                    "endpoint_id": "ep-cancel",
+                    "endpoint_name": "n",
+                    "job_id": "j-cancel",
+                    "attempt": 0,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.2}),
+        )
+
+        def cancel_during_metrics(spec, metrics):
+            orch._update(run_id, "cancelled")
+            return 0.2
+
+        real_get_status = orch.get_status
+        status_failures = {"remaining": 0, "cancelled_reads": 0}
+
+        def unreadable_after_confirmed_cancel(run_id):
+            if status_failures["remaining"]:
+                status_failures["remaining"] -= 1
+                raise PermissionError("status file is transiently unreadable")
+            current = real_get_status(run_id)
+            if current.state == "cancelled":
+                status_failures["cancelled_reads"] += 1
+                if status_failures["cancelled_reads"] == 2:
+                    status_failures["remaining"] = 2
+            return current
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "_persist_metrics", cancel_during_metrics)
+        monkeypatch.setattr(orch, "get_status", unreadable_after_confirmed_cancel)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "cancelled"
+        assert gc_calls == [run_id], "the positively observed terminal cancel must still be reaped"
+
+
+def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-live-owner"
+        stale_remote = {
+            "endpoint_id": "ep-stale",
+            "endpoint_name": "n",
+            "job_id": "j-stale",
+            "attempt": 0,
+        }
+        live_remote = {
+            "endpoint_id": "ep-live",
+            "endpoint_name": "n",
+            "job_id": "j-live",
+            "attempt": 1,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote=stale_remote,
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="redeploy"),
+        )
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
+
+        real_get_status = orch.get_status
+        status_failures = {"remaining": 0}
+
+        def transiently_unreadable_status(run_id):
+            if status_failures["remaining"]:
+                status_failures["remaining"] -= 1
+                raise PermissionError("status file is transiently unreadable")
+            return real_get_status(run_id)
+
+        def duplicate_supervisor_refusal(*args, **kwargs):
+            orch._update(run_id, "running", remote=live_remote)
+            status_failures["remaining"] = 2
+            raise orch._RunCancelled("another supervisor owns the durable provider handle")
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "get_status", transiently_unreadable_status)
+        monkeypatch.setattr(orch, "_run_training", duplicate_supervisor_refusal)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "running"
+        assert status.remote == live_remote
+        assert gc_calls == [run_id], "only stale-handle cleanup may run before live ownership appears"
+
+
 def test_attach_requires_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)

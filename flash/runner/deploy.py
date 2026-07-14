@@ -235,11 +235,15 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # check above). Re-read before the terminal "done" so a late worker success can't resurrect
         # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
+            cleanup_terminal = True
             raise _RunCancelled(f"run {run_id} was cancelled")
         _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(public_spec))
         cleanup_terminal = True
     except _RunCancelled:
-        cleanup_terminal = True  # cancel_run already wrote terminal `cancelled`
+        # this also signals a non-terminal duplicate-supervisor refusal, so only a readable terminal
+        # status may authorize cleanup; otherwise retain prior positive terminal knowledge.
+        with contextlib.suppress(Exception):
+            cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
