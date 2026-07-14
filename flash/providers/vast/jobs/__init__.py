@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import sys
 import time
 from collections.abc import Callable
 
@@ -181,6 +182,17 @@ def _adopt_instance_by_label(label: str) -> dict | None:
     return None
 
 
+def _cleanup_unpublished_instance(run_id: str, instance_id: int, *, context: str) -> bool:
+    """clean an exact unpublished instance, falling back to its run label only when unconfirmed."""
+    exact_delete_confirmed = False
+    with contextlib.suppress(BaseException):
+        exact_delete_confirmed = _best_effort_destroy(instance_id, context=context)
+    if not exact_delete_confirmed:
+        with contextlib.suppress(BaseException):
+            destroy_run_instances(run_id)
+    return exact_delete_confirmed
+
+
 def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int, err, say) -> VastJobHandle:
     """Reconcile the contract a possibly-billed AMBIGUOUS create (5xx/429/timeout on the non-idempotent
     PUT /asks) may have left behind. If an instance materialized under our unique label, ADOPT it;
@@ -209,16 +221,33 @@ def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int
             attempt=attempt,
             started_ts=started,
         )
-    # Nothing cleanly adopted (no row under our label, or an unparseable id). Proactively destroy any
-    # phantom by label, then raise TERMINAL (not the retriable VastApiError, which would rent another
-    # box while the phantom may still surface and bill under the still-active run).
-    destroyed = destroy_run_instances(spec.run_id)
+    # nothing cleanly adopted (no row under our label, or an unparseable id). a contradictory
+    # rejection can carry the exact contract id; when its deletion is provider-confirmed, ownership is
+    # resolved and a run-wide label reap would only risk sibling seeds or attempts. otherwise retain the
+    # label fallback, then abort terminally so an unresolved create never walks to another offer.
+    contract_id = getattr(err, "contract_id", None)
+    exact_delete_confirmed = False
+    destroyed: list[int] = []
+    if contract_id is not None:
+        exact_delete_confirmed = _cleanup_unpublished_instance(
+            spec.run_id,
+            contract_id,
+            context="ambiguous create reconciliation",
+        )
+    else:
+        with contextlib.suppress(BaseException):
+            destroyed = destroy_run_instances(spec.run_id)
     if destroyed:
         with contextlib.suppress(Exception):
             say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
+    cleanup = (
+        f"confirmed exact deletion of contract {contract_id}"
+        if exact_delete_confirmed
+        else "attempted phantom cleanup by run label"
+    )
     raise UnreconciledCreateError(
         f"ambiguous vast create on offer {offer.offer_id} (label={label}); aborting the offer walk "
-        f"to avoid double-provisioning (destroyed phantom by label): {err}"
+        f"to avoid double-provisioning ({cleanup}): {err}"
     ) from err
 
 
@@ -255,62 +284,87 @@ def deploy_and_submit(
     candidates = list(offers[:5])
     refreshed = False
     last_err: Exception | None = None
-    while candidates:
-        offer = candidates.pop(0)
-        tried.append(offer)
-        try:
-            instance_id = vast_api.create_instance(
-                offer.offer_id,
-                image=vast_image(offer.gpu),
-                disk_gb=_effective_disk_gb(spec),
-                env={},
-                onstart=onstart,
-                label=label,
-            )
-        except vast_api.VastApiError as e:
-            last_err = e
-            # suppress: a raising log here must not abort before the ambiguous-create reconcile below.
-            with contextlib.suppress(Exception):
-                say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
-            # An AMBIGUOUS failure (5xx/429/timeout/unreadable body on the non-idempotent PUT /asks) may
-            # have billed a contract that never surfaced -> reconcile by label (adopt or abort) before
-            # renting another offer. A DEFINITIVE 4xx / success=false rejection created nothing: walk on.
-            if vast_api.create_error_is_ambiguous(e):
-                return _reconcile_ambiguous_create(spec, offer, label, attempt, e, say)
-            # Market is live: refresh the search ONCE, re-excluding the machines that just rejected us
-            # and staying within the allocator-approved class pool (``offers`` is already class-filtered).
-            if not candidates and not refreshed:
-                refreshed = True
-                allowed = {o.gpu for o in offers}
-                candidates = [
-                    o
-                    for o in usable_offers(
-                        min(o.vram_gb for o in offers),
-                        _effective_disk_gb(spec),
-                        exclude_machine_ids={o.machine_id for o in tried},
-                        max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+    create_attempted = False
+    try:
+        while candidates:
+            offer = candidates.pop(0)
+            tried.append(offer)
+            # evaluate every fallible request argument before arming cleanup for the non-idempotent call.
+            offer_id = offer.offer_id
+            image = vast_image(offer.gpu)
+            disk_gb = _effective_disk_gb(spec)
+            create_attempted = True
+            try:
+                instance_id = vast_api.create_instance(
+                    offer_id,
+                    image=image,
+                    disk_gb=disk_gb,
+                    env={},
+                    onstart=onstart,
+                    label=label,
+                )
+            except vast_api.VastApiError as e:
+                last_err = e
+                # an ambiguous failure may have billed a contract, so transfer cleanup to reconciliation
+                # before any fallible logging. a definitive rejection or local not-sent failure may walk on.
+                ambiguous = vast_api.create_error_is_ambiguous(e)
+                if ambiguous:
+                    try:
+                        return _reconcile_ambiguous_create(spec, offer, label, attempt, e, say)
+                    except UnreconciledCreateError:
+                        create_attempted = False
+                        raise
+                create_attempted = False
+                with contextlib.suppress(Exception):
+                    say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
+                # market is live: refresh the search once, re-excluding the machines that just rejected us
+                # and staying within the allocator-approved class pool (``offers`` is already class-filtered).
+                if not candidates and not refreshed:
+                    refreshed = True
+                    allowed = {o.gpu for o in offers}
+                    candidates = [
+                        o
+                        for o in usable_offers(
+                            min(o.vram_gb for o in offers),
+                            _effective_disk_gb(spec),
+                            exclude_machine_ids={o.machine_id for o in tried},
+                            max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                        )
+                        if o.gpu in allowed
+                    ][:5]
+                continue
+            # guard the accepted create before any fallible post-create work can lose the exact id.
+            try:
+                with contextlib.suppress(Exception):
+                    say(
+                        f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
+                        f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
+                        f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
                     )
-                    if o.gpu in allowed
-                ][:5]
-            continue
-        # suppress: a raising log before we return would skip the teardown finally and leak the box.
-        with contextlib.suppress(Exception):
-            say(
-                f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
-                f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
-                f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
-            )
-        return VastJobHandle(
-            instance_id=instance_id,
-            offer_id=offer.offer_id,
-            machine_id=offer.machine_id,
-            label=label,
-            gpu=offer.gpu,
-            hourly_usd=offer.dph_total,
-            attempt=attempt,
-            started_ts=time.time(),
-        )
-    raise vast_api.VastApiError(f"all {len(tried)} vast offers rejected the job: {last_err}")
+                return VastJobHandle(
+                    instance_id=instance_id,
+                    offer_id=offer.offer_id,
+                    machine_id=offer.machine_id,
+                    label=label,
+                    gpu=offer.gpu,
+                    hourly_usd=offer.dph_total,
+                    attempt=attempt,
+                    started_ts=time.time(),
+                )
+            except BaseException:
+                create_attempted = False
+                _cleanup_unpublished_instance(
+                    spec.run_id,
+                    instance_id,
+                    context="post-create handle acquisition",
+                )
+                raise
+        raise vast_api.VastApiError(f"all {len(tried)} vast offers rejected the job: {last_err}")
+    except BaseException:
+        if create_attempted:
+            with contextlib.suppress(BaseException):
+                destroy_run_instances(spec.run_id)
+        raise
 
 
 # Rate-limited reader for one HF artifact's text content (None until it exists). Shared with runpod's
@@ -480,18 +534,21 @@ def submit_run_vast(
         )
         if o.gpu == spec.gpu.type
     ]
-    handle = deploy_and_submit(
-        spec, seed, offers, attempt=attempt, log=log, runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
-    )
-    # The instance is billing the MOMENT deploy_and_submit returns; the teardown ``finally`` must guard
-    # EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself raise).
+    handle = None
     try:
+        handle = deploy_and_submit(
+            spec,
+            seed,
+            offers,
+            attempt=attempt,
+            log=log,
+            runtime_secrets=runtime_secrets,
+            code_prefix=code_prefix,
+        )
         if on_handle is not None:
             on_handle(handle.to_dict())
         reader = heartbeat_reader_for(spec)
-        # Wall cap + provision/cold-start grace; Vast has no server-side execution timeout, so the
-        # client deadline (and the bootstrap's own cap) bound spend.
+        # wall cap plus provision/cold-start grace bounds spend because vast has no server-side timeout
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
         return poll_vast_job(
             handle,
@@ -502,13 +559,23 @@ def submit_run_vast(
             deadline_s=deadline,
         )
     finally:
-        # An UNCONFIRMED single-instance destroy (success:false / breakdown) on a retriable run is
-        # dangerous: while the run stays ``running`` the active-run sweep SHIELDS its label, so this
-        # attempt's possibly-billing box could survive into the next attempt handle-less. Escalate to a
-        # run-scoped reap by label (not active-shielded) so it's cleared before the next launch.
-        if not _best_effort_destroy(handle.instance_id, context="submit_run_vast teardown"):
-            with contextlib.suppress(Exception):
-                destroy_run_instances(spec.run_id)
+        if handle is not None:
+            # a cleanup-time baseexception (interrupt during the delete) must not replace the
+            # in-flight exception or skip the run-label fallback.
+            confirmed = False
+            cleanup_exc: BaseException | None = None
+            try:
+                confirmed = _best_effort_destroy(
+                    handle.instance_id, context="submit_run_vast teardown"
+                )
+            except BaseException as e:
+                cleanup_exc = e
+            if not confirmed:
+                # an unconfirmed exact-id destroy must retain the run-label recovery path before any retry
+                with contextlib.suppress(BaseException):
+                    destroy_run_instances(spec.run_id)
+            if cleanup_exc is not None and sys.exc_info()[1] is None:
+                raise cleanup_exc
 
 
 def _best_effort_destroy(instance_id, *, context: str) -> bool:
