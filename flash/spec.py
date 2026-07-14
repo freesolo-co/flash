@@ -124,9 +124,6 @@ class TrainSpec:
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
-    # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
-    opd_eos_loss_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.55"})
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
@@ -219,7 +216,6 @@ class JobSpec:
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
-                opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
