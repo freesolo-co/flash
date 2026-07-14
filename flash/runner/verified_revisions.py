@@ -39,25 +39,25 @@ def _locked_ledger(run_id: str, *, exclusive: bool) -> Iterator[tuple[str, str]]
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _read_unlocked(path: str) -> tuple[int, list[str]]:
+def _read_unlocked(path: str, run_id: str) -> tuple[int, list[str]]:
     try:
         with open(path) as ledger_file:
             raw = json.load(ledger_file)
     except FileNotFoundError:
         return 0, []
-    if isinstance(raw, list):
-        generation = 0
-        revisions = raw
-    elif isinstance(raw, dict):
-        generation = raw.get("generation")
-        revisions = raw.get("revisions")
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-            raise ValueError(f"invalid verified revision generation: {path}")
-    else:
+    if not isinstance(raw, dict):
         raise ValueError(f"invalid verified revision ledger: {path}")
+    generation = raw.get("generation")
+    revisions = raw.get("revisions")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError(f"invalid verified revision generation: {path}")
     if not isinstance(revisions, list):
         raise ValueError(f"invalid verified revision membership: {path}")
-    return generation, [revision for revision in revisions if isinstance(revision, str) and revision]
+    for revision in revisions:
+        parsed = parse_adapter_revision(revision) if isinstance(revision, str) else None
+        if parsed is None or parsed[0] != run_id:
+            raise ValueError(f"invalid verified adapter revision for run {run_id}: {revision!r}")
+    return generation, revisions
 
 
 def _fsync_directory(path: str) -> None:
@@ -90,14 +90,14 @@ def _write_unlocked(runs_dir: str, path: str, generation: int, revisions: list[s
 def read_verified_adapter_revisions(run_id: str) -> frozenset[str]:
     """Read the authoritative verified revision membership for a run."""
     with _locked_ledger(run_id, exclusive=False) as (_, path):
-        _, revisions = _read_unlocked(path)
+        _, revisions = _read_unlocked(path, run_id)
         return frozenset(revisions)
 
 
 def verified_adapter_revision_generation(run_id: str) -> int:
     """Read the current undeploy generation for a run."""
     with _locked_ledger(run_id, exclusive=False) as (_, path):
-        generation, _ = _read_unlocked(path)
+        generation, _ = _read_unlocked(path, run_id)
         return generation
 
 
@@ -105,22 +105,22 @@ def commit_verified_adapter_revision(
     run_id: str,
     revision: str,
     *,
-    expected_generation: int | None,
+    expected_generation: int,
     commit: Callable[[], None],
 ) -> bool:
     """Persist verified membership before committing its ready status."""
     parsed = parse_adapter_revision(revision)
     if parsed is None or parsed[0] != run_id:
         raise ValueError(f"invalid verified adapter revision for run {run_id}: {revision!r}")
-    if expected_generation is not None and (
+    if (
         isinstance(expected_generation, bool)
         or not isinstance(expected_generation, int)
         or expected_generation < 0
     ):
         raise ValueError(f"invalid verified revision generation: {expected_generation!r}")
     with _locked_ledger(run_id, exclusive=True) as (runs_dir, path):
-        generation, revisions = _read_unlocked(path)
-        if expected_generation is not None and generation != expected_generation:
+        generation, revisions = _read_unlocked(path, run_id)
+        if generation != expected_generation:
             return False
         if revision not in revisions:
             revisions.append(revision)
@@ -133,7 +133,7 @@ def add_verified_adapter_revision(
     run_id: str,
     revision: str,
     *,
-    expected_generation: int | None = None,
+    expected_generation: int,
 ) -> bool:
     """Atomically add one canonical same-run immutable revision."""
     return commit_verified_adapter_revision(
@@ -151,7 +151,7 @@ def invalidate_verified_adapter_revisions(
 ) -> int:
     """Clear membership, advance the tombstone generation, then commit undeploy status."""
     with _locked_ledger(run_id, exclusive=True) as (runs_dir, path):
-        generation, _ = _read_unlocked(path)
+        generation, _ = _read_unlocked(path, run_id)
         generation += 1
         _write_unlocked(runs_dir, path, generation, [])
         commit()

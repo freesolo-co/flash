@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
+from pathlib import Path
+
+import pytest
 
 
 def _complete_checkpoint(run_id: str, revision: str, barrier) -> None:
@@ -14,6 +18,7 @@ def _complete_checkpoint(run_id: str, revision: str, barrier) -> None:
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
     )
 
 
@@ -40,6 +45,50 @@ def _new_status(runner, run_id: str):
         state="done",
         spec={"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
     )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ["legacy-revision"],
+        {"generation": 0, "revisions": ["legacy-revision"]},
+    ],
+)
+def test_verified_revision_ledger_rejects_legacy_shapes(monkeypatch, tmp_path, raw):
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    run_id = "strict-revision-ledger"
+    path = Path(runner.runs_file_path(run_id, ".verified-revisions"))
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="invalid verified"):
+        runner.read_verified_adapter_revisions(run_id)
+
+
+def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    run_id = "stale-generation"
+    runner._save_status(_new_status(runner, run_id))
+    revision = f"{run_id}@final." + "e" * 40
+    stale_generation = runner.verified_adapter_revision_generation(run_id)
+
+    assert runner.clear_verified_adapter_revisions(run_id) == stale_generation + 1
+    status = runner.mark_checkpoint_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=stale_generation,
+    )
+
+    assert status.deployment is None
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_concurrent_checkpoint_completions_preserve_both_revisions(monkeypatch, tmp_path):
@@ -87,6 +136,7 @@ def test_stale_status_process_cannot_erase_verified_revision(monkeypatch, tmp_pa
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
     )
     release.set()
     process.join(timeout=10)
@@ -103,7 +153,11 @@ def test_verified_revision_ledger_survives_new_process(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "restart-revision"
     revision = f"{run_id}@final." + "d" * 40
-    runner.add_verified_adapter_revision(run_id, revision)
+    runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=runner.verified_adapter_revision_generation(run_id),
+    )
     context = multiprocessing.get_context("fork")
     output = context.Queue()
     process = context.Process(target=_read_revisions, args=(run_id, output))

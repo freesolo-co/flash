@@ -107,7 +107,11 @@ class _FakeClient:
 
     def undeploy(self, run_id: str) -> dict:
         self.calls.append(("undeploy", run_id))
-        return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
+        return {
+            "run_id": run_id,
+            "disabled_aliases": [run_id],
+            "disabled_revisions": [f"{run_id}@final." + "a" * 40],
+        }
 
     def deployments(self) -> list[dict]:
         return [

@@ -659,8 +659,7 @@ def undeployed(result: dict) -> str:
     rid = _paint(result.get("run_id", ""), _ACCENT2)
     aliases = result.get("disabled_aliases") or []
     revisions = result.get("disabled_revisions") or []
-    legacy = result.get("deleted_endpoints") or []
-    affected = [*aliases, *revisions, *legacy]
+    affected = [*aliases, *revisions]
     line = ok(f"torn down {rid}")
     if affected:
         line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")

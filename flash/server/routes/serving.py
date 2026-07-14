@@ -157,13 +157,7 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
 
 
 def _verified_adapter_revisions(status) -> set[str]:
-    revisions = set(read_verified_adapter_revisions(status.run_id))
-    legacy_ready = _previous_ready_deployment(status.deployment or {})
-    if legacy_ready is not None and legacy_ready.get("verification_generation") is None:
-        revision = legacy_ready.get("adapter_revision")
-        if isinstance(revision, str) and revision:
-            revisions.add(revision)
-    return revisions
+    return set(read_verified_adapter_revisions(status.run_id))
 
 
 def recover_deployments() -> int:
@@ -442,10 +436,7 @@ def _finish_deployment_unlocked(
             before_activate=_before_activate,
         )
         activated = True
-        previous_deployment = deployment.get("previous_deployment")
         current = {**current, **dep.to_dict()}
-        if previous_deployment:
-            current["previous_deployment"] = previous_deployment
         current["verify"] = True
         current = _deployment_state(
             current,
@@ -455,15 +446,26 @@ def _finish_deployment_unlocked(
             ready_at=time.time(),
             **smoke_result,
         )
+        verification_generation = current.get("verification_generation")
         current = _public_deployment(current)
 
         def _commit_ready() -> bool:
             state_guard = prev_state
             if is_checkpoint:
                 state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-                marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
+                marked = mark_checkpoint_deployed(
+                    run_id,
+                    current,
+                    expect_state=state_guard,
+                    verification_generation=verification_generation,
+                )
                 return marked.deployment == current
-            marked = mark_deployed(run_id, current, expect_state=prev_state)
+            marked = mark_deployed(
+                run_id,
+                current,
+                expect_state=prev_state,
+                verification_generation=verification_generation,
+            )
             return marked.state == "deployed" and marked.deployment == current
 
         def _reconcile_commit_miss() -> None:
@@ -478,9 +480,18 @@ def _finish_deployment_unlocked(
                 # this attempt still owns the record; only the run state moved under the
                 # guard. retry the write once against the fresh state.
                 if is_checkpoint:
-                    marked = mark_checkpoint_deployed(run_id, current)
+                    marked = mark_checkpoint_deployed(
+                        run_id,
+                        current,
+                        verification_generation=verification_generation,
+                    )
                 else:
-                    marked = mark_deployed(run_id, current, expect_state=latest.state)
+                    marked = mark_deployed(
+                        run_id,
+                        current,
+                        expect_state=latest.state,
+                        verification_generation=verification_generation,
+                    )
                 if marked.deployment == current:
                     return
                 latest = marked

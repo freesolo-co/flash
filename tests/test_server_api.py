@@ -1876,6 +1876,12 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
         "adapter_revision": revision,
     }
     runner._save_status(status)
+    generation = runner.verified_adapter_revision_generation(run_id)
+    assert runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=generation,
+    )
     seen = {}
 
     def fake_stream(**kwargs):
@@ -1901,6 +1907,45 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert seen["run_id"] == revision
 
 
+def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    revision = f"{run_id}@final." + "b" * 40
+    status = runner.get_status(run_id)
+    status.state = "deployed"
+    status.deployment = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": revision,
+    }
+    runner._save_status(status)
+
+    assert "verification_generation" not in runner.get_status(run_id).deployment
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("unverified revision must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "adapter_revision": revision,
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    assert "has not passed a successful deployment smoke" in response.json()["detail"]
+
+
 def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1922,6 +1967,7 @@ def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
                 "endpoint_name": "https://serve.example",
                 "adapter_revision": revision,
             },
+            verification_generation=runner.verified_adapter_revision_generation(run_id),
         )
     latest = runner.get_status(run_id)
     assert runner.read_verified_adapter_revisions(run_id) == frozenset(revisions)
@@ -2185,7 +2231,11 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     revision = f"{run_id}@final." + "e" * 40
-    runner.add_verified_adapter_revision(run_id, revision)
+    runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     def boom(_run_id):
         raise ServingError("serving backend unreachable: could not delete endpoint")
@@ -3469,7 +3519,11 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
     revision = f"{run_id}@step-40." + "f" * 40
-    runner.add_verified_adapter_revision(run_id, revision)
+    runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     r = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
     assert r.status_code == 200, r.text

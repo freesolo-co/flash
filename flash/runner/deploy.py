@@ -251,6 +251,7 @@ def _commit_verified_deployment(
     run_id: str,
     deployment: dict,
     *,
+    verification_generation: int | None,
     commit: Callable[[], None],
 ) -> bool:
     revision = deployment.get("adapter_revision")
@@ -259,12 +260,14 @@ def _commit_verified_deployment(
     ):
         commit()
         return True
+    if verification_generation is None:
+        raise ValueError("immutable deployment commit requires a verification generation")
     from flash.runner.verified_revisions import commit_verified_adapter_revision
 
     return commit_verified_adapter_revision(
         run_id,
         revision,
-        expected_generation=deployment.get("verification_generation"),
+        expected_generation=verification_generation,
         commit=commit,
     )
 
@@ -278,7 +281,13 @@ def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     status.state = "deployed"
 
 
-def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
+def mark_deployed(
+    run_id: str,
+    deployment: dict,
+    expect_state: str | None = None,
+    *,
+    verification_generation: int | None = None,
+) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
     with _STATUS_LOCK:
@@ -295,13 +304,22 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             status.updated_at = time.time()
             _save_status(status)
 
-        if not _commit_verified_deployment(run_id, deployment, commit=_commit):
+        if not _commit_verified_deployment(
+            run_id,
+            deployment,
+            verification_generation=verification_generation,
+            commit=_commit,
+        ):
             return get_status(run_id)
         return status
 
 
 def mark_checkpoint_deployed(
-    run_id: str, deployment: dict, expect_state: str | None = None
+    run_id: str,
+    deployment: dict,
+    expect_state: str | None = None,
+    *,
+    verification_generation: int | None = None,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -327,7 +345,12 @@ def mark_checkpoint_deployed(
             status.updated_at = time.time()
             _save_status(status)
 
-        if not _commit_verified_deployment(run_id, deployment, commit=_commit):
+        if not _commit_verified_deployment(
+            run_id,
+            deployment,
+            verification_generation=verification_generation,
+            commit=_commit,
+        ):
             return get_status(run_id)
         return status
 
