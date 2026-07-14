@@ -1468,6 +1468,52 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
 
+def test_cancel_active_checkpoint_wins_terminal_race_while_waiting_for_lock(api, monkeypatch):
+    import threading
+
+    import flash.runner as runner
+    import flash.serve.deploy as deploy_mod
+    from flash.server._locks import _deploy_lock
+
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "adapter_revision": f"{run_id}@step-10." + "b" * 40,
+    }
+    runner._save_status(status)
+    revoked = threading.Event()
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: {"run_id": target})
+    real_mark_undeployed = runner.mark_deployment_undeployed
+
+    def mark_undeployed(target):
+        result = real_mark_undeployed(target)
+        revoked.set()
+        return result
+
+    monkeypatch.setattr(runner, "mark_deployment_undeployed", mark_undeployed)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+
+    lock = _deploy_lock(run_id)
+    lock.acquire()
+    results = []
+    thread = threading.Thread(target=lambda: results.append(runner.cancel_run(run_id)))
+    try:
+        thread.start()
+        assert revoked.wait(timeout=5)
+        raced = runner.get_status(run_id)
+        raced.state = "done"
+        runner._save_status(raced)
+    finally:
+        lock.release()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert results[0].state == "cancelled"
+    assert runner.get_status(run_id).deployment["state"] == "undeployed"
+
+
 def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod
