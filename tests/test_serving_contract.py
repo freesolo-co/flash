@@ -449,6 +449,30 @@ def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypat
     assert out["updated_at"] == "2026-07-12T12:00:15Z"
 
 
+def test_activation_readback_rejects_disabled_alias_with_stale_target(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "status": "disabled",
+            "metadata": {"record_type": "alias", "alias_of": revision},
+        },
+    )
+
+    with pytest.raises(deploy.ActivationOutcomeUnknown, match="alias_activation_unknown"):
+        deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
+
+
 def test_activation_commit_survives_lost_response_and_transient_readback_failure(monkeypatch):
     import flash.serve.deploy as deploy
 
@@ -552,9 +576,7 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
     )
 
     with pytest.raises(deploy.ServingError, match="outcome is ambiguous"):
-        deploy._activate_revision(
-            "flash-1", revision, "flash-1", expected_adapter_revision=None
-        )
+        deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
 
 
 def test_activation_divergence_requires_reconciliation(monkeypatch):

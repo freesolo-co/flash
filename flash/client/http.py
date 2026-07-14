@@ -349,13 +349,17 @@ class ApiClient:
             else:
                 last_state = str(status.get("state") or "unknown")
                 deployment = status.get("deployment") or {}
-                if isinstance(deployment, dict) and deployment.get("state") == "revocation_failed":
+                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
+                revocation_failed = (
+                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                )
+                if terminal and revocation_failed:
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
                         "cancel request reached the control plane, but backend revocation is "
                         f"unconfirmed: {error}; retry cancellation"
                     ) from cause
-                if last_state in {"cancelled", "done", "failed", "dry_run"}:
+                if terminal:
                     return status
             if time.monotonic() >= deadline:
                 raise ClientError(

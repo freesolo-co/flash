@@ -548,6 +548,32 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
         client.cancel_run("r1")
 
 
+def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+    polls = iter(
+        [
+            {
+                "run_id": "r1",
+                "state": "running",
+                "deployment": {"state": "revocation_failed", "retryable": True},
+            },
+            {"run_id": "r1", "state": "cancelled", "deployment": {"state": "undeployed"}},
+        ]
+    )
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return next(polls)
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+    monkeypatch.setattr("flash.client.http.time.sleep", lambda _seconds: None)
+
+    assert client.cancel_run("r1")["state"] == "cancelled"
+
+
 def test_deploy_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     for bad in ("flash-run/step-", "flash-run/checkpoints/step-4", "flash-run/step-4/adapter"):

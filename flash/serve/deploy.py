@@ -593,12 +593,18 @@ def _alias_target(record: dict | None) -> str | None:
     return None
 
 
+def _active_alias_target(record: dict | None) -> str | None:
+    if not isinstance(record, dict) or record.get("status") == "disabled":
+        return None
+    return _alias_target(record)
+
+
 def adapter_alias_target(run_id: str) -> str | None:
     """Read the authoritative immutable revision targeted by a mutable run alias."""
     record = _registered_adapter(run_id)
     if record is None or record.get("status") == "disabled":
         return None
-    target = _alias_target(record)
+    target = _active_alias_target(record)
     if target is None:
         raise ServingError(
             f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
@@ -661,7 +667,7 @@ def _activate_revision(
             except ServingError as read_exc:
                 read_error = read_exc
                 continue
-            target = _alias_target(alias)
+            target = _active_alias_target(alias)
             if target == revision:
                 return {
                     "adapter_id": run_id,
