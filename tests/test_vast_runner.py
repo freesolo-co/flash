@@ -226,7 +226,8 @@ def test_deploy_walks_documented_non_2xx_rejection(monkeypatch):
     assert requested == ["/v0/asks/1/", "/v0/asks/2/"]
 
 
-def test_deploy_stops_on_contradictory_create_response(monkeypatch):
+@pytest.mark.parametrize("destroy_confirmed", [True, False])
+def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_confirmed):
     from flash.providers.base import UnreconciledCreateError
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
@@ -243,7 +244,9 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch):
     monkeypatch.setattr(vast_api, "list_instances", lambda: [])
     destroyed_exact = []
     monkeypatch.setattr(
-        vast_api, "destroy_instance", lambda iid: destroyed_exact.append(iid) or False
+        vast_api,
+        "destroy_instance",
+        lambda iid: destroyed_exact.append(iid) or destroy_confirmed,
     )
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: destroyed_for.append(run_id) or [])
@@ -256,7 +259,8 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch):
     # the contradictory response's known contract id is destroyed directly, even when the
     # eventually-consistent listing shows nothing under the label yet
     assert destroyed_exact == [777]
-    assert destroyed_for == [_spec().run_id]
+    expected_fallback = [] if destroy_confirmed else [_spec().run_id]
+    assert destroyed_for == expected_fallback
 
 
 def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
@@ -275,6 +279,34 @@ def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
     monkeypatch.setattr(vast, "make_say", raising_say)
     h = vast.deploy_and_submit(_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
     assert h.instance_id == 4242
+
+
+@pytest.mark.parametrize("argument_builder", ["vast_image", "_effective_disk_gb"])
+def test_deploy_argument_failure_precedes_create_and_cleanup(monkeypatch, argument_builder):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    original = RuntimeError(f"{argument_builder} failed")
+
+    def fail_argument(*args, **kwargs):
+        raise original
+
+    create_requests = []
+    run_reaps = []
+    monkeypatch.setattr(vast, argument_builder, fail_argument)
+    monkeypatch.setattr(
+        vast_api,
+        "create_instance",
+        lambda *args, **kwargs: create_requests.append((args, kwargs)),
+    )
+    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: run_reaps.append(run_id) or [])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        vast.deploy_and_submit(_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+
+    assert exc_info.value is original
+    assert create_requests == []
+    assert run_reaps == []
 
 
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
@@ -310,7 +342,8 @@ def test_post_create_baseexception_cleans_and_never_walks_offers(
 
     assert created == [1]
     assert destroyed_ids == [4242]
-    assert reconciled_runs == [spec.run_id]
+    expected_fallback = [] if destroy_confirmed else [spec.run_id]
+    assert reconciled_runs == expected_fallback
 
 
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
