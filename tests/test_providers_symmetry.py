@@ -292,3 +292,15 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     get_provider("runpod").destroy(handle)
     assert cancelled == [("ep", "j")]
     assert deleted == ["ep"]
+
+
+def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
+    from flash.providers import get_provider
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as rp_api
+
+    monkeypatch.setattr(rp_api, "delete_endpoint", lambda endpoint_id: False)
+    handle = JobHandle("runpod", {"endpoint_id": "ep-unconfirmed", "job_id": "j"})
+
+    with pytest.raises(rp_api.RunpodApiError, match="unconfirmed"):
+        get_provider("runpod").destroy(handle)

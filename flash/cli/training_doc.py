@@ -355,13 +355,12 @@ Pick SFT when you already have good answers and want the model to imitate them.
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. Warm-start CONTINUES the one SFT adapter in place — GRPO/OPD keep training
   the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
-  adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank`. Set
-  `lora_rank` EQUAL to the SFT run's rank and within the serving cap (some serving models
-  allow rank 128, larger serving paths cap at 64). Flash preflights both before the run:
-  it rejects an adapter over the cap, and rejects a `lora_rank` that disagrees with the
-  continued adapter — because the trainer ignores `lora_rank` for a warm-start but the
-  cost/GPU-allocation/GRPO-sleep sizing all read it, so a mismatch mis-quotes and mis-sizes
-  the run.
+  adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
+  serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
+  for a warm-start: the source adapter's rank/alpha metadata is authoritative. Flash reads the
+  rank from the source adapter and uses it for cost, GPU allocation, and GRPO-sleep sizing, so
+  setting `lora_rank` alongside `init_from_adapter` is rejected at submit; it also rejects a
+  source adapter whose rank exceeds the serving cap.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
@@ -371,9 +370,8 @@ algorithm = "grpo"
 # the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
 # specific checkpoint listed by `flash checkpoints <run-id>`
 init_from_adapter = "<sft-run-id>"
-lora_rank = 32     # MUST equal the SFT run's lora_rank (32 above): the warm-start continues that
-                   # adapter at its rank; a mismatch is rejected at submit
-lora_alpha = 64
+# do NOT set lora_rank / lora_alpha for a warm-start: the source adapter's rank and alpha
+# metadata are authoritative, and setting lora_rank alongside init_from_adapter is rejected
 ```
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
