@@ -163,7 +163,10 @@ def cancel_run(run_id: str) -> RunStatus:
                 }
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
-        if not retry_revocation and status.state != "cancelled":
+        preserve_terminal_retry = (
+            retry_revocation and status.state in TERMINAL_STATES and not entered_deployed
+        )
+        if status.state != "cancelled" and not preserve_terminal_retry:
             _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
         deployment_state = (final.deployment or {}).get("state")

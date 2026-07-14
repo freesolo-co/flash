@@ -436,6 +436,40 @@ def test_cancel_undeploys_active_deployment_after_terminal_transition_at_lock(
     assert out.deployment["state"] == "undeployed"
 
 
+def test_cancel_revocation_retry_transitions_deployed_run_to_cancelled(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-deployed-revocation-retry"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="deployed",
+            spec=spec.to_dict(),
+            deployment={"state": "revocation_failed", "error": "backend unavailable"},
+        )
+    )
+    attempts = []
+
+    def undeploy(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise deploy.ServingError("backend still unavailable")
+        return ["endpoint"]
+
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id, run_id]
+    assert retried.state == "cancelled"
+    assert retried.deployment["state"] == "undeployed"
+
+
 def test_cancel_retries_revocation_after_terminal_transition_at_lock(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
