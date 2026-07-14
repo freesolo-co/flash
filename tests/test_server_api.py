@@ -1376,6 +1376,46 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
     assert json.loads(forwarded) == {"json": schema}
 
 
+def test_thinking_structured_deploy_rejects_verify_false_before_mutation(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    schema = {"type": "object", "required": ["answer"]}
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {**SPEC["train"], "structured_outputs": {"json": schema}},
+    }
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    monkeypatch.setattr(
+        app_mod,
+        "start_deployment_job",
+        lambda *_a, **_k: pytest.fail("deployment must not be queued"),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: pytest.fail("serving mutation must not be attempted"),
+    )
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"verify": False},
+        headers=_bearer(key),
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "verify=false is not allowed" in resp.json()["detail"]
+    assert runner.get_status(run_id).deployment is None
+
+
 def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
