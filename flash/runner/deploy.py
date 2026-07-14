@@ -183,7 +183,9 @@ def cancel_run(run_id: str) -> RunStatus:
                 and _should_preserve_checkpoint_deployment(run_id, prelock_status.deployment)
             )
             if prelock_active_deployment and not prelock_preserve_checkpoint:
-                mark_deployment_undeployed(run_id)
+                mark_deployment_revocation_failed(
+                    run_id, "backend revocation is pending the contended deployment lock"
+                )
                 backend_reconcile_required = True
             deploy_lock.acquire()
             lock_acquired = True

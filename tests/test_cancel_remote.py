@@ -384,6 +384,61 @@ def test_cancel_reruns_endpoint_gc_after_contended_deploy_lock(tmp_path, monkeyp
     ]
 
 
+def test_contended_cancel_process_death_leaves_revocation_retryable(tmp_path, monkeypatch):
+    import threading
+
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-contended-cancel-death"
+    spec = _run_spec(run_id)
+    orch._save_status(orch.RunStatus(run_id=run_id, state="done", spec=spec.to_dict()))
+    revision = f"{run_id}@final." + "a" * 40
+    orch.mark_deployed(
+        run_id,
+        {"state": "ready", "adapter_revision": revision, "endpoint_name": "final"},
+        verification_generation=orch.verified_adapter_revision_generation(run_id),
+    )
+
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    class DeathWhileWaitingForDeployLock:
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                return False
+            pending = orch.get_status(run_id)
+            assert pending.deployment["state"] == "revocation_failed"
+            assert pending.deployment["retryable"] is True
+            raise SimulatedProcessDeath
+
+        def release(self) -> None:
+            pytest.fail("an unacquired lock must not be released")
+
+    lock_attempts = iter([DeathWhileWaitingForDeployLock(), threading.Lock()])
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: next(lock_attempts))
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    attempts = []
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: attempts.append(target) or [])
+
+    with pytest.raises(SimulatedProcessDeath):
+        orch.cancel_run(run_id)
+
+    interrupted = orch.get_status(run_id)
+    assert interrupted.state == "deployed"
+    assert interrupted.deployment["state"] == "revocation_failed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+    assert attempts == []
+
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id]
+    assert retried.state == "cancelled"
+    assert retried.deployment["state"] == "undeployed"
+
+
 def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy

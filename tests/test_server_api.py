@@ -1438,17 +1438,19 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
         assert target == run_id
         return {"run_id": run_id}
 
-    real_mark_undeployed = runner.mark_deployment_undeployed
+    real_mark_revocation_failed = runner.mark_deployment_revocation_failed
 
-    def mark_undeployed_then_release(target):
-        status = real_mark_undeployed(target)
+    def mark_revocation_failed_then_release(target, error):
+        status = real_mark_revocation_failed(target, error)
         local_revoked.set()
         return status
 
     monkeypatch.setattr(serving, "_run_deployment_smoke", blocked_smoke)
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
-    monkeypatch.setattr(runner, "mark_deployment_undeployed", mark_undeployed_then_release)
+    monkeypatch.setattr(
+        runner, "mark_deployment_revocation_failed", mark_revocation_failed_then_release
+    )
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
 
     deploy_thread = threading.Thread(
