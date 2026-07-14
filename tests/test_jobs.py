@@ -149,9 +149,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
             "temperature_c": 68,
             "power_w": 411.3,
             "power_limit_w": 575.0,
-            "processes": [
-                {"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}
-            ],
+            "processes": [{"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}],
         },
     }
     monkeypatch.setattr("flash.providers._poll._record_heartbeat", lambda _hb: None)
@@ -334,26 +332,46 @@ def test_worker_flagged_retriable_gates_stale_prior_attempt_heartbeat():
     # Gated: fresh ts (a prior worker still shutting down uploads AFTER launch) but a DIFFERENT
     # attempt -> still ignored (the subtle case a ts-only check would miss).
     late_prior = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 0, "retriable": True}
-    assert worker_flagged_retriable(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is False
+    assert (
+        worker_flagged_retriable(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is False
+    )
     # Gated: a genuine THIS-attempt retriable heartbeat is still honored.
     fresh = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "attempt": 1, "retriable": True}
     assert worker_flagged_retriable(reader(fresh), launch_ts=10_000.0, current_attempt=1) is True
     # A missing attempt field is not an explicit mismatch. Keep honoring the worker-stamped retry
     # flag unless the heartbeat timestamp proves it predates this attempt's launch.
     fresh_no_attempt = {"stage": "rl_step", "step": 5, "ts": 10_500.0, "retriable": True}
-    assert worker_flagged_retriable(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    assert (
+        worker_flagged_retriable(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1)
+        is True
+    )
     stale_no_attempt = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "retriable": True}
-    assert worker_flagged_retriable(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    assert (
+        worker_flagged_retriable(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1)
+        is False
+    )
     undated_no_attempt = {"stage": "rl_step", "retriable": True}
-    assert worker_flagged_retriable(reader(undated_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    assert (
+        worker_flagged_retriable(reader(undated_no_attempt), launch_ts=10_000.0, current_attempt=1)
+        is True
+    )
     # No retriable flag -> False regardless of gating.
     no_flag = {"ts": 10_500.0, "attempt": 1}
     assert worker_flagged_retriable(reader(no_flag), launch_ts=10_000.0, current_attempt=1) is False
     # Codex clock-skew: a lagging worker host stamps a THIS-attempt heartbeat with a ts BEFORE launch.
     # The explicit attempt match proves provenance -> the retriable flag is still honored; a ts-only
     # staleness check would wrongly discard it and misclassify a same-attempt infra loss as job_failed.
-    clock_skew_match = {"stage": "rl_step", "step": 5, "ts": 9_000.0, "attempt": 1, "retriable": True}
-    assert worker_flagged_retriable(reader(clock_skew_match), launch_ts=10_000.0, current_attempt=1) is True
+    clock_skew_match = {
+        "stage": "rl_step",
+        "step": 5,
+        "ts": 9_000.0,
+        "attempt": 1,
+        "retriable": True,
+    }
+    assert (
+        worker_flagged_retriable(reader(clock_skew_match), launch_ts=10_000.0, current_attempt=1)
+        is True
+    )
 
 
 def test_heartbeat_is_stale_prior_attempt_trusts_explicit_attempt_over_clock():
@@ -367,15 +385,31 @@ def test_heartbeat_is_stale_prior_attempt_trusts_explicit_attempt_over_clock():
 
     # Matching attempt but clock-skewed ts (before launch) -> NOT stale (the fix: trust the attempt).
     skew_match = {"stage": "rl_step", "ts": 9_000.0, "attempt": 1}
-    assert heartbeat_is_stale_prior_attempt(reader(skew_match), launch_ts=10_000.0, current_attempt=1) is False
+    assert (
+        heartbeat_is_stale_prior_attempt(reader(skew_match), launch_ts=10_000.0, current_attempt=1)
+        is False
+    )
     # A different attempt (even with a fresh, post-launch ts) -> stale prior.
     late_prior = {"stage": "rl_step", "ts": 10_500.0, "attempt": 0}
-    assert heartbeat_is_stale_prior_attempt(reader(late_prior), launch_ts=10_000.0, current_attempt=1) is True
+    assert (
+        heartbeat_is_stale_prior_attempt(reader(late_prior), launch_ts=10_000.0, current_attempt=1)
+        is True
+    )
     # No attempt field -> date by ts: predates launch is stale, after launch is current.
     stale_no_attempt = {"stage": "rl_step", "ts": 9_000.0}
-    assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1) is True
+    assert (
+        heartbeat_is_stale_prior_attempt(
+            reader(stale_no_attempt), launch_ts=10_000.0, current_attempt=1
+        )
+        is True
+    )
     fresh_no_attempt = {"stage": "rl_step", "ts": 10_500.0}
-    assert heartbeat_is_stale_prior_attempt(reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1) is False
+    assert (
+        heartbeat_is_stale_prior_attempt(
+            reader(fresh_no_attempt), launch_ts=10_000.0, current_attempt=1
+        )
+        is False
+    )
     # Ungated (missing launch/attempt) -> conservative: never called stale.
     assert heartbeat_is_stale_prior_attempt(reader(stale_no_attempt)) is False
 
@@ -547,7 +581,9 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "submit_job",
-        lambda endpoint_id, payload: submitted.update({"endpoint_id": endpoint_id, "payload": payload}) or "job-1",
+        lambda endpoint_id, payload: (
+            submitted.update({"endpoint_id": endpoint_id, "payload": payload}) or "job-1"
+        ),
     )
     monkeypatch.setattr(jobs, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
 
@@ -579,7 +615,9 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     # The IN_QUEUE phase triggers poll_job's endpoint_health probe on the first loop; stub it so the
     # test is hermetic (never hits the network even if RUNPOD_API_KEY is set in the environment).
-    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: {"workers": {"ready": 1, "running": 1}})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health", lambda eid: {"workers": {"ready": 1, "running": 1}}
+    )
     h = jobs.JobHandle("ep", "name", "job")
     res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
     assert res.ok
@@ -601,9 +639,13 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # arm throttled_timer (~t=100)
-            {"status": "IN_QUEUE"},  # accumulate (~t=200, still < grace 150 from t=100... fires at 250)
+            {
+                "status": "IN_QUEUE"
+            },  # accumulate (~t=200, still < grace 150 from t=100... fires at 250)
             {"status": "IN_PROGRESS"},  # leaves the queue -> timer must reset
-            {"status": "IN_QUEUE"},  # re-queued, throttled: with a stale arm this would fire instantly
+            {
+                "status": "IN_QUEUE"
+            },  # re-queued, throttled: with a stale arm this would fire instantly
             {"status": "COMPLETED", "output": ok},
         ]
     )
@@ -627,7 +669,9 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
         setup_grace_s=100_000.0,
         stall_after_s=100_000.0,
     )
-    assert res.ok, res.detail  # completed; the re-queue throttle timer re-armed fresh, no false no_capacity
+    assert res.ok, (
+        res.detail
+    )  # completed; the re-queue throttle timer re-armed fresh, no false no_capacity
 
 
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
@@ -725,7 +769,9 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
         return base.PollResult(ok=True)
 
     monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
-    spec = types.SimpleNamespace(phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None))
+    spec = types.SimpleNamespace(
+        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+    )
 
     handle = base.JobHandle(
         provider="runpod",
@@ -853,7 +899,9 @@ def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
 
     none_run = _stall_abs_time(None)
     stale_run = _stall_abs_time({"stage": "train", "step": 4, "ts": 500})  # OLDER ts -> stale
-    fresh_run = _stall_abs_time({"stage": "train", "step": 6, "ts": 2000})  # newer ts -> real progress
+    fresh_run = _stall_abs_time(
+        {"stage": "train", "step": 6, "ts": 2000}
+    )  # newer ts -> real progress
 
     assert stale_run == none_run, "a stale late heartbeat must be a no-op for progress"
     assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
@@ -1022,7 +1070,9 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health",
-        lambda eid: {"workers": {"unhealthy": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+        lambda eid: {
+            "workers": {"unhealthy": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}
+        },
     )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
@@ -1104,7 +1154,9 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health",
-        lambda eid: {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+        lambda eid: {
+            "workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}
+        },
     )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
@@ -1280,7 +1332,22 @@ def test_poll_job_tolerates_transient_api_errors(monkeypatch):
 def _fresh_orchestrator(tmp, monkeypatch):
     from tests._helpers.runner import fresh_runner
 
-    return fresh_runner(tmp, monkeypatch)
+    runner = fresh_runner(tmp, monkeypatch)
+    import flash.lora_rank as rank_mod
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda endpoint_id: True)
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+            digest="identity-v1",
+            config_sha256="config-v1",
+            weight_filename="adapter_model.safetensors",
+            weight_identity="weight-v1:123",
+        ),
+    )
+    return runner
 
 
 def _spec(run_id):
@@ -1293,6 +1360,16 @@ def _spec(run_id):
         train=TrainSpec(epochs=1, max_examples=1),
         gpu=GpuSpec(type="RTX 4090", max_retries=2),
     )
+
+
+def _adapter_config(*, rank=32, alpha=64):
+    return {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
+        "r": rank,
+        "lora_alpha": alpha,
+    }
 
 
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
@@ -1309,7 +1386,14 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
             calls["n"] += 1
             code_prefixes.append(code_prefix)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{calls['n']}",
+                        "attempt": attempt,
+                    }
+                )
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1317,7 +1401,9 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
         monkeypatch.setattr(
             "flash.providers._worker.upload_code",
-            lambda repo=None, code_prefix=None: uploaded.setdefault("code_prefix", code_prefix) or "repo",
+            lambda repo=None, code_prefix=None: (
+                uploaded.setdefault("code_prefix", code_prefix) or "repo"
+            ),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("retry-ok"), dry_run=False, background=False)
@@ -1335,6 +1421,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         import flash.lora_rank as rank_mod
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
+        import flash.runner.checkpoints as checkpoints
         from flash.spec import JobSpec
 
         source = JobSpec.from_dict(
@@ -1350,9 +1437,19 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
-        import flash.runner.checkpoints as checkpoints
-
-        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: step == 40)
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+        monkeypatch.setattr(
+            checkpoints,
+            "adapter_artifact_exists",
+            lambda spec, *, step, revision=None: step == 40,
+        )
+        monkeypatch.setattr(
+            rank_mod,
+            "adapter_artifact_identity",
+            lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+                "digest", "config", "adapter_model.safetensors", "weights:1"
+            ),
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1360,19 +1457,21 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                 "train": {
                     **base["train"],
                     "init_from_adapter": "source-run/step-40",
+                    "lora_rank": 8,
+                    "lora_alpha": 16,
                 },
             }
         )
-        launched: dict[str, str] = {}
+        launched: dict[str, object] = {}
 
         def fake_submit(spec, *_, **__):
             launched["init_from_adapter"] = spec.train.init_from_adapter
+            launched["lora_rank"] = spec.train.lora_rank
+            launched["lora_alpha"] = spec.train.lora_alpha
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        # A continued warm-start runs at the source adapter's rank, so it must equal the run's
-        # train.lora_rank (default 32 here) — the rank preflight rejects a mismatch.
-        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 32})
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
         monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
@@ -1380,10 +1479,13 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
 
         st = orch.get_status("warm-run")
         assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
+        assert "lora_rank" not in st.spec["train"]
+        assert st.spec["train"]["lora_alpha"] == 16
         assert (
             launched["init_from_adapter"]
             == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
         )
+        assert (launched["lora_rank"], launched["lora_alpha"]) == (32, 64)
 
 
 def test_submit_rejects_cross_org_init_ref(monkeypatch):
@@ -1441,11 +1543,22 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
         import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
+
         monkeypatch.setattr(db, "run_owner", lambda run_id: 7 if run_id == "source-run" else None)
-        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
-        # The rank preflight now runs in dry-run too; this test exercises org-ownership, not rank, so
-        # give the source adapter the run's default lora_rank (32) to let the preflight pass.
-        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 32})
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+        monkeypatch.setattr(
+            checkpoints,
+            "adapter_artifact_exists",
+            lambda spec, *, step, revision=None: True,
+        )
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
+        monkeypatch.setattr(
+            rank_mod,
+            "adapter_artifact_identity",
+            lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+                "digest", "config", "adapter_model.safetensors", "weights:1"
+            ),
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1465,10 +1578,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         assert status.state == "dry_run"
 
 
-def test_submit_dry_run_rejects_warmstart_rank_mismatch(monkeypatch):
-    # The continued warm-start rank preflight runs in dry-run too, so `--dry-run` rejects a config a
-    # real submit would reject (train.lora_rank disagreeing with the source adapter's rank) instead
-    # of passing and only failing at live submit.
+def test_submit_dry_run_omits_public_warmstart_rank_and_preserves_alpha(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         from flash.spec import JobSpec
@@ -1485,17 +1595,42 @@ def test_submit_dry_run_rejects_warmstart_rank_mismatch(monkeypatch):
         import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
 
-        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: True)
-        # Source adapter is rank 64; the child leaves lora_rank at its default 32 -> a mismatch the
-        # preflight must catch even though this is only a dry-run.
-        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: {"r": 64})
+        monkeypatch.setattr(
+            checkpoints, "adapter_artifact_exists", lambda spec, step, revision=None: True
+        )
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+        monkeypatch.setattr(
+            rank_mod,
+            "load_hf_adapter_config",
+            lambda *a, **k: _adapter_config(rank=64, alpha=128),
+        )
+        monkeypatch.setattr(
+            rank_mod,
+            "adapter_artifact_identity",
+            lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+                "digest", "config", "adapter_model.safetensors", "weights:1"
+            ),
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
-            {**base, "train": {**base["train"], "init_from_adapter": "source-run"}}
+            {
+                **base,
+                "train": {
+                    **base["train"],
+                    "init_from_adapter": "source-run",
+                    "lora_rank": 8,
+                    "lora_alpha": 16,
+                },
+            }
         )
 
-        with pytest.raises(ValueError, match=r"train\.lora_rank=32 does not match.*rank 64"):
-            orch.submit_job(spec, dry_run=True, background=False)
+        status = orch.submit_job(spec, dry_run=True, background=False)
+
+        assert status.state == "dry_run"
+        assert "lora_rank" not in status.spec["train"]
+        assert "init_from_adapter_revision" not in status.spec["train"]
+        assert status.spec["train"]["lora_alpha"] == 16
+        assert status.to_dict()["spec"] == status.spec
 
 
 def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
@@ -1529,6 +1664,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
 def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
         from flash.spec import JobSpec
 
@@ -1541,7 +1677,12 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
             }
         )
         orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
-        monkeypatch.setattr(checkpoints, "final_adapter_exists", lambda spec: False)
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+        monkeypatch.setattr(
+            checkpoints,
+            "adapter_artifact_exists",
+            lambda spec, *, step, revision=None: False,
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1550,7 +1691,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
             }
         )
 
-        with pytest.raises(ValueError, match="final adapter was not found"):
+        with pytest.raises(ValueError, match="complete adapter artifact was not found"):
             orch.submit_job(spec, dry_run=True, background=False)
 
 
@@ -1591,6 +1732,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
 def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
         from flash.spec import JobSpec
 
@@ -1610,7 +1752,12 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 billing_context={"org_id": "org-a"},
             )
         )
-        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: False)
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+        monkeypatch.setattr(
+            checkpoints,
+            "adapter_artifact_exists",
+            lambda spec, *, step, revision=None: False,
+        )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1619,7 +1766,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
             }
         )
 
-        with pytest.raises(ValueError, match="deployable checkpoint was not found"):
+        with pytest.raises(ValueError, match="complete adapter artifact was not found"):
             orch.submit_job(
                 spec,
                 dry_run=True,
@@ -1631,6 +1778,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
 def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
         from flash.spec import JobSpec
 
@@ -1651,12 +1799,14 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             )
         )
 
-        def fail_listing(spec, step):
+        monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
+
+        def fail_listing(spec, *, step, revision=None):
             raise checkpoints.CheckpointListingError(
                 "could not verify deployable checkpoints for source-run: 503"
             )
 
-        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", fail_listing)
+        monkeypatch.setattr(checkpoints, "adapter_artifact_exists", fail_listing)
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
             {
@@ -1674,48 +1824,128 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             )
 
 
-def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
+def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.train as flash_train
-        import flash.runner.checkpoints as checkpoints
+        import flash.lora_rank as rank_mod
+        import flash.providers as providers
+        from flash.providers.base import PollResult
         from flash.spec import JobSpec
 
-        source = JobSpec.from_dict(
-            {
-                "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
-                "algorithm": "grpo",
-                "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
-            }
-        )
-        orch._save_status(
-            orch.RunStatus(
-                run_id="source-run",
-                state="done",
-                spec=source.to_dict(),
-                billing_context={"org_id": "org-a"},
-            )
-        )
-        monkeypatch.setattr(checkpoints, "checkpoint_step_exists", lambda spec, step: step == 40)
         base = _spec("warm-recover").to_dict()
-        spec = JobSpec.from_dict(
+        public_spec = JobSpec.from_dict(
             {
                 **base,
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
+        worker_dict = public_spec.to_internal_dict()
+        worker_dict["train"].update(
+            {
+                "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+                "init_from_adapter_revision": "a" * 40,
+                "lora_rank": 64,
+            }
+        )
+        worker_spec = JobSpec.from_dict(worker_dict)
+        identity = rank_mod.AdapterArtifactIdentity(
+            "digest-v1", "config-v1", "adapter_model.safetensors", "weights-v1:123"
+        )
         orch._save_status(
             orch.RunStatus(
                 run_id="warm-recover",
                 state="running",
-                spec=spec.to_dict(),
-                billing_context={"org_id": "org-a"},
+                spec=public_spec.to_dict(),
                 remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+                effective_preparation={
+                    "worker_spec": worker_spec.to_internal_dict(),
+                    "adapter_identity": identity.to_dict(),
+                    "preparation_digest": orch._preparation_digest(
+                        public_spec, worker_spec, identity.to_dict()
+                    ),
+                },
             )
         )
-        launched: dict[str, str] = {}
+        monkeypatch.setattr(
+            rank_mod,
+            "load_hf_adapter_config",
+            lambda *a, **k: pytest.fail("live handle recovery must not reread the source"),
+        )
+        polled = {}
+
+        class Provider:
+            def poll(self, handle, spec, seed, **kwargs):
+                polled.update(
+                    init_from_adapter=spec.train.init_from_adapter,
+                    revision=spec.train.init_from_adapter_revision,
+                    lora_rank=spec.train.lora_rank,
+                )
+                return PollResult(True, metrics={"wall_seconds": 1.0})
+
+        monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+        status = orch.attach_run("warm-recover", log_stream=sys.stderr)
+
+        assert status.state == "done"
+        assert polled == {
+            "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+            "revision": "a" * 40,
+            "lora_rank": 64,
+        }
+
+
+def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import JobSpec
+
+        base = _spec("warm-recover").to_dict()
+        public_spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {
+                    **base["train"],
+                    "init_from_adapter": "source-run/step-40",
+                    "lora_rank": 8,
+                },
+            }
+        )
+        worker_dict = public_spec.to_dict()
+        worker_dict["train"] = {
+            **worker_dict["train"],
+            "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 64,
+        }
+        worker_spec = JobSpec.from_dict(worker_dict)
+        identity = rank_mod.AdapterArtifactIdentity(
+            "digest-v1", "config-v1", "adapter_model.safetensors", "weights-v1:123"
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-recover",
+                state="running",
+                spec=public_spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+                effective_preparation={
+                    "worker_spec": worker_spec.to_internal_dict(),
+                    "adapter_identity": identity.to_dict(),
+                    "preparation_digest": orch._preparation_digest(
+                        public_spec, worker_spec, identity.to_dict()
+                    ),
+                },
+            )
+        )
+        monkeypatch.setattr(
+            rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config(rank=64)
+        )
+        monkeypatch.setattr(rank_mod, "adapter_artifact_identity", lambda *a, **k: identity)
+        launched: dict[str, object] = {}
         monkeypatch.setattr(
             jobs,
             "poll_job",
@@ -1727,58 +1957,98 @@ def test_attach_resolves_public_init_ref_before_recovery_launch(monkeypatch):
         monkeypatch.setattr(
             orch,
             "_run_training",
-            lambda spec, *a, **k: launched.setdefault(
-                "init_from_adapter", spec.train.init_from_adapter
+            lambda spec, *a, **k: launched.update(
+                init_from_adapter=spec.train.init_from_adapter,
+                init_from_adapter_revision=spec.train.init_from_adapter_revision,
+                lora_rank=spec.train.lora_rank,
             ),
         )
 
         orch.attach_run("warm-recover", log_stream=sys.stderr)
 
-        assert (
-            launched["init_from_adapter"]
-            == "Freesolo-Co/source:rl/source-run/checkpoints/step-40"
-        )
+        assert launched == {
+            "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 64,
+        }
 
 
-def test_attach_polls_existing_job_before_resolving_init_ref(monkeypatch):
+def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.lora_rank as rank_mod
         import flash.providers.runpod.jobs as jobs
         from flash.spec import JobSpec
 
         base = _spec("warm-recover").to_dict()
-        spec = JobSpec.from_dict(
+        public_spec = JobSpec.from_dict(
             {
                 **base,
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
+        worker_dict = public_spec.to_dict()
+        worker_dict["train"] = {
+            **worker_dict["train"],
+            "init_from_adapter": "private-owner/private-repo:rl/source-run/checkpoints/step-40",
+            "init_from_adapter_revision": "a" * 40,
+        }
+        worker_spec = JobSpec.from_dict(worker_dict)
+        original_identity = {
+            "digest": "original",
+            "config_sha256": "config-v1",
+            "weight_filename": "adapter_model.safetensors",
+            "weight_identity": "weights-v1:123",
+        }
         orch._save_status(
             orch.RunStatus(
                 run_id="warm-recover",
                 state="running",
-                spec=spec.to_dict(),
+                spec=public_spec.to_dict(),
                 remote={"provider": "runpod", "endpoint_id": "ep", "job_id": "job"},
+                effective_preparation={
+                    "worker_spec": worker_dict,
+                    "adapter_identity": original_identity,
+                    "preparation_digest": orch._preparation_digest(
+                        public_spec, worker_spec, original_identity
+                    ),
+                },
             )
         )
+        monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
+        monkeypatch.setattr(
+            rank_mod,
+            "adapter_artifact_identity",
+            lambda *a, **k: rank_mod.AdapterArtifactIdentity(
+                "changed", "config-v2", "adapter_model.safetensors", "weights-v2:123"
+            ),
+        )
+        polls = []
         monkeypatch.setattr(
             jobs,
             "poll_job",
-            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.1}),
-        )
-        monkeypatch.setattr(
-            orch,
-            "_resolve_init_from_adapter",
-            lambda *a, **k: (_ for _ in ()).throw(ValueError("hf listing down")),
+            lambda *a, **k: (
+                polls.append("polled")
+                or jobs.PollResult(False, failure="stalled", detail="stalled")
+            ),
         )
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+        monkeypatch.setattr(
+            orch,
+            "_run_training",
+            lambda *a, **k: pytest.fail("drifted source must block resubmission"),
+        )
 
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
-        assert status.state == "done"
+        assert polls == ["polled"]
+        assert status.state == "failed"
+        assert "source-run/step-40" in (status.error or "")
+        assert "changed after submission" in (status.error or "")
+        assert "private-owner" not in (status.error or "")
 
 
-def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
+def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -1802,19 +2072,15 @@ def test_attach_marks_failed_when_init_ref_resolution_errors(monkeypatch):
         monkeypatch.setattr(
             jobs,
             "poll_job",
-            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
-        )
-        monkeypatch.setattr(
-            orch,
-            "_resolve_init_from_adapter",
-            lambda *a, **k: (_ for _ in ()).throw(ValueError("could not verify checkpoints")),
+            lambda *a, **k: pytest.fail("legacy warm start must fail before provider polling"),
         )
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
 
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
         assert status.state == "failed"
-        assert "could not verify checkpoints" in (status.error or "")
+        assert "original preparation snapshot is unavailable" in (status.error or "")
+        assert "source-run/step-40" in (status.error or "")
 
 
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
@@ -1834,7 +2100,14 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
             if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
-                on_handle({"endpoint_id": "epWALK", "endpoint_name": "n", "job_id": "jW", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "epWALK",
+                        "endpoint_name": "n",
+                        "job_id": "jW",
+                        "attempt": attempt,
+                    }
+                )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
@@ -1844,7 +2117,9 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
         orch.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
 
         assert orch.get_status("cancel-reap").state == "cancelled"
-        assert orch.get_status("cancel-reap").remote is None  # handle write lost the stickiness race
+        assert (
+            orch.get_status("cancel-reap").remote is None
+        )  # handle write lost the stickiness race
         assert "epWALK" in deleted  # the walked endpoint was reaped on the cancel path
 
 
@@ -1860,7 +2135,14 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{calls['n']}",
+                        "attempt": attempt,
+                    }
+                )
             if calls["n"] == 1:
                 return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -1943,8 +2225,11 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
         monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
-            run_id="no-retry", model="Qwen/Qwen3.5-0.8B", algorithm="grpo",
-            train=TrainSpec(epochs=1, max_examples=1), gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            run_id="no-retry",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type="RTX 4090", max_retries=0),
         )
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -1968,7 +2253,14 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{attempt}",
+                        "attempt": attempt,
+                    }
+                )
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -2030,7 +2322,14 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{attempt}",
+                        "attempt": attempt,
+                    }
+                )
             if attempt == 0:
                 return jobs.PollResult(False, failure="oom", detail="vLLM free-memory preflight")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -2114,7 +2413,9 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             alloc = real_allocate(*a, **k)
             keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
             best = keep[0]
-            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
+            return dataclasses.replace(
+                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep
+            )
 
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
@@ -2122,7 +2423,14 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{attempt}",
+                        "attempt": attempt,
+                    }
+                )
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -2166,7 +2474,9 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             alloc = real_allocate(*a, **k)
             keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
             best = keep[0]
-            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
+            return dataclasses.replace(
+                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep
+            )
 
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         last_flags: list[bool] = []
@@ -2174,7 +2484,14 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             last_flags.append(on_last_gpu)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{attempt}",
+                        "attempt": attempt,
+                    }
+                )
             if attempt < 2:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
@@ -2228,7 +2545,14 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
-                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}", "attempt": attempt})
+                on_handle(
+                    {
+                        "endpoint_id": "ep",
+                        "endpoint_name": "n",
+                        "job_id": f"j{attempt}",
+                        "attempt": attempt,
+                    }
+                )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(jobs, "submit_run", fake_submit)
@@ -2300,6 +2624,132 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
 # ---------------------------------------------------------------------------
 # Cross-process cancel via REST handle + attach
 # ---------------------------------------------------------------------------
+def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        base = _spec("warm-cancel").to_dict()
+        public_spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {
+                    **base["train"],
+                    "init_from_adapter": "source-run",
+                    "lora_rank": 8,
+                },
+            }
+        )
+        worker_dict = public_spec.to_dict()
+        worker_dict["train"] = {
+            **worker_dict["train"],
+            "init_from_adapter": "private-owner/private-repo:rl/source-run",
+            "init_from_adapter_revision": "a" * 40,
+            "lora_rank": 64,
+        }
+        worker_spec = JobSpec.from_dict(worker_dict)
+        identity = {"digest": "immutable-v1"}
+        orch._save_status(
+            orch.RunStatus(
+                run_id="warm-cancel",
+                state="running",
+                spec=public_spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                last_heartbeat={"stage": "rl_step", "step": 2},
+                effective_preparation={
+                    "worker_spec": worker_dict,
+                    "adapter_identity": identity,
+                    "preparation_digest": orch._preparation_digest(
+                        public_spec, worker_spec, identity
+                    ),
+                },
+            )
+        )
+        priced = []
+        cleaned = []
+
+        def fake_charge(spec, *, steps=None, fallback=0.0):
+            priced.append((spec.train.lora_rank, spec.train.init_from_adapter, steps))
+            return 3.25
+
+        monkeypatch.setattr(orch, "charge_usd_for_spec", fake_charge)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: cleaned.append(spec))
+
+        status = orch.cancel_run("warm-cancel")
+
+        assert status.state == "cancelled"
+        assert status.cost_usd == 3.25
+        assert priced == [(64, "private-owner/private-repo:rl/source-run", 2)]
+        assert cleaned[0].train.lora_rank == 64
+
+
+@pytest.mark.parametrize("snapshot", [None, {"worker_spec": "malformed"}])
+def test_cancel_tears_down_legacy_or_malformed_warmstart_without_child_pricing(
+    monkeypatch, snapshot
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        from flash.spec import JobSpec
+
+        base = _spec("warm-cancel-bad-snapshot").to_dict()
+        public_spec = JobSpec.from_dict(
+            {
+                **base,
+                "train": {
+                    **base["train"],
+                    "init_from_adapter": "source-run",
+                    "lora_rank": 8,
+                },
+            }
+        )
+        orch._save_status(
+            orch.RunStatus(
+                run_id=public_spec.run_id,
+                state="running",
+                spec=public_spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                remote={"provider": "fake", "job_id": "job-1"},
+                deployment={"state": "ready"},
+                effective_preparation=snapshot,
+            )
+        )
+        calls = []
+
+        class Provider:
+            def cancel(self, handle):
+                calls.append("cancel")
+
+            def destroy(self, handle):
+                calls.append("destroy")
+
+        import flash.providers
+        import flash.serve.deploy
+
+        monkeypatch.setattr(flash.providers, "get_provider", lambda name: Provider())
+        monkeypatch.setattr(
+            flash.serve.deploy, "undeploy_adapter", lambda run_id: calls.append("undeploy")
+        )
+        monkeypatch.setattr(
+            orch, "_gc_run_endpoints", lambda spec: calls.append(("gc", spec.train.lora_rank))
+        )
+        monkeypatch.setattr(
+            orch,
+            "charge_usd_for_spec",
+            lambda *a, **k: pytest.fail("public child rank must not be priced"),
+        )
+
+        status = orch.cancel_run(public_spec.run_id)
+
+        assert status.state == "cancelled"
+        assert status.cost_usd == 0.0
+        assert status.billing_state == "failed"
+        assert "private preparation snapshot" in (status.billing_error or "")
+        assert "cancel" in calls
+        assert "destroy" in calls
+        assert "undeploy" in calls
+        assert ("gc", 32) in calls
+
+
 def test_cancel_uses_rest_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -2363,6 +2813,171 @@ def test_attach_completes_run(monkeypatch):
             assert json.load(f)["cost_usd"] == 0.2
 
 
+def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-finally-status"
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote={
+                    "endpoint_id": "ep-finally",
+                    "endpoint_name": "n",
+                    "job_id": "j-finally",
+                    "attempt": 0,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.2}),
+        )
+
+        real_get_status = orch.get_status
+        real_update = orch._update
+        fail_next_status_read = {"armed": False}
+
+        def update_then_arm_status_failure(run_id, state, **updates):
+            applied = real_update(run_id, state, **updates)
+            if state == "done":
+                fail_next_status_read["armed"] = True
+            return applied
+
+        def transiently_unreadable_status(run_id):
+            if fail_next_status_read["armed"]:
+                fail_next_status_read["armed"] = False
+                raise PermissionError("status file is transiently unreadable")
+            return real_get_status(run_id)
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "_update", update_then_arm_status_failure)
+        monkeypatch.setattr(orch, "get_status", transiently_unreadable_status)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "done", "the final status read must not mask the completed outcome"
+        assert gc_calls == [run_id], "terminal endpoint cleanup must still run"
+
+
+def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-confirmed-cancel"
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote={
+                    "endpoint_id": "ep-cancel",
+                    "endpoint_name": "n",
+                    "job_id": "j-cancel",
+                    "attempt": 0,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.2}),
+        )
+
+        def cancel_during_metrics(spec, metrics):
+            orch._update(run_id, "cancelled")
+            return 0.2
+
+        real_get_status = orch.get_status
+        status_failures = {"remaining": 0, "cancelled_reads": 0}
+
+        def unreadable_after_confirmed_cancel(run_id):
+            if status_failures["remaining"]:
+                status_failures["remaining"] -= 1
+                raise PermissionError("status file is transiently unreadable")
+            current = real_get_status(run_id)
+            if current.state == "cancelled":
+                status_failures["cancelled_reads"] += 1
+                if status_failures["cancelled_reads"] == 2:
+                    status_failures["remaining"] = 2
+            return current
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "_persist_metrics", cancel_during_metrics)
+        monkeypatch.setattr(orch, "get_status", unreadable_after_confirmed_cancel)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "cancelled"
+        assert gc_calls == [run_id], "the positively observed terminal cancel must still be reaped"
+
+
+def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-live-owner"
+        stale_remote = {
+            "endpoint_id": "ep-stale",
+            "endpoint_name": "n",
+            "job_id": "j-stale",
+            "attempt": 0,
+        }
+        live_remote = {
+            "endpoint_id": "ep-live",
+            "endpoint_name": "n",
+            "job_id": "j-live",
+            "attempt": 1,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote=stale_remote,
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="redeploy"),
+        )
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
+
+        real_get_status = orch.get_status
+        status_failures = {"remaining": 0}
+
+        def transiently_unreadable_status(run_id):
+            if status_failures["remaining"]:
+                status_failures["remaining"] -= 1
+                raise PermissionError("status file is transiently unreadable")
+            return real_get_status(run_id)
+
+        def duplicate_supervisor_refusal(*args, **kwargs):
+            orch._update(run_id, "running", remote=live_remote)
+            status_failures["remaining"] = 2
+            raise orch._RunCancelled("another supervisor owns the durable provider handle")
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "get_status", transiently_unreadable_status)
+        monkeypatch.setattr(orch, "_run_training", duplicate_supervisor_refusal)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "running"
+        assert status.remote == live_remote
+        assert gc_calls == [run_id], "only stale-handle cleanup may run before live ownership appears"
+
+
 def test_attach_requires_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -2404,12 +3019,16 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         uploads = []
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: uploads.append((repo, code_prefix)) or repo)
+        monkeypatch.setattr(
+            "flash.providers._worker.upload_code",
+            lambda repo, *, code_prefix: uploads.append((repo, code_prefix)) or repo,
+        )
         seen = {}
 
         def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
             seen["remote"] = orch.get_status(spec.run_id).remote
             seen["code_prefix"] = code_prefix
+            seen["hf_repo"] = spec.train.hf_repo
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -2418,7 +3037,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
 
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
         assert re.fullmatch(r"code/[0-9a-f]{32}/flash", seen["code_prefix"] or "")
-        assert uploads == [(_spec("i1").train.hf_repo, seen["code_prefix"])]
+        assert uploads == [(seen["hf_repo"], seen["code_prefix"])]
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
 
@@ -2500,7 +3119,9 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             ),
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
+        monkeypatch.setattr(
+            "flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo
+        )
         resumed = {"called": False}
 
         def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
@@ -2513,7 +3134,9 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
 
         st = orch.attach_run("g1", log_stream=sys.stderr)
 
-        assert resumed["called"] is True, "attach must attempt a checkpoint resume on any non-ok poll"
+        assert resumed["called"] is True, (
+            "attach must attempt a checkpoint resume on any non-ok poll"
+        )
         assert st.state == "failed", "a resume that fails again must terminate the run"
         assert "bad reward fn" in (st.error or "")
 
@@ -2571,7 +3194,9 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
 
         st = orch.attach_run("v1", log_stream=sys.stderr)
 
-        assert resumed["called"] is False, "must NOT resume a second worker over a possibly-live box"
+        assert resumed["called"] is False, (
+            "must NOT resume a second worker over a possibly-live box"
+        )
         assert st.state == "running", "run left non-terminal for a later recovery/sweep"
         remote = orch.get_status("v1").remote
         assert remote is not None, "handle preserved"
@@ -2704,7 +3329,9 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
 
     with pytest.raises(RuntimeError, match="workers quota"):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -2734,7 +3361,9 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
 
     ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     assert ep_id == "ep-on-kB"
@@ -2836,13 +3465,13 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     # must be swept; the current run's endpoint (and its "live-" form) must be skipped.
     endpoints = [
         {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # scaled to zero, idle → delete
-        {"id": "ep-warm-idle", "name": "live-flash-a100-warm"}, # WARM idle/ready worker → delete
+        {"id": "ep-warm-idle", "name": "live-flash-a100-warm"},  # WARM idle/ready worker → delete
         {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # running a job → keep
-        {"id": "ep-initing",   "name": "flash-a100-init"},      # worker spinning up → keep
+        {"id": "ep-initing", "name": "flash-a100-init"},  # worker spinning up → keep
         {"id": "ep-live-skip", "name": "live-flash-a100-cur"},  # live- form of current → skip
-        {"id": "ep-bare-idle", "name": "flash-a100-old"},       # bare prefix, idle → delete
-        {"id": "ep-skip-bare", "name": "flash-a100-cur"},       # current run (bare) → skip
-        {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
+        {"id": "ep-bare-idle", "name": "flash-a100-old"},  # bare prefix, idle → delete
+        {"id": "ep-skip-bare", "name": "flash-a100-cur"},  # current run (bare) → skip
+        {"id": "ep-other", "name": "other-ep"},  # not flash-* → skip
     ]
 
     def fake_list_by_key():
@@ -2850,17 +3479,25 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
     def fake_health(eid, key):
         if eid in ("ep-live-idle", "ep-bare-idle"):
-            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                    "jobs": {"inQueue": 0, "inProgress": 0}}
+            return {
+                "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0},
+            }
         if eid == "ep-warm-idle":  # warm worker left over after a job, nothing pending → reapable
-            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
-                    "jobs": {"inQueue": 0, "inProgress": 0}}
+            return {
+                "workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0},
+            }
         if eid == "ep-live-busy":
-            return {"workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
-                    "jobs": {"inQueue": 0, "inProgress": 1}}
+            return {
+                "workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 1},
+            }
         if eid == "ep-initing":  # initializing worker is busy (spinning up) → not reapable
-            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 1},
-                    "jobs": {"inQueue": 0, "inProgress": 0}}
+            return {
+                "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 1},
+                "jobs": {"inQueue": 0, "inProgress": 0},
+            }
         return {}
 
     deleted = []
@@ -2874,9 +3511,7 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", fake_delete)
     jobs._idle_since.clear()
 
-    count = jobs._sweep_idle_flash_endpoints(
-        protected={"flash-a100-cur", "live-flash-a100-cur"}
-    )
+    count = jobs._sweep_idle_flash_endpoints(protected={"flash-a100-cur", "live-flash-a100-cur"})
 
     # warm idle/ready (ep-warm-idle) is reaped too — the dominant leak the old scaled-to-zero rule
     # never caught; running/initializing stay, current-run endpoints are protected.
@@ -2892,20 +3527,26 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
 
     endpoints = [
         {"id": "ep-warm", "name": "live-flash-a100-warm"},  # warm idle/ready worker
-        {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
+        {"id": "ep-zero", "name": "flash-a100-zero"},  # fully scaled to zero
     ]
 
     def health(eid, key):
         if eid == "ep-warm":
-            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
-                    "jobs": {"inQueue": 0, "inProgress": 0}}
-        return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                "jobs": {"inQueue": 0, "inProgress": 0}}
+            return {
+                "workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0},
+            }
+        return {
+            "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+            "jobs": {"inQueue": 0, "inProgress": 0},
+        }
 
     deleted = []
     monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda: ({"k": endpoints}, []))
     monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True
+    )
 
     # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
     jobs._idle_since.clear()
@@ -2933,11 +3574,15 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                          "jobs": {"inQueue": 0, "inProgress": 0}},
+        lambda eid, key: {
+            "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+            "jobs": {"inQueue": 0, "inProgress": 0},
+        },
     )
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True
+    )
     jobs._idle_since.clear()
 
     clock = {"t": 1000.0}
@@ -2979,7 +3624,9 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
     deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True
+    )
     jobs._idle_since.clear()
     clock = {"t": 1000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -3015,8 +3662,10 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, key: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-                          "jobs": {"inQueue": 0, "inProgress": 0}},
+        lambda eid, key: {
+            "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+            "jobs": {"inQueue": 0, "inProgress": 0},
+        },
     )
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: True)
     jobs._idle_since.clear()

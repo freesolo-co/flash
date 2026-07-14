@@ -167,6 +167,10 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "teacher_model": "accounts/fireworks/models/glm-5p2",
         "structured_outputs": "",
     }
+    assert "lora_rank" not in sparse["train"]
+    assert (
+        spec_payload(spec, authored_train_keys=authored | {"lora_rank"})["train"]["lora_rank"] == 32
+    )
     assert spec_payload(spec, authored_train_keys=set())["train"] == {}
 
 
