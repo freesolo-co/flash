@@ -7,14 +7,22 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
+import json
 import math
+import multiprocessing
 import re
 import time
 from typing import Annotated
 
+import regex as safe_regex
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from jsonschema import SchemaError, ValidationError
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
+from flash.engine.structured_outputs import parse_structured_outputs
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -39,6 +47,117 @@ _DEPLOYMENT_BUSY_STATES = {"deploying", "registering", "verifying"}
 _DEPLOYMENT_READY_STATES = {"ready", "deployed"}
 _DEPLOYMENT_STALE_SECONDS = 30 * 60
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+
+
+def _reject_external_schema_reference(uri: str):
+    raise NoSuchResource(ref=uri)
+
+
+_DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
+_JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
+_JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
+
+
+def _bounded_regex_fullmatch(pattern: str, value: str):
+    try:
+        return safe_regex.fullmatch(pattern, value, timeout=_DIRECT_REGEX_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise ServingError(
+            f"structured-output regex evaluation exceeded the {_DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
+        ) from exc
+
+
+def _sanitized_schema_error(exc: Exception) -> str:
+    message = getattr(exc, "message", str(exc))
+    return " ".join(str(message).split())[:500]
+
+
+def _json_schema_validation_worker(connection, instance, schema) -> None:
+    try:
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        registry = Registry(retrieve=_reject_external_schema_reference)
+        validator_class(schema, registry=registry).validate(instance)
+    except Unresolvable as exc:
+        outcome = ("reference", _sanitized_schema_error(exc))
+    except SchemaError as exc:
+        outcome = ("schema", _sanitized_schema_error(exc))
+    except ValidationError as exc:
+        outcome = ("validation", _sanitized_schema_error(exc))
+    except Exception as exc:
+        outcome = ("error", f"{type(exc).__name__}: {_sanitized_schema_error(exc)}")
+    else:
+        outcome = ("ok", "")
+    try:
+        connection.send(outcome)
+    finally:
+        connection.close()
+
+
+def _reap_schema_validation_process(process) -> None:
+    process.join(timeout=0.1)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=0.2)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def _validate_json_schema(instance, schema: dict) -> None:
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_json_schema_validation_worker,
+        args=(send_connection, instance, schema),
+        name=_JSON_SCHEMA_PROCESS_NAME,
+        daemon=True,
+    )
+    deadline = time.monotonic() + _JSON_SCHEMA_TIMEOUT_SECONDS
+    outcome: tuple[str, str] | None = None
+    try:
+        try:
+            process.start()
+        except Exception as exc:
+            raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
+        finally:
+            send_connection.close()
+        remaining = max(0.0, deadline - time.monotonic())
+        if receive_connection.poll(remaining):
+            try:
+                outcome = receive_connection.recv()
+            except EOFError:
+                outcome = None
+    finally:
+        receive_connection.close()
+        if process.pid is not None:
+            _reap_schema_validation_process(process)
+            process.close()
+
+    if outcome is None:
+        raise ServingError(
+            f"JSON schema validation exceeded the {_JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
+        )
+    status, detail = outcome
+    if status == "ok":
+        return
+    if status == "reference":
+        raise ServingError(f"configured JSON schema reference could not be resolved: {detail}")
+    if status == "schema":
+        raise ServingError(f"configured JSON schema is invalid: {detail}")
+    if status == "validation":
+        raise ServingError(f"structured smoke output violates the configured JSON schema: {detail}")
+    raise ServingError(f"JSON schema validation failed safely: {detail}")
+
+
+def _strict_json_loads(value: str):
+    def reject_constant(constant: str):
+        raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
+
+    try:
+        return json.loads(value, parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -92,6 +211,39 @@ def recover_deployments() -> int:
     return recovered
 
 
+def _thinking_structured_answer(content: str) -> str:
+    closed = content.find("</think>")
+    if closed < 0:
+        raise ServingError(
+            "structured smoke generation for a thinking adapter never closed its reasoning with "
+            "</think>"
+        )
+    answer = content[closed + len("</think>") :].strip()
+    if not answer:
+        raise ServingError("structured smoke generation returned no answer after </think>")
+    return answer
+
+
+def _validate_structured_smoke(answer: str, constraint: dict) -> None:
+    try:
+        if "json" in constraint:
+            _validate_json_schema(_strict_json_loads(answer), constraint["json"])
+        elif constraint.get("json_object") is True:
+            if not isinstance(_strict_json_loads(answer), dict):
+                raise ServingError("structured smoke output is valid JSON but not a JSON object")
+        elif "choice" in constraint:
+            if answer not in constraint["choice"]:
+                raise ServingError(
+                    f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
+                )
+        elif "regex" in constraint and _bounded_regex_fullmatch(
+            str(constraint["regex"]), answer
+        ) is None:
+            raise ServingError("structured smoke output does not match the configured regex")
+    except safe_regex.error as exc:
+        raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
+
+
 def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     started = time.monotonic()
     result = _app.serve_chat(
@@ -105,16 +257,22 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
-    if not content.strip():
+    constraint = parse_structured_outputs(spec.train.structured_outputs)
+    if constraint and spec.thinking and finish == "length":
+        raise ServingError("structured smoke generation was truncated at the maximum token length")
+    answer = _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
+    if not answer:
         raise ServingError(
             f"smoke generation returned no content (finish_reason={finish!r}) after {latency:.1f}s"
         )
+    if constraint:
+        _validate_structured_smoke(answer, constraint)
     return {
         "verified_at": time.time(),
         "verify_latency_s": latency,
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
-        "verify_sample": content.strip()[:160],
+        "verify_sample": answer[:160],
     }
 
 
@@ -348,6 +506,15 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
+        if not dry_run and spec.thinking and spec.train.structured_outputs and not verify:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "verify=false is not allowed for thinking deployments with structured outputs; "
+                    "verification is required to confirm the post-reasoning answer satisfies the "
+                    "configured constraint"
+                ),
+            )
         current_deployment = status.deployment or {}
         if (
             not dry_run
@@ -387,9 +554,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
-            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
-            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
-            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            # a run trained with structured_outputs serves under the same canonical constraint;
+            # thinking registration is gated on serving's deferred-constraint capability.
             "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
         }
