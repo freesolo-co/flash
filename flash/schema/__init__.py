@@ -227,7 +227,9 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 TRAIN_KEY_MIN_VERSIONS = {
-    item.name: str(item.metadata["introduced_in"]) for item in dataclass_fields(TrainSpec)
+    item.name: str(item.metadata["introduced_in"])
+    for item in dataclass_fields(TrainSpec)
+    if "introduced_in" in item.metadata
 }
 TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
 
@@ -245,7 +247,6 @@ def validate_train_keys(keys: Collection[str]) -> None:
             f"[train] unknown key(s): {', '.join(unknown)} "
             f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
         )
-
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
@@ -342,9 +343,20 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    init_from_adapter = _init_from_adapter_ref(train_raw)
+    if algorithm == "sft" and init_from_adapter:
+        raise ConfigError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
+    if init_from_adapter and "lora_rank" in train_raw:
+        raise ConfigError(
+            "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
+            "rank metadata is authoritative"
+        )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)
-    if max_lora_rank is not None and lora_rank > max_lora_rank:
+    if not init_from_adapter and max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
             f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
             f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
@@ -367,7 +379,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=_init_from_adapter_ref(train_raw),
+            init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
@@ -381,8 +393,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
-            # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
-            opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
             # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),

@@ -58,10 +58,12 @@ def cancel_run(run_id: str) -> RunStatus:
         _update,
         actual_steps_run,
         charge_usd_for_spec,
+        effective_spec_from_status,
         get_status,
         mark_deployment_revocation_failed,
         mark_deployment_undeployed,
     )
+    from flash.server._locks import _deploy_lock
 
     status = get_status(run_id)
     retry_revocation = (
@@ -72,9 +74,13 @@ def cancel_run(run_id: str) -> RunStatus:
         return status
     # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
     entered_deployed = status.state == "deployed"
-    spec = JobSpec.from_dict(status.spec)
-    # a mid-training cancel is re-priced to the work actually completed. deployed runs retain the
-    # completed training quote, and revocation retries never alter billing.
+    public_spec = JobSpec.from_dict(status.spec)
+    effective_spec = None
+    with contextlib.suppress(Exception):
+        effective_spec = effective_spec_from_status(status)
+    cleanup_spec = effective_spec or public_spec
+    # a mid-training cancel is re-priced from the authoritative prepared spec. deployed runs
+    # retain the completed quote, and revocation retries never alter billing.
     bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
     remote = status.remote or {}
     teardown_error: Exception | None = None
@@ -99,16 +105,29 @@ def cancel_run(run_id: str) -> RunStatus:
             provider.destroy(handle)
         except Exception:
             pass
-    _gc_run_endpoints(spec)
-    cancel_charge_usd: float | None = (
-        charge_usd_for_spec(spec, steps=actual_steps_run(get_status(run_id)), fallback=0.0)
-        if bill_cancel
-        else None
-    )
-    from flash.server._locks import _deploy_lock
-
+    with contextlib.suppress(Exception):
+        _gc_run_endpoints(cleanup_spec)
+    cancel_charge_usd: float | None = None
+    billing_diagnostic: dict = {}
+    if bill_cancel:
+        if effective_spec is not None:
+            cancel_charge_usd = charge_usd_for_spec(
+                effective_spec,
+                steps=actual_steps_run(get_status(run_id)),
+                fallback=0.0,
+            )
+        else:
+            cancel_charge_usd = 0.0
+            billing_diagnostic = {
+                "billing_state": "failed",
+                "billing_error": (
+                    "cancellation charge was not computed because the private preparation "
+                    "snapshot was unavailable or invalid; teardown was still attempted"
+                ),
+            }
     with _deploy_lock(run_id):
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
+        cancel_updates.update(billing_diagnostic)
         if not retry_revocation:
             _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
@@ -146,15 +165,22 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         TERMINAL_STATES,
         _gc_run_endpoints,
         _persist_metrics,
-        _resolve_init_from_adapter,
         _run_training,
         _RunCancelled,
         _status_estimated_charge,
-        _status_org_id,
         _update,
         artifacts_dir,
+        effective_spec_from_status,
         get_status,
     )
+
+    cleanup_terminal = False
+
+    def status_for_return() -> RunStatus:
+        nonlocal cleanup_terminal
+        current = get_status(run_id)
+        cleanup_terminal = current.state in TERMINAL_STATES
+        return current
 
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
@@ -163,11 +189,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
     public_spec = JobSpec.from_dict(status.spec)
+    worker_spec = public_spec
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
 
     try:
+        worker_spec = effective_spec_from_status(status)
         remote = dict(status.remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
@@ -178,10 +206,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         allocated_gpu = remote.pop("allocated_gpu", None)
         handle = JobHandle.from_dict(remote)
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-        res = get_provider(handle.provider).poll(handle, public_spec, seed, log=log)
+        res = get_provider(handle.provider).poll(handle, worker_spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
-            return get_status(run_id)
+            return status_for_return()
         if not res.ok:
+            # job ended not-ok, so any replacement must revalidate the pinned source before paid work.
+            worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume from
             # the last HF checkpoint (fresh allocation, worker resumes mid-training) instead of
             # failing; _run_training still terminates a genuinely broken run when it re-fails.
@@ -213,26 +243,16 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # GC the dead endpoint / any label-named instances (a second force-reap attempt when the
             # teardown above was unconfirmed), then clear the stale handle.
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(public_spec)
+                _gc_run_endpoints(worker_spec)
             if not teardown_confirmed:
                 # Keep ``remote`` so the still-billing box stays reachable for the next recovery/sweep,
                 # and leave the run non-terminal (do not _update) so a future re-attach re-polls it.
-                return get_status(run_id)
+                return status_for_return()
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
-                return get_status(run_id)
-            owner_key_id = None
-            with contextlib.suppress(Exception):
-                from flash.server import db
-
-                owner_key_id = db.run_owner(run_id)
-            worker_spec = _resolve_init_from_adapter(
-                public_spec,
-                owner_org_id=_status_org_id(status),
-                owner_key_id=owner_key_id,
-            )
+                return status_for_return()
             if code_prefix is None:
                 from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
@@ -245,7 +265,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 prior_cost=float(status.cost_usd or 0.0),
                 code_prefix=code_prefix,
             )
-            return get_status(run_id)
+            return status_for_return()
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Add the recovered run's cost to any already booked before the restart so recovery
@@ -258,16 +278,28 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # check above). Re-read before the terminal "done" so a late worker success can't resurrect
         # a user-cancelled run. _RunCancelled is caught below, leaving the cancellation intact.
         if get_status(run_id).state == "cancelled":
+            cleanup_terminal = True
             raise _RunCancelled(f"run {run_id} was cancelled")
         _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(public_spec))
+        cleanup_terminal = True
     except _RunCancelled:
-        pass  # cancel_run already wrote terminal `cancelled`
+        # this also signals a non-terminal duplicate-supervisor refusal, so only a readable terminal
+        # status may authorize cleanup; otherwise retain prior positive terminal knowledge.
+        with contextlib.suppress(Exception):
+            cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
+        cleanup_terminal = True
     finally:
-        _gc_run_endpoints(public_spec)
-    return get_status(run_id)
+        # only reap a positively observed terminal run. if the final status read is transiently
+        # unavailable, retain prior terminal knowledge without risking a live duplicate supervisor.
+        with contextlib.suppress(Exception):
+            cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
+        if cleanup_terminal:
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(worker_spec)
+    return status_for_return()
 
 
 def _deployment_attempt_is_owned(status: RunStatus, deployment: dict) -> bool:
@@ -440,7 +472,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             }
         else:
             failed = dict(deployment)
-            failed.pop("previous_deployment", None)
+            if not failed.get("activation_outcome_unknown"):
+                failed.pop("previous_deployment", None)
             state = (
                 "reconciling"
                 if failed.get("activation_outcome_unknown")

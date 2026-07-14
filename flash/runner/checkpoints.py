@@ -47,14 +47,16 @@ def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:
     return "adapter_config.json" in names and not names.isdisjoint(ADAPTER_WEIGHT_FILES)
 
 
-def _repo_files(spec: JobSpec, *, strict: bool) -> list[str]:
+def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> list[str]:
     repo = spec.train.hf_repo
     if not repo:
         return []
     try:
         from huggingface_hub import HfApi
 
-        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(repo, repo_type="dataset")
+        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+            repo, repo_type="dataset", revision=revision
+        )
     except Exception as exc:
         if strict:
             raise CheckpointListingError(
@@ -106,25 +108,26 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     return _checkpoints_from_files(spec, _repo_files(spec, strict=False))
 
 
-def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
-    """Authoritatively verify a warm-start checkpoint step before provisioning a worker.
+def adapter_artifact_exists(
+    spec: JobSpec, *, step: int | None, revision: str | None = None
+) -> bool:
+    """Authoritatively verify config and weights for one final or checkpoint adapter."""
+    files = _repo_files(spec, strict=True, revision=revision)
+    prefix = adapter_prefix(spec) if step is None else checkpoint_adapter_prefix(spec, int(step))
+    return _adapter_folder_has_required_files(files, prefix)
 
-    Unlike ``list_checkpoints()``, this raises ``CheckpointListingError`` when HF listing fails
-    so transient/auth errors are not misreported as "step missing".
-    """
-    return any(
-        int(item.get("step", -1)) == int(step)
-        for item in _checkpoints_from_files(spec, _repo_files(spec, strict=True))
-    )
+
+def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
+    """Authoritatively verify a warm-start checkpoint step before provisioning a worker."""
+    return adapter_artifact_exists(spec, step=step)
 
 
 def final_adapter_exists(spec: JobSpec) -> bool:
     """Authoritatively verify that the run-level final adapter exists in the artifact repo."""
     try:
-        files = _repo_files(spec, strict=True)
+        return adapter_artifact_exists(spec, step=None)
     except CheckpointListingError as exc:
         cause = exc.__cause__ or exc
         raise CheckpointListingError(
             f"could not verify final adapter for {spec.run_id}: {cause}"
         ) from cause
-    return _adapter_folder_has_required_files(files, adapter_prefix(spec))

@@ -141,7 +141,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
                 "hf_repo": "user/ignored",
                 "max_examples": 1,
                 "temperature": 0,
-                "opd_eos_loss_coef": 0,
                 "stop_sequences": [],
                 "teacher_model": "GLM 5.2",
                 "structured_outputs": False,
@@ -153,7 +152,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "hf_repo",
         "max_examples",
         "temperature",
-        "opd_eos_loss_coef",
         "stop_sequences",
         "teacher_model",
         "structured_outputs",
@@ -168,11 +166,14 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "hf_repo": "",
         "max_examples": 1,
         "temperature": 0.0,
-        "opd_eos_loss_coef": 0.0,
         "stop_sequences": (),
         "teacher_model": "accounts/fireworks/models/glm-5p2",
         "structured_outputs": "",
     }
+    assert "lora_rank" not in sparse["train"]
+    assert (
+        spec_payload(spec, authored_train_keys=authored | {"lora_rank"})["train"]["lora_rank"] == 32
+    )
     assert spec_payload(spec, authored_train_keys=set())["train"] == {}
 
 
@@ -517,6 +518,26 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
         ("POST", "/v1/runs/r1/cancel", 60.0),
         ("GET", "/v1/runs/r1", None),
     ]
+
+
+def test_cancel_timeout_rejects_unconfirmed_serving_revocation(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return {
+                "run_id": "r1",
+                "state": "cancelled",
+                "deployment": {"state": "revocation_failed"},
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ClientError, match="serving disablement is unconfirmed"):
+        client.cancel_run("r1")
 
 
 def test_deploy_rejects_malformed_checkpoint_ref():
