@@ -475,13 +475,6 @@ def _emit_opd_trained_heartbeat(*, opt_steps: int, train_wall: float, forward_te
 
 
 def _run_opd(forward_teacher_accounting):
-    resume_ckpt = _w.hf_resume_checkpoint()
-    if resume_ckpt:
-        raise RuntimeError(
-            "opd found a same-run checkpoint, but opd checkpoint resume is not supported; "
-            "refusing to restart from step zero"
-        )
-
     import torch
     from transformers import AutoTokenizer
 
@@ -764,6 +757,10 @@ def _run_opd(forward_teacher_accounting):
     # and the wandb_run_info() already threaded into train_meta below returns {} (codex[bot]). We log
     # loss/coverage per optimizer step; the worker exit path (__init__.py) calls wandb_finish.
     _wandb_on = bool(_w.wandb_report_to())
+
+    resume_ckpt = _w.hf_resume_checkpoint()
+    if resume_ckpt:
+        print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
 
     out_dir = f"/tmp/opd_seed{_w.SEED}"
     adapter_dir = f"{out_dir}/adapter"

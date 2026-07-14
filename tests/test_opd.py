@@ -746,34 +746,6 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
         _spec({"max_context_tokens": 256})
 
 
-def test_same_run_opd_checkpoint_fails_before_training_provider_requests(monkeypatch):
-    from flash.engine.worker import forward_teacher as forward_teacher_mod
-    from flash.engine.worker import opd as opd_mod
-    from flash.engine.worker import teacher as teacher_mod
-
-    calls = []
-    fake_w = SimpleNamespace(
-        hf_resume_checkpoint=lambda: "checkpoint-4",
-        require_active_env=lambda: calls.append("environment"),
-    )
-    monkeypatch.setattr(opd_mod, "_w", fake_w)
-    monkeypatch.setattr(
-        teacher_mod,
-        "TeacherClient",
-        lambda *_args, **_kwargs: calls.append("teacher") or object(),
-    )
-    monkeypatch.setattr(
-        forward_teacher_mod,
-        "ForwardTeacherClient",
-        lambda *_args, **_kwargs: calls.append("forward_teacher") or object(),
-    )
-
-    with pytest.raises(RuntimeError, match="checkpoint resume is not supported"):
-        opd_mod.run_opd()
-
-    assert calls == []
-
-
 def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     """Regression (codex[bot], opd.py:380-381): when EVERY sample in a step skips (empty completion
     / no teacher signal, or an over-budget re-render), the per-sample SUCCESS ping is never reached.

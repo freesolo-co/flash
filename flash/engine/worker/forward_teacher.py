@@ -230,7 +230,8 @@ class ForwardTeacherClient:
 
     def _pace_attempt(self, *, max_delay: float | None = None) -> float:
         with self._start_lock:
-            now = self._clock()
+            started = self._clock()
+            now = started
             if self._last_request_started is not None:
                 delay = self._last_request_started + 2.0 - now
                 if delay > 0:
@@ -239,7 +240,7 @@ class ForwardTeacherClient:
                     self._sleep(delay)
                     now = self._clock()
             self._last_request_started = now
-            return now
+            return started
 
     @staticmethod
     def _retry_after(headers) -> float:

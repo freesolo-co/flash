@@ -299,12 +299,14 @@ def test_forward_teacher_paces_outbound_attempt_starts_without_sleeping_first():
         return _Response(_payload())
 
     client = ForwardTeacherClient("key", seed=123, opener=opener, sleep=sleep, clock=clock)
-    client.generate([{"role": "user", "content": "first"}])
+    first = client.generate([{"role": "user", "content": "first"}])
     now[0] += 0.25
-    client.generate([{"role": "user", "content": "second"}])
+    second = client.generate([{"role": "user", "content": "second"}])
 
     assert starts == [100.0, 102.0]
     assert sleeps == [1.75]
+    assert first.latency_seconds == pytest.approx(0.0)
+    assert second.latency_seconds == pytest.approx(1.75)
 
 
 @pytest.mark.parametrize(
