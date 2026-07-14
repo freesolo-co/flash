@@ -110,13 +110,18 @@ class RestClient:
                 return self.request(target, method=method, body=body, key=key)
             except urllib.error.HTTPError as e:
                 if e.code < 500 and e.code != 429:
-                    detail = ""
+                    raw = b""
                     with contextlib.suppress(Exception):
-                        detail = e.read().decode("utf-8", "replace")[:500].strip()
+                        raw = e.read()
+                    detail = raw.decode("utf-8", "replace")[:500].strip() if raw else ""
                     suffix = f": {detail}" if detail else ""
-                    raise self.error_cls(
+                    err = self.error_cls(
                         f"{method} {target} -> HTTP {e.code}: {e.reason}{suffix}"
-                    ) from e
+                    )
+                    # the consumed body is truncated in the message; keep the full bytes so
+                    # callers (e.g. vast create rejection recovery) can parse the real response.
+                    err.response_body = raw
+                    raise err from e
                 last = e
             except json.JSONDecodeError as e:
                 # Cloudflare HTML interstitial or truncated body — treat as transient.
