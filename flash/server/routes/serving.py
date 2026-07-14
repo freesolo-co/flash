@@ -26,6 +26,7 @@ from flash.runner import (
     adapter_prefix,
     complete_deployment_cleanup,
     deployment_lifecycle_allows_intent,
+    effective_spec_from_status,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_attempt_queued,
@@ -494,7 +495,9 @@ def _finish_deployment_unlocked(
         if prior_revision is not None and (
             not isinstance(prior_mutation_id, str) or not prior_mutation_id
         ):
-            raise ServingError("prior deployment mutation identity changed before registry mutation")
+            raise ServingError(
+                "prior deployment mutation identity changed before registry mutation"
+            )
         intent = _deployment_state(
             deployment,
             "deploying",
@@ -700,6 +703,10 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
+        try:
+            effective_spec = effective_spec_from_status(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
         mutation_id = str(uuid4())
@@ -758,7 +765,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "adapter_prefix": deploy_prefix,
             "mutation_id": mutation_id,
             "dry_run": dry_run,
-            "lora_rank": spec.train.lora_rank,
+            "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
             # a run trained with structured_outputs serves under the same grammar for both thinking
@@ -781,7 +788,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             from flash.serve.deploy import validate_serving_lora_rank
 
             validate_serving_lora_rank(
-                spec.model, spec.train.lora_rank, rank_source="configured train.lora_rank"
+                spec.model,
+                effective_spec.train.lora_rank,
+                rank_source="effective prepared LoRA rank",
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -806,9 +815,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
         active_deployment = (
-            current_deployment
-            if current_deployment.get("state") in {"ready", "deployed"}
-            else None
+            current_deployment if current_deployment.get("state") in {"ready", "deployed"} else None
         )
         deployment_attempt = {
             "phase": "redeploy" if active_deployment is not None else "initial",
@@ -823,10 +830,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             expect_attempt=current_attempt,
         )
         expected_visible = active_deployment if active_deployment is not None else dep_dict
-        if (
-            marked.deployment != expected_visible
-            or marked.deployment_attempt != deployment_attempt
-        ):
+        if marked.deployment != expected_visible or marked.deployment_attempt != deployment_attempt:
             raise HTTPException(
                 status_code=409,
                 detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
@@ -931,7 +935,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         "adapter_id": run_id,
         "repository": repository,
         "url": url,
-        "source": f"{spec.train.hf_repo}:{subfolder}",
+        "source": f"{run_id}/step-{checkpoint_step}" if is_checkpoint else run_id,
     }
     if is_checkpoint:
         result["step"] = checkpoint_step

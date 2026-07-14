@@ -1,9 +1,14 @@
-"""LoRA adapter rank parsing and control-plane preflight helpers."""
+"""LoRA adapter metadata parsing and control-plane preflight helpers."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from flash.catalog import serving_lora_rank_cap
@@ -11,7 +16,29 @@ from flash.catalog import serving_lora_rank_cap
 if TYPE_CHECKING:
     from flash.spec import JobSpec
 
-AdapterConfigLoader = Callable[[str, str | None], Mapping[str, Any]]
+AdapterConfigLoader = Callable[[str, str | None, str | None], Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class AdapterMetadata:
+    rank: int
+    alpha: int
+
+
+@dataclass(frozen=True)
+class AdapterArtifactIdentity:
+    digest: str
+    config_sha256: str
+    weight_filename: str
+    weight_identity: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "digest": self.digest,
+            "config_sha256": self.config_sha256,
+            "weight_filename": self.weight_filename,
+            "weight_identity": self.weight_identity,
+        }
 
 
 def resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
@@ -33,49 +60,230 @@ def adapter_config_path_from_ref(adapter_ref: str) -> tuple[str, str]:
 
 def _positive_int(value: Any, *, source: str, field: str) -> int:
     if isinstance(value, bool):
+        raise ValueError(f"could not verify adapter metadata: {source} has invalid {field}")
+    parsed: int | None = None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            parsed = int(value)
+    elif isinstance(value, Decimal):
+        # load_hf_adapter_config parses json floats as decimal for exact textual fidelity.
+        if value.is_finite() and value == value.to_integral_value():
+            parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+]?[0-9]+", text):
+            parsed = int(text)
+        else:
+            try:
+                numeric = Decimal(text)
+            except InvalidOperation:
+                numeric = Decimal("NaN")
+            if numeric.is_finite() and numeric == numeric.to_integral_value():
+                parsed = int(numeric)
+    if parsed is None:
+        raise ValueError(f"could not verify adapter metadata: {source} has invalid {field}")
+    if parsed <= 0:
         raise ValueError(
-            f"could not verify adapter rank: {source} has invalid rank metadata ({field})"
+            f"could not verify adapter metadata: {source} has non-positive {field} {parsed}"
         )
+    return parsed
+
+
+def _file_identity(file_info: Any) -> str:
+    lfs = getattr(file_info, "lfs", None)
+    if isinstance(lfs, Mapping):
+        oid = lfs.get("sha256") or lfs.get("oid")
+        size = lfs.get("size")
+    else:
+        oid = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
+        size = getattr(lfs, "size", None)
+    blob_id = getattr(file_info, "blob_id", None)
+    size = size if size is not None else getattr(file_info, "size", None)
+    immutable = oid or blob_id
+    if not immutable:
+        raise ValueError("source adapter weight metadata has no immutable content identity")
+    return f"{immutable}:{size if size is not None else 'unknown'}"
+
+
+def resolve_hf_dataset_revision(repo: str, token: str | None = None) -> str:
+    """Resolve a dataset's current revision to an immutable commit SHA."""
     try:
-        rank = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"could not verify adapter rank: {source} has invalid rank metadata ({field})"
-        ) from exc
-    if rank <= 0:
-        raise ValueError(f"could not verify adapter rank: {source} has non-positive rank {rank}")
-    return rank
+        from huggingface_hub import HfApi
+
+        revision = str(HfApi(token=token).repo_info(repo, repo_type="dataset").sha or "").strip()
+    except Exception as exc:
+        raise ValueError("could not pin source adapter revision") from exc
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+        raise ValueError("source adapter revision is not an immutable commit SHA")
+    return revision.lower()
+
+
+def _contains_decimal(value: Any) -> bool:
+    if isinstance(value, Decimal):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_decimal(key) or _contains_decimal(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_decimal(item) for item in value)
+    return False
+
+
+def _typed_canonical_tree(value: Any) -> Any:
+    """Encode JSON values and decimals into an injective, type-aware canonical tree."""
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, Decimal):
+        return ["decimal", str(value)]
+    if isinstance(value, int):
+        return ["int", str(value)]
+    if isinstance(value, float):
+        return ["float", value]
+    if isinstance(value, str):
+        return ["string", value]
+    if isinstance(value, Mapping):
+        return [
+            "object",
+            [
+                [_typed_canonical_tree(key), _typed_canonical_tree(item)]
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            ],
+        ]
+    if isinstance(value, (list, tuple)):
+        return ["array", [_typed_canonical_tree(item) for item in value]]
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _canonical_config_bytes(config: Mapping[str, Any]) -> bytes:
+    if not _contains_decimal(config):
+        return json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    tree = _typed_canonical_tree(config)
+    encoded = json.dumps(tree, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return b"typed-json-decimal-v1\0" + encoded
+
+
+def adapter_artifact_identity(
+    adapter_ref: str,
+    config: Mapping[str, Any],
+    token: str | None = None,
+    revision: str | None = None,
+) -> AdapterArtifactIdentity:
+    """Bind adapter config semantics and one required weight object's immutable metadata."""
+    from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
+
+    resolved = resolve_adapter_ref(adapter_ref)
+    if resolved is None:
+        raise ValueError("source adapter reference is invalid")
+    repo, prefix = resolved
+    config_bytes = _canonical_config_bytes(config)
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    paths = [f"{prefix}/adapter/{name}" for name in ADAPTER_WEIGHT_FILES]
+    try:
+        from huggingface_hub import HfApi
+
+        infos = HfApi(token=token).get_paths_info(
+            repo, paths=paths, repo_type="dataset", revision=revision
+        )
+    except Exception as exc:
+        raise ValueError("could not verify source adapter weight identity") from exc
+    by_name = {str(getattr(info, "path", "")).rsplit("/", 1)[-1]: info for info in infos}
+    selected = next((name for name in ADAPTER_WEIGHT_FILES if name in by_name), None)
+    if selected is None:
+        raise ValueError("source adapter has no required weight file")
+    weight_identity = _file_identity(by_name[selected])
+    payload = f"v1\0{config_sha256}\0{selected}\0{weight_identity}".encode()
+    return AdapterArtifactIdentity(
+        digest=hashlib.sha256(payload).hexdigest(),
+        config_sha256=config_sha256,
+        weight_filename=selected,
+        weight_identity=weight_identity,
+    )
+
+
+def _pattern_values(config: Mapping[str, Any], *, field: str, source: str) -> list[int]:
+    value = config.get(field)
+    if value is None:
+        return []
+    if not isinstance(value, Mapping):
+        raise ValueError(f"could not verify adapter metadata: {source} has invalid {field}")
+    return [_positive_int(item, source=source, field=field) for item in value.values()]
 
 
 def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
-    """Return the max LoRA rank advertised by PEFT adapter metadata."""
+    """Return the maximum LoRA rank across default and per-module metadata."""
     if not isinstance(config, Mapping):
-        raise ValueError(f"could not verify adapter rank: {source} is not a JSON object")
-    ranks: list[int] = []
+        raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
+    ranks = _pattern_values(config, field="rank_pattern", source=source)
     if config.get("r") is not None:
         ranks.append(_positive_int(config["r"], source=source, field="r"))
-    if "rank_pattern" in config and config["rank_pattern"] is not None:
-        rank_pattern = config["rank_pattern"]
-        if not isinstance(rank_pattern, Mapping):
-            raise ValueError(
-                f"could not verify adapter rank: {source} has invalid rank metadata (rank_pattern)"
-            )
-        ranks.extend(
-            _positive_int(v, source=source, field="rank_pattern") for v in rank_pattern.values()
-        )
     if not ranks:
-        raise ValueError(f"could not verify adapter rank: {source} has no LoRA rank metadata")
+        raise ValueError(f"could not verify adapter metadata: {source} has no LoRA rank metadata")
     return max(ranks)
 
 
-def load_hf_adapter_config(adapter_ref: str, token: str | None = None) -> Mapping[str, Any]:
+def alpha_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
+    """Return the maximum LoRA alpha across default and per-module metadata."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
+    alphas = _pattern_values(config, field="alpha_pattern", source=source)
+    if config.get("lora_alpha") is not None:
+        alphas.append(_positive_int(config["lora_alpha"], source=source, field="lora_alpha"))
+    if not alphas:
+        raise ValueError(f"could not verify adapter metadata: {source} has no LoRA alpha metadata")
+    return max(alphas)
+
+
+def _normalized_model(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def inspect_adapter_config(
+    config: Mapping[str, Any], *, source: str, target_model: str
+) -> AdapterMetadata:
+    """Validate PEFT compatibility and return source-authoritative adapter metadata."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
+    if str(config.get("peft_type") or "").strip().upper() != "LORA":
+        raise ValueError(f"could not verify adapter metadata: {source} peft_type must be LORA")
+    task_type = str(config.get("task_type") or "").strip().upper()
+    if task_type and task_type != "CAUSAL_LM":
+        raise ValueError(f"could not verify adapter metadata: {source} task_type must be CAUSAL_LM")
+    base_model = _normalized_model(config.get("base_model_name_or_path"))
+    if base_model and base_model != _normalized_model(target_model):
+        raise ValueError(
+            f"train.init_from_adapter base model {base_model!r} does not match target model "
+            f"{target_model!r}"
+        )
+    rank = rank_from_adapter_config(config, source=source)
+    alpha = alpha_from_adapter_config(config, source=source)
+    max_lora_rank = serving_lora_rank_cap(target_model)
+    if max_lora_rank is not None and rank > max_lora_rank:
+        raise ValueError(
+            f"train.init_from_adapter has rank {rank}, exceeding {target_model}'s serving "
+            f"max_lora_rank={max_lora_rank}; use a lower-rank adapter or raise the serving cap "
+            "after real-GPU validation"
+        )
+    return AdapterMetadata(rank=rank, alpha=alpha)
+
+
+def load_hf_adapter_config(
+    adapter_ref: str, token: str | None = None, revision: str | None = None
+) -> Mapping[str, Any]:
     """Read ``adapter_config.json`` for a Flash adapter ref from Hugging Face datasets."""
     repo, filename = adapter_config_path_from_ref(adapter_ref)
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
         raise ValueError(
-            "could not verify train.init_from_adapter rank: huggingface_hub is not installed"
+            "could not verify train.init_from_adapter metadata: huggingface_hub is not installed"
         ) from exc
     try:
         local = hf_hub_download(
@@ -83,21 +291,22 @@ def load_hf_adapter_config(adapter_ref: str, token: str | None = None) -> Mappin
             filename=filename,
             repo_type="dataset",
             token=token,
+            revision=revision,
         )
     except Exception as exc:
         raise ValueError(
-            f"could not verify train.init_from_adapter rank: failed to read {repo}:{filename}"
+            f"could not verify train.init_from_adapter metadata: failed to read {repo}:{filename}"
         ) from exc
     try:
         with open(local, encoding="utf-8") as f:
-            config = json.load(f)
+            config = json.load(f, parse_float=Decimal)
     except Exception as exc:
         raise ValueError(
-            f"could not verify train.init_from_adapter rank: invalid JSON in {repo}:{filename}"
+            f"could not verify train.init_from_adapter metadata: invalid JSON in {repo}:{filename}"
         ) from exc
     if not isinstance(config, Mapping):
         raise ValueError(
-            f"could not verify train.init_from_adapter rank: {repo}:{filename} is not a JSON object"
+            f"could not verify train.init_from_adapter metadata: {repo}:{filename} is not a JSON object"
         )
     return config
 
@@ -107,82 +316,28 @@ def preflight_init_adapter_lora_rank(
     *,
     token: str | None = None,
     config_loader: AdapterConfigLoader | None = None,
-) -> None:
-    """Reject a warm-start adapter the model can't serve, or that mismatches ``train.lora_rank``.
-
-    Warm-start CONTINUES the prior adapter in place (SFT→GRPO/OPD keep the one LoRA, rank unchanged),
-    so the run trains and serves at the SOURCE adapter's rank — ``train.lora_rank`` is ignored once
-    ``init_from_adapter`` is set (the trainer keeps the loaded LoRA; see
-    ``flash.engine.worker.adapter._init_adapter_model``). That rank must therefore (a) fit the serving
-    cap — for cataloged serving models — and (b) equal ``spec.train.lora_rank`` for EVERY warm-start,
-    because the cost model, allocator, and GRPO sleep-mode sizing all read ``spec.train.lora_rank`` — a
-    mismatch (e.g. a rank-64 source with the default ``lora_rank=32``) is quoted/placed for the wrong
-    rank and can then OOM or fail to load at the true rank, even on an uncataloged model that has no
-    cap. The control plane calls this before creating/submitting a run; it intentionally uses only
-    ``adapter_config.json`` so the preflight stays CPU-only (no GPU) and catches an undeployable or
-    mis-sized adapter before any training GPU is allocated.
-    """
+) -> AdapterMetadata | None:
+    """Validate and return metadata for a continued adapter without comparing child knobs."""
     adapter_storage_ref = (spec.train.init_from_adapter or "").strip()
     if not adapter_storage_ref:
-        return
-
+        return None
     repo, filename = adapter_config_path_from_ref(adapter_storage_ref)
-    source = f"{repo}:{filename}"
     loader = config_loader or load_hf_adapter_config
-    config = loader(adapter_storage_ref, token)
-    adapter_rank = rank_from_adapter_config(config, source=source)
-
-    # The serving cap only bounds cataloged serving models; open-policy / uncataloged models have no
-    # cap and skip THIS check (but not the sizing-mismatch check below, which is cap-independent).
-    max_lora_rank = serving_lora_rank_cap(spec.model)
-    if max_lora_rank is not None and adapter_rank > max_lora_rank:
-        raise ValueError(
-            f"train.init_from_adapter={adapter_storage_ref!r} has rank {adapter_rank}, exceeding "
-            f"{spec.model}'s serving max_lora_rank={max_lora_rank}; use a lower-rank adapter "
-            "or raise the serving cap after real-GPU validation"
-        )
-
-    # A continued warm-start keeps the SOURCE adapter, so it trains and serves at ``adapter_rank`` no
-    # matter what ``train.lora_rank`` says. But cost/allocator/GRPO-sleep sizing all read
-    # ``spec.train.lora_rank``; if it disagrees with the source rank the run is quoted and placed for
-    # the wrong rank (a rank-64 source with the default lora_rank=32 is sized as 32) and then OOMs or
-    # fails to load the rank-64 adapter. This mis-sizing is cap-independent — an uncataloged model is
-    # quoted, billed, and placed at the wrong rank too — so the check runs for every warm-start, not
-    # just capped ones. Reject the mismatch so every sizing consumer agrees on the one true rank once
-    # the config is corrected.
-    configured_rank = int(spec.train.lora_rank)
-    if configured_rank != adapter_rank:
-        raise ValueError(
-            f"train.lora_rank={configured_rank} does not match the continued warm-start adapter's "
-            f"rank {adapter_rank} (train.init_from_adapter={adapter_storage_ref!r}). A warm-start "
-            f"CONTINUES the source adapter in place, so this run trains and serves at rank "
-            f"{adapter_rank} regardless of train.lora_rank — but cost, GPU allocation, and GRPO "
-            f"sleep-mode sizing all read train.lora_rank, so a mismatch is mis-quoted and mis-placed. "
-            f"Set train.lora_rank={adapter_rank} to match the source adapter (or warm-start from a "
-            f"rank-{configured_rank} adapter)."
-        )
+    return inspect_adapter_config(
+        loader(adapter_storage_ref, token, spec.train.init_from_adapter_revision or None),
+        source=f"{repo}:{filename}",
+        target_model=spec.model,
+    )
 
 
 def preflight_train_context_within_serving(spec: JobSpec) -> None:
-    """Reject a run whose training context exceeds the model's serving ``max_model_len``.
-
-    A LoRA is served at the model's fixed serving context; training it at a LONGER sequence wastes
-    compute and learns positions inference never uses. The control plane calls this before submitting
-    a run — CPU-only (catalog lookup, no GPU, no network), like the rank preflight above.
-    Open-policy / uncataloged models have no serving cap and are skipped.
-
-    SFT training context is ``train.max_context_tokens``; GRPO is the rollout prompt+completion
-    length (``grpo_rollout_seq_len``, which folds in ``train.max_completion_tokens`` and the recipe
-    defaults). An unset SFT ``max_context_tokens`` uses the worker's small recipe default (always
-    within the cap) and is skipped.
-    """
+    """Reject a run whose training context exceeds the model's serving ``max_model_len``."""
     from flash.catalog import serving_context_cap
     from flash.engine.vram import grpo_rollout_seq_len
 
     cap = serving_context_cap(spec.model)
     if cap is None:
         return
-
     if spec.algorithm == "grpo":
         effective = grpo_rollout_seq_len(
             spec.train.max_context_tokens or 0, spec.train.max_completion_tokens, spec.thinking
@@ -190,10 +345,9 @@ def preflight_train_context_within_serving(spec: JobSpec) -> None:
         knob = "train.max_context_tokens / train.max_completion_tokens (GRPO rollout prompt+completion)"
     else:
         effective = int(spec.train.max_context_tokens or 0)
-        if effective <= 0:  # unset -> worker recipe default, always within the cap
+        if effective <= 0:
             return
         knob = "train.max_context_tokens"
-
     if effective > cap:
         raise ValueError(
             f"{knob}={effective} exceeds {spec.model}'s serving max_model_len={cap}: a LoRA trained "

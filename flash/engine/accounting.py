@@ -8,6 +8,47 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from typing import Any
+
+_PRIVATE_SOURCE_MARKER = "[prepared warm-start source]"
+_PRIVATE_METRIC_KEYS = frozenset({"hf_repo", "init_from_adapter_revision"})
+
+
+def sanitize_worker_metrics(value: Any) -> Any:
+    """Remove private artifact locators from worker metrics before persistence or reporting."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = str(key)
+            if name in _PRIVATE_METRIC_KEYS and item:
+                out[name] = _PRIVATE_SOURCE_MARKER
+            elif name == "init_from_adapter" and isinstance(item, str) and item:
+                try:
+                    from flash.schema import parse_adapter_storage_ref
+
+                    out[name] = (
+                        _PRIVATE_SOURCE_MARKER
+                        if parse_adapter_storage_ref(item) is not None
+                        else item
+                    )
+                except Exception:
+                    out[name] = _PRIVATE_SOURCE_MARKER if ":" in item else item
+            else:
+                out[name] = sanitize_worker_metrics(item)
+        return out
+    if isinstance(value, list):
+        return [sanitize_worker_metrics(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_worker_metrics(item) for item in value]
+    if isinstance(value, str):
+        try:
+            from flash.schema import parse_adapter_storage_ref
+
+            if parse_adapter_storage_ref(value) is not None:
+                return _PRIVATE_SOURCE_MARKER
+        except Exception:
+            pass
+    return value
 
 
 @dataclass
@@ -31,7 +72,7 @@ class RunMetrics:
     notes: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        return json.dumps(sanitize_worker_metrics(asdict(self)), indent=2)
 
     def save(self, path: str):
         with open(path, "w") as f:

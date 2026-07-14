@@ -27,7 +27,7 @@ import os
 import threading
 
 from flash import __version__
-from flash.runner import get_status, submit_job
+from flash.runner import get_status, prepare_job, submit_job
 from flash.runner.checkpoints import list_checkpoints
 from flash.serve.deploy import (
     DeploymentSuperseded,
@@ -81,6 +81,7 @@ __all__ = [
     "export_adapter",
     "get_status",
     "list_checkpoints",
+    "prepare_job",
     "read_adapter_record",
     "reconcile_owned_adapter_cleanup",
     "record_matches",
