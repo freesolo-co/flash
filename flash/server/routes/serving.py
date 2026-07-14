@@ -106,8 +106,7 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     finish = choice.get("finish_reason")
     if not content.strip():
         raise ServingError(
-            "smoke generation returned no content "
-            f"(finish_reason={finish!r}) after {latency:.1f}s"
+            f"smoke generation returned no content (finish_reason={finish!r}) after {latency:.1f}s"
         )
     return {
         "verified_at": time.time(),
@@ -159,7 +158,7 @@ def _finish_deployment_unlocked(
     verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
-    active = (_app.get_status(run_id).deployment or {})
+    active = _app.get_status(run_id).deployment or {}
     if (
         active.get("requested_at") != deployment.get("requested_at")
         or active.get("state") not in _DEPLOYMENT_BUSY_STATES
@@ -197,9 +196,7 @@ def _finish_deployment_unlocked(
             marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
         else:
             marked = mark_deployed(run_id, current, expect_state=prev_state)
-        cas_failed = (
-            marked.deployment != current if is_checkpoint else marked.state != "deployed"
-        )
+        cas_failed = marked.deployment != current if is_checkpoint else marked.state != "deployed"
         if state_guard is not None and cas_failed:
             with contextlib.suppress(Exception):
                 _app.undeploy_adapter(run_id)
@@ -237,8 +234,7 @@ def _finish_deployment_unlocked(
                 failed.pop("previous_deployment", None)
                 failed["rollback_error"] = rollback_error
                 failed["detail"] = (
-                    "deployment failed and serving rollback failed; "
-                    "operator cleanup required"
+                    "deployment failed and serving rollback failed; operator cleanup required"
                 )
             elif isinstance(previous_deployment, dict):
                 failed["detail"] = "deployment failed; restored previous deployment"
@@ -250,6 +246,7 @@ def _finish_deployment_unlocked(
 def _finish_deployment(**kwargs) -> None:
     with _app._deploy_lock(kwargs["run_id"]):
         _finish_deployment_unlocked(**kwargs)
+
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
     raw = payload.get("messages")
@@ -528,6 +525,18 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ServingError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # best-effort product-analytics report: exports never otherwise touch the
+    # platform backend (the copy is hf-to-hf inside flash).
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_model_exported
+
+        record_model_exported(
+            status=status,
+            key=key,
+            repository=repository,
+            url=url,
+            step=checkpoint_step if is_checkpoint else None,
+        )
     result = {
         "run_id": run_id,
         "adapter_id": run_id,
