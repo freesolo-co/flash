@@ -36,6 +36,7 @@ _DEPLOYMENT_BUSY_STATES = frozenset(
     }
 )
 _REVOCATION_RETRY_STATE = "revocation_failed"
+_INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
 
 
 class DeploymentRevocationError(RuntimeError):
@@ -48,6 +49,56 @@ class DeploymentRevocationError(RuntimeError):
         )
         self.run_id = run_id
         self.retryable = True
+
+
+def _deployment_state_and_requires_revocation(
+    deployment: object,
+) -> tuple[str | None, bool]:
+    if deployment is None:
+        return None, False
+    if not isinstance(deployment, dict):
+        return None, True
+    state = deployment.get("state")
+    if not isinstance(state, str):
+        return None, True
+    return state, state not in _INACTIVE_DEPLOYMENT_STATES
+
+
+def _should_preserve_checkpoint_deployment(run_id: str, deployment: object) -> bool:
+    if not isinstance(deployment, dict):
+        return False
+    state, _ = _deployment_state_and_requires_revocation(deployment)
+    if state not in _RESTORABLE_DEPLOYMENT_STATES:
+        return False
+    checkpoint_step = deployment.get("checkpoint_step")
+    if (
+        isinstance(checkpoint_step, bool)
+        or not isinstance(checkpoint_step, int)
+        or checkpoint_step < 0
+    ):
+        return False
+    revision = deployment.get("adapter_revision")
+    if not isinstance(revision, str):
+        return False
+    parsed_revision = parse_adapter_revision(revision)
+    if parsed_revision is None:
+        return False
+    revision_run_id, revision_step, hf_revision = parsed_revision
+    if revision_step is None:
+        return False
+    canonical_revision = f"{revision_run_id}@step-{revision_step}.{hf_revision}"
+    if (
+        revision != canonical_revision
+        or revision_run_id != run_id
+        or revision_step != checkpoint_step
+    ):
+        return False
+    from flash.runner.verified_revisions import read_verified_adapter_revisions
+
+    try:
+        return revision in read_verified_adapter_revisions(run_id)
+    except Exception:
+        return False
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -90,10 +141,11 @@ def cancel_run(run_id: str) -> RunStatus:
             return cancelled, False
 
     initial_status = get_status(run_id)
-    initial_deployment_state = (initial_status.deployment or {}).get("state")
+    initial_deployment_state, initial_active_deployment = (
+        _deployment_state_and_requires_revocation(initial_status.deployment)
+    )
     initial_retry_revocation = initial_deployment_state == _REVOCATION_RETRY_STATE
-    initial_active_deployment = initial_deployment_state not in (None, "undeployed", "dry_run")
-    if initial_status.state == "dry_run" or (
+    if (
         initial_status.state in TERMINAL_STATES
         and not initial_retry_revocation
         and not initial_active_deployment
@@ -101,42 +153,92 @@ def cancel_run(run_id: str) -> RunStatus:
         return initial_status
     entered_deployed = initial_status.state == "deployed"
 
-    # revoke serving authority and stop any durable remote before waiting on the deploy lock.
-    teardown_error: Exception | None = None
-    initial_teardown_confirmed = False
-    if initial_active_deployment:
-        try:
-            from flash.serve.deploy import undeploy_adapter
-
-            undeploy_adapter(run_id)
-            mark_deployment_undeployed(run_id)
-            initial_teardown_confirmed = True
-        except Exception as exc:
-            teardown_error = exc
+    # stop the durable training worker and endpoint before deciding serving authority.
     initial_remote = initial_status.remote or {}
     remote_cancelled, remote_destroyed = _teardown_remote(initial_remote)
+    initial_public_spec = JobSpec.from_dict(initial_status.spec)
+    initial_effective_spec = None
+    with contextlib.suppress(Exception):
+        initial_effective_spec = effective_spec_from_status(initial_status)
+    with contextlib.suppress(Exception):
+        _gc_run_endpoints(initial_effective_spec or initial_public_spec)
+    if not initial_remote:
+        initial_remote = get_status(run_id).remote or {}
+        remote_cancelled, remote_destroyed = _teardown_remote(initial_remote)
 
-    with _deploy_lock(run_id):
+    teardown_error: Exception | None = None
+    deployment_teardown_confirmed = False
+    backend_reconcile_required = False
+    deploy_lock = _deploy_lock(run_id)
+    lock_acquired = deploy_lock.acquire(blocking=False)
+    lock_was_contended = not lock_acquired
+    try:
+        if not lock_acquired:
+            prelock_status = get_status(run_id)
+            _, prelock_active_deployment = _deployment_state_and_requires_revocation(
+                prelock_status.deployment
+            )
+            prelock_preserve_checkpoint = (
+                prelock_status.state != "dry_run"
+                and _should_preserve_checkpoint_deployment(run_id, prelock_status.deployment)
+            )
+            if prelock_active_deployment and not prelock_preserve_checkpoint:
+                mark_deployment_undeployed(run_id)
+                backend_reconcile_required = True
+            deploy_lock.acquire()
+            lock_acquired = True
+
         # reread after the submission handshake releases the lock so a newly durable provider
         # handle is cancelled and destroyed rather than leaving an untracked paid resource.
         status = get_status(run_id)
-        deployment_state = (status.deployment or {}).get("state")
+        remote = status.remote or {}
+        same_remote = remote == initial_remote
+        if remote and (not same_remote or not remote_destroyed):
+            _teardown_remote(remote, skip_cancel=same_remote and remote_cancelled)
+        if lock_was_contended:
+            locked_public_spec = JobSpec.from_dict(status.spec)
+            locked_effective_spec = None
+            with contextlib.suppress(Exception):
+                locked_effective_spec = effective_spec_from_status(status)
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(locked_effective_spec or locked_public_spec)
+        if not remote:
+            _teardown_remote(get_status(run_id).remote or {})
+
+        # decide serving fate only after training teardown, from the locked authoritative status.
+        status = get_status(run_id)
+        deployment_state, has_active_deployment = _deployment_state_and_requires_revocation(
+            status.deployment
+        )
         retry_revocation = deployment_state == _REVOCATION_RETRY_STATE
-        has_active_deployment = deployment_state not in (None, "undeployed", "dry_run")
-        if status.state == "dry_run" or (
+        if (
             status.state in TERMINAL_STATES
             and not retry_revocation
             and not entered_deployed
             and not has_active_deployment
+            and not backend_reconcile_required
         ):
             return status
         # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
         entered_deployed = entered_deployed or status.state == "deployed"
-        public_spec = JobSpec.from_dict(status.spec)
+        preserve_checkpoint = status.state != "dry_run" and _should_preserve_checkpoint_deployment(
+            run_id, status.deployment
+        )
+        if not preserve_checkpoint and (has_active_deployment or backend_reconcile_required):
+            try:
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                if has_active_deployment:
+                    mark_deployment_undeployed(run_id)
+                deployment_teardown_confirmed = True
+                backend_reconcile_required = False
+            except Exception as exc:
+                teardown_error = exc
+
         effective_spec = None
         with contextlib.suppress(Exception):
             effective_spec = effective_spec_from_status(status)
-        cleanup_spec = effective_spec or public_spec
         # a mid-training cancel is re-priced from the authoritative prepared spec, including
         # revocation retries that are still non-terminal. deployed and terminal runs retain billing.
         bill_cancel = (
@@ -144,14 +246,6 @@ def cancel_run(run_id: str) -> RunStatus:
             and status.state not in TERMINAL_STATES
             and not entered_deployed
         )
-        remote = status.remote or {}
-        same_remote = remote == initial_remote
-        if remote and (not same_remote or not remote_destroyed):
-            _teardown_remote(remote, skip_cancel=same_remote and remote_cancelled)
-        with contextlib.suppress(Exception):
-            _gc_run_endpoints(cleanup_spec)
-        if not remote:
-            _teardown_remote(get_status(run_id).remote or {})
         cancel_charge_usd: float | None = None
         billing_diagnostic: dict = {}
         if bill_cancel:
@@ -176,31 +270,46 @@ def cancel_run(run_id: str) -> RunStatus:
             retry_revocation and status.state in TERMINAL_STATES and not entered_deployed
         )
         if status.state != "cancelled" and not preserve_terminal_retry:
-            _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
+            _update(
+                run_id,
+                "cancelled",
+                allow_from_terminal=entered_deployed,
+                **cancel_updates,
+            )
         final = get_status(run_id)
-        deployment_state = (final.deployment or {}).get("state")
-        if deployment_state not in (None, "undeployed", "dry_run"):
-            if teardown_error is not None and status.state in TERMINAL_STATES and not entered_deployed:
-                mark_deployment_revocation_failed(run_id, str(teardown_error))
-            else:
-                try:
-                    from flash.serve.deploy import undeploy_adapter
+        if not preserve_checkpoint:
+            _, final_active_deployment = _deployment_state_and_requires_revocation(final.deployment)
+            if final_active_deployment or backend_reconcile_required:
+                if (
+                    teardown_error is not None
+                    and status.state in TERMINAL_STATES
+                    and not entered_deployed
+                ):
+                    mark_deployment_revocation_failed(run_id, str(teardown_error))
+                else:
+                    try:
+                        from flash.serve.deploy import undeploy_adapter
 
-                    undeploy_adapter(run_id)
-                    mark_deployment_undeployed(run_id)
-                    teardown_error = None
-                except Exception as exc:
-                    teardown_error = exc
-                    mark_deployment_revocation_failed(run_id, str(exc))
-        elif teardown_error is not None:
-            mark_deployment_revocation_failed(run_id, str(teardown_error))
-        elif not initial_teardown_confirmed:
-            # cancel always advances the local generation, including stale status projections.
-            mark_deployment_undeployed(run_id)
+                        undeploy_adapter(run_id)
+                        if final_active_deployment:
+                            mark_deployment_undeployed(run_id)
+                        teardown_error = None
+                        backend_reconcile_required = False
+                    except Exception as exc:
+                        teardown_error = exc
+                        mark_deployment_revocation_failed(run_id, str(exc))
+            elif teardown_error is not None:
+                mark_deployment_revocation_failed(run_id, str(teardown_error))
+            elif not deployment_teardown_confirmed:
+                # cancel always advances the local generation, including stale status projections.
+                mark_deployment_undeployed(run_id)
         with contextlib.suppress(Exception):
             from flash.server.checkpoints import register_checkpoints_best_effort
 
             register_checkpoints_best_effort(get_status(run_id))
+    finally:
+        if lock_acquired:
+            deploy_lock.release()
     if teardown_error is not None:
         raise DeploymentRevocationError(run_id, str(teardown_error)) from teardown_error
     return get_status(run_id)
@@ -545,8 +654,9 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
         status = get_status(run_id)
 
         def _commit() -> None:
+            deployment = status.deployment if isinstance(status.deployment, dict) else {}
             status.deployment = {
-                **(status.deployment or {}),
+                **deployment,
                 "state": "revocation_failed",
                 "error": error,
                 "retryable": True,
@@ -592,8 +702,9 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
         status = get_status(run_id)
 
         def _commit() -> None:
-            if status.deployment:
-                status.deployment = {**status.deployment, "state": "undeployed"}
+            if status.deployment is not None:
+                deployment = status.deployment if isinstance(status.deployment, dict) else {}
+                status.deployment = {**deployment, "state": "undeployed"}
                 status.updated_at = time.time()
                 _save_status(status)
 

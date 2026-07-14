@@ -1158,27 +1158,34 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
-def test_public_run_routes_redact_private_and_legacy_deployment_fields(api):
+def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monkeypatch):
     import flash.runner as runner
+    import flash.serve.deploy as deploy_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner.get_status(run_id)
+    revision = f"{run_id}@final." + "a" * 40
     status.deployment = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
         "openai_base_url": "https://serve.example/v1",
         "url": "https://stale.example/v1",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
+        "adapter_revision": revision,
     }
     runner._save_status(status)
+    runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     responses = [
         api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json(),
         api.get("/v1/runs", headers=_bearer(key)).json()["runs"][0],
-        api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key)).json(),
         api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"][0],
     ]
     for body in responses:
@@ -1191,6 +1198,15 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api):
     assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
     assert persisted["url"] == "https://stale.example/v1"
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
+
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: [target])
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["deployment"]["state"] == "undeployed"
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
 def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
