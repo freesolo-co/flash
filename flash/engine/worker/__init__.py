@@ -60,6 +60,7 @@ from flash.engine.worker.heartbeat import (
     _HB_UPLOAD_LOCK,
     _SFT_HEARTBEAT_INTERVAL_S,
     _STEP_GPU_DIAG_INTERVAL_S,
+    exception_runtime_telemetry,
     heartbeat,
     make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
@@ -389,6 +390,7 @@ def main():
             if RUN_MODE == "opd" and int(OPD_OPTIMIZER_STEPS) > 0
             else {}
         )
+        runtime_telemetry = exception_runtime_telemetry(e)
         try:
             heartbeat(
                 f"error_{failure_mode}",
@@ -396,6 +398,7 @@ def main():
                 mode=failure_mode,
                 **progress,
                 **hb_flags,
+                **runtime_telemetry,
                 diag=gpu_diagnostics(),
             )
         except Exception:
@@ -405,6 +408,7 @@ def main():
                 mode=failure_mode,
                 **progress,
                 **hb_flags,
+                **runtime_telemetry,
             )
         wandb_finish(exit_code=1)
         raise

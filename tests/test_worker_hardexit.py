@@ -237,3 +237,50 @@ def test_worker_does_not_hard_exit_on_failure(monkeypatch):
         pass
     assert raised_value_error, "the real error must propagate (not be swallowed by a hard-exit)"
     assert called["exit"] is False, "must NOT hard-exit when the handler failed"
+
+
+def test_worker_error_heartbeat_forwards_sanitized_exception_telemetry(monkeypatch):
+    calls = []
+    original = RuntimeError("private provider response")
+    original.runtime_telemetry = {
+        "parasail_provider_requests": 1,
+        "parasail_provider_generations": 1,
+        "parasail_provider_failures": 0,
+        "parasail_prompt_tokens": 12,
+        "parasail_attempts": 1,
+        "parasail_retries": 0,
+        "parasail_latency_seconds": 0.25,
+        "parasail_ambiguous_paid_requests": 0,
+        "private_target": "must not leave the worker",
+    }
+
+    _patch_common(monkeypatch, lambda code=0: None)
+    monkeypatch.setattr(worker, "RUN_MODE", "opd")
+    monkeypatch.setattr(worker, "run_opd", lambda: (_ for _ in ()).throw(original))
+    monkeypatch.setattr(worker, "_force_fla_triton_gdn_on_sm100", lambda: None)
+    monkeypatch.setattr(worker, "_neutralize_tilelang_cudart_stub", lambda: None)
+    monkeypatch.setattr(worker, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
+    monkeypatch.setattr(worker, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(worker, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "wandb_finish", lambda *_args, **_kwargs: None)
+
+    def capture_heartbeat(stage, **kwargs):
+        calls.append((stage, kwargs))
+        if stage == "error_opd" and "diag" in kwargs:
+            raise RuntimeError("diagnostics heartbeat failed")
+
+    monkeypatch.setattr(worker, "heartbeat", capture_heartbeat)
+
+    with pytest.raises(RuntimeError, match="private provider response"):
+        worker.main()
+
+    error_calls = [kwargs for stage, kwargs in calls if stage == "error_opd"]
+    assert len(error_calls) == 2
+    for payload in error_calls:
+        assert payload["parasail_provider_requests"] == 1
+        assert payload["parasail_provider_generations"] == 1
+        assert payload["parasail_prompt_tokens"] == 12
+        assert payload["parasail_latency_seconds"] == 0.25
+        assert "private_target" not in payload

@@ -1155,8 +1155,16 @@ def _run_opd(parasail_accounting):
                         f"resampling rollout {no_signal_attempt}/{max_no_signal_attempts}"
                     )
                     continue
-                no_signal_skipped_steps += 1
-                print(f"[opd] step {it}: no usable teacher signal this step (skipped; {reasons})")
+                if hybrid.enabled:
+                    print(
+                        f"[opd] step {it}: no usable teacher signal; retrying the same hybrid "
+                        f"optimizer update ({reasons})"
+                    )
+                else:
+                    no_signal_skipped_steps += 1
+                    print(
+                        f"[opd] step {it}: no usable teacher signal this step (skipped; {reasons})"
+                    )
                 break
             if nseq == 0:
                 continue
@@ -1939,15 +1947,6 @@ class _ParasailPreparationError(RuntimeError):
         self.stats = stats
         self.retriable = bool(retriable)
         self.runtime_telemetry = stats.runtime_telemetry()
-
-
-def _common_prefix_len(left, right) -> int:
-    n = 0
-    for a, b in zip(left, right, strict=False):
-        if a != b:
-            break
-        n += 1
-    return n
 
 
 def _render_chat(tok, messages, *, add_generation_prompt: bool) -> str:

@@ -2711,6 +2711,41 @@ def test_opd_resamples_no_signal_rollout_before_skipping_step(monkeypatch):
     assert notes["skip_reasons"] == {"alignment_empty": 1}
 
 
+def test_hybrid_no_signal_retry_group_does_not_count_as_skipped_update(monkeypatch):
+    state = {"n": 0}
+    metas = []
+
+    def _three_empty_then_update(*, model, **_kwargs):
+        state["n"] += 1
+        if state["n"] <= 3:
+            return opd_mod.SampleResult(teacher_status="ok", skip_reason="alignment_empty")
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_three_empty_then_update,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+        metas=metas,
+    )
+    parasail_calls = _patch_hybrid_parasail(monkeypatch)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+
+    opd_mod.run_opd()
+
+    notes = metas[-1]["notes"]
+    assert state["n"] == 4
+    assert notes["opt_steps"] == 1
+    assert notes["no_signal_resamples"] == 2
+    assert notes["no_signal_skipped_steps"] == 0
+    assert [name for name, _payload in parasail_calls].count("generate") == 1
+
+
 def test_opd_no_signal_log_includes_skip_reasons(monkeypatch, capsys):
     """The skipped-step line must explain why the signal was unusable."""
 

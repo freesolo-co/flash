@@ -21,7 +21,6 @@ HYBRID_OPD_OBJECTIVE_REVERSE_ONLY = "reverse_only"
 PARASAIL_URL = "https://api.parasail.io/v1/chat/completions"
 PARASAIL_MODEL_ID = "deepseek-ai/DeepSeek-V4-Pro"
 FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID = "accounts/fireworks/models/deepseek-v4-pro"
-HYBRID_OPD_FORWARD_OBJECTIVE_COEF = 0.1
 
 # The single Fireworks OpenAI-compatible endpoint every managed OPD teacher is reached over. ONE
 # base_url + ONE platform-managed FIREWORKS_API_KEY authorize every teacher below (all are Fireworks
