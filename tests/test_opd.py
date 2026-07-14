@@ -24,6 +24,73 @@ from flash.engine.worker.tokenizer_align import (
 )
 
 
+def test_opd_training_started_marker_is_attempt_scoped_and_aggregate(monkeypatch):
+    from pathlib import Path
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as hf_mod
+
+    uploads = []
+
+    def _capture(local_path, repo_subpath, required=False):
+        uploads.append(
+            (local_path, repo_subpath, required, json.loads(Path(local_path).read_text()))
+        )
+
+    monkeypatch.setattr(worker, "ATTEMPT", 3)
+    monkeypatch.setattr(worker, "RUN_ID", "opd-marker-run")
+    monkeypatch.setattr(hf_mod.time, "time", lambda: 1234.5)
+    monkeypatch.setattr(worker, "hf_upload_file", _capture)
+    marker_path = Path("/tmp/opd_training_started_attempt3.json")
+    try:
+        hf_mod.persist_opd_training_started()
+    finally:
+        marker_path.unlink(missing_ok=True)
+
+    assert uploads == [
+        (
+            str(marker_path),
+            "opd_training_started_attempt3.json",
+            True,
+            {
+                "attempt": 3,
+                "run_id": "opd-marker-run",
+                "training_started": True,
+                "ts": 1234.5,
+            },
+        )
+    ]
+    assert type(uploads[0][3]["attempt"]) is int
+    assert type(uploads[0][3]["training_started"]) is bool
+    assert type(uploads[0][3]["run_id"]) is str
+    assert type(uploads[0][3]["ts"]) is float
+
+
+def test_opd_training_started_marker_upload_failure_is_generic(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as hf_mod
+
+    monkeypatch.setattr(worker, "ATTEMPT", 4)
+    monkeypatch.setattr(worker, "RUN_ID", "opd-marker-upload-failure")
+    monkeypatch.setattr(
+        worker,
+        "hf_upload_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret payload")),
+    )
+    try:
+        with pytest.raises(
+            RuntimeError, match="optimizer-start marker persistence failed"
+        ) as caught:
+            hf_mod.persist_opd_training_started()
+    finally:
+        from pathlib import Path
+
+        Path("/tmp/opd_training_started_attempt4.json").unlink(missing_ok=True)
+
+    assert "secret payload" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
 def _student(spans):
     return [StudentToken(token_id=i, start=a, end=b) for i, (a, b) in enumerate(spans)]
 
@@ -142,7 +209,7 @@ def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
 
     calls = _install_student_loader_fakes(monkeypatch, vl_raises=True)
     fake_w = SimpleNamespace(
-        is_vl_checkpoint=lambda model_id: False,
+        is_vl_checkpoint=lambda model_id, **_kwargs: False,
         _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
@@ -168,7 +235,7 @@ def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
 
     calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
     fake_w = SimpleNamespace(
-        is_vl_checkpoint=lambda model_id: True,
+        is_vl_checkpoint=lambda model_id, **_kwargs: True,
         _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
@@ -679,6 +746,34 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
         _spec({"max_context_tokens": 256})
 
 
+def test_same_run_opd_checkpoint_fails_before_training_provider_requests(monkeypatch):
+    from flash.engine.worker import opd as opd_mod
+    from flash.engine.worker import parasail as parasail_mod
+    from flash.engine.worker import teacher as teacher_mod
+
+    calls = []
+    fake_w = SimpleNamespace(
+        hf_resume_checkpoint=lambda: "checkpoint-4",
+        require_active_env=lambda: calls.append("environment"),
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(
+        teacher_mod,
+        "TeacherClient",
+        lambda *_args, **_kwargs: calls.append("teacher") or object(),
+    )
+    monkeypatch.setattr(
+        parasail_mod,
+        "ParasailClient",
+        lambda *_args, **_kwargs: calls.append("parasail") or object(),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint resume is not supported"):
+        opd_mod.run_opd()
+
+    assert calls == []
+
+
 def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     """Regression (codex[bot], opd.py:380-381): when EVERY sample in a step skips (empty completion
     / no teacher signal, or an over-budget re-render), the per-sample SUCCESS ping is never reached.
@@ -725,7 +820,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         THINKING=False,
         SEED=0,
         heartbeat=lambda stage, **kw: beats.append((stage, kw)),
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
@@ -799,6 +894,8 @@ def _opd_harness(
     structured_outputs="",
     metas=None,
     outputs=None,
+    teacher_model="accounts/fireworks/models/glm-5p2",
+    meta=None,
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -810,19 +907,48 @@ def _opd_harness(
         pad_token = "<pad>"
         eos_token = "<eos>"
         pad_token_id = 0
+        eos_token_id = 7
+        all_special_ids = (7,)
 
-        def apply_chat_template(self, messages, **kw):
-            return "PROMPT"
+        def __init__(self):
+            self._visible_content = ""
+            self._decodings = {(1, 2): "PROMPT"}
+
+        def __len__(self):
+            return 8
+
+        def apply_chat_template(self, messages, *, add_generation_prompt=False, **kw):
+            if add_generation_prompt:
+                return "PROMPT"
+            content = str(messages[-1].get("content", ""))
+            if content and not content.startswith("__flash_parasail_content_begin_"):
+                self._visible_content = content
+            return "PROMPT" + content + "END"
 
         def __call__(self, text, add_special_tokens=False):
-            return SimpleNamespace(input_ids=[1, 2])
+            if text == "PROMPT":
+                ids = [1, 2]
+            elif text == "PROMPTEND":
+                ids = [1, 2, 7]
+            elif text.startswith("PROMPT") and text.endswith("END") and text != "PROMPTEND":
+                ids = [1, 2, 3, 4, 7]
+            elif text.startswith("PROMPT"):
+                content = text[len("PROMPT") :]
+                ids = [1, 2, 3, 4] if content == self._visible_content else [1, 2, 3]
+            else:
+                raise AssertionError(f"unexpected tokenization: {text!r}")
+            self._decodings[tuple(ids)] = text
+            return SimpleNamespace(input_ids=ids)
 
         def decode(self, ids, skip_special_tokens=True):
-            return "".join("x" for _ in ids)
+            values = tuple(int(value) for value in ids)
+            if not skip_special_tokens and values in self._decodings:
+                return self._decodings[values]
+            return "".join("x" for value in values if value != 7)
 
     class _Model(_TinyLM):
         def __init__(self):
-            super().__init__(torch, T=4, V=8)
+            super().__init__(torch, T=32, V=8)
             self.config = SimpleNamespace(use_cache=False)
 
     env = SimpleNamespace(
@@ -843,12 +969,16 @@ def _opd_harness(
             if beats is not None
             else (lambda stage, **kw: None)
         ),
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
+        persist_opd_training_started=lambda: None,
+        OPD_OPTIMIZER_STEPS=0,
         write_train_meta=(
-            (lambda **k: metas.append(k)) if metas is not None else (lambda **k: None)
+            (lambda **k: metas.append(k))
+            if metas is not None
+            else ((lambda **k: meta.update(k)) if meta is not None else (lambda **k: None))
         ),
         wandb_report_to=lambda: [],  # W&B off by default in unit tests
         wandb_run_info=lambda: {},
@@ -858,7 +988,7 @@ def _opd_harness(
         opd_mod,
         "_resolve_opd_knobs",
         lambda: opd_mod.OpdKnobs(
-            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_model=teacher_model,
             teacher_base_url="http://teacher.invalid",
             epochs=epochs,
             learning_rate=1e-4,
@@ -896,6 +1026,16 @@ def _opd_harness(
 
     monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
     monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
+    if teacher_model == "accounts/fireworks/models/deepseek-v4-pro":
+        monkeypatch.setenv("FLASH_OPD_HYBRID_ACTIVATED", "1")
+        monkeypatch.setenv("FLASH_OPD_HYBRID_OBJECTIVE", "projected_soft")
+        monkeypatch.setenv("FLASH_OPD_HYBRID_FORWARD_COEF", "0.1")
+        monkeypatch.delenv("FLASH_OPD_HYBRID_ENTROPY_TAU", raising=False)
+    else:
+        monkeypatch.delenv("FLASH_OPD_HYBRID_ACTIVATED", raising=False)
+        monkeypatch.delenv("FLASH_OPD_HYBRID_OBJECTIVE", raising=False)
+        monkeypatch.delenv("FLASH_OPD_HYBRID_FORWARD_COEF", raising=False)
+        monkeypatch.delenv("FLASH_OPD_HYBRID_ENTROPY_TAU", raising=False)
     return opd_mod
 
 
@@ -962,6 +1102,62 @@ def test_opd_truncated_rollouts_bypass_teacher_and_gkd(monkeypatch, capsys):
 
     assert calls == {"teacher": 0, "gkd": 0}
     assert "truncated_rollout=1" in capsys.readouterr().out
+def _hybrid_parasail_result(
+    *,
+    content="target",
+    prompt_tokens=3,
+    completion_tokens=2,
+    attempts=1,
+    latency_seconds=0.25,
+):
+    from flash.engine.worker.parasail import (
+        ParasailRecordKind,
+        ParasailSemanticRecord,
+        ParasailTopLogprob,
+    )
+
+    split = len(content) // 2
+    parts = (content[:split], content[split:])
+    visible_records = tuple(
+        ParasailSemanticRecord(
+            kind=ParasailRecordKind.VISIBLE_CONTENT,
+            index=index,
+            token=part,
+            logprob=0.0,
+            top_logprobs=(ParasailTopLogprob(token=part, logprob=0.0),),
+        )
+        for index, part in enumerate(parts)
+    )
+    return SimpleNamespace(
+        content=content,
+        content_logprobs=(),
+        parsed_completion=SimpleNamespace(visible_content_records=visible_records),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        latency_seconds=latency_seconds,
+        attempts=attempts,
+    )
+
+
+def _patch_hybrid_parasail(monkeypatch, *, generate=None):
+    from flash.engine.worker import parasail as parasail_mod
+
+    calls = []
+
+    class _Parasail:
+        def __init__(self, api_key, *, seed):
+            calls.append(("init", {"api_key": api_key, "seed": seed}))
+
+        def generate(self, messages):
+            calls.append(("generate", messages))
+            if generate is not None:
+                return generate(messages)
+            return _hybrid_parasail_result()
+
+    monkeypatch.setattr(parasail_mod, "ParasailClient", _Parasail)
+    monkeypatch.setenv("PARASAIL_API_KEY", "unit-test-parasail-key")
+    return calls
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
@@ -973,7 +1169,14 @@ def test_opd_rejects_tool_environments(monkeypatch):
     from flash.engine.worker import opd as opd_mod
 
     env = SimpleNamespace(is_tool_env=True)
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            hf_resume_checkpoint=lambda: "",
+            require_active_env=lambda e=env: e,
+        ),
+    )
     with pytest.raises(RuntimeError, match="tool-calling"):
         opd_mod.run_opd()
 
@@ -1109,7 +1312,14 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         model, tok_, device, samples, knobs, microbatch, *, backward_scale=None, **_kwargs
     ):
         out = real_resolve_samples_batched(
-            model, tok_, device, samples, knobs, microbatch, backward_scale=backward_scale, **_kwargs
+            model,
+            tok_,
+            device,
+            samples,
+            knobs,
+            microbatch,
+            backward_scale=backward_scale,
+            **_kwargs,
         )
         for (gen, _score, prompt_ids), r in zip(samples, out, strict=True):
             loss_calls.append((len(prompt_ids), gen.completion_text, r.loss is not None))
@@ -1128,9 +1338,10 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         THINKING=False,
         SEED=0,
         heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
+        persist_opd_training_started=lambda: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: meta.update(k),
         wandb_report_to=lambda: [],
@@ -1230,6 +1441,24 @@ def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
     assert captured["key"] == "unit-test-teacher-key"
 
 
+def test_hybrid_opd_passes_authoritative_worker_seed_to_parasail(monkeypatch):
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    opd_mod._w.SEED = 4242
+    parasail_calls = _patch_hybrid_parasail(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    assert parasail_calls[0] == (
+        "init",
+        {"api_key": "unit-test-parasail-key", "seed": 4242},
+    )
+
+
 def test_opd_missing_teacher_key_raises_platform_managed_error(monkeypatch):
     """With no key in the worker env, run_opd fails with the platform-managed diagnostic (a
     platform-side injection failure), not the old 'declare and export it' message."""
@@ -1237,6 +1466,837 @@ def test_opd_missing_teacher_key_raises_platform_managed_error(monkeypatch):
     monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="platform-managed"):
         opd_mod.run_opd()
+
+
+def test_hybrid_opd_requires_managed_parasail_key_before_gpu_wait(monkeypatch):
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
+    waited = []
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *_a, **_k: waited.append(True))
+
+    with pytest.raises(RuntimeError, match="platform-managed Parasail credential"):
+        opd_mod.run_opd()
+
+    assert waited == []
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "reason"),
+    [
+        ("multi_turn", "multi_turn"),
+        ("thinking", "thinking"),
+        ("structured_outputs", "structured_outputs"),
+        ("explicit_stop_sequences", "explicit_stop_sequences"),
+    ],
+)
+def test_activated_hybrid_runtime_mismatch_fails_closed_before_gpu_setup(
+    monkeypatch, mismatch, reason
+):
+    from dataclasses import replace
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    if mismatch == "multi_turn":
+        opd_mod._w.require_active_env().multi_turn = True
+    elif mismatch == "thinking":
+        opd_mod._w.THINKING = True
+    else:
+        knobs = opd_mod._resolve_opd_knobs()
+        override = (
+            {"structured_outputs": "{}"}
+            if mismatch == "structured_outputs"
+            else {"stop_sequences": ("stop",)}
+        )
+        monkeypatch.setattr(opd_mod, "_resolve_opd_knobs", lambda: replace(knobs, **override))
+    waited = []
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *_a, **_k: waited.append(True))
+
+    with pytest.raises(RuntimeError, match=f"runtime eligibility mismatch: {reason}") as caught:
+        opd_mod.run_opd()
+
+    assert str(caught.value) == f"opd hybrid runtime eligibility mismatch: {reason}"
+    assert waited == []
+
+
+@pytest.mark.parametrize(
+    ("objective_mode", "message"),
+    [
+        (None, "activated objective mode is missing"),
+        ("unknown", "activated objective mode is invalid"),
+    ],
+)
+def test_hybrid_opd_rejects_missing_or_unknown_objective_before_gpu_setup(
+    monkeypatch, objective_mode, message
+):
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    if objective_mode is None:
+        monkeypatch.delenv("FLASH_OPD_HYBRID_OBJECTIVE")
+    else:
+        monkeypatch.setenv("FLASH_OPD_HYBRID_OBJECTIVE", objective_mode)
+    waited = []
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *_a, **_k: waited.append(True))
+
+    with pytest.raises(RuntimeError, match=message):
+        opd_mod.run_opd()
+
+    assert waited == []
+
+
+def test_reverse_only_opd_rejects_objective_environment_before_gpu_setup(monkeypatch):
+    opd_mod = _opd_harness(monkeypatch, sample_result=_skip)
+    monkeypatch.setenv("FLASH_OPD_HYBRID_OBJECTIVE", "projected_soft")
+    waited = []
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *_a, **_k: waited.append(True))
+
+    with pytest.raises(RuntimeError, match="inconsistent with reverse-only runtime"):
+        opd_mod.run_opd()
+
+    assert waited == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("FLASH_OPD_HYBRID_FORWARD_COEF", "bad", "is invalid"),
+        ("FLASH_OPD_HYBRID_FORWARD_COEF", "nan", "must be finite and > 0"),
+        ("FLASH_OPD_HYBRID_FORWARD_COEF", "inf", "must be finite and > 0"),
+        ("FLASH_OPD_HYBRID_FORWARD_COEF", "0", "must be finite and > 0"),
+        ("FLASH_OPD_HYBRID_FORWARD_COEF", "-0.1", "must be finite and > 0"),
+        ("FLASH_OPD_HYBRID_ENTROPY_TAU", "bad", "is invalid"),
+        ("FLASH_OPD_HYBRID_ENTROPY_TAU", "nan", "must be finite and >= 0"),
+        ("FLASH_OPD_HYBRID_ENTROPY_TAU", "inf", "must be finite and >= 0"),
+        ("FLASH_OPD_HYBRID_ENTROPY_TAU", "-0.1", "must be finite and >= 0"),
+    ],
+)
+def test_hybrid_runtime_settings_reject_invalid_numeric_values(monkeypatch, name, value, message):
+    from flash.engine.worker.opd import _runtime_hybrid_settings
+
+    monkeypatch.setenv("FLASH_OPD_HYBRID_FORWARD_COEF", "0.1")
+    monkeypatch.delenv("FLASH_OPD_HYBRID_ENTROPY_TAU", raising=False)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=message):
+        _runtime_hybrid_settings(activated=True)
+
+
+def test_hybrid_runtime_settings_require_coef_and_reject_reverse_only_injection(monkeypatch):
+    from flash.engine.worker.opd import _runtime_hybrid_settings
+
+    monkeypatch.delenv("FLASH_OPD_HYBRID_FORWARD_COEF", raising=False)
+    monkeypatch.delenv("FLASH_OPD_HYBRID_ENTROPY_TAU", raising=False)
+    with pytest.raises(RuntimeError, match="FLASH_OPD_HYBRID_FORWARD_COEF is missing"):
+        _runtime_hybrid_settings(activated=True)
+
+    monkeypatch.setenv("FLASH_OPD_HYBRID_ENTROPY_TAU", "0.5")
+    with pytest.raises(RuntimeError, match="inconsistent with reverse-only runtime"):
+        _runtime_hybrid_settings(activated=False)
+
+
+def _parasail_runtime_telemetry(**overrides):
+    telemetry = {
+        "parasail_logical_accepted_targets": 0,
+        "parasail_supervised_positions": 0,
+        "parasail_visible_provider_positions": 0,
+        "parasail_eligible_projected_rows": 0,
+        "parasail_retained_support_entries": 0,
+        "parasail_reported_mass_sum": 0.0,
+        "parasail_retained_mass_sum": 0.0,
+        "parasail_dropped_mass_sum": 0.0,
+        "parasail_entropy_nats_sum": 0.0,
+        "parasail_collision_count": 0,
+        "parasail_projected_drop_zero_token": 0,
+        "parasail_projected_drop_multi_token": 0,
+        "parasail_projected_drop_prefix_retokenization": 0,
+        "parasail_projected_drop_special_token": 0,
+        "parasail_projected_drop_invalid_token_id": 0,
+        "parasail_projected_drop_round_trip_mismatch": 0,
+        "parasail_projected_drop_realized_multi_token": 0,
+        "parasail_provider_requests": 0,
+        "parasail_provider_generations": 0,
+        "parasail_provider_failures": 0,
+        "parasail_prompt_tokens": 0,
+        "parasail_completion_tokens": 0,
+        "parasail_attempts": 0,
+        "parasail_retries": 0,
+        "parasail_latency_seconds": 0.0,
+        "parasail_ambiguous_paid_requests": 0,
+    }
+    telemetry.update(overrides)
+    return telemetry
+
+
+def test_hybrid_opd_classifies_exhausted_parasail_outage_as_retriable(monkeypatch):
+    from flash.engine.worker.parasail import ParasailTransientError
+    from flash.engine.worker.perf import RetriableInfraError
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(
+        monkeypatch,
+        generate=lambda _messages: (_ for _ in ()).throw(
+            ParasailTransientError(
+                "parasail HTTP 503",
+                attempts=2,
+                latency_seconds=1.5,
+                ambiguous_paid_requests=2,
+            )
+        ),
+    )
+
+    with pytest.raises(RetriableInfraError, match="parasail HTTP 503") as caught:
+        opd_mod.run_opd()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
+        parasail_provider_requests=1,
+        parasail_provider_failures=1,
+        parasail_attempts=2,
+        parasail_retries=1,
+        parasail_latency_seconds=1.5,
+        parasail_ambiguous_paid_requests=2,
+    )
+
+
+def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import SampleResult
+    from flash.engine.worker.parasail import ParasailTransientError
+    from flash.engine.worker.perf import RetriableInfraError
+
+    def _one_update(*, model, **_kwargs):
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=2,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    calls = []
+
+    def _generate(_messages):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ParasailTransientError(
+                "parasail transport failure",
+                attempts=2,
+                latency_seconds=1.5,
+                ambiguous_paid_requests=2,
+            )
+        return _hybrid_parasail_result(
+            content="private target",
+            prompt_tokens=3,
+            completion_tokens=2,
+            attempts=2,
+            latency_seconds=0.25,
+        )
+
+    _patch_hybrid_parasail(monkeypatch, generate=_generate)
+    optimizer_steps = []
+    real_step = torch.optim.AdamW.step
+
+    def _step(optimizer, *args, **kwargs):
+        optimizer_steps.append(True)
+        return real_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", _step)
+
+    with pytest.raises(RetriableInfraError, match="transport failure") as caught:
+        opd_mod.run_opd()
+
+    assert optimizer_steps == [True]
+    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
+        parasail_logical_accepted_targets=1,
+        parasail_supervised_positions=2,
+        parasail_visible_provider_positions=2,
+        parasail_eligible_projected_rows=2,
+        parasail_retained_support_entries=2,
+        parasail_reported_mass_sum=2.0,
+        parasail_retained_mass_sum=2.0,
+        parasail_provider_requests=2,
+        parasail_provider_generations=1,
+        parasail_provider_failures=1,
+        parasail_prompt_tokens=3,
+        parasail_completion_tokens=2,
+        parasail_attempts=4,
+        parasail_retries=2,
+        parasail_latency_seconds=1.75,
+        parasail_ambiguous_paid_requests=2,
+    )
+    assert "private target" not in str(caught.value)
+    assert "private target" not in repr(caught.value.runtime_telemetry)
+
+
+def test_hybrid_opd_keeps_permanent_parasail_failure_non_retriable(monkeypatch):
+    from flash.engine.worker.opd import _ParasailPreparationError
+    from flash.engine.worker.parasail import ParasailError
+    from flash.engine.worker.perf import RetriableInfraError
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(
+        monkeypatch,
+        generate=lambda _messages: (_ for _ in ()).throw(
+            ParasailError(
+                "parasail HTTP 400",
+                attempts=1,
+                latency_seconds=0.4,
+                ambiguous_paid_requests=0,
+            )
+        ),
+    )
+
+    with pytest.raises(_ParasailPreparationError, match="parasail HTTP 400") as caught:
+        opd_mod.run_opd()
+    assert not isinstance(caught.value, RetriableInfraError)
+    assert caught.value.retriable is False
+    assert caught.value.runtime_telemetry["parasail_provider_requests"] == 1
+    assert caught.value.runtime_telemetry["parasail_provider_failures"] == 1
+    assert caught.value.runtime_telemetry["parasail_attempts"] == 1
+    assert caught.value.runtime_telemetry["parasail_retries"] == 0
+    assert caught.value.runtime_telemetry["parasail_latency_seconds"] == pytest.approx(0.4)
+    assert caught.value.runtime_telemetry["parasail_ambiguous_paid_requests"] == 0
+
+
+def test_hybrid_opd_activation_is_independent_of_ambient_world_size(monkeypatch):
+    beats = []
+    meta = {}
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        beats=beats,
+        meta=meta,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    _patch_hybrid_parasail(monkeypatch)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    private_fields = {
+        "hybrid_enabled",
+        "hybrid_reason",
+        "hybrid_objective_mode",
+        "hybrid_forward_objective_coef",
+    }
+    assert private_fields.isdisjoint(meta["notes"])
+    assert len(meta["notes"]["forward_loss_curve"]) == 1
+    assert all(private_fields.isdisjoint(fields) for _stage, fields in beats)
+    post_update = [
+        fields for stage, fields in beats if stage == "opd_step" and fields.get("step") == 1
+    ]
+    assert post_update[-1]["forward_loss"] is not None
+
+
+def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd_soft_targets import (
+        ProjectedPosition,
+        ProjectedTarget,
+        ProjectionDropCounts,
+    )
+
+    reverse_calls = []
+
+    def _skip_once_then_update(*, model, **_kwargs):
+        reverse_calls.append(1)
+        if len(reverse_calls) <= 9:
+            return SampleResult(teacher_status="ok", skip_reason="alignment_empty")
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip_once_then_update,
+        epochs=1,
+        group=3,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(monkeypatch)
+    row = ProjectedPosition(
+        provider_record_index=0,
+        logits_index=1,
+        token_ids=(3, 4),
+        probabilities=(0.75, 0.25),
+        reported_top_k_mass=0.8,
+        retained_projected_mass=0.8,
+        rejected_reported_mass=0.0,
+        unreported_mass=0.2,
+        total_dropped_mass=0.2,
+        support_size=2,
+        collision_count=0,
+        conditional_entropy_nats=0.562335,
+        drop_counts=ProjectionDropCounts(),
+    )
+    target = ProjectedTarget(
+        input_ids=(1, 2),
+        positions=(row,),
+        rows=(row,),
+        visible_position_count=1,
+        eligible_row_count=1,
+        drop_counts=ProjectionDropCounts(),
+    )
+    preparation_calls = []
+
+    def _prepare(*_args, **_kwargs):
+        preparation_calls.append(True)
+        return [target], _ParasailBatchStats(
+            logical_accepted_targets=1,
+            supervised_positions=1,
+            visible_provider_positions=1,
+            eligible_projected_rows=1,
+            retained_support_entries=2,
+            reported_mass_sum=0.8,
+            retained_mass_sum=0.8,
+            dropped_mass_sum=0.2,
+            entropy_nats_sum=0.562335,
+            provider_requests=1,
+            provider_generations=1,
+            prompt_tokens=3,
+            completion_tokens=3,
+            attempts=1,
+        )
+
+    monkeypatch.setattr(opd_mod, "_prepare_parasail_targets", _prepare)
+    events = []
+    projected_calls = []
+    forward_calls = []
+    real_normalize = opd_mod._normalize_accumulated_gradients
+    real_projected = opd_mod._backward_projected_targets
+    real_forward = opd_mod._forward_logits
+    real_step = torch.optim.AdamW.step
+
+    def _normalize(*args, **kwargs):
+        events.append("normalize")
+        return real_normalize(*args, **kwargs)
+
+    def _projected(*args, **kwargs):
+        events.append("projected")
+        projected_calls.append(True)
+        return real_projected(*args, **kwargs)
+
+    def _forward(*args, **kwargs):
+        forward_calls.append(True)
+        return real_forward(*args, **kwargs)
+
+    def _step(optimizer, *args, **kwargs):
+        events.append("step")
+        return real_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(opd_mod, "_normalize_accumulated_gradients", _normalize)
+    monkeypatch.setattr(opd_mod, "_backward_projected_targets", _projected)
+    monkeypatch.setattr(opd_mod, "_forward_logits", _forward)
+    monkeypatch.setattr(torch.optim.AdamW, "step", _step)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    assert len(reverse_calls) == 12
+    assert preparation_calls == [True]
+    assert projected_calls == [True]
+    assert forward_calls == [True]
+    assert events == ["normalize", "projected", "step"]
+    assert opd_mod.OpdVllmRolloutEngine.instances[0].sync_count == 1
+
+
+def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
+
+    def _one_update(*, model, **_kwargs):
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(monkeypatch)
+    empty = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=1,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(multi_token=1),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_prepare_parasail_targets",
+        lambda *_args, **_kwargs: (
+            [empty],
+            _ParasailBatchStats(
+                logical_accepted_targets=1,
+                supervised_positions=0,
+                visible_provider_positions=1,
+                eligible_projected_rows=0,
+                projected_drop_multi_token=1,
+                dropped_mass_sum=1.0,
+                provider_requests=1,
+                provider_generations=1,
+                attempts=1,
+            ),
+        ),
+    )
+    events = []
+    clip_gradient_sums = []
+    real_clip = torch.nn.utils.clip_grad_norm_
+    real_step = torch.optim.AdamW.step
+
+    def _clip(parameters, max_norm, *args, **kwargs):
+        params = list(parameters)
+        clip_gradient_sums.append(
+            sum(float(param.grad.abs().sum()) for param in params if param.grad is not None)
+        )
+        events.append("clip")
+        return real_clip(params, max_norm, *args, **kwargs)
+
+    def _step(optimizer, *args, **kwargs):
+        events.append("step")
+        return real_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _clip)
+    monkeypatch.setattr(torch.optim.AdamW, "step", _step)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+
+    opd_mod.run_opd()
+
+    assert events == ["clip", "step"]
+    assert len(clip_gradient_sums) == 1
+    assert clip_gradient_sums[0] > 0
+    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 1
+
+
+def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    def _unexpected_reverse(**_kwargs):
+        pytest.fail("provider reverse work must not run")
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_unexpected_reverse,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+
+    class _MismatchTok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+        eos_token_id = 7
+        all_special_ids = (7,)
+
+        def apply_chat_template(self, messages, *, add_generation_prompt=False, **_kwargs):
+            if add_generation_prompt:
+                return "ROLLOUT"
+            return "COMPLETED" + str(messages[-1].get("content", "")) + "END"
+
+        def __call__(self, text, add_special_tokens=False):
+            if text == "ROLLOUT":
+                ids = [1, 2]
+            elif text == "COMPLETED":
+                ids = [1, 6]
+            elif text.startswith("COMPLETED") and text.endswith("END"):
+                ids = [1, 6, 3, 4, 7]
+            else:
+                raise AssertionError(f"unexpected tokenization: {text!r}")
+            return SimpleNamespace(input_ids=ids)
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for i in ids if not (skip_special_tokens and int(i) == 7))
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _MismatchTok()
+    )
+
+    def _generate(_messages):
+        return SimpleNamespace(
+            content="target",
+            parsed_completion=SimpleNamespace(visible_content_records=()),
+            prompt_tokens=3,
+            completion_tokens=2,
+            latency_seconds=0.25,
+            attempts=1,
+        )
+
+    parasail_calls = _patch_hybrid_parasail(monkeypatch, generate=_generate)
+    monkeypatch.setattr(
+        opd_mod.OpdVllmRolloutEngine,
+        "generate",
+        lambda *_args, **_kwargs: pytest.fail("rollout must not run"),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_score_many",
+        lambda *_args, **_kwargs: pytest.fail("provider reverse work must not run"),
+    )
+    optimizer_steps = []
+    monkeypatch.setattr(
+        torch.optim.AdamW,
+        "step",
+        lambda *_args, **_kwargs: optimizer_steps.append(True),
+    )
+
+    with pytest.raises(
+        opd_mod._ParasailPreparationError,
+        match="projected target rollout prompt mismatch",
+    ):
+        opd_mod.run_opd()
+
+    assert [kind for kind, _value in parasail_calls] == ["init", "generate"]
+    assert optimizer_steps == []
+
+
+def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
+
+    def _one_update(*, model, **_kwargs):
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(monkeypatch)
+    target = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=1,
+        eligible_row_count=1,
+        drop_counts=ProjectionDropCounts(),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_prepare_parasail_targets",
+        lambda *_args, **_kwargs: (
+            [target],
+            _ParasailBatchStats(
+                logical_accepted_targets=1,
+                supervised_positions=1,
+                provider_requests=1,
+                provider_generations=1,
+                attempts=1,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_backward_projected_targets",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("projected failure")),
+    )
+    optimizer_steps = []
+    monkeypatch.setattr(
+        torch.optim.AdamW,
+        "step",
+        lambda *_args, **_kwargs: optimizer_steps.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="projected failure"):
+        opd_mod.run_opd()
+
+    assert optimizer_steps == []
+
+
+@pytest.mark.parametrize("failure", ["provider", "target", "forward"])
+def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
+
+    def _one_update(*, model, **_kwargs):
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(monkeypatch)
+    if failure == "provider":
+        _patch_hybrid_parasail(
+            monkeypatch,
+            generate=lambda _messages: (_ for _ in ()).throw(
+                RuntimeError("sanitized provider failure")
+            ),
+        )
+    elif failure == "target":
+        monkeypatch.setattr(
+            opd_mod,
+            "_prepare_parasail_targets",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("target failure")),
+        )
+    else:
+        target = ProjectedTarget(
+            input_ids=(1,),
+            positions=(),
+            rows=(),
+            visible_position_count=1,
+            eligible_row_count=0,
+            drop_counts=ProjectionDropCounts(),
+        )
+        monkeypatch.setattr(
+            opd_mod,
+            "_prepare_parasail_targets",
+            lambda *_a, **_k: (
+                [target],
+                _ParasailBatchStats(
+                    logical_accepted_targets=1,
+                    supervised_positions=0,
+                    provider_requests=1,
+                    provider_generations=1,
+                    prompt_tokens=3,
+                    completion_tokens=2,
+                    attempts=1,
+                    latency_seconds=0.25,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            opd_mod,
+            "_backward_projected_targets",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("forward failure")),
+        )
+
+    optimizer_steps = []
+    monkeypatch.setattr(
+        torch.optim.AdamW,
+        "step",
+        lambda *_a, **_k: optimizer_steps.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match=failure) as caught:
+        opd_mod.run_opd()
+
+    assert optimizer_steps == []
+    if failure == "forward":
+        assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
+            parasail_logical_accepted_targets=1,
+            parasail_provider_requests=1,
+            parasail_provider_generations=1,
+            parasail_prompt_tokens=3,
+            parasail_completion_tokens=2,
+            parasail_attempts=1,
+            parasail_latency_seconds=0.25,
+        )
+
+
+def test_hybrid_opd_finalization_failure_retains_parasail_telemetry(monkeypatch):
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    _patch_hybrid_parasail(monkeypatch)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    original = RuntimeError("metadata finalization failed")
+    monkeypatch.setattr(
+        opd_mod._w,
+        "write_train_meta",
+        lambda **_kwargs: (_ for _ in ()).throw(original),
+    )
+
+    with pytest.raises(RuntimeError, match="metadata finalization failed") as caught:
+        opd_mod.run_opd()
+
+    assert caught.value is original
+    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
+        parasail_logical_accepted_targets=1,
+        parasail_supervised_positions=2,
+        parasail_visible_provider_positions=2,
+        parasail_eligible_projected_rows=2,
+        parasail_retained_support_entries=2,
+        parasail_reported_mass_sum=2.0,
+        parasail_retained_mass_sum=2.0,
+        parasail_provider_requests=1,
+        parasail_provider_generations=1,
+        parasail_prompt_tokens=3,
+        parasail_completion_tokens=2,
+        parasail_attempts=1,
+        parasail_latency_seconds=0.25,
+    )
 
 
 def test_opd_liveness_heartbeat_gets_monotonic_progress_callback(monkeypatch):
@@ -1340,6 +2400,73 @@ def test_opd_resolves_one_halt_set_for_generation(monkeypatch):
 
     assert len(calls) == 1
     assert opd_mod.OpdVllmRolloutEngine.instances[0].eos_token_ids == (5, 7)
+
+
+def test_opd_marker_failure_aborts_before_first_optimizer_step(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update)
+    optimizer_steps = []
+    monkeypatch.setattr(
+        torch.optim.AdamW,
+        "step",
+        lambda *_args, **_kwargs: optimizer_steps.append(True),
+    )
+    monkeypatch.setattr(
+        opd_mod._w,
+        "persist_opd_training_started",
+        lambda: (_ for _ in ()).throw(RuntimeError("marker persistence failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="marker persistence failed"):
+        opd_mod.run_opd()
+
+    assert optimizer_steps == []
+    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 0
+
+
+def test_opd_successful_update_then_vllm_sync_failure_preserves_progress(monkeypatch):
+    pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=2)
+    markers = []
+    monkeypatch.setattr(opd_mod._w, "persist_opd_training_started", lambda: markers.append(True))
+    original_sync = opd_mod.OpdVllmRolloutEngine.sync_from_model
+
+    def _fail_second_sync(engine, model):
+        if engine.sync_count == 1:
+            raise RuntimeError("vllm synchronization failed")
+        return original_sync(engine, model)
+
+    monkeypatch.setattr(opd_mod.OpdVllmRolloutEngine, "sync_from_model", _fail_second_sync)
+
+    with pytest.raises(RuntimeError, match="vllm synchronization failed"):
+        opd_mod.run_opd()
+
+    assert markers == [True]
+    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 1
 
 
 def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
@@ -2104,7 +3231,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         THINKING=False,
         SEED=1234,
         heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
@@ -2215,7 +3342,7 @@ def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
         THINKING=False,
         SEED=1234,
         heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: 0.0,
+        prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
@@ -2315,6 +3442,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     prefetched: list = []
     fake_w = SimpleNamespace(
         require_active_env=lambda: env,
+        hf_resume_checkpoint=lambda: "",
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
@@ -2323,7 +3451,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         THINKING=False,
         SEED=0,
         heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: (prefetched.append(mid), 0.0)[1],
+        prefetch_model=lambda mid, **_kwargs: (prefetched.append(mid), 0.0)[1],
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -2399,7 +3527,9 @@ def test_student_model_continues_warmstart_adapter_in_place(monkeypatch):
     out, rollout_model_source = opd_mod._student_model("Qwen/Qwen3.5-4B", {"dtype": "bf16"}, "cpu")
     assert out is live  # the same live adapter, moved to device
     assert moved == ["cpu"]
-    assert rollout_model_source == "Qwen/Qwen3.5-4B"  # continued adapter deploys on the catalog base
+    assert (
+        rollout_model_source == "Qwen/Qwen3.5-4B"
+    )  # continued adapter deploys on the catalog base
     assert calls == []  # no base reload: neither causal nor VL loader is used
 
 
@@ -2572,7 +3702,9 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    assert not supports_fp8_kv(cheapest_gpu(need))  # ...on the A100 (sm80), which does NOT use fp8 KV
+    assert not supports_fp8_kv(
+        cheapest_gpu(need)
+    )  # ...on the A100 (sm80), which does NOT use fp8 KV
 
 
 def test_opd_oversized_reject_names_the_knobs_to_shrink():
@@ -2937,6 +4069,70 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
     assert ei.value.permanent is False
 
 
+def test_teacher_http_error_never_exposes_provider_body(monkeypatch, caplog, capsys):
+    import io
+    import urllib.error
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    sensitive = (
+        "prompt=private response=private answer=private reasoning=private "
+        "authorization=Bearer-secret credential=secret"
+    )
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            503,
+            "service unavailable",
+            {},
+            io.BytesIO(sensitive.encode()),
+        )
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", fake_urlopen)
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
+
+    with pytest.raises(TeacherError) as caught:
+        client.score("private prompt", "private answer")
+
+    captured = capsys.readouterr()
+    exposed = "\n".join([str(caught.value), captured.out, captured.err, caplog.text])
+    for secret in ("private", "Bearer-secret", "credential=secret", sensitive):
+        assert secret not in exposed
+    assert "teacher HTTP 503" in str(caught.value)
+    assert caught.value.permanent is False
+
+
+def test_teacher_validation_error_never_exposes_provider_payload(monkeypatch):
+    from flash.engine.worker.teacher import TeacherError
+
+    sensitive_token = "provider-secret-token"
+    sensitive_completion = "private-answer"
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": [sensitive_token],
+                    "token_logprobs": [-0.5],
+                    "text_offset": [0],
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "glm")
+
+    with pytest.raises(TeacherError) as caught:
+        client.score("private-prompt", sensitive_completion)
+
+    detail = str(caught.value)
+    assert "does not tile" in detail.lower()
+    assert sensitive_token not in detail
+    assert sensitive_completion not in detail
+    assert "private-prompt" not in detail
+
+
 def test_teacher_score_rejects_non_list_logprob_fields_as_permanent(monkeypatch):
     """Regression (codex[bot], teacher.py:130): the length check assumes tokens/token_logprobs/
     text_offset are sequences. A malformed 200 with token_logprobs=null (or a scalar text_offset) makes
@@ -2987,7 +4183,38 @@ def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):
     with pytest.raises(TeacherError) as ei:
         client.score("P", "hi")
     assert ei.value.permanent is False  # transient -> retried as infra, not permanent no-signal
-    assert "unparseable" in str(ei.value).lower()
+    assert str(ei.value) == "teacher returned unparseable HTTP 200 JSON on /completions"
+    assert "502 Bad Gateway" not in str(ei.value)
+
+
+def test_teacher_retry_timeout_and_backoff_stop_at_run_deadline(monkeypatch):
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    clock = {"now": 100.0}
+    timeouts = []
+    sleeps = []
+
+    def urlopen(_req, timeout=None):
+        timeouts.append(timeout)
+        raise tm.urllib.error.URLError("private provider response")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
+    monkeypatch.setattr(tm.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(tm.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(tm.time, "sleep", sleep)
+
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
+    with pytest.raises(TeacherError, match="run wall deadline") as exc_info:
+        client.score("private prompt", "private completion")
+
+    assert timeouts == [1.0]
+    assert sleeps == [1.0]
+    assert "private" not in str(exc_info.value)
 
 
 def test_teacher_incomplete_read_body_is_transient_teacher_error(monkeypatch):
@@ -3410,9 +4637,7 @@ def test_opd_loss_skips_empty_student_group_without_crashing():
     from flash.engine.worker import opd as opd_mod
 
     rows = torch.zeros(1, 8, requires_grad=True)
-    loss = opd_mod._gkd_loss_from_logits_rows(
-        rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0
-    )
+    loss = opd_mod._gkd_loss_from_logits_rows(rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0)
     assert loss is not None  # the empty group is ignored; the real group still trains
     loss.backward()
     assert rows.grad is not None
@@ -3509,6 +4734,88 @@ class _TinyLM:
 
     def train(self, mode=True):  # _resolve_samples_batched flips the model into train mode
         return self
+
+
+def test_backward_projected_targets_retains_empty_target_in_outer_mean():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import _backward_projected_targets
+    from flash.engine.worker.opd_soft_targets import (
+        ProjectedPosition,
+        ProjectedTarget,
+        ProjectionDropCounts,
+    )
+
+    row = ProjectedPosition(
+        provider_record_index=0,
+        logits_index=0,
+        token_ids=(1, 2),
+        probabilities=(0.4, 0.6),
+        reported_top_k_mass=1.0,
+        retained_projected_mass=1.0,
+        rejected_reported_mass=0.0,
+        unreported_mass=0.0,
+        total_dropped_mass=0.0,
+        support_size=2,
+        collision_count=0,
+        conditional_entropy_nats=0.0,
+        drop_counts=ProjectionDropCounts(),
+    )
+    eligible = ProjectedTarget(
+        input_ids=(1,),
+        positions=(row,),
+        rows=(row,),
+        visible_position_count=1,
+        eligible_row_count=1,
+        drop_counts=ProjectionDropCounts(),
+    )
+    empty = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=1,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(multi_token=1),
+    )
+    tok = SimpleNamespace(pad_token_id=0)
+    eligible_model = _TinyLM(torch, T=2, V=4)
+    eligible_loss, eligible_rows = _backward_projected_targets(
+        eligible_model, [eligible], "cpu", tok, coef=1.0
+    )
+    eligible_grad = eligible_model.w.grad.detach().clone()
+
+    mixed_model = _TinyLM(torch, T=2, V=4)
+    mixed_loss, mixed_rows = _backward_projected_targets(
+        mixed_model, [eligible, empty], "cpu", tok, coef=1.0
+    )
+
+    assert eligible_rows == mixed_rows == 1
+    assert mixed_loss == pytest.approx(eligible_loss / 2)
+    torch.testing.assert_close(mixed_model.w.grad, eligible_grad / 2, rtol=0, atol=0)
+
+
+def test_backward_projected_targets_all_empty_is_graph_attached_zero():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import _backward_projected_targets
+    from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
+
+    empty = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=1,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(multi_token=1),
+    )
+    model = _TinyLM(torch, T=2, V=4)
+
+    loss, supervised_rows = _backward_projected_targets(
+        model, [empty, empty], "cpu", SimpleNamespace(pad_token_id=0), coef=1.0
+    )
+
+    assert loss == 0.0
+    assert supervised_rows == 0
+    assert model.w.grad is not None
+    torch.testing.assert_close(model.w.grad, torch.zeros_like(model.w.grad), rtol=0, atol=0)
 
 
 def test_opd_loss_backpropagates_over_grouped_spans():
@@ -3778,12 +5085,14 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     groups = [([0, 1], -0.75), ([2], -0.25)]
 
     loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
-    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
-        rows, dim=-1
-    )
+    manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(
+        1
+    ) - torch.logsumexp(rows, dim=-1)
     coeff0 = 0.5 * (manual_logps[:2].detach().sum() - groups[0][1]) / 2
     coeff1 = 0.5 * (manual_logps[2:].detach().sum() - groups[1][1])
-    expected = torch.stack([coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]).mean()
+    expected = torch.stack(
+        [coeff0 * manual_logps[0], coeff0 * manual_logps[1], coeff1 * manual_logps[2]]
+    ).mean()
 
     assert loss is not None
     torch.testing.assert_close(loss, expected)
@@ -3817,12 +5126,8 @@ def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     student_ids = [2]
     rows_hi = torch.zeros(1, V, requires_grad=True)  # uniform logits -> student logprob = -log V
     rows_lo = torch.zeros(1, V, requires_grad=True)
-    hi = opd_mod._gkd_loss_from_logits_rows(
-        rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0
-    )
-    lo = opd_mod._gkd_loss_from_logits_rows(
-        rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0
-    )
+    hi = opd_mod._gkd_loss_from_logits_rows(rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0)
+    lo = opd_mod._gkd_loss_from_logits_rows(rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0)
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.
     # teacher=-5.0 -> larger coeff -> more-negative loss than teacher=-0.5.
     assert hi is not None

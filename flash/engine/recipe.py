@@ -11,6 +11,17 @@ HF_MODEL_ID = "Qwen/Qwen3.5-4B"
 # (a shared, dependency-free home) so the schema/worker/teacher/client all reference ONE symbol
 # instead of re-typing the literal (a typo would silently disable the required-secret gate).
 FIREWORKS_API_KEY_SECRET = "FIREWORKS_API_KEY"
+PARASAIL_API_KEY_SECRET = "PARASAIL_API_KEY"
+HYBRID_OPD_ACTIVATION_ENV = "FLASH_OPD_HYBRID_ACTIVATED"
+HYBRID_OPD_OBJECTIVE_ENV = "FLASH_OPD_HYBRID_OBJECTIVE"
+HYBRID_OPD_FORWARD_COEF_ENV = "FLASH_OPD_HYBRID_FORWARD_COEF"
+HYBRID_OPD_ENTROPY_TAU_ENV = "FLASH_OPD_HYBRID_ENTROPY_TAU"
+HYBRID_OPD_OBJECTIVE_PROJECTED_SOFT = "projected_soft"
+HYBRID_OPD_OBJECTIVE_REVERSE_ONLY = "reverse_only"
+PARASAIL_URL = "https://api.parasail.io/v1/chat/completions"
+PARASAIL_MODEL_ID = "deepseek-ai/DeepSeek-V4-Pro"
+FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID = "accounts/fireworks/models/deepseek-v4-pro"
+HYBRID_OPD_FORWARD_OBJECTIVE_COEF = 0.1
 
 # The single Fireworks OpenAI-compatible endpoint every managed OPD teacher is reached over. ONE
 # base_url + ONE platform-managed FIREWORKS_API_KEY authorize every teacher below (all are Fireworks

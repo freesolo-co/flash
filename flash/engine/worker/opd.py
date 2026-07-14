@@ -22,6 +22,7 @@ module is CPU/offline-safe.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import random
 import time
@@ -30,7 +31,18 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
-from flash.engine.recipe import RECIPE, resolve_teacher
+from flash.engine.recipe import (
+    FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID,
+    HYBRID_OPD_ACTIVATION_ENV,
+    HYBRID_OPD_ENTROPY_TAU_ENV,
+    HYBRID_OPD_FORWARD_COEF_ENV,
+    HYBRID_OPD_OBJECTIVE_ENV,
+    HYBRID_OPD_OBJECTIVE_PROJECTED_SOFT,
+    HYBRID_OPD_OBJECTIVE_REVERSE_ONLY,
+    PARASAIL_API_KEY_SECRET,
+    RECIPE,
+    resolve_teacher,
+)
 from flash.engine.steps import on_policy_steps
 from flash.engine.structured_outputs import (
     describe_structured_outputs,
@@ -46,6 +58,13 @@ from flash.engine.worker.opd_gkd import (
     _teacher_prompt_text,
     _trim_trailing_stop,
     student_tokens_with_offsets,
+)
+from flash.engine.worker.opd_soft_targets import (
+    ProjectedTarget,
+    SoftTargetProjectionError,
+    project_visible_records,
+    projected_row_is_active,
+    sparse_projected_conditional_cross_entropy,
 )
 from flash.engine.worker.opd_vllm import (
     OpdVllmOutput,
@@ -135,6 +154,95 @@ def _opd_loss_microbatch_size(model_id: str, total_samples: int) -> int:
     # OPD serial by default so the B200 path does not trade speed for OOM risk.
     default = OPD_LOSS_MICROBATCH_SIZE if params_b and params_b <= 10.0 else 1
     return max(1, min(total, default))
+
+
+@dataclass(frozen=True)
+class HybridEligibility:
+    enabled: bool
+    reason: str
+
+
+def _resolve_hybrid_eligibility(
+    *, multi_turn: bool, knobs, thinking: bool, gpu_count: int = 1, activated: bool = False
+):
+    if multi_turn:
+        return HybridEligibility(False, "multi_turn")
+    if thinking:
+        return HybridEligibility(False, "thinking")
+    if getattr(knobs, "structured_outputs", ""):
+        return HybridEligibility(False, "structured_outputs")
+    if tuple(getattr(knobs, "stop_sequences", ()) or ()):
+        return HybridEligibility(False, "explicit_stop_sequences")
+    if int(gpu_count) != 1:
+        return HybridEligibility(False, "multi_gpu")
+    if getattr(knobs, "teacher_model", "") != FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID:
+        return HybridEligibility(False, "teacher_pairing")
+    if not activated:
+        return HybridEligibility(False, "not_activated")
+    return HybridEligibility(True, "eligible")
+
+
+def _runtime_hybrid_objective_mode(*, activated: bool) -> str:
+    selected = os.environ.get(HYBRID_OPD_OBJECTIVE_ENV)
+    if not activated:
+        if selected is not None:
+            raise RuntimeError(
+                "opd hybrid objective mode is inconsistent with reverse-only runtime"
+            )
+        return HYBRID_OPD_OBJECTIVE_REVERSE_ONLY
+    if selected is None or not selected.strip():
+        raise RuntimeError("opd hybrid activated objective mode is missing")
+    mode = selected.strip()
+    if mode != HYBRID_OPD_OBJECTIVE_PROJECTED_SOFT:
+        raise RuntimeError("opd hybrid activated objective mode is invalid")
+    return mode
+
+
+@dataclass(frozen=True)
+class HybridRuntimeSettings:
+    forward_coef: float | None
+    entropy_tau: float | None
+
+
+def _runtime_numeric_setting(name: str, *, minimum: float, strict: bool) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        raise RuntimeError(f"opd hybrid runtime setting {name} is missing")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError(f"opd hybrid runtime setting {name} is invalid") from None
+    if not math.isfinite(value) or (value <= minimum if strict else value < minimum):
+        operator = ">" if strict else ">="
+        raise RuntimeError(
+            f"opd hybrid runtime setting {name} must be finite and {operator} {minimum:g}"
+        )
+    return value
+
+
+def _runtime_hybrid_settings(*, activated: bool) -> HybridRuntimeSettings:
+    configured = {
+        name
+        for name in (HYBRID_OPD_FORWARD_COEF_ENV, HYBRID_OPD_ENTROPY_TAU_ENV)
+        if name in os.environ
+    }
+    if not activated:
+        if configured:
+            raise RuntimeError(
+                "opd hybrid forward settings are inconsistent with reverse-only runtime"
+            )
+        return HybridRuntimeSettings(forward_coef=None, entropy_tau=None)
+    forward_coef = _runtime_numeric_setting(
+        HYBRID_OPD_FORWARD_COEF_ENV,
+        minimum=0.0,
+        strict=True,
+    )
+    entropy_tau = (
+        _runtime_numeric_setting(HYBRID_OPD_ENTROPY_TAU_ENV, minimum=0.0, strict=False)
+        if HYBRID_OPD_ENTROPY_TAU_ENV in os.environ
+        else None
+    )
+    return HybridRuntimeSettings(forward_coef=forward_coef, entropy_tau=entropy_tau)
 
 
 @dataclass(frozen=True)
@@ -304,9 +412,8 @@ def _student_model(model_id, model_init_kwargs, device):
 
     # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
     # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(
-        device
-    )
+    load_kwargs = {"trust_remote_code": True, **model_init_kwargs}
+    base = model_cls.from_pretrained(init_model, **load_kwargs).to(device)
     return get_peft_model(base, init_peft), str(init_model)
 
 
@@ -333,10 +440,52 @@ def _format_skip_counts(counts: Counter[str]) -> str:
     return ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
 
 
+def _normalize_accumulated_gradients(
+    parameters, *, accum_target: int, valid_sequences: int
+) -> None:
+    """Correct gradients accumulated at 1/accum_target to the valid-sequence mean."""
+    if valid_sequences <= 0:
+        raise ValueError("valid_sequences must be positive")
+    if valid_sequences == accum_target:
+        return
+    scale = accum_target / valid_sequences
+    for parameter in parameters:
+        if parameter.grad is not None:
+            parameter.grad.mul_(scale)
+
+
 def run_opd():
+    parasail_accounting = _ParasailRuntimeAccounting()
+    try:
+        return _run_opd(parasail_accounting)
+    except Exception as exc:
+        parasail_accounting.attach(exc)
+        raise
+
+
+def _emit_opd_trained_heartbeat(*, opt_steps: int, train_wall: float, parasail_accounting) -> None:
+    """Emit the final successful heartbeat with cumulative Parasail accounting intact."""
+    _w.heartbeat(
+        "opd_trained",
+        step=opt_steps,
+        train_wall=train_wall,
+        gpu=gpu_diagnostics(),
+        **parasail_accounting.totals.runtime_telemetry(),
+    )
+
+
+def _run_opd(parasail_accounting):
+    resume_ckpt = _w.hf_resume_checkpoint()
+    if resume_ckpt:
+        raise RuntimeError(
+            "opd found a same-run checkpoint, but opd checkpoint resume is not supported; "
+            "refusing to restart from step zero"
+        )
+
     import torch
     from transformers import AutoTokenizer
 
+    from flash.engine.worker.parasail import ParasailClient
     from flash.engine.worker.teacher import TeacherClient
 
     env = _w.require_active_env()
@@ -353,8 +502,20 @@ def run_opd():
     # single-turn env keeps the original one-generate-per-prompt path.
     multi_turn = bool(getattr(env, "multi_turn", False))
     t_start = time.time()
-    _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
+    hybrid_activated = os.environ.get(HYBRID_OPD_ACTIVATION_ENV) == "1"
+    _runtime_hybrid_objective_mode(activated=hybrid_activated)
+    hybrid_settings = _runtime_hybrid_settings(activated=hybrid_activated)
+    hybrid = _resolve_hybrid_eligibility(
+        multi_turn=multi_turn,
+        knobs=knobs,
+        thinking=bool(_w.THINKING),
+        gpu_count=1,
+        activated=hybrid_activated,
+    )
+    if hybrid_activated and not hybrid.enabled:
+        raise RuntimeError(f"opd hybrid runtime eligibility mismatch: {hybrid.reason}")
+    _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     warm_start = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
@@ -372,6 +533,14 @@ def run_opd():
             "FIREWORKS_API_KEY configured in its environment."
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    parasail = None
+    if hybrid.enabled:
+        parasail_key = os.environ.get(PARASAIL_API_KEY_SECRET, "").strip()
+        if not parasail_key:
+            raise RuntimeError(
+                "opd hybrid requires the platform-managed Parasail credential; the worker injection is missing"
+            )
+        parasail = ParasailClient(parasail_key, seed=_w.SEED)
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
@@ -596,10 +765,6 @@ def run_opd():
     # loss/coverage per optimizer step; the worker exit path (__init__.py) calls wandb_finish.
     _wandb_on = bool(_w.wandb_report_to())
 
-    resume_ckpt = _w.hf_resume_checkpoint()
-    if resume_ckpt:
-        print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
-
     out_dir = f"/tmp/opd_seed{_w.SEED}"
     adapter_dir = f"{out_dir}/adapter"
     os.makedirs(out_dir, exist_ok=True)
@@ -608,6 +773,9 @@ def run_opd():
     coverage_curve: list[float] = []
     generated_tokens = 0
     teacher_input_tokens = 0
+    parasail_accounting.totals = _ParasailBatchStats()
+    forward_loss_curve: list[float] = []
+    total_loss_curve: list[float] = []
     # length-capped rollouts and alignment granularity are surfaced in train_meta for diagnosis.
     truncated_rollouts = 0
     granularity_sum = 0.0
@@ -746,6 +914,9 @@ def run_opd():
     def _samples_progress():
         return samples_seen
 
+    hybrid_update_index = -1
+    hybrid_batch = None
+    forward_targets: list[ProjectedTarget] = []
     with (
         liveness_heartbeat(
             "opd_step", progress=_samples_progress, fields=lambda: {"step": opt_steps}
@@ -755,13 +926,49 @@ def run_opd():
     ):
         while opt_steps < steps and step < max_iters:
             optimizer.zero_grad(set_to_none=True)
-            for no_signal_attempt in range(1, max_no_signal_attempts + 1):
-                it = step  # data-slice + display index for THIS rollout attempt
-                step += 1  # advance up front so the nseq==0 retry path can't spin forever
-                batch = [
+            if hybrid.enabled and hybrid_update_index != opt_steps:
+                # bind the logical data slice to the intended optimizer update. raw rollout retries
+                # still advance `step` for the global attempt bound, but they must not consume a new
+                # prompt slice or a new parasail target batch before this update lands.
+                it = opt_steps
+                hybrid_batch = [
                     examples[(it * prompts_per_step + i) % len(examples)]
                     for i in range(prompts_per_step)
                 ]
+                preparation_failure: tuple[str, _ParasailBatchStats, bool] | None = None
+                try:
+                    forward_targets, parasail_stats = _prepare_parasail_targets(
+                        parasail,
+                        tok,
+                        hybrid_batch,
+                        max_length=seq_cap,
+                        entropy_tau=hybrid_settings.entropy_tau,
+                    )
+                except _ParasailPreparationError as exc:
+                    preparation_failure = (str(exc), exc.stats, exc.retriable)
+                if preparation_failure is not None:
+                    reason, partial_stats, retriable = preparation_failure
+                    parasail_accounting.totals = parasail_accounting.totals.merged(partial_stats)
+                    telemetry = parasail_accounting.totals.runtime_telemetry()
+                    if retriable:
+                        raise RetriableInfraError(reason, runtime_telemetry=telemetry) from None
+                    raise _ParasailPreparationError(
+                        reason, stats=parasail_accounting.totals, retriable=False
+                    ) from None
+                parasail_accounting.totals = parasail_accounting.totals.merged(parasail_stats)
+                hybrid_update_index = opt_steps
+            for no_signal_attempt in range(1, max_no_signal_attempts + 1):
+                if hybrid.enabled:
+                    it = opt_steps
+                    batch = hybrid_batch
+                    step += 1
+                else:
+                    it = step  # data-slice + display index for this rollout attempt
+                    step += 1  # advance up front so the nseq==0 retry path cannot spin forever
+                    batch = [
+                        examples[(it * prompts_per_step + i) % len(examples)]
+                        for i in range(prompts_per_step)
+                    ]
                 accum_target = max(1, prompts_per_step * group)
                 step_loss = 0.0
                 step_cov = 0.0
@@ -827,6 +1034,7 @@ def run_opd():
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
+                    loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
                         model,
                         tok,
@@ -836,6 +1044,8 @@ def run_opd():
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
                     )
+                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
+                    opd_phase_counts["loss_batches"] += 1
                     for r in resolved:
                         _account(r)
 
@@ -953,11 +1163,28 @@ def run_opd():
             # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
             # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
             # silently smaller update.
-            if nseq != accum_target:
-                scale = accum_target / nseq
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+            _normalize_accumulated_gradients(
+                model.parameters(), accum_target=accum_target, valid_sequences=nseq
+            )
+            reverse_avg_loss = step_loss / nseq
+            forward_loss = None
+            supervised_position_count = 0
+            if hybrid.enabled:
+                forward_started = time.perf_counter()
+                if hybrid_settings.forward_coef is None:
+                    raise RuntimeError("opd hybrid forward coefficient is unavailable")
+                forward_loss, supervised_position_count = _backward_projected_targets(
+                    model,
+                    forward_targets,
+                    device,
+                    tok,
+                    coef=hybrid_settings.forward_coef,
+                    entropy_tau=hybrid_settings.entropy_tau,
+                )
+                opd_phase_seconds["forward_objective_forward_backward"] += (
+                    time.perf_counter() - forward_started
+                )
+                opd_phase_counts["forward_objective_batches"] += 1
             optimizer_started = time.perf_counter()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             if opt_steps == 0:
@@ -978,10 +1205,14 @@ def run_opd():
                     vllm_rollout.sync_from_model(model)
                     opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
                     opd_phase_counts["vllm_syncs"] += 1
-            avg_loss = step_loss / nseq
+            avg_loss = reverse_avg_loss
             avg_cov = step_cov / nseq
+            total_loss = avg_loss + forward_loss if forward_loss is not None else avg_loss
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
+            if forward_loss is not None:
+                forward_loss_curve.append(forward_loss)
+            total_loss_curve.append(total_loss)
             _w.heartbeat(
                 "opd_step",
                 # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
@@ -993,6 +1224,11 @@ def run_opd():
                 step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
+                reverse_loss=avg_loss,
+                forward_loss=forward_loss,
+                total_loss=total_loss,
+                supervised_positions=supervised_position_count,
+                **(parasail_accounting.totals.runtime_telemetry() if hybrid.enabled else {}),
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
             )
@@ -1001,7 +1237,16 @@ def run_opd():
                 with contextlib.suppress(Exception):
                     import wandb
 
-                    wandb.log({"opd/loss": avg_loss, "opd/coverage": avg_cov}, step=opt_steps)
+                    metrics = {
+                        "opd/loss": avg_loss,
+                        "opd/coverage": avg_cov,
+                        "opd/reverse_loss": avg_loss,
+                        "opd/total_loss": total_loss,
+                    }
+                    if forward_loss is not None:
+                        metrics["opd/forward_loss"] = forward_loss
+                        metrics["opd/supervised_positions"] = supervised_position_count
+                    wandb.log(metrics, step=opt_steps)
             if it % 10 == 0:
                 print(
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
@@ -1072,7 +1317,11 @@ def run_opd():
     # adapter publish but before DONE is persisted reads a STEPLESS opd_trained/opd_train_done as the
     # last heartbeat, and actual_steps_run floors a fully-trained run to 0 (opd_trained isn't a training
     # stage) -- re-pricing paid work as $0 (codex[bot]).
-    _w.heartbeat("opd_trained", step=opt_steps, train_wall=train_wall, gpu=gpu_diagnostics())
+    _emit_opd_trained_heartbeat(
+        opt_steps=opt_steps,
+        train_wall=train_wall,
+        parasail_accounting=parasail_accounting,
+    )
 
     _w.write_train_meta(
         phase="opd",
@@ -1098,6 +1347,13 @@ def run_opd():
             "chalk_kernels": _chalk_active or None,
             "thinking": _w.THINKING,
             "loss_curve": loss_curve,
+            "reverse_loss_curve": loss_curve,
+            "forward_loss_curve": forward_loss_curve,
+            "total_loss_curve": total_loss_curve,
+            **parasail_accounting.totals.runtime_telemetry(),
+            # compatibility aliases for existing train metadata consumers.
+            "parasail_accepted_targets": parasail_accounting.totals.logical_accepted_targets,
+            "parasail_generations": parasail_accounting.totals.provider_generations,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or
             # distilled.
@@ -1129,10 +1385,18 @@ def run_opd():
             "opd_phase_rollout_generate_seconds": float(opd_phase_seconds["rollout_generate"]),
             "opd_phase_teacher_rpc_sum_seconds": float(opd_phase_seconds["teacher_rpc_sum"]),
             "opd_phase_teacher_wait_seconds": float(opd_phase_seconds["teacher_wait"]),
+            "opd_phase_loss_backward_seconds": float(opd_phase_seconds["loss_backward"]),
+            "opd_phase_forward_objective_forward_backward_seconds": float(
+                opd_phase_seconds["forward_objective_forward_backward"]
+            ),
             "opd_phase_optimizer_step_seconds": float(opd_phase_seconds["optimizer_step"]),
             "opd_phase_vllm_sync_seconds": float(opd_phase_seconds["vllm_sync"]),
             "opd_phase_rollout_generate_calls": int(opd_phase_counts["rollout_generate_calls"]),
             "opd_phase_teacher_batches": int(opd_phase_counts["teacher_batches"]),
+            "opd_phase_loss_batches": int(opd_phase_counts["loss_batches"]),
+            "opd_phase_forward_objective_batches": int(
+                opd_phase_counts["forward_objective_batches"]
+            ),
             "opd_phase_optimizer_steps": int(opd_phase_counts["optimizer_steps"]),
             "opd_phase_vllm_syncs": int(opd_phase_counts["vllm_syncs"]),
             "opd_rollout_pipeline_chunks": (
@@ -1504,6 +1768,488 @@ class _PreparedLoss:
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
+
+
+@dataclass(frozen=True)
+class _AssistantContentBoundary:
+    prompt_text: str
+    content_prefix: str
+    content_suffix: str
+    full_text: str
+
+
+def _nonnegative_int(value: object, *, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _nonnegative_float(value: object, *, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) and parsed >= 0 else default
+
+
+@dataclass(frozen=True)
+class _ParasailBatchStats:
+    logical_accepted_targets: int = 0
+    supervised_positions: int = 0
+    visible_provider_positions: int = 0
+    eligible_projected_rows: int = 0
+    retained_support_entries: int = 0
+    reported_mass_sum: float = 0.0
+    retained_mass_sum: float = 0.0
+    dropped_mass_sum: float = 0.0
+    entropy_nats_sum: float = 0.0
+    collision_count: int = 0
+    projected_drop_zero_token: int = 0
+    projected_drop_multi_token: int = 0
+    projected_drop_prefix_retokenization: int = 0
+    projected_drop_special_token: int = 0
+    projected_drop_invalid_token_id: int = 0
+    projected_drop_round_trip_mismatch: int = 0
+    projected_drop_realized_multi_token: int = 0
+    provider_requests: int = 0
+    provider_generations: int = 0
+    provider_failures: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    attempts: int = 0
+    latency_seconds: float = 0.0
+    ambiguous_paid_requests: int = 0
+
+    @property
+    def accepted(self) -> int:
+        return self.logical_accepted_targets
+
+    @property
+    def retries(self) -> int:
+        return max(0, self.attempts - self.provider_requests)
+
+    def merged(self, other: _ParasailBatchStats) -> _ParasailBatchStats:
+        return _ParasailBatchStats(
+            logical_accepted_targets=(
+                self.logical_accepted_targets + other.logical_accepted_targets
+            ),
+            supervised_positions=self.supervised_positions + other.supervised_positions,
+            visible_provider_positions=(
+                self.visible_provider_positions + other.visible_provider_positions
+            ),
+            eligible_projected_rows=(self.eligible_projected_rows + other.eligible_projected_rows),
+            retained_support_entries=(
+                self.retained_support_entries + other.retained_support_entries
+            ),
+            reported_mass_sum=self.reported_mass_sum + other.reported_mass_sum,
+            retained_mass_sum=self.retained_mass_sum + other.retained_mass_sum,
+            dropped_mass_sum=self.dropped_mass_sum + other.dropped_mass_sum,
+            entropy_nats_sum=self.entropy_nats_sum + other.entropy_nats_sum,
+            collision_count=self.collision_count + other.collision_count,
+            projected_drop_zero_token=(
+                self.projected_drop_zero_token + other.projected_drop_zero_token
+            ),
+            projected_drop_multi_token=(
+                self.projected_drop_multi_token + other.projected_drop_multi_token
+            ),
+            projected_drop_prefix_retokenization=(
+                self.projected_drop_prefix_retokenization
+                + other.projected_drop_prefix_retokenization
+            ),
+            projected_drop_special_token=(
+                self.projected_drop_special_token + other.projected_drop_special_token
+            ),
+            projected_drop_invalid_token_id=(
+                self.projected_drop_invalid_token_id + other.projected_drop_invalid_token_id
+            ),
+            projected_drop_round_trip_mismatch=(
+                self.projected_drop_round_trip_mismatch + other.projected_drop_round_trip_mismatch
+            ),
+            projected_drop_realized_multi_token=(
+                self.projected_drop_realized_multi_token + other.projected_drop_realized_multi_token
+            ),
+            provider_requests=self.provider_requests + other.provider_requests,
+            provider_generations=self.provider_generations + other.provider_generations,
+            provider_failures=self.provider_failures + other.provider_failures,
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            attempts=self.attempts + other.attempts,
+            latency_seconds=self.latency_seconds + other.latency_seconds,
+            ambiguous_paid_requests=(self.ambiguous_paid_requests + other.ambiguous_paid_requests),
+        )
+
+    def runtime_telemetry(self) -> dict[str, int | float]:
+        return {
+            "parasail_logical_accepted_targets": self.logical_accepted_targets,
+            "parasail_supervised_positions": self.supervised_positions,
+            "parasail_visible_provider_positions": self.visible_provider_positions,
+            "parasail_eligible_projected_rows": self.eligible_projected_rows,
+            "parasail_retained_support_entries": self.retained_support_entries,
+            "parasail_reported_mass_sum": self.reported_mass_sum,
+            "parasail_retained_mass_sum": self.retained_mass_sum,
+            "parasail_dropped_mass_sum": self.dropped_mass_sum,
+            "parasail_entropy_nats_sum": self.entropy_nats_sum,
+            "parasail_collision_count": self.collision_count,
+            "parasail_projected_drop_zero_token": self.projected_drop_zero_token,
+            "parasail_projected_drop_multi_token": self.projected_drop_multi_token,
+            "parasail_projected_drop_prefix_retokenization": (
+                self.projected_drop_prefix_retokenization
+            ),
+            "parasail_projected_drop_special_token": self.projected_drop_special_token,
+            "parasail_projected_drop_invalid_token_id": self.projected_drop_invalid_token_id,
+            "parasail_projected_drop_round_trip_mismatch": (
+                self.projected_drop_round_trip_mismatch
+            ),
+            "parasail_projected_drop_realized_multi_token": (
+                self.projected_drop_realized_multi_token
+            ),
+            "parasail_provider_requests": self.provider_requests,
+            "parasail_provider_generations": self.provider_generations,
+            "parasail_provider_failures": self.provider_failures,
+            "parasail_prompt_tokens": self.prompt_tokens,
+            "parasail_completion_tokens": self.completion_tokens,
+            "parasail_attempts": self.attempts,
+            "parasail_retries": self.retries,
+            "parasail_latency_seconds": self.latency_seconds,
+            "parasail_ambiguous_paid_requests": self.ambiguous_paid_requests,
+        }
+
+
+class _ParasailRuntimeAccounting:
+    def __init__(self) -> None:
+        self.totals = _ParasailBatchStats()
+
+    def attach(self, exc: BaseException) -> None:
+        if self.totals.provider_requests <= 0:
+            return
+        exc.runtime_telemetry = self.totals.runtime_telemetry()
+
+
+class _ParasailPreparationError(RuntimeError):
+    """Sanitized target-preparation failure with aggregate-only partial accounting."""
+
+    def __init__(self, reason: str, *, stats: _ParasailBatchStats, retriable: bool) -> None:
+        super().__init__(reason)
+        self.stats = stats
+        self.retriable = bool(retriable)
+        self.runtime_telemetry = stats.runtime_telemetry()
+
+
+def _common_prefix_len(left, right) -> int:
+    n = 0
+    for a, b in zip(left, right, strict=False):
+        if a != b:
+            break
+        n += 1
+    return n
+
+
+def _render_chat(tok, messages, *, add_generation_prompt: bool) -> str:
+    try:
+        rendered = tok.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+        )
+    except Exception:
+        raise RuntimeError("opd hybrid target rendering failed") from None
+    if not isinstance(rendered, str):
+        raise RuntimeError("opd hybrid target rendering failed")
+    return rendered
+
+
+def _encode_no_special(tok, text: str) -> list[int]:
+    try:
+        encoded = tok(text, add_special_tokens=False)
+        ids = encoded.input_ids if hasattr(encoded, "input_ids") else encoded["input_ids"]
+        return [int(value) for value in ids]
+    except Exception:
+        raise RuntimeError("opd hybrid target tokenization failed") from None
+
+
+def _derive_assistant_content_boundary(
+    tok, prompt_messages, visible_content: str
+) -> _AssistantContentBoundary:
+    if not isinstance(visible_content, str) or not visible_content.strip():
+        raise RuntimeError("opd hybrid target visible content is empty")
+    assistant = {"role": "assistant", "content": visible_content}
+    full_messages = [*prompt_messages, assistant]
+    prompt_text = _render_chat(tok, prompt_messages, add_generation_prompt=True)
+    rendered_full_text = _render_chat(tok, full_messages, add_generation_prompt=False)
+
+    marker_left = "__flash_parasail_content_begin_7d2f__"
+    marker_right = "__flash_parasail_content_end_7d2f__"
+    joined = prompt_text + rendered_full_text + visible_content
+    if marker_left in joined or marker_right in joined:
+        raise RuntimeError("opd hybrid target boundary marker collision")
+    marked_text = _render_chat(
+        tok,
+        [
+            *prompt_messages,
+            {"role": "assistant", "content": marker_left + marker_right},
+        ],
+        add_generation_prompt=False,
+    )
+    if marked_text.count(marker_left) != 1 or marked_text.count(marker_right) != 1:
+        raise RuntimeError("opd hybrid target boundary mismatch")
+    marker_start = marked_text.index(marker_left)
+    marker_end = marked_text.index(marker_right)
+    if marker_end != marker_start + len(marker_left):
+        raise RuntimeError("opd hybrid target boundary mismatch")
+    content_prefix = marked_text[:marker_start]
+    content_suffix = marked_text[marker_end + len(marker_right) :]
+    if not rendered_full_text.startswith(content_prefix) or not rendered_full_text.endswith(
+        content_suffix
+    ):
+        raise RuntimeError("opd hybrid target boundary mismatch")
+    rendered_content_end = len(rendered_full_text) - len(content_suffix)
+    rendered_content = rendered_full_text[len(content_prefix) : rendered_content_end]
+    if not content_suffix:
+        rendered_content = rendered_full_text[len(content_prefix) :]
+    if rendered_content not in (visible_content, visible_content.strip()):
+        raise RuntimeError("opd hybrid target boundary mismatch")
+
+    full_text = content_prefix + visible_content + content_suffix
+    return _AssistantContentBoundary(
+        prompt_text=prompt_text,
+        content_prefix=content_prefix,
+        content_suffix=content_suffix,
+        full_text=full_text,
+    )
+
+
+def _build_projected_target(
+    tok,
+    prompt_messages,
+    prompt_ids,
+    visible_content: str,
+    visible_records,
+    *,
+    max_length: int,
+) -> ProjectedTarget:
+    boundary = _derive_assistant_content_boundary(tok, prompt_messages, visible_content)
+    if tuple(_encode_no_special(tok, boundary.content_prefix)) != tuple(prompt_ids):
+        raise RuntimeError("opd hybrid projected target rollout prompt mismatch")
+    if "".join(record.token for record in visible_records) != visible_content:
+        raise RuntimeError("opd hybrid projected visible records do not reconstruct content")
+    try:
+        target = project_visible_records(
+            tok,
+            prefix_text=boundary.content_prefix,
+            visible_records=visible_records,
+        )
+    except SoftTargetProjectionError as exc:
+        raise RuntimeError(str(exc)) from None
+    if len(target.input_ids) > int(max_length):
+        raise RuntimeError("opd hybrid target exceeds the local context")
+    return target
+
+
+def _prepare_parasail_targets(
+    client,
+    tok,
+    batch,
+    *,
+    max_length: int,
+    entropy_tau: float | None = None,
+):
+    sanitized: tuple[str, _ParasailBatchStats, bool] | None = None
+    try:
+        return _prepare_parasail_targets_impl(
+            client,
+            tok,
+            batch,
+            max_length=max_length,
+            entropy_tau=entropy_tau,
+        )
+    except _ParasailPreparationError as exc:
+        sanitized = (str(exc), exc.stats, exc.retriable)
+    reason, stats, retriable = sanitized
+    raise _ParasailPreparationError(reason, stats=stats, retriable=retriable) from None
+
+
+def _prepare_parasail_targets_impl(
+    client,
+    tok,
+    batch,
+    *,
+    max_length: int,
+    entropy_tau: float | None,
+):
+    import json
+
+    from flash.engine.worker.parasail import ParasailError
+
+    targets: list[ProjectedTarget] = []
+    cached: dict[tuple[str, tuple[int, ...]], ProjectedTarget] = {}
+    stats = _ParasailBatchStats()
+    for _example, messages, prompt_ids in batch:
+        try:
+            serialized_messages = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise _ParasailPreparationError(
+                "opd hybrid prompt serialization failed",
+                stats=stats,
+                retriable=False,
+            ) from None
+        key = (serialized_messages, tuple(prompt_ids))
+        if key not in cached:
+            stats = stats.merged(_ParasailBatchStats(provider_requests=1))
+            try:
+                result = client.generate(messages)
+            except ParasailError as exc:
+                stats = stats.merged(
+                    _ParasailBatchStats(
+                        provider_failures=1,
+                        attempts=max(
+                            1,
+                            _nonnegative_int(getattr(exc, "attempts", 0)),
+                        ),
+                        latency_seconds=_nonnegative_float(getattr(exc, "latency_seconds", 0.0)),
+                        ambiguous_paid_requests=_nonnegative_int(
+                            getattr(exc, "ambiguous_paid_requests", 0)
+                        ),
+                    )
+                )
+                raise _ParasailPreparationError(
+                    str(exc), stats=stats, retriable=bool(getattr(exc, "retriable", False))
+                ) from None
+            except Exception:
+                stats = stats.merged(
+                    _ParasailBatchStats(
+                        provider_failures=1,
+                        attempts=1,
+                        ambiguous_paid_requests=1,
+                    )
+                )
+                raise _ParasailPreparationError(
+                    "opd hybrid provider target preparation failed",
+                    stats=stats,
+                    retriable=False,
+                ) from None
+            try:
+                successful_stats = _ParasailBatchStats(
+                    provider_generations=1,
+                    prompt_tokens=_nonnegative_int(result.prompt_tokens),
+                    completion_tokens=_nonnegative_int(result.completion_tokens),
+                    attempts=max(1, _nonnegative_int(result.attempts)),
+                    latency_seconds=_nonnegative_float(result.latency_seconds),
+                    ambiguous_paid_requests=_nonnegative_int(
+                        getattr(result, "ambiguous_paid_requests", 0)
+                    ),
+                )
+                visible_content = result.content
+                visible_records = result.parsed_completion.visible_content_records
+            except Exception:
+                stats = stats.merged(
+                    _ParasailBatchStats(
+                        provider_generations=1,
+                        attempts=1,
+                        ambiguous_paid_requests=1,
+                    )
+                )
+                raise _ParasailPreparationError(
+                    "opd hybrid provider result accounting failed",
+                    stats=stats,
+                    retriable=False,
+                ) from None
+            stats = stats.merged(successful_stats)
+            try:
+                cached[key] = _build_projected_target(
+                    tok,
+                    messages,
+                    prompt_ids,
+                    visible_content,
+                    visible_records,
+                    max_length=max_length,
+                )
+            except RuntimeError as exc:
+                raise _ParasailPreparationError(str(exc), stats=stats, retriable=False) from None
+            except Exception:
+                raise _ParasailPreparationError(
+                    "opd hybrid local target preparation failed",
+                    stats=stats,
+                    retriable=False,
+                ) from None
+        target = cached[key]
+        targets.append(target)
+        rows = target.rows
+        drops = target.drop_counts
+        target_stats = _ParasailBatchStats(
+            logical_accepted_targets=1,
+            supervised_positions=sum(
+                projected_row_is_active(row, entropy_tau) for row in rows
+            ),
+            visible_provider_positions=target.visible_position_count,
+            eligible_projected_rows=target.eligible_row_count,
+            retained_support_entries=sum(row.support_size for row in rows),
+            reported_mass_sum=math.fsum(row.reported_top_k_mass for row in target.positions),
+            retained_mass_sum=math.fsum(row.retained_projected_mass for row in target.positions),
+            dropped_mass_sum=math.fsum(row.total_dropped_mass for row in target.positions),
+            entropy_nats_sum=math.fsum(row.conditional_entropy_nats for row in rows),
+            collision_count=sum(row.collision_count for row in target.positions),
+            projected_drop_zero_token=drops.zero_token,
+            projected_drop_multi_token=drops.multi_token,
+            projected_drop_prefix_retokenization=drops.prefix_retokenization,
+            projected_drop_special_token=drops.special_token,
+            projected_drop_invalid_token_id=drops.invalid_token_id,
+            projected_drop_round_trip_mismatch=drops.round_trip_mismatch,
+            projected_drop_realized_multi_token=drops.realized_multi_token,
+        )
+        stats = stats.merged(target_stats)
+    if not targets:
+        raise _ParasailPreparationError(
+            "opd hybrid target batch is empty", stats=stats, retriable=False
+        ) from None
+    return targets, stats
+
+
+def _backward_projected_targets(
+    model,
+    targets: list[ProjectedTarget],
+    device,
+    tok,
+    *,
+    coef: float,
+    entropy_tau: float | None = None,
+):
+    import torch
+
+    if not targets:
+        raise RuntimeError("opd hybrid projected targets are missing")
+    model.train()
+    model.config.use_cache = False
+    pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
+    max_len = max(len(target.input_ids) for target in targets)
+    input_ids = torch.full((len(targets), max_len), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(targets), max_len), dtype=torch.long, device=device)
+    for row, target in enumerate(targets):
+        input_ids[row, : len(target.input_ids)] = torch.tensor(
+            target.input_ids, dtype=torch.long, device=device
+        )
+        attention_mask[row, : len(target.input_ids)] = 1
+    logits = _forward_logits(model, input_ids, attention_mask)
+    loss = float(coef) * sparse_projected_conditional_cross_entropy(
+        logits,
+        targets,
+        entropy_tau=entropy_tau,
+    )
+    loss.backward()
+    supervised_positions = sum(
+        projected_row_is_active(row, entropy_tau)
+        for target in targets
+        for row in target.rows
+    )
+    return float(loss.detach()), supervised_positions
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
