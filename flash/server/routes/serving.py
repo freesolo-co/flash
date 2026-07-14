@@ -22,7 +22,6 @@ from referencing import Registry
 from referencing.exceptions import NoSuchResource, Unresolvable
 
 from flash.engine.structured_outputs import parse_structured_outputs
-from flash.envs.registry import load_environment
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -73,9 +72,8 @@ _DEPLOYMENT_ORDER = {
     "failed": 7,
 }
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
-# hard wall-clock budget for the whole smoke (environment setup + every generation turn),
-# strictly below _DEPLOYMENT_STALE_SECONDS so a hanging environment or generation fails the
-# deployment cleanly instead of pinning it in smoke_testing until the stale sweeper reaps it.
+# hard wall-clock budget for the trusted fixed-prompt generation, strictly below
+# _DEPLOYMENT_STALE_SECONDS so a hanging request fails instead of pinning smoke_testing.
 _SMOKE_BUDGET_SECONDS = 600.0
 
 
@@ -84,11 +82,10 @@ def _smoke_timeout_error(budget_s: float) -> ServingError:
 
 
 def _bounded_call(fn, *, deadline: float, budget_s: float):
-    """run ``fn()`` in a daemon worker thread, waiting at most the remaining smoke budget.
+    """run ``fn()`` in a daemon worker thread within the remaining smoke budget.
 
-    environment hooks are arbitrary user code with no cooperative cancellation; on timeout the
-    blocked thread is abandoned (daemon, so it cannot pin shutdown) and the smoke fails with the
-    stable timeout error rather than leaving the deployment busy past the stale threshold.
+    the serving request has no cooperative cancellation. on timeout the blocked thread is abandoned
+    so it cannot pin shutdown, and the deployment fails before the stale threshold.
     """
     import threading
 
@@ -330,10 +327,6 @@ def recover_deployments() -> int:
     return recovered
 
 
-def _valid_messages(value) -> bool:
-    return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
-
-
 def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
@@ -407,131 +400,44 @@ def _run_deployment_smoke(
     deadline = started + budget_s
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    environment_id = spec.environment.id
-    environment_revision = spec.environment.resolved_sha
-    env = None
-    state = None
-    multi_turn = False
-    verify_kind = "fixed_fallback"
     messages = [{"role": "user", "content": _SMOKE_PROMPT}]
-
-    def _environment_setup() -> tuple:
-        env = load_environment(
-            environment_id,
-            params=spec.environment.params,
-            resolved_sha=environment_revision,
-        )
-        examples = env.dataset()
-        if not examples:
-            raise ValueError("environment dataset is empty")
-        example = examples[0]
-        multi_turn = bool(getattr(env, "multi_turn", False))
-        if multi_turn:
-            state = env.new_rollout_state(example)
-            messages = state.get("messages") if isinstance(state, dict) else None
-            kind = "environment_multi_turn"
-        else:
-            state = None
-            messages = env.prompt_messages(example)
-            kind = "environment_single_turn"
-        if not _valid_messages(messages):
-            raise ValueError("environment did not produce valid initial messages")
-        return env, state, multi_turn, messages, kind
-
-    try:
-        env, state, multi_turn, messages, verify_kind = _bounded_call(
-            _environment_setup, deadline=deadline, budget_s=budget_s
-        )
-    except ServingError:
-        # deadline expiry is a hard failure, never a fallback: a smoke that timed out setting up
-        # has no budget left to prove anything with the fixed prompt either.
-        raise
-    except Exception:
-        # pre-generation environment failures fall back to the fixed prompt while budget remains,
-        # so a broken env repo does not block verifying that the adapter itself serves.
-        env = None
-        state = None
-        multi_turn = False
-        messages = [{"role": "user", "content": _SMOKE_PROMPT}]
-        verify_kind = "fixed_fallback"
-
-    finishes = []
-    last_content = ""
-    last_answer = ""
-    last_finish = None
-    thinking_tag = False
-    turns = 0
-    while turns < (2 if multi_turn else 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _smoke_timeout_error(budget_s)
-        result = _bounded_call(
-            lambda messages=messages, remaining=remaining: _app.serve_chat(
-                run_id=serving_model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=256,
-                thinking=spec.thinking,
-                expected_checkpoint=expected_checkpoint,
-                timeout_s=remaining,
-            ),
-            deadline=deadline,
-            budget_s=budget_s,
-        )
-        turns += 1
-        last_content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
-        finishes.append(finish)
-        last_finish = finish
-        thinking_tag = thinking_tag or "<think>" in last_content or "</think>" in last_content
-        if constraint and spec.thinking and finish == "length":
-            raise ServingError(
-                "structured smoke generation was truncated at the maximum token length"
-            )
-        last_answer = (
-            _thinking_structured_answer(last_content)
-            if constraint and spec.thinking
-            else last_content.strip()
-        )
-        if constraint:
-            _validate_structured_smoke(last_answer, constraint)
-        if not multi_turn or env is None or state is None:
-            break
-
-        def _environment_transition(env=env, state=state, content=last_content) -> list | None:
-            env.record_model_turn(state, content)
-            if env.rollout_done(state):
-                return None
-            env.env_reply(state["messages"], state)
-            if env.rollout_done(state):
-                return None
-            return state["messages"]
-
-        try:
-            next_messages = _bounded_call(
-                _environment_transition, deadline=deadline, budget_s=budget_s
-            )
-            if next_messages is not None and not _valid_messages(next_messages):
-                raise ValueError("environment transition produced invalid messages")
-        except ServingError:
-            raise
-        except Exception as exc:
-            raise ServingError(f"smoke_environment_failed: {exc}") from exc
-        if next_messages is None:
-            break
-        messages = next_messages
-
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _smoke_timeout_error(budget_s)
+    result = _bounded_call(
+        lambda: _app.serve_chat(
+            run_id=serving_model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=256,
+            thinking=spec.thinking,
+            expected_checkpoint=expected_checkpoint,
+            timeout_s=remaining,
+        ),
+        deadline=deadline,
+        budget_s=budget_s,
+    )
+    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
+    thinking_tag = "<think>" in content or "</think>" in content
+    if constraint and spec.thinking and finish == "length":
+        raise ServingError("structured smoke generation was truncated at the maximum token length")
+    answer = (
+        _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
+    )
+    if constraint:
+        _validate_structured_smoke(answer, constraint)
     return {
         "verified_at": time.time(),
-        "verify_kind": verify_kind,
-        "verify_environment_id": environment_id,
-        "verify_environment_revision": environment_revision,
-        "verify_turns": turns,
-        "verify_multi_turn": multi_turn,
+        "verify_kind": "fixed_prompt",
+        "verify_environment_id": None,
+        "verify_environment_revision": None,
+        "verify_turns": 1,
+        "verify_multi_turn": False,
         "verify_latency_s": time.monotonic() - started,
-        "verify_finish_reasons": finishes,
-        "verify_finish_reason": last_finish,
+        "verify_finish_reasons": [finish],
+        "verify_finish_reason": finish,
         "thinking_tag": thinking_tag,
-        "verify_sample": last_answer[:160],
+        "verify_sample": answer[:160],
     }
 
 
@@ -766,7 +672,8 @@ def _finish_deployment_unlocked(
                     f"{', '.join(str(step) for step in steps)})"
                 )
         failed_source = dict(current)
-        failed_source.pop("activation_outcome_unknown", None)
+        if not deployment.get("activation_outcome_unknown"):
+            failed_source.pop("activation_outcome_unknown", None)
         failed = _deployment_state(
             failed_source,
             "failed",
@@ -994,6 +901,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             queued_at=time.time(),
         )
         dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
+        if current_deployment.get("activation_outcome_unknown"):
+            dep_dict["activation_outcome_unknown"] = True
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
         if previous_deployment:

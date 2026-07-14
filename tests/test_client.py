@@ -520,7 +520,8 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     ]
 
 
-def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch):
+@pytest.mark.parametrize("run_state", ["cancelled", "done", "failed", "dry_run"])
+def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
     def request(method, path, body=None, timeout=None, progress=None):
@@ -529,7 +530,7 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
         if method == "GET" and path == "/v1/runs/r1":
             return {
                 "run_id": "r1",
-                "state": "cancelled",
+                "state": run_state,
                 "deployment": {
                     "state": "revocation_failed",
                     "retryable": True,

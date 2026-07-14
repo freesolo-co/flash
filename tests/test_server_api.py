@@ -2032,7 +2032,7 @@ def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, d
 def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
-    from flash.serve.deploy import ActivationOutcomeUnknown
+    from flash.serve.deploy import ActivationOutcomeUnknown, ServingError
     from flash.server.routes import serving
 
     key = _login()
@@ -2064,6 +2064,8 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
         assert activating["activation_outcome_unknown"] is True
         if len(expected_revisions) == 1:
             raise ActivationOutcomeUnknown(run_id, attempted_revision)
+        if len(expected_revisions) == 2:
+            raise ServingError("retry failed before alias activation")
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "adapter_alias_target", fake_alias_target)
@@ -2100,9 +2102,19 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
     assert retry.status_code == 200, retry.text
-    assert retry.json()["state"] == "ready"
-    assert alias_reads == [run_id]
-    assert expected_revisions == [previous_revision, attempted_revision]
+    assert retry.json()["state"] == "failed"
+    retry_failed = runner.get_status(run_id).deployment
+    assert retry_failed["state"] == "failed"
+    assert retry_failed["adapter_revision"] == attempted_revision
+    assert retry_failed["activation_outcome_unknown"] is True
+    assert retry_failed["previous_deployment"] == previous
+
+    final_retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert final_retry.status_code == 200, final_retry.text
+    assert final_retry.json()["state"] == "ready"
+    assert alias_reads == [run_id, run_id]
+    assert expected_revisions == [previous_revision, attempted_revision, attempted_revision]
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):

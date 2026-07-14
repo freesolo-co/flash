@@ -433,16 +433,17 @@ def _smoke_result(
     }
 
 
-def test_run_deployment_smoke_uses_fixed_fallback_before_first_request(monkeypatch):
+def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
     revision = "run-1@final." + "a" * 40
+
+    class UntrustedEnvironment:
+        def __getattribute__(self, name):
+            pytest.fail(f"control-plane smoke accessed user environment field {name!r}")
+
     spec = types.SimpleNamespace(
         thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha="b" * 40),
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_environment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
+        train=types.SimpleNamespace(structured_outputs=""),
+        environment=UntrustedEnvironment(),
     )
     calls = []
 
@@ -452,156 +453,24 @@ def test_run_deployment_smoke_uses_fixed_fallback_before_first_request(monkeypat
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = serving._run_deployment_smoke(
-        "run-1", spec, serving_model=revision, expected_checkpoint="run-1"
+        "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=10.0
     )
-    assert out["verify_kind"] == "fixed_fallback"
+
+    assert out["verify_kind"] == "fixed_prompt"
+    assert out["verify_environment_id"] is None
+    assert out["verify_environment_revision"] is None
     assert out["verify_turns"] == 1
+    assert out["verify_multi_turn"] is False
     assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
     assert calls[0]["expected_checkpoint"] == "run-1"
-
-
-def test_run_deployment_smoke_multi_turn_is_bounded_and_never_scores(monkeypatch):
-    revision = "run-1@step-20." + "c" * 40
-    checkpoint = "run-1/step-20"
-    state = {"messages": [{"role": "user", "content": "start"}], "done": False}
-
-    class Env:
-        multi_turn = True
-
-        def dataset(self):
-            return [{"id": 1}]
-
-        def new_rollout_state(self, example):
-            assert example == {"id": 1}
-            return state
-
-        def record_model_turn(self, rollout, content):
-            rollout["messages"].append({"role": "assistant", "content": content})
-
-        def rollout_done(self, rollout):
-            return False
-
-        def env_reply(self, messages, rollout):
-            messages.append({"role": "user", "content": "continue"})
-
-        def reward(self, *args, **kwargs):
-            pytest.fail("deployment smoke must not call reward")
-
-        def judge(self, *args, **kwargs):
-            pytest.fail("deployment smoke must not call judge")
-
-        def score(self, *args, **kwargs):
-            pytest.fail("deployment smoke must not call score")
-
-        def grade(self, *args, **kwargs):
-            pytest.fail("deployment smoke must not call grade")
-
-        def quality(self, *args, **kwargs):
-            pytest.fail("deployment smoke must not call quality")
-
-    spec = types.SimpleNamespace(
-        thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-    monkeypatch.setattr(serving, "load_environment", lambda *args, **kwargs: Env())
-    calls = []
-
-    def fake_serve_chat(**kwargs):
-        calls.append(kwargs)
-        return _smoke_result(revision, checkpoint, content=f"turn {len(calls)}")
-
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = serving._run_deployment_smoke(
-        "run-1", spec, serving_model=revision, expected_checkpoint=checkpoint
-    )
-    assert out["verify_kind"] == "environment_multi_turn"
-    assert out["verify_turns"] == 2
-    assert len(calls) == 2
-
-
-def test_run_deployment_smoke_blocked_environment_setup_times_out_within_budget(monkeypatch):
-    # a hanging load_environment must fail the smoke with the stable timeout error inside the
-    # budget, and no generation may ever run — never a fixed-prompt fallback after expiry.
-    revision = "run-1@final." + "e" * 40
-    spec = types.SimpleNamespace(
-        thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-
-    def hang(*args, **kwargs):
-        time.sleep(30.0)
-
-    monkeypatch.setattr(serving, "load_environment", hang)
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **kwargs: pytest.fail("timed-out environment setup must not reach generation"),
-    )
-    started = time.monotonic()
-    with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
-        serving._run_deployment_smoke(
-            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.2
-        )
-    assert time.monotonic() - started < 5.0
-
-
-def test_run_deployment_smoke_passes_remaining_budget_to_serve_chat(monkeypatch):
-    # each generation gets the remaining budget, not the fixed 30-minute client timeout, and a
-    # later turn sees strictly less than the first.
-    revision = "run-1@step-20." + "f" * 40
-    checkpoint = "run-1/step-20"
-    state = {"messages": [{"role": "user", "content": "start"}]}
-
-    class Env:
-        multi_turn = True
-
-        def dataset(self):
-            return [{"id": 1}]
-
-        def new_rollout_state(self, example):
-            return state
-
-        def record_model_turn(self, rollout, content):
-            rollout["messages"].append({"role": "assistant", "content": content})
-
-        def rollout_done(self, rollout):
-            return False
-
-        def env_reply(self, messages, rollout):
-            messages.append({"role": "user", "content": "continue"})
-
-    spec = types.SimpleNamespace(
-        thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-    monkeypatch.setattr(serving, "load_environment", lambda *args, **kwargs: Env())
-    timeouts = []
-
-    def fake_serve_chat(**kwargs):
-        timeouts.append(kwargs["timeout_s"])
-        time.sleep(0.05)
-        return _smoke_result(revision, checkpoint)
-
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = serving._run_deployment_smoke(
-        "run-1", spec, serving_model=revision, expected_checkpoint=checkpoint, budget_s=10.0
-    )
-    assert out["verify_turns"] == 2
-    assert len(timeouts) == 2
-    assert all(t <= 10.0 for t in timeouts)
-    assert timeouts[1] < timeouts[0]  # turn 2 only gets what turn 1 left over
+    assert calls[0]["timeout_s"] <= 10.0
 
 
 def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
     revision = "run-1@final." + "a" * 40
     spec = types.SimpleNamespace(
         thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_environment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
+        train=types.SimpleNamespace(structured_outputs=""),
     )
 
     def slow_serve_chat(**kwargs):
@@ -618,95 +487,20 @@ def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
 
 
 def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):
-    # once the deadline expires no further generation starts, and expiry never falls back to the
-    # fixed prompt.
     revision = "run-1@final." + "a" * 40
     spec = types.SimpleNamespace(
         thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
+        train=types.SimpleNamespace(structured_outputs=""),
     )
-
-    class Env:
-        multi_turn = False
-
-        def dataset(self):
-            time.sleep(0.05)  # consumes the whole (tiny) budget inside setup
-            return [{"id": 1}]
-
-        def prompt_messages(self, example):
-            return [{"role": "user", "content": "hello"}]
-
-    monkeypatch.setattr(serving, "load_environment", lambda *args, **kwargs: Env())
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
         lambda **kwargs: pytest.fail("expired budget must not start a generation"),
     )
+
     with pytest.raises(ServingError, match="deployment_smoke_timeout"):
         serving._run_deployment_smoke(
-            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.01
-        )
-
-
-def test_run_deployment_smoke_env_setup_error_still_falls_back_with_budget_left(monkeypatch):
-    # a pre-generation environment exception (not a timeout) keeps the fixed-prompt fallback as
-    # long as budget remains.
-    revision = "run-1@final." + "b" * 40
-    spec = types.SimpleNamespace(
-        thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_environment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("env repo broken")),
-    )
-    calls = []
-
-    def fake_serve_chat(**kwargs):
-        calls.append(kwargs)
-        return _smoke_result(revision, "run-1")
-
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = serving._run_deployment_smoke(
-        "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=10.0
-    )
-    assert out["verify_kind"] == "fixed_fallback"
-    assert len(calls) == 1
-    assert calls[0]["timeout_s"] <= 10.0
-
-
-def test_run_deployment_smoke_does_not_fallback_after_first_request(monkeypatch):
-    revision = "run-1@final." + "d" * 40
-
-    class Env:
-        multi_turn = True
-
-        def dataset(self):
-            return [{}]
-
-        def new_rollout_state(self, example):
-            return {"messages": [{"role": "user", "content": "start"}]}
-
-        def record_model_turn(self, state, content):
-            raise RuntimeError("transition broke")
-
-        def rollout_done(self, state):
-            return False
-
-    spec = types.SimpleNamespace(
-        thinking=False,
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha=None),
-    )
-    monkeypatch.setattr(serving, "load_environment", lambda *args, **kwargs: Env())
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **kwargs: _smoke_result(revision, "run-1"),
-    )
-    with pytest.raises(ServingError, match="smoke_environment_failed"):
-        serving._run_deployment_smoke(
-            "run-1", spec, serving_model=revision, expected_checkpoint="run-1"
+            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.0
         )
 
 
@@ -734,11 +528,6 @@ def _structured_smoke_response(content: str, finish_reason: str = "stop") -> dic
 
 def _run_structured_smoke(monkeypatch, run_id: str, spec):
     assert run_id == "run-1"
-    monkeypatch.setattr(
-        serving,
-        "load_environment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
-    )
     return serving._run_deployment_smoke(
         run_id,
         spec,

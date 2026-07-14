@@ -596,7 +596,7 @@ def _alias_target(record: dict | None) -> str | None:
 def adapter_alias_target(run_id: str) -> str | None:
     """Read the authoritative immutable revision targeted by a mutable run alias."""
     record = _registered_adapter(run_id)
-    if record is None:
+    if record is None or record.get("status") == "disabled":
         return None
     target = _alias_target(record)
     if target is None:

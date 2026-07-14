@@ -137,7 +137,9 @@ def _parse_chat_target(target: str) -> tuple[str, str | None]:
         return revision[0], target.strip()
     parsed = parse_checkpoint_ref(target)
     if parsed is None:
-        raise ClientError("invalid run id: expected a bare RUN_ID or full immutable adapter revision")
+        raise ClientError(
+            "invalid run id: expected a bare RUN_ID or full immutable adapter revision"
+        )
     run_id, step = parsed
     if step is not None:
         raise ClientError(
@@ -347,11 +349,7 @@ class ApiClient:
             else:
                 last_state = str(status.get("state") or "unknown")
                 deployment = status.get("deployment") or {}
-                if (
-                    last_state == "cancelled"
-                    and isinstance(deployment, dict)
-                    and deployment.get("state") == "revocation_failed"
-                ):
+                if isinstance(deployment, dict) and deployment.get("state") == "revocation_failed":
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
                         "cancel request reached the control plane, but backend revocation is "

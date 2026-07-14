@@ -609,6 +609,17 @@ def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
     )
     assert d.adapter_alias_target("run-1") == revision
 
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter",
+        lambda run_id: {
+            "adapter_id": run_id,
+            "status": "disabled",
+            "metadata": {"alias_of": revision},
+        },
+    )
+    assert d.adapter_alias_target("run-1") is None
+
     monkeypatch.setattr(d, "_registered_adapter", lambda run_id: {"adapter_id": run_id})
     with pytest.raises(d.ServingError, match="legacy aliases are unsupported"):
         d.adapter_alias_target("run-1")
