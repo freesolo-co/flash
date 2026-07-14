@@ -32,10 +32,13 @@ from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-# The ONE public checkpoint/adapter reference grammar: `<run_id>` (a run's trained adapter) or
-# `<run_id>/step-N` (a specific saved checkpoint listed by `flash checkpoints`). The control plane
-# resolves it to the internal storage reference below; users never see or write storage refs.
+# canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
+# revisions additionally lock that checkpoint identity to the exact hugging face commit.
 _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
+_ADAPTER_REVISION_RE = re.compile(
+    rf"^(?P<run_id>{_RUN_ID_RE})@(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\."
+    r"(?P<hf_revision>[0-9a-f]{40})$"
+)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -56,6 +59,19 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
         return match.group("run_id"), int(step)
     except ValueError:
         return None
+
+
+def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
+    """Parse a locked immutable adapter revision into ``(run_id, step|None, hf_revision)``."""
+    match = _ADAPTER_REVISION_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    step = match.group("step")
+    return (
+        match.group("run_id"),
+        int(step) if step is not None else None,
+        match.group("hf_revision"),
+    )
 
 
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:

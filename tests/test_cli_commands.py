@@ -721,6 +721,14 @@ def test_chat_checkpoint_ref_uses_base_run_id(fake_client) -> None:
     assert fake_client.calls[-1][1] == "flash-1"
 
 
+def test_chat_full_immutable_revision_reaches_client_unchanged(fake_client) -> None:
+    revision = "flash-1@step-40." + "a" * 40
+
+    assert _run(["chat", revision, "-m", "What is 6*7?"]) == 0
+    assert fake_client.calls[-1][0] == "chat_stream"
+    assert fake_client.calls[-1][1] == revision
+
+
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
     assert _run(["chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0

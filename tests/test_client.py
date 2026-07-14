@@ -64,7 +64,10 @@ def stub():
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
-            if self.path == "/v1/runs/r1/chat":
+            if (
+                self.path in {"/v1/runs/r1/chat", "/v1/runs/run-a/chat"}
+                and seen["body"].get("stream") is True
+            ):
                 body = "héllo".encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -271,6 +274,29 @@ def test_chat_sends_user_supplied_system_prompt(stub):
     }
 
 
+def test_chat_full_immutable_revision_is_forwarded_unchanged(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = "run-a@step-40." + "a" * 40
+
+    client.chat(revision, [{"role": "user", "content": "hi"}])
+
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"]["adapter_revision"] == revision
+
+
+@pytest.mark.parametrize("step", ["00", "01"])
+def test_chat_rejects_zero_padded_immutable_revision(stub, step):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = f"run-a@step-{step}." + "a" * 40
+
+    with pytest.raises(ClientError, match="invalid run id"):
+        client.chat(revision, [{"role": "user", "content": "hi"}])
+
+    assert seen == {}
+
+
 def test_chat_stream_sends_stream_request_and_yields_text(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
@@ -285,6 +311,31 @@ def test_chat_stream_sends_stream_request_and_yields_text(stub):
         "temperature": 0.2,
         "max_tokens": 7,
         "stream": True,
+    }
+
+
+def test_chat_stream_full_immutable_revision_is_forwarded_unchanged(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = "run-a@step-40." + "a" * 40
+
+    chunks = list(
+        client.chat_stream(
+            revision,
+            [{"role": "user", "content": "hi"}],
+            temperature=0.2,
+            max_tokens=7,
+        )
+    )
+
+    assert "".join(chunks) == "héllo"
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "max_tokens": 7,
+        "stream": True,
+        "adapter_revision": revision,
     }
 
 

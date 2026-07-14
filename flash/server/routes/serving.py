@@ -22,8 +22,11 @@ from flash.runner import (
     mark_deployment_failed,
     mark_deployment_pending,
     mark_undeployed,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
+from flash.schema import parse_adapter_revision
 from flash.serve.deploy import AdapterConfigMissing, ServingError
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
@@ -151,6 +154,16 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
         return dict(previous)
     return None
+
+
+def _verified_adapter_revisions(status) -> set[str]:
+    revisions = set(read_verified_adapter_revisions(status.run_id))
+    legacy_ready = _previous_ready_deployment(status.deployment or {})
+    if legacy_ready is not None and legacy_ready.get("verification_generation") is None:
+        revision = legacy_ready.get("adapter_revision")
+        if isinstance(revision, str) and revision:
+            revisions.add(revision)
+    return revisions
 
 
 def recover_deployments() -> int:
@@ -728,6 +741,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             requested_at=time.time(),
             queued_at=time.time(),
         )
+        dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
         if previous_deployment:
@@ -854,6 +868,30 @@ def deployments(key: Annotated[dict, Depends(require_key)]):
 def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
     messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
+    adapter_revision = payload.get("adapter_revision")
+    serving_model = run_id
+    if adapter_revision is not None:
+        parsed_revision = (
+            parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
+        )
+        if parsed_revision is None:
+            raise HTTPException(
+                status_code=400,
+                detail="adapter_revision must be a full immutable adapter revision",
+            )
+        if parsed_revision[0] != run_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
+            )
+        serving_model = adapter_revision.strip()
+        if serving_model not in _verified_adapter_revisions(status):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"adapter_revision {serving_model} has not passed a successful deployment smoke"
+                ),
+            )
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
     deployment_state = deployment.get("state")
@@ -917,7 +955,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         if payload.get("stream") is True:
             return StreamingResponse(
                 _app.serve_chat_stream(
-                    run_id=run_id,
+                    run_id=serving_model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -926,7 +964,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                 media_type="text/plain; charset=utf-8",
             )
         return _app.serve_chat(
-            run_id=run_id,
+            run_id=serving_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,

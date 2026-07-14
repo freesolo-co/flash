@@ -15,6 +15,7 @@ from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
     ConfigError,
+    parse_adapter_revision,
     spec_from_dict,
     train_schema_metadata,
     validate_train_keys,
@@ -44,6 +45,13 @@ def _raw(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 # schema validation error paths
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("step", ["00", "01"])
+def test_parse_adapter_revision_rejects_zero_padded_steps(step):
+    revision = f"run-a@step-{step}." + "a" * 40
+
+    assert parse_adapter_revision(revision) is None
 
 
 @pytest.mark.parametrize(

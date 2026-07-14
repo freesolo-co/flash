@@ -751,17 +751,18 @@ def cmd_deployments(args) -> int:
 
 
 def cmd_chat(args) -> int:
-    from flash.schema import parse_checkpoint_ref
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-    parsed = parse_checkpoint_ref(args.run_id)
-    if parsed is None:
+    revision = parse_adapter_revision(args.run_id)
+    parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
+    if revision is None and parsed is None:
         print(
             f"invalid run/checkpoint reference {args.run_id!r} "
-            "(expected <run_id> or <run_id>/step-N)",
+            "(expected <run_id>, <run_id>/step-N, or a full immutable adapter revision)",
             file=sys.stderr,
         )
         return 1
-    base_run_id, _step = parsed
+    chat_target = args.run_id if revision is not None else parsed[0]
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
     system = getattr(args, "system", None)
@@ -773,7 +774,7 @@ def cmd_chat(args) -> int:
     if stream is not None:
         wrote = False
         for chunk in stream(
-            base_run_id,
+            chat_target,
             messages=messages,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -785,7 +786,7 @@ def cmd_chat(args) -> int:
         return 0
 
     resp = client.chat(
-        base_run_id,
+        chat_target,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,

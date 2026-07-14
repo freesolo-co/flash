@@ -399,19 +399,24 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
     ) -> dict:
-        from flash.schema import parse_checkpoint_ref
+        from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
+        revision = parse_adapter_revision(run_id)
+        parsed = parse_checkpoint_ref(run_id) if revision is None else None
+        if revision is None and parsed is None:
             raise ClientError(
-                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+                "invalid run id: expected RUN_ID, RUN_ID/step-N, or a full immutable "
+                "adapter revision"
             )
-        base_run_id, _step = parsed
+        base_run_id = revision[0] if revision is not None else parsed[0]
         _validate_chat_messages(messages)
+        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        if revision is not None:
+            body["adapter_revision"] = run_id.strip()
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
-            body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
+            body=body,
             timeout=timeout if timeout is not None else 30 * 60,
         )
 
@@ -422,14 +427,16 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
-        from flash.schema import parse_checkpoint_ref
+        from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
+        revision = parse_adapter_revision(run_id)
+        parsed = parse_checkpoint_ref(run_id) if revision is None else None
+        if revision is None and parsed is None:
             raise ClientError(
-                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
+                "invalid run id: expected RUN_ID, RUN_ID/step-N, or a full immutable "
+                "adapter revision"
             )
-        base_run_id, _step = parsed
+        base_run_id = revision[0] if revision is not None else parsed[0]
         _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -443,6 +450,7 @@ class ApiClient:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "stream": True,
+                    **({"adapter_revision": run_id.strip()} if revision is not None else {}),
                 }
             ).encode(),
             headers=headers,

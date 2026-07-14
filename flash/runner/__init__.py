@@ -846,3 +846,9 @@ from flash.runner.lifecycle import (  # noqa: E402,F401
     _spec_with_gpu,
     _submit_seed_supervised,
 )
+from flash.runner.verified_revisions import (  # noqa: E402,F401
+    add_verified_adapter_revision,
+    clear_verified_adapter_revisions,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
+)

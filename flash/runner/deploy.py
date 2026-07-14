@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from flash.spec import JobSpec
@@ -20,6 +21,9 @@ if TYPE_CHECKING:
 
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
 _RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
+_DEPLOYMENT_BUSY_STATES = frozenset(
+    {"deploying", "queued", "registered", "downloading", "loading", "smoke_testing", "registering", "verifying"}
+)
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -230,6 +234,41 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     return get_status(run_id)
 
 
+def _deployment_attempt_is_owned(status: RunStatus, deployment: dict) -> bool:
+    requested_at = deployment.get("requested_at")
+    if requested_at is None:
+        return True
+    current = status.deployment or {}
+    if current == deployment:
+        return True
+    return (
+        current.get("requested_at") == requested_at
+        and current.get("state") in _DEPLOYMENT_BUSY_STATES
+    )
+
+
+def _commit_verified_deployment(
+    run_id: str,
+    deployment: dict,
+    *,
+    commit: Callable[[], None],
+) -> bool:
+    revision = deployment.get("adapter_revision")
+    if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES or not isinstance(
+        revision, str
+    ):
+        commit()
+        return True
+    from flash.runner.verified_revisions import commit_verified_adapter_revision
+
+    return commit_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=deployment.get("verification_generation"),
+        commit=commit,
+    )
+
+
 def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     """Apply the lifecycle state for a final-adapter deployment."""
     # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
@@ -248,9 +287,16 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        _promote_final_deployment(status, deployment)
-        status.updated_at = time.time()
-        _save_status(status)
+        if not _deployment_attempt_is_owned(status, deployment):
+            return status
+
+        def _commit() -> None:
+            _promote_final_deployment(status, deployment)
+            status.updated_at = time.time()
+            _save_status(status)
+
+        if not _commit_verified_deployment(run_id, deployment, commit=_commit):
+            return get_status(run_id)
         return status
 
 
@@ -270,12 +316,19 @@ def mark_checkpoint_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        if status.state in _FINAL_DEPLOYMENT_STATES:
-            _promote_final_deployment(status, deployment)
-        else:
-            status.deployment = deployment
-        status.updated_at = time.time()
-        _save_status(status)
+        if not _deployment_attempt_is_owned(status, deployment):
+            return status
+
+        def _commit() -> None:
+            if status.state in _FINAL_DEPLOYMENT_STATES:
+                _promote_final_deployment(status, deployment)
+            else:
+                status.deployment = deployment
+            status.updated_at = time.time()
+            _save_status(status)
+
+        if not _commit_verified_deployment(run_id, deployment, commit=_commit):
+            return get_status(run_id)
         return status
 
 
@@ -335,15 +388,20 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
 def mark_undeployed(run_id: str) -> RunStatus:
     """Record an explicit undeploy; live final-adapter deployments return to `done`."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if status.deployment:
-            status.deployment = {**status.deployment, "state": "undeployed"}
-        if status.state == "deployed":
-            status.state = "done"
-        status.updated_at = time.time()
-        _save_status(status)
+
+        def _commit() -> None:
+            if status.deployment:
+                status.deployment = {**status.deployment, "state": "undeployed"}
+            if status.state == "deployed":
+                status.state = "done"
+            status.updated_at = time.time()
+            _save_status(status)
+
+        invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status
 
 
@@ -354,11 +412,16 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
     so it works even after a racing mark_undeployed has already written terminal `done`.
     """
     from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if status.deployment:
-            status.deployment = {**status.deployment, "state": "undeployed"}
-            status.updated_at = time.time()
-            _save_status(status)
+
+        def _commit() -> None:
+            if status.deployment:
+                status.deployment = {**status.deployment, "state": "undeployed"}
+                status.updated_at = time.time()
+                _save_status(status)
+
+        invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status
