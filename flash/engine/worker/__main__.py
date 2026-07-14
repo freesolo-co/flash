@@ -1,4 +1,7 @@
 from flash.engine.worker import main
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        main()
+    except Exception:
+        raise SystemExit(1) from None

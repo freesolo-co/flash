@@ -281,7 +281,9 @@ def static_rates_for(identity_attr: str) -> dict[str, float]:
     """Friendly GPU name -> static ``GpuClass.hourly_usd`` for the classes a provider offers (keyed by
     the same per-provider identity field). The offline/fallback rate snapshot for RunPod and Vast;
     Lambda keeps its own list-price map because its prices differ from this RunPod-snapshot field."""
-    return {name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)}
+    return {
+        name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)
+    }
 
 
 # Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
@@ -480,6 +482,7 @@ class Provider(Protocol):
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         code_prefix: str | None = None,
+        _deadline_at: float | None = None,
     ) -> PollResult:
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll to terminal.
 
@@ -487,7 +490,15 @@ class Provider(Protocol):
         """
         ...
 
-    def poll(self, handle: JobHandle, spec: JobSpec, seed: int, *, log: Any = None) -> PollResult:
+    def poll(
+        self,
+        handle: JobHandle,
+        spec: JobSpec,
+        seed: int,
+        *,
+        log: Any = None,
+        _deadline_at: float | None = None,
+    ) -> PollResult:
         """Reattach to a persisted handle and poll it to a terminal state."""
         ...
 

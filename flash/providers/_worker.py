@@ -233,7 +233,9 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    for k in ("FLASH_CHALK_SPEC",):  # install-source override; kernel selection is fixed in chalk_kernels
+    for k in (
+        "FLASH_CHALK_SPEC",
+    ):  # install-source override; kernel selection is fixed in chalk_kernels
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
@@ -267,19 +269,31 @@ def build_worker_env(
 _CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
-def _hf_call(call, label: str):
-    return hf_call(call, label, logger=logger, sleep=time.sleep)
+def _hf_call(call, label: str, *, deadline_at: float | None = None):
+    return hf_call(
+        call,
+        label,
+        logger=logger,
+        sleep=time.sleep,
+        deadline_at=deadline_at,
+    )
 
 
 def _is_hf_not_found(exc: BaseException) -> bool:
     return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
 
 
-def _ensure_private_artifact_repo(api, repo: str) -> None:
+def _ensure_private_artifact_repo(
+    api,
+    repo: str,
+    *,
+    deadline_at: float | None = None,
+) -> None:
     try:
         _hf_call(
             lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
             f"lookup artifact repo {repo}",
+            deadline_at=deadline_at,
         )
     except Exception as exc:
         if not _is_hf_not_found(exc):
@@ -287,15 +301,22 @@ def _ensure_private_artifact_repo(api, repo: str) -> None:
         _hf_call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),
             f"create artifact repo {repo}",
+            deadline_at=deadline_at,
         )
     # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
     _hf_call(
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",
+        deadline_at=deadline_at,
     )
 
 
-def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> str:
+def upload_code(
+    repo: str | None = None,
+    *,
+    code_prefix: str | None = None,
+    deadline_at: float | None = None,
+) -> str:
     """Upload the ``flash`` package to its content-addressed HF artifact prefix."""
     from huggingface_hub import HfApi
 
@@ -309,12 +330,13 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
     token = os.environ.get("HF_TOKEN")
     pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
-    _ensure_private_artifact_repo(api, repo)
+    _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
     code_prefix = code_prefix or flash_code_prefix()
     code_marker = f"{code_prefix}/{_CODE_SNAPSHOT_COMPLETE}"
     if _hf_call(
         lambda: api.file_exists(repo_id=repo, filename=code_marker, repo_type="dataset"),
         f"check flash code snapshot {repo}:{code_marker}",
+        deadline_at=deadline_at,
     ):
         return repo
     _hf_call(
@@ -326,6 +348,7 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
             ignore_patterns=["__pycache__/*", "*.pyc", "*.pyo"],
         ),
         f"upload flash code to {repo}:{code_prefix}",
+        deadline_at=deadline_at,
     )
     _hf_call(
         lambda: api.upload_file(
@@ -335,5 +358,6 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
             repo_type="dataset",
         ),
         f"mark flash code snapshot complete {repo}:{code_marker}",
+        deadline_at=deadline_at,
     )
     return repo

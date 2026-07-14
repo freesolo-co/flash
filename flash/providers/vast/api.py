@@ -16,6 +16,11 @@ import urllib.request
 from typing import Any
 
 from flash._logging import get_logger
+from flash.providers._deadline import (
+    remaining_seconds,
+    require_create_allowance,
+    require_deadline_at,
+)
 from flash.providers._http import RestClient, is_not_found
 
 logger = get_logger(__name__)
@@ -54,10 +59,20 @@ def request_with_retries(
     body: dict | None = None,
     retries: int = 4,
     base_delay: float = 2.0,
+    deadline_at: float | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
+    if deadline_at is None:
+        return _CLIENT.request_with_retries(
+            path, method=method, body=body, retries=retries, base_delay=base_delay
+        )
     return _CLIENT.request_with_retries(
-        path, method=method, body=body, retries=retries, base_delay=base_delay
+        path,
+        method=method,
+        body=body,
+        retries=retries,
+        base_delay=base_delay,
+        deadline_at=deadline_at,
     )
 
 
@@ -71,6 +86,7 @@ def search_offers(
     min_reliability: float = 0.95,
     min_duration_seconds: float = 0,
     limit: int = 64,
+    deadline_at: float | None = None,
 ) -> list[dict]:
     """Rentable single-GPU offers from verified datacenter hosts, cheapest first.
 
@@ -95,7 +111,12 @@ def search_offers(
     if min_duration_seconds > 0:
         # Keep only offers Vast says are available for at least the run's deadline.
         q["duration"] = {"gte": float(min_duration_seconds)}
-    out = request_with_retries("/v0/search/asks/", method="PUT", body={"q": q})
+    out = request_with_retries(
+        "/v0/search/asks/",
+        method="PUT",
+        body={"q": q},
+        deadline_at=deadline_at,
+    )
     offers = out.get("offers") if isinstance(out, dict) else None
     return offers if isinstance(offers, list) else []
 
@@ -134,11 +155,11 @@ def _rejection_from_body(offer_id: int, body: dict) -> VastApiError | None:
     if contract:
         err = VastAmbiguousCreate(
             f"create_instance({offer_id}) returned contradictory rejection with contract "
-            f"evidence {contract!r} (possible billed contract): {body}"
+            "evidence; provider detail suppressed; possible billed contract"
         )
         err.contract_id = _usable_contract_id(contract)
         return err
-    return VastCreateRejected(f"create_instance({offer_id}) rejected: {body}")
+    return VastCreateRejected(f"create_instance({offer_id}) rejected; provider detail suppressed")
 
 
 def _http_error_response(error: VastApiError) -> dict | None:
@@ -172,12 +193,16 @@ def create_instance(
     env: dict[str, str],
     onstart: str,
     label: str,
+    deadline_at: float | None = None,
 ) -> int:
     """Rent an offer -> instance id. Raises VastApiError on rejection (offer taken).
 
     ``args`` runtype: the script is the container command (``bash -c``), so no SSH key is
     needed and the container lifecycle == the job lifecycle.
     """
+    deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
+    if deadline is not None:
+        require_create_allowance(deadline)
     body = {
         "client_id": "me",
         "image": image,
@@ -192,7 +217,13 @@ def create_instance(
     # (blind retry on a lost response = double-provision + double-bill).
     target = f"/v0/asks/{int(offer_id)}/"
     try:
-        out = request_with_retries(target, method="PUT", body=body, retries=0)
+        out = request_with_retries(
+            target,
+            method="PUT",
+            body=body,
+            retries=0,
+            **({} if deadline is None else {"deadline_at": deadline}),
+        )
     except VastApiError as e:
         if getattr(e, "__cause__", None) is None and str(e) == _CLIENT.missing_key_message:
             # raised locally before any http request: the create was definitively never sent,
@@ -206,20 +237,21 @@ def create_instance(
         cause = getattr(e, "__cause__", None)
         if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)):
             raise VastAmbiguousCreate(
-                f"create_instance({offer_id}) response unreadable (possible billed contract): {cause}"
-            ) from cause
+                f"create_instance({offer_id}) response unreadable; provider detail suppressed; "
+                "possible billed contract"
+            ) from None
         raise
-    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException) as e:
-        # unreadable 200 body on this non-idempotent create may mean vast billed a contract while
-        # the response leg failed. these decode errors aren't oserrors so _http doesn't wrap them;
-        # surface as vastambiguouscreate so the caller reconciles rather than leaking the contract.
+    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException):
+        # an unreadable response may mean vast billed a contract before the response failed.
+        # surface an ambiguous create so the caller reconciles instead of leaking the contract.
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) response unreadable (possible billed contract): {e}"
-        ) from e
+            f"create_instance({offer_id}) response unreadable; provider detail suppressed; "
+            "possible billed contract"
+        ) from None
     if not isinstance(out, dict):
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned an ambiguous response "
-            f"(possible billed contract): {out}"
+            f"create_instance({offer_id}) returned an ambiguous response; "
+            "provider detail suppressed; possible billed contract"
         )
     classified = _rejection_from_body(offer_id, out)
     if classified is not None:
@@ -227,13 +259,13 @@ def create_instance(
     parsed_id = _usable_contract_id(out.get("new_contract"))
     if out.get("success") is not True:
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned an ambiguous response "
-            f"(possible billed contract): {out}"
+            f"create_instance({offer_id}) returned an ambiguous response; "
+            "provider detail suppressed; possible billed contract"
         )
     if parsed_id is None:
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}): no instance id in response "
-            f"(unparseable new_contract {out.get('new_contract')!r}, possible billed contract): {out}"
+            f"create_instance({offer_id}) returned no instance id usable; "
+            "provider detail suppressed; possible billed contract"
         )
     return parsed_id
 
@@ -246,14 +278,21 @@ def create_error_is_ambiguous(err: Exception) -> bool:
     return not isinstance(err, (VastCreateRejected, VastCreateNotSent))
 
 
-def get_instance(instance_id: int) -> dict | None:
+def get_instance(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+) -> dict | None:
     """Instance detail dict, or None once it no longer exists (destroyed).
 
     The v0 detail route answers 200 with ``{"instances": null}`` for unknown ids — that is
     the "gone" signal, not a 404.
     """
     try:
-        out = request_with_retries(f"/v0/instances/{int(instance_id)}/")
+        out = request_with_retries(
+            f"/v0/instances/{int(instance_id)}/",
+            deadline_at=deadline_at,
+        )
     except VastApiError as e:
         # Status-code authoritative (via is_not_found), not a "404" substring: a non-404 body
         # embedding an id like "4040" must not be misread as a disappearance.
@@ -269,12 +308,19 @@ def get_instance(instance_id: int) -> dict | None:
         # is None), silently RESETTING the missing streak and masking a real disappearance. Raise so
         # the poller counts it as a bounded, retryable poll_error instead of a false healthy read.
         if out.get("success") is False:
-            raise VastApiError(f"vast instance-detail error envelope for {int(instance_id)}: {out}")
+            raise VastApiError(
+                f"vast instance-detail error envelope for {int(instance_id)}; "
+                "provider detail suppressed"
+            )
         return out
     return None
 
 
-def list_instances(strict: bool = False) -> list[dict]:
+def list_instances(
+    strict: bool = False,
+    *,
+    deadline_at: float | None = None,
+) -> list[dict]:
     # v0 list is deprecated (410 "use /api/v1/instances/"); detail/destroy stay on v0. The v1 list
     # is keyset-paginated (limit max 25; pass the prior page's ``next_token`` as ``after_token``,
     # null on the last page). Must walk every page or a flash-labeled orphan on a later page (which
@@ -286,12 +332,14 @@ def list_instances(strict: bool = False) -> list[dict]:
     # is never read as "gone".
     instances: list[dict] = []
     after_token: str | None = None
-    for page_no in range(200):  # runaway guard: 200 pages x 25 = 5000 instances, beyond any real account
+    for page_no in range(
+        200
+    ):  # runaway guard: 200 pages x 25 = 5000 instances, beyond any real account
         path = "/v1/instances/"
         if after_token:
             path += f"?after_token={urllib.parse.quote(str(after_token))}"
         try:
-            out = request_with_retries(path)
+            out = request_with_retries(path, deadline_at=deadline_at)
         except Exception:
             # A later page failed after earlier ones succeeded: return the partial list rather than
             # discard it — lenient consumers only act on instances they see, and the next sweep
@@ -307,7 +355,9 @@ def list_instances(strict: bool = False) -> list[dict]:
             raise
         if not isinstance(out, dict):
             if strict:
-                raise VastApiError("vast instance listing returned a non-dict page; listing incomplete")
+                raise VastApiError(
+                    "vast instance listing returned a non-dict page; listing incomplete"
+                )
             break
         page = out.get("instances")
         if isinstance(page, list):
@@ -315,7 +365,9 @@ def list_instances(strict: bool = False) -> list[dict]:
         elif strict:
             # A 200 lacking an ``instances`` list (e.g. an error envelope) would otherwise look like
             # a complete empty page; a strict caller must treat it as incomplete, not "none remain".
-            raise VastApiError("vast instance listing page has no 'instances' list; listing incomplete")
+            raise VastApiError(
+                "vast instance listing page has no 'instances' list; listing incomplete"
+            )
         after_token = out.get("next_token")
         if not after_token:
             break
@@ -325,33 +377,43 @@ def list_instances(strict: bool = False) -> list[dict]:
     return instances
 
 
-def instance_logs(instance_id: int) -> str | None:
+def instance_logs(instance_id: int, *, deadline_at: float | None = None) -> str | None:
     """Container log tail via the logs API (request -> poll the result URL).
 
     The only place early-bootstrap failures are visible. Best-effort: returns None when logs
     are unavailable (e.g. the instance is already destroyed); never raises.
     """
     try:
+        absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
         out = request_with_retries(
             f"/v0/instances/request_logs/{int(instance_id)}/",
             method="PUT",
             body={"tail": "400"},
             retries=1,
+            deadline_at=absolute_deadline,
         )
         url = out.get("result_url") if isinstance(out, dict) else None
         if not url:
             return None
-        deadline = time.time() + 20.0
-        while time.time() < deadline:
+        poll_deadline = time.time() + 20.0
+        if absolute_deadline is not None:
+            poll_deadline = min(poll_deadline, absolute_deadline)
+        while True:
+            remaining = remaining_seconds(poll_deadline)
+            if remaining <= 0:
+                break
             try:
-                with urllib.request.urlopen(url, timeout=15) as resp:
+                with urllib.request.urlopen(url, timeout=min(15.0, remaining)) as resp:
                     body = resp.read().decode(errors="replace")
                 if body.strip():
                     return body
             except urllib.error.HTTPError as e:
                 if e.code != 404:  # 404 = not materialized yet
                     return None
-            time.sleep(2.0)
+            sleep_for = min(2.0, remaining_seconds(poll_deadline))
+            if sleep_for <= 0:
+                break
+            time.sleep(sleep_for)
     except Exception:
         return None
     return None
@@ -366,10 +428,14 @@ def _genuine_http_not_found(exc: Exception) -> bool:
     )
 
 
-def _exact_instance_absent(instance_id: int) -> bool:
+def _exact_instance_absent(instance_id: int, *, deadline_at: float | None = None) -> bool:
     """confirm absence only from the exact-instance route's documented null or 404 signal."""
     try:
-        out = request_with_retries(f"/v0/instances/{int(instance_id)}/", retries=1)
+        out = request_with_retries(
+            f"/v0/instances/{int(instance_id)}/",
+            retries=1,
+            deadline_at=deadline_at,
+        )
     except Exception as exc:
         return _genuine_http_not_found(exc)
     if not isinstance(out, dict) or "error" in out or "detail" in out:
@@ -379,21 +445,28 @@ def _exact_instance_absent(instance_id: int) -> bool:
     return "instances" in out and out["instances"] is None
 
 
-def destroy_instance(instance_id: int) -> bool:
+def destroy_instance(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+) -> bool:
     """destroy an instance and return true only when provider-confirmed absent."""
     try:
-        out = request_with_retries(f"/v0/instances/{int(instance_id)}/", method="DELETE", retries=2)
+        out = request_with_retries(
+            f"/v0/instances/{int(instance_id)}/",
+            method="DELETE",
+            retries=2,
+            deadline_at=deadline_at,
+        )
     except Exception as exc:
         if _genuine_http_not_found(exc):
             return True
         cause = getattr(exc, "__cause__", None)
         if isinstance(cause, urllib.error.HTTPError) and cause.code < 500 and cause.code != 429:
             return False
-        return _exact_instance_absent(instance_id)
+        return _exact_instance_absent(instance_id, deadline_at=deadline_at)
     if isinstance(out, dict) and out.get("success") is True:
         return True
-    if isinstance(out, dict) and (
-        out.get("success") is False or "error" in out or "detail" in out
-    ):
+    if isinstance(out, dict) and (out.get("success") is False or "error" in out or "detail" in out):
         return False
-    return _exact_instance_absent(instance_id)
+    return _exact_instance_absent(instance_id, deadline_at=deadline_at)

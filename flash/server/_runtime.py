@@ -240,12 +240,45 @@ def _confirm_run_clear(spec) -> bool:
     return clear
 
 
-def _start_resubmit(spec) -> None:
+def _recovery_block_reason(spec) -> str | None:
+    from flash.runner import _opd_progress_detected, _spec_with_remaining_wall
+
+    if spec.algorithm == "opd":
+        try:
+            if _opd_progress_detected(spec.run_id):
+                return (
+                    "opd progress was detected; automatic recovery is blocked because opd "
+                    "checkpoint resume is not supported"
+                )
+        except RuntimeError as exc:
+            return str(exc)
+    try:
+        _spec_with_remaining_wall(spec, require_provider_minimum=True)
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def _fail_blocked_recovery(spec, reason: str) -> None:
+    from flash.runner import _update
+
+    with contextlib.suppress(Exception):
+        _update(spec.run_id, "failed", remote=None, error=reason)
+    with contextlib.suppress(Exception):
+        _append_run_log(spec.run_id, reason)
+
+
+def _start_resubmit(spec) -> bool:
     from flash.runner import _run_job_background
 
+    reason = _recovery_block_reason(spec)
+    if reason is not None:
+        _fail_blocked_recovery(spec, reason)
+        return False
     with contextlib.suppress(Exception):
         _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
     threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    return True
 
 
 def _deferred_resubmit_loop(spec) -> None:
@@ -357,6 +390,7 @@ def recover_runs() -> None:
     re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
     a worker."""
     from flash.runner import (
+        _drain_cleanup_remotes,
         _gc_run_endpoints,
         _mark_warmstart_source,
         _update,
@@ -382,6 +416,8 @@ def recover_runs() -> None:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
+        with contextlib.suppress(Exception):
+            _drain_cleanup_remotes(status.run_id)
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
@@ -453,6 +489,10 @@ def recover_runs() -> None:
             prov.sweep_orphans(active_labels=active, known_labels=known)
 
     for spec, prior_state in resubmit:
+        reason = _recovery_block_reason(spec)
+        if reason is not None:
+            _fail_blocked_recovery(spec, reason)
+            continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a

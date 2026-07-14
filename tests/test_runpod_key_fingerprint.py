@@ -62,14 +62,16 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
     monkeypatch.setattr(
         api,
         "endpoint_health_for_key",
-        lambda eid, key: seen.update(health=(eid, key)) or {"ok": True},
+        lambda eid, key, *, deadline_at=None: (
+            seen.update(health=(eid, key, deadline_at)) or {"ok": True}
+        ),
     )
 
     fp_b = api.key_fingerprint("secretB")
     assert api.delete_endpoint_for_fingerprint("ep-1", fp_b) is True
     assert seen["delete"] == ("ep-1", "secretB")  # resolved to the real owning key, internally
-    api.endpoint_health_for_fingerprint("ep-1", fp_b)
-    assert seen["health"] == ("ep-1", "secretB")
+    api.endpoint_health_for_fingerprint("ep-1", fp_b, deadline_at=123.0)
+    assert seen["health"] == ("ep-1", "secretB", 123.0)
 
     with pytest.raises(api.RunpodApiError):
         api.delete_endpoint_for_fingerprint("ep-1", "rpk-no-such-account")  # no pool key matches

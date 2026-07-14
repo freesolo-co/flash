@@ -2086,6 +2086,141 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert runner.get_status("nohandle-1").state != "failed"
 
 
+def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
+    import flash.providers as providers_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    run_id = "terminal-cleanup-recovery"
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-cleanup",
+        "job_id": "job-cleanup",
+        "attempt": 1,
+    }
+    runner._save_status(
+        runner.RunStatus(run_id=run_id, state="cancelled", spec={"run_id": run_id}),
+        _cleanup_remotes=[remote],
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
+    drained = []
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set())
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+
+    app_mod.recover_runs()
+
+    assert drained == [run_id]
+
+
+@pytest.mark.parametrize("block", ["expired", "opd-heartbeat", "opd-marker"])
+def test_recover_runs_blocks_unsafe_handleless_resubmit(monkeypatch, tmp_path, block):
+    import huggingface_hub
+
+    import flash.providers as providers_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    is_opd = block.startswith("opd-")
+    spec = JobSpec(
+        run_id=f"blocked-{block}",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd" if is_opd else "sft",
+        train=TrainSpec(hf_repo="owner/run-artifacts") if block == "opd-marker" else TrainSpec(),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    created_at = 100.0 if block == "expired" else runner.time.time()
+    status = runner.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        remote=({"attempt": 0, "started_ts": created_at} if block == "opd-marker" else None),
+        last_heartbeat=(
+            {"stage": "opd_step", "step": 0}
+            if block == "opd-heartbeat"
+            else {"stage": "liveness", "step": 0}
+            if block == "opd-marker"
+            else None
+        ),
+        created_at=created_at,
+    )
+    deadline = created_at + float(spec.gpu.max_wall_seconds)
+    runner._save_status(status, _run_deadline_at=deadline, _next_attempt=1)
+    marker_reads = []
+    marker_downloads = []
+
+    class _Api:
+        def __init__(self, **_kwargs):
+            pass
+
+        def file_exists(self, **kwargs):
+            marker_reads.append(kwargs["filename"])
+            return True
+
+    if block == "opd-marker":
+        marker_path = tmp_path / "opd-training-started.json"
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "attempt": 0,
+                    "run_id": spec.run_id,
+                    "training_started": True,
+                    "ts": created_at,
+                }
+            )
+        )
+
+        def fake_download(**kwargs):
+            marker_downloads.append(kwargs["filename"])
+            return str(marker_path)
+
+        monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        assert runner._immutable_opd_progress_detected(runner._load_status_json(spec.run_id), spec)
+        status.remote = None
+        runner._save_status(status, _run_deadline_at=deadline, _next_attempt=1)
+    if block == "expired":
+        monkeypatch.setattr(runner.time, "time", lambda: deadline + 1.0)
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    submitted = []
+    monkeypatch.setattr(
+        runner, "_run_job_background", lambda recovered: submitted.append(recovered.run_id)
+    )
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+
+    app_mod.recover_runs()
+
+    recovered = runner.get_status(spec.run_id)
+    assert submitted == []
+    assert recovered.state == "failed"
+    if block == "opd-marker":
+        assert recovered.error == (
+            "immutable OPD optimizer-start evidence could not be verified; retry is blocked"
+        )
+        expected_marker = f"{spec.phase}/{spec.run_id}/opd_training_started_attempt0.json"
+        assert marker_reads == [expected_marker, expected_marker]
+        assert marker_downloads == [expected_marker, expected_marker]
+    elif is_opd:
+        assert "opd progress was detected" in recovered.error
+    else:
+        assert "deadline exhausted" in recovered.error
+
+
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
     # Codex: a handle-less run's force-reap before resubmit is best-effort — Vast's gc
     # (destroy_run_instances) returns an empty list rather than raising when a DELETE is unconfirmed

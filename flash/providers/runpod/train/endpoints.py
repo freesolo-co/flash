@@ -195,6 +195,7 @@ def _train_body(input_data: dict) -> dict:
     """
     import contextlib
     import json
+    import math
     import os
     import subprocess
     import sys
@@ -262,249 +263,291 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
-    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+    raw_deadline = input_data.get("deadline_at")
+    if isinstance(raw_deadline, bool) or not isinstance(raw_deadline, (int, float)):
+        raise RuntimeError("run wall deadline is invalid")
+    deadline_at = float(raw_deadline)
+    if not math.isfinite(deadline_at) or deadline_at <= 0:
+        raise RuntimeError("run wall deadline is invalid")
 
-    def _extra_pip_env() -> tuple[dict[str, str], str | None]:
-        env = dict(os.environ)
-        env.update(overrides)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        askpass = None
-        if env.get("GITHUB_TOKEN"):
-            fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(
-                    "#!/bin/sh\n"
-                    'case "$1" in\n'
-                    '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                    '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
-                    "esac\n"
-                )
-            os.chmod(askpass, 0o700)
-            env["GIT_ASKPASS"] = askpass
-        return env, askpass
+    def _require_deadline_allowance() -> float:
+        now = time.time()
+        if not math.isfinite(now) or now <= 0:
+            raise RuntimeError("run wall deadline clock is invalid")
+        remaining_seconds = deadline_at - now
+        if remaining_seconds <= 0:
+            raise TimeoutError("run wall deadline exceeded")
+        return remaining_seconds
 
-    extra_pip = input_data.get("extra_pip") or []
-    if extra_pip:
-        extra_env, askpass = _extra_pip_env()
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", *extra_pip],
-                check=True,
-                env=extra_env,
-            )
-        finally:
-            if askpass:
-                with contextlib.suppress(OSError):
-                    os.remove(askpass)
+    try:
+        remaining = _require_deadline_allowance()
+    except TimeoutError:
+        raise RuntimeError("run wall deadline exceeded before bootstrap") from None
 
-    def _code_prefix() -> str:
-        raw = input_data.get("code_prefix")
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("missing code_prefix")
-        prefix = raw.strip().strip("/")
-        parts = prefix.split("/")
-        digest = parts[1] if len(parts) == 3 else ""
-        if (
-            len(parts) != 3
-            or parts[0] != "code"
-            or parts[2] != "flash"
-            or len(digest) != 32
-            or any(c not in "0123456789abcdef" for c in digest)
-        ):
-            raise ValueError(f"invalid code_prefix: {prefix!r}")
-        return prefix
+    def _deadline_exit() -> None:
+        print("run wall deadline exceeded; terminating worker", flush=True)
+        os._exit(124)
 
-    def _hf_status_code(exc: BaseException) -> int | None:
-        response = getattr(exc, "response", None)
-        code = getattr(response, "status_code", None)
-        try:
-            return int(code)
-        except (TypeError, ValueError):
-            return None
+    deadline_timer = threading.Timer(remaining, _deadline_exit)
+    deadline_timer.daemon = True
+    deadline_timer.start()
 
-    def _hf_retry_after(exc: BaseException) -> float | None:
-        response = getattr(exc, "response", None)
-        headers = getattr(response, "headers", None) or {}
-        value = headers.get("retry-after") if hasattr(headers, "get") else None
-        if not value and hasattr(headers, "items"):
-            for key, candidate in headers.items():
-                if str(key).lower() == "retry-after":
-                    value = candidate
-                    break
-        if not value:
-            return None
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
+    try:
+        overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
+
+        def _extra_pip_env() -> tuple[dict[str, str], str | None]:
+            env = dict(os.environ)
+            env.update(overrides)
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            askpass = None
+            if env.get("GITHUB_TOKEN"):
+                fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#!/bin/sh\n"
+                        'case "$1" in\n'
+                        '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                        '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                        "esac\n"
+                    )
+                os.chmod(askpass, 0o700)
+                env["GIT_ASKPASS"] = askpass
+            return env, askpass
+
+        extra_pip = input_data.get("extra_pip") or []
+        if extra_pip:
+            extra_env, askpass = _extra_pip_env()
             try:
-                retry_at = parsedate_to_datetime(str(value))
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=UTC)
-                seconds = (retry_at - datetime.now(UTC)).total_seconds()
+                _require_deadline_allowance()
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", *extra_pip],
+                    check=True,
+                    env=extra_env,
+                )
+            finally:
+                if askpass:
+                    with contextlib.suppress(OSError):
+                        os.remove(askpass)
+
+        def _code_prefix() -> str:
+            raw = input_data.get("code_prefix")
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("missing code_prefix")
+            prefix = raw.strip().strip("/")
+            parts = prefix.split("/")
+            digest = parts[1] if len(parts) == 3 else ""
+            if (
+                len(parts) != 3
+                or parts[0] != "code"
+                or parts[2] != "flash"
+                or len(digest) != 32
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise ValueError(f"invalid code_prefix: {prefix!r}")
+            return prefix
+
+        def _hf_status_code(exc: BaseException) -> int | None:
+            response = getattr(exc, "response", None)
+            code = getattr(response, "status_code", None)
+            try:
+                return int(code)
             except (TypeError, ValueError):
                 return None
-        return min(60.0, max(0.0, seconds))
 
-    def _hf_call(call, label: str):
-        retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
-        transient_status_codes = {429, 500, 502, 503, 504}
-        for attempt in range(len(retry_delays) + 1):
+        def _hf_retry_after(exc: BaseException) -> float | None:
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None) or {}
+            value = headers.get("retry-after") if hasattr(headers, "get") else None
+            if not value and hasattr(headers, "items"):
+                for key, candidate in headers.items():
+                    if str(key).lower() == "retry-after":
+                        value = candidate
+                        break
+            if not value:
+                return None
             try:
-                return call()
-            except Exception as exc:
-                if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
-                    retry_delays
-                ):
-                    raise
-                retry_after = _hf_retry_after(exc)
-                delay = retry_after if retry_after is not None else retry_delays[attempt]
-                print(
-                    f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
-                    flush=True,
+                seconds = float(value)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(str(value))
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=UTC)
+                    seconds = (retry_at - datetime.now(UTC)).total_seconds()
+                except (TypeError, ValueError):
+                    return None
+            return min(60.0, max(0.0, seconds))
+
+        def _hf_call(call, label: str):
+            retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
+            transient_status_codes = {429, 500, 502, 503, 504}
+            for attempt in range(len(retry_delays) + 1):
+                _require_deadline_allowance()
+                try:
+                    return call()
+                except Exception as exc:
+                    if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                        retry_delays
+                    ):
+                        raise
+                    retry_after = _hf_retry_after(exc)
+                    delay = retry_after if retry_after is not None else retry_delays[attempt]
+                    delay = min(delay, _require_deadline_allowance())
+                    print(
+                        f"{label} transient Hugging Face error; provider detail suppressed; "
+                        f"retrying in {delay:.0f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+            raise AssertionError("unreachable")
+
+        def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
+            from huggingface_hub import HfApi, hf_hub_download
+
+            api = HfApi(token=token)
+            files = [
+                entry.path
+                for entry in _hf_call(
+                    lambda: list(
+                        api.list_repo_tree(
+                            repo_id=repo_id,
+                            repo_type="dataset",
+                            path_in_repo=prefix,
+                            recursive=True,
+                            token=token,
+                        )
+                    ),
+                    f"list flash code under {repo_id}:{prefix}",
                 )
-                time.sleep(delay)
-        raise AssertionError("unreachable")
-
-    def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
-        from huggingface_hub import HfApi, hf_hub_download
-
-        api = HfApi(token=token)
-        files = [
-            entry.path
-            for entry in _hf_call(
-                lambda: list(
-                    api.list_repo_tree(
+                if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+            ]
+            if not files:
+                raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+            for filename in files:
+                _hf_call(
+                    lambda filename=filename: hf_hub_download(
                         repo_id=repo_id,
                         repo_type="dataset",
-                        path_in_repo=prefix,
-                        recursive=True,
+                        filename=filename,
+                        local_dir="/runcode",
                         token=token,
-                    )
-                ),
-                f"list flash code under {repo_id}:{prefix}",
-            )
-            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-        ]
-        if not files:
-            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
-        for filename in files:
-            _hf_call(
-                lambda filename=filename: hf_hub_download(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    filename=filename,
-                    local_dir="/runcode",
-                    token=token,
-                ),
-                f"download flash code file {repo_id}:{filename}",
-            )
+                    ),
+                    f"download flash code file {repo_id}:{filename}",
+                )
 
-    code_prefix = _code_prefix()
-    _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
-    code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        code_prefix = _code_prefix()
+        _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
+        code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
 
-    env = dict(os.environ)
-    env.update(overrides)
-    # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
-    if not os.path.isdir("/runpod-volume"):
-        for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
-            env.pop(_k, None)
-    # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
-    spec_path = "/tmp/job_spec.json"
-    with open(spec_path, "w") as sf:
-        sf.write(input_data["job_spec_json"])
-    env["FLASH_JOB_SPEC_PATH"] = spec_path
-    env.pop("FLASH_JOB_SPEC_JSON", None)
-    env["PHASE"] = input_data["phase"]
-    env["SEED"] = str(input_data["seed"])
-    env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-
-    def _upload_console(mode: str) -> None:
-        """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-        console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-        from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-        without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-        ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-        crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
-        console = f"/tmp/console_{mode}.txt"
-        if not os.path.exists(console):
-            return
-        try:
-            from huggingface_hub import HfApi
-
-            spec = json.loads(input_data["job_spec_json"])
-            phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
-            prefix = f"{phase_ns}/{spec['run_id']}"
-            # Keep the newest bytes only; the uploaded tail's end is never truncated.
-            tail_bytes = 64_000
-            with open(console, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - tail_bytes))
-                tail = f.read().decode("utf-8", "replace")
-            with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
-                f.write(tail)
-            HfApi(token=env.get("HF_TOKEN")).upload_file(
-                path_or_fileobj=console + ".tail",
-                path_in_repo=f"{prefix}/console_{mode}.txt",
-                repo_id=input_data["hf_repo"],
-                repo_type="dataset",
-            )
-        except Exception as up_err:
-            print("console upload warn:", up_err)
-
-    def run_mode(mode: str, check: bool) -> int:
-        """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
-        console = f"/tmp/console_{mode}.txt"
-        interval = 3600.0
-        stop_upload = threading.Event()
-
-        def _upload_loop() -> None:
-            while not stop_upload.wait(interval):
-                _upload_console(mode)  # best-effort; swallows its own errors
-
-        with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "flash.engine.worker"],
-                cwd=code_dir,
-                env={**env, "RUN_MODE": mode},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            uploader = threading.Thread(target=_upload_loop, daemon=True)
-            uploader.start()
-            try:
-                for line in proc.stdout:
-                    print(line, end="")
-                    cf.write(line)
-                proc.wait()
-            finally:
-                stop_upload.set()
-                uploader.join(timeout=10)
-        _upload_console(mode)
-        if proc.returncode != 0 and check:
-            raise RuntimeError(
-                f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                f"and error_{mode}_attempt*.txt in the HF dataset repo"
-            )
-        return proc.returncode
-
-    # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
-    for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(stale)
-    # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
-    run_mode(input_data["phase"], check=False)
-    if not os.path.exists("/tmp/metrics.json"):
-        phase = input_data["phase"]
-        _upload_console(phase)
-        raise RuntimeError(
-            f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-            f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-            f"dataset repo for the full traceback"
+        env = dict(os.environ)
+        env.update(overrides)
+        # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
+        if not os.path.isdir("/runpod-volume"):
+            for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
+                env.pop(_k, None)
+        # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
+        spec_path = "/tmp/job_spec.json"
+        with open(spec_path, "w") as sf:
+            sf.write(input_data["job_spec_json"])
+        env["FLASH_JOB_SPEC_PATH"] = spec_path
+        env.pop("FLASH_JOB_SPEC_JSON", None)
+        env["PHASE"] = input_data["phase"]
+        env["SEED"] = str(input_data["seed"])
+        env["PYTHONPATH"] = code_dir + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
-    with open("/tmp/metrics.json") as f:
-        return json.load(f)
+
+        def _upload_console(mode: str) -> None:
+            """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
+            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
+            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
+            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
+            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
+            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+            console = f"/tmp/console_{mode}.txt"
+            if not os.path.exists(console):
+                return
+            try:
+                from huggingface_hub import HfApi
+
+                _require_deadline_allowance()
+                spec = json.loads(input_data["job_spec_json"])
+                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
+                prefix = f"{phase_ns}/{spec['run_id']}"
+                # Keep the newest bytes only; the uploaded tail's end is never truncated.
+                tail_bytes = 64_000
+                with open(console, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - tail_bytes))
+                    tail = f.read().decode("utf-8", "replace")
+                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                    f.write(tail)
+                _require_deadline_allowance()
+                HfApi(token=env.get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=console + ".tail",
+                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    repo_id=input_data["hf_repo"],
+                    repo_type="dataset",
+                )
+            except Exception:
+                print("console upload warn; provider detail suppressed")
+
+        def run_mode(mode: str, check: bool) -> int:
+            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            console = f"/tmp/console_{mode}.txt"
+            interval = 3600.0
+            stop_upload = threading.Event()
+
+            def _upload_loop() -> None:
+                while not stop_upload.wait(interval):
+                    _upload_console(mode)  # best-effort; swallows its own errors
+
+            with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
+                _require_deadline_allowance()
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "flash.engine.worker"],
+                    cwd=code_dir,
+                    env={**env, "RUN_MODE": mode},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader.start()
+                try:
+                    for line in proc.stdout:
+                        print(line, end="")
+                        cf.write(line)
+                    proc.wait()
+                finally:
+                    stop_upload.set()
+                    uploader.join(timeout=10)
+            _upload_console(mode)
+            if proc.returncode != 0 and check:
+                raise RuntimeError(
+                    f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
+                    f"and error_{mode}_attempt*.txt in the HF dataset repo"
+                )
+            return proc.returncode
+
+        # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
+        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stale)
+        # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
+        run_mode(input_data["phase"], check=False)
+        if not os.path.exists("/tmp/metrics.json"):
+            phase = input_data["phase"]
+            _upload_console(phase)
+            raise RuntimeError(
+                f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
+                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
+                f"dataset repo for the full traceback"
+            )
+        with open("/tmp/metrics.json") as f:
+            return json.load(f)
+    finally:
+        deadline_timer.cancel()
 
 
 def isolate_flash_state(scope: str | None = None) -> None:

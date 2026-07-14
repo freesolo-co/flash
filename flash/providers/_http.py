@@ -13,6 +13,8 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
+from flash.providers._deadline import remaining_seconds, require_deadline_at
+
 _HTTP_404_RE = re.compile(r"\bhttp 404\b")
 
 
@@ -102,24 +104,36 @@ class RestClient:
         body: dict | None,
         retries: int,
         base_delay: float,
+        deadline_at: float | None,
     ) -> Any:
         """One key's full backoff loop (the original single-key behavior)."""
+        deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
         last: Exception | None = None
         for attempt in range(retries + 1):
+            timeout = 30.0
+            if deadline is not None:
+                remaining = remaining_seconds(deadline)
+                if remaining <= 0:
+                    raise self.error_cls(f"{method} {target} deadline exceeded") from None
+                timeout = min(timeout, remaining)
             try:
-                return self.request(target, method=method, body=body, key=key)
+                return self.request(
+                    target,
+                    method=method,
+                    body=body,
+                    timeout=timeout,
+                    key=key,
+                )
             except urllib.error.HTTPError as e:
                 if e.code < 500 and e.code != 429:
                     raw = b""
                     with contextlib.suppress(Exception):
                         raw = e.read()
-                    detail = raw.decode("utf-8", "replace")[:500].strip() if raw else ""
-                    suffix = f": {detail}" if detail else ""
                     err = self.error_cls(
-                        f"{method} {target} -> HTTP {e.code}: {e.reason}{suffix}"
+                        f"{method} {target} -> HTTP {e.code}; provider detail suppressed"
                     )
-                    # the consumed body is truncated in the message; keep the full bytes so
-                    # callers (e.g. vast create rejection recovery) can parse the real response.
+                    # retain the body as structured metadata for provider-specific classification
+                    # without exposing it through the exception message.
                     err.response_body = raw
                     raise err from e
                 last = e
@@ -130,10 +144,17 @@ class RestClient:
                 last = e
             if attempt < retries:
                 delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
-                time.sleep(delay * random.uniform(0.7, 1.3))
+                delay *= random.uniform(0.7, 1.3)
+                if deadline is not None:
+                    remaining = remaining_seconds(deadline)
+                    if remaining <= 0:
+                        break
+                    delay = min(delay, remaining)
+                if delay > 0:
+                    time.sleep(delay)
         # Chain last so is_not_found and failover_predicate can inspect the HTTPError code.
         raise self.error_cls(
-            f"{method} {target} failed after {retries + 1} attempts: {last}"
+            f"{method} {target} failed after {retries + 1} attempts; provider detail suppressed"
         ) from last
 
     def request_with_retries_for_key(
@@ -144,9 +165,18 @@ class RestClient:
         body: dict | None = None,
         retries: int = 4,
         base_delay: float = 2.0,
+        deadline_at: float | None = None,
     ) -> Any:
         """Like request_with_retries but uses the supplied key, bypassing the pool."""
-        return self._request_one_key(key, target, method, body, retries, base_delay)
+        return self._request_one_key(
+            key,
+            target,
+            method,
+            body,
+            retries,
+            base_delay,
+            deadline_at,
+        )
 
     def request_with_retries(
         self,
@@ -155,13 +185,22 @@ class RestClient:
         body: dict | None = None,
         retries: int = 4,
         base_delay: float = 2.0,
+        deadline_at: float | None = None,
     ) -> Any:
         """REST call with jittered backoff; with a key pool, failover-class errors try the next key."""
         ordered = self._ordered_keys()
         last_exc: Exception | None = None
         for i, key in enumerate(ordered):
             try:
-                return self._request_one_key(key, target, method, body, retries, base_delay)
+                return self._request_one_key(
+                    key,
+                    target,
+                    method,
+                    body,
+                    retries,
+                    base_delay,
+                    deadline_at,
+                )
             except self.error_cls as e:
                 last_exc = e
                 more_keys = i < len(ordered) - 1

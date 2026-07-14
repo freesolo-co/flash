@@ -7,13 +7,13 @@ every submodule name. Submodules read state via ``_w.<name>`` (live-package prox
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
 # Unused here; ``worker.threading.Thread`` is patched by tests to run upload threads inline.
 import threading  # noqa: F401
 import time
-import traceback
 
 from flash.engine.accounting import RunMetrics
 from flash.engine.worker.adapter import (
@@ -74,6 +74,8 @@ from flash.engine.worker.hf import (
     hf_upload_file,
     hf_upload_folder,
     make_checkpoint_upload_callback,
+    opd_training_started_artifact_name,
+    persist_opd_training_started,
     prefetch_model,
     publish_deployable_checkpoint,
     upload_debug_jsonl,
@@ -127,15 +129,27 @@ from flash.engine.worker.wandb_log import (
     wandb_run_info,
     wandb_run_name,
 )
+from flash.engine.worker_entrypoint import WORKER_FAILURE_LINE
 from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import FIXED_SEED, load_job_spec_from_env
+
+
+def _parse_attempt_env() -> int:
+    raw = os.environ.get("ATTEMPT")
+    if raw is None:
+        return 0
+    if not raw or any(char < "0" or char > "9" for char in raw):
+        raise RuntimeError("managed worker ATTEMPT must be an unsigned decimal integer")
+    return int(raw)
+
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", str(FIXED_SEED)))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
-ATTEMPT = os.environ.get("ATTEMPT", "")
+ATTEMPT = _parse_attempt_env()
+OPD_OPTIMIZER_STEPS = 0
 JOB_SPEC = load_job_spec_from_env()
 PHASE = os.environ.get(
     "PHASE",
@@ -183,6 +197,20 @@ _HB_TERMINAL_ONLY = False
 
 _WANDB_FINISH_WAIT_S = 120.0
 _WANDB_FINISH_FAIL_WAIT_S = 5.0
+
+
+def _remaining_worker_wall_seconds() -> float | None:
+    raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
+    if raw_deadline is None:
+        return None
+    try:
+        deadline = float(raw_deadline)
+    except (TypeError, ValueError):
+        raise RuntimeError("worker run wall deadline is invalid") from None
+    now = time.time()
+    if deadline <= 0 or now <= 0 or not math.isfinite(deadline) or not math.isfinite(now):
+        raise RuntimeError("worker run wall deadline is invalid")
+    return max(0.0, deadline - now)
 
 
 def _load_active_env():
@@ -247,6 +275,17 @@ def _finalize(metrics: RunMetrics):
 
 def main():
     try:
+        modes = {
+            "sft": run_sft,
+            "rl": run_rl,
+            "opd": run_opd,
+        }
+        handler = modes.get(RUN_MODE)
+        if handler is None:
+            raise RuntimeError("worker run mode is invalid")
+        remaining = _remaining_worker_wall_seconds()
+        if remaining is not None and remaining <= 0:
+            raise RuntimeError("worker run wall deadline exceeded")
         if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
             raise ValueError(
                 "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
@@ -266,6 +305,9 @@ def main():
                 done = True
             except Exception:
                 done = False
+            remaining = _remaining_worker_wall_seconds()
+            if remaining is not None and remaining <= 0:
+                raise RuntimeError("worker run wall deadline exceeded")
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
                 heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
@@ -273,8 +315,10 @@ def main():
                 # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
                 # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
                 # below and would report a genuinely-succeeded run as a fatal failure.
-                last_err: Exception | None = None
                 for attempt in range(3):
+                    remaining = _remaining_worker_wall_seconds()
+                    if remaining is not None and remaining <= 0:
+                        break
                     try:
                         got = hf_hub_download(
                             repo_id=HF_REPO,
@@ -287,11 +331,19 @@ def main():
                         shutil.copy(got, "/tmp/metrics.json")
                         sys.stdout.flush()
                         os._exit(0)
-                    except Exception as e:
-                        last_err = e
-                        time.sleep(5 * (attempt + 1))
+                    except Exception:
+                        if attempt >= 2:
+                            break
+                        delay = 5 * (attempt + 1)
+                        remaining = _remaining_worker_wall_seconds()
+                        if remaining is not None:
+                            if remaining <= 0:
+                                break
+                            delay = min(delay, remaining)
+                        if delay > 0:
+                            time.sleep(delay)
                 raise RetriableInfraError(
-                    f"DONE present but metrics.json unreadable after retries (transient HF): {last_err}"
+                    "DONE present but metrics.json was unreadable before the run wall deadline"
                 )
         # BEFORE any model import / fla dispatch: on sm100 the baked tilelang GDN backend
         # computes wrong gradients — opt out so fla uses its (correct-there) Triton path.
@@ -305,14 +357,6 @@ def main():
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()
         load_mega_cache()
-        modes = {
-            "sft": run_sft,
-            "rl": run_rl,
-            "opd": run_opd,
-        }
-        handler = modes.get(RUN_MODE)
-        if handler is None:
-            raise SystemExit(f"unknown RUN_MODE {RUN_MODE}; known: {sorted(modes)}")
         handler()
         # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
         wandb_finish(exit_code=0)
@@ -320,25 +364,49 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
-        tb = traceback.format_exc()
-        traceback.print_exc()
+        safe_error = WORKER_FAILURE_LINE
+        failure_mode = (
+            RUN_MODE
+            if RUN_MODE in ("sft", "rl", "opd")
+            else PHASE
+            if PHASE in ("sft", "rl", "opd")
+            else "sft"
+        )
+        print(safe_error, file=sys.stderr, flush=True)
         try:
-            err_name = error_artifact_name(RUN_MODE, ATTEMPT)
+            err_name = error_artifact_name(failure_mode, ATTEMPT)
             err_path = f"/tmp/{err_name}"
             with open(err_path, "w") as f:
-                f.write(tb)
+                f.write(safe_error + "\n")
             hf_upload_file(err_path, err_name)
-        except Exception as up_err:
-            print("error-upload warn:", up_err)
+        except Exception:
+            print("error-upload warn; provider detail suppressed", flush=True)
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
+        progress = (
+            {"step": int(OPD_OPTIMIZER_STEPS)}
+            if RUN_MODE == "opd" and int(OPD_OPTIMIZER_STEPS) > 0
+            else {}
+        )
         try:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
+            heartbeat(
+                f"error_{failure_mode}",
+                error=safe_error,
+                mode=failure_mode,
+                **progress,
+                **hb_flags,
+                diag=gpu_diagnostics(),
+            )
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
+            heartbeat(
+                f"error_{failure_mode}",
+                error=safe_error,
+                mode=failure_mode,
+                **progress,
+                **hb_flags,
+            )
         wandb_finish(exit_code=1)
-        time.sleep(10)
         raise
 
 
@@ -347,6 +415,7 @@ __all__ = [
     "ATTEMPT",
     "HF_REPO",
     "JOB_SPEC",
+    "OPD_OPTIMIZER_STEPS",
     "PHASE",
     "RUN_ID",
     "RUN_MODE",
@@ -436,9 +505,11 @@ __all__ = [
     "make_lora",
     "make_reward_heartbeat_callback",
     "make_sft_heartbeat_callback",
+    "opd_training_started_artifact_name",
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
+    "persist_opd_training_started",
     "prefetch_model",
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
@@ -466,4 +537,7 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        raise SystemExit(1) from None

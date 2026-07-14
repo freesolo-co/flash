@@ -118,7 +118,9 @@ def fake_transformers(monkeypatch):
     return mod
 
 
-def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_streams_full_state_checkpoint_latest_only(
+    tmp_path, monkeypatch, fake_transformers
+):
     """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
 
     This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
@@ -156,7 +158,9 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     assert "ignore_patterns" not in up
 
 
-def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_also_publishes_deployable_snapshot(
+    tmp_path, monkeypatch, fake_transformers
+):
     """Each save additionally mirrors an adapter-only, NON-pruned per-step deployable snapshot.
 
     The two paths are distinct: the resume stream (above) is full-state + latest-only; the
@@ -172,7 +176,9 @@ def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatc
         SimpleNamespace(),
     )
 
-    deployable = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")]
+    deployable = [
+        u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")
+    ]
     assert len(deployable) == 1
     up = deployable[0]
     # Adapter-only (trainer state stripped) and accumulating (never pruned).
@@ -193,7 +199,9 @@ def test_upload_callback_noop_without_repo(tmp_path, monkeypatch, fake_transform
     assert rec.uploads == []
 
 
-def test_upload_callback_skips_when_checkpoint_dir_missing(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_skips_when_checkpoint_dir_missing(
+    tmp_path, monkeypatch, fake_transformers
+):
     """A save event whose checkpoint folder isn't on disk yet must not push a phantom commit."""
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
@@ -252,7 +260,9 @@ def test_hf_resume_checkpoint_returns_latest_step(monkeypatch, resume_run_id):
     path = worker.hf_resume_checkpoint()
 
     assert path is not None
-    assert path.endswith("checkpoint-80"), "must resume from the highest streamed step, not the first"
+    assert path.endswith("checkpoint-80"), (
+        "must resume from the highest streamed step, not the first"
+    )
     assert os.path.isdir(path)
 
 
@@ -282,6 +292,20 @@ def test_hf_resume_checkpoint_swallows_download_error(monkeypatch, resume_run_id
 
     # A transient HF outage must degrade to "start fresh", never abort the paid run.
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
+    assert worker.hf_resume_checkpoint() is None
+
+
+def test_hf_resume_checkpoint_starts_no_download_at_deadline(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **kwargs: pytest.fail("snapshot download must not start at the deadline"),
+    )
+
     assert worker.hf_resume_checkpoint() is None
 
 
@@ -335,7 +359,11 @@ def orch(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     # The retry loop tears the prior attempt's endpoint down before relaunching; keep it off-network.
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda *a, **k: True)
     return runner
 
@@ -391,7 +419,9 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
-        on_handle({"provider": "vast", "instance_id": f"i{attempt}"})  # vast handle drives the teardown
+        on_handle(
+            {"provider": "vast", "instance_id": f"i{attempt}"}
+        )  # vast handle drives the teardown
         return PollResult(False, failure="stalled", detail="infra")  # attempt 0 fails infra-shaped
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
@@ -421,11 +451,65 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 
     assert submits == [0], "must NOT launch a second worker over a possibly-live box"
     assert gc_calls == [spec.run_id], "force-reap the run's label before failing terminally"
-    assert "teardown UNCONFIRMED" in log.getvalue()
+    assert "teardown unconfirmed" in log.getvalue()
     # handle preserved (not cleared) so the run's outer GC can still reach the box
     remote = orch.get_status(spec.run_id).remote
     assert remote is not None
     assert remote.get("instance_id") == "i0"
+
+
+@pytest.mark.parametrize("teardown_failure", ["cancel", "delete_false", "delete_exception"])
+def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
+    orch, monkeypatch, teardown_failure
+):
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import train as runpod_train
+
+    submits = []
+    teardown_events = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(attempt)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        return PollResult(False, failure="stalled", detail="infra")
+
+    def cancel_job(endpoint_id, job_id):
+        teardown_events.append(("cancel", endpoint_id, job_id))
+        if teardown_failure == "cancel":
+            raise RuntimeError("private cancellation response")
+        return {"id": job_id, "status": "CANCELLED"}
+
+    def delete_endpoint(endpoint_id):
+        teardown_events.append(("delete", endpoint_id))
+        if teardown_failure == "delete_false":
+            return False
+        if teardown_failure == "delete_exception":
+            raise RuntimeError("private deletion response")
+        return True
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+    monkeypatch.setattr(runpod_train, "terminate_endpoint", lambda *_args, **_kwargs: None)
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0]
+    assert teardown_events[:2] == [("cancel", "ep0", "j0"), ("delete", "ep0")]
+    assert "teardown unconfirmed" in log.getvalue()
+    assert "private" not in log.getvalue()
+    assert "private" not in str(caught.value)
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("endpoint_id") == "ep0"
+    assert remote.get("job_id") == "j0"
 
 
 def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, monkeypatch):
@@ -444,7 +528,11 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
     # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
     cancels: list[str] = []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda eid, jid: cancels.append(eid))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda eid, jid: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
+    )
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
@@ -467,7 +555,9 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     metrics = orch._submit_seed_supervised(spec, 0, log)
 
     assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
-    assert cancels == ["ep0"], "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+    assert cancels == ["ep0"], (
+        "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+    )
 
 
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):

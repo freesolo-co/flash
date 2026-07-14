@@ -13,6 +13,7 @@ import http.client
 import io
 import itertools
 import json
+import time
 import urllib.error
 
 import pytest
@@ -39,6 +40,27 @@ def _offer(**kw):
     return make_vast_offer(**kw)
 
 
+def _terminal_marker(
+    *,
+    ok: bool,
+    ts: float = 10_005.0,
+    attempt: int = 0,
+    run_id: str = "flash-1700000000-abcd1234",
+    retriable: bool = False,
+    error: str = "",
+) -> str:
+    return json.dumps(
+        {
+            "attempt": attempt,
+            "error": error,
+            "ok": ok,
+            "retriable": retriable,
+            "run_id": run_id,
+            "ts": ts,
+        }
+    )
+
+
 def _handle(started_ts=10_000.0, rate=0.47, attempt=0):
     from flash.providers.vast.jobs.builders import VastJobHandle
 
@@ -62,11 +84,15 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-supersecret")
     monkeypatch.setenv("HF_TOKEN", "hf-worker-token")
-    payload = builders.build_payload(_spec(), seed=0, attempt=1)
+    deadline_at = time.time() + 3600
+    payload = builders.build_payload(_spec(), seed=0, attempt=1, deadline_at=deadline_at)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
     assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234"
-    assert payload["max_wall_s"] == 3600
+    assert payload["deadline_at"] == deadline_at
+    assert payload["run_id"] == "flash-1700000000-abcd1234"
+    assert payload["run_max_wall_seconds"] == 3600.0
+    assert payload["run_created_at"] + payload["run_max_wall_seconds"] == deadline_at
     assert payload["hf_repo"] == "org/repo"
     assert payload["flash_arm"] == "vast"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
@@ -148,7 +174,9 @@ def test_onstart_spills_large_spec_to_hf(monkeypatch):
     }
     script = builders.build_onstart(payload)
     assert big not in script  # the giant spec is NOT embedded inline...
-    assert uploaded["path"] == "sft/run/seed0/job_spec.json"  # ...it was spilled to the dataset repo
+    assert (
+        uploaded["path"] == "sft/run/seed0/job_spec.json"
+    )  # ...it was spilled to the dataset repo
     assert uploaded["type"] == "dataset"
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     embedded = json.loads(base64.b64decode(b64))
@@ -249,7 +277,9 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_conf
         lambda iid: destroyed_exact.append(iid) or destroy_confirmed,
     )
     destroyed_for = []
-    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: destroyed_for.append(run_id) or [])
+    monkeypatch.setattr(
+        vast, "destroy_run_instances", lambda run_id: destroyed_for.append(run_id) or []
+    )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
 
     with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
@@ -261,6 +291,26 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_conf
     assert destroyed_exact == [777]
     expected_fallback = [] if destroy_confirmed else [_spec().run_id]
     assert destroyed_for == expected_fallback
+
+
+def test_deploy_refuses_primary_creation_below_minimum_deadline_allowance(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast.time, "time", lambda: 100.0)
+    created = []
+    monkeypatch.setattr(
+        vast_api,
+        "create_instance",
+        lambda *_args, **_kwargs: created.append(True) or 4242,
+    )
+
+    with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
+        vast.deploy_and_submit(
+            _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=159.0
+        )
+
+    assert created == []
 
 
 def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
@@ -299,7 +349,9 @@ def test_deploy_argument_failure_precedes_create_and_cleanup(monkeypatch, argume
         "create_instance",
         lambda *args, **kwargs: create_requests.append((args, kwargs)),
     )
-    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: run_reaps.append(run_id) or [])
+    monkeypatch.setattr(
+        vast, "destroy_run_instances", lambda run_id: run_reaps.append(run_id) or []
+    )
 
     with pytest.raises(RuntimeError) as exc_info:
         vast.deploy_and_submit(_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
@@ -335,10 +387,12 @@ def test_post_create_baseexception_cleans_and_never_walks_offers(
         lambda instance_id: destroyed_ids.append(instance_id) or destroy_confirmed,
     )
     reconciled_runs = []
-    monkeypatch.setattr(vast, "destroy_run_instances", lambda run_id: reconciled_runs.append(run_id) or [])
+    monkeypatch.setattr(
+        vast, "destroy_run_instances", lambda run_id: reconciled_runs.append(run_id) or []
+    )
 
     with pytest.raises(interrupt_type):
-        vast.submit_run_vast(spec, seed=0)
+        vast.submit_run_vast(spec, seed=0, deadline_at=20_000.0)
 
     assert created == [1]
     assert destroyed_ids == [4242]
@@ -388,7 +442,7 @@ def test_post_create_preserves_original_baseexception_when_cleanup_raises(
     monkeypatch.setattr(vast, "destroy_run_instances", destroy_label)
 
     with pytest.raises(interrupt_type) as exc_info:
-        vast.submit_run_vast(spec, seed=0)
+        vast.submit_run_vast(spec, seed=0, deadline_at=20_000.0)
 
     assert exc_info.value is original
     assert created == [1]
@@ -415,6 +469,32 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     assert h.offer_id == 99
 
 
+def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    now = {"value": 100.0}
+    monkeypatch.setattr(vast.time, "time", lambda: now["value"])
+    created = []
+
+    def fake_create(offer_id, **_kwargs):
+        created.append(offer_id)
+        now["value"] = 141.0
+        raise vast_api.VastCreateRejected("offer taken")
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    monkeypatch.setattr(
+        vast, "usable_offers", lambda *a, **k: [_offer(offer_id=99, machine_id=99, gpu="RTX 4090")]
+    )
+
+    with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
+        vast.deploy_and_submit(
+            _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0, deadline_at=200.0
+        )
+
+    assert created == [1]
+
+
 def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
     # Codex Mr72L: a 5xx/timeout on the NON-IDEMPOTENT create may have made a billed contract. The
     # walk must reconcile by our unique label and ADOPT it, not rent the next offer (double-billing).
@@ -437,7 +517,9 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
     # the box's real launch epoch in start_date
     label = "flash-1700000000-abcd1234-s0-a2"
     monkeypatch.setattr(
-        vast_api, "list_instances", lambda: [{"id": 555, "label": label, "start_date": 1699999000.0}]
+        vast_api,
+        "list_instances",
+        lambda: [{"id": 555, "label": label, "start_date": 1699999000.0}],
     )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     h = vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
@@ -464,7 +546,7 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
 
     def fake_create(offer_id, **kw):
         rented.append(offer_id)
-        e = vast_api.VastApiError("create failed: 503")
+        e = vast_api.VastApiError("create failed: provider body secret")
         e.__cause__ = urllib.error.HTTPError("u", 503, "boom", None, io.BytesIO(b""))
         raise e
 
@@ -474,10 +556,46 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
-    with pytest.raises(UnreconciledCreateError, match="aborting the offer walk"):
-        vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2)
+    log = io.StringIO()
+    with pytest.raises(UnreconciledCreateError, match="aborting the offer walk") as exc_info:
+        vast.deploy_and_submit(_spec(), seed=0, offers=offers, attempt=2, log=log)
     assert rented == [1]  # aborted after the FIRST offer — never rented offer 2
     assert destroyed_for  # destroy_run_instances was called to reap any phantom contract
+    assert "provider body secret" not in str(exc_info.value)
+    assert "provider body secret" not in log.getvalue()
+
+
+def test_vast_failure_detail_never_reads_or_exposes_raw_provider_content(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setattr(
+        vast,
+        "_make_hf_file_reader",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("raw failure artifacts must not be read for outward detail")
+        ),
+    )
+    monkeypatch.setattr(
+        vast_api,
+        "instance_logs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("raw provider logs must not be read for outward detail")
+        ),
+    )
+
+    detail = vast._failure_detail(
+        "org/repo",
+        "sft/run",
+        "sft",
+        {"error": "private prompt and provider response"},
+        instance_id=1,
+        attempt=1,
+    )
+
+    assert detail == "vast worker reported failure; detail suppressed"
+    assert "private prompt" not in detail
+    assert "provider response" not in detail
 
 
 def test_deploy_aborts_when_adopted_row_has_unparseable_id(monkeypatch):
@@ -627,7 +745,7 @@ def _wire_poll(
         return last["inst"]
 
     monkeypatch.setattr(vast_api, "get_instance", fake_get)
-    monkeypatch.setattr(vast_api, "instance_logs", lambda iid: logs)
+    monkeypatch.setattr(vast_api, "instance_logs", lambda iid, **_kwargs: logs)
     monkeypatch.setattr(vast.time, "sleep", lambda s: None)
     clock = itertools.count(start=10_000, step=step)
     monkeypatch.setattr(vast.time, "time", lambda: float(next(clock)))
@@ -691,7 +809,7 @@ def test_poll_ok_marker_without_done_records_instance_wall_to_marker_ts(monkeypa
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        marker=json.dumps({"ok": True, "attempt": 0, "ts": 10_005.0}),
+        marker=_terminal_marker(ok=True),
         metrics=json.dumps({"wall_seconds": 5, "cost_usd": 0.0}),
         # no DONE -> finish_from_ok_marker falls back to the marker ts for the instance-wall note
     )
@@ -710,7 +828,7 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
 
     def done_seq():
         seq["n"] += 1
-        return "10500.0" if seq["n"] >= 5 else None
+        return "10000.0" if seq["n"] >= 5 else None
 
     vast = _wire_poll(
         monkeypatch,
@@ -747,7 +865,7 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
         raise exc
 
     monkeypatch.setattr(vast_api, "get_instance", boom)
-    monkeypatch.setattr(vast, "_make_hf_file_reader", lambda *a, **k: (lambda force=False: None))
+    monkeypatch.setattr(vast, "_make_hf_file_reader", lambda *a, **k: lambda force=False: None)
     monkeypatch.setattr(vast.time, "sleep", lambda s: None)
     monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
     clock = itertools.count(start=10_000, step=10.0)
@@ -783,10 +901,12 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
         _handle(started_ts=10_000.0),
         _spec(),
         seed=0,
-        interval_s=0,
+        interval_s=1,
         heartbeat_reader=lambda force=False: fresh_hb,
     )
-    assert res.ok  # survived past LOAD_TIMEOUT_S because the fresh heartbeat disarmed the load timeout
+    assert (
+        res.ok
+    )  # survived past LOAD_TIMEOUT_S because the fresh heartbeat disarmed the load timeout
 
 
 def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
@@ -816,10 +936,12 @@ def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
         _handle(started_ts=10_000.0),
         _spec(),
         seed=0,
-        interval_s=0,
+        interval_s=1,
         heartbeat_reader=hb,
     )
-    assert res.ok  # disarmed on the crossing tick; the pre-read ordering would return 'stalled' here
+    assert (
+        res.ok
+    )  # disarmed on the crossing tick; the pre-read ordering would return 'stalled' here
 
 
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
@@ -835,7 +957,9 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
 
     def late_done():
         done_seq["n"] += 1
-        return None if done_seq["n"] <= 1 else "10500.0"  # missed on the first read, surfaces on retry
+        return (
+            None if done_seq["n"] <= 1 else "10000.0"
+        )  # missed on the first read, surfaces on retry
 
     vast = _wire_poll(
         monkeypatch,
@@ -852,30 +976,87 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     res = vast.poll_vast_job(_handle(started_ts=10_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok  # finished from the bounded terminal read, not a poll_error abandonment
     assert res.metrics["train_tokens"] == 4096
-    assert done_seq["n"] >= 2  # the bounded read retried past the first miss (a single read would fail)
+    assert (
+        done_seq["n"] >= 2
+    )  # the bounded read retried past the first miss (a single read would fail)
 
 
-def test_poll_deadline_waits_for_late_terminal_artifacts(monkeypatch):
-    """Codex: at the launch-relative deadline the worker may have just finished / self-destructed at the
-    wall cap with DONE not yet visible on HF (read-after-write lag). The deadline path does a BOUNDED
-    terminal-artifact wait, so a DONE that surfaces a moment later finishes the run instead of a false
-    'stalled' that re-rents a GPU for the same seed."""
-    done_seq = {"n": 0}
+def test_poll_deadline_starts_no_terminal_read_or_sleep(monkeypatch):
+    reads = {"done": 0}
+    sleeps = []
 
-    def late_done():
-        done_seq["n"] += 1
-        return None if done_seq["n"] <= 2 else "10500.0"  # invisible on the first reads, then surfaces
+    def missing_done():
+        reads["done"] += 1
 
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done=late_done,
-        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
+        done=missing_done,
     )
-    # deadline (1s) fires on the first tick (elapsed 1000s); the bounded wait then catches the late DONE.
-    res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0, deadline_s=1.0)
-    assert res.ok  # finished from the just-surfaced DONE, not a false 'stalled'
-    assert res.metrics["train_tokens"] == 4096
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert reads["done"] == 0
+    assert sleeps == []
+
+
+def test_poll_interval_sleep_is_capped_to_deadline(monkeypatch):
+    clock = {"now": 9_990.0}
+    sleeps = []
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: clock["now"])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(vast.time, "sleep", sleep)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_900.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert sleeps == [10.0]
+
+
+def test_poll_error_backoff_stops_at_absolute_deadline(monkeypatch):
+    from flash.providers import _poll
+
+    clock = {"now": 100.0}
+    sleeps = []
+    messages = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(_poll.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(_poll.time, "sleep", sleep)
+    tracker = _poll.PollErrorTracker(messages.append, interval_s=10.0)
+
+    assert tracker.record(RuntimeError("provider body secret"), deadline_at=105.0) is False
+    assert tracker.record(RuntimeError("provider body secret"), deadline_at=105.0) is True
+    assert sleeps == [5.0]
+    assert all("provider body secret" not in message for message in messages)
 
 
 def test_poll_stale_done_is_ignored(monkeypatch):
@@ -895,28 +1076,88 @@ def test_poll_marker_failure_is_job_failed(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "RuntimeError: boom"}),
+        marker=_terminal_marker(ok=False, error="RuntimeError: boom"),
     )
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
     assert not res.ok
     assert res.failure == "job_failed"  # real worker error fails fast
-    assert "boom" in res.detail
+    assert res.detail == "vast worker reported failure; detail suppressed"
+    assert "boom" not in res.detail
 
 
 def test_poll_retriable_marker_is_job_preempted(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        marker=json.dumps({"ok": False, "attempt": 0, "error": "transient", "retriable": True}),
+        marker=_terminal_marker(ok=False, error="transient", retriable=True),
     )
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
     assert not res.ok
     assert res.failure == "job_preempted"
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "{malformed",
+        json.dumps([]),
+        _terminal_marker(ok=True, attempt=True),
+        _terminal_marker(ok=True, attempt=1),
+        _terminal_marker(ok=True, run_id="other-run"),
+        _terminal_marker(ok=True, ts=float("nan")),
+        _terminal_marker(ok=True, ts=float("inf")),
+        _terminal_marker(ok=True, ts=9_000.0),
+        _terminal_marker(ok=True, ts=20_000.0),
+        json.dumps(
+            {
+                "attempt": 0,
+                "error": "",
+                "ok": 1,
+                "retriable": False,
+                "run_id": "flash-1700000000-abcd1234",
+                "ts": 10_005.0,
+            }
+        ),
+    ],
+)
+def test_poll_terminal_marker_fails_closed_on_invalid_content(monkeypatch, marker):
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        marker=marker,
+    )
+
+    res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert res.detail == "terminal marker is invalid or unverifiable"
+    assert marker not in res.detail
+
+
+@pytest.mark.parametrize("started_ts", [True, float("nan"), float("inf"), -1.0])
+def test_poll_terminal_marker_rejects_invalid_launch_clock(monkeypatch, started_ts):
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        marker=_terminal_marker(ok=True),
+        metrics=json.dumps({"wall_seconds": 5.0}),
+    )
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=started_ts),
+        _spec(),
+        seed=0,
+        interval_s=0,
+    )
+
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert res.detail == "terminal marker is invalid or unverifiable"
+
+
 def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
-    """An instance that vanished without writing DONE/marker is a host loss -> retryable, with the
-    container log tail (Vast's console API) as the only window."""
+    """A vanished instance is retryable without exposing its container log tail."""
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}, {"actual_status": "exited"}],
@@ -925,7 +1166,8 @@ def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
     assert not res.ok
     assert res.failure == "job_preempted"
-    assert "gpu never became ready" in res.detail
+    assert res.detail == "vast worker terminated without a DONE sentinel; detail suppressed"
+    assert "gpu never became ready" not in res.detail
 
 
 def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
@@ -941,7 +1183,8 @@ def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "job_failed"
-    assert "environment archive" in res.detail
+    assert res.detail == "vast worker terminated without a DONE sentinel; detail suppressed"
+    assert "environment archive" not in res.detail
 
 
 def test_poll_dead_host_stale_prior_attempt_error_is_preempted(monkeypatch):
@@ -991,7 +1234,8 @@ def test_poll_dead_host_current_attempt_error_is_job_failed(monkeypatch):
     )
     assert not res.ok
     assert res.failure == "job_failed"
-    assert "bad config" in res.detail
+    assert res.detail == "vast worker terminated without a DONE sentinel; detail suppressed"
+    assert "bad config" not in res.detail
 
 
 def test_poll_dead_host_unknown_launch_same_attempt_error_is_job_failed(monkeypatch):
@@ -1016,7 +1260,8 @@ def test_poll_dead_host_unknown_launch_same_attempt_error_is_job_failed(monkeypa
     )
     assert not res.ok
     assert res.failure == "job_failed"
-    assert "deterministic crash" in res.detail
+    assert res.detail == "vast worker terminated without a DONE sentinel; detail suppressed"
+    assert "deterministic crash" not in res.detail
 
 
 def test_poll_running_then_unknown_is_dead_host_preempted(monkeypatch):
@@ -1078,7 +1323,7 @@ def test_poll_done_waits_for_eventually_consistent_metrics(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",
+        done="10000.0",
         metrics=metrics_seq,
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
@@ -1095,12 +1340,14 @@ def test_poll_done_without_metrics_is_infra_retryable(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",
+        done="10000.0",
         metrics=None,  # never visible
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert not res.ok
-    assert res.failure == "poll_error"  # infra-retryable, not a fast-fail job_failed on a DONE success
+    assert (
+        res.failure == "poll_error"
+    )  # infra-retryable, not a fast-fail job_failed on a DONE success
     assert "DONE without metrics.json" in res.detail
 
 
@@ -1112,7 +1359,7 @@ def test_poll_done_with_corrupt_metrics_is_controlled_failure(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",
+        done="10000.0",
         metrics="{ truncated json",  # present but unparseable
     )
     res = vast.poll_vast_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
@@ -1160,7 +1407,12 @@ def test_poll_training_heartbeat_tightens_to_stall_window(monkeypatch):
     """Once a TRAINING heartbeat (a non-setup stage) arrives, the poll tightens to the smaller
     stall_after_s — a hung training loop is caught quickly (not given the full setup grace)."""
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
-    training_hb = {"stage": "rl_step", "step": 3, "ts": 10_000.0, "attempt": 0}  # training stage, then frozen
+    training_hb = {
+        "stage": "rl_step",
+        "step": 3,
+        "ts": 10_000.0,
+        "attempt": 0,
+    }  # training stage, then frozen
     res = vast.poll_vast_job(
         _handle(),
         _spec(),
@@ -1234,7 +1486,12 @@ def test_poll_fresh_boot_heartbeat_satisfies_liveness(monkeypatch):
         seed=0,
         interval_s=0,
         first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0, "attempt": 0},
+        heartbeat_reader=lambda force=False: {
+            "stage": "boot",
+            "step": 0,
+            "ts": 10_000.0,
+            "attempt": 0,
+        },
     )
     assert res.failure == "job_preempted"
     assert "no worker heartbeat" not in (res.detail or "")
@@ -1275,22 +1532,30 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
-def test_poll_recovered_deadline_persists_done_written_during_outage(monkeypatch):
-    """A control-plane outage longer than the launch-anchored deadline must NOT discard a seed the
-    worker actually finished during the downtime: before returning the deadline stall, the poller reads
-    terminal artifacts once and persists a fresh DONE."""
+def test_poll_recovered_deadline_starts_no_terminal_artifact_reads(monkeypatch):
+    reads = {"done": 0, "metrics": 0}
+
+    def done():
+        reads["done"] += 1
+        return "9900.0"
+
+    def metrics():
+        reads["metrics"] += 1
+        return json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
+
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10400.0",
-        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+        done=done,
+        metrics=metrics,
         step=10.0,
     )
     res = vast.poll_vast_job(
         _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
     )
-    assert res.ok, res
-    assert res.metrics["cost_usd"] > 0
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert reads == {"done": 0, "metrics": 0}
 
 
 def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
@@ -1299,7 +1564,7 @@ def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
     vast = _wire_poll(
         monkeypatch,
         instances=[{"actual_status": "running"}],
-        done="10500.0",
+        done="10000.0",
         metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
         step=10.0,
     )
@@ -1321,7 +1586,9 @@ def _wire_submit(monkeypatch, poll_result=None, poll_raises=None):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
 
@@ -1374,7 +1641,9 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1397,11 +1666,15 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed single destroy
+    monkeypatch.setattr(
+        vast_api, "destroy_instance", lambda iid: False
+    )  # unconfirmed single destroy
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1410,7 +1683,9 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
 
     res = vast.submit_run_vast(_spec(), seed=0)
     assert res.ok  # the successful seed still returns
-    assert reaped == [_spec().run_id], "an unconfirmed teardown must escalate to a run-scoped label reap"
+    assert reaped == [_spec().run_id], (
+        "an unconfirmed teardown must escalate to a run-scoped label reap"
+    )
 
 
 def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
@@ -1424,7 +1699,9 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None, deadline_at=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1498,7 +1775,9 @@ def test_submit_teardown_cleanup_baseexception_preserves_original_and_still_reap
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
 
@@ -1531,7 +1810,9 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: _handle(),
+        lambda spec, seed, offers, attempt=0, log=None, runtime_secrets=None, code_prefix=None: (
+            _handle()
+        ),
     )
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [_offer()])
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -1599,6 +1880,33 @@ def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
     PROVIDER.destroy(JobHandle.from_dict({"provider": "vast"}))
 
 
+def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.vast import VastProvider
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    deadline_at = 12_345.0
+    captured = []
+
+    def fake_poll(handle, spec, seed, **kwargs):
+        captured.append(kwargs["deadline_at"])
+        return PollResult(True, metrics={})
+
+    monkeypatch.setattr(vast, "usable_offers", lambda *_a, **_k: [_offer(offer_id=1)])
+    monkeypatch.setattr(vast, "deploy_and_submit", lambda *_a, **_k: _handle(started_ts=1.0))
+    monkeypatch.setattr(vast, "heartbeat_reader_for", lambda _spec: None)
+    monkeypatch.setattr(vast, "poll_vast_job", fake_poll)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda _iid: True)
+    provider = VastProvider()
+    spec = _spec()
+    assert provider.submit_run(spec, seed=0, _deadline_at=deadline_at).ok
+    handle = JobHandle.from_dict(_handle(started_ts=1.0).to_dict())
+    assert provider.poll(handle, spec, seed=0, _deadline_at=deadline_at).ok
+
+    assert captured == [deadline_at, deadline_at]
+
+
 def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     """Cursor: VastProvider.poll's recovery-teardown ``finally`` must escalate an UNCONFIRMED single-
     instance destroy to a run-scoped reap (mirroring the submit_run_vast finally). Otherwise a successful
@@ -1610,7 +1918,9 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed single destroy
+    monkeypatch.setattr(
+        vast_api, "destroy_instance", lambda iid: False
+    )  # unconfirmed single destroy
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
     monkeypatch.setattr(_hf_artifacts, "make_hf_heartbeat_reader", lambda *a, **k: None)
     reaped = []
@@ -1619,7 +1929,9 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     handle = JobHandle.from_dict(_handle().to_dict())
     res = PROVIDER.poll(handle, _spec(), seed=0)
     assert res.ok  # the recovered seed still returns its success
-    assert reaped == [_spec().run_id], "unconfirmed recovery teardown must escalate to a run-scoped reap"
+    assert reaped == [_spec().run_id], (
+        "unconfirmed recovery teardown must escalate to a run-scoped reap"
+    )
 
 
 def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
@@ -1743,7 +2055,9 @@ def test_run_instances_remaining_raises_on_label_match_with_unparseable_id(monke
 
     # a matching label, but the id is non-numeric -> can't enumerate/destroy -> not clear
     monkeypatch.setattr(
-        vast_api, "list_instances", lambda strict=False: [{"id": "not-an-int", "label": "flash-run1-s0-a0"}]
+        vast_api,
+        "list_instances",
+        lambda strict=False: [{"id": "not-an-int", "label": "flash-run1-s0-a0"}],
     )
     with pytest.raises(vast_api.VastApiError, match="unparseable id"):
         vast.run_instances_remaining("run1")

@@ -11,6 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from flash.providers._deadline import deadline_kwargs
 from flash.spec import JobSpec
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
@@ -27,6 +28,7 @@ class _RetryBudget:
     cache_fallbacks: int
     infra_used: int = 0
     oom_used: int = 0
+    cache_used: int = 0
 
     @property
     def max_attempts(self) -> int:
@@ -39,13 +41,14 @@ class _RetryBudget:
         if failure not in RETRY_FAILURES:
             return False
         if cache_drop:
-            return True
+            return self.cache_used < self.cache_fallbacks
         if failure == "oom":
             return self.oom_used < self.oom_retries
         return self.infra_used < self.infra_retries
 
     def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
         if cache_drop:
+            self.cache_used += 1
             return
         if failure == "oom":
             self.oom_used += 1
@@ -105,6 +108,33 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _strict_teardown_handle(handle) -> None:
+    """Synchronously confirm provider teardown before any replacement provisioning."""
+    from flash.providers import INSTANCE_PROVIDERS, get_provider
+
+    provider = get_provider(handle.provider)
+    data = handle.to_dict()
+    if handle.provider == "runpod":
+        failures = []
+        if data.get("job_id"):
+            try:
+                provider.cancel(handle)
+            except Exception as exc:
+                failures.append(exc)
+        try:
+            provider.destroy(handle)
+        except Exception as exc:
+            failures.append(exc)
+        if failures:
+            raise RuntimeError("runpod teardown could not be confirmed") from failures[0]
+        return
+    if handle.provider in INSTANCE_PROVIDERS:
+        provider.destroy(handle)
+        return
+    provider.cancel(handle)
+    provider.destroy(handle)
+
+
 def _select_candidate(candidates, failed_providers: set[str], tried_classes: set[tuple[str, str]]):
     """Pick the next (provider, class) from the cross-provider ranked candidate list.
 
@@ -137,19 +167,28 @@ def _submit_seed_supervised(
     log,
     runtime_secrets: dict[str, str] | None = None,
     code_prefix: str | None = None,
+    attempt_start: int = 0,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
 
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
+    ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
     from flash.providers.base import PollResult
     from flash.runner import (
         TERMINAL_STATES,
+        _compare_and_clear_remote,
+        _load_run_deadline_at,
+        _opd_progress_detected,
         _persist_effective_worker_spec,
+        _preserve_cleanup_remote,
+        _reserve_attempt,
         _RunCancelled,
         _spec_with_gpu,
+        _spec_with_remaining_wall,
+        _TerminalHandleRace,
         _update,
         flash_code_prefix,
         get_status,
@@ -161,29 +200,43 @@ def _submit_seed_supervised(
     current_gpu: dict = {}
     # Persisted into the run handle so attach_run recovery polls with the same stall tuning.
     current_on_last_gpu: dict = {"value": False}
-    current_attempt: dict = {"value": 0}
+    attempt_start = max(0, int(attempt_start))
+    current_attempt: dict = {"value": attempt_start}
     # Tracks rN-suffixed retry endpoint ids that _gc_run_endpoints can't reconstruct by name.
     seen_endpoints: set[str] = set()
     submission_lock = None
 
     def on_handle(handle: dict):
         nonlocal submission_lock
+        from flash.providers.base import JobHandle
+
         try:
             last_handle.clear()
             last_handle.update(handle)
             if handle.get("endpoint_id"):
                 seen_endpoints.add(handle["endpoint_id"])
-            _update(
-                spec.run_id,
-                "running",
-                remote={
-                    **handle,
-                    "seed": int(seed),
-                    "allocated_gpu": current_gpu.get("name"),
-                    "on_last_gpu": bool(current_on_last_gpu["value"]),
-                    "attempt": int(current_attempt["value"]),
-                    "code_prefix": code_prefix,
-                },
+            persisted_handle = {
+                **handle,
+                "seed": int(seed),
+                "allocated_gpu": current_gpu.get("name"),
+                "on_last_gpu": bool(current_on_last_gpu["value"]),
+                "attempt": int(current_attempt["value"]),
+                "code_prefix": code_prefix,
+            }
+            if _update(spec.run_id, "running", remote=persisted_handle):
+                return
+            cleanup_confirmed = False
+            try:
+                _strict_teardown_handle(JobHandle.from_dict(handle))
+                cleanup_confirmed = True
+            except Exception:
+                pass
+            if cleanup_confirmed:
+                last_handle.clear()
+            else:
+                _preserve_cleanup_remote(spec.run_id, persisted_handle)
+            raise _TerminalHandleRace(
+                f"run {spec.run_id} became terminal while its provider handle was being persisted"
             )
         finally:
             lock = submission_lock
@@ -221,87 +274,64 @@ def _submit_seed_supervised(
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    cache_fallback_attempts = 1 if started_with_shared_cache else 0
+    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
     tried_classes: set[tuple[str, str]] = set()
     oom_vram_floor = 0
-    for attempt in range(retry_budget.max_attempts):
-        if attempt > 0 and last_handle:
-            from flash.providers import INSTANCE_PROVIDERS
+    for local_attempt in range(retry_budget.max_attempts):
+        attempt = attempt_start + local_attempt
+        if local_attempt > 0 and last_handle:
+            from flash.providers import get_provider
+            from flash.providers.base import JobHandle
 
             teardown_confirmed = True
-            if last_handle.get("endpoint_id"):
-                from flash.providers import get_provider
-                from flash.providers.base import JobHandle
-
-                rp = get_provider("runpod")
-                rp_handle = JobHandle.from_dict(last_handle)
-                with contextlib.suppress(Exception):
-                    rp.cancel(rp_handle)  # cancel_job is best-effort; endpoint deletion confirms teardown
-                try:
-                    rp.destroy(rp_handle)  # delete_endpoint drops the billable resource
-                    print(
-                        f"retry {attempt}: deleted endpoint {last_handle['endpoint_id']} "
-                        "(escaping throttled/sick host)",
-                        file=log,
-                        flush=True,
-                    )
-                except Exception as exc:
-                    teardown_confirmed = False
-                    print(
-                        f"retry {attempt}: runpod endpoint {last_handle.get('endpoint_id')} teardown "
-                        f"UNCONFIRMED ({exc}); keeping the handle so the possibly-billing endpoint "
-                        "stays reachable for cleanup",
-                        file=log,
-                        flush=True,
-                    )
-            elif last_handle.get("provider") in INSTANCE_PROVIDERS:
-                try:
-                    from flash.providers import get_provider
-                    from flash.providers.base import JobHandle
-
-                    _prov = last_handle["provider"]
-                    get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
-                    instance_id = last_handle.get("instance_id")
-                    print(
-                        f"retry {attempt}: terminated {_prov} instance {instance_id} (escaping sick host)",
-                        file=log,
-                        flush=True,
-                    )
-                except Exception as exc:
-                    teardown_confirmed = False
-                    print(
-                        f"retry {attempt}: {last_handle.get('provider')} instance "
-                        f"{last_handle.get('instance_id')} teardown UNCONFIRMED ({exc}); keeping the "
-                        "handle so the possibly-billing box stays reachable for cleanup",
-                        file=log,
-                        flush=True,
-                    )
+            try:
+                _strict_teardown_handle(JobHandle.from_dict(last_handle))
+            except Exception:
+                teardown_confirmed = False
+            resource_kind = "endpoint" if last_handle.get("endpoint_id") else "instance"
+            resource_id = last_handle.get("endpoint_id") or last_handle.get("instance_id")
             if teardown_confirmed:
-                remote_cleared = True
-                try:
-                    status = get_status(spec.run_id)
-                    if status.state not in TERMINAL_STATES and status.remote is not None:
-                        _update(spec.run_id, status.state, remote=None)
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    remote_cleared = False
-                if remote_cleared:
-                    last_handle.clear()
+                if not _compare_and_clear_remote(spec.run_id, last_handle):
+                    raise RuntimeError(
+                        f"seed {seed}: previous attempt's persisted remote changed before clear; "
+                        "aborting replacement to avoid double-provisioning"
+                    )
+                print(
+                    f"retry {attempt}: terminated {last_handle.get('provider')} {resource_kind} "
+                    f"{resource_id} (escaping sick host)",
+                    file=log,
+                    flush=True,
+                )
+                last_handle.clear()
             else:
                 with contextlib.suppress(Exception):
-                    from flash.providers import get_provider
-
                     get_provider(last_handle["provider"]).gc(spec)
                 _gc_seen_endpoints()
-                raise RuntimeError(
-                    f"seed {seed}: previous attempt's {last_handle.get('provider')} resource teardown "
-                    "could not be confirmed; failing to avoid double-provisioning a second worker over "
-                    f"a possibly-live resource (last: {last_detail})"
+                print(
+                    f"retry {attempt}: {last_handle.get('provider')} {resource_kind} {resource_id} "
+                    "teardown unconfirmed; provider detail suppressed; keeping the handle so the "
+                    "possibly-billing resource stays reachable for cleanup",
+                    file=log,
+                    flush=True,
                 )
+                raise RuntimeError(
+                    f"seed {seed}: previous attempt's {last_handle.get('provider')} {resource_kind} "
+                    f"{resource_id} teardown could not be confirmed; failing to avoid "
+                    "double-provisioning a second worker over a possibly-live resource"
+                )
+        try:
+            attempt_spec = _spec_with_remaining_wall(spec, require_provider_minimum=True)
+        except RuntimeError:
+            _gc_seen_endpoints()
+            raise
+        attempt = _reserve_attempt(
+            spec.run_id,
+            minimum_attempt=attempt_start if local_attempt == 0 else 0,
+        )
+        current_attempt["value"] = attempt
         res = None
         alloc = None
         chosen = None
@@ -315,24 +345,27 @@ def _submit_seed_supervised(
                 raise _cancel()
         try:
             alloc = allocate(
-                spec.model,
-                spec.algorithm,
-                train=spec.train,
-                thinking=spec.thinking,
+                attempt_spec.model,
+                attempt_spec.algorithm,
+                train=attempt_spec.train,
+                thinking=attempt_spec.thinking,
                 # The run's requested disk, so the Vast capacity check searches at the SAME effective
                 # floor submit provisions with — else a high-disk run is advertised Vast capacity that
                 # only exists at 60 GB and then can't rent.
-                disk_gb=float(getattr(spec.gpu, "disk_gb", 0.0) or 0.0),
-                # The run's wall cap, so the Vast capacity check requires offers available for at least
-                # max_wall+grace — else a long run is advertised short-lived offers that expire mid-run.
-                max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
+                # the remaining run-global wall cap, so retries cannot reset the duration budget.
+                max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError
 
             if isinstance(exc, UnsupportedGpuError):
                 raise  # config-shaped: no GPU anywhere can run this job
-            res = PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
+            res = PollResult(
+                False,
+                failure="poll_error",
+                detail="allocation failed; provider detail suppressed",
+            )
         if alloc is not None:
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
@@ -349,7 +382,8 @@ def _submit_seed_supervised(
             chosen = _select_candidate(cands, failed_providers, tried_classes)
             untried = [c for c in cands if (c.provider, c.gpu) not in tried_classes]
             cache_fallback_available = (
-                started_with_shared_cache
+                retry_budget.cache_used < retry_budget.cache_fallbacks
+                and started_with_shared_cache
                 and not drop_weight_cache
                 and chosen is not None
                 and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
@@ -366,9 +400,17 @@ def _submit_seed_supervised(
                     file=log,
                     flush=True,
                 )
-            run_spec = _spec_with_gpu(spec, chosen.gpu)
+            effective_spec = _spec_with_gpu(spec, chosen.gpu)
             if drop_weight_cache:
-                run_spec = _drop_weight_cache(run_spec)
+                effective_spec = _drop_weight_cache(effective_spec)
+            try:
+                run_spec = _spec_with_remaining_wall(
+                    effective_spec,
+                    require_provider_minimum=True,
+                )
+            except RuntimeError:
+                _gc_seen_endpoints()
+                raise
             current_gpu["name"] = chosen.gpu
             current_attempt["value"] = attempt
             retry_delay = 0
@@ -382,7 +424,7 @@ def _submit_seed_supervised(
                     raise _RunCancelled(
                         f"run {spec.run_id} already has a durable provider handle; not resubmitting"
                     )
-                if not _persist_effective_worker_spec(run_spec):
+                if not _persist_effective_worker_spec(effective_spec):
                     raise _cancel()
                 if get_status(spec.run_id).state in TERMINAL_STATES:
                     raise _cancel()
@@ -394,21 +436,32 @@ def _submit_seed_supervised(
                         "attempt": attempt,
                         "on_last_gpu": on_last_gpu,
                         "code_prefix": code_prefix,
+                        "_deadline_at": _load_run_deadline_at(spec.run_id),
                     }
                     if runtime_secrets:
                         submit_kwargs["runtime_secrets"] = runtime_secrets
                     res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                except _TerminalHandleRace:
+                    raise
                 except Exception as exc:
                     from flash.providers.base import UnreconciledCreateError
 
                     if isinstance(exc, UnreconciledCreateError):
                         res = PollResult(
-                            False, failure="job_failed", detail=f"unreconciled create: {exc}"
+                            False,
+                            failure="job_failed",
+                            detail="provider create could not be reconciled; detail suppressed",
                         )
                     else:
-                        res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                        if attempt < infra_budget:
-                            retry_delay = 10 * (attempt + 1)
+                        res = PollResult(
+                            False,
+                            failure="poll_error",
+                            detail="provider submit failed; detail suppressed",
+                        )
+                        if local_attempt < infra_budget:
+                            remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                            if remaining > 0:
+                                retry_delay = min(10 * (local_attempt + 1), remaining)
             finally:
                 lock = submission_lock
                 submission_lock = None
@@ -446,15 +499,28 @@ def _submit_seed_supervised(
             run_had_cache and not drop_weight_cache and res.failure in ("no_capacity", "poll_error")
         )
         oom_mode = oom_vram_floor > 0
-        will_retry = retry_budget.can_retry(
-            res.failure,
-            cache_drop=first_cache_drop,
+        opd_progress = spec.algorithm == "opd" and _opd_progress_detected(spec.run_id)
+        will_retry = (
+            retry_budget.can_retry(
+                res.failure,
+                cache_drop=first_cache_drop,
+            )
+            and not opd_progress
         )
+        if opd_progress:
+            last_detail = (
+                "opd progress was detected; automatic retry is blocked because opd checkpoint "
+                "recovery is not supported"
+            )
         action = (
             f"retrying on a larger GPU (> {oom_vram_floor} GB)"
             if (will_retry and oom_mode)
+            else "retrying before opd training progress"
+            if will_retry and spec.algorithm == "opd"
             else "retrying (resume from last checkpoint)"
             if will_retry
+            else "not retrying because opd progress was detected and opd resume is unsupported"
+            if opd_progress
             else "not retrying"
         )
         print(
@@ -484,11 +550,22 @@ def _run_job_inner(
     upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import _run_training, _RunCancelled, _update, flash_code_prefix, get_status
+    from flash.runner import (
+        _load_run_deadline_at,
+        _run_training,
+        _RunCancelled,
+        _update,
+        flash_code_prefix,
+        get_status,
+    )
 
     try:
         code_prefix = flash_code_prefix()
-        upload_code(spec.train.hf_repo, code_prefix=code_prefix)
+        upload_code(
+            spec.train.hf_repo,
+            code_prefix=code_prefix,
+            **deadline_kwargs(upload_code, _load_run_deadline_at(spec.run_id)),
+        )
         with open(log_path, "a") as log:
             _run_training(
                 spec,
@@ -499,9 +576,9 @@ def _run_job_inner(
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
-    except Exception as exc:
+    except Exception:
         if get_status(spec.run_id).state != "cancelled":
-            _update(spec.run_id, "failed", error=str(exc))
+            _update(spec.run_id, "failed", error="run failed; detail suppressed")
         raise
 
 
@@ -512,12 +589,14 @@ def _run_training(
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     code_prefix: str | None = None,
+    attempt_start: int = 0,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
     Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
     checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
-    recovery so the total isn't under-reported."""
+    recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
+    worker identities while each invocation keeps its own bounded retry budget."""
     from flash.runner import (
         FIXED_SEED,
         TERMINAL_STATES,
@@ -548,7 +627,12 @@ def _run_training(
         flush=True,
     )
     metrics = _submit_seed_supervised(
-        spec, FIXED_SEED, log, runtime_secrets=runtime_secrets, code_prefix=code_prefix
+        spec,
+        FIXED_SEED,
+        log,
+        runtime_secrets=runtime_secrets,
+        code_prefix=code_prefix,
+        attempt_start=attempt_start,
     )
     # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
@@ -586,8 +670,12 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
         from flash.server.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(get_status(spec.run_id), log=log)
-    except Exception as exc:  # never let checkpoint bookkeeping disturb a run
-        print(f"[ckpt] register warn ({spec.run_id}): {exc}", file=log, flush=True)
+    except Exception:  # never let checkpoint bookkeeping disturb a run
+        print(
+            f"[ckpt] register warn ({spec.run_id}); detail suppressed",
+            file=log,
+            flush=True,
+        )
 
 
 def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
@@ -665,15 +753,27 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner import effective_spec_from_status, get_status
+    from flash.runner import (
+        _drain_cleanup_remotes,
+        _remote_resource_identity,
+        effective_spec_from_status,
+        get_status,
+    )
 
+    attempted_cleanup = set()
+    with contextlib.suppress(Exception):
+        attempted_cleanup = _drain_cleanup_remotes(spec.run_id)
     status = None
     with contextlib.suppress(Exception):
         status = get_status(spec.run_id)
     if status is not None:
         with contextlib.suppress(Exception):
             spec = effective_spec_from_status(status)
-    if status is not None and status.remote:
+    if (
+        status is not None
+        and status.remote
+        and _remote_resource_identity(status.remote) not in attempted_cleanup
+    ):
         try:
             from flash.providers import get_provider
             from flash.providers.base import JobHandle

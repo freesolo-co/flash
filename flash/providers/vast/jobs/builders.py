@@ -111,6 +111,7 @@ def build_payload(
     attempt: int,
     runtime_secrets: dict | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> dict:
     """The Vast bootstrap payload (shared builder, arm='vast').
 
@@ -124,6 +125,7 @@ def build_payload(
         arm="vast",
         runtime_secrets=runtime_secrets,
         code_prefix=code_prefix,
+        deadline_at=deadline_at,
     )
 
 

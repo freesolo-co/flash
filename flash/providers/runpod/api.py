@@ -44,14 +44,20 @@ def request_with_retries(
     body: dict | None = None,
     retries: int = 4,
     base_delay: float = 2.0,
+    deadline_at: float | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
-        url, method=method, body=body, retries=retries, base_delay=base_delay
+        url,
+        method=method,
+        body=body,
+        retries=retries,
+        base_delay=base_delay,
+        deadline_at=deadline_at,
     )
 
 
-def list_endpoints() -> list[dict]:
+def list_endpoints(*, deadline_at: float | None = None) -> list[dict]:
     # Queries all pool accounts and aggregates; raises on any per-key failure so callers
     # never act on a partial fleet view.
     pool = _keys.keys()
@@ -61,7 +67,12 @@ def list_endpoints() -> list[dict]:
         )
     all_endpoints: list[dict] = []
     for key in pool:
-        out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        out = _CLIENT.request_with_retries_for_key(
+            key,
+            f"{REST_BASE}/endpoints",
+            retries=2,
+            deadline_at=deadline_at,
+        )
         if not isinstance(out, list):
             raise RunpodApiError(
                 f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
@@ -70,7 +81,10 @@ def list_endpoints() -> list[dict]:
     return all_endpoints
 
 
-def list_endpoints_by_key() -> tuple[dict[str, list[dict]], list[str]]:
+def list_endpoints_by_key(
+    *,
+    deadline_at: float | None = None,
+) -> tuple[dict[str, list[dict]], list[str]]:
     """Best-effort per-account endpoint listing for the idle reaper.
 
     Returns ({key_fingerprint: [endpoints]}, [failed_fingerprints]). One flaky account
@@ -87,7 +101,12 @@ def list_endpoints_by_key() -> tuple[dict[str, list[dict]], list[str]]:
     for key in pool:
         fp = key_fingerprint(key)
         try:
-            out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+            out = _CLIENT.request_with_retries_for_key(
+                key,
+                f"{REST_BASE}/endpoints",
+                retries=2,
+                deadline_at=deadline_at,
+            )
         except RunpodApiError:
             failed.append(fp)
             continue
@@ -98,8 +117,12 @@ def list_endpoints_by_key() -> tuple[dict[str, list[dict]], list[str]]:
     return by_fingerprint, failed
 
 
-def find_endpoints_by_name(substr: str) -> list[dict]:
-    return [e for e in list_endpoints() if substr in (e.get("name") or "")]
+def find_endpoints_by_name(
+    substr: str,
+    *,
+    deadline_at: float | None = None,
+) -> list[dict]:
+    return [e for e in list_endpoints(deadline_at=deadline_at) if substr in (e.get("name") or "")]
 
 
 def delete_endpoint(endpoint_id: str) -> bool:
@@ -127,13 +150,29 @@ def _is_not_found(err: RunpodApiError) -> bool:
     return is_not_found(err)
 
 
-def endpoint_health(endpoint_id: str) -> dict:
-    return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/health")
+def endpoint_health(
+    endpoint_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict:
+    return request_with_retries(
+        f"{QUEUE_BASE}/{endpoint_id}/health",
+        deadline_at=deadline_at,
+    )
 
 
-def endpoint_health_for_key(endpoint_id: str, key: str) -> dict:
+def endpoint_health_for_key(
+    endpoint_id: str,
+    key: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict:
     """Endpoint health via a specific pool key (no failover waterfall)."""
-    return _CLIENT.request_with_retries_for_key(key, f"{QUEUE_BASE}/{endpoint_id}/health")
+    return _CLIENT.request_with_retries_for_key(
+        key,
+        f"{QUEUE_BASE}/{endpoint_id}/health",
+        deadline_at=deadline_at,
+    )
 
 
 def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
@@ -141,15 +180,33 @@ def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
     return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
 
 
-def endpoint_health_for_fingerprint(endpoint_id: str, fingerprint: str) -> dict:
+def endpoint_health_for_fingerprint(
+    endpoint_id: str,
+    fingerprint: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict:
     """endpoint_health_for_key addressed by fingerprint; raw key resolved internally."""
-    return endpoint_health_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+    return endpoint_health_for_key(
+        endpoint_id,
+        _key_for_fingerprint(fingerprint),
+        deadline_at=deadline_at,
+    )
 
 
-def submit_job(endpoint_id: str, input_payload: dict) -> str:
+def submit_job(
+    endpoint_id: str,
+    input_payload: dict,
+    *,
+    deadline_at: float,
+) -> str:
     """POST /run -> job id (async queue submission)."""
     out = request_with_retries(
-        f"{QUEUE_BASE}/{endpoint_id}/run", method="POST", body={"input": input_payload}
+        f"{QUEUE_BASE}/{endpoint_id}/run",
+        method="POST",
+        body={"input": input_payload},
+        retries=0,
+        deadline_at=deadline_at,
     )
     job_id = out.get("id")
     if not job_id:
@@ -157,9 +214,17 @@ def submit_job(endpoint_id: str, input_payload: dict) -> str:
     return job_id
 
 
-def job_status(endpoint_id: str, job_id: str) -> dict:
+def job_status(
+    endpoint_id: str,
+    job_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict:
     """GET /status/<job_id> -> {status, output?, error?, ...}."""
-    return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/status/{job_id}")
+    return request_with_retries(
+        f"{QUEUE_BASE}/{endpoint_id}/status/{job_id}",
+        deadline_at=deadline_at,
+    )
 
 
 def cancel_job(endpoint_id: str, job_id: str) -> dict:

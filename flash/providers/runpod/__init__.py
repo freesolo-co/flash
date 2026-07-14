@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.providers._deadline import deadline_kwargs
 from flash.providers.base import (
     AllocationConstraints,
     Candidate,
@@ -15,7 +16,6 @@ from flash.providers.base import (
 
 
 class RunpodProvider:
-
     name = "runpod"
     # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
     # run_instances_remaining): only RunPod offers the shared weight-cache network volume, so the
@@ -62,6 +62,7 @@ class RunpodProvider:
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         code_prefix: str | None = None,
+        _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.providers.runpod.jobs import submit_run
 
@@ -71,13 +72,21 @@ class RunpodProvider:
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
             "code_prefix": code_prefix,
+            **deadline_kwargs(submit_run, _deadline_at),
         }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
         return submit_run(spec, seed, **kwargs)
 
-    def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
-        from flash.providers._poll import _attempt_int
+    def poll(
+        self,
+        handle: JobHandle,
+        spec,
+        seed: int,
+        *,
+        log: Any = None,
+        _deadline_at: float | None = None,
+    ) -> PollResult:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
             make_hf_failure_detail_reader,
@@ -90,22 +99,38 @@ class RunpodProvider:
         prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
         rh = RunpodJobHandle.from_dict(hd)
-        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        if not rh.job_id:
+            raise ValueError("endpoint-only RunPod handles cannot be polled")
+        reader = (
+            make_hf_heartbeat_reader(
+                hf_repo,
+                prefix,
+                **deadline_kwargs(make_hf_heartbeat_reader, _deadline_at),
+            )
+            if hf_repo
+            else None
+        )
         failure_reader = (
-            make_hf_failure_detail_reader(hf_repo, prefix, spec.phase, attempt=rh.attempt)
+            make_hf_failure_detail_reader(
+                hf_repo,
+                prefix,
+                spec.phase,
+                attempt=rh.attempt,
+                **deadline_kwargs(make_hf_failure_detail_reader, _deadline_at),
+            )
             if hf_repo
             else None
         )
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
-        current_attempt = _attempt_int(hd.get("attempt"))
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
-            current_attempt=current_attempt,
+            current_attempt=rh.attempt,
+            **deadline_kwargs(poll_job, _deadline_at),
             **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 
@@ -113,8 +138,17 @@ class RunpodProvider:
         from flash.providers.runpod import api as runpod_api
 
         d = handle.to_dict()
-        if d.get("endpoint_id") and d.get("job_id"):
-            runpod_api.cancel_job(d["endpoint_id"], d["job_id"])
+        endpoint_id = d.get("endpoint_id")
+        job_id = d.get("job_id")
+        if not endpoint_id or not job_id:
+            raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
+        response = runpod_api.cancel_job(endpoint_id, job_id)
+        if (
+            not isinstance(response, dict)
+            or response.get("id") != job_id
+            or response.get("status") != "CANCELLED"
+        ):
+            raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
 
     def destroy(self, handle: JobHandle) -> None:
         from flash.providers.runpod import api as runpod_api

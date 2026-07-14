@@ -94,10 +94,20 @@ def test_create_instance_success_body_without_contract_is_ambiguous(monkeypatch)
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
-    for body in ({"success": True}, {"success": True, "new_contract": 0}, {"success": True, "new_contract": None}):
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
+    for body in (
+        {"success": True},
+        {"success": True, "new_contract": 0},
+        {"success": True, "new_contract": None},
+    ):
         _capture_urlopen(monkeypatch, [body])
-        with pytest.raises(vast_api.VastApiError, match="no instance id in response") as ei:
+        with pytest.raises(vast_api.VastApiError, match="returned no instance id") as ei:
             vast_api.create_instance(123, **kwargs)
         assert isinstance(ei.value, vast_api.VastAmbiguousCreate)
         assert vast_api.create_error_is_ambiguous(ei.value) is True
@@ -183,7 +193,9 @@ def test_instance_logs_returns_body_on_first_poll(monkeypatch):
     returned verbatim (decoded)."""
     from flash.providers.vast import api as vast_api
 
-    monkeypatch.setattr(vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"})
+    monkeypatch.setattr(
+        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+    )
     _fake_log_urlopen(monkeypatch, [b"boot ok\ntrainer started\n"])
     assert vast_api.instance_logs(42) == "boot ok\ntrainer started\n"
 
@@ -204,7 +216,9 @@ def test_instance_logs_none_on_non_404_http_error(monkeypatch):
     -> stop polling and return None."""
     from flash.providers.vast import api as vast_api
 
-    monkeypatch.setattr(vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"})
+    monkeypatch.setattr(
+        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+    )
     _fake_log_urlopen(monkeypatch, [_http_error(500)])
     assert vast_api.instance_logs(42) is None
 
@@ -214,10 +228,43 @@ def test_instance_logs_polls_past_404_and_empty_then_returns_body(monkeypatch):
     polling; a later non-empty body is returned. Exercises the 404-continue and empty-body branches."""
     from flash.providers.vast import api as vast_api
 
-    monkeypatch.setattr(vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"})
+    monkeypatch.setattr(
+        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+    )
     # poll 1: 404 (not ready) -> continue; poll 2: whitespace-only body -> continue; poll 3: real logs
     _fake_log_urlopen(monkeypatch, [_http_error(404), b"   \n", b"the real logs"])
     assert vast_api.instance_logs(42) == "the real logs"
+
+
+def test_instance_logs_caps_requests_and_sleep_at_run_deadline(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    clock = {"now": 100.0}
+    request_kwargs = {}
+    fetch_timeouts = []
+    sleeps = []
+
+    def request(*_args, **kwargs):
+        request_kwargs.update(kwargs)
+        return {"result_url": "http://logs/x"}
+
+    def urlopen(_url, timeout=None):
+        fetch_timeouts.append(timeout)
+        return _LogResp(b"")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(vast_api, "request_with_retries", request)
+    monkeypatch.setattr(vast_api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(vast_api.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vast_api.time, "sleep", sleep)
+
+    assert vast_api.instance_logs(42, deadline_at=101.0) is None
+    assert request_kwargs["deadline_at"] == 101.0
+    assert fetch_timeouts == [1.0]
+    assert sleeps == [1.0]
 
 
 def test_instance_logs_none_when_deadline_exhausted(monkeypatch):
@@ -225,7 +272,9 @@ def test_instance_logs_none_when_deadline_exhausted(monkeypatch):
     and the function returns None (no fetch attempted)."""
     from flash.providers.vast import api as vast_api
 
-    monkeypatch.setattr(vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"})
+    monkeypatch.setattr(
+        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+    )
 
     # First time() call sets deadline = now + 20; the loop-condition time() jumps well past it.
     stamps = [1000.0, 9999.0]

@@ -30,7 +30,12 @@ def test_job_handle_roundtrip():
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).attempt == 0
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).started_ts == 0.0
     assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job"}).endpoint_name == ""
-    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"}).attempt == 0
+    endpoint_only = JobHandle.from_dict({"endpoint_id": "ep", "attempt": 3})
+    assert endpoint_only.job_id is None
+    assert "job_id" not in endpoint_only.to_dict()
+    assert JobHandle.from_dict(endpoint_only.to_dict()) == endpoint_only
+    with pytest.raises(ValueError, match="attempt identity is invalid"):
+        JobHandle.from_dict({"endpoint_id": "ep", "job_id": "job", "attempt": "x"})
 
 
 def test_decode_output_success():
@@ -560,7 +565,7 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     captured.clear()
     PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
     assert captured["queue_grace_s"] == 300.0
-    assert captured["current_attempt"] is None
+    assert captured["current_attempt"] == 0
 
 
 def test_submit_run_payload_carries_code_prefix(monkeypatch):
@@ -591,6 +596,210 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     assert jobs.submit_run(spec, seed=0, code_prefix=pinned_prefix).ok
     assert submitted["endpoint_id"] == "ep"
     assert submitted["payload"]["code_prefix"] == pinned_prefix
+
+
+def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs, train
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="runpod-submit-retryable",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    original = RuntimeError("ambiguous queue post")
+    handles = []
+    deleted = []
+    monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *_args, **_kwargs: ("endpoint", "name")
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(original),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint",
+        lambda endpoint_id: deleted.append(endpoint_id) or True,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        jobs.submit_run(spec, 0, attempt=4, on_handle=handles.append)
+
+    assert caught.value is original
+    assert deleted == ["endpoint"]
+    assert handles == []
+
+
+@pytest.mark.parametrize("deletion_mode", ["false", "exception"])
+def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch, deletion_mode):
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs, train
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id=f"runpod-submit-unreconciled-{deletion_mode}",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    handles = []
+    monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *_args, **_kwargs: ("endpoint", "name")
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ambiguous queue post")),
+    )
+
+    def delete_endpoint(_endpoint_id):
+        if deletion_mode == "exception":
+            raise RuntimeError("deletion response unavailable")
+        return False
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+
+    with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
+        jobs.submit_run(spec, 0, attempt=4, on_handle=handles.append)
+
+    assert len(handles) == 1
+    assert handles[0]["provider"] == "runpod"
+    assert handles[0]["endpoint_id"] == "endpoint"
+    assert handles[0]["attempt"] == 4
+    assert "job_id" not in handles[0]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"id": "different-job", "status": "CANCELLED"},
+        {"id": "job-1", "status": "IN_PROGRESS"},
+    ],
+)
+def test_runpod_cancel_rejects_unconfirmed_acknowledgement(monkeypatch, response):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda _endpoint_id, _job_id: response)
+    handle = JobHandle.from_dict(
+        {"provider": "runpod", "endpoint_id": "endpoint-1", "job_id": "job-1"}
+    )
+
+    with pytest.raises(runpod_api.RunpodApiError, match="could not be confirmed"):
+        RunpodProvider().cancel(handle)
+
+
+def test_runpod_cancel_accepts_exact_cancelled_acknowledgement(monkeypatch):
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod import api as runpod_api
+
+    calls = []
+
+    def cancel_job(endpoint_id, job_id):
+        calls.append((endpoint_id, job_id))
+        return {"id": job_id, "status": "CANCELLED"}
+
+    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+    handle = JobHandle.from_dict(
+        {"provider": "runpod", "endpoint_id": "endpoint-1", "job_id": "job-1"}
+    )
+
+    RunpodProvider().cancel(handle)
+
+    assert calls == [("endpoint-1", "job-1")]
+
+
+def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.runpod import RunpodProvider, jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="runpod-shared-deadline",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    deadline_at = 12_345.0
+    captured = []
+
+    monkeypatch.setattr(jobs.time, "time", lambda: 100.0)
+    monkeypatch.setattr(jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name"))
+    monkeypatch.setattr(runpod_api, "submit_job", lambda *_a, **_k: "job-1")
+
+    def fake_poll(handle, **kwargs):
+        captured.append(kwargs["deadline_at"])
+        return PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll)
+    provider = RunpodProvider()
+    assert provider.submit_run(spec, seed=0, _deadline_at=deadline_at).ok
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "endpoint-name",
+            "job_id": "job-1",
+            "attempt": 0,
+        }
+    )
+    assert provider.poll(handle, spec, seed=0, _deadline_at=deadline_at).ok
+
+    assert captured == [deadline_at, deadline_at]
+
+
+def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="runpod-deadline-boundary",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090"),
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: now["value"])
+
+    def _deploy(*_args, **_kwargs):
+        now["value"] = 141.0
+        return "ep", "endpoint-name"
+
+    monkeypatch.setattr(jobs, "deploy_train_endpoint", _deploy)
+    submitted = []
+    deleted = []
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda *_args, **_kwargs: submitted.append(True) or "job-1",
+    )
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint", lambda endpoint_id: deleted.append(endpoint_id) or True
+    )
+
+    with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
+        jobs.submit_run(spec, seed=0, deadline_at=200.0)
+
+    assert submitted == []
+    assert deleted == ["ep"]
 
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
@@ -754,7 +963,7 @@ def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch)
     assert "limit 5000s" in res.detail
 
 
-def test_reattach_passes_persisted_current_attempt(monkeypatch):
+def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(monkeypatch):
     import types
 
     from flash.providers import base
@@ -763,14 +972,18 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
     captured = {}
 
     def fake_poll_job(rh, **kw):
-        captured.clear()
         captured["handle"] = rh
-        captured.update(kw)
+        captured["current_attempt"] = kw["current_attempt"]
         return base.PollResult(ok=True)
 
+    def fake_failure_reader(*_args, attempt, **_kwargs):
+        captured["failure_attempt"] = attempt
+        return lambda: None
+
     monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+    monkeypatch.setattr(jobs, "make_hf_failure_detail_reader", fake_failure_reader)
     spec = types.SimpleNamespace(
-        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo="org/repo")
     )
 
     handle = base.JobHandle(
@@ -785,19 +998,59 @@ def test_reattach_passes_persisted_current_attempt(monkeypatch):
     )
     RunpodProvider().poll(handle, spec, 0)
     assert captured["current_attempt"] == 2
+    assert captured["failure_attempt"] == 2
+    assert captured["handle"].attempt == 2
     assert captured["handle"].started_ts == 12_345.0
-
-    for raw_attempt in ("", "x", None):
-        handle = base.JobHandle(
-            provider="runpod",
-            data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": raw_attempt},
-        )
-        RunpodProvider().poll(handle, spec, 0)
-        assert captured["current_attempt"] is None
 
     handle = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
     RunpodProvider().poll(handle, spec, 0)
-    assert captured["current_attempt"] is None
+    assert captured["current_attempt"] == 0
+    assert captured["failure_attempt"] == 0
+    assert captured["handle"].attempt == 0
+
+
+@pytest.mark.parametrize("raw_attempt", ["", "x", None, True, -1, 1.5])
+def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_attempt):
+    import types
+
+    from flash.providers import base
+    from flash.providers.runpod import RunpodProvider, jobs
+
+    monkeypatch.setattr(
+        jobs,
+        "poll_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not poll")),
+    )
+    spec = types.SimpleNamespace(
+        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+    )
+    handle = base.JobHandle(
+        provider="runpod",
+        data={"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j", "attempt": raw_attempt},
+    )
+
+    with pytest.raises(ValueError, match="attempt identity is invalid"):
+        RunpodProvider().poll(handle, spec, 0)
+
+
+def test_reattach_rejects_endpoint_only_handle(monkeypatch):
+    import types
+
+    from flash.providers import base
+    from flash.providers.runpod import RunpodProvider, jobs
+
+    monkeypatch.setattr(
+        jobs,
+        "poll_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not poll")),
+    )
+    spec = types.SimpleNamespace(
+        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+    )
+    handle = base.JobHandle(provider="runpod", data={"endpoint_id": "ep", "attempt": 0})
+
+    with pytest.raises(ValueError, match="endpoint-only"):
+        RunpodProvider().poll(handle, spec, 0)
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
@@ -1350,6 +1603,17 @@ def _fresh_orchestrator(tmp, monkeypatch):
     return runner
 
 
+def _confirm_runpod_retry_teardown(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda _endpoint_id: True)
+
+
 def _spec(run_id):
     from flash.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -1375,6 +1639,7 @@ def _adapter_config(*, rank=32, alpha=64):
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
@@ -1898,6 +2163,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
 def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.lora_rank as rank_mod
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
@@ -1976,6 +2242,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
 def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.lora_rank as rank_mod
         import flash.providers.runpod.jobs as jobs
         from flash.spec import JobSpec
@@ -2051,6 +2318,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
 def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         from flash.spec import JobSpec
 
@@ -2095,7 +2363,12 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
         from flash.providers.runpod import api as runpod_api
 
         deleted: list[str] = []
-        monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+        monkeypatch.setattr(
+            runpod_api,
+            "cancel_job",
+            lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        )
+        monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
@@ -2127,6 +2400,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
     # A "job_preempted" first attempt retries on a fresh endpoint and completes.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
@@ -2237,6 +2511,38 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
         assert orch.get_status("no-retry").state == "failed"
 
 
+@pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
+def test_shared_cache_zero_retry_budget_submits_once(monkeypatch, failure):
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        submissions = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+            submissions.append((attempt, spec.gpu.network_volume, on_last_gpu))
+            return jobs.PollResult(False, failure=failure, detail="cache-constrained failure")
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        spec = JobSpec(
+            run_id=f"cache-zero-{failure}",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(epochs=1, max_examples=1),
+            gpu=GpuSpec(type="RTX 4090", max_retries=0),
+        )
+
+        with pytest.raises(RuntimeError):
+            orch.submit_job(spec, dry_run=False, background=False)
+
+        assert submissions == [(0, orch.WEIGHT_CACHE_VOLUME_NAME, True)]
+
+
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
     # down the ranked candidate list, not burn every retry on the same (capacity-starved)
@@ -2244,6 +2550,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # RTX 4090 < RTX 5090 < A100 PCIe < ... by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
@@ -2294,6 +2601,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
     """An OOM retry must not re-roll the same VRAM class; it walks to a strictly larger card."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
@@ -2398,6 +2706,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
@@ -2461,6 +2770,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
@@ -2742,7 +3052,7 @@ def test_cancel_tears_down_legacy_or_malformed_warmstart_without_child_pricing(
 
         assert status.state == "cancelled"
         assert status.cost_usd == 0.0
-        assert status.billing_state == "failed"
+        assert status.billing_state == "retry"
         assert "private preparation snapshot" in (status.billing_error or "")
         assert "cancel" in calls
         assert "destroy" in calls
@@ -2763,7 +3073,11 @@ def test_cancel_uses_rest_handle(monkeypatch):
         )
         orch._save_status(status)
         cancelled, deleted = [], []
-        monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
+        monkeypatch.setattr(
+            runpod_api,
+            "cancel_job",
+            lambda e, j: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+        )
         monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e))
         import flash.providers.runpod.train as flash_train
 
@@ -2922,6 +3236,7 @@ def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch)
 def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
 
         run_id = "attach-live-owner"
@@ -2950,7 +3265,9 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="redeploy"),
         )
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo)
+        monkeypatch.setattr(
+            "flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo
+        )
 
         real_get_status = orch.get_status
         status_failures = {"remaining": 0}
@@ -2975,7 +3292,9 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
 
         assert status.state == "running"
         assert status.remote == live_remote
-        assert gc_calls == [run_id], "only stale-handle cleanup may run before live ownership appears"
+        assert gc_calls == [run_id], (
+            "only stale-handle cleanup may run before live ownership appears"
+        )
 
 
 def test_attach_requires_handle(monkeypatch):
@@ -2993,6 +3312,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     # stale handle so a second restart during the fresh allocation re-resumes cleanly.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
@@ -3025,7 +3345,15 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         )
         seen = {}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
+        def fake_training(
+            spec,
+            log,
+            *,
+            prior_cost,
+            runtime_secrets=None,
+            code_prefix=None,
+            attempt_start,
+        ):
             seen["remote"] = orch.get_status(spec.run_id).remote
             seen["code_prefix"] = code_prefix
             seen["hf_repo"] = spec.train.hf_repo
@@ -3045,6 +3373,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
 def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
@@ -3072,9 +3401,18 @@ def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
+        def fake_training(
+            spec,
+            log,
+            *,
+            prior_cost,
+            runtime_secrets=None,
+            code_prefix=None,
+            attempt_start,
+        ):
             seen["prior_cost"] = prior_cost
             seen["code_prefix"] = code_prefix
+            seen["attempt_start"] = attempt_start
             orch._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -3085,6 +3423,7 @@ def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
         assert seen == {
             "prior_cost": 0.25,
             "code_prefix": "code/0123456789abcdef0123456789abcdef/flash",
+            "attempt_start": 1,
         }
 
 
@@ -3094,6 +3433,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
     # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
@@ -3124,10 +3464,19 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         )
         resumed = {"called": False}
 
-        def fake_training(spec, log, *, prior_cost, runtime_secrets=None, code_prefix=None):
-            # The training submit re-runs the run; a genuinely broken run fails there (matches
+        def fake_training(
+            spec,
+            log,
+            *,
+            prior_cost,
+            runtime_secrets=None,
+            code_prefix=None,
+            attempt_start,
+        ):
+            # the training submit re-runs the run; a genuinely broken run fails there (matches
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
+            resumed["attempt_start"] = attempt_start
             raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -3139,6 +3488,117 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         )
         assert st.state == "failed", "a resume that fails again must terminate the run"
         assert "bad reward fn" in (st.error or "")
+
+
+@pytest.mark.parametrize("teardown_failure", ["cancel", "delete_false", "delete_exception"])
+def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(monkeypatch, teardown_failure):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        from flash.providers.runpod import api as runpod_api
+
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep-old",
+            "endpoint_name": "old",
+            "job_id": "job-old",
+            "attempt": 0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="runpod-unconfirmed",
+                state="running",
+                spec=_spec("runpod-unconfirmed").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
+        )
+        teardown_events = []
+
+        def cancel_job(endpoint_id, job_id):
+            teardown_events.append(("cancel", endpoint_id, job_id))
+            if teardown_failure == "cancel":
+                raise runpod_api.RunpodApiError("cancel unconfirmed")
+            return {"id": job_id, "status": "CANCELLED"}
+
+        def delete_endpoint(endpoint_id):
+            teardown_events.append(("delete", endpoint_id))
+            if teardown_failure == "delete_false":
+                return False
+            if teardown_failure == "delete_exception":
+                raise runpod_api.RunpodApiError("delete unconfirmed")
+            return True
+
+        monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+        monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+        resumed = []
+        monkeypatch.setattr(orch, "_run_training", lambda *a, **k: resumed.append(True))
+
+        status = orch.attach_run("runpod-unconfirmed", log_stream=sys.stderr)
+
+        assert teardown_events[:2] == [
+            ("cancel", "ep-old", "job-old"),
+            ("delete", "ep-old"),
+        ]
+        assert resumed == []
+        assert status.state == "running"
+        assert status.remote == remote
+
+
+def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        old_remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep-old",
+            "endpoint_name": "old",
+            "job_id": "job-old",
+            "attempt": 0,
+        }
+        newer_remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep-new",
+            "endpoint_name": "new",
+            "job_id": "job-new",
+            "attempt": 1,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="attach-newer-remote",
+                state="running",
+                spec=_spec("attach-newer-remote").to_dict(),
+                remote=old_remote,
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
+        )
+        gc_calls = []
+
+        def racing_gc(_spec):
+            gc_calls.append(True)
+            if len(gc_calls) == 1:
+                assert orch._update("attach-newer-remote", "running", remote=newer_remote)
+
+        monkeypatch.setattr(orch, "_gc_run_endpoints", racing_gc)
+        resumed = []
+        monkeypatch.setattr(orch, "_run_training", lambda *a, **k: resumed.append(True))
+
+        status = orch.attach_run("attach-newer-remote", log_stream=sys.stderr)
+
+        assert resumed == []
+        assert status.state == "running"
+        assert status.remote == newer_remote
 
 
 def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
@@ -3166,7 +3626,10 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         class _RaisingVast:
-            def poll(self, handle, spec, seed, *, log=None):
+            def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
+                assert _deadline_at == pytest.approx(
+                    orch.get_status("v1").created_at + _spec("v1").gpu.max_wall_seconds
+                )
                 return PollResult(False, failure="stalled", detail="host vanished")
 
             def destroy(self, handle):  # unconfirmed teardown -> attach must not resume over it

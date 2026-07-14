@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import os
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,20 @@ class TeacherError(RuntimeError):
     def __init__(self, *args, permanent: bool = False) -> None:
         super().__init__(*args)
         self.permanent = permanent
+
+
+def _remaining_run_wall_seconds() -> float | None:
+    raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
+    if raw_deadline is None:
+        return None
+    try:
+        deadline = float(raw_deadline)
+    except (TypeError, ValueError):
+        raise TeacherError("worker run wall deadline is invalid", permanent=True) from None
+    now = time.time()
+    if not math.isfinite(deadline) or deadline <= 0 or not math.isfinite(now) or now <= 0:
+        raise TeacherError("worker run wall deadline is invalid", permanent=True)
+    return max(0.0, deadline - now)
 
 
 def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int]]:
@@ -79,7 +94,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     full_len = len(full)
     for o in offsets[:n]:
         if isinstance(o, bool) or not isinstance(o, (int, float)):
-            _bad(f"teacher echo response text_offset has a non-numeric value: {o!r}")
+            _bad("teacher echo response text_offset has a non-numeric value")
         # int(offsets[i]) below coerces each offset to a character index into `full`. A value that
         # is merely numeric still corrupts the alignment three ways that the check above misses:
         # NaN/inf makes int() RAISE outside TeacherError; a fractional float silently TRUNCATES to a wrong index; an offset
@@ -87,15 +102,13 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         # it. Require a FINITE INTEGER within range up front and reject as PERMANENT (codex[bot]).
         # isfinite() must precede int() -- int(NaN) raises -- so the order here is load-bearing.
         if not math.isfinite(o):
-            _bad(f"teacher echo response text_offset is not finite: {o!r}")
+            _bad("teacher echo response text_offset is not finite")
         if o != int(o):
-            _bad(f"teacher echo response text_offset is not an integer: {o!r}")
+            _bad("teacher echo response text_offset is not an integer")
         if o < 0 or o > full_len:
-            _bad(f"teacher echo response text_offset {o!r} is outside [0, {full_len}]")
+            _bad("teacher echo response text_offset is outside the echoed input")
         if prev_off is not None and o < prev_off:
-            _bad(
-                f"teacher echo response text_offset is not non-decreasing: {prev_off!r} -> {o!r}"
-            )
+            _bad("teacher echo response text_offset is not non-decreasing")
         prev_off = o
     # Tiling from offsets[0] only proves coverage of full[offsets[0]:], so the echo must START at 0.
     # A malformed 200 that DROPS a prompt prefix and echoes a clean-tiling SUFFIX (offsets[0] > 0)
@@ -104,8 +117,8 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     # the first offset to be 0 for a non-empty echo and reject a dropped prefix as PERMANENT (codex[bot]).
     if n and int(offsets[0]) != 0:
         _bad(
-            f"teacher echo does not start at offset 0 (first text_offset={int(offsets[0])}); it "
-            "dropped a prompt prefix, so every completion logprob is conditioned on a truncated prompt."
+            "teacher echo does not start at offset 0; it dropped a prompt prefix, so every "
+            "completion logprob is conditioned on a truncated prompt."
         )
     # token_logprobs[i] is coerced with float(...) below (None -> 0.0 for a null realized logprob,
     # e.g. the first token). A malformed 200 can still put a non-numeric value (e.g. a "NaN" string)
@@ -118,9 +131,9 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         if lp is None:
             continue
         if isinstance(lp, bool) or not isinstance(lp, (int, float)):
-            _bad(f"teacher echo response token_logprobs has a non-numeric value: {lp!r}")
+            _bad("teacher echo response token_logprobs has a non-numeric value")
         if not math.isfinite(lp):
-            _bad(f"teacher echo response token_logprobs has a non-finite value: {lp!r}")
+            _bad("teacher echo response token_logprobs has a non-finite value")
         if lp > 1e-6:
             # A log-probability cannot exceed 0. A malformed 200 with a POSITIVE value is a
             # probability > 1: summed into teacher_logsum it poisons the reverse-KL coefficient
@@ -129,7 +142,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
             # as PERMANENT. The 1e-6 tolerance absorbs float rounding of a ~0 logprob on a
             # near-deterministic token (codex[bot]).
             _bad(
-                f"teacher echo response token_logprobs has a positive value {lp!r} "
+                "teacher echo response token_logprobs has a positive value "
                 "(a log-probability cannot exceed 0)."
             )
     # The echoed tokens must TILE `full` contiguously: each token's TEXT must equal the substring it
@@ -152,8 +165,7 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
         expected = full[start:boundary]
         if str(tokens[i]) != expected:
             _bad(
-                f"teacher echo does not tile the input at token {i}: token text "
-                f"{str(tokens[i])!r} != echoed substring full[{start}:{boundary}]={expected!r} "
+                "teacher echo does not tile the input "
                 "(gap/overlap/truncation or a non-literal echo); its span would be fabricated."
             )
     return spans
@@ -188,47 +200,38 @@ class TeacherClient:
         }
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
+            remaining = _remaining_run_wall_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TeacherError("teacher call exceeded the run wall deadline") from None
+            timeout = self.timeout if remaining is None else min(self.timeout, remaining)
             req = urllib.request.Request(self.base_url + path, data=data, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                # Retry transient server/rate-limit errors; fail fast on 4xx client errors. Guard the
-                # error-body preview read: a retryable 429/5xx whose body is truncated or times out
-                # makes e.read() raise IncompleteRead/OSError BEFORE last_err is set, so repeated
-                # retryable errors could end as permanent no-signal instead of a retriable outage.
-                # Classify by e.code regardless (codex[bot]).
-                try:
-                    body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
-                except (http.client.IncompleteRead, OSError):
-                    body_txt = "<error body unavailable>"
+                # classify by status only; provider bodies may contain private request data.
                 retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
-                last_err = TeacherError(
-                    f"teacher HTTP {e.code} on {path}: {body_txt}", permanent=not retryable
-                )
-                if not retryable:  # bad key (401/403) / model id (404) / bad request (400)
-                    raise last_err from e
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_err = TeacherError(f"teacher transport error on {path}: {e}")
-            except http.client.IncompleteRead as e:
-                # The server sent an HTTP 200 header but the body was truncated mid-read() (dropped
-                # connection / short Content-Length). IncompleteRead is an http.client.HTTPException,
-                # NOT an OSError, so without this clause it escapes the retry loop. A stream of truncated
-                # 200s could then burn every OPD step and fail as a permanent no-signal run instead of
-                # retrying. Classify as TRANSIENT teacher infra, like the unparseable-body case below
-                # (codex[bot]).
-                last_err = TeacherError(f"teacher HTTP 200 body truncated mid-read on {path}: {e}")
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                # HTTP 200 with a malformed / non-JSON body (a flaky proxy or gateway returning an
-                # error page under a 200, a truncated read). The teacher contract is 200 => JSON, so
-                # classify this as TRANSIENT teacher infra: retry in the loop, and if it persists the
-                # exhausted last_err surfaces as a TeacherError -- NOT a raw JSONDecodeError, so a run
-                # hammered by malformed 200s is retried as teacher infra instead of failing as permanent
-                # no-signal.
-                last_err = TeacherError(
-                    f"teacher returned HTTP 200 with unparseable body on {path}: {e}"
-                )
-            time.sleep(min(2.0 * (2**attempt), 20.0))
+                last_err = TeacherError(f"teacher HTTP {e.code} on {path}", permanent=not retryable)
+                if not retryable:
+                    raise last_err from None
+            except (urllib.error.URLError, TimeoutError, OSError):
+                last_err = TeacherError(f"teacher transport error on {path}")
+            except http.client.IncompleteRead:
+                # a truncated successful response is transient teacher infrastructure failure.
+                last_err = TeacherError(f"teacher HTTP 200 body was truncated on {path}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # malformed successful bodies are transient and never copied into errors.
+                last_err = TeacherError(f"teacher returned invalid HTTP 200 JSON on {path}")
+            if attempt + 1 >= self.max_retries:
+                break
+            delay = min(2.0 * (2**attempt), 20.0)
+            remaining = _remaining_run_wall_seconds()
+            if remaining is not None:
+                if remaining <= 0:
+                    raise TeacherError("teacher call exceeded the run wall deadline") from None
+                delay = min(delay, remaining)
+            if delay > 0:
+                time.sleep(delay)
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------
@@ -272,7 +275,7 @@ class TeacherClient:
             idx = choice.get("index", pos)
             if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0 or idx >= len(fulls):
                 raise TeacherError(
-                    f"teacher echo response choice {pos} has invalid index {idx!r}",
+                    f"teacher echo response choice {pos} has an invalid index",
                     permanent=True,
                 )
             if idx in by_index:
@@ -301,10 +304,10 @@ class TeacherClient:
             tokens = lp["tokens"]
             token_logprobs = lp["token_logprobs"]
             offsets = lp["text_offset"]
-        except (KeyError, IndexError, TypeError) as e:
+        except (KeyError, IndexError, TypeError):
             raise TeacherError(
-                f"teacher echo response missing logprobs: {e}", permanent=True
-            ) from e
+                "teacher echo response missing or invalid logprobs", permanent=True
+            ) from None
         spans = _validate_echo(tokens, token_logprobs, offsets, full)
         out: list[TeacherToken] = []
         for i, (start, end) in enumerate(spans):

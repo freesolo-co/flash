@@ -285,7 +285,11 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     from flash.providers.runpod import api as rp_api
 
     cancelled, deleted = [], []
-    monkeypatch.setattr(rp_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
+    monkeypatch.setattr(
+        rp_api,
+        "cancel_job",
+        lambda e, j: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(rp_api, "delete_endpoint", lambda e: deleted.append(e) or True)
     handle = JobHandle("runpod", {"endpoint_id": "ep", "job_id": "j"})
     get_provider("runpod").cancel(handle)

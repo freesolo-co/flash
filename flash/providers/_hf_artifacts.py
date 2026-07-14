@@ -16,19 +16,28 @@ import json
 import os
 import time
 
+from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._poll import _attempt_int
 
 
-def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
+def make_hf_text_reader(
+    hf_repo: str,
+    path_in_repo: str,
+    min_interval_s: float = 45.0,
+    *,
+    deadline_at: float | None = None,
+):
     """Rate-limited reader for an HF artifact; returns None until it exists or on any error."""
+    deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     state = {"last": 0.0}
 
     def read(force: bool = False) -> str | None:
-        if not hf_repo:
+        if not hf_repo or (deadline is not None and remaining_seconds(deadline) <= 0):
             return None
-        if not force and time.time() - state["last"] < min_interval_s:
+        now = time.time()
+        if not force and now - state["last"] < min_interval_s:
             return None
-        state["last"] = time.time()
+        state["last"] = now
         try:
             from huggingface_hub import hf_hub_download
 
@@ -47,9 +56,20 @@ def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float =
     return read
 
 
-def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 30.0):
+def make_hf_heartbeat_reader(
+    hf_repo: str,
+    prefix: str,
+    min_interval_s: float = 30.0,
+    *,
+    deadline_at: float | None = None,
+):
     """Rate-limited JSON reader for ``{prefix}/heartbeat.json`` on HF."""
-    text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
+    text_reader = make_hf_text_reader(
+        hf_repo,
+        f"{prefix}/heartbeat.json",
+        min_interval_s,
+        **deadline_kwargs(make_hf_text_reader, deadline_at),
+    )
 
     def read(force: bool = False) -> dict | None:
         raw = text_reader(force=force)
@@ -63,10 +83,18 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     return read
 
 
-def heartbeat_reader_for(spec):
+def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
     """The HF heartbeat reader for a run's spec (None when the run has no hf_repo)."""
     hf_repo = spec.train.hf_repo
-    return make_hf_heartbeat_reader(hf_repo, f"{spec.phase}/{spec.run_id}") if hf_repo else None
+    return (
+        make_hf_heartbeat_reader(
+            hf_repo,
+            f"{spec.phase}/{spec.run_id}",
+            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
+        )
+        if hf_repo
+        else None
+    )
 
 
 def error_artifact_name(phase: str, attempt) -> str:
@@ -80,13 +108,23 @@ def make_hf_failure_detail_reader(
     phase: str,
     min_interval_s: float = 45.0,
     attempt: int = 0,
+    *,
+    deadline_at: float | None = None,
 ):
     """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
     # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
     err_name = error_artifact_name(phase, attempt)
-    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/{err_name}", min_interval_s)
+    error_reader = make_hf_text_reader(
+        hf_repo,
+        f"{prefix}/{err_name}",
+        min_interval_s,
+        **deadline_kwargs(make_hf_text_reader, deadline_at),
+    )
     console_reader = make_hf_text_reader(
-        hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s
+        hf_repo,
+        f"{prefix}/console_{phase}.txt",
+        min_interval_s,
+        **deadline_kwargs(make_hf_text_reader, deadline_at),
     )
 
     def read(force: bool = False) -> str | None:

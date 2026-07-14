@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from flash._logging import get_logger
+from flash.providers._deadline import require_create_allowance, require_deadline_at
 from flash.providers._http import RestClient, is_not_found
 
 logger = get_logger(__name__)
@@ -38,10 +39,16 @@ def request_with_retries(
     body: dict | None = None,
     retries: int = 4,
     base_delay: float = 2.0,
+    deadline_at: float | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
-        path, method=method, body=body, retries=retries, base_delay=base_delay
+        path,
+        method=method,
+        body=body,
+        retries=retries,
+        base_delay=base_delay,
+        deadline_at=deadline_at,
     )
 
 
@@ -56,47 +63,62 @@ _TYPES_TTL_S = 45.0
 _types_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
 
-def list_instance_types(force: bool = False) -> dict[str, dict]:
+def list_instance_types(
+    force: bool = False,
+    *,
+    deadline_at: float | None = None,
+) -> dict[str, dict]:
     """Map of ``instance_type_name -> {instance_type, regions_with_capacity_available}`` (cached)."""
     now = time.time()
     if not force and _types_cache["data"] is not None and now - _types_cache["ts"] < _TYPES_TTL_S:
         return _types_cache["data"]
-    out = _data(request_with_retries("/instance-types"))
+    out = _data(request_with_retries("/instance-types", deadline_at=deadline_at))
     if not isinstance(out, dict):
-        raise LambdaApiError(f"unexpected /instance-types response: {out!r}")
+        raise LambdaApiError("unexpected /instance-types response; provider detail suppressed")
     _types_cache.update(ts=now, data=out)
     return out
 
 
-def regions_with_capacity(instance_type: str, force: bool = False) -> list[str]:
+def regions_with_capacity(
+    instance_type: str,
+    force: bool = False,
+    *,
+    deadline_at: float | None = None,
+) -> list[str]:
     """Region names that currently have capacity for ``instance_type``."""
-    info = list_instance_types(force=force).get(instance_type) or {}
-    return [
-        r.get("name")
-        for r in info.get("regions_with_capacity_available", [])
-        if r.get("name")
-    ]
+    info = list_instance_types(force=force, deadline_at=deadline_at).get(instance_type) or {}
+    return [r.get("name") for r in info.get("regions_with_capacity_available", []) if r.get("name")]
 
 
-def all_regions(force: bool = False) -> list[str]:
+def all_regions(
+    force: bool = False,
+    *,
+    deadline_at: float | None = None,
+) -> list[str]:
     """Union of all regions with capacity across instance types (Lambda has no standalone region API)."""
     regions: set[str] = set()
-    for info in list_instance_types(force=force).values():
+    for info in list_instance_types(force=force, deadline_at=deadline_at).values():
         for r in (info or {}).get("regions_with_capacity_available", []):
             if r.get("name"):
                 regions.add(r["name"])
     return sorted(regions)
 
 
-def instance_type_price_usd_hr(instance_type: str) -> float | None:
+def instance_type_price_usd_hr(
+    instance_type: str,
+    *,
+    deadline_at: float | None = None,
+) -> float | None:
     """Live $/hr for a Lambda instance type (``price_cents_per_hour`` / 100), or None."""
-    info = (list_instance_types().get(instance_type) or {}).get("instance_type") or {}
+    info = (list_instance_types(deadline_at=deadline_at).get(instance_type) or {}).get(
+        "instance_type"
+    ) or {}
     cents = info.get("price_cents_per_hour")
     return float(cents) / 100.0 if cents else None
 
 
-def list_ssh_keys() -> list[dict]:
-    out = _data(request_with_retries("/ssh-keys"))
+def list_ssh_keys(*, deadline_at: float | None = None) -> list[dict]:
+    out = _data(request_with_retries("/ssh-keys", deadline_at=deadline_at))
     return out if isinstance(out, list) else []
 
 
@@ -108,8 +130,12 @@ def launch_instance(
     name: str,
     user_data: str,
     file_system_names: list[str] | None = None,
+    deadline_at: float | None = None,
 ) -> str:
     """Launch one instance -> its id. NON-IDEMPOTENT: never retried (blind retry = double-provision)."""
+    deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
+    if deadline is not None:
+        require_create_allowance(deadline)
     body = {
         "region_name": region_name,
         "instance_type_name": instance_type_name,
@@ -120,55 +146,117 @@ def launch_instance(
     }
     if file_system_names:
         body["file_system_names"] = list(file_system_names)
-    out = _data(request_with_retries("/instance-operations/launch", method="POST", body=body, retries=0))
+    out = _data(
+        request_with_retries(
+            "/instance-operations/launch",
+            method="POST",
+            body=body,
+            retries=0,
+            **({} if deadline is None else {"deadline_at": deadline}),
+        )
+    )
     ids = out.get("instance_ids") if isinstance(out, dict) else None
     if not ids:
-        raise LambdaApiError(f"launch({instance_type_name}@{region_name}) returned no instance id: {out}")
+        raise LambdaApiError(
+            f"launch({instance_type_name}@{region_name}) returned no instance id; "
+            "provider detail suppressed"
+        )
     return str(ids[0])
 
 
 # IMPORTANT: Lambda filesystem paths are ASYMMETRIC by design — LIST uses /file-systems (hyphenated),
 # CREATE/DELETE use /filesystems (no hyphen). DO NOT unify them; /file-systems 404s for write ops.
-def list_filesystems() -> list[dict]:
+def list_filesystems(*, deadline_at: float | None = None) -> list[dict]:
     """All filesystems on the account: ``[{id, name, mount_point, region:{name}, is_in_use}, ...]``."""
-    out = _data(request_with_retries("/file-systems"))
+    out = _data(request_with_retries("/file-systems", deadline_at=deadline_at))
     return out if isinstance(out, list) else []
 
 
-def create_filesystem(name: str, region_name: str) -> dict:
-    """Create filesystem ``name`` in ``region_name`` -> its object (incl. ``mount_point``)."""
+def create_filesystem(name: str, region_name: str, *, deadline_at: float) -> dict:
+    """Issue one deadline-gated filesystem create request and return its object."""
+    deadline = require_deadline_at(deadline_at)
+    require_create_allowance(deadline)
     out = _data(
         request_with_retries(
-            "/filesystems", method="POST", body={"name": name, "region": region_name}, retries=2
+            "/filesystems",
+            method="POST",
+            body={"name": name, "region": region_name},
+            retries=0,
+            deadline_at=deadline,
         )
     )
-    return out if isinstance(out, dict) else {}
+    if not isinstance(out, dict) or not out:
+        raise LambdaApiError("filesystem create returned no verifiable object")
+    return out
 
 
-def delete_filesystem(filesystem_id: str) -> bool:
+def delete_filesystem(
+    filesystem_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> bool:
     """Delete a filesystem by id (best-effort). Returns True if the request didn't raise."""
     try:
-        request_with_retries(f"/filesystems/{filesystem_id}", method="DELETE", retries=2)
+        request_with_retries(
+            f"/filesystems/{filesystem_id}",
+            method="DELETE",
+            retries=2,
+            **({} if deadline_at is None else {"deadline_at": deadline_at}),
+        )
         return True
-    except Exception as exc:
-        logger.warning("lambda delete_filesystem(%s) failed: %s", filesystem_id, exc)
+    except Exception:
+        logger.warning(
+            "lambda delete_filesystem(%s) failed; provider detail suppressed",
+            filesystem_id,
+        )
         return False
 
 
-def ensure_filesystem(name: str, region_name: str) -> str:
-    """Create-if-absent the cache filesystem ``name`` in ``region_name``; return its mount_point
-    (``/lambda/nfs/<name>``). Idempotent: reuses an existing same-name filesystem in that region."""
-    for fs in list_filesystems():
-        if fs.get("name") == name and (fs.get("region") or {}).get("name") == region_name:
-            return fs.get("mount_point") or f"/lambda/nfs/{name}"
-    created = create_filesystem(name, region_name)
+def _matching_filesystems(filesystems: list[dict], name: str, region_name: str) -> list[dict]:
+    return [
+        fs
+        for fs in filesystems
+        if fs.get("name") == name and (fs.get("region") or {}).get("name") == region_name
+    ]
+
+
+def ensure_filesystem(name: str, region_name: str, *, deadline_at: float) -> str:
+    """Reuse an exact filesystem or reconcile one ambiguous non-idempotent create."""
+    deadline = require_deadline_at(deadline_at)
+    matches = _matching_filesystems(
+        list_filesystems(deadline_at=deadline),
+        name,
+        region_name,
+    )
+    if len(matches) > 1:
+        raise LambdaApiError("filesystem identity is ambiguous")
+    if matches:
+        return matches[0].get("mount_point") or f"/lambda/nfs/{name}"
+    try:
+        created = create_filesystem(name, region_name, deadline_at=deadline)
+    except Exception:
+        matches = _matching_filesystems(
+            list_filesystems(deadline_at=deadline),
+            name,
+            region_name,
+        )
+        if len(matches) != 1:
+            raise LambdaApiError("ambiguous filesystem create could not be reconciled") from None
+        return matches[0].get("mount_point") or f"/lambda/nfs/{name}"
     return created.get("mount_point") or f"/lambda/nfs/{name}"
 
 
-def get_instance(instance_id: str) -> dict | None:
+def get_instance(
+    instance_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict | None:
     """Instance detail dict, or None once it no longer exists (terminated)."""
     try:
-        out = request_with_retries(f"/instances/{instance_id}")
+        out = request_with_retries(
+            f"/instances/{instance_id}",
+            deadline_at=deadline_at,
+        )
     except LambdaApiError as e:
         if is_not_found(e):
             return None
@@ -177,12 +265,16 @@ def get_instance(instance_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def list_instances() -> list[dict]:
-    out = _data(request_with_retries("/instances"))
+def list_instances(*, deadline_at: float | None = None) -> list[dict]:
+    out = _data(request_with_retries("/instances", deadline_at=deadline_at))
     return out if isinstance(out, list) else []
 
 
-def terminate_instances(instance_ids: list[str]) -> list[str]:
+def terminate_instances(
+    instance_ids: list[str],
+    *,
+    deadline_at: float | None = None,
+) -> list[str]:
     """Terminate instances; return ids that succeeded. Per-id isolation: Lambda's batch endpoint
     rejects the whole request if any id is invalid, so one stale id would leak billing for the rest."""
     deleted: list[str] = []
@@ -193,8 +285,9 @@ def terminate_instances(instance_ids: list[str]) -> list[str]:
                 method="POST",
                 body={"instance_ids": [iid]},
                 retries=2,
+                **({} if deadline_at is None else {"deadline_at": deadline_at}),
             )
             deleted.append(iid)
-        except Exception as exc:
-            logger.warning("lambda terminate(%s) failed: %s", iid, exc)
+        except Exception:
+            logger.warning("lambda terminate(%s) failed; provider detail suppressed", iid)
     return deleted

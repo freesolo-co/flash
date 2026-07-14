@@ -27,6 +27,11 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
+from flash.providers._deadline import (
+    deadline_kwargs,
+    require_create_allowance,
+    require_deadline_at,
+)
 from flash.providers._hf_artifacts import (
     error_artifact_name,
     heartbeat_reader_for,
@@ -36,7 +41,6 @@ from flash.providers._instance_poll import InstancePollAdapter, poll_instance_jo
 from flash.providers._poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
-    PROVISION_GRACE_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
     make_say,
@@ -73,9 +77,9 @@ RELIABILITY_FLOOR = 0.995
 MIN_INET_MBPS = 200.0
 # The shared instance-poll timing defaults imported from ``_poll`` above. The staged setup-vs-training
 # grace is the fix for the historical "Vast box dies every ~25-30 min": the old provider used one flat
-# 1500s window that fired mid cold-start and tore down healthy boxes. LOAD_TIMEOUT_S and PROVISION_GRACE_S
-# are read at call time so ``monkeypatch.setattr(jobs, …)`` takes effect; SETUP_GRACE_S / STALL_AFTER_S /
-# FIRST_LIVENESS_S are supplied as ``poll_vast_job`` defaults (override by passing the kwarg, not by
+# 1500s window that fired mid cold-start and tore down healthy boxes. load_timeout_s is read at call
+# time so ``monkeypatch.setattr(jobs, …)`` takes effect; setup_grace_s / stall_after_s /
+# first_liveness_s are supplied as ``poll_vast_job`` defaults (override by passing the kwarg, not by
 # patching the global).
 # Boards under-report VRAM vs class nominal (L4 23034/24GB, A40 46068/48GB ≈ 0.938). The server-side
 # gpu_ram filter gets this slack; the class gate (vast_gpu_for_offer) stays exact.
@@ -88,6 +92,10 @@ MIN_DISK_GB = 60.0
 # yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
 # this poller's no-status fallback, so it needs no ``became_running`` gate.
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
+
+
+class _SubmitDeadline(float):
+    """deadline already bounded by the submit path's provider call."""
 
 
 def _effective_disk_gb(spec) -> float:
@@ -105,6 +113,7 @@ def usable_offers(
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     limit: int = 256,
     max_wall_seconds: float = 0,
+    deadline_at: float | None = None,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
 
@@ -113,13 +122,11 @@ def usable_offers(
     ``limit`` is the price-sorted page size. Callers bucket rows BY GPU CLASS, so the page must span
     every fitting managed class — 256 comfortably covers the verified-datacenter market (a specific-class
     caller just filters down further). ``max_wall_seconds`` (>0) also requires offers available for at
-    least ``max(60, max_wall) + PROVISION_GRACE_S`` — the same deadline the poller enforces — so the
-    search never advertises capacity an offer can't outlast. 0 = no duration floor.
+    least ``max(60, max_wall)`` so the search never advertises capacity an offer cannot outlast. Provider
+    provisioning grace is not added to the run's terminal cutoff. 0 = no duration floor.
     """
     min_duration = (
-        max(60.0, float(max_wall_seconds)) + PROVISION_GRACE_S
-        if max_wall_seconds and max_wall_seconds > 0
-        else 0
+        max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
     )
     rows = vast_api.search_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
@@ -127,6 +134,7 @@ def usable_offers(
         min_reliability=RELIABILITY_FLOOR,
         min_duration_seconds=min_duration,
         limit=int(limit),
+        **deadline_kwargs(vast_api.search_offers, deadline_at),
     )
     out: list[VastOffer] = []
     for r in rows:
@@ -168,38 +176,69 @@ def usable_offers(
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
 
 
-def _adopt_instance_by_label(label: str) -> dict | None:
+def _adopt_instance_by_label(
+    label: str,
+    *,
+    deadline_at: float | None = None,
+) -> dict | None:
     """Best-effort instance DICT carrying this EXACT (per run/seed/attempt) label, or ``None``. Reclaims
     a contract a possibly-successful-but-unconfirmed create left behind so the walk adopts it instead of
     renting a duplicate; the full dict (not just the id) lets the caller stamp the real launch time. Any
     lookup failure -> ``None`` (caller falls back; the orphan sweep is the backstop)."""
     try:
-        for inst in vast_api.list_instances():
+        for inst in vast_api.list_instances(
+            **deadline_kwargs(vast_api.list_instances, deadline_at),
+        ):
             if str(inst.get("label") or "") == label and inst.get("id"):
                 return inst
-    except Exception as exc:  # listing is best-effort; never let it abort the launch
-        logger.warning("vast label reconcile failed (%s); proceeding without adoption", exc)
+    except Exception:  # listing is best-effort; never let it abort the launch
+        logger.warning("vast label reconcile failed; provider detail suppressed")
     return None
 
 
-def _cleanup_unpublished_instance(run_id: str, instance_id: int, *, context: str) -> bool:
+def _cleanup_unpublished_instance(
+    run_id: str,
+    instance_id: int,
+    *,
+    context: str,
+    deadline_at: float | None = None,
+) -> bool:
     """clean an exact unpublished instance, falling back to its run label only when unconfirmed."""
     exact_delete_confirmed = False
     with contextlib.suppress(BaseException):
-        exact_delete_confirmed = _best_effort_destroy(instance_id, context=context)
+        exact_delete_confirmed = _best_effort_destroy(
+            instance_id,
+            context=context,
+            **deadline_kwargs(_best_effort_destroy, deadline_at),
+        )
     if not exact_delete_confirmed:
         with contextlib.suppress(BaseException):
-            destroy_run_instances(run_id)
+            destroy_run_instances(
+                run_id,
+                **deadline_kwargs(destroy_run_instances, deadline_at),
+            )
     return exact_delete_confirmed
 
 
-def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int, err, say) -> VastJobHandle:
+def _reconcile_ambiguous_create(
+    spec,
+    offer: VastOffer,
+    label: str,
+    attempt: int,
+    err,
+    say,
+    *,
+    deadline_at: float,
+) -> VastJobHandle:
     """Reconcile the contract a possibly-billed AMBIGUOUS create (5xx/429/timeout on the non-idempotent
     PUT /asks) may have left behind. If an instance materialized under our unique label, ADOPT it;
     otherwise destroy this run's instances by label and raise ``UnreconciledCreateError`` to abort the
     offer walk — renting another offer would double-provision. ``say`` is suppressed throughout so a
     logging error can never swallow the terminal raise (which would let the orchestrator retry)."""
-    adopted = _adopt_instance_by_label(label)
+    adopted = _adopt_instance_by_label(
+        label,
+        **deadline_kwargs(_adopt_instance_by_label, deadline_at),
+    )
     # Coerce defensively: a truthy-but-unparseable id can't be adopted -> fall through to the abort.
     adopted_id = _coerce_instance_id(adopted.get("id")) if adopted is not None else None
     if adopted_id is not None:
@@ -221,10 +260,7 @@ def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int
             attempt=attempt,
             started_ts=started,
         )
-    # nothing cleanly adopted (no row under our label, or an unparseable id). a contradictory
-    # rejection can carry the exact contract id; when its deletion is provider-confirmed, ownership is
-    # resolved and a run-wide label reap would only risk sibling seeds or attempts. otherwise retain the
-    # label fallback, then abort terminally so an unresolved create never walks to another offer.
+    # clean exact contract evidence first, then retain the run-label fallback when unconfirmed.
     contract_id = getattr(err, "contract_id", None)
     exact_delete_confirmed = False
     destroyed: list[int] = []
@@ -233,10 +269,14 @@ def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int
             spec.run_id,
             contract_id,
             context="ambiguous create reconciliation",
+            **deadline_kwargs(_cleanup_unpublished_instance, deadline_at),
         )
     else:
         with contextlib.suppress(BaseException):
-            destroyed = destroy_run_instances(spec.run_id)
+            destroyed = destroy_run_instances(
+                spec.run_id,
+                **deadline_kwargs(destroy_run_instances, deadline_at),
+            )
     if destroyed:
         with contextlib.suppress(Exception):
             say(f"destroyed {len(destroyed)} possible phantom instance(s) {destroyed} on abort")
@@ -247,8 +287,8 @@ def _reconcile_ambiguous_create(spec, offer: VastOffer, label: str, attempt: int
     )
     raise UnreconciledCreateError(
         f"ambiguous vast create on offer {offer.offer_id} (label={label}); aborting the offer walk "
-        f"to avoid double-provisioning ({cleanup}): {err}"
-    ) from err
+        f"to avoid double-provisioning; provider detail suppressed; {cleanup}"
+    ) from None
 
 
 def deploy_and_submit(
@@ -259,6 +299,7 @@ def deploy_and_submit(
     log=None,
     runtime_secrets: dict | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> VastJobHandle:
     """Rent the cheapest offer that will actually take the job; walk on rejection.
 
@@ -267,6 +308,9 @@ def deploy_and_submit(
     market re-search doesn't re-select one that just rejected us).
     """
     say = make_say(log)
+    absolute_deadline = require_deadline_at(
+        deadline_at if deadline_at is not None else time.time() + float(spec.gpu.max_wall_seconds)
+    )
 
     if not offers:
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")
@@ -276,6 +320,7 @@ def deploy_and_submit(
         attempt,
         runtime_secrets=runtime_secrets,
         code_prefix=code_prefix,
+        **deadline_kwargs(build_payload, absolute_deadline),
     )
     label = instance_label(spec.run_id, seed, attempt)
     onstart = build_onstart(payload)
@@ -283,16 +328,16 @@ def deploy_and_submit(
     tried: list[VastOffer] = []
     candidates = list(offers[:5])
     refreshed = False
-    last_err: Exception | None = None
     create_attempted = False
     try:
         while candidates:
             offer = candidates.pop(0)
             tried.append(offer)
-            # evaluate every fallible request argument before arming cleanup for the non-idempotent call.
             offer_id = offer.offer_id
             image = vast_image(offer.gpu)
             disk_gb = _effective_disk_gb(spec)
+            if not isinstance(deadline_at, _SubmitDeadline) or len(tried) > 1:
+                require_create_allowance(absolute_deadline)
             create_attempted = True
             try:
                 instance_id = vast_api.create_instance(
@@ -302,23 +347,29 @@ def deploy_and_submit(
                     env={},
                     onstart=onstart,
                     label=label,
+                    **deadline_kwargs(vast_api.create_instance, absolute_deadline),
                 )
             except vast_api.VastApiError as e:
-                last_err = e
-                # an ambiguous failure may have billed a contract, so transfer cleanup to reconciliation
-                # before any fallible logging. a definitive rejection or local not-sent failure may walk on.
-                ambiguous = vast_api.create_error_is_ambiguous(e)
-                if ambiguous:
+                if vast_api.create_error_is_ambiguous(e):
                     try:
-                        return _reconcile_ambiguous_create(spec, offer, label, attempt, e, say)
+                        return _reconcile_ambiguous_create(
+                            spec,
+                            offer,
+                            label,
+                            attempt,
+                            e,
+                            say,
+                            **deadline_kwargs(_reconcile_ambiguous_create, absolute_deadline),
+                        )
                     except UnreconciledCreateError:
                         create_attempted = False
                         raise
                 create_attempted = False
                 with contextlib.suppress(Exception):
-                    say(f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) rejected: {e}")
-                # market is live: refresh the search once, re-excluding the machines that just rejected us
-                # and staying within the allocator-approved class pool (``offers`` is already class-filtered).
+                    say(
+                        f"offer {offer.offer_id} ({offer.gpu} ${offer.dph_total:.2f}/hr) "
+                        "rejected; provider detail suppressed"
+                    )
                 if not candidates and not refreshed:
                     refreshed = True
                     allowed = {o.gpu for o in offers}
@@ -329,11 +380,11 @@ def deploy_and_submit(
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                            **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
                     ][:5]
                 continue
-            # guard the accepted create before any fallible post-create work can lose the exact id.
             try:
                 with contextlib.suppress(Exception):
                     say(
@@ -357,13 +408,19 @@ def deploy_and_submit(
                     spec.run_id,
                     instance_id,
                     context="post-create handle acquisition",
+                    **deadline_kwargs(_cleanup_unpublished_instance, absolute_deadline),
                 )
                 raise
-        raise vast_api.VastApiError(f"all {len(tried)} vast offers rejected the job: {last_err}")
+        raise vast_api.VastApiError(
+            f"all {len(tried)} vast offers rejected the job; provider detail suppressed"
+        )
     except BaseException:
         if create_attempted:
             with contextlib.suppress(BaseException):
-                destroy_run_instances(spec.run_id)
+                destroy_run_instances(
+                    spec.run_id,
+                    **deadline_kwargs(destroy_run_instances, absolute_deadline),
+                )
         raise
 
 
@@ -381,23 +438,11 @@ def _failure_detail(
     instance_id: int | None = None,
     attempt: int = 0,
 ) -> str:
-    """Best root-cause detail we can assemble from the HF artifacts + the Vast console.
-
-    Unlike Lambda (no console API -> a host boot.log on HF), Vast exposes a container log API, so
-    early-bootstrap failures (pip/env errors before the worker can reach HF) are read live from it.
-    """
-    parts = []
-    if marker and marker.get("error"):
-        parts.append(str(marker["error"]))
-    err_name = error_artifact_name(phase, attempt)
-    content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-    if content:
-        parts.append(f"--- {err_name} ---\n{content}")
-    if instance_id:
-        logs = vast_api.instance_logs(int(instance_id))
-        if logs:
-            parts.append(f"--- instance log tail ---\n{logs}")
-    return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
+    """Return failure classification without exposing worker or provider content."""
+    del hf_repo, prefix, phase, instance_id, attempt
+    if marker is not None:
+        return "vast worker reported failure; detail suppressed"
+    return "vast worker terminated without a DONE sentinel; detail suppressed"
 
 
 def poll_vast_job(
@@ -411,6 +456,7 @@ def poll_vast_job(
     stall_after_s: float = STALL_AFTER_S,
     first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_s: float | None = None,
+    deadline_at: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (cf. lambdalabs.jobs.poll_lambda_job).
 
@@ -421,6 +467,7 @@ def poll_vast_job(
     file — assembles failure detail from HF artifacts + the live instance log tail. ``LOAD_TIMEOUT_S`` is
     read here (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
     """
+    absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
     err_name = error_artifact_name(spec.phase, handle.attempt)
@@ -448,6 +495,7 @@ def poll_vast_job(
 
     adapter = InstancePollAdapter(
         instance_id=handle.instance_id,
+        run_id=spec.run_id,
         current_attempt=handle.attempt,
         # started_ts is 0.0 for an old/corrupt handle -> fall back to now for the load/stall clocks + cost.
         # The heartbeat attempt-DATING uses the TRUE launch (0.0 == unknown), NOT the now() fallback: a
@@ -455,13 +503,27 @@ def poll_vast_job(
         # as a prior-attempt leftover.
         launch_ts=handle.started_ts or time.time(),
         dating_launch=handle.started_ts or 0.0,
-        done_reader=_make_hf_file_reader(hf_repo, f"{prefix}/DONE"),
-        marker_reader=_make_hf_file_reader(
-            hf_repo, f"{prefix}/vast_attempt{handle.attempt}.json", min_interval_s=60.0
+        done_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/DONE",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
         ),
-        metrics_reader=_make_hf_file_reader(hf_repo, f"{prefix}/metrics.json"),
+        marker_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/vast_attempt{handle.attempt}.json",
+            min_interval_s=60.0,
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        ),
+        metrics_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/metrics.json",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        ),
         # Resolve get_instance / instance_logs on the api MODULE at call time so a monkeypatch bites.
-        fetch_instance=lambda: vast_api.get_instance(handle.instance_id),
+        fetch_instance=lambda: vast_api.get_instance(
+            handle.instance_id,
+            **deadline_kwargs(vast_api.get_instance, absolute_deadline),
+        ),
         # A malformed 200 body (truncated / non-JSON / invalid-UTF8) makes RestClient raise a decode /
         # incomplete-read error, NOT a VastApiError — the _http retry wrapper only catches OSError
         # transients, so these escape get_instance raw. Treat them like any transient poll error.
@@ -476,8 +538,17 @@ def poll_vast_job(
         dead_states=_DEAD_STATES,
         missing_dead_threshold=4,
         # A non-empty CONTAINER LOG tail proves the bootstrap is alive during a slow cold start.
-        early_liveness_alive=lambda: bool(vast_api.instance_logs(handle.instance_id)),
-        read_current_error=lambda: _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True),
+        early_liveness_alive=lambda: bool(
+            vast_api.instance_logs(
+                handle.instance_id,
+                **deadline_kwargs(vast_api.instance_logs, absolute_deadline),
+            )
+        ),
+        read_current_error=lambda: _make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/{err_name}",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        )(force=True),
         stamp_cost_and_notes=stamp_cost_and_notes,
         failure_detail=lambda marker: _failure_detail(
             hf_repo, prefix, spec.phase, marker, handle.instance_id, attempt=handle.attempt
@@ -500,6 +571,7 @@ def poll_vast_job(
         first_liveness_s=first_liveness_s,
         load_timeout_s=LOAD_TIMEOUT_S,
         deadline_s=deadline_s,
+        **deadline_kwargs(poll_instance_job, absolute_deadline),
     )
 
 
@@ -511,6 +583,7 @@ def submit_run_vast(
     attempt: int = 0,
     runtime_secrets: dict | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> PollResult:
     """Vast equivalent of ``lambdalabs.jobs.submit_run_lambda``: rent, persist, poll, destroy.
 
@@ -524,6 +597,9 @@ def submit_run_vast(
         raise vast_api.VastApiError(
             f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
         )
+    absolute_deadline = require_deadline_at(
+        deadline_at if deadline_at is not None else time.time() + float(spec.gpu.max_wall_seconds)
+    )
     info = GPU_INFO[spec.gpu.type]
     offers = [
         o
@@ -531,6 +607,7 @@ def submit_run_vast(
             info.vram_gb,
             _effective_disk_gb(spec),
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+            **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type
     ]
@@ -544,41 +621,50 @@ def submit_run_vast(
             log=log,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            **deadline_kwargs(deploy_and_submit, _SubmitDeadline(absolute_deadline)),
         )
         if on_handle is not None:
             on_handle(handle.to_dict())
-        reader = heartbeat_reader_for(spec)
-        # wall cap plus provision/cold-start grace bounds spend because vast has no server-side timeout
-        deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
+        reader = heartbeat_reader_for(
+            spec,
+            **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
+        )
         return poll_vast_job(
             handle,
             spec,
             seed,
             log=log,
             heartbeat_reader=reader,
-            deadline_s=deadline,
+            **deadline_kwargs(poll_vast_job, absolute_deadline),
         )
     finally:
         if handle is not None:
-            # a cleanup-time baseexception (interrupt during the delete) must not replace the
-            # in-flight exception or skip the run-label fallback.
             confirmed = False
             cleanup_exc: BaseException | None = None
             try:
                 confirmed = _best_effort_destroy(
-                    handle.instance_id, context="submit_run_vast teardown"
+                    handle.instance_id,
+                    context="submit_run_vast teardown",
+                    **deadline_kwargs(_best_effort_destroy, absolute_deadline),
                 )
-            except BaseException as e:
-                cleanup_exc = e
+            except BaseException as exc:
+                cleanup_exc = exc
             if not confirmed:
-                # an unconfirmed exact-id destroy must retain the run-label recovery path before any retry
                 with contextlib.suppress(BaseException):
-                    destroy_run_instances(spec.run_id)
+                    destroy_run_instances(
+                        spec.run_id,
+                        **deadline_kwargs(destroy_run_instances, absolute_deadline),
+                    )
             if cleanup_exc is not None and sys.exc_info()[1] is None:
                 raise cleanup_exc
 
 
-def _best_effort_destroy(instance_id, *, context: str) -> bool:
+def _best_effort_destroy(
+    instance_id,
+    *,
+    context: str,
+    deadline_at: float | None = None,
+) -> bool:
     """``destroy_instance`` for best-effort teardown paths (submit/poll ``finally``, cancel) that must
     NOT raise. Returns the confirmation bool and WARNS on an unconfirmed teardown (``success: false`` /
     breakdown -> may still be billing) for immediate operator visibility. (``VastProvider.destroy`` wraps
@@ -586,7 +672,10 @@ def _best_effort_destroy(instance_id, *, context: str) -> bool:
 
     Pass ``instance_id`` THROUGH unconverted: ``destroy_instance`` does the ``int()`` internally, so
     converting here would re-introduce a raise in the very ``finally``/``suppress`` paths this quiets."""
-    ok = vast_api.destroy_instance(instance_id)
+    ok = vast_api.destroy_instance(
+        instance_id,
+        **deadline_kwargs(vast_api.destroy_instance, deadline_at),
+    )
     if not ok:
         logger.warning(
             "vast teardown unconfirmed for instance %s (%s): success:false / breakdown — instance may "
@@ -614,7 +703,11 @@ def cancel(remote: dict) -> None:
         _best_effort_destroy(instance_id, context="cancel")
 
 
-def destroy_run_instances(run_id: str) -> list[int]:
+def destroy_run_instances(
+    run_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> list[int]:
     """Destroy every instance belonging to ONE run (labels start with its run prefix).
 
     Cancel/GC path: unlike ``sweep_orphans`` this never looks at other runs, so it is safe to call
@@ -624,7 +717,9 @@ def destroy_run_instances(run_id: str) -> list[int]:
     if not run_id:
         return destroyed
     try:
-        instances = vast_api.list_instances()
+        instances = vast_api.list_instances(
+            **deadline_kwargs(vast_api.list_instances, deadline_at),
+        )
     except Exception:
         return destroyed
     prefix = run_label_prefix(run_id)
@@ -632,7 +727,14 @@ def destroy_run_instances(run_id: str) -> list[int]:
         iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the loop
         label = str(inst.get("label") or "")
         # Match on the label boundary (not a raw prefix) so ``flash-100`` can't also destroy ``flash-1000``.
-        if iid and label_matches_run(label, prefix) and vast_api.destroy_instance(iid):
+        if (
+            iid
+            and label_matches_run(label, prefix)
+            and vast_api.destroy_instance(
+                iid,
+                **deadline_kwargs(vast_api.destroy_instance, deadline_at),
+            )
+        ):
             destroyed.append(iid)
     return destroyed
 
@@ -687,16 +789,15 @@ def sweep_orphans(
     """
     try:
         instances = vast_api.list_instances()
-    except Exception as exc:
-        logger.warning("vast orphan sweep skipped: %s", exc)
+    except Exception:
+        logger.warning("vast orphan sweep skipped; provider detail suppressed")
         return []
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
-    except Exception as exc:
-        # Resolving a protection/known set failed — SKIP the sweep rather than fall through to an empty
-        # set (which would treat every live run's instance as an orphan). Honors "never raises".
-        logger.warning("vast orphan sweep skipped: could not resolve run sets: %s", exc)
+    except Exception:
+        # resolving a protection set failed, so skip rather than treat live instances as orphans.
+        logger.warning("vast orphan sweep skipped; could not resolve run sets; detail suppressed")
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
     known_prefixes = (

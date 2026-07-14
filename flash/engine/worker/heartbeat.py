@@ -63,6 +63,7 @@ def _is_critical_stage(stage: str) -> bool:
     given the longer upload-lock timeout, because no later heartbeat can repair a missed one."""
     return stage in _HB_TERMINAL_STAGES or stage.startswith("error_")
 
+
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so trainer callbacks don't
 # block on the network.
 _HB_LOCK = threading.Lock()
@@ -189,7 +190,10 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             if force:
                 _w._HB_LAST_FORCED_UPLOAD = now
             _committed_step = kw.get("step")
-            if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
+            if (
+                isinstance(_committed_step, (int, float))
+                and _committed_step > _w._HB_LAST_COMMITTED_STEP
+            ):
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
     if upload_due:
         critical = _is_critical_stage(stage)
@@ -206,7 +210,9 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                         os.remove(up)
                 if committed is False:
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
-                    _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
+                    _rollback_throttle_slot(
+                        my_claim, prev_last_upload, prev_last_step, prev_last_forced
+                    )
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
                 elif not liveness:
                     # this committed snapshot carried real progress; settle the progress-carry

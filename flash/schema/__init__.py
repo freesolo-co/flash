@@ -20,6 +20,7 @@ from flash.schema.fields import (
     _coerce_scalar,
     _environment_secrets,
     _require_environment_ref,
+    _section_int,
     _train_float,
     _train_int,
     _train_stops,
@@ -299,6 +300,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
+    gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
+    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=1)
+    gpu_options = {}
+    if gpu_max_retries is not None:
+        gpu_options["max_retries"] = gpu_max_retries
+    if gpu_max_wall_seconds is not None:
+        gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
 
     try:
         # Offline sizing/display only; allocator re-resolves at submit time.
@@ -385,7 +393,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
         ),
-        gpu=GpuSpec(type=gpu_type),
+        gpu=GpuSpec(type=gpu_type, **gpu_options),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         worker_env=worker_env,
         model_policy=model_policy,

@@ -14,6 +14,11 @@ import time
 from collections.abc import Callable
 
 from flash._logging import get_logger
+from flash.providers._deadline import (
+    deadline_kwargs,
+    require_create_allowance,
+    require_deadline_at,
+)
 from flash.providers._hf_artifacts import (
     error_artifact_name,
     heartbeat_reader_for,
@@ -23,7 +28,6 @@ from flash.providers._instance_poll import InstancePollAdapter, poll_instance_jo
 from flash.providers._poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
-    PROVISION_GRACE_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
     make_say,
@@ -49,21 +53,23 @@ from flash.providers.lambdalabs.jobs.builders import (
 logger = get_logger(__name__)
 
 # The shared instance-poll timing defaults imported from ``_poll`` above (setup grace covers Docker pull
-# + pip + model download, before any heartbeat). LOAD_TIMEOUT_S and PROVISION_GRACE_S are read at call
-# time so ``monkeypatch.setattr(jobs, …)`` takes effect; SETUP_GRACE_S / STALL_AFTER_S / FIRST_LIVENESS_S
+# + pip + model download, before any heartbeat). load_timeout_s is read at call time so
+# ``monkeypatch.setattr(jobs, …)`` takes effect; setup_grace_s / stall_after_s / first_liveness_s
 # are supplied as ``poll_lambda_job`` defaults (override by passing the kwarg, not by patching the global).
 
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
 
-def resolve_ssh_key_names() -> list[str]:
+def resolve_ssh_key_names(*, deadline_at: float | None = None) -> list[str]:
     """Return the SSH key to attach at launch (required by Lambda even though we never SSH in)."""
     import os
 
     pinned = os.environ.get("LAMBDA_SSH_KEY_NAME")
     if pinned:
         return [pinned]
-    keys = lambda_api.list_ssh_keys()
+    keys = lambda_api.list_ssh_keys(
+        **deadline_kwargs(lambda_api.list_ssh_keys, deadline_at),
+    )
     names = [k.get("name") for k in keys if k.get("name")]
     if not names:
         raise lambda_api.LambdaApiError(
@@ -74,14 +80,22 @@ def resolve_ssh_key_names() -> list[str]:
     return [names[0]]
 
 
-def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance]:
+def usable_instances(
+    gpu_class: str,
+    force: bool = False,
+    *,
+    deadline_at: float | None = None,
+) -> list[LambdaInstance]:
     """Regions currently advertising capacity for the given GPU class. Empty = no Lambda capacity now."""
     from flash.providers.lambdalabs.gpus import instance_type_for
     from flash.providers.lambdalabs.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
     itype = instance_type_for(gpu_class)
-    rate = hourly_rate(gpu_class)
+    rate = hourly_rate(
+        gpu_class,
+        **deadline_kwargs(hourly_rate, deadline_at),
+    )
     return [
         LambdaInstance(
             gpu=gpu_class,
@@ -90,7 +104,11 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in lambda_api.regions_with_capacity(itype, force=force)
+        for region in lambda_api.regions_with_capacity(
+            itype,
+            force=force,
+            **deadline_kwargs(lambda_api.regions_with_capacity, deadline_at),
+        )
     ]
 
 
@@ -114,16 +132,27 @@ def launch_and_submit(
     mode: str | None = None,
     models: list | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection."""
     say = make_say(log)
+    absolute_deadline = require_deadline_at(
+        deadline_at if deadline_at is not None else time.time() + float(spec.gpu.max_wall_seconds)
+    )
     if not instances:
         raise lambda_api.LambdaApiError(
             f"no Lambda capacity for {spec.gpu.type} (no region advertises the instance type)"
         )
     cache_name = getattr(spec.gpu, "network_volume", None)
     cold_user_data = build_user_data(
-        build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets, code_prefix=code_prefix),
+        build_payload(
+            spec,
+            seed,
+            attempt,
+            runtime_secrets=runtime_secrets,
+            code_prefix=code_prefix,
+            **deadline_kwargs(build_payload, absolute_deadline),
+        ),
         gpu=spec.gpu.type,
     )
 
@@ -131,8 +160,15 @@ def launch_and_submit(
         """Build user_data with this region's actual NFS mount point."""
         return build_user_data(
             build_payload(
-                spec, seed, attempt, runtime_secrets=runtime_secrets,
-                cache_host_mount=mount_point, mode=mode, models=models, code_prefix=code_prefix,
+                spec,
+                seed,
+                attempt,
+                runtime_secrets=runtime_secrets,
+                cache_host_mount=mount_point,
+                mode=mode,
+                models=models,
+                code_prefix=code_prefix,
+                **deadline_kwargs(build_payload, absolute_deadline),
             ),
             gpu=spec.gpu.type,
         )
@@ -140,12 +176,13 @@ def launch_and_submit(
     default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
     cache_user_data = _cache_user_data_for(default_cache_mount) if cache_name else None
     name = instance_label(spec.run_id, seed, attempt)
-    ssh_keys = resolve_ssh_key_names()
+    ssh_keys = resolve_ssh_key_names(
+        **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
+    )
 
     tried_regions: set[str] = set()
     candidates = list(instances)
     refreshed = False
-    last_err: Exception | None = None
     while candidates:
         inst = candidates.pop(0)
         if inst.region in tried_regions:
@@ -154,21 +191,32 @@ def launch_and_submit(
         user_data, fs_names = cold_user_data, None
         if cache_name:
             try:
-                mount_point = lambda_api.ensure_filesystem(cache_name, inst.region)
+                mount_point = lambda_api.ensure_filesystem(
+                    cache_name,
+                    inst.region,
+                    **deadline_kwargs(lambda_api.ensure_filesystem, absolute_deadline),
+                )
                 # Rebuild user_data when the actual mount_point differs from the default (rare).
                 region_user_data = (
-                    cache_user_data if mount_point == default_cache_mount
+                    cache_user_data
+                    if mount_point == default_cache_mount
                     else _cache_user_data_for(mount_point)
                 )
                 user_data, fs_names = region_user_data, [cache_name]
-            except Exception as e:
-                # Preload must not fall back cold — it would train instead of warming the cache.
+            except Exception:
+                # preload must not fall back cold because it would train instead of warming the cache.
                 if mode == "preload":
-                    say(f"weight cache unavailable in {inst.region} ({e}); skipping (preload needs it)")
-                    last_err = e
+                    say(
+                        f"weight cache unavailable in {inst.region}; provider detail suppressed; "
+                        "skipping (preload needs it)"
+                    )
                     continue
-                say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
+                say(
+                    f"weight cache unavailable in {inst.region}; provider detail suppressed; "
+                    "launching cold"
+                )
         try:
+            require_create_allowance(absolute_deadline)
             instance_id = lambda_api.launch_instance(
                 region_name=inst.region,
                 instance_type_name=inst.instance_type,
@@ -176,55 +224,85 @@ def launch_and_submit(
                 name=name,
                 user_data=user_data,
                 file_system_names=fs_names,
+                **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
             )
         except lambda_api.LambdaApiError as e:
-            last_err = e
             if not _launch_rejection_is_clean(e):
-                # Ambiguous: Lambda may have billed an instance we never got an id for — don't launch
-                # again; reap by run-name and let the runner retry fresh.
-                say(f"ambiguous launch failure in {inst.region}: {e}; reconciling + retrying fresh")
+                # ambiguous creates may have billed an instance, so reconcile before any retry.
+                say(
+                    f"ambiguous launch failure in {inst.region}; provider detail suppressed; "
+                    "reconciling + retrying fresh"
+                )
                 with contextlib.suppress(Exception):
-                    terminate_run_instances(spec.run_id)
+                    terminate_run_instances(
+                        spec.run_id,
+                        **deadline_kwargs(terminate_run_instances, absolute_deadline),
+                    )
                 raise lambda_api.LambdaApiError(
-                    f"ambiguous Lambda launch failure (possible phantom reaped): {e}"
-                ) from e
-            say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {e}")
+                    "ambiguous Lambda launch failure; provider detail suppressed; "
+                    "possible phantom reaped"
+                ) from None
+            say(
+                f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected; "
+                "provider detail suppressed"
+            )
             # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
             fs_attach_reject = fs_names and any(
                 tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
             )
             if mode != "preload" and fs_attach_reject:
-                say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
+                say(
+                    f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)"
+                )
                 try:
+                    require_create_allowance(absolute_deadline)
                     instance_id = lambda_api.launch_instance(
-                        region_name=inst.region, instance_type_name=inst.instance_type,
-                        ssh_key_names=ssh_keys, name=name, user_data=cold_user_data,
+                        region_name=inst.region,
+                        instance_type_name=inst.instance_type,
+                        ssh_key_names=ssh_keys,
+                        name=name,
+                        user_data=cold_user_data,
                         file_system_names=None,
+                        **deadline_kwargs(lambda_api.launch_instance, absolute_deadline),
                     )
                 except lambda_api.LambdaApiError as e2:
-                    last_err = e2
                     if not _launch_rejection_is_clean(e2):
                         with contextlib.suppress(Exception):
-                            terminate_run_instances(spec.run_id)
+                            terminate_run_instances(
+                                spec.run_id,
+                                **deadline_kwargs(terminate_run_instances, absolute_deadline),
+                            )
                         raise lambda_api.LambdaApiError(
-                            f"ambiguous Lambda launch failure (possible phantom reaped): {e2}"
-                        ) from e2
-                    say(f"region {inst.region} also rejected cold: {e2}")
+                            "ambiguous Lambda launch failure; provider detail suppressed; "
+                            "possible phantom reaped"
+                        ) from None
+                    say(f"region {inst.region} also rejected cold; provider detail suppressed")
                 else:
                     say(
                         f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
                         f"{inst.instance_type} in {inst.region} attempt={attempt} seed={seed}"
                     )
                     return LambdaJobHandle(
-                        instance_id=instance_id, instance_type=inst.instance_type, region=inst.region,
-                        name=name, gpu=inst.gpu, hourly_usd=inst.price_usd_hr, attempt=attempt,
+                        instance_id=instance_id,
+                        instance_type=inst.instance_type,
+                        region=inst.region,
+                        name=name,
+                        gpu=inst.gpu,
+                        hourly_usd=inst.price_usd_hr,
+                        attempt=attempt,
                         started_ts=time.time(),
                     )
             # Preload must not refresh to a different region (would warm the wrong one).
             if mode != "preload" and not candidates and not refreshed:
                 refreshed = True
                 candidates = [
-                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
+                    c
+                    for c in usable_instances(
+                        inst.gpu,
+                        force=True,
+                        **deadline_kwargs(usable_instances, absolute_deadline),
+                    )
+                    if c.region not in tried_regions
                 ]
             continue
         say(
@@ -243,10 +321,13 @@ def launch_and_submit(
         )
     # Reap any phantom instance (accepted but no id returned) before giving up.
     with contextlib.suppress(Exception):
-        terminate_run_instances(spec.run_id)
+        terminate_run_instances(
+            spec.run_id,
+            **deadline_kwargs(terminate_run_instances, absolute_deadline),
+        )
     raise lambda_api.LambdaApiError(
         f"all {len(tried_regions)} Lambda region(s) rejected the {spec.gpu.type} launch "
-        f"(no capacity): {last_err}"
+        "(no capacity); provider detail suppressed"
     )
 
 
@@ -254,19 +335,14 @@ def launch_and_submit(
 _make_hf_file_reader = make_hf_text_reader
 
 
-def _failure_detail(hf_repo: str, prefix: str, phase: str, marker: dict | None, attempt: int) -> str:
-    """Assemble failure detail from HF artifacts (boot.log is the only early-bootstrap log source)."""
-    parts = []
-    if marker and marker.get("error"):
-        parts.append(str(marker["error"]))
-    err_name = error_artifact_name(phase, attempt)
-    err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-    if err:
-        parts.append(f"--- {err_name} ---\n{err}")
-    boot = _make_hf_file_reader(hf_repo, f"{prefix}/lambda_attempt{attempt}_boot.log")(force=True)
-    if boot:
-        parts.append(f"--- lambda_attempt{attempt}_boot.log (host) ---\n{boot}")
-    return "\n".join(parts) or "lambda worker terminated without a DONE sentinel"
+def _failure_detail(
+    hf_repo: str, prefix: str, phase: str, marker: dict | None, attempt: int
+) -> str:
+    """Return failure classification without exposing worker or provider content."""
+    del hf_repo, prefix, phase, attempt
+    if marker is not None:
+        return "lambda worker reported failure; detail suppressed"
+    return "lambda worker terminated without a DONE sentinel; detail suppressed"
 
 
 def poll_lambda_job(
@@ -280,6 +356,7 @@ def poll_lambda_job(
     stall_after_s: float = STALL_AFTER_S,
     first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_s: float | None = None,
+    deadline_at: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state.
 
@@ -289,12 +366,16 @@ def poll_lambda_job(
     reads early-liveness + failure detail from the host boot.log on HF. ``LOAD_TIMEOUT_S`` is read here
     (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
     """
+    absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}"
     err_name = error_artifact_name(spec.phase, handle.attempt)
     # Absence of boot.log while active = cloud-init never ran (sick region / stuck host).
     boot_log_reader = _make_hf_file_reader(
-        hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
+        hf_repo,
+        f"{prefix}/lambda_attempt{handle.attempt}_boot.log",
+        min_interval_s=60.0,
+        **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
     )
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
@@ -315,18 +396,33 @@ def poll_lambda_job(
 
     adapter = InstancePollAdapter(
         instance_id=handle.instance_id,
+        run_id=spec.run_id,
         current_attempt=handle.attempt,
         # 0.0 = corrupt/missing handle -> anchor elapsed/cost to now (avoid billing from the 1970 epoch);
         # the heartbeat attempt-DATING uses the TRUE launch (0.0 == unknown), NOT the now() fallback.
         launch_ts=handle.started_ts or time.time(),
         dating_launch=handle.started_ts or 0.0,
-        done_reader=_make_hf_file_reader(hf_repo, f"{prefix}/DONE"),
-        marker_reader=_make_hf_file_reader(
-            hf_repo, f"{prefix}/lambda_attempt{handle.attempt}.json", min_interval_s=60.0
+        done_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/DONE",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
         ),
-        metrics_reader=_make_hf_file_reader(hf_repo, f"{prefix}/metrics.json"),
+        marker_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/lambda_attempt{handle.attempt}.json",
+            min_interval_s=60.0,
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        ),
+        metrics_reader=_make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/metrics.json",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        ),
         # Resolve get_instance on the api MODULE at call time so a monkeypatch bites.
-        fetch_instance=lambda: lambda_api.get_instance(handle.instance_id),
+        fetch_instance=lambda: lambda_api.get_instance(
+            handle.instance_id,
+            **deadline_kwargs(lambda_api.get_instance, absolute_deadline),
+        ),
         poll_error_exceptions=(lambda_api.LambdaApiError,),
         status_field="status",
         running_status="active",
@@ -334,7 +430,11 @@ def poll_lambda_job(
         missing_dead_threshold=3,
         # Empty "" boot.log counts as liveness (existence = cloud-init ran) -> ``is not None``.
         early_liveness_alive=lambda: boot_log_reader(force=True) is not None,
-        read_current_error=lambda: _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True),
+        read_current_error=lambda: _make_hf_file_reader(
+            hf_repo,
+            f"{prefix}/{err_name}",
+            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        )(force=True),
         stamp_cost_and_notes=stamp_cost_and_notes,
         failure_detail=lambda marker: _failure_detail(
             hf_repo, prefix, spec.phase, marker, handle.attempt
@@ -358,6 +458,7 @@ def poll_lambda_job(
         first_liveness_s=first_liveness_s,
         load_timeout_s=LOAD_TIMEOUT_S,
         deadline_s=deadline_s,
+        **deadline_kwargs(poll_instance_job, absolute_deadline),
     )
 
 
@@ -369,13 +470,20 @@ def submit_run_lambda(
     attempt: int = 0,
     runtime_secrets: dict | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> PollResult:
     """Launch, poll, and always terminate the instance (finally is the cost-safety primary)."""
     if spec.gpu.type not in GPU_INFO:
         raise lambda_api.LambdaApiError(
             f"submit_run_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
         )
-    instances = usable_instances(spec.gpu.type)
+    absolute_deadline = require_deadline_at(
+        deadline_at if deadline_at is not None else time.time() + float(spec.gpu.max_wall_seconds)
+    )
+    instances = usable_instances(
+        spec.gpu.type,
+        **deadline_kwargs(usable_instances, absolute_deadline),
+    )
     handle = launch_and_submit(
         spec,
         seed,
@@ -384,30 +492,42 @@ def submit_run_lambda(
         log=log,
         runtime_secrets=runtime_secrets,
         code_prefix=code_prefix,
+        **deadline_kwargs(launch_and_submit, absolute_deadline),
     )
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        reader = heartbeat_reader_for(spec)
-        deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
+        reader = heartbeat_reader_for(
+            spec,
+            **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
+        )
         return poll_lambda_job(
             handle,
             spec,
             seed,
             log=log,
             heartbeat_reader=reader,
-            deadline_s=deadline,
+            **deadline_kwargs(poll_lambda_job, absolute_deadline),
         )
     finally:
-        lambda_api.terminate_instances([handle.instance_id])
+        lambda_api.terminate_instances(
+            [handle.instance_id],
+            **deadline_kwargs(lambda_api.terminate_instances, absolute_deadline),
+        )
 
 
-def terminate_run_instances(run_id: str) -> list[str]:
+def terminate_run_instances(
+    run_id: str,
+    *,
+    deadline_at: float | None = None,
+) -> list[str]:
     """Terminate every instance belonging to one run. Best-effort, never raises."""
     if not run_id:
         return []
     try:
-        instances = lambda_api.list_instances()
+        instances = lambda_api.list_instances(
+            **deadline_kwargs(lambda_api.list_instances, deadline_at),
+        )
     except Exception:
         return []
     prefix = run_label_prefix(run_id)
@@ -416,7 +536,14 @@ def terminate_run_instances(run_id: str) -> list[str]:
         for i in instances
         if i.get("id") and label_matches_run(str(i.get("name") or ""), prefix)
     ]
-    return lambda_api.terminate_instances(ids) if ids else []
+    return (
+        lambda_api.terminate_instances(
+            ids,
+            **deadline_kwargs(lambda_api.terminate_instances, deadline_at),
+        )
+        if ids
+        else []
+    )
 
 
 def sweep_orphans(
@@ -431,19 +558,21 @@ def sweep_orphans(
     """
     try:
         instances = lambda_api.list_instances()
-    except Exception as exc:
-        logger.warning("lambda orphan sweep skipped: %s", exc)
+    except Exception:
+        logger.warning("lambda orphan sweep skipped; provider detail suppressed")
         return []
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
-    except Exception as exc:
-        # Never fall through to an empty set — that would reap every live run's instance.
-        logger.warning("lambda orphan sweep skipped: could not resolve run sets: %s", exc)
+    except Exception:
+        # never fall through to an empty set because that would reap every live run's instance.
+        logger.warning("lambda orphan sweep skipped; could not resolve run sets; detail suppressed")
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
     # None = unscoped (single-plane); empty set = this plane owns nothing, reaps nothing.
-    known_prefixes = None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
+    known_prefixes = (
+        None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
+    )
 
     def _matches(prefixes: set[str]) -> bool:
         return any(label_matches_run(name, p) for p in prefixes)
@@ -462,7 +591,9 @@ def sweep_orphans(
                     orphans.append(str(iid))
                     logger.warning(
                         "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
-                        "driver lost)", name)
+                        "driver lost)",
+                        name,
+                    )
             continue
         if _matches(active):
             continue

@@ -289,7 +289,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
     # outside _STATUS_LOCK, the old racy path); that helper holds _STATUS_LOCK.
-    assert "with _STATUS_LOCK" in inspect.getsource(orch.mark_deployment_undeployed)
+    assert "with _status_guard(run_id)" in inspect.getsource(orch.mark_deployment_undeployed)
 
     called = []
     real_helper = orch.mark_deployment_undeployed
@@ -492,9 +492,7 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
             stub = _types.ModuleType(mod_name)
             stub.__path__ = []  # mark as package so sub-imports don't raise
             monkeypatch.setitem(sys.modules, mod_name, stub)
-    monkeypatch.setitem(
-        sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod
-    )
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
 
     async def _call():
         return ftrain.terminate_endpoint("RTX 5090", run_id)
@@ -520,6 +518,211 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
     assert called["v"] is False, "must not tear down endpoints for an already-terminal run"
 
 
+def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypatch):
+    import flash.providers as providers
+    import flash.runner as orch
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancelled-1"})
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict()))
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-cleanup",
+        "job_id": "job-cleanup",
+        "attempt": 1,
+    }
+    assert orch._preserve_cleanup_remote(spec.run_id, remote) is True
+    events = []
+
+    class Provider:
+        def cancel(self, handle):
+            events.append(("cancel", handle.to_dict()["job_id"]))
+
+        def destroy(self, handle):
+            events.append(("destroy", handle.to_dict()["endpoint_id"]))
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+
+    out = orch.cancel_run(spec.run_id)
+
+    assert out.state == "cancelled"
+    assert events == [("cancel", "job-cleanup"), ("destroy", "endpoint-cleanup")]
+    assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
+
+
+def test_cancel_run_preserves_failed_exact_teardown_before_cancelled_and_retries(
+    tmp_path, monkeypatch
+):
+    import flash.providers as providers
+    import flash.runner as orch
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-exact",
+        "job_id": "job-exact",
+        "attempt": 7,
+        "seed": 42,
+    }
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+    events = []
+
+    class Provider:
+        cancel_calls = 0
+
+        def cancel(self, handle):
+            self.cancel_calls += 1
+            data = handle.to_dict()
+            events.append(("cancel", data["endpoint_id"], data["job_id"], data["attempt"]))
+            if self.cancel_calls == 1:
+                raise RuntimeError("cancellation acknowledgement failed")
+
+        def destroy(self, handle):
+            data = handle.to_dict()
+            events.append(("destroy", data["endpoint_id"], data.get("job_id"), data["attempt"]))
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+    gc_calls = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda value: gc_calls.append(value.run_id))
+    cleanup_at_cancel = []
+    real_update = orch._update
+
+    def update(run_id, state, **updates):
+        if state == "cancelled":
+            cleanup_at_cancel.append(orch._load_status_json(run_id).get(orch._CLEANUP_REMOTES_KEY))
+        return real_update(run_id, state, **updates)
+
+    monkeypatch.setattr(orch, "_update", update)
+
+    first = orch.cancel_run(spec.run_id)
+    cleanup_remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-exact",
+        "job_id": "job-exact",
+        "attempt": 7,
+    }
+
+    assert first.state == "cancelled"
+    assert cleanup_at_cancel == [[cleanup_remote]]
+    assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [cleanup_remote]
+    assert gc_calls == [spec.run_id]
+    assert events == [
+        ("cancel", "endpoint-exact", "job-exact", 7),
+        ("destroy", "endpoint-exact", "job-exact", 7),
+    ]
+
+    second = orch.cancel_run(spec.run_id)
+
+    assert second.state == "cancelled"
+    assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
+    assert events == [
+        ("cancel", "endpoint-exact", "job-exact", 7),
+        ("destroy", "endpoint-exact", "job-exact", 7),
+        ("cancel", "endpoint-exact", "job-exact", 7),
+        ("destroy", "endpoint-exact", "job-exact", 7),
+    ]
+
+
+def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_path, monkeypatch):
+    import flash.providers as providers
+    import flash.runner as orch
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-race"})
+    original_remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-original",
+        "job_id": "job-original",
+        "attempt": 2,
+    }
+    replacement_remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-replacement",
+        "job_id": "job-replacement",
+        "attempt": 3,
+    }
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=original_remote,
+        )
+    )
+
+    class Provider:
+        def cancel(self, _handle):
+            current = orch.get_status(spec.run_id)
+            current.remote = replacement_remote
+            orch._save_status(current)
+            raise RuntimeError("cancellation acknowledgement failed")
+
+        def destroy(self, _handle):
+            return None
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+
+    out = orch.cancel_run(spec.run_id)
+    raw = orch._load_status_json(spec.run_id)
+
+    assert out.state == "cancelled"
+    assert raw["remote"] == replacement_remote
+    assert raw[orch._CLEANUP_REMOTES_KEY] == [original_remote]
+
+
+def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):
+    import flash.providers as providers
+    import flash.runner as orch
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-clean"})
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-clean",
+        "job_id": "job-clean",
+        "attempt": 3,
+    }
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+    events = []
+
+    class Provider:
+        def cancel(self, handle):
+            events.append(("cancel", handle.to_dict()["job_id"]))
+
+        def destroy(self, handle):
+            events.append(("destroy", handle.to_dict()["endpoint_id"]))
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+
+    out = orch.cancel_run(spec.run_id)
+
+    assert out.state == "cancelled"
+    assert events == [("cancel", "job-clean"), ("destroy", "endpoint-clean")]
+    assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
+
+
 # ---------------------------------------------------------------------------
 # Recovery TOCTOU: a run flipped terminal mid-recovery must not submit paid work
 # ---------------------------------------------------------------------------
@@ -534,8 +737,14 @@ def _make_poll_provider(monkeypatch, *, on_poll):
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
 
     class _StubProvider:
-        def poll(self, handle, spec, seed, *, log=None):
+        def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
             return on_poll(handle, spec, seed)
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
 
     monkeypatch.setattr(providers, "get_provider", lambda name: _StubProvider())
 

@@ -533,7 +533,11 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     cancelled, deleted, submitted_gpus = [], [], []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda e, j: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
@@ -604,7 +608,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     status = orch.get_status(spec.run_id)
     assert status.remote["endpoint_id"] == "ep-unconfirmed"
     assert status.remote["job_id"] == "job-unconfirmed"
-    assert "teardown UNCONFIRMED" in log.getvalue()
+    assert "teardown unconfirmed" in log.getvalue()
 
 
 def _oom_candidates():
@@ -624,7 +628,11 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     from flash.providers.runpod import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=_oom_candidates()))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
 
     submitted = []
@@ -754,7 +762,11 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
         Candidate("lambda", "H100", 0.50, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
 
     rp_gpus, lam_gpus = [], []
@@ -785,12 +797,8 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatch):
-    """The platform auto-attaches the SHARED weight cache, so its endpoint-pinning DC-set
-    restriction must not cost the user a GPU-walk retry: a no_capacity on the cached spec earns ONE
-    extra, cache-less cross-region attempt even at max_retries=0 (else the auto-cache could fail a
-    run a cache-less launch would have won). Regression for the cache-fallback-vs-retry-budget gap.
-    """
+def test_auto_cache_run_does_not_add_submission_at_zero_retries(orch, monkeypatch):
+    """max_retries=0 permits exactly one provider submission, including cached runs."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -802,7 +810,11 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
         "allocate",
         lambda *a, **k: _alloc(candidates=(Candidate("runpod", "H100", 0.49, 48),)),
     )
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
 
     volumes_seen = []
@@ -823,10 +835,9 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics["train_tokens"] == 4096
-    # Exactly two attempts: the cache-attached one (no_capacity) then the bonus cache-less retry.
-    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
+    with pytest.raises(RuntimeError, match="cache DC set starved"):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME]
 
 
 def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
@@ -850,7 +861,11 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
         ),  # the GPU-walk target the real retry must reach
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
 
     seen = []
@@ -1005,7 +1020,11 @@ def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
     from flash.providers.runpod import train as rp_train
 
     cancelled_jobs, deleted_eps = [], []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled_jobs.append((e, j)))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda e, j: cancelled_jobs.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted_eps.append(e) or True)
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
     spec = _spec()

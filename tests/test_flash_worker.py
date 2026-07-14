@@ -8,6 +8,8 @@ Covers:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 
@@ -19,6 +21,16 @@ def _spec():
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
+
+
+def _run_deadline_fields() -> dict[str, float | int]:
+    run_created_at = time.time()
+    run_max_wall_seconds = 3600
+    return {
+        "run_created_at": run_created_at,
+        "run_max_wall_seconds": run_max_wall_seconds,
+        "deadline_at": run_created_at + run_max_wall_seconds,
+    }
 
 
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
@@ -106,7 +118,9 @@ def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch)
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B", algorithm="opd", train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs")
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
     )
     assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
     # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
@@ -351,7 +365,9 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(epochs=1, max_examples=2))
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(epochs=1, max_examples=2)
+    )
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
@@ -466,6 +482,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
                 "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
                 "code_prefix": "../code/flash",
+                **_run_deadline_fields(),
             }
         )
 
@@ -509,6 +526,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
                     "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
                     "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
                     "code_prefix": "../code/flash",
+                    **_run_deadline_fields(),
                 }
             )
     finally:
@@ -723,6 +741,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         "job_spec_json": job_spec,
         "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
         "code_prefix": code_prefix,
+        **_run_deadline_fields(),
     }
 
     try:
@@ -774,6 +793,7 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"HF_TOKEN": "tok"},
                 "code_prefix": "../code/flash",
+                **_run_deadline_fields(),
             }
         )
 

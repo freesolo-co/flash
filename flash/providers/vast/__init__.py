@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.providers._deadline import deadline_kwargs
 from flash.providers._instance import InstanceJobHandle
 from flash.providers._instance_provider import InstanceProvider
 from flash.providers.base import (
@@ -58,6 +59,7 @@ class VastProvider(InstanceProvider):
         attempt: int,
         runtime_secrets: dict[str, str] | None,
         code_prefix: str | None,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import submit_run_vast
 
@@ -69,6 +71,7 @@ class VastProvider(InstanceProvider):
             attempt=attempt,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            deadline_at=deadline_at,
         )
 
     def _poll_job(
@@ -79,7 +82,7 @@ class VastProvider(InstanceProvider):
         *,
         log: Any,
         heartbeat_reader: Any,
-        deadline_s: float,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import poll_vast_job
 
@@ -89,22 +92,30 @@ class VastProvider(InstanceProvider):
             seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
-            deadline_s=deadline_s,
+            deadline_at=deadline_at,
         )
 
-    def _reattach_deadline(self, spec) -> float:
-        from flash.providers.vast.jobs import PROVISION_GRACE_S
-
-        return max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-
-    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
+    def _teardown_reattached(
+        self,
+        handle: JobHandle,
+        spec,
+        *,
+        deadline_at: float | None,
+    ) -> None:
         from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
-        if not _best_effort_destroy(handle.instance_id, context="poll recovery teardown"):
-            # Unconfirmed teardown: the active-run sweep shields this label, so escalate to a
+        if not _best_effort_destroy(
+            handle.instance_id,
+            context="poll recovery teardown",
+            **deadline_kwargs(_best_effort_destroy, deadline_at),
+        ):
+            # unconfirmed teardown: the active-run sweep shields this label, so escalate to a
             # run-scoped reap by label (re-lists + retries, not active-shielded), mirroring the
             # submit_run_vast teardown finally.
-            destroy_run_instances(spec.run_id)
+            destroy_run_instances(
+                spec.run_id,
+                **deadline_kwargs(destroy_run_instances, deadline_at),
+            )
 
     def _gc(self, run_id: str) -> None:
         from flash.providers.vast.jobs import destroy_run_instances

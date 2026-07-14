@@ -21,6 +21,7 @@ import abc
 from collections.abc import Callable
 from typing import Any
 
+from flash.providers._deadline import deadline_kwargs
 from flash.providers._instance import InstanceJobHandle
 from flash.providers.base import GpuClass, JobHandle, PollResult
 
@@ -61,6 +62,7 @@ class InstanceProvider(abc.ABC):
         attempt: int,
         runtime_secrets: dict[str, str] | None,
         code_prefix: str | None,
+        deadline_at: float | None,
     ) -> PollResult: ...
 
     @abc.abstractmethod
@@ -72,15 +74,17 @@ class InstanceProvider(abc.ABC):
         *,
         log: Any,
         heartbeat_reader: Any,
-        deadline_s: float,
+        deadline_at: float | None,
     ) -> PollResult: ...
 
     @abc.abstractmethod
-    def _reattach_deadline(self, spec) -> float:
-        """Launch-relative wall deadline for a reattached poll (per-substrate; the formulas differ)."""
-
-    @abc.abstractmethod
-    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
+    def _teardown_reattached(
+        self,
+        handle: JobHandle,
+        spec,
+        *,
+        deadline_at: float | None,
+    ) -> None:
         """Destroy an instance recovered via ``poll`` (attach has no submit teardown to lean on)."""
 
     @abc.abstractmethod
@@ -120,6 +124,7 @@ class InstanceProvider(abc.ABC):
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         code_prefix: str | None = None,
+        _deadline_at: float | None = None,
     ) -> PollResult:
         # ``on_last_gpu`` is unused: the instance providers use a uniform per-GPU wait (kept for interface parity).
         return self._submit_run(
@@ -130,19 +135,26 @@ class InstanceProvider(abc.ABC):
             attempt=attempt,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            deadline_at=_deadline_at,
         )
 
-    def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+    def poll(
+        self,
+        handle: JobHandle,
+        spec,
+        seed: int,
+        *,
+        log: Any = None,
+        _deadline_at: float | None = None,
+    ) -> PollResult:
         import contextlib
 
         from flash.providers._hf_artifacts import heartbeat_reader_for
 
-        reader = heartbeat_reader_for(spec)
+        reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
         h = self._handle_cls.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: {self.name} instance={h.instance_id}", file=log, flush=True)
-        # Deadline is launch-relative, not reattach-relative: resetting on recovery would extend the billable window unbounded.
-        deadline = self._reattach_deadline(spec)
         try:
             return self._poll_job(
                 h,
@@ -150,12 +162,16 @@ class InstanceProvider(abc.ABC):
                 seed,
                 log=log,
                 heartbeat_reader=reader,
-                deadline_s=deadline,
+                deadline_at=_deadline_at,
             )
         finally:
             # attach_run has no submit-time teardown; destroy the reattached instance here so a recovered run stops billing.
             with contextlib.suppress(Exception):
-                self._teardown_reattached(h, spec)
+                self._teardown_reattached(
+                    h,
+                    spec,
+                    **deadline_kwargs(self._teardown_reattached, _deadline_at),
+                )
 
     def gc(self, spec) -> None:
         self._gc(spec.run_id)

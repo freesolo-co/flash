@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
-from flash.providers._poll import heartbeat_progress_ts
+import pytest
+
+from flash.providers._poll import _attempt_int, heartbeat_progress_ts
+
+
+def test_attempt_int_rejects_oversized_ascii_decimal():
+    if not hasattr(sys, "set_int_max_str_digits"):
+        assert _attempt_int("9" * 5000) is None
+        return
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(0)
+        assert int("9" * 5000) > 0
+        assert _attempt_int("9" * 5000) is None
+    finally:
+        sys.set_int_max_str_digits(previous)
 
 
 def test_heartbeat_progress_credits_post_launch_ts_and_is_fresh():
@@ -83,9 +99,49 @@ def test_heartbeat_progress_rejects_unstamped_when_attempt_known():
     now = time.time()
     launch = now - 100
     for attempt_field in ("", None):
-        _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, attempt_field), launch, current_attempt=1)
+        _ts, fresh = heartbeat_progress_ts(
+            ("rl", 5, now - 10, attempt_field), launch, current_attempt=1
+        )
         assert fresh is False
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10), launch, current_attempt=1)
     assert fresh is False
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch)
     assert fresh is True
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_attempt", "current_attempt"),
+    [(0, 0), (7, 7), ("0", 0), ("7", 7), ("007", 7)],
+)
+def test_heartbeat_progress_accepts_only_canonical_attempt_identities(
+    heartbeat_attempt, current_attempt
+):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, heartbeat_attempt), now - 10, current_attempt=current_attempt
+    )
+    assert fresh is True
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [True, False, 1.0, -1, "-1", "+1", " 1", "1 ", "", chr(0x661), chr(0xFF11), object()],
+)
+def test_heartbeat_progress_rejects_malformed_heartbeat_attempt(malformed_attempt):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, malformed_attempt), now - 10, current_attempt=1
+    )
+    assert fresh is False
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [True, False, 1.0, -1, "-1", "+1", " 1", "1 ", "", chr(0x661), chr(0xFF11), object()],
+)
+def test_heartbeat_progress_rejects_malformed_current_attempt(malformed_attempt):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, 1), now - 10, current_attempt=malformed_attempt
+    )
+    assert fresh is False
