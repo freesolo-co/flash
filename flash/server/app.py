@@ -29,18 +29,9 @@ import threading
 from flash import __version__
 from flash.runner import get_status, prepare_job, submit_job
 from flash.runner.checkpoints import list_checkpoints
-from flash.serve.deploy import (
-    DeploymentSuperseded,
-    deploy_adapter,
-    deployment_record,
-    disable_owned_adapter,
-    read_adapter_record,
-    reconcile_owned_adapter_cleanup,
-    record_matches,
-    undeploy_adapter,
-)
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
+from flash.serve.deploy import deploy_adapter, deployment_record, undeploy_adapter
 from flash.serve.export import export_adapter
 
 from . import db
@@ -67,7 +58,6 @@ _log = logging.getLogger("flash.server")
 __all__ = [
     "_DEPLOY_LOCKS",
     "_RECOVERABLE",
-    "DeploymentSuperseded",
     "_charge_retry_loop",
     "_charge_retry_startup",
     "_deploy_lock",
@@ -77,14 +67,10 @@ __all__ = [
     "create_app",
     "deploy_adapter",
     "deployment_record",
-    "disable_owned_adapter",
     "export_adapter",
     "get_status",
     "list_checkpoints",
     "prepare_job",
-    "read_adapter_record",
-    "reconcile_owned_adapter_cleanup",
-    "record_matches",
     "recover_runs",
     "run_server",
     "serve_chat",
@@ -335,25 +321,7 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
-
-        deployment_recovery_stop = threading.Event()
-
-        async def recover_deployments_background() -> None:
-            while not deployment_recovery_stop.is_set():
-                try:
-                    recovered = await asyncio.to_thread(
-                        serving.recover_deployments, stop_event=deployment_recovery_stop
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    _log.exception("deployment recovery scan failed")
-                else:
-                    if recovered:
-                        _log.info("recovered %d interrupted deployment(s)", recovered)
-                await asyncio.to_thread(deployment_recovery_stop.wait, 30.0)
-
-        deployment_recovery_task = asyncio.create_task(recover_deployments_background())
+        serving.recover_deployments()
         # Recover completion-time customer charges left pending/failed by a transient blip or a
         # crash between the `done` write and the charge. recover_runs deliberately excludes terminal
         # `done`, so those would otherwise leak revenue; this startup sweep catches them promptly.
@@ -402,9 +370,6 @@ def create_app():
         try:
             yield
         finally:
-            deployment_recovery_stop.set()
-            with contextlib.suppress(asyncio.CancelledError):
-                await deployment_recovery_task
             for task in (
                 startup_charge_task,
                 cost_task,

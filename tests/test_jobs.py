@@ -2709,7 +2709,7 @@ def test_cancel_tears_down_legacy_or_malformed_warmstart_without_child_pricing(
                 spec=public_spec.to_dict(),
                 billing_context={"org_id": "org-a"},
                 remote={"provider": "fake", "job_id": "job-1"},
-                deployment={"state": "ready", "target_revision": 1, "mutation_id": "m1"},
+                deployment={"state": "ready"},
                 effective_preparation=snapshot,
             )
         )
@@ -2727,9 +2727,7 @@ def test_cancel_tears_down_legacy_or_malformed_warmstart_without_child_pricing(
 
         monkeypatch.setattr(flash.providers, "get_provider", lambda name: Provider())
         monkeypatch.setattr(
-            flash.serve.deploy,
-            "reconcile_owned_adapter_cleanup",
-            lambda run_id, cleanup: calls.append("undeploy") or True,
+            flash.serve.deploy, "undeploy_adapter", lambda run_id: calls.append("undeploy")
         )
         monkeypatch.setattr(
             orch, "_gc_run_endpoints", lambda spec: calls.append(("gc", spec.train.lora_rank))

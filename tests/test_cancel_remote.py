@@ -12,8 +12,6 @@ from __future__ import annotations
 import sys
 import types
 
-import pytest
-
 import flash.providers.runpod.train as ftrain
 from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
 
@@ -221,294 +219,12 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
-
-
-@pytest.mark.parametrize(
-    "cleanup_error",
-    [
-        pytest.param(RuntimeError("delete failed"), id="delete-failure"),
-        pytest.param(RuntimeError("disable readback was inconclusive"), id="ambiguous-readback"),
-    ],
-)
-def test_cancel_retains_exact_cleanup_identity_until_disable_is_confirmed(
-    tmp_path, monkeypatch, cleanup_error
-):
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cleanup-keep"})
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            deployment={
-                "state": "deploying",
-                "mutation_id": "mutation-7",
-                "target_revision": 7,
-            },
-        )
-    )
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "reconcile_owned_adapter_cleanup",
-        lambda *_args: (_ for _ in ()).throw(cleanup_error),
-    )
-
-    out = orch.cancel_run(spec.run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert out.deployment_cleanup["target"] == {
-        "revision": 7,
-        "mutation_id": "mutation-7",
-    }
-    assert out.deployment_cleanup["prior"] is None
-    assert "deployment_cleanup" not in out.to_dict()
-
-
-def test_cancel_clears_exact_cleanup_identity_after_confirmed_disable(tmp_path, monkeypatch):
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cleanup-done"})
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            deployment={
-                "state": "deploying",
-                "mutation_id": "mutation-8",
-                "target_revision": 8,
-            },
-        )
-    )
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
-    disabled = []
-    monkeypatch.setattr(
-        deploy,
-        "reconcile_owned_adapter_cleanup",
-        lambda *args: disabled.append(args) or True,
-    )
-
-    out = orch.cancel_run(spec.run_id)
-
-    assert len(disabled) == 1
-    assert disabled[0][0] == spec.run_id
-    assert disabled[0][1]["target"] == {"revision": 8, "mutation_id": "mutation-8"}
-    assert disabled[0][1]["prior"] is None
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert out.deployment_cleanup is None
-
-
-def test_cancel_preserves_ready_checkpoint_deployment(tmp_path, monkeypatch):
-    # A cancelled run keeps any ready per-step CHECKPOINT deployment it registered: the chat path still
-    # serves a cancelled run's checkpoint, so cancel must not undeploy it or reconcile its registry
-    # identity. Only a FINAL adapter deployment is torn down on cancel.
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
-    from flash.spec import JobSpec
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-ckpt-keep"})
-    checkpoint = {"state": "ready", "checkpoint_step": 2, "mutation_id": "m2", "target_revision": 2}
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            deployment=dict(checkpoint),
-        )
-    )
-
-    def _forbidden(*_a, **_k):
-        pytest.fail("a ready checkpoint deployment must not be reconciled or undeployed on cancel")
-
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", _forbidden)
-    monkeypatch.setattr(deploy, "reconcile_owned_adapter_cleanup", _forbidden)
-
-    out = orch.cancel_run(spec.run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment == checkpoint
-    assert out.deployment_cleanup is None
-
-
-def test_cancel_defers_networked_reconcile_until_after_gpu_teardown(tmp_path, monkeypatch):
-    # A run still training bills a GPU, so its serving-registry reconcile (a networked call) must not
-    # run before GPU teardown: a serving outage must never block GPU destruction. cancel persists a
-    # local cleanup intent from the deployment's immutable identity on the first pass and reconciles
-    # only after _gc_run_endpoints.
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
-
-    events = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: events.append("teardown"))
-    monkeypatch.setattr(
-        deploy,
-        "owned_adapter_cleanup",
-        lambda *_a, **_k: pytest.fail("networked registry read must be deferred past GPU teardown"),
-    )
-    monkeypatch.setattr(
-        deploy,
-        "reconcile_owned_adapter_cleanup",
-        lambda *_args: events.append("reconcile") or True,
-    )
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-defer"})
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            deployment={"state": "ready", "mutation_id": "m9", "target_revision": 9},
-        )
-    )
-
-    out = orch.cancel_run(spec.run_id)
-
-    assert events == ["teardown", "reconcile"]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert out.deployment_cleanup is None
-
-
-def test_cancel_terminal_run_reconciles_pending_deployment_in_band(tmp_path, monkeypatch):
-    # A run already in a terminal state (not `deployed`) returns early from cancel, so its pending
-    # serving-adapter cleanup must be reconciled on the first pass rather than deferred to background
-    # recovery: a terminal run has no live training GPU to protect, so there is nothing to tear down
-    # first. Under the deferred (remote=False) first pass the networked read never ran and the FINAL
-    # deployment stayed advertised `ready`.
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
-
-    reads = []
-    monkeypatch.setattr(
-        deploy,
-        "owned_adapter_cleanup",
-        lambda _run_id, _deployment=None: reads.append("read") or None,
-    )
-    monkeypatch.setattr(
-        deploy,
-        "reconcile_owned_adapter_cleanup",
-        lambda *_args: pytest.fail("authoritative absence must retire the record without a reconcile"),
-    )
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-terminal-cleanup"})
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="failed",
-            spec=spec.to_dict(),
-            deployment={"state": "ready", "mutation_id": "m3", "target_revision": 3},
-        )
-    )
-
-    out = orch.cancel_run(spec.run_id)
-
-    # The authoritative registry read ran in-band (the fix); the deployment is retired now, not left
-    # `ready` for background recovery.
-    assert reads == ["read"], "terminal cancel must reconcile the pending deployment in-band"
-    assert out.state == "failed", "an already-terminal run keeps its terminal state"
-    assert out.deployment["state"] == "undeployed"
-
-
-def test_cancel_persists_cleanup_intent_when_authoritative_read_raises(tmp_path, monkeypatch):
-    # If the authoritative owned_adapter_cleanup read raises, cancel must NOT treat that as the adapter
-    # being gone (which would drop the record at `ready` with the remote adapter still live). It
-    # persists a local cleanup intent from the deployment's immutable identity so reconcile retries.
-    import flash.runner as orch
-    import flash.serve.deploy as deploy
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
-    from flash.spec import JobSpec
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-read-fail"})
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="deployed",
-            spec=spec.to_dict(),
-            deployment={"state": "ready", "mutation_id": "m9", "target_revision": 9},
-        )
-    )
-    monkeypatch.setattr(
-        deploy,
-        "owned_adapter_cleanup",
-        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("registry read failed")),
-    )
-    # Reconcile also cannot confirm the disable, so the intent must survive for a later retry.
-    monkeypatch.setattr(
-        deploy,
-        "reconcile_owned_adapter_cleanup",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("disable unconfirmed")),
-    )
-
-    out = orch.cancel_run(spec.run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "ready"
-    assert out.deployment_cleanup is not None
-    assert out.deployment_cleanup["target"] == {"revision": 9, "mutation_id": "m9"}
-    assert out.deployment_cleanup["prior"] is None
-
-
-def test_complete_cleanup_returns_recovered_deployed_run_to_done(tmp_path, monkeypatch):
-    # A crash-recovery reconcile (via complete_deployment_cleanup) that retires a `deployed` run's only
-    # deployment must return the run to `done`, mirroring mark_undeployed / revoke_deployment_intent,
-    # so the chat path does not keep a `deployed` run alive with no ready deployment.
-    import flash.runner as orch
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.spec import JobSpec
-
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-1"})
-    deployment = {"state": "ready", "mutation_id": "m9", "target_revision": 9}
-    cleanup = {
-        "adapter_id": spec.run_id,
-        "target": {"revision": 9, "mutation_id": "m9"},
-        "prior": None,
-        "local_deployment": dict(deployment),
-    }
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="deployed",
-            spec=spec.to_dict(),
-            deployment=dict(deployment),
-            deployment_cleanup=cleanup,
-        )
-    )
-
-    out = orch.complete_deployment_cleanup(spec.run_id, cleanup)
-
-    assert out.state == "done"
-    assert out.deployment["state"] == "undeployed"
-    assert out.deployment_cleanup is None
 
 
 def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path, monkeypatch):
@@ -527,9 +243,7 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     undeployed: list[str] = []
     monkeypatch.setattr(
-        deploy,
-        "owned_adapter_cleanup",
-        lambda rid, _deployment=None: undeployed.append(rid) or None,
+        deploy, "undeploy_adapter", lambda rid, *a, **k: undeployed.append(rid) or ["x"]
     )
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
@@ -570,7 +284,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
@@ -580,9 +294,9 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     called = []
     real_helper = orch.mark_deployment_undeployed
 
-    def spy(run_id, **kwargs):
+    def spy(run_id):
         called.append(run_id)
-        return real_helper(run_id, **kwargs)
+        return real_helper(run_id)
 
     monkeypatch.setattr(orch, "mark_deployment_undeployed", spy)
 
@@ -613,16 +327,17 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", lambda _run_id, _deployment=None: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # Inject the race: a concurrent mark_undeployed flips the run to terminal `done` AFTER
     # cancel_run's initial get_status (state="deployed") but BEFORE the deployment is retired.
-    def racing_undeploy(_run_id, _deployment=None):
+    def racing_undeploy(*a, **k):
         # mark_undeployed moves a live `deployed` run to terminal `done`.
         orch.mark_undeployed(spec.run_id)
+        return ["flash-serve-5090-x"]
 
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", racing_undeploy)
+    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
 
     out = orch.cancel_run(spec.run_id)
     # Explicit cancel WINS over the racing undeploy: even though mark_undeployed flipped the
@@ -659,11 +374,12 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
 
     # The racing undeploy flips the run to terminal `done` mid-cancel (after cancel_run's
     # initial non-terminal read, before its final `cancelled` write).
-    def racing_undeploy(_run_id, _deployment=None):
+    def racing_undeploy(*a, **k):
         orch.mark_undeployed(spec.run_id)
         assert orch.get_status(spec.run_id).state == "done"  # the race landed
+        return ["flash-serve-5090-x"]
 
-    monkeypatch.setattr(deploy, "owned_adapter_cleanup", racing_undeploy)
+    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled", "explicit cancel must win over a racing undeploy `done`"

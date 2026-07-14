@@ -11,8 +11,6 @@ from flash.serve.deploy import (
     undeploy_adapter,
 )
 
-MUTATION_ID = "00000000-0000-4000-8000-000000000001"
-
 
 def test_serving_base_url_default_and_override(monkeypatch):
     from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
@@ -26,71 +24,109 @@ def test_serving_base_url_default_and_override(monkeypatch):
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
-    dep = deploy_adapter(
-        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
-    )
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
-    assert data == {
-        "run_id": "r1",
-        "model": "Qwen/Qwen3.5-0.8B",
-        "adapter_hf_prefix": "rl/r1/seed0/adapter",
-        "openai_model": "r1",
-        "endpoint_name": serving_base_url(),
-        "openai_base_url": f"{serving_base_url()}/v1",
-        "state": "dry_run",
-    }
+    assert data["state"] == "dry_run"
+    assert "gpu" not in data
+    assert "mode" not in data
+    assert "idle_timeout_s" not in data
+    assert "est_idle_cost_usd_per_day" not in data
 
 
-def test_undeploy_absent_record_is_clean(monkeypatch):
+def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(500, text="no base-model engines loaded", request=req)
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert ei.value.status_code == 500
+    assert "500" in str(ei.value)
+    assert "no base-model engines loaded" in str(ei.value)
+    assert "operator must check" in str(ei.value)
+
+
+def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(401, text="invalid internal key", request=req)
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    msg = str(ei.value)
+    assert ei.value.status_code == 401
+    assert "401" in msg
+    assert "FREESOLO_INTERNAL_KEY" in msg
+    assert "no engine" not in msg
+    assert "operator must check" not in msg
+
+
+def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    def fake_post(url, *a, **k):
+        raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert ei.value.status_code is None
+    assert "could not reach" in str(ei.value)
+
+
+def test_undeploy_calls_freesolo_delete(monkeypatch):
     import flash.serve.deploy as deploy_mod
 
-    monkeypatch.setattr(deploy_mod, "read_adapter_record", lambda _run_id: None)
-    monkeypatch.setattr(
-        deploy_mod,
-        "_serving_request",
-        lambda *a, **k: pytest.fail("absent adapter must not delete"),
-    )
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    deleted_urls = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
+        deleted_urls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
+    out = undeploy_adapter("flash-1-abc")
+    assert out == ["flash-1-abc"]
+    assert deleted_urls == ["https://serve.example/adapters/flash-1-abc"]
+
+
+def test_undeploy_404_is_clean(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+
+    class _Resp:
+        status_code = 404
+
+        def raise_for_status(self):  # pragma: no cover
+            raise AssertionError("404 must not raise")
+
+    monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
     assert undeploy_adapter("flash-1-gone") == []
-
-
-def test_undeploy_disables_exact_registry_identity(monkeypatch):
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setattr(
-        deploy_mod,
-        "read_adapter_record",
-        lambda _run_id: {"registry_revision": 7, "mutation_id": "m7", "status": "ready"},
-    )
-    disabled = []
-    monkeypatch.setattr(
-        deploy_mod, "disable_owned_adapter", lambda *args: disabled.append(args)
-    )
-    assert undeploy_adapter("flash-7-live") == ["flash-7-live"]
-    assert disabled == [("flash-7-live", 7, "m7")]
-
-
-@pytest.mark.parametrize(
-    "record",
-    [
-        pytest.param({"registry_revision": 0, "mutation_id": "m7"}, id="nonpositive-revision"),
-        pytest.param({"registry_revision": "7", "mutation_id": "m7"}, id="string-revision"),
-        pytest.param({"registry_revision": 7, "mutation_id": "  "}, id="blank-mutation"),
-        pytest.param({"registry_revision": 7}, id="missing-mutation"),
-    ],
-)
-def test_undeploy_malformed_identity_raises_controlled_error(monkeypatch, record):
-    # A malformed persisted identity must raise a controlled ServingError (mapped to a 502 by the
-    # undeploy route) rather than a raw KeyError/ValueError that would surface as an opaque 500.
-    import flash.serve.deploy as deploy_mod
-
-    monkeypatch.setattr(deploy_mod, "read_adapter_record", lambda _run_id: {**record, "status": "ready"})
-    monkeypatch.setattr(
-        deploy_mod,
-        "disable_owned_adapter",
-        lambda *_args: pytest.fail("a malformed registry identity must not be disabled"),
-    )
-    with pytest.raises(deploy_mod.ServingError, match="registry identity was malformed"):
-        undeploy_adapter("flash-7-bad")
 
 
 def test_deployment_roundtrip_dict():
@@ -174,11 +210,199 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
         assert ei.value.status_code == 400, bad
 
 
+def _registry_resp(records):
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "adapters": records}
+
+    return _Resp()
+
+
+def test_deploy_reads_registry_back_before_ready(monkeypatch):
+    """A terminal /v1 override keeps registration and verification on the control root."""
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    posts: list[str] = []
+    gets: list[str] = []
+
+    def fake_post(url, **k):
+        posts.append(url)
+        return _PostResp()
+
+    def fake_get(url, **k):
+        gets.append(url)
+        return _registry_resp([{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}])
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
+    monkeypatch.setattr(deploy_mod.httpx, "get", fake_get)
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert dep.state == "ready"
+    assert dep.endpoint_name == "https://serve.example"
+    assert dep.openai_base_url == "https://serve.example/v1"
+    assert posts == ["https://serve.example/adapters"]
+    assert gets == ["https://serve.example/adapters", "https://serve.example/adapters"]
+
+
+def test_deploy_registry_readback_falls_back_to_camel_adapter_id(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": None, "adapterId": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+        ),
+    )
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert dep.state == "ready"
+
+
+def test_deploy_fails_when_adapter_never_appears_in_registry(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: _registry_resp([]))
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    msg = str(ei.value)
+    assert "never appeared" in msg
+    assert "Unknown adapter id" in msg
+
+
+def test_deploy_fails_when_registry_keeps_prior_checkpoint(monkeypatch):
+    """A checkpoint swap that leaves the OLD subfolder registered must fail loudly."""
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+
+    class _PostResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: _PostResp())
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/checkpoints/step_100/adapter"}]
+        ),
+    )
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert "previously deployed checkpoint" in str(ei.value)
+
+
+def test_deploy_5xx_recovers_when_registry_shows_requested_checkpoint(monkeypatch):
+    """An ambiguous POST failure (timeout/5xx) is resolved by reading the registry back."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(
+        deploy_mod.httpx,
+        "get",
+        lambda *a, **k: _registry_resp(
+            [{"adapter_id": "flash-1-abc", "subfolder": "rl/r1/seed0/adapter"}]
+        ),
+    )
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert dep.state == "ready"
+
+
+def test_deploy_5xx_recovers_when_new_registry_record_omits_subfolder(monkeypatch):
+    """Older serving builds omit subfolder; accept it only when there was no prior deployment."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    responses = iter([_registry_resp([]), _registry_resp([{"adapter_id": "flash-1-abc"}])])
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
+
+    dep = deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert dep.state == "ready"
+
+
+def test_deploy_5xx_rejects_subfolderless_record_after_prior_deployment(monkeypatch):
+    """A checkpoint swap must not accept a subfolder-less record after an ambiguous POST failure."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(502, text="bad gateway", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    responses = iter(
+        [
+            _registry_resp([{"adapter_id": "flash-1-abc"}]),
+            _registry_resp([{"adapter_id": "flash-1-abc"}]),
+        ]
+    )
+    monkeypatch.setattr(deploy_mod.httpx, "get", lambda *a, **k: next(responses))
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+    assert "cannot confirm" in str(ei.value)
+
+
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    dep = deploy_adapter(
-        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
-    )
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
@@ -187,9 +411,7 @@ def test_deployment_dict_carries_openai_v1_url(monkeypatch):
 
 def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
-    dep = deploy_adapter(
-        "r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", mutation_id=MUTATION_ID, dry_run=True
-    )
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"

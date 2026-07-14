@@ -19,47 +19,7 @@ if TYPE_CHECKING:
     from flash.runner import RunStatus
 
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
-_CHECKPOINT_DEPLOYMENT_STATES = frozenset(
-    {"queued", "provisioning", "running", "done", "deployed", "failed", "cancelled"}
-)
-_CHECKPOINT_FORWARD_STATES = {
-    "queued": frozenset({"provisioning", "running", "done"}),
-    "provisioning": frozenset({"running", "done"}),
-    "running": frozenset({"done"}),
-}
-
-
-def deployment_lifecycle_allows_intent(
-    current_state: str,
-    *,
-    expected_state: str,
-    is_checkpoint: bool,
-) -> bool:
-    """Return whether exact queued lifecycle ownership still permits registry intent."""
-    allowed_states = _CHECKPOINT_DEPLOYMENT_STATES if is_checkpoint else _FINAL_DEPLOYMENT_STATES
-    if expected_state not in allowed_states or current_state not in allowed_states:
-        return False
-    if current_state == expected_state:
-        return True
-    if not is_checkpoint:
-        return False
-    return current_state in _CHECKPOINT_FORWARD_STATES.get(expected_state, frozenset())
-
-
-def _local_cleanup_intent(run_id: str, deployment: dict) -> dict | None:
-    """Best-effort cleanup identity recovered from a local deployment record.
-
-    When the authoritative registry read fails (or is deferred past provider teardown) during cancel,
-    the local deployment still carries the immutable ``target_revision``/``mutation_id`` this attempt
-    registered, which is enough to persist a cleanup intent for the reconcile pass to retry. Returns
-    ``None`` when the local identity is itself malformed and no intent can be formed.
-    """
-    from flash.serve.deploy import ServingError, persisted_adapter_cleanup
-
-    try:
-        return persisted_adapter_cleanup(run_id, deployment)
-    except ServingError:
-        return None
+_RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 
 
 def cancel_run(run_id: str) -> RunStatus:
@@ -70,138 +30,82 @@ def cancel_run(run_id: str) -> RunStatus:
         _update,
         actual_steps_run,
         charge_usd_for_spec,
-        complete_deployment_cleanup,
         effective_spec_from_status,
         get_status,
-        mark_deployment_cleanup,
         mark_deployment_undeployed,
-        revoke_deployment_attempt,
-        revoke_deployment_intent,
     )
     from flash.server._locks import _deploy_lock
 
-    def revoke_current_deployment_ownership(*, remote: bool) -> RunStatus:
+    with _deploy_lock(run_id):
         status = get_status(run_id)
-        attempt = status.deployment_attempt
-        if isinstance(attempt, dict):
-            revoke_deployment_attempt(run_id, attempt)
-        status = get_status(run_id)
-        deployment = status.deployment or {}
-        if deployment.get("state") == "deploying":
-            mutation_id = str(deployment.get("mutation_id") or "")
-            if mutation_id:
-                revoke_deployment_intent(run_id, mutation_id)
-        status = get_status(run_id)
-        cleanup = status.deployment_cleanup
-        if not isinstance(cleanup, dict):
-            deployment = status.deployment or {}
-            # a cancelled run keeps any ready per-step checkpoint deployment it registered, so only a
-            # final adapter deployment is torn down on cancel.
-            is_checkpoint = deployment.get("checkpoint_step") is not None
-            if not is_checkpoint and deployment.get("state") in {"ready", "deployed"}:
-                ownership: dict | None
-                authoritative_absence = False
-                if remote:
-                    try:
-                        from flash.serve.deploy import owned_adapter_cleanup
-
-                        ownership = owned_adapter_cleanup(run_id, deployment)
-                        authoritative_absence = ownership is None
-                    except Exception:
-                        # the registry read failed, so persist local immutable cleanup identity for retry.
-                        ownership = _local_cleanup_intent(run_id, deployment)
-                else:
-                    # defer the networked registry read until after provider teardown.
-                    ownership = _local_cleanup_intent(run_id, deployment)
-                if authoritative_absence:
-                    mark_deployment_undeployed(run_id, expect_deployment=deployment)
-                elif ownership is not None:
-                    cleanup = {
-                        **ownership,
-                        "local_deployment": deployment,
-                        "requested_at": time.time(),
-                    }
-                    marked = mark_deployment_cleanup(
-                        run_id,
-                        cleanup,
-                        expect_deployment=deployment,
-                    )
-                    cleanup = marked.deployment_cleanup
-        if remote and isinstance(cleanup, dict):
+        if status.state in TERMINAL_STATES:
+            return status
+        # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
+        entered_deployed = status.state == "deployed"
+        public_spec = JobSpec.from_dict(status.spec)
+        effective_spec = None
+        with contextlib.suppress(Exception):
+            effective_spec = effective_spec_from_status(status)
+        cleanup_spec = effective_spec or public_spec
+        # a run cancelled mid-training is re-priced to how far it got. a deployed run already
+        # completed training, so it keeps the full quoted cost. pricing happens after teardown from
+        # the freshest persisted heartbeat.
+        bill_cancel = bool(status.billing_context) and not entered_deployed
+        remote = status.remote or {}
+        if status.state == "deployed":
             try:
-                from flash.serve.deploy import reconcile_owned_adapter_cleanup
+                from flash.serve.deploy import undeploy_adapter
 
-                reconciled = reconcile_owned_adapter_cleanup(run_id, cleanup)
+                undeploy_adapter(run_id)
+                if status.deployment:
+                    mark_deployment_undeployed(run_id)
             except Exception:
                 pass
+        if remote:
+            try:
+                from flash.providers import get_provider
+                from flash.providers.base import JobHandle
+
+                handle = JobHandle.from_dict(remote)
+                provider = get_provider(handle.provider)
+                provider.cancel(handle)
+                provider.destroy(handle)
+            except Exception:
+                pass
+        with contextlib.suppress(Exception):
+            _gc_run_endpoints(cleanup_spec)
+        # price only from the validated effective snapshot. a missing or malformed private snapshot
+        # must never make the public child rank authoritative, but it also must never block teardown.
+        cancel_charge_usd: float | None = None
+        billing_diagnostic: dict = {}
+        if bill_cancel:
+            if effective_spec is not None:
+                cancel_charge_usd = charge_usd_for_spec(
+                    effective_spec,
+                    steps=actual_steps_run(get_status(run_id)),
+                    fallback=0.0,
+                )
             else:
-                if reconciled:
-                    complete_deployment_cleanup(run_id, cleanup)
-        return get_status(run_id)
-
-    with _deploy_lock(run_id):
-        status = get_status(run_id)
-        entered_deployed = status.state == "deployed"
-        # a deployed or already-terminal run has no live training gpu, so reconcile its serving
-        # adapter now. a run still training bills a gpu, so defer the networked reconcile until after
-        # teardown below.
-        reconcile_now = entered_deployed or status.state in TERMINAL_STATES
-        status = revoke_current_deployment_ownership(remote=reconcile_now)
-        if status.state in TERMINAL_STATES and not entered_deployed:
-            return status
-
-    public_spec = JobSpec.from_dict(status.spec)
-    effective_spec = None
-    with contextlib.suppress(Exception):
-        effective_spec = effective_spec_from_status(status)
-    cleanup_spec = effective_spec or public_spec
-    # a run cancelled mid-training is re-priced to how far it got. a deployed run already completed
-    # training, so it keeps the full quoted cost. pricing happens after teardown from the freshest
-    # persisted heartbeat.
-    bill_cancel = bool(status.billing_context) and not entered_deployed
-    remote = status.remote or {}
-    if remote:
-        try:
-            from flash.providers import get_provider
-            from flash.providers.base import JobHandle
-
-            handle = JobHandle.from_dict(remote)
-            provider = get_provider(handle.provider)
-            provider.cancel(handle)
-            provider.destroy(handle)
-        except Exception:
-            pass
-    with contextlib.suppress(Exception):
-        _gc_run_endpoints(cleanup_spec)
-
-    # price only from the validated effective snapshot. a missing or malformed private snapshot must
-    # never make the public child rank authoritative, but it also must never block teardown.
-    cancel_charge_usd: float | None = None
-    billing_diagnostic: dict = {}
-    if bill_cancel:
-        if effective_spec is not None:
-            cancel_charge_usd = charge_usd_for_spec(
-                effective_spec,
-                steps=actual_steps_run(get_status(run_id)),
-                fallback=0.0,
-            )
-        else:
-            cancel_charge_usd = 0.0
-            billing_diagnostic = {
-                "billing_state": "failed",
-                "billing_error": (
-                    "cancellation charge was not computed because the private preparation "
-                    "snapshot was unavailable or invalid; teardown was still attempted"
-                ),
-            }
-
-    with _deploy_lock(run_id):
-        revoke_current_deployment_ownership(remote=True)
+                cancel_charge_usd = 0.0
+                billing_diagnostic = {
+                    "billing_state": "failed",
+                    "billing_error": (
+                        "cancellation charge was not computed because the private preparation "
+                        "snapshot was unavailable or invalid; teardown was still attempted"
+                    ),
+                }
         # set the cancel charge when re-pricing a mid-training cancel. a deployed-then-cancelled run
         # keeps its already-quoted cost_usd. the billing retry sweep is idempotent by run id.
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
         _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
+        final = get_status(run_id)
+        if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
+            with contextlib.suppress(Exception):
+                from flash.serve.deploy import undeploy_adapter
+
+                undeploy_adapter(run_id)
+                mark_deployment_undeployed(run_id)
         with contextlib.suppress(Exception):
             from flash.server.checkpoints import register_checkpoints_best_effort
 
@@ -364,13 +268,7 @@ def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     status.state = "deployed"
 
 
-def mark_deployed(
-    run_id: str,
-    deployment: dict,
-    expect_state: str | None = None,
-    expect_mutation_id: str | None = None,
-    expect_deployment_state: str | None = None,
-) -> RunStatus:
+def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
     with _STATUS_LOCK:
@@ -379,17 +277,6 @@ def mark_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        current_deployment = status.deployment or {}
-        if (
-            expect_mutation_id is not None
-            and current_deployment.get("mutation_id") != expect_mutation_id
-        ):
-            return status
-        if (
-            expect_deployment_state is not None
-            and current_deployment.get("state") != expect_deployment_state
-        ):
-            return status
         _promote_final_deployment(status, deployment)
         status.updated_at = time.time()
         _save_status(status)
@@ -397,11 +284,7 @@ def mark_deployed(
 
 
 def mark_checkpoint_deployed(
-    run_id: str,
-    deployment: dict,
-    expect_state: str | None = None,
-    expect_mutation_id: str | None = None,
-    expect_deployment_state: str | None = None,
+    run_id: str, deployment: dict, expect_state: str | None = None
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -416,17 +299,6 @@ def mark_checkpoint_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        current_deployment = status.deployment or {}
-        if (
-            expect_mutation_id is not None
-            and current_deployment.get("mutation_id") != expect_mutation_id
-        ):
-            return status
-        if (
-            expect_deployment_state is not None
-            and current_deployment.get("state") != expect_deployment_state
-        ):
-            return status
         if status.state in _FINAL_DEPLOYMENT_STATES:
             _promote_final_deployment(status, deployment)
         else:
@@ -436,214 +308,19 @@ def mark_checkpoint_deployed(
         return status
 
 
-def mark_deployment_attempt_queued(
-    run_id: str,
-    attempt: dict,
-    *,
-    expect_state: str,
-    expect_deployment: dict | None,
-    expect_attempt: dict | None,
+def mark_deployment_pending(
+    run_id: str, deployment: dict, expect_state: str | None = None
 ) -> RunStatus:
-    """Persist exact queued ownership without hiding an active ready deployment."""
+    """Attach an in-progress deployment record without changing the run lifecycle state."""
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if status.state != expect_state:
+        if status.state == "dry_run":
             return status
-        if status.deployment != expect_deployment or status.deployment_attempt != expect_attempt:
+        if expect_state is not None and status.state != expect_state:
             return status
-        phase = attempt.get("phase")
-        queued = attempt.get("deployment")
-        if (
-            phase not in {"initial", "redeploy"}
-            or not isinstance(queued, dict)
-            or not queued.get("mutation_id")
-        ):
-            raise ValueError("invalid deployment attempt")
-        if phase == "redeploy":
-            if attempt.get("active_deployment") != expect_deployment:
-                raise ValueError("redeploy attempt active deployment mismatch")
-        else:
-            status.deployment = queued
-        status.deployment_attempt = attempt
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def mark_deployment_intent(
-    run_id: str,
-    intent: dict,
-    *,
-    expect_attempt: dict,
-    expect_state: str,
-) -> RunStatus:
-    """Replace exact queued ownership with durable forward-only registry intent."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment_attempt != expect_attempt:
-            return status
-        queued = expect_attempt.get("deployment")
-        phase = expect_attempt.get("phase")
-        if (
-            not isinstance(queued, dict)
-            or not queued.get("mutation_id")
-            or intent.get("mutation_id") != queued.get("mutation_id")
-        ):
-            return status
-        if not deployment_lifecycle_allows_intent(
-            status.state,
-            expected_state=expect_state,
-            is_checkpoint=queued.get("checkpoint_step") is not None,
-        ):
-            return status
-        if phase == "initial":
-            current = status.deployment or {}
-            if (
-                current != queued
-                or current.get("state") != "deploying"
-                or current.get("mutation_id") != queued.get("mutation_id")
-            ):
-                return status
-        elif phase == "redeploy":
-            if status.deployment != expect_attempt.get("active_deployment"):
-                return status
-        else:
-            return status
-        status.deployment = intent
-        status.deployment_attempt = None
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def revoke_deployment_attempt(run_id: str, attempt: dict) -> RunStatus:
-    """Revoke exact queued ownership without disturbing a prior active redeploy."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment_attempt != attempt:
-            return status
-        queued = attempt.get("deployment")
-        if attempt.get("phase") == "redeploy":
-            if status.deployment != attempt.get("active_deployment"):
-                return status
-        elif attempt.get("phase") == "initial" and status.deployment == queued:
-            status.deployment = {**queued, "state": "undeployed"}
-        else:
-            return status
-        status.deployment_attempt = None
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def revoke_deployment_intent(run_id: str, mutation_id: str) -> RunStatus:
-    """Revoke an exact durable deployment intent before registry mutation."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        deployment = status.deployment or {}
-        if deployment.get("state") != "deploying" or deployment.get("mutation_id") != mutation_id:
-            return status
-        target_revision = deployment.get("target_revision")
-        if not isinstance(target_revision, int):
-            return status
-        prior_revision = deployment.get("prior_revision")
-        prior_mutation_id = deployment.get("prior_mutation_id")
-        prior = None
-        if prior_revision is not None:
-            prior = {
-                "revision": prior_revision,
-                "mutation_id": prior_mutation_id,
-            }
-        status.deployment_cleanup = {
-            "adapter_id": run_id,
-            "target": {
-                "revision": target_revision,
-                "mutation_id": mutation_id,
-            },
-            "prior": prior,
-            "requested_at": time.time(),
-        }
-        status.deployment = {**deployment, "state": "undeployed"}
-        status.deployment_attempt = None
-        if status.state == "deployed":
-            status.state = "done"
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def mark_deployment_cleanup(
-    run_id: str,
-    cleanup: dict,
-    *,
-    expect_deployment: dict,
-) -> RunStatus:
-    """Persist exact cleanup ownership for an unchanged active deployment."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment != expect_deployment or status.deployment_cleanup is not None:
-            return status
-        status.deployment_cleanup = cleanup
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def complete_deployment_cleanup(run_id: str, cleanup: dict) -> RunStatus:
-    """Complete exact cleanup and deactivate only its matching local deployment."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment_cleanup != cleanup:
-            return status
-        local_deployment = cleanup.get("local_deployment")
-        if isinstance(local_deployment, dict) and status.deployment == local_deployment:
-            status.deployment = {**local_deployment, "state": "undeployed"}
-            # Mirror mark_undeployed / revoke_deployment_intent: a deployed run that loses its active
-            # deployment returns to `done`, so a crash-recovery reconcile of this cleanup cannot leave
-            # a `deployed` run whose chat path rejects it for having no ready deployment.
-            if status.state == "deployed":
-                status.state = "done"
-        status.deployment_cleanup = None
-        status.updated_at = time.time()
-        _save_status(status)
-        return status
-
-
-def mark_deployment_pre_intent_failed(
-    run_id: str,
-    attempt: dict,
-    failed: dict,
-) -> RunStatus:
-    """Fail an initial attempt or privately clear an exact queued redeploy."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
-
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.deployment_attempt != attempt:
-            return status
-        queued = attempt.get("deployment")
-        phase = attempt.get("phase")
-        if phase == "redeploy":
-            if status.deployment != attempt.get("active_deployment"):
-                return status
-            status.deployment_attempt = None
-        elif phase == "initial" and status.deployment == queued:
-            status.deployment = {**failed, "state": "failed"}
-            status.deployment_attempt = None
-        else:
-            return status
+        status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
         return status
@@ -660,12 +337,22 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         if current.get("state") == "undeployed":
             return status
         if (
-            current.get("mutation_id") is not None
-            and deployment.get("mutation_id") is not None
-            and current.get("mutation_id") != deployment.get("mutation_id")
+            current.get("requested_at") is not None
+            and deployment.get("requested_at") is not None
+            and current.get("requested_at") != deployment.get("requested_at")
         ):
             return status
-        status.deployment = {**deployment, "state": "failed"}
+        previous = deployment.get("previous_deployment")
+        if isinstance(previous, dict) and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES:
+            status.deployment = {
+                **previous,
+                "last_deploy_error": deployment.get("error") or "deployment failed",
+                "last_deploy_failed_at": time.time(),
+            }
+        else:
+            failed = dict(deployment)
+            failed.pop("previous_deployment", None)
+            status.deployment = {**failed, "state": "failed"}
         status.updated_at = time.time()
         _save_status(status)
         return status
@@ -679,8 +366,6 @@ def mark_undeployed(run_id: str) -> RunStatus:
         status = get_status(run_id)
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
-        status.deployment_attempt = None
-        status.deployment_cleanup = None
         if status.state == "deployed":
             status.state = "done"
         status.updated_at = time.time()
@@ -688,29 +373,18 @@ def mark_undeployed(run_id: str) -> RunStatus:
         return status
 
 
-def mark_deployment_undeployed(
-    run_id: str,
-    *,
-    expect_deployment: dict | None = None,
-) -> RunStatus:
-    """Flip only an optionally exact deployment field to ``undeployed``."""
+def mark_deployment_undeployed(run_id: str) -> RunStatus:
+    """Flip ONLY the deployment field to ``undeployed``, leaving the run's state untouched.
+
+    Used by cancel_run — unlike mark_undeployed, never asserts or changes the run state,
+    so it works even after a racing mark_undeployed has already written terminal `done`.
+    """
     from flash.runner import _STATUS_LOCK, _save_status, get_status
 
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if expect_deployment is not None and status.deployment != expect_deployment:
-            return status
-        changed = False
         if status.deployment:
             status.deployment = {**status.deployment, "state": "undeployed"}
-            changed = True
-        if status.deployment_attempt is not None:
-            status.deployment_attempt = None
-            changed = True
-        if status.deployment_cleanup is not None:
-            status.deployment_cleanup = None
-            changed = True
-        if changed:
             status.updated_at = time.time()
             _save_status(status)
         return status

@@ -1158,7 +1158,7 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
-def test_public_run_routes_redact_private_deployment_intent(api):
+def test_public_run_routes_redact_private_and_legacy_deployment_fields(api):
     import flash.runner as runner
 
     key = _login()
@@ -1171,13 +1171,7 @@ def test_public_run_routes_redact_private_deployment_intent(api):
         "endpoint_name": "https://serve.example",
         "openai_base_url": "https://serve.example/v1",
         "url": "https://stale.example/v1",
-        "desired_record": {"adapter_id": run_id},
-        "prior_revision": 4,
-        "target_revision": 5,
-        "mutation_id": "mutation-5",
-        "repo_revision": "a" * 40,
-        "requested_at": 123.0,
-        "verify": True,
+        "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
     }
     runner._save_status(status)
 
@@ -1191,17 +1185,12 @@ def test_public_run_routes_redact_private_deployment_intent(api):
         deployment = body["deployment"]
         assert deployment["openai_base_url"] == "https://serve.example/v1"
         assert "url" not in deployment
-        assert "desired_record" not in deployment
-        assert "prior_revision" not in deployment
-        assert "target_revision" not in deployment
-        assert "mutation_id" not in deployment
-        assert "repo_revision" not in deployment
-        assert "requested_at" not in deployment
-        assert "verify" not in deployment
+        assert "previous_deployment" not in deployment
 
     persisted = runner.get_status(run_id).deployment
-    assert persisted["desired_record"] == {"adapter_id": run_id}
+    assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
+    assert persisted["url"] == "https://stale.example/v1"
 
 
 def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
@@ -1239,7 +1228,7 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
 
     def fake_deploy(**kwargs):
         seen.update(kwargs)
-        return _FakeDeployment(kwargs["adapter_prefix"], _fake_registry_record(kwargs))
+        return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
 
@@ -1317,7 +1306,7 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "deploying"
-    assert "verify" not in resp.json()
+    assert resp.json()["verify"] is True
     assert started["run_id"] == run_id
     assert started["deploy_kwargs"]["adapter_prefix"].endswith(run_id)
 
@@ -1325,796 +1314,6 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployment["state"] == "deploying"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
     assert deployments[0]["deployment"]["state"] == "deploying"
-
-
-def _queue_deploy_job(api, monkeypatch, *, active=False):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "deployed" if active else "done"
-    if active:
-        status.deployment = {
-            "state": "ready",
-            "endpoint_name": "https://old.example",
-            "openai_base_url": "https://old.example/v1",
-        }
-    runner._save_status(status)
-    jobs = []
-    monkeypatch.setattr(
-        app_mod,
-        "start_deployment_job",
-        lambda target, **kwargs: jobs.append((target, kwargs)) or False,
-    )
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-    assert response.status_code == 200, response.text
-    return key, run_id, jobs
-
-
-@pytest.mark.parametrize("failure", ["artifact missing", "revision unavailable"])
-def test_redeploy_pre_intent_failure_preserves_ready_deployment_and_chat(
-    api, monkeypatch, failure
-):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
-
-    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    queued = runner.get_status(run_id)
-    assert queued.deployment["state"] == "ready"
-    assert queued.deployment_attempt["phase"] == "redeploy"
-    public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
-    assert public["deployment"]["state"] == "ready"
-    assert "deployment_attempt" not in public
-
-    monkeypatch.setattr(
-        app_mod,
-        "deploy_adapter",
-        lambda **_kwargs: (_ for _ in ()).throw(ServingError(failure)),
-    )
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert status.deployment["state"] == "ready"
-    assert status.deployment["endpoint_name"] == "https://old.example"
-    assert status.deployment_attempt is None
-    monkeypatch.setattr(
-        app_mod,
-        "serve_chat",
-        lambda **_kwargs: {"choices": [{"message": {"content": "still live"}}]},
-    )
-    chat = api.post(
-        f"/v1/runs/{run_id}/chat",
-        json={"messages": [{"role": "user", "content": "hi"}]},
-        headers=_bearer(key),
-    )
-    assert chat.status_code == 200, chat.text
-
-
-def test_duplicate_private_redeploy_attempt_is_rejected(api, monkeypatch):
-    import flash.runner as runner
-
-    key, run_id, _jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    status = runner.get_status(run_id)
-    assert status.deployment["state"] == "ready"
-    assert status.deployment_attempt["deployment"]["state"] == "deploying"
-
-    duplicate = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-
-    assert duplicate.status_code == 409, duplicate.text
-    assert runner.get_status(run_id).deployment_attempt == status.deployment_attempt
-
-
-def test_initial_pre_intent_failure_remains_failed(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
-    monkeypatch.setattr(
-        app_mod,
-        "deploy_adapter",
-        lambda **_kwargs: (_ for _ in ()).throw(ServingError("artifact missing")),
-    )
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert status.deployment["state"] == "failed"
-    assert status.deployment_attempt is None
-
-
-@pytest.mark.parametrize("active", [False, True])
-def test_undeploy_before_registry_intent_revokes_worker(api, monkeypatch, active):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=active)
-    posts = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda _run_id: [])
-    undeployed = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
-    assert undeployed.status_code == 200, undeployed.text
-
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert posts == []
-    assert status.deployment["state"] == "undeployed"
-    assert status.deployment_attempt is None
-
-
-def test_cancel_revokes_queued_redeploy_before_registry_intent(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    posts = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(
-        "flash.serve.deploy.owned_adapter_cleanup",
-        lambda _run_id, _deployment=None: None,
-    )
-    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
-    assert cancelled.status_code == 200, cancelled.text
-
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert posts == []
-    assert status.state == "cancelled"
-    assert status.deployment["state"] == "undeployed"
-    assert status.deployment_attempt is None
-
-
-@pytest.mark.parametrize(
-    ("expected_state", "current_state", "is_checkpoint", "allowed"),
-    [
-        ("done", "done", False, True),
-        ("done", "cancelled", False, False),
-        ("cancelled", "cancelled", True, True),
-        ("failed", "failed", True, True),
-        ("running", "done", True, True),
-        ("running", "cancelled", True, False),
-        ("running", "failed", True, False),
-    ],
-)
-def test_deployment_lifecycle_intent_states(
-    expected_state, current_state, is_checkpoint, allowed
-):
-    import flash.runner as runner
-
-    assert (
-        runner.deployment_lifecycle_allows_intent(
-            current_state,
-            expected_state=expected_state,
-            is_checkpoint=is_checkpoint,
-        )
-        is allowed
-    )
-
-
-def test_deployment_intent_rejects_lifecycle_change_after_queue(api, monkeypatch):
-    import flash.runner as runner
-
-    _key, run_id, _jobs = _queue_deploy_job(api, monkeypatch)
-    queued = runner.get_status(run_id)
-    attempt = queued.deployment_attempt
-    queued.state = "cancelled"
-    runner._save_status(queued)
-    intent = {
-        **attempt["deployment"],
-        "state": "deploying",
-        "desired_record": {"adapter_id": run_id},
-        "target_revision": 1,
-    }
-
-    marked = runner.mark_deployment_intent(
-        run_id,
-        intent,
-        expect_attempt=attempt,
-        expect_state="done",
-    )
-
-    assert marked.state == "cancelled"
-    assert marked.deployment_attempt == attempt
-    assert marked.deployment == attempt["deployment"]
-    assert "desired_record" not in marked.deployment
-
-
-def test_registry_guard_rejects_lifecycle_change_after_intent(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
-    posts = []
-    disabled = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        status = runner.get_status(run_id)
-        assert status.deployment["state"] == "deploying"
-        status.state = "cancelled"
-        runner._save_status(status)
-        with kwargs["registry_mutation_guard"]():
-            posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(
-        app_mod,
-        "disable_owned_adapter",
-        lambda *args: disabled.append(args) or True,
-    )
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    final = runner.get_status(run_id)
-    assert posts == []
-    assert len(disabled) == 1
-    assert final.state == "cancelled"
-    assert final.deployment["state"] == "failed"
-
-
-def test_cancel_revokes_redeploy_queued_during_unlocked_teardown(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "deployed"
-    status.deployment = {
-        "state": "ready",
-        "endpoint_name": "https://old.example",
-        "openai_base_url": "https://old.example/v1",
-    }
-    runner._save_status(status)
-
-    jobs = []
-    monkeypatch.setattr(
-        app_mod,
-        "start_deployment_job",
-        lambda target, **kwargs: jobs.append((target, kwargs)) or False,
-    )
-    registry = {
-        run_id: {
-            "adapter_id": run_id,
-            "registry_revision": 7,
-            "mutation_id": "ready-mutation",
-            "status": "ready",
-        }
-    }
-    cleanup_attempts = []
-
-    monkeypatch.setattr(
-        "flash.serve.deploy.read_adapter_record",
-        lambda adapter_id: registry.get(adapter_id),
-    )
-
-    def fail_disable(disable_run_id, revision, mutation_id):
-        cleanup_attempts.append((disable_run_id, revision, mutation_id, "failed"))
-        raise ServingError("transient undeploy failure")
-
-    monkeypatch.setattr("flash.serve.deploy.disable_owned_adapter", fail_disable)
-    queued = False
-
-    def queue_redeploy_during_teardown(_spec):
-        nonlocal queued
-        if queued:
-            return
-        queued = True
-        response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-        assert response.status_code == 200, response.text
-
-    monkeypatch.setattr(runner, "_gc_run_endpoints", queue_redeploy_during_teardown)
-    posts = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        with kwargs["registry_mutation_guard"]():
-            posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-
-    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
-    assert cancelled.status_code == 200, cancelled.text
-    assert len(jobs) == 1
-    queued_mutation = jobs[0][1]["deploy_kwargs"]["mutation_id"]
-    after_cancel = runner.get_status(run_id)
-    assert after_cancel.state == "cancelled"
-    assert after_cancel.deployment_attempt is None
-
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    pending = runner.get_status(run_id)
-    assert cleanup_attempts == [
-        (run_id, 7, "ready-mutation", "failed"),
-        (run_id, 7, "ready-mutation", "failed"),
-    ]
-    assert posts == []
-    assert pending.state == "cancelled"
-    assert pending.deployment_attempt is None
-    assert pending.deployment_cleanup["adapter_id"] == run_id
-    assert pending.deployment_cleanup["target"] == {
-        "revision": 7,
-        "mutation_id": "ready-mutation",
-    }
-    assert pending.deployment_cleanup["prior"] is None
-    assert (pending.deployment or {}).get("state") == "ready"
-    assert (pending.deployment or {}).get("mutation_id") != queued_mutation
-
-    def complete_disable(disable_run_id, revision, mutation_id):
-        cleanup_attempts.append((disable_run_id, revision, mutation_id, "completed"))
-        registry[disable_run_id] = {
-            **registry[disable_run_id],
-            "registry_revision": revision + 1,
-            "status": "disabled",
-        }
-        return True
-
-    monkeypatch.setattr("flash.serve.deploy.disable_owned_adapter", complete_disable)
-    import flash.server.routes.serving as serving
-
-    assert serving._recover_deployment(run_id) is True
-    final = runner.get_status(run_id)
-    assert cleanup_attempts[-1] == (run_id, 7, "ready-mutation", "completed")
-    assert final.state == "cancelled"
-    assert final.deployment_cleanup is None
-    assert (final.deployment or {}).get("state") == "undeployed"
-
-    listed = api.get("/v1/deployments", headers=_bearer(key))
-    assert listed.status_code == 200
-    assert listed.json()["deployments"] == []
-    chat = api.post(
-        f"/v1/runs/{run_id}/chat",
-        json={"messages": [{"role": "user", "content": "hello"}]},
-        headers=_bearer(key),
-    )
-    assert chat.status_code == 409
-    assert "was cancelled" in chat.json()["detail"]
-
-
-def test_repeated_cancel_retries_pending_ready_cleanup(api, monkeypatch):
-    import flash.runner as runner
-    import flash.serve.deploy as deploy
-    from flash.serve.deploy import ServingError
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "deployed"
-    status.deployment = {
-        "state": "ready",
-        "endpoint_name": "https://old.example",
-        "target_revision": 4,
-        "mutation_id": "ready-mutation",
-    }
-    runner._save_status(status)
-    registry = {
-        run_id: {
-            "adapter_id": run_id,
-            "registry_revision": 4,
-            "mutation_id": "ready-mutation",
-            "status": "ready",
-        }
-    }
-    attempts = []
-    reads = 0
-
-    def read_adapter(adapter_id):
-        nonlocal reads
-        reads += 1
-        if reads == 1:
-            raise ServingError("registry read unavailable")
-        return registry.get(adapter_id)
-
-    monkeypatch.setattr(deploy, "read_adapter_record", read_adapter)
-
-    def fail_disable(disable_run_id, revision, mutation_id):
-        attempts.append((disable_run_id, revision, mutation_id, "failed"))
-        raise ServingError("delete unavailable")
-
-    monkeypatch.setattr(deploy, "disable_owned_adapter", fail_disable)
-    first = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
-    assert first.status_code == 200
-    assert runner.get_status(run_id).deployment_cleanup is not None
-
-    def complete_disable(disable_run_id, revision, mutation_id):
-        attempts.append((disable_run_id, revision, mutation_id, "completed"))
-        registry[disable_run_id] = {
-            **registry[disable_run_id],
-            "registry_revision": revision + 1,
-            "status": "disabled",
-        }
-        return True
-
-    monkeypatch.setattr(deploy, "disable_owned_adapter", complete_disable)
-    repeated = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
-    assert repeated.status_code == 200
-    final = runner.get_status(run_id)
-    assert attempts[-1] == (run_id, 4, "ready-mutation", "completed")
-    assert final.state == "cancelled"
-    assert final.deployment_cleanup is None
-    assert final.deployment["state"] == "undeployed"
-
-
-def test_cancel_after_initial_intent_prevents_registry_mutation(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch)
-    posts = []
-    reads = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        persisted = runner.get_status(run_id)
-        assert persisted.deployment["state"] == "deploying"
-        assert persisted.deployment_attempt is None
-
-        runner.cancel_run(run_id)
-        with kwargs["registry_mutation_guard"]():
-            posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(
-        "flash.serve.deploy.read_adapter_record",
-        lambda cancelled_run_id: reads.append(cancelled_run_id) or None,
-    )
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert posts == []
-    assert reads == [run_id]
-    assert status.state == "done"
-    assert status.deployment["state"] == "undeployed"
-    assert status.deployment_attempt is None
-    assert status.deployment_cleanup is None
-
-
-def test_cancel_redeploy_after_intent_disables_expected_prior_without_post(api, monkeypatch):
-    import flash.runner as runner
-    import flash.serve.deploy as deploy
-    import flash.server.app as app_mod
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    target, kwargs = jobs[0]
-    target_mutation = kwargs["deploy_kwargs"]["mutation_id"]
-    prior = {
-        "adapter_id": run_id,
-        "registry_revision": 7,
-        "mutation_id": "m7",
-        "status": "ready",
-    }
-    registry = {run_id: dict(prior)}
-    posts = []
-    disabled = []
-
-    def delayed_deploy(**deploy_kwargs):
-        desired = _fake_registry_record(deploy_kwargs)
-        desired_context = {
-            **desired,
-            deploy._PRIOR_MUTATION_ID_CONTEXT_KEY: "m7",
-        }
-        deploy_kwargs["before_registry_mutation"](
-            7,
-            desired_context,
-            8,
-            desired["mutation_id"],
-            desired["repo_revision"],
-        )
-        runner.cancel_run(run_id)
-        with deploy_kwargs["registry_mutation_guard"]():
-            posts.append(desired)
-        return _FakeDeployment(deploy_kwargs["adapter_prefix"], desired, target_revision=8)
-
-    def disable_exact(disable_run_id, revision, mutation_id):
-        assert registry[disable_run_id]["registry_revision"] == revision
-        assert registry[disable_run_id]["mutation_id"] == mutation_id
-        disabled.append((disable_run_id, revision, mutation_id))
-        registry[disable_run_id] = {
-            **registry[disable_run_id],
-            "registry_revision": revision + 1,
-            "status": "disabled",
-        }
-        return True
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(deploy, "read_adapter_record", lambda adapter_id: registry.get(adapter_id))
-    monkeypatch.setattr(deploy, "disable_owned_adapter", disable_exact)
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert posts == []
-    assert disabled == [(run_id, 7, "m7")]
-    assert registry[run_id] == {
-        **prior,
-        "registry_revision": 8,
-        "status": "disabled",
-    }
-    assert registry[run_id]["mutation_id"] != target_mutation
-    assert status.state == "cancelled"
-    assert status.deployment["state"] == "undeployed"
-    assert status.deployment_cleanup is None
-
-
-def test_cancel_redeploy_retains_prior_cleanup_until_recurring_recovery(api, monkeypatch):
-    import flash.runner as runner
-    import flash.serve.deploy as deploy
-    import flash.server.app as app_mod
-    import flash.server.routes.serving as serving
-    from flash.serve.deploy import ServingError
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    target, kwargs = jobs[0]
-    target_mutation = kwargs["deploy_kwargs"]["mutation_id"]
-    prior = {
-        "adapter_id": run_id,
-        "registry_revision": 7,
-        "mutation_id": "m7",
-        "status": "ready",
-    }
-    registry = {run_id: dict(prior)}
-    posts = []
-    attempts = []
-
-    def delayed_deploy(**deploy_kwargs):
-        desired = _fake_registry_record(deploy_kwargs)
-        desired_context = {
-            **desired,
-            deploy._PRIOR_MUTATION_ID_CONTEXT_KEY: "m7",
-        }
-        deploy_kwargs["before_registry_mutation"](
-            7,
-            desired_context,
-            8,
-            desired["mutation_id"],
-            desired["repo_revision"],
-        )
-        runner.cancel_run(run_id)
-        with deploy_kwargs["registry_mutation_guard"]():
-            posts.append(desired)
-        return _FakeDeployment(deploy_kwargs["adapter_prefix"], desired, target_revision=8)
-
-    def fail_disable(disable_run_id, revision, mutation_id):
-        attempts.append((disable_run_id, revision, mutation_id, "failed"))
-        raise ServingError("delete readback unavailable")
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    monkeypatch.setattr(deploy, "read_adapter_record", lambda adapter_id: registry.get(adapter_id))
-    monkeypatch.setattr(deploy, "disable_owned_adapter", fail_disable)
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    cleanup = status.deployment_cleanup
-    assert posts == []
-    assert cleanup["target"] == {"revision": 8, "mutation_id": target_mutation}
-    assert cleanup["prior"] == {"revision": 7, "mutation_id": "m7"}
-    assert attempts == [
-        (run_id, 7, "m7", "failed"),
-        (run_id, 7, "m7", "failed"),
-    ]
-
-    def complete_disable(disable_run_id, revision, mutation_id):
-        attempts.append((disable_run_id, revision, mutation_id, "completed"))
-        registry[disable_run_id] = {
-            **registry[disable_run_id],
-            "registry_revision": revision + 1,
-            "status": "disabled",
-        }
-        return True
-
-    monkeypatch.setattr(deploy, "disable_owned_adapter", complete_disable)
-    assert serving._recover_deployment(run_id) is True
-
-    recovered = runner.get_status(run_id)
-    assert attempts[-1] == (run_id, 7, "m7", "completed")
-    assert registry[run_id]["registry_revision"] == 8
-    assert registry[run_id]["mutation_id"] == "m7"
-    assert registry[run_id]["status"] == "disabled"
-    assert recovered.deployment_cleanup is None
-
-
-def test_active_worker_prevents_age_based_attempt_replacement(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.routes.serving as serving
-
-    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    status = runner.get_status(run_id)
-    status.deployment_attempt["deployment"]["updated_at"] = 0.0
-    status.deployment_attempt["deployment"]["requested_at"] = 0.0
-    runner._save_status(status)
-
-    duplicate = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-    assert duplicate.status_code == 409
-    assert len(jobs) == 1
-    assert runner.get_status(run_id).deployment_attempt == status.deployment_attempt
-    serving._clear_deployment_worker_active(
-        run_id, status.deployment_attempt["deployment"]["mutation_id"]
-    )
-
-
-def test_newer_queued_mutation_replaces_stale_attempt(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.routes.serving as serving
-
-    key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    status = runner.get_status(run_id)
-    status.deployment_attempt["deployment"]["updated_at"] = 0.0
-    status.deployment_attempt["deployment"]["requested_at"] = 0.0
-    runner._save_status(status)
-    old_mutation = status.deployment_attempt["deployment"]["mutation_id"]
-    serving._clear_deployment_worker_active(run_id, old_mutation)
-
-    newer = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-    assert newer.status_code == 200, newer.text
-    assert len(jobs) == 2
-    current_attempt = runner.get_status(run_id).deployment_attempt
-    assert current_attempt["deployment"]["mutation_id"] != jobs[0][1]["deploy_kwargs"]["mutation_id"]
-
-    posts = []
-
-    def delayed_deploy(**kwargs):
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        posts.append(desired)
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", delayed_deploy)
-    target, kwargs = jobs[0]
-    target(**kwargs)
-
-    assert posts == []
-    assert runner.get_status(run_id).deployment_attempt == current_attempt
-
-
-def test_redeploy_post_intent_failure_is_forward_only(api, monkeypatch):
-    import flash.runner as runner
-    import flash.serve.deploy as deploy
-    import flash.server.app as app_mod
-    from flash.serve.deploy import DeploymentSuperseded, ServingError
-
-    _key, run_id, jobs = _queue_deploy_job(api, monkeypatch, active=True)
-    target, kwargs = jobs[0]
-    new_mutation = kwargs["deploy_kwargs"]["mutation_id"]
-    prior = {
-        "adapter_id": run_id,
-        "registry_revision": 7,
-        "mutation_id": "prior-mutation",
-        "status": "ready",
-    }
-    registry = {run_id: dict(prior)}
-    cleanup = []
-
-    def fail_after_intent(**deploy_kwargs):
-        desired = _fake_registry_record(deploy_kwargs)
-        desired_context = {
-            **desired,
-            deploy._PRIOR_MUTATION_ID_CONTEXT_KEY: "prior-mutation",
-        }
-        deploy_kwargs["before_registry_mutation"](
-            7, desired_context, 8, desired["mutation_id"], desired["repo_revision"]
-        )
-        assert registry[run_id] == prior
-        raise ServingError("registration failed after intent")
-
-    def reject_cleanup(cleanup_run_id, revision, mutation_id):
-        cleanup.append((cleanup_run_id, revision, mutation_id, dict(registry[run_id])))
-        raise DeploymentSuperseded("the prior registry row still owns this adapter")
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", fail_after_intent)
-    monkeypatch.setattr(app_mod, "disable_owned_adapter", reject_cleanup)
-    target(**kwargs)
-
-    status = runner.get_status(run_id)
-    assert cleanup == [(run_id, 8, new_mutation, prior)]
-    assert registry[run_id] == prior
-    assert status.deployment["state"] == "failed"
-    assert status.deployment["mutation_id"] == new_mutation
-    assert status.deployment.get("endpoint_name") != "https://old.example"
-    assert status.deployment_attempt is None
-
-
-@pytest.mark.parametrize("is_checkpoint", [False, True], ids=["initial", "checkpoint"])
-def test_finalization_does_not_resurrect_revoked_deployment(api, monkeypatch, is_checkpoint):
-    import flash.runner as runner
-    import flash.server.routes.serving as serving
-    from flash.spec import JobSpec
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "running" if is_checkpoint else "done"
-    desired = {"adapter_id": run_id, "checkpoint": run_id, "mutation_id": "mutation-1"}
-    status.deployment = {
-        "state": "deploying",
-        "mutation_id": "mutation-1",
-        "target_revision": 1,
-        "desired_record": desired,
-    }
-    runner._save_status(status)
-    spec = JobSpec.from_dict(status.spec)
-    original = runner.mark_checkpoint_deployed if is_checkpoint else runner.mark_deployed
-
-    def revoke_then_finalize(*args, **kwargs):
-        runner.mark_undeployed(run_id)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(serving._app, "record_matches", lambda *_args: True)
-    monkeypatch.setattr(
-        serving._app,
-        "read_adapter_record",
-        lambda _run_id: {**desired, "registry_revision": 1},
-    )
-    monkeypatch.setattr(
-        serving,
-        "mark_checkpoint_deployed" if is_checkpoint else "mark_deployed",
-        revoke_then_finalize,
-    )
-
-    serving._finalize_registered_deployment(
-        run_id,
-        spec,
-        status.deployment,
-        checkpoint_step=1 if is_checkpoint else None,
-        is_checkpoint=is_checkpoint,
-        prev_state=status.state,
-        verify=False,
-    )
-
-    final = runner.get_status(run_id)
-    assert final.state == ("running" if is_checkpoint else "done")
-    assert final.deployment["state"] == "undeployed"
-    assert final.deployment["mutation_id"] == "mutation-1"
 
 
 def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
@@ -2189,17 +1388,97 @@ def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     status.state = "done"
     status.deployment = {"state": "deploying", "updated_at": 0.0, "requested_at": 0.0}
     runner._save_status(status)
-    _install_successful_fake_deploy(monkeypatch, app_mod)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
+
+
+def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
+    status = runner.get_status(run_id)
+    status.deployment = previous
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_k: (_ for _ in ()).throw(ServingError("new adapter failed smoke")),
+    )
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert resp.status_code == 200, resp.text
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["endpoint_name"] == "old"
+    assert deployment["last_deploy_error"] == "new adapter failed smoke"
+    assert resp.json()["endpoint_name"] == "old"
+
+
+def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
+    status = runner.get_status(run_id)
+    status.deployment = previous
+    runner._save_status(status)
+
+    registered_prefixes = []
+
+    def fake_deploy(**kwargs):
+        registered_prefixes.append(kwargs["adapter_prefix"])
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
-        lambda **_kwargs: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
+        lambda **_k: {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
     )
 
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
-    assert response.status_code == 200, response.text
-    assert response.json()["state"] == "ready"
+    assert resp.status_code == 200, resp.text
+    assert registered_prefixes[-1] == "rl/old"
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["endpoint_name"] == "old"
+    assert "smoke generation returned no content" in deployment["last_deploy_error"]
+
+
+def test_recover_deployments_restores_previous_ready_record(api):
+    import flash.runner as runner
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "verifying",
+        "updated_at": 0.0,
+        "requested_at": 0.0,
+        "previous_deployment": previous,
+    }
+    runner._save_status(status)
+
+    assert serving.recover_deployments() == 1
+
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "ready"
+    assert deployment["endpoint_name"] == "old"
+    assert "interrupted" in deployment["last_deploy_error"]
 
 
 def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
@@ -2363,36 +1642,6 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 200, resp.text
     assert seen["org_id"] == "platform-org"
-
-
-def test_deploy_rejects_run_without_persisted_org(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "done"
-    status.billing_context = None
-    status.platform_context = None
-    status.deployment = None
-    runner._save_status(status)
-    monkeypatch.setattr(
-        app_mod, "deploy_adapter", lambda **_kwargs: pytest.fail("must not deploy ownerless run")
-    )
-    monkeypatch.setattr(
-        app_mod,
-        "start_deployment_job",
-        lambda *_args, **_kwargs: pytest.fail("must not queue ownerless run"),
-    )
-
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-
-    assert response.status_code == 409
-    assert response.json()["detail"] == "run has no persisted owning org and cannot be deployed"
-    assert runner.get_status(run_id).deployment is None
 
 
 def test_chat_streams_deployed_run(api, monkeypatch):
@@ -3756,38 +3005,9 @@ _FAKE_CKPTS = [
 ]
 
 
-def _fake_registry_record(kwargs):
-    run_id = kwargs["run_id"]
-    adapter_prefix = kwargs["adapter_prefix"]
-    marker = "/checkpoints/step-"
-    checkpoint = (
-        f"{run_id}/{adapter_prefix.rsplit('/checkpoints/', 1)[-1].split('/', 1)[0]}"
-        if marker in adapter_prefix
-        else run_id
-    )
-    return {
-        "adapter_id": run_id,
-        "repo_id": kwargs["hf_repo"],
-        "base_model": kwargs["model"],
-        "subfolder": f"{adapter_prefix}/adapter",
-        "repo_type": "dataset",
-        "repo_revision": "a" * 40,
-        "org_id": "org-1",
-        "mutation_id": kwargs["mutation_id"],
-        "status": "ready",
-        "thinking": bool(kwargs.get("thinking")),
-        "checkpoint": checkpoint,
-    }
-
-
 class _FakeDeployment:
-    def __init__(self, adapter_prefix, desired_record, target_revision=1):
+    def __init__(self, adapter_prefix):
         self.adapter_prefix = adapter_prefix
-        self.desired_record = desired_record
-        self.prior_revision = None
-        self.target_revision = target_revision
-        self.mutation_id = desired_record["mutation_id"]
-        self.repo_revision = desired_record["repo_revision"]
 
     def to_dict(self):
         return {
@@ -3795,35 +3015,6 @@ class _FakeDeployment:
             "run_id": "X",
             "adapter_hf_prefix": f"{self.adapter_prefix}/adapter",
         }
-
-
-def _install_successful_fake_deploy(monkeypatch, app_mod, *, on_deploy=None):
-    captured = {}
-    record = {}
-
-    def fake_deploy(**kwargs):
-        captured.update(kwargs)
-        desired = _fake_registry_record(kwargs)
-        kwargs["before_registry_mutation"](
-            None, desired, 1, desired["mutation_id"], desired["repo_revision"]
-        )
-        record.update(**desired, registry_revision=1)
-        if on_deploy is not None:
-            on_deploy()
-        return _FakeDeployment(kwargs["adapter_prefix"], desired)
-
-    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
-    monkeypatch.setattr(app_mod, "read_adapter_record", lambda _run_id: record)
-    monkeypatch.setattr(
-        app_mod,
-        "record_matches",
-        lambda current, desired, revision: (
-            current.get("registry_revision") == revision
-            and all(current.get(key) == value for key, value in desired.items())
-        ),
-    )
-    monkeypatch.setattr(app_mod, "disable_owned_adapter", lambda *_args: True)
-    return captured
 
 
 def _make_run(api, key, state):
@@ -3853,7 +3044,13 @@ def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    captured = _install_successful_fake_deploy(monkeypatch, app_mod)
+    captured = {}
+
+    def fake_deploy(**kwargs):
+        captured.update(kwargs)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -3874,7 +3071,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    _install_successful_fake_deploy(monkeypatch, app_mod)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, "cancelled")
@@ -3895,7 +3092,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    _install_successful_fake_deploy(monkeypatch, app_mod)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
 
     key = _login()
     run_id = _make_run(api, key, state)
@@ -3917,12 +3114,13 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
     key = _login()
     run_id = _make_run(api, key, "running")
 
-    def finish_run():
+    def fake_deploy(**kwargs):
         status = runner.get_status(run_id)
         status.state = "done"
         runner._save_status(status)
+        return _FakeDeployment(kwargs["adapter_prefix"])
 
-    _install_successful_fake_deploy(monkeypatch, app_mod, on_deploy=finish_run)
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
@@ -3931,24 +3129,26 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
     assert status.deployment["checkpoint_step"] == 40
 
 
-def test_deploy_checkpoint_does_not_disable_if_newer_local_attempt_wins(api, monkeypatch):
+def test_deploy_checkpoint_rolls_back_if_final_deploy_wins_cas(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    disabled = []
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
     key = _login()
     run_id = _make_run(api, key, "done")
 
-    def final_deploy_wins():
+    def fake_deploy(**kwargs):
         runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "final"})
+        return _FakeDeployment(kwargs["adapter_prefix"])
 
-    _install_successful_fake_deploy(monkeypatch, app_mod, on_deploy=final_deploy_wins)
-    monkeypatch.setattr(app_mod, "disable_owned_adapter", lambda *args: disabled.append(args))
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
 
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
-    assert response.status_code == 200, response.text
-    assert disabled == []
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert rollbacks == [run_id]
     status = runner.get_status(run_id)
     assert status.state == "deployed"
     assert status.deployment == {"state": "ready", "endpoint_name": "final"}
@@ -3976,20 +3176,24 @@ def test_deploy_checkpoint_preserves_finished_run_undeploy_cas(api, monkeypatch)
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    disabled = []
+    rollbacks = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: rollbacks.append(run_id))
+
     key = _login()
     run_id = _make_run(api, key, "deployed")
     status = runner.get_status(run_id)
     status.deployment = {"state": "ready", "endpoint_name": "old"}
     runner._save_status(status)
-    _install_successful_fake_deploy(
-        monkeypatch, app_mod, on_deploy=lambda: runner.mark_undeployed(run_id)
-    )
-    monkeypatch.setattr(app_mod, "disable_owned_adapter", lambda *args: disabled.append(args))
 
-    response = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
-    assert response.status_code == 200, response.text
-    assert disabled == []
+    def fake_deploy(**kwargs):
+        runner.mark_undeployed(run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert rollbacks == [run_id]
     status = runner.get_status(run_id)
     assert status.state == "done"
     assert status.deployment["state"] == "undeployed"
@@ -4000,7 +3204,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     import flash.server.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    _install_successful_fake_deploy(monkeypatch, app_mod)
+    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
     monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
 
     key = _login()

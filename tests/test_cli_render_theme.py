@@ -452,7 +452,9 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     assert "worker" not in out.split("details")[0]  # no empty heartbeat rows
 
     # malformed heartbeat fields must render defensively, never raise
-    weird = dict(fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"})
+    weird = dict(
+        fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"}
+    )
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row
