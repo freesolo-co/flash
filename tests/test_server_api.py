@@ -1441,17 +1441,16 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
 
     real_mark_revocation_failed = runner.mark_deployment_revocation_failed
 
-    def mark_revocation_failed_then_release(target, error):
+    def mark_pending_then_release(target, error):
         status = real_mark_revocation_failed(target, error)
-        local_revoked.set()
+        if "pending" in error:
+            local_revoked.set()
         return status
 
     monkeypatch.setattr(serving, "_run_deployment_smoke", blocked_smoke)
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
-    monkeypatch.setattr(
-        runner, "mark_deployment_revocation_failed", mark_revocation_failed_then_release
-    )
+    monkeypatch.setattr(runner, "mark_deployment_revocation_failed", mark_pending_then_release)
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
 
     deploy_thread = threading.Thread(
@@ -1486,6 +1485,33 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     assert final.deployment["state"] == "undeployed"
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
+
+def test_cancel_local_persistence_failure_returns_structured_retryable_error(api, monkeypatch):
+    import flash.runner as runner
+    from flash.runner.deploy import DeploymentStatePersistenceError
+
+    assert runner.DeploymentStatePersistenceError is DeploymentStatePersistenceError
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner,
+        "mark_deployment_undeployed",
+        lambda _target: (_ for _ in ()).throw(OSError("generation store unavailable")),
+    )
+
+    response = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["code"] == "deployment_state_persistence_failed"
+    assert detail["run_id"] == run_id
+    assert detail["retryable"] is True
+    assert detail["backend_outcome"] == "not_required"
+    assert "backend revocation was not required" in detail["message"]
+    assert runner.get_status(run_id).state == "cancelled"
+
+
 def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod
@@ -1519,7 +1545,7 @@ def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, 
     assert detail["run_id"] == run_id
     assert detail["retryable"] is True
     assert "backend unavailable" in detail["message"]
-    assert attempts == [run_id, run_id]
+    assert attempts == [run_id]
     status = runner.get_status(run_id)
     assert status.state == "cancelled"
     assert status.deployment["state"] == "revocation_failed"
@@ -1904,9 +1930,7 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
 
 
 @pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])
-def test_redeploy_after_inactive_deployment_state_is_allowed(
-    api, monkeypatch, deployment_state
-):
+def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.serve.deploy import ServingError

@@ -1126,6 +1126,7 @@ def _save_status(status: RunStatus) -> None:
 
 from flash.runner.deploy import (  # noqa: E402,F401
     DeploymentRevocationError,
+    DeploymentStatePersistenceError,
     attach_run,
     cancel_run,
     mark_checkpoint_deployed,

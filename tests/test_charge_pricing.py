@@ -3,6 +3,8 @@ steps); a run cancelled mid-training is re-priced to the SAME estimate at the st
 
 from __future__ import annotations
 
+import pytest
+
 import flash.runner as runner
 
 SPEC = {
@@ -55,7 +57,9 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
 
     full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
-    naive = float(estimate_cost(replace(cfg, steps=10)).total_usd)  # steps lowered, tokens NOT scaled
+    naive = float(
+        estimate_cost(replace(cfg, steps=10)).total_usd
+    )  # steps lowered, tokens not scaled
     half = runner.charge_usd_for_spec(object(), steps=10)  # cancelled at 10 of 20 steps
     assert 0 < half < full
     # the token scaling is what prorates SFT: a steps-only replace (naive) barely moves the price.
@@ -87,7 +91,9 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT training
     # stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing a fully
     # trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills (codex[bot]).
-    assert runner.actual_steps_run(st({"stage": "opd_trained"})) == 0  # the bug the step guards against
+    assert (
+        runner.actual_steps_run(st({"stage": "opd_trained"})) == 0
+    )  # the bug the step guards against
     assert runner.actual_steps_run(st({"stage": "opd_train_done"})) == 0
     assert runner.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
     assert runner.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
@@ -157,14 +163,24 @@ def test_cancel_run_prices_nonterminal_revocation_retry_at_actual_steps(monkeypa
 
     monkeypatch.setattr(serve_deploy, "undeploy_adapter", retry_undeploy)
 
-    deploy.cancel_run("run-1")
+    with pytest.raises(deploy.DeploymentRevocationError):
+        deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    failed = runner.get_status("run-1")
+    repriced_cost = runner.charge_usd_for_spec(spec, steps=10)
+    assert attempts == ["run-1"]
+    assert failed.state == "cancelled"
+    assert failed.deployment["state"] == "revocation_failed"
+    assert failed.cost_usd == repriced_cost
+    assert 0 < failed.cost_usd < full_quote
+
+    retried = deploy.cancel_run("run-1")
+
     assert attempts == ["run-1", "run-1"]
-    assert st.state == "cancelled"
-    assert st.deployment["state"] == "undeployed"
-    assert st.cost_usd == runner.charge_usd_for_spec(spec, steps=10)
-    assert 0 < st.cost_usd < full_quote
+    assert retried.state == "cancelled"
+    assert retried.deployment["state"] == "undeployed"
+    assert retried.cost_usd == repriced_cost
+    assert 0 < retried.cost_usd < full_quote
 
 
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
