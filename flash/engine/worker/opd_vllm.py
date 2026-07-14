@@ -240,6 +240,8 @@ class OpdVllmRolloutEngine:
     temperature: float
     top_p: float
     stop_sequences: tuple[str, ...] = ()
+    # the exact model/tokenizer halt set shared with opd's eos termination diagnostics.
+    eos_token_ids: tuple[int, ...] = ()
     # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
     structured_outputs: dict[str, Any] | None = None
     # vLLM EngineArgs.reasoning_parser (e.g. "deepseek_r1") when thinking + a constraint are both on:
@@ -390,6 +392,8 @@ class OpdVllmRolloutEngine:
             "top_p": float(self.top_p),
             "stop": list(self.stop_sequences) if self.stop_sequences else None,
         }
+        if self.eos_token_ids:
+            kwargs["stop_token_ids"] = list(self.eos_token_ids)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
         # matching the shared OPD stop-trimming path. Older vLLM builds ignore unsupported kwargs by
         # raising.
