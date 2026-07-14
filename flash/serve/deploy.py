@@ -647,10 +647,12 @@ def reconcile_owned_adapter_cleanup(run_id: str, cleanup: dict) -> bool:
 
     if current_revision > target_revision:
         return True
-    if prior is not None and current_revision == target_revision:
-        return True
+    # Same registry revision but a different mutation won the CAS: that row is owned by another
+    # deployment attempt (disable_owned_adapter would reject it as superseded), so it is never ours
+    # to disable and our local cleanup for this attempt is already complete. This holds whether or
+    # not we redeployed over a prior revision.
     if current_revision == target_revision:
-        raise ServingError(f"adapter {run_id} cleanup observed a conflicting target identity")
+        return True
     raise ServingError(f"adapter {run_id} cleanup observed an unexpected older registry identity")
 
 
@@ -658,7 +660,16 @@ def undeploy_adapter(run_id: str) -> list[str]:
     current = read_adapter_record(run_id)
     if current is None or current.get("status") == "disabled":
         return []
-    disable_owned_adapter(run_id, int(current["registry_revision"]), str(current["mutation_id"]))
+    revision = current.get("registry_revision")
+    mutation_id = current.get("mutation_id")
+    if (
+        not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(mutation_id, str)
+        or not mutation_id.strip()
+    ):
+        raise ServingError(f"adapter {run_id} registry identity was malformed")
+    disable_owned_adapter(run_id, revision, mutation_id)
     return [run_id]
 
 

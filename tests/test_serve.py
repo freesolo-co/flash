@@ -518,7 +518,11 @@ def test_cleanup_reconciliation_protects_true_forward_supersession(monkeypatch):
     assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
 
 
-def test_cleanup_reconciliation_rejects_same_revision_newer_mutation(monkeypatch):
+def test_cleanup_reconciliation_accepts_same_revision_foreign_mutation(monkeypatch):
+    # A same-revision row bound to a different mutation won the registry CAS for another deployment
+    # attempt (disable_owned_adapter would reject it as superseded), so it is never ours to disable and
+    # our local cleanup for this attempt is already complete. Reconcile is symmetric with the
+    # newer-revision case: both report the cleanup done rather than raising.
     cleanup = {
         "adapter_id": "r1",
         "target": {"revision": 8, "mutation_id": "old"},
@@ -529,11 +533,10 @@ def test_cleanup_reconciliation_rejects_same_revision_newer_mutation(monkeypatch
     monkeypatch.setattr(
         d,
         "disable_owned_adapter",
-        lambda *_args: pytest.fail("different mutation must not be disabled"),
+        lambda *_args: pytest.fail("a foreign same-revision mutation must not be disabled"),
     )
 
-    with pytest.raises(d.ServingError, match="conflicting target"):
-        d.reconcile_owned_adapter_cleanup("r1", cleanup)
+    assert d.reconcile_owned_adapter_cleanup("r1", cleanup) is True
 
 
 def test_cleanup_reconciliation_rejects_unexpected_older_identity(monkeypatch):

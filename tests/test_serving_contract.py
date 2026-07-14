@@ -53,6 +53,46 @@ def test_undeploy_absent_record_is_clean(monkeypatch):
     assert undeploy_adapter("flash-1-gone") == []
 
 
+def test_undeploy_disables_exact_registry_identity(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setattr(
+        deploy_mod,
+        "read_adapter_record",
+        lambda _run_id: {"registry_revision": 7, "mutation_id": "m7", "status": "ready"},
+    )
+    disabled = []
+    monkeypatch.setattr(
+        deploy_mod, "disable_owned_adapter", lambda *args: disabled.append(args)
+    )
+    assert undeploy_adapter("flash-7-live") == ["flash-7-live"]
+    assert disabled == [("flash-7-live", 7, "m7")]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param({"registry_revision": 0, "mutation_id": "m7"}, id="nonpositive-revision"),
+        pytest.param({"registry_revision": "7", "mutation_id": "m7"}, id="string-revision"),
+        pytest.param({"registry_revision": 7, "mutation_id": "  "}, id="blank-mutation"),
+        pytest.param({"registry_revision": 7}, id="missing-mutation"),
+    ],
+)
+def test_undeploy_malformed_identity_raises_controlled_error(monkeypatch, record):
+    # A malformed persisted identity must raise a controlled ServingError (mapped to a 502 by the
+    # undeploy route) rather than a raw KeyError/ValueError that would surface as an opaque 500.
+    import flash.serve.deploy as deploy_mod
+
+    monkeypatch.setattr(deploy_mod, "read_adapter_record", lambda _run_id: {**record, "status": "ready"})
+    monkeypatch.setattr(
+        deploy_mod,
+        "disable_owned_adapter",
+        lambda *_args: pytest.fail("a malformed registry identity must not be disabled"),
+    )
+    with pytest.raises(deploy_mod.ServingError, match="registry identity was malformed"):
+        undeploy_adapter("flash-7-bad")
+
+
 def test_deployment_roundtrip_dict():
     d = Deployment(
         run_id="r",

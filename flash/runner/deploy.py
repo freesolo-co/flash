@@ -46,6 +46,22 @@ def deployment_lifecycle_allows_intent(
     return current_state in _CHECKPOINT_FORWARD_STATES.get(expected_state, frozenset())
 
 
+def _local_cleanup_intent(run_id: str, deployment: dict) -> dict | None:
+    """Best-effort cleanup identity recovered from a local deployment record.
+
+    When the authoritative registry read fails (or is deferred past provider teardown) during cancel,
+    the local deployment still carries the immutable ``target_revision``/``mutation_id`` this attempt
+    registered, which is enough to persist a cleanup intent for the reconcile pass to retry. Returns
+    ``None`` when the local identity is itself malformed and no intent can be formed.
+    """
+    from flash.serve.deploy import ServingError, persisted_adapter_cleanup
+
+    try:
+        return persisted_adapter_cleanup(run_id, deployment)
+    except ServingError:
+        return None
+
+
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel a run: stop the remote worker and mark it cancelled."""
     from flash.runner import (
@@ -63,7 +79,7 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
-    def revoke_current_deployment_ownership() -> RunStatus:
+    def revoke_current_deployment_ownership(*, remote: bool) -> RunStatus:
         status = get_status(run_id)
         attempt = status.deployment_attempt
         if isinstance(attempt, dict):
@@ -78,15 +94,29 @@ def cancel_run(run_id: str) -> RunStatus:
         cleanup = status.deployment_cleanup
         if not isinstance(cleanup, dict):
             deployment = status.deployment or {}
-            if deployment.get("state") in {"ready", "deployed"}:
+            # A cancelled run keeps any ready per-step CHECKPOINT deployment it registered (the chat
+            # path still serves a cancelled run's checkpoint), so only a FINAL adapter deployment is
+            # torn down on cancel.
+            is_checkpoint = deployment.get("checkpoint_step") is not None
+            if not is_checkpoint and deployment.get("state") in {"ready", "deployed"}:
+                ownership: dict | None
                 authoritative_absence = False
-                try:
-                    from flash.serve.deploy import owned_adapter_cleanup
+                if remote:
+                    try:
+                        from flash.serve.deploy import owned_adapter_cleanup
 
-                    ownership = owned_adapter_cleanup(run_id, deployment)
-                    authoritative_absence = ownership is None
-                except Exception:
-                    ownership = None
+                        ownership = owned_adapter_cleanup(run_id, deployment)
+                        authoritative_absence = ownership is None
+                    except Exception:
+                        # The registry read (and its persisted-identity fallback) failed, so we cannot
+                        # prove the adapter is gone. Persist a cleanup intent from the local
+                        # deployment's immutable identity so reconcile retries, rather than leaving the
+                        # remote adapter active with the record stuck at `ready`.
+                        ownership = _local_cleanup_intent(run_id, deployment)
+                else:
+                    # Defer the networked registry read until after provider teardown so a serving
+                    # outage cannot block GPU destruction; persist the local cleanup intent now.
+                    ownership = _local_cleanup_intent(run_id, deployment)
                 if authoritative_absence:
                     mark_deployment_undeployed(run_id, expect_deployment=deployment)
                 elif ownership is not None:
@@ -101,7 +131,7 @@ def cancel_run(run_id: str) -> RunStatus:
                         expect_deployment=deployment,
                     )
                     cleanup = marked.deployment_cleanup
-        if isinstance(cleanup, dict):
+        if remote and isinstance(cleanup, dict):
             try:
                 from flash.serve.deploy import reconcile_owned_adapter_cleanup
 
@@ -116,7 +146,9 @@ def cancel_run(run_id: str) -> RunStatus:
     with _deploy_lock(run_id):
         status = get_status(run_id)
         entered_deployed = status.state == "deployed"
-        status = revoke_current_deployment_ownership()
+        # A deployed run has no live training GPU, so reconcile its serving adapter now. A run still
+        # training bills a GPU, so defer the networked adapter reconcile until after teardown below.
+        status = revoke_current_deployment_ownership(remote=entered_deployed)
         if status.state in TERMINAL_STATES and not entered_deployed:
             return status
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
@@ -148,7 +180,7 @@ def cancel_run(run_id: str) -> RunStatus:
         else None
     )
     with _deploy_lock(run_id):
-        revoke_current_deployment_ownership()
+        revoke_current_deployment_ownership(remote=True)
         # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
         # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
         # charges the run from cost_usd (idempotent by runId).
@@ -549,6 +581,11 @@ def complete_deployment_cleanup(run_id: str, cleanup: dict) -> RunStatus:
         local_deployment = cleanup.get("local_deployment")
         if isinstance(local_deployment, dict) and status.deployment == local_deployment:
             status.deployment = {**local_deployment, "state": "undeployed"}
+            # Mirror mark_undeployed / revoke_deployment_intent: a deployed run that loses its active
+            # deployment returns to `done`, so a crash-recovery reconcile of this cleanup cannot leave
+            # a `deployed` run whose chat path rejects it for having no ready deployment.
+            if status.state == "deployed":
+                status.state = "done"
         status.deployment_cleanup = None
         status.updated_at = time.time()
         _save_status(status)
