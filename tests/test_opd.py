@@ -1904,6 +1904,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     monkeypatch.setattr(opd_mod, "_prepare_parasail_targets", _prepare)
     events = []
     projected_calls = []
+    projected_microbatch_sizes = []
     forward_calls = []
     real_normalize = opd_mod._normalize_accumulated_gradients
     real_projected = opd_mod._backward_projected_targets
@@ -1917,6 +1918,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     def _projected(*args, **kwargs):
         events.append("projected")
         projected_calls.append(True)
+        projected_microbatch_sizes.append(kwargs["microbatch_size"])
         return real_projected(*args, **kwargs)
 
     def _forward(*args, **kwargs):
@@ -1939,6 +1941,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     assert len(reverse_calls) == 12
     assert preparation_calls == [True]
     assert projected_calls == [True]
+    assert projected_microbatch_sizes == [1]
     assert forward_calls == [True]
     assert events == ["normalize", "projected", "step"]
     assert opd_mod.OpdVllmRolloutEngine.instances[0].sync_count == 1
@@ -4814,18 +4817,101 @@ def test_backward_projected_targets_retains_empty_target_in_outer_mean():
     tok = SimpleNamespace(pad_token_id=0)
     eligible_model = _TinyLM(torch, T=2, V=4)
     eligible_loss, eligible_rows = _backward_projected_targets(
-        eligible_model, [eligible], "cpu", tok, coef=1.0
+        eligible_model, [eligible], "cpu", tok, coef=1.0, microbatch_size=1
     )
     eligible_grad = eligible_model.w.grad.detach().clone()
 
     mixed_model = _TinyLM(torch, T=2, V=4)
     mixed_loss, mixed_rows = _backward_projected_targets(
-        mixed_model, [eligible, empty], "cpu", tok, coef=1.0
+        mixed_model, [eligible, empty], "cpu", tok, coef=1.0, microbatch_size=2
     )
 
     assert eligible_rows == mixed_rows == 1
     assert mixed_loss == pytest.approx(eligible_loss / 2)
     torch.testing.assert_close(mixed_model.w.grad, eligible_grad / 2, rtol=0, atol=0)
+
+
+def test_backward_projected_targets_microbatches_preserve_loss_and_gradients():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import _backward_projected_targets
+    from flash.engine.worker.opd_soft_targets import (
+        ProjectedPosition,
+        ProjectedTarget,
+        ProjectionDropCounts,
+    )
+
+    row = ProjectedPosition(
+        provider_record_index=0,
+        logits_index=0,
+        token_ids=(1, 2),
+        probabilities=(0.4, 0.6),
+        reported_top_k_mass=1.0,
+        retained_projected_mass=1.0,
+        rejected_reported_mass=0.0,
+        unreported_mass=0.0,
+        total_dropped_mass=0.0,
+        support_size=2,
+        collision_count=0,
+        conditional_entropy_nats=0.0,
+        drop_counts=ProjectionDropCounts(),
+    )
+    eligible = ProjectedTarget(
+        input_ids=(1,),
+        positions=(row,),
+        rows=(row,),
+        visible_position_count=1,
+        eligible_row_count=1,
+        drop_counts=ProjectionDropCounts(),
+    )
+    empty = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=1,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(multi_token=1),
+    )
+    targets = [eligible, empty, eligible, empty, eligible]
+    tok = SimpleNamespace(pad_token_id=0)
+
+    class _CountingTinyLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=2, V=4)
+            self.forward_batch_sizes = []
+
+        def __call__(self, input_ids):
+            self.forward_batch_sizes.append(int(input_ids.shape[0]))
+            return super().__call__(input_ids)
+
+    full_model = _CountingTinyLM()
+    full_loss, full_rows = _backward_projected_targets(
+        full_model,
+        targets,
+        "cpu",
+        tok,
+        coef=0.03,
+        microbatch_size=len(targets),
+    )
+    chunked_model = _CountingTinyLM()
+    chunked_loss, chunked_rows = _backward_projected_targets(
+        chunked_model,
+        targets,
+        "cpu",
+        tok,
+        coef=0.03,
+        microbatch_size=2,
+    )
+
+    assert full_model.forward_batch_sizes == [5]
+    assert chunked_model.forward_batch_sizes == [2, 2, 1]
+    assert chunked_rows == full_rows == 3
+    assert chunked_loss == pytest.approx(full_loss, rel=1e-7, abs=1e-9)
+    torch.testing.assert_close(
+        chunked_model.w.grad,
+        full_model.w.grad,
+        rtol=1e-6,
+        atol=1e-8,
+    )
 
 
 def test_backward_projected_targets_all_empty_is_graph_attached_zero():
@@ -4844,7 +4930,12 @@ def test_backward_projected_targets_all_empty_is_graph_attached_zero():
     model = _TinyLM(torch, T=2, V=4)
 
     loss, supervised_rows = _backward_projected_targets(
-        model, [empty, empty], "cpu", SimpleNamespace(pad_token_id=0), coef=1.0
+        model,
+        [empty, empty],
+        "cpu",
+        SimpleNamespace(pad_token_id=0),
+        coef=1.0,
+        microbatch_size=1,
     )
 
     assert loss == 0.0

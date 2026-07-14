@@ -402,6 +402,7 @@ def test_projected_target_telemetry_and_backward_count_only_entropy_active_rows(
         torch.device("cpu"),
         SimpleNamespace(pad_token_id=0),
         coef=0.03,
+        microbatch_size=1,
         entropy_tau=0.5,
     )
 

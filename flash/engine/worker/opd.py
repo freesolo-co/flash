@@ -1187,6 +1187,7 @@ def _run_opd(parasail_accounting):
                     device,
                     tok,
                     coef=hybrid_settings.forward_coef,
+                    microbatch_size=loss_microbatch_size,
                     entropy_tau=hybrid_settings.entropy_tau,
                 )
                 opd_phase_seconds["forward_objective_forward_backward"] += (
@@ -2219,36 +2220,52 @@ def _backward_projected_targets(
     tok,
     *,
     coef: float,
+    microbatch_size: int,
     entropy_tau: float | None = None,
 ):
     import torch
 
     if not targets:
         raise RuntimeError("opd hybrid projected targets are missing")
+    if isinstance(microbatch_size, bool) or not isinstance(microbatch_size, int):
+        raise ValueError("opd hybrid projected target microbatch size must be an integer")
+    if microbatch_size <= 0:
+        raise ValueError("opd hybrid projected target microbatch size must be positive")
     model.train()
     model.config.use_cache = False
     pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
-    max_len = max(len(target.input_ids) for target in targets)
-    input_ids = torch.full((len(targets), max_len), pad_id, dtype=torch.long, device=device)
-    attention_mask = torch.zeros((len(targets), max_len), dtype=torch.long, device=device)
-    for row, target in enumerate(targets):
-        input_ids[row, : len(target.input_ids)] = torch.tensor(
-            target.input_ids, dtype=torch.long, device=device
+    total_targets = len(targets)
+    total_loss = 0.0
+    for start in range(0, total_targets, microbatch_size):
+        chunk = targets[start : start + microbatch_size]
+        max_len = max(len(target.input_ids) for target in chunk)
+        input_ids = torch.full((len(chunk), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(chunk), max_len), dtype=torch.long, device=device)
+        for row, target in enumerate(chunk):
+            input_ids[row, : len(target.input_ids)] = torch.tensor(
+                target.input_ids, dtype=torch.long, device=device
+            )
+            attention_mask[row, : len(target.input_ids)] = 1
+        logits = _forward_logits(model, input_ids, attention_mask)
+        chunk_weight = len(chunk) / total_targets
+        loss = (
+            float(coef)
+            * chunk_weight
+            * sparse_projected_conditional_cross_entropy(
+                logits,
+                chunk,
+                entropy_tau=entropy_tau,
+            )
         )
-        attention_mask[row, : len(target.input_ids)] = 1
-    logits = _forward_logits(model, input_ids, attention_mask)
-    loss = float(coef) * sparse_projected_conditional_cross_entropy(
-        logits,
-        targets,
-        entropy_tau=entropy_tau,
-    )
-    loss.backward()
+        loss.backward()
+        total_loss += float(loss.detach())
+        del loss, logits, input_ids, attention_mask
     supervised_positions = sum(
         projected_row_is_active(row, entropy_tau)
         for target in targets
         for row in target.rows
     )
-    return float(loss.detach()), supervised_positions
+    return total_loss, supervised_positions
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
