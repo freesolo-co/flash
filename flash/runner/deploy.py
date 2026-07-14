@@ -65,10 +65,6 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
-    def _has_active_deployment(status: RunStatus) -> bool:
-        state = (status.deployment or {}).get("state")
-        return state not in (None, "undeployed", "dry_run")
-
     def _teardown_remote(remote: dict, *, skip_cancel: bool = False) -> tuple[bool, bool]:
         if not remote:
             return False, False
