@@ -470,6 +470,52 @@ def test_cancel_revocation_retry_transitions_deployed_run_to_cancelled(tmp_path,
     assert retried.deployment["state"] == "undeployed"
 
 
+def test_cancel_revocation_retry_reprices_running_run(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-running-revocation-retry"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            cost_usd=9.0,
+            billing_context={"org_id": "org-test"},
+            deployment={"state": "revocation_failed", "error": "backend unavailable"},
+        )
+    )
+    attempts = []
+
+    def undeploy(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise deploy.ServingError("backend still unavailable")
+        return ["endpoint"]
+
+    charges = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "effective_spec_from_status", lambda _status: spec)
+    monkeypatch.setattr(orch, "actual_steps_run", lambda _status: 3)
+    monkeypatch.setattr(
+        orch,
+        "charge_usd_for_spec",
+        lambda *_args, **_kwargs: charges.append(1.25) or 1.25,
+    )
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id, run_id]
+    assert charges == [1.25]
+    assert retried.state == "cancelled"
+    assert retried.cost_usd == 1.25
+    assert retried.deployment["state"] == "undeployed"
+
+
 def test_cancel_retries_revocation_after_terminal_transition_at_lock(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
