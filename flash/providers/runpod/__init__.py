@@ -120,8 +120,11 @@ class RunpodProvider:
         from flash.providers.runpod import api as runpod_api
 
         d = handle.to_dict()
-        if d.get("endpoint_id"):
-            runpod_api.delete_endpoint(d["endpoint_id"])
+        endpoint_id = d.get("endpoint_id")
+        if endpoint_id and not runpod_api.delete_endpoint(endpoint_id):
+            raise runpod_api.RunpodApiError(
+                f"runpod delete_endpoint({endpoint_id}) unconfirmed; endpoint may still bill"
+            )
 
     def gc(self, spec) -> None:
         from flash.providers.runpod.train import terminate_endpoint

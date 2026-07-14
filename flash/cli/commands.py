@@ -231,6 +231,17 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    if spec.train.init_from_adapter:
+        # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
+        # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
+        # (resolved server-side at submit/dry-run), which can be higher — so this estimate may
+        # under-quote. stderr keeps stdout clean for machine-readable callers.
+        print(
+            "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
+            "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
+            "may cost more than this estimate. Run `flash train --dry-run` for a source-rank quote.",
+            file=sys.stderr,
+        )
     estimate = estimate_cost(runconfig_from_spec(spec))
     if render.styled():
         print(render.cost_panel(estimate))

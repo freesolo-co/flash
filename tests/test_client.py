@@ -141,7 +141,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
                 "hf_repo": "user/ignored",
                 "max_examples": 1,
                 "temperature": 0,
-                "opd_eos_loss_coef": 0,
                 "stop_sequences": [],
                 "teacher_model": "GLM 5.2",
                 "structured_outputs": False,
@@ -153,7 +152,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "hf_repo",
         "max_examples",
         "temperature",
-        "opd_eos_loss_coef",
         "stop_sequences",
         "teacher_model",
         "structured_outputs",
@@ -168,11 +166,14 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "hf_repo": "",
         "max_examples": 1,
         "temperature": 0.0,
-        "opd_eos_loss_coef": 0.0,
         "stop_sequences": (),
         "teacher_model": "accounts/fireworks/models/glm-5p2",
         "structured_outputs": "",
     }
+    assert "lora_rank" not in sparse["train"]
+    assert (
+        spec_payload(spec, authored_train_keys=authored | {"lora_rank"})["train"]["lora_rank"] == 32
+    )
     assert spec_payload(spec, authored_train_keys=set())["train"] == {}
 
 

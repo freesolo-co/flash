@@ -107,6 +107,9 @@ class TrainSpec:
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
+    # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
+    # control-plane jobspec payloads; the public config schema does not accept this key.
+    init_from_adapter_revision: str = ""
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
     hf_repo: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # None -> worker's tuned recipe default.
@@ -124,9 +127,6 @@ class TrainSpec:
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # OPD only: weight of the terminal-EOS behaviour-cloning term (recipe default when None). 0
-    # disables it. Raise it for a student that keeps running past the length cap without emitting EOS.
-    opd_eos_loss_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.55"})
     # OPD only: the managed teacher to distil from, stored as its resolved Fireworks model id (parse
     # canonicalizes any alias / spaced / raw-id form via recipe.resolve_teacher, e.g. "glm-5.2" =>
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
@@ -175,10 +175,20 @@ class JobSpec:
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the public/API representation of this job specification."""
+        data = asdict(self)
+        train = data["train"]
+        train.pop("init_from_adapter_revision", None)
+        if train.get("init_from_adapter"):
+            train.pop("lora_rank", None)
+        return data
+
+    def to_internal_dict(self) -> dict[str, Any]:
+        """Return the complete control-plane and worker representation."""
         return asdict(self)
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True)
+        return json.dumps(self.to_internal_dict(), sort_keys=True)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
@@ -206,6 +216,7 @@ class JobSpec:
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
+                init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),
@@ -219,7 +230,6 @@ class JobSpec:
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
-                opd_eos_loss_coef=_opt_float(train.get("opd_eos_loss_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),

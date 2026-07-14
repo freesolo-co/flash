@@ -190,7 +190,7 @@ def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
 
     _stub_adapter_config(monkeypatch, tmp_path, config={"r": 32, "rank_pattern": []})
 
-    with pytest.raises(ValueError, match="invalid rank metadata"):
+    with pytest.raises(ValueError, match="invalid rank_pattern"):
         deploy_adapter(
             run_id="r-bad-pattern",
             model="Qwen/Qwen3.5-4B",

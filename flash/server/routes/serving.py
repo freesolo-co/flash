@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from flash.envs.registry import load_environment
 from flash.runner import (
     adapter_prefix,
+    effective_spec_from_status,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_failed,
@@ -685,6 +686,10 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
+        try:
+            effective_spec = effective_spec_from_status(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
         # smoke verification is mandatory for every real deployment: a loadable-but-broken
         # revision must never become the bare-run alias target. reject an explicit opt-out
@@ -735,7 +740,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "hf_repo": spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
             "dry_run": dry_run,
-            "lora_rank": spec.train.lora_rank,
+            "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
             # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
@@ -763,7 +768,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             from flash.serve.deploy import validate_serving_lora_rank
 
             validate_serving_lora_rank(
-                spec.model, spec.train.lora_rank, rank_source="configured train.lora_rank"
+                spec.model,
+                effective_spec.train.lora_rank,
+                rank_source="effective prepared LoRA rank",
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -892,7 +899,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         "adapter_id": run_id,
         "repository": repository,
         "url": url,
-        "source": f"{spec.train.hf_repo}:{subfolder}",
+        "source": f"{run_id}/step-{checkpoint_step}" if is_checkpoint else run_id,
     }
     if is_checkpoint:
         result["step"] = checkpoint_step

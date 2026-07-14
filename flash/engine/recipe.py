@@ -160,15 +160,6 @@ class OPDConfig:
     # (student_logsum - teacher_logsum) advantage. 1.0 is plain reverse KL (Thinking Machines,
     # *On-Policy Distillation*). Overridable via [train].kl_penalty_coef.
     kl_coef: float = 1.0
-    # Weight of the terminal-EOS behaviour-cloning term added to the reverse-KL loss. The
-    # cross-tokenizer text-span alignment CANNOT supervise the stop token — a special/eos token is
-    # zero-width (decodes to nothing), so it lands in no alignment group and the reverse-KL gives it
-    # NO gradient. Distilling only the content tokens toward a strong, verbose teacher (GLM-5.2) then
-    # erodes the student's termination and rollouts run away to the length cap (observed across OPD
-    # runs as thousands of non-terminated rollouts). This adds a bounded, self-limiting cross-entropy
-    # that pushes up log P(eos) at the position a rollout naturally terminated, restoring the stop
-    # signal the alignment cannot express. 0 disables it; overridable via [train].opd_eos_loss_coef.
-    eos_loss_coef: float = 0.5
 
 
 @dataclass(frozen=True)
