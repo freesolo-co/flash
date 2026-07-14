@@ -221,7 +221,7 @@ class TeacherClient:
                 last_err = TeacherError(f"teacher HTTP 200 body was truncated on {path}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 # malformed successful bodies are transient and never copied into errors.
-                last_err = TeacherError(f"teacher returned invalid HTTP 200 JSON on {path}")
+                last_err = TeacherError(f"teacher returned unparseable HTTP 200 JSON on {path}")
             if attempt + 1 >= self.max_retries:
                 break
             delay = min(2.0 * (2**attempt), 20.0)
