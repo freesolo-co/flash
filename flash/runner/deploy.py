@@ -65,39 +65,50 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
-    initial_status = get_status(run_id)
-    initial_deployment_state = (initial_status.deployment or {}).get("state")
-    initial_retry_revocation = initial_deployment_state == _REVOCATION_RETRY_STATE
-    initial_has_active_deployment = initial_deployment_state not in (None, "undeployed", "dry_run")
-    if initial_status.state == "dry_run" or (
-        initial_status.state in TERMINAL_STATES
-        and not initial_retry_revocation
-        and not initial_has_active_deployment
-    ):
-        return initial_status
-    entered_deployed = initial_status.state == "deployed"
+    def _has_active_deployment(status: RunStatus) -> bool:
+        state = (status.deployment or {}).get("state")
+        return state not in (None, "undeployed", "dry_run")
 
-    # revoke serving authority before waiting on a deployment smoke that holds the deploy lock.
-    teardown_error: Exception | None = None
-    initial_teardown_confirmed = False
-
-    def teardown_remote(remote_handle: dict) -> None:
-        if not remote_handle:
-            return
+    def _teardown_remote(remote: dict, *, skip_cancel: bool = False) -> tuple[bool, bool]:
+        if not remote:
+            return False, False
         try:
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            handle = JobHandle.from_dict(remote_handle)
+            handle = JobHandle.from_dict(remote)
             provider = get_provider(handle.provider)
-            provider.cancel(handle)
-            provider.destroy(handle)
         except Exception:
-            pass
+            return False, False
+        cancelled = skip_cancel
+        if not skip_cancel:
+            try:
+                provider.cancel(handle)
+                cancelled = True
+            except Exception:
+                return False, False
+        try:
+            provider.destroy(handle)
+            return cancelled, True
+        except Exception:
+            return cancelled, False
 
-    initial_remote = initial_status.remote or {}
-    teardown_remote(initial_remote)
-    if initial_status.state == "deployed":
+    initial_status = get_status(run_id)
+    initial_deployment_state = (initial_status.deployment or {}).get("state")
+    initial_retry_revocation = initial_deployment_state == _REVOCATION_RETRY_STATE
+    initial_active_deployment = initial_deployment_state not in (None, "undeployed", "dry_run")
+    if initial_status.state == "dry_run" or (
+        initial_status.state in TERMINAL_STATES
+        and not initial_retry_revocation
+        and not initial_active_deployment
+    ):
+        return initial_status
+    entered_deployed = initial_status.state == "deployed"
+
+    # revoke serving authority and stop any durable remote before waiting on the deploy lock.
+    teardown_error: Exception | None = None
+    initial_teardown_confirmed = False
+    if initial_active_deployment:
         try:
             from flash.serve.deploy import undeploy_adapter
 
@@ -106,6 +117,8 @@ def cancel_run(run_id: str) -> RunStatus:
             initial_teardown_confirmed = True
         except Exception as exc:
             teardown_error = exc
+    initial_remote = initial_status.remote or {}
+    remote_cancelled, remote_destroyed = _teardown_remote(initial_remote)
 
     with _deploy_lock(run_id):
         # reread after the submission handshake releases the lock so a newly durable provider
@@ -137,12 +150,13 @@ def cancel_run(run_id: str) -> RunStatus:
             and not retry_revocation
         )
         remote = status.remote or {}
-        if remote != initial_remote:
-            teardown_remote(remote)
+        same_remote = remote == initial_remote
+        if remote and (not same_remote or not remote_destroyed):
+            _teardown_remote(remote, skip_cancel=same_remote and remote_cancelled)
         with contextlib.suppress(Exception):
             _gc_run_endpoints(cleanup_spec)
         if not remote:
-            teardown_remote(get_status(run_id).remote or {})
+            _teardown_remote(get_status(run_id).remote or {})
         cancel_charge_usd: float | None = None
         billing_diagnostic: dict = {}
         if bill_cancel:
@@ -171,15 +185,18 @@ def cancel_run(run_id: str) -> RunStatus:
         final = get_status(run_id)
         deployment_state = (final.deployment or {}).get("state")
         if deployment_state not in (None, "undeployed", "dry_run"):
-            try:
-                from flash.serve.deploy import undeploy_adapter
+            if teardown_error is not None and status.state in TERMINAL_STATES and not entered_deployed:
+                mark_deployment_revocation_failed(run_id, str(teardown_error))
+            else:
+                try:
+                    from flash.serve.deploy import undeploy_adapter
 
-                undeploy_adapter(run_id)
-                mark_deployment_undeployed(run_id)
-                teardown_error = None
-            except Exception as exc:
-                teardown_error = exc
-                mark_deployment_revocation_failed(run_id, str(exc))
+                    undeploy_adapter(run_id)
+                    mark_deployment_undeployed(run_id)
+                    teardown_error = None
+                except Exception as exc:
+                    teardown_error = exc
+                    mark_deployment_revocation_failed(run_id, str(exc))
         elif teardown_error is not None:
             mark_deployment_revocation_failed(run_id, str(teardown_error))
         elif not initial_teardown_confirmed:

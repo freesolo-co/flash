@@ -1467,7 +1467,6 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     assert final.deployment["state"] == "undeployed"
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
-
 def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod

@@ -240,7 +240,6 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     assert isinstance(submit_errors[0], orch._RunCancelled)
     assert not resource_live["value"]
 
-
 def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
