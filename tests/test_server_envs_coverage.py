@@ -11,6 +11,7 @@ and the offline conftest.
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import tarfile
 import types
@@ -417,13 +418,30 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
     assert "control-plane restart" in failed["error"]
 
 
+def _smoke_spec(*, thinking: bool, constraint: dict | None = None):
+    return types.SimpleNamespace(
+        thinking=thinking,
+        train=types.SimpleNamespace(
+            structured_outputs="" if constraint is None else json.dumps(constraint)
+        ),
+    )
+
+
+def _smoke_response(content: str, finish_reason: str = "stop") -> dict:
+    return {
+        "choices": [
+            {"message": {"content": content}, "finish_reason": finish_reason}
+        ]
+    }
+
+
 def test_run_deployment_smoke_success_and_empty(monkeypatch):
-    spec = types.SimpleNamespace(thinking=False)
+    spec = _smoke_spec(thinking=False)
 
     def fake_serve_chat(**kwargs):
         assert kwargs["run_id"] == "run-1"
         assert kwargs["temperature"] == 0.0
-        return {"choices": [{"message": {"content": "The answer is 4"}, "finish_reason": "stop"}]}
+        return _smoke_response("The answer is 4")
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = serving._run_deployment_smoke("run-1", spec)
@@ -432,19 +450,176 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     assert out["thinking_tag"] is False
     assert out["verify_latency_s"] >= 0.0
 
-    # Thinking tags in the sample are detected.
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: {"choices": [{"message": {"content": "<think>hmm</think> 4"}}]},
+        lambda **_k: _smoke_response("<think>still reasoning"),
     )
-    assert serving._run_deployment_smoke("run-1", spec)["thinking_tag"] is True
+    thinking_out = serving._run_deployment_smoke(
+        "run-1", _smoke_spec(thinking=True)
+    )
+    assert thinking_out["thinking_tag"] is True
+    assert thinking_out["verify_sample"] == "<think>still reasoning"
 
-    # Empty generation is a ServingError, not a silent "ready".
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: {"choices": [{"message": {"content": "   "}, "finish_reason": "length"}]},
+        lambda **_k: _smoke_response("   ", "length"),
     )
     with pytest.raises(ServingError, match="no content"):
         serving._run_deployment_smoke("run-1", spec)
+
+
+@pytest.mark.parametrize(
+    ("constraint", "content", "sample"),
+    [
+        (
+            {"json": {"type": "object", "required": ["answer"]}},
+            '<think>{"ignored":</think>{"answer": 4}',
+            '{"answer": 4}',
+        ),
+        (
+            {"json_object": True},
+            '<think>[invalid reasoning json</think>{"answer": 4}',
+            '{"answer": 4}',
+        ),
+        (
+            {
+                "json": {
+                    "$defs": {"answer": {"type": "string"}},
+                    "type": "object",
+                    "properties": {"answer": {"$ref": "#/$defs/answer"}},
+                    "required": ["answer"],
+                }
+            },
+            '<think>2+2</think>{"answer": "4"}',
+            '{"answer": "4"}',
+        ),
+        ({"choice": ["4", "four"]}, "<think>2+2</think>4", "4"),
+        ({"regex": "[0-9]+"}, "<think>2+2</think>4", "4"),
+    ],
+)
+def test_thinking_structured_smoke_validates_only_answer_after_reasoning(
+    monkeypatch, constraint, content, sample
+):
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    out = serving._run_deployment_smoke(
+        "run-1", _smoke_spec(thinking=True, constraint=constraint)
+    )
+    assert out["verify_sample"] == sample
+    assert out["verify_finish_reason"] == "stop"
+    assert out["thinking_tag"] is True
+    assert out["verify_latency_s"] >= 0.0
+
+
+def test_structured_smoke_rejects_external_schema_ref_without_network(monkeypatch):
+    import socket
+
+    connection_attempts: list[tuple] = []
+
+    def reject_connection(*args, **kwargs):
+        connection_attempts.append((args, kwargs))
+        raise AssertionError("external network access attempted")
+
+    monkeypatch.setattr(socket, "create_connection", reject_connection)
+    constraint = {"json": {"$ref": "http://127.0.0.1:9/schema.json"}}
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response("<think>2+2</think>{}"),
+    )
+
+    with pytest.raises(ServingError, match="schema reference could not be resolved"):
+        serving._run_deployment_smoke(
+            "run-1", _smoke_spec(thinking=True, constraint=constraint)
+        )
+    assert connection_attempts == []
+
+
+def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkeypatch):
+    constraint = {
+        "json": {
+            "$defs": {"answer": {"type": "string"}},
+            "$ref": "#/$defs/missing",
+        }
+    }
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response('<think>2+2</think>{"answer": "4"}'),
+    )
+
+    with pytest.raises(ServingError, match="schema reference could not be resolved") as exc_info:
+        serving._run_deployment_smoke(
+            "run-1", _smoke_spec(thinking=True, constraint=constraint)
+        )
+    assert "external retrieval" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("constraint", "content", "finish_reason", "match"),
+    [
+        (
+            {"json": {"type": "object", "required": ["answer"]}},
+            "<think>x</think>{}",
+            "stop",
+            "violates the configured JSON schema",
+        ),
+        ({"json_object": True}, "<think>x</think>[]", "stop", "not a JSON object"),
+        ({"json_object": True}, "<think>x</think>{", "stop", "not valid JSON"),
+        ({"choice": ["4"]}, "<think>x</think>5", "stop", "is not one of"),
+        ({"regex": "[0-9]+"}, "<think>x</think>four", "stop", "does not match"),
+        ({"choice": ["4"]}, "4", "stop", "never closed its reasoning"),
+        ({"choice": ["4"]}, "<think>2+2", "stop", "never closed its reasoning"),
+        ({"choice": ["4"]}, "<think>x</think>   ", "stop", "no answer"),
+        (
+            {"choice": ["4"]},
+            "<think>x</think><think>4",
+            "stop",
+            "opened a new <think> block",
+        ),
+        (
+            {"choice": ["4"]},
+            "<think>x</think>garbage</think>4",
+            "stop",
+            "additional </think> delimiter",
+        ),
+        (
+            {"json_object": True},
+            '<think>x</think>{"literal": "</think>"}',
+            "stop",
+            "additional </think> delimiter",
+        ),
+        (
+            {"choice": ["4"]},
+            "<think>x</think>4",
+            "length",
+            "truncated at the maximum token length",
+        ),
+    ],
+)
+def test_thinking_structured_smoke_rejects_invalid_output(
+    monkeypatch, constraint, content, finish_reason, match
+):
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(content, finish_reason),
+    )
+    with pytest.raises(ServingError, match=match):
+        serving._run_deployment_smoke(
+            "run-1", _smoke_spec(thinking=True, constraint=constraint)
+        )
+
+
+def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypatch):
+    content = "  <think>literal</think>4  "
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    out = serving._run_deployment_smoke(
+        "run-1",
+        _smoke_spec(
+            thinking=False,
+            constraint={"choice": ["<think>literal</think>4"]},
+        ),
+    )
+    assert out["verify_sample"] == "<think>literal</think>4"

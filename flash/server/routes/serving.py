@@ -7,6 +7,7 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import re
 import time
@@ -14,7 +15,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from jsonschema import SchemaError, ValidationError
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
+from flash.engine.structured_outputs import parse_structured_outputs
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -39,6 +45,13 @@ _DEPLOYMENT_BUSY_STATES = {"deploying", "registering", "verifying"}
 _DEPLOYMENT_READY_STATES = {"ready", "deployed"}
 _DEPLOYMENT_STALE_SECONDS = 30 * 60
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+
+
+def _reject_external_schema_reference(uri: str):
+    raise NoSuchResource(ref=uri)
+
+
+_SCHEMA_REGISTRY = Registry(retrieve=_reject_external_schema_reference)
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -92,6 +105,58 @@ def recover_deployments() -> int:
     return recovered
 
 
+def _thinking_structured_answer(content: str) -> str:
+    closed = content.find("</think>")
+    if closed < 0:
+        raise ServingError(
+            "structured smoke generation for a thinking adapter never closed its reasoning with "
+            "</think>"
+        )
+    suffix = content[closed + len("</think>") :]
+    if "<think>" in suffix:
+        raise ServingError(
+            "structured smoke generation opened a new <think> block after reasoning closed"
+        )
+    if "</think>" in suffix:
+        raise ServingError(
+            "structured smoke generation returned an additional </think> delimiter in the answer"
+        )
+    answer = suffix.strip()
+    if not answer:
+        raise ServingError("structured smoke generation returned no answer after </think>")
+    return answer
+
+
+def _validate_structured_smoke(answer: str, constraint: dict) -> None:
+    try:
+        if "json" in constraint:
+            instance = json.loads(answer)
+            schema = constraint["json"]
+            validator_class = validator_for(schema)
+            validator_class.check_schema(schema)
+            validator_class(schema, registry=_SCHEMA_REGISTRY).validate(instance)
+        elif constraint.get("json_object") is True:
+            if not isinstance(json.loads(answer), dict):
+                raise ServingError("structured smoke output is valid JSON but not a JSON object")
+        elif "choice" in constraint:
+            if answer not in constraint["choice"]:
+                raise ServingError(
+                    f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
+                )
+        elif "regex" in constraint and re.fullmatch(str(constraint["regex"]), answer) is None:
+            raise ServingError("structured smoke output does not match the configured regex")
+    except json.JSONDecodeError as exc:
+        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
+    except Unresolvable as exc:
+        raise ServingError(f"configured JSON schema reference could not be resolved: {exc}") from exc
+    except (ValidationError, SchemaError) as exc:
+        raise ServingError(
+            f"structured smoke output violates the configured JSON schema: {exc}"
+        ) from exc
+    except re.error as exc:
+        raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
+
+
 def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     started = time.monotonic()
     result = _app.serve_chat(
@@ -105,16 +170,22 @@ def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
-    if not content.strip():
+    constraint = parse_structured_outputs(spec.train.structured_outputs)
+    if constraint and spec.thinking and finish == "length":
+        raise ServingError("structured smoke generation was truncated at the maximum token length")
+    answer = _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
+    if not answer:
         raise ServingError(
             f"smoke generation returned no content (finish_reason={finish!r}) after {latency:.1f}s"
         )
+    if constraint:
+        _validate_structured_smoke(answer, constraint)
     return {
         "verified_at": time.time(),
         "verify_latency_s": latency,
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
-        "verify_sample": content.strip()[:160],
+        "verify_sample": answer[:160],
     }
 
 
@@ -348,6 +419,15 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
         verify = _require_bool(payload, "verify", True)
+        if not dry_run and spec.thinking and spec.train.structured_outputs and not verify:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "verify=false is not allowed for thinking deployments with structured outputs; "
+                    "verification is required to confirm the post-reasoning answer satisfies the "
+                    "configured constraint"
+                ),
+            )
         current_deployment = status.deployment or {}
         if (
             not dry_run
@@ -387,9 +467,8 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
-            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
-            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
-            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            # a run trained with structured_outputs serves under the same canonical constraint;
+            # thinking registration is gated on serving's deferred-constraint capability.
             "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
         }

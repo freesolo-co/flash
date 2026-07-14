@@ -50,8 +50,15 @@ def _stub_adapter_config(
     return seen
 
 
-def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **deploy_kwargs):
-    """Run a non-dry-run deploy_adapter with httpx.post captured; return the POSTed /adapters body."""
+def _capture_registration_body(
+    monkeypatch,
+    tmp_path,
+    stub_serving_registry,
+    *,
+    events: list[tuple[str, str]] | None = None,
+    **deploy_kwargs,
+):
+    """Run a non-dry-run deploy_adapter and return the posted adapter body."""
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
@@ -67,6 +74,8 @@ def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **d
             return None
 
     def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        if events is not None:
+            events.append(("POST", url))
         seen["json"] = json
         return _Resp()
 
@@ -75,6 +84,20 @@ def _capture_registration_body(monkeypatch, tmp_path, stub_serving_registry, **d
     stub_serving_registry(
         {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
     )
+    registry_get = d.httpx.get
+
+    class _HealthResp(_Resp):
+        def json(self):
+            return {"capabilities": [d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY]}
+
+    def fake_get(url, **kwargs):
+        if url == "https://serve.example/healthz":
+            if events is not None:
+                events.append(("GET", url))
+            return _HealthResp()
+        return registry_get(url, **kwargs)
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
     d.deploy_adapter(**deploy_kwargs)
     return seen["json"]
 
@@ -97,6 +120,26 @@ def test_deploy_dry_run():
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
     assert "mode" not in d
     assert "est_idle_cost_usd_per_day" not in d
+
+
+def test_thinking_structured_dry_run_does_not_probe_capabilities(monkeypatch):
+    import flash.serve.deploy as d
+
+    monkeypatch.setattr(
+        d,
+        "_require_thinking_structured_outputs_capability",
+        lambda _base: pytest.fail("dry run must not probe serving capabilities"),
+    )
+    dep = d.deploy_adapter(
+        run_id="r1",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/r1/seed0",
+        dry_run=True,
+        thinking=True,
+        structured_outputs=json.dumps({"choice": ["4"]}),
+    )
+    assert dep.state == "dry_run"
 
 
 def test_deploy_9b_dry_run_is_not_rejected():
@@ -373,16 +416,19 @@ def test_deploy_registers_structured_outputs_default(
     schema = {"type": "object", "properties": {"industries": {"type": "array"}}}
     spec = json.dumps({"json": schema})
 
+    events: list[tuple[str, str]] = []
     body = _capture_registration_body(
         monkeypatch,
         tmp_path,
         stub_serving_registry,
+        events=events,
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         structured_outputs=spec,
     )
+    assert events == [("POST", "https://serve.example/adapters")]
     assert body["structured_outputs"] == {"json": schema}
     # thinking default is still carried and independent of the constraint.
     assert body["thinking"] is False
@@ -404,18 +450,16 @@ def test_deploy_omits_structured_outputs_when_unset(monkeypatch, tmp_path, stub_
     assert "structured_outputs" not in body
 
 
-def test_deploy_skips_structured_outputs_default_for_thinking(
+def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe(
     monkeypatch, tmp_path, stub_serving_registry
 ):
-    """A THINKING run does NOT register a serving grammar default even if a constraint is set:
-    serving binds the grammar from token 0 (no reasoning-parser deferral), which would suppress the
-    <think> phase. (Training stays compatible via a deferred grammar; serving has no such deferral,
-    so the serve-time default is skipped rather than break reasoning.)"""
     spec = json.dumps({"json": {"type": "object"}})
+    events: list[tuple[str, str]] = []
     body = _capture_registration_body(
         monkeypatch,
         tmp_path,
         stub_serving_registry,
+        events=events,
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
@@ -423,22 +467,86 @@ def test_deploy_skips_structured_outputs_default_for_thinking(
         thinking=True,
         structured_outputs=spec,
     )
-    assert "structured_outputs" not in body
+    assert events == [
+        ("GET", "https://serve.example/healthz"),
+        ("POST", "https://serve.example/adapters"),
+    ]
+    assert body["structured_outputs"] == {"json": {"type": "object"}}
     assert body["thinking"] is True
 
 
+@pytest.mark.parametrize(
+    ("health_case", "match"),
+    [
+        ("missing", "missing required capability"),
+        ("malformed", "must return a list field named capabilities"),
+        ("invalid_json", "did not return valid JSON"),
+        ("http_error", "HTTP 503"),
+        ("unreachable", "could not reach the serving backend"),
+    ],
+)
+def test_thinking_structured_capability_failure_never_posts_adapter(
+    monkeypatch, tmp_path, health_case, match
+):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    posts: list[str] = []
+
+    class _HealthResp:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            if health_case == "http_error":
+                request = d.httpx.Request("GET", "https://serve.example/healthz")
+                response = d.httpx.Response(503, request=request, text="unavailable")
+                raise d.httpx.HTTPStatusError("unavailable", request=request, response=response)
+
+        def json(self):
+            if health_case == "invalid_json":
+                raise ValueError("not json")
+            if health_case == "malformed":
+                return {"capabilities": "thinking_structured_outputs_deferred_v1"}
+            return {"capabilities": []}
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://serve.example/healthz"
+        if health_case == "unreachable":
+            request = d.httpx.Request("GET", url)
+            raise d.httpx.ConnectError("connection refused", request=request)
+        return _HealthResp()
+
+    def fake_post(url, **_kwargs):
+        posts.append(url)
+        pytest.fail("adapter registration must not be attempted")
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    with pytest.raises(d.ServingError, match=match):
+        d.deploy_adapter(
+            run_id="flash-7-abcd",
+            model="Qwen/Qwen3.5-0.8B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/flash-7-abcd/seed0",
+            thinking=True,
+            structured_outputs=json.dumps({"choice": ["4"]}),
+        )
+    assert posts == []
+
+
 def test_structured_outputs_body_helper():
-    """Unit-level contract of the deploy helper: unset/thinking -> None; non-thinking spec ->
-    parsed canonical dict; corrupt spec -> ValueError (fail loud, not silently unconstrained)."""
     from flash.serve.deploy import _structured_outputs_body
 
     assert _structured_outputs_body("r1", "", thinking=False) is None
     assert _structured_outputs_body("r1", "", thinking=True) is None
     spec = json.dumps({"json": {"type": "object"}})
-    assert _structured_outputs_body("r1", spec, thinking=True) is None
     assert _structured_outputs_body("r1", spec, thinking=False) == {"json": {"type": "object"}}
+    assert _structured_outputs_body("r1", spec, thinking=True) == {"json": {"type": "object"}}
     with pytest.raises(ValueError, match="corrupt train"):
-        _structured_outputs_body("r1", "{not json", thinking=False)
+        _structured_outputs_body("r1", "{not json", thinking=True)
 
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
