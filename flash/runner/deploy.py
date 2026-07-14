@@ -63,6 +63,7 @@ def cancel_run(run_id: str) -> RunStatus:
         mark_deployment_revocation_failed,
         mark_deployment_undeployed,
     )
+    from flash.server._locks import _deploy_lock
 
     status = get_status(run_id)
     retry_revocation = (
@@ -131,8 +132,6 @@ def cancel_run(run_id: str) -> RunStatus:
                     "snapshot was unavailable or invalid; teardown was still attempted"
                 ),
             }
-    from flash.server._locks import _deploy_lock
-
     with _deploy_lock(run_id):
         if not remote:
             teardown_remote(get_status(run_id).remote or {})
