@@ -14,10 +14,9 @@ arbitrary tokenizer mismatch and covers every student token. See ``tokenizer_ali
 
 There is NO local reference model: the teacher lives behind the API. Sampling uses a colocated vLLM
 engine loaded with the student LoRA and refreshed after each optimizer step, matching GRPO's rollout
-shape. Length-capped rollouts contribute no auxiliary loss. Termination behaviour is diagnosed through
-captured ``finish_reason`` values, truncation/empty EMAs, and a bounded sample of detached EOS
-log-probabilities reported in run metrics. All heavy imports (torch/transformers/peft/vllm) are inside
-functions, so importing this module is CPU/offline-safe.
+shape. Length-capped rollouts bypass teacher scoring, contribute no loss, and are counted in run
+metadata. All heavy imports (torch/transformers/peft/vllm) are inside functions, so importing this
+module is CPU/offline-safe.
 """
 
 from __future__ import annotations
@@ -76,10 +75,6 @@ OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
-
-_DIAGNOSTIC_EMA_DECAY = 0.97
-# bounds detached termination-diagnostic forward cost per run.
-_EOS_DIAG_BUDGET = 32
 
 
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
@@ -546,7 +541,7 @@ def run_opd():
     # tens of GiB reserved but unallocated.
     free_gpu()
 
-    # resolve the model/tokenizer halt set once for both vllm sampling and eos diagnostics.
+    # resolve the model/tokenizer halt set once for vllm sampling and termination classification.
     generation_eos_ids = _generation_eos_ids(model, tok)
     vllm_kwargs = _opd_vllm_kwargs(model_id, knobs, seq_cap)
     lora_rank = _opd_lora_rank(
@@ -613,16 +608,8 @@ def run_opd():
     teacher_input_tokens = 0
     # length-capped rollouts and alignment granularity are surfaced in train_meta for diagnosis.
     truncated_rollouts = 0
-    # diagnostic termination emas update at step boundaries in generation order, never in
-    # asynchronous teacher-rpc completion order, so repeated runs produce the same trajectories.
-    trunc_ema = 0.0
-    empty_ema = 0.0
     granularity_sum = 0.0
     granularity_n = 0
-    # running mean of defect-row log p(any valid eos), surfaced in train_meta.
-    eos_logprob_sum = 0.0
-    eos_logprob_n = 0
-    eos_diagnostic_count = [0]
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
     )
@@ -684,14 +671,13 @@ def run_opd():
                 max_tokens=max(1, int(max_new)),
             )[0]
 
-    def _account(r, *, backward: bool = True):
-        """Consume one sample's SampleResult: tally teacher health / truncations, backprop a distilled
-        sample (scaled 1/accum_target for gradient accumulation), advance the step aggregates, and
-        refresh the stall clock. Called after vLLM generation and teacher scoring; ``samples_seen`` is
-        advanced by the caller once per generated rollout so its timing is unchanged."""
+    def _account(r):
+        """Consume one sample's SampleResult: tally teacher health / truncations, advance the step
+        aggregates, and refresh the stall clock. Called after vLLM generation and teacher scoring;
+        ``samples_seen`` is advanced by the caller once per generated rollout so its timing is
+        unchanged."""
         nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
-        nonlocal eos_logprob_sum, eos_logprob_n
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -700,9 +686,6 @@ def run_opd():
             teacher_error += 1
         if r.truncated:
             truncated_rollouts += 1
-        if r.eos_logprob is not None:
-            eos_logprob_sum += r.eos_logprob
-            eos_logprob_n += 1
         if r.loss is None:
             reason = _sample_skip_reason(r)
             skip_counts[reason] += 1
@@ -711,8 +694,6 @@ def run_opd():
             # _opd_progress) — else an all-skip stretch emits only ignored liveness pings.
             _opd_progress(opt_steps, nseq)
             return
-        if backward:
-            (r.loss / accum_target).backward()
         step_loss += float(r.loss.detach())
         step_cov += r.coverage
         granularity_sum += r.group_granularity
@@ -774,7 +755,6 @@ def run_opd():
                 step_cov = 0.0
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
-                generated_in_order: list[_GenResult] = []
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
                 # handed to the resident teacher pool, and completed teacher futures are converted into
                 # differentiable GKD losses as soon as they finish. This preserves one optimizer update
@@ -801,40 +781,9 @@ def run_opd():
                         if batch:
                             _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
-                def _resolve_without_teacher(
-                    pendings: list[_Pending], *, _accum_target=accum_target
-                ) -> None:
-                    if not pendings:
-                        return
-                    loss_started = time.perf_counter()
-                    resolved = _resolve_samples_batched(
-                        model,
-                        tok,
-                        device,
-                        [(p.gen, None, p.prompt_ids) for p in pendings],
-                        knobs,
-                        loss_microbatch_size,
-                        backward_scale=1.0 / _accum_target,
-                        eos_ids=generation_eos_ids,
-                        eos_diagnostic_count=eos_diagnostic_count,
-                    )
-                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
-                    opd_phase_counts["loss_batches"] += 1
-                    for result in resolved:
-                        _account(result, backward=False)
-
-                def _queue_or_account(
-                    p: _Pending,
-                    *,
-                    _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
-                    _generated_in_order=generated_in_order,
-                ) -> None:
-                    _generated_in_order.append(p.gen)
-                    if p.gen.skip:
+                def _queue_or_account(p: _Pending) -> None:
+                    if p.gen.skip or p.gen.truncated:
                         _account(_resolve_no_loss_sample(p.gen, None))
-                        return
-                    if p.gen.truncated:
-                        _resolve_without_teacher([p])
                         return
                     _queue_teacher_batch([p])
 
@@ -866,7 +815,6 @@ def run_opd():
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
                         scored_samples.append((p.gen, score, p.prompt_ids))
-                    loss_started = time.perf_counter()
                     resolved = _resolve_samples_batched(
                         model,
                         tok,
@@ -875,12 +823,9 @@ def run_opd():
                         knobs,
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
-                        eos_ids=generation_eos_ids,
                     )
-                    opd_phase_seconds["loss_backward"] += time.perf_counter() - loss_started
-                    opd_phase_counts["loss_batches"] += 1
                     for r in resolved:
-                        _account(r, backward=False)
+                        _account(r)
 
                 def _drain_ready_teacher_futures(
                     *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
@@ -954,23 +899,18 @@ def run_opd():
                             )
                             opd_phase_counts["rollout_generate_calls"] += 1
                         scorable: list[_Pending] = []
-                        defects: list[_Pending] = []
                         for gen, (prompt_ids, prompt_messages) in zip(
                             gens, chunk_contexts, strict=True
                         ):
-                            generated_in_order.append(gen)
                             p = _Pending(
                                 gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
                             )
-                            if gen.skip:
+                            if gen.skip or gen.truncated:
                                 _account(_resolve_no_loss_sample(gen, None))
-                            elif gen.truncated:
-                                defects.append(p)
                             else:
                                 scorable.append(p)
                             samples_seen += 1  # advances the liveness-thread progress signal
                             _opd_progress(opt_steps, nseq)
-                        _resolve_without_teacher(defects)
                         _queue_teacher_batch(scorable)
                         _drain_ready_teacher_futures()
 
@@ -982,12 +922,6 @@ def run_opd():
                         _consume_teacher_future(fut)
                     wait_started = time.perf_counter()
                 _opd_progress(opt_steps, nseq)  # refresh leaving the network phase
-
-                # teacher futures complete out of order. update diagnostics only after the whole step,
-                # replaying original generation order so the ema trajectory is deterministic.
-                trunc_ema, empty_ema = _update_termination_emas(
-                    generated_in_order, trunc_ema=trunc_ema, empty_ema=empty_ema
-                )
 
                 if nseq:
                     break
@@ -1151,12 +1085,8 @@ def run_opd():
             "loss_curve": loss_curve,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or
-            # distilled; their eos probability is measured only for diagnostics.
+            # distilled.
             "truncated_rollouts": truncated_rollouts,
-            "mean_eos_logprob": (eos_logprob_sum / eos_logprob_n) if eos_logprob_n else None,
-            # deterministic generation-order diagnostics; neither value controls training.
-            "final_empty_rate_ema": round(empty_ema, 5),
-            "final_truncation_rate_ema": round(trunc_ema, 5),
             "teacher_transient_failures": teacher_transient,
             "teacher_errors": teacher_error,
             "no_signal_resamples": no_signal_resamples,
@@ -1184,12 +1114,10 @@ def run_opd():
             "opd_phase_rollout_generate_seconds": float(opd_phase_seconds["rollout_generate"]),
             "opd_phase_teacher_rpc_sum_seconds": float(opd_phase_seconds["teacher_rpc_sum"]),
             "opd_phase_teacher_wait_seconds": float(opd_phase_seconds["teacher_wait"]),
-            "opd_phase_loss_backward_seconds": float(opd_phase_seconds["loss_backward"]),
             "opd_phase_optimizer_step_seconds": float(opd_phase_seconds["optimizer_step"]),
             "opd_phase_vllm_sync_seconds": float(opd_phase_seconds["vllm_sync"]),
             "opd_phase_rollout_generate_calls": int(opd_phase_counts["rollout_generate_calls"]),
             "opd_phase_teacher_batches": int(opd_phase_counts["teacher_batches"]),
-            "opd_phase_loss_batches": int(opd_phase_counts["loss_batches"]),
             "opd_phase_optimizer_steps": int(opd_phase_counts["optimizer_steps"]),
             "opd_phase_vllm_syncs": int(opd_phase_counts["vllm_syncs"]),
             "opd_rollout_pipeline_chunks": (
@@ -1248,15 +1176,13 @@ class SampleResult:
     group_granularity: float = 0.0
     # Machine-readable reason when loss is None. Used for skipped-step diagnostics and train_meta.
     skip_reason: str = ""
-    # detached log p(any valid eos) at a budgeted defect's first post-content row, else none.
-    eos_logprob: float | None = None
 
 
 @dataclass(frozen=True)
 class _GenResult:
     """One student rollout after OPD's pre-scoring gates: the sampled completion plus skip/truncated
-    verdicts. ``truncated`` samples bypass teacher scoring but retain termination diagnostics; ``skip``
-    covers empty or U+FFFD completions. Otherwise ``completion_ids`` / ``completion_text`` carry the
+    verdicts. ``truncated`` samples bypass teacher scoring; ``skip`` covers empty or U+FFFD completions.
+    Otherwise ``completion_ids`` / ``completion_text`` carry the
     trimmed on-policy answer to score + distil. Torch-free (completion_ids is a CPU list) so it can be
     handed to the model-free scoring thread pool."""
 
@@ -1311,17 +1237,6 @@ class _Pending:
     prompt_ids: object
     prompt_messages: object
     score: object = None
-
-
-def _update_termination_emas(
-    generated_in_order, *, trunc_ema: float, empty_ema: float
-) -> tuple[float, float]:
-    for gen in generated_in_order:
-        trunc_ema += (1.0 - _DIAGNOSTIC_EMA_DECAY) * ((1.0 if gen.truncated else 0.0) - trunc_ema)
-        empty_ema += (1.0 - _DIAGNOSTIC_EMA_DECAY) * (
-            (1.0 if gen.skip_reason == "empty_completion" else 0.0) - empty_ema
-        )
-    return trunc_ema, empty_ema
 
 
 def _termination_cause(
@@ -1572,14 +1487,6 @@ class _PreparedLoss:
     group_granularity: float
 
 
-@dataclass(frozen=True)
-class _PreparedEosDiagnostic:
-    idx: int
-    prompt_ids: object
-    student_ids: object
-    gen_tokens: int
-
-
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
     import torch
     import torch.nn.functional as F
@@ -1647,70 +1554,6 @@ def _bump_model_counter(model, name: str, inc: int = 1) -> None:
         setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
 
 
-def _eos_defect_logprob(sample_logits, prompt_len: int, student_ids, eos_ids):
-    """Return detached log P(any valid EOS) at a length-capped rollout's cap row."""
-    import torch
-
-    comp_len = len(student_ids)
-    if comp_len == 0 or not eos_ids:
-        return None
-    row_index = prompt_len - 1 + comp_len
-    if row_index < 0 or row_index >= sample_logits.shape[0]:
-        return None
-    vocab_size = sample_logits.shape[-1]
-    valid_eos_ids = sorted(int(token_id) for token_id in eos_ids if 0 <= int(token_id) < vocab_size)
-    if not valid_eos_ids:
-        return None
-    with torch.no_grad():
-        logits_row = sample_logits[row_index].float()
-        eos_index = torch.tensor(valid_eos_ids, dtype=torch.long, device=logits_row.device)
-        eos_logprob = torch.logsumexp(
-            torch.log_softmax(logits_row, dim=-1).index_select(0, eos_index), dim=0
-        )
-    return float(eos_logprob)
-
-
-def _resolve_eos_diagnostics_batched(
-    model, tok, device, diagnostics: list[_PreparedEosDiagnostic], microbatch: int, eos_ids
-):
-    import torch
-
-    if not diagnostics:
-        return {}
-    model.config.use_cache = False
-    pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
-    mb = max(1, int(microbatch))
-    resolved = {}
-    with torch.no_grad():
-        for start in range(0, len(diagnostics), mb):
-            chunk = diagnostics[start : start + mb]
-            _bump_model_counter(model, "_flash_opd_full_logits_batches")
-            _bump_model_counter(model, "_flash_opd_eos_diag_batches")
-            seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
-            max_len = max(len(seq) for seq in seqs)
-            input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
-            for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                attention_mask[row, : len(seq)] = 1
-            logits = _forward_logits(model, input_ids, attention_mask)
-            for row, p in enumerate(chunk):
-                resolved[p.idx] = _eos_defect_logprob(
-                    logits[row], len(p.prompt_ids), p.student_ids, eos_ids
-                )
-    return resolved
-
-
-def _is_eos_defect(gen: _GenResult, eos_ids) -> bool:
-    """True only for a rollout verifiably stopped by the length cap."""
-    return bool(
-        str(gen.finish_reason or "").lower() == "length"
-        and gen.truncated
-        and gen.completion_ids
-        and eos_ids
-    )
-
-
 def _resolve_samples_batched(
     model,
     tok,
@@ -1720,8 +1563,6 @@ def _resolve_samples_batched(
     microbatch: int,
     *,
     backward_scale: float | None = None,
-    eos_ids=frozenset(),
-    eos_diagnostic_count: list[int] | None = None,
 ) -> list[SampleResult]:
     import torch
 
@@ -1729,31 +1570,9 @@ def _resolve_samples_batched(
         return []
     results: list[SampleResult | None] = [None] * len(samples)
     prepared: list[_PreparedLoss] = []
-    diagnostics: list[_PreparedEosDiagnostic] = []
     for idx, (gen, score, prompt_ids) in enumerate(samples):
         if gen.truncated:
-            if _is_eos_defect(gen, eos_ids):
-                results[idx] = SampleResult(
-                    truncated=True,
-                    gen_tokens=gen.gen_tokens,
-                    skip_reason="truncated_rollout",
-                )
-                if eos_diagnostic_count is not None:
-                    diagnostic_index = eos_diagnostic_count[0]
-                    eos_diagnostic_count[0] += 1
-                    if diagnostic_index < _EOS_DIAG_BUDGET:
-                        diagnostics.append(
-                            _PreparedEosDiagnostic(
-                                idx=idx,
-                                prompt_ids=prompt_ids,
-                                student_ids=[
-                                    int(token_id) for token_id in gen.completion_ids
-                                ],
-                                gen_tokens=gen.gen_tokens,
-                            )
-                        )
-            else:
-                results[idx] = _resolve_no_loss_sample(gen, score)
+            results[idx] = _resolve_no_loss_sample(gen, score)
             continue
         if gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
@@ -1856,17 +1675,6 @@ def _resolve_samples_batched(
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
 
-    eos_logprobs = _resolve_eos_diagnostics_batched(
-        model, tok, device, diagnostics, microbatch, eos_ids
-    )
-    for p in diagnostics:
-        results[p.idx] = SampleResult(
-            truncated=True,
-            gen_tokens=p.gen_tokens,
-            skip_reason="truncated_rollout",
-            eos_logprob=eos_logprobs.get(p.idx),
-        )
-
     return [r if r is not None else SampleResult(skip_reason="teacher_error") for r in results]
 
 
@@ -1876,7 +1684,6 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
     Scored samples must go through ``_resolve_samples_batched`` so OPD has exactly one loss path.
     """
     if gen.truncated:
-        # no cap-row eos diagnostic could be constructed.
         return SampleResult(
             truncated=True,
             gen_tokens=gen.gen_tokens,

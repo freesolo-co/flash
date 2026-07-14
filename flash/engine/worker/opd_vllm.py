@@ -240,7 +240,7 @@ class OpdVllmRolloutEngine:
     temperature: float
     top_p: float
     stop_sequences: tuple[str, ...] = ()
-    # the exact model/tokenizer halt set shared with opd's eos termination diagnostics.
+    # the exact model/tokenizer halt set used for generation and termination classification.
     eos_token_ids: tuple[int, ...] = ()
     # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
     structured_outputs: dict[str, Any] | None = None

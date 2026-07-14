@@ -445,21 +445,21 @@ lora_rank = 32
 ```
 
 The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
-the zero-width stop token**. Termination defects are diagnosed and reported, but no auxiliary EOS loss
-is applied. Watch `truncated_rollouts` and `mean_eos_logprob` in the run metrics; warm-starting from
-an SFT adapter can still improve initial termination behavior.
+the zero-width stop token**. No auxiliary EOS loss is applied. `truncated_rollouts` records completions
+that reached the length cap without EOS or a configured stop. Warm-starting from an SFT adapter can
+still improve initial termination behavior.
 
-A verbose teacher also hurts in a way termination diagnostics can't reach: it inflates the *content*
-the student distils toward — long per-turn reasoning and extra multi-turn looping — so episodes still
-forfeit against the length/turn budget regardless of stop-token behavior. Because the teacher scores the
+A verbose teacher can also inflate the *content* the student distils toward through long per-turn
+reasoning and extra multi-turn looping, so episodes still forfeit against the length/turn budget
+regardless of stop-token behavior. Because the teacher scores the
 student's rollouts **conditioned on your environment's own system prompt**, you can shrink its target
 distribution at the source: give the prompt used for OPD rollouts a **hard, specific reasoning
 budget** — e.g. "reason in at most two or three sentences, then act; once you have started, do not
 reconsider" — rather than a vague "be brief." The phrasing matters. A soft brevity request can
 **backfire on a thinking teacher**, trimming the median while *inflating* the long tail (the model
 spirals when told to be brief on a problem it finds hard), which is exactly the tail that drives
-runaway. Constrain the content with the prompt, and use the termination diagnostics to track missing
-stops. Both assume the teacher is still strong at the task (vet it first, above).
+runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
+failures. This assumes the teacher is still strong at the task (vet it first, above).
 
 ---
 
@@ -520,7 +520,7 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
 | Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt with a *hard, specific* budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail |
 | Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
-| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | Termination is diagnosed and reported, but no auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out. |
+| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | No auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out. |
 | Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
 | Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
 | Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |

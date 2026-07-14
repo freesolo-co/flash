@@ -8,7 +8,6 @@ CI, which has the training stack).
 from __future__ import annotations
 
 import json
-import math
 import sys
 import types
 from types import SimpleNamespace
@@ -799,6 +798,7 @@ def _opd_harness(
     stop_sequences=(),
     structured_outputs="",
     metas=None,
+    outputs=None,
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -881,7 +881,12 @@ def _opd_harness(
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "grad_checkpointing_on", lambda *a, **k: False)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
-    _patch_opd_run_vllm_stub(monkeypatch, opd_mod, sample_result=sample_result)
+    _patch_opd_run_vllm_stub(
+        monkeypatch,
+        opd_mod,
+        sample_result=sample_result,
+        outputs=outputs,
+    )
     if liveness is not None:
         monkeypatch.setattr(opd_mod, "liveness_heartbeat", liveness)
     import transformers
@@ -894,17 +899,7 @@ def _opd_harness(
     return opd_mod
 
 
-@pytest.mark.parametrize(
-    ("stop_sequences", "structured_outputs"),
-    [
-        ((), ""),
-        (("</answer>",), ""),
-        ((), '{"json_object":true}'),
-    ],
-)
-def test_opd_train_meta_reports_termination_diagnostics(
-    monkeypatch, stop_sequences, structured_outputs
-):
+def test_opd_train_meta_reports_truncated_rollouts_without_special_diagnostics(monkeypatch):
     calls = 0
 
     def _trained_sample(*, model, **_kwargs):
@@ -915,7 +910,6 @@ def test_opd_train_meta_reports_termination_diagnostics(
                 truncated=True,
                 gen_tokens=1,
                 skip_reason="truncated_rollout",
-                eos_logprob=-2.0,
             )
         return opd_mod.SampleResult(
             loss=model.w.float().sum() * 1e-6,
@@ -926,19 +920,48 @@ def test_opd_train_meta_reports_termination_diagnostics(
         )
 
     metas = []
-    opd_mod = _opd_harness(
-        monkeypatch,
-        sample_result=_trained_sample,
-        stop_sequences=stop_sequences,
-        structured_outputs=structured_outputs,
-        metas=metas,
-    )
+    opd_mod = _opd_harness(monkeypatch, sample_result=_trained_sample, metas=metas)
 
     opd_mod.run_opd()
 
     notes = metas[-1]["notes"]
     assert notes["truncated_rollouts"] == 1
-    assert notes["mean_eos_logprob"] == -2.0
+    assert "mean_eos_logprob" not in notes
+    assert "final_empty_rate_ema" not in notes
+    assert "final_truncation_rate_ema" not in notes
+
+
+def test_opd_truncated_rollouts_bypass_teacher_and_gkd(monkeypatch, capsys):
+    from flash.engine.worker import opd as opd_mod
+
+    outputs = [
+        opd_mod.OpdVllmOutput([3], "x", finish_reason="length") for _ in range(13)
+    ]
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=None,
+        outputs=outputs,
+    )
+    calls = {"teacher": 0, "gkd": 0}
+
+    def _score_many(_teacher, pendings, **_kwargs):
+        calls["teacher"] += 1
+        return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
+
+    original_resolve = opd_mod._resolve_samples_batched
+
+    def _resolve_samples_batched(*args, **kwargs):
+        calls["gkd"] += 1
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(opd_mod, "_score_many", _score_many)
+    monkeypatch.setattr(opd_mod, "_resolve_samples_batched", _resolve_samples_batched)
+
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    assert calls == {"teacher": 0, "gkd": 0}
+    assert "truncated_rollout=1" in capsys.readouterr().out
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
@@ -1288,7 +1311,7 @@ def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
     assert engine.sync_count == 1  # initial LoRA sync only; no rollout remains after step 1
 
 
-def test_opd_resolves_one_halt_set_for_generation_and_loss(monkeypatch):
+def test_opd_resolves_one_halt_set_for_generation(monkeypatch):
     torch = pytest.importorskip("torch")
 
     def _one_update(*, model, **_kwargs):
@@ -1310,27 +1333,6 @@ def test_opd_resolves_one_halt_set_for_generation_and_loss(monkeypatch):
         "_generation_eos_ids",
         lambda model, tok: calls.append((model, tok)) or halt_set,
     )
-    captured = {}
-
-    def _resolve_samples_batched(
-        model, tok, device, samples, knobs, microbatch, *, backward_scale=None, eos_ids=frozenset()
-    ):
-        captured["eos_ids"] = eos_ids
-        loss = model.w.float().sum() * 1e-6
-        if backward_scale is not None:
-            (loss * backward_scale).backward()
-        return [
-            opd_mod.SampleResult(
-                loss=loss.detach(),
-                teacher_status="ok",
-                coverage=1.0,
-                gen_tokens=1,
-                teacher_tokens=1,
-            )
-            for _sample in samples
-        ]
-
-    monkeypatch.setattr(opd_mod, "_resolve_samples_batched", _resolve_samples_batched)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -1338,28 +1340,6 @@ def test_opd_resolves_one_halt_set_for_generation_and_loss(monkeypatch):
 
     assert len(calls) == 1
     assert opd_mod.OpdVllmRolloutEngine.instances[0].eos_token_ids == (5, 7)
-    assert captured["eos_ids"] is halt_set
-
-
-def test_update_termination_emas_replays_generation_order():
-    from flash.engine.worker import opd as opd_mod
-
-    generated = [
-        opd_mod._GenResult(truncated=True),
-        opd_mod._GenResult(skip=True, skip_reason="empty_completion"),
-        opd_mod._GenResult(),
-        opd_mod._GenResult(),
-    ]
-    trunc_ema, empty_ema = opd_mod._update_termination_emas(generated, trunc_ema=0.0, empty_ema=0.0)
-    decay = opd_mod._DIAGNOSTIC_EMA_DECAY
-    assert trunc_ema == pytest.approx((1.0 - decay) * decay**3)
-    assert empty_ema == pytest.approx((1.0 - decay) * decay**2)
-
-    reversed_trunc, reversed_empty = opd_mod._update_termination_emas(
-        list(reversed(generated)), trunc_ema=0.0, empty_ema=0.0
-    )
-    assert reversed_trunc != pytest.approx(trunc_ema)
-    assert reversed_empty != pytest.approx(empty_ema)
 
 
 def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
@@ -3668,158 +3648,58 @@ def test_resolve_samples_batched_uses_full_logits():
     assert model._flash_opd_full_logits_batches == 1
 
 
-def test_eos_defect_logprob_targets_post_content_row_without_gradients():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
-
-    vocab, eos_ids = 8, frozenset({5, 7, 99})
-    logits = torch.zeros(3, vocab, requires_grad=True)
-    logprob = opd_mod._eos_defect_logprob(
-        logits, prompt_len=1, student_ids=[2, 3], eos_ids=eos_ids
-    )
-
-    assert isinstance(logprob, float)
-    assert logprob == pytest.approx(math.log(2 / vocab), abs=1e-6)
-    assert logits.grad is None
-
-
-def test_eos_defect_logprob_is_shift_invariant_and_detached():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
-
-    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.2, -0.7, 1.3, 0.4]], requires_grad=True)
-    shifted_logits = (logits.detach() + 123.0).requires_grad_(True)
-
-    logprob = opd_mod._eos_defect_logprob(
-        logits, prompt_len=1, student_ids=[1], eos_ids=frozenset({2, 3})
-    )
-    shifted_logprob = opd_mod._eos_defect_logprob(
-        shifted_logits, prompt_len=1, student_ids=[1], eos_ids=frozenset({2, 3})
-    )
-
-    # fp32 rounding of the +123 shift costs mantissa bits; a shift-variant raw-logit
-    # objective would drift by ~123, so 1e-5 still catches the real failure mode
-    assert shifted_logprob == pytest.approx(logprob, abs=1e-5)
-    assert logits.grad is None
-    assert shifted_logits.grad is None
-
-
-def test_eos_defect_diagnostics_never_add_auxiliary_gradients():
+def test_resolve_samples_batched_truncated_sample_has_no_forward_or_gradients():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
     class _Tok:
         pad_token_id = 0
 
-        def decode(self, ids, skip_special_tokens=True):
-            return "".join({2: "a"}.get(int(i), "") for i in ids)
+    class _NoForwardLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=3, V=8)
+            self.calls = 0
 
-    eos_ids = frozenset({5})
-    natural = (
+        def __call__(self, input_ids, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                logits=self.w[: input_ids.shape[1]]
+                .unsqueeze(0)
+                .expand(input_ids.shape[0], -1, -1)
+            )
+
+    model = _NoForwardLM()
+    sample = (
         opd_mod._GenResult(
-            completion_ids=[2], completion_text="a", gen_tokens=1, finish_reason="stop"
+            completion_ids=[2],
+            completion_text="a",
+            gen_tokens=1,
+            truncated=True,
+            finish_reason="length",
+            skip_reason="truncated_rollout",
         ),
         opd_mod._ScoreResult(teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"),
         [1],
     )
-    defect = (
-        opd_mod._GenResult(
-            completion_ids=[2],
-            completion_text="a",
-            gen_tokens=1,
-            truncated=True,
-            finish_reason="length",
-        ),
-        None,
-        [1],
-    )
-
-    natural_model = _TinyLM(torch, T=3, V=8)
-    natural_out = opd_mod._resolve_samples_batched(
-        natural_model,
-        _Tok(),
-        "cpu",
-        [natural],
-        SimpleNamespace(kl_coef=1.0, stop_sequences=(), structured_outputs=""),
-        microbatch=1,
-        eos_ids=eos_ids,
-    )[0]
-    natural_out.loss.backward()
-    assert natural_out.eos_logprob is None
-    assert natural_model.w.grad[1].abs().sum() == 0
-
-    class _NoGradObservedLM(_TinyLM):
-        def __init__(self):
-            super().__init__(torch, T=3, V=8)
-            self.grad_enabled_during_forward = []
-
-        def __call__(self, input_ids, **kwargs):
-            self.grad_enabled_during_forward.append(torch.is_grad_enabled())
-            return super().__call__(input_ids)
-
-    for knobs in (
-        SimpleNamespace(kl_coef=1.0, stop_sequences=(), structured_outputs=""),
-        SimpleNamespace(kl_coef=1.0, stop_sequences=("</answer>",), structured_outputs=""),
-        SimpleNamespace(kl_coef=1.0, stop_sequences=(), structured_outputs='{"json_object":true}'),
-    ):
-        defect_model = _NoGradObservedLM()
-        defect_out = opd_mod._resolve_samples_batched(
-            defect_model,
-            _Tok(),
-            "cpu",
-            [defect],
-            knobs,
-            microbatch=1,
-            eos_ids=eos_ids,
-            eos_diagnostic_count=[0],
-        )[0]
-        assert defect_out.loss is None
-        assert defect_out.truncated is True
-        assert defect_out.eos_logprob is not None
-        assert defect_model.grad_enabled_during_forward == [False]
-        assert defect_model.w.grad is None
-
-
-def test_eos_defect_diagnostic_budget_skips_k_plus_one_forward():
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
-
-    class _Tok:
-        pad_token_id = 0
-
-    defect = (
-        opd_mod._GenResult(
-            completion_ids=[2],
-            completion_text="a",
-            gen_tokens=1,
-            truncated=True,
-            finish_reason="length",
-        ),
-        None,
-        [1],
-    )
-    samples = [defect for _ in range(opd_mod._EOS_DIAG_BUDGET + 1)]
-    diagnostic_count = [0]
 
     out = opd_mod._resolve_samples_batched(
-        _TinyLM(torch, T=3, V=8),
+        model,
         _Tok(),
         "cpu",
-        samples,
+        [sample],
         SimpleNamespace(kl_coef=1.0),
-        microbatch=8,
-        eos_ids=frozenset({5}),
-        eos_diagnostic_count=diagnostic_count,
-    )
+        microbatch=1,
+    )[0]
 
-    assert diagnostic_count == [opd_mod._EOS_DIAG_BUDGET + 1]
-    assert all(result.truncated for result in out)
-    assert all(result.skip_reason == "truncated_rollout" for result in out)
-    assert all(result.eos_logprob is not None for result in out[:-1])
-    assert out[-1].eos_logprob is None
+    assert out.loss is None
+    assert out.teacher_status is None
+    assert out.truncated is True
+    assert out.skip_reason == "truncated_rollout"
+    assert model.calls == 0
+    assert model.w.grad is None
 
 
-def test_resolve_samples_batched_mixes_distillation_and_defect_diagnostics():
+def test_resolve_samples_batched_mixes_distillation_and_truncated_no_loss():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -3829,7 +3709,20 @@ def test_resolve_samples_batched_mixes_distillation_and_defect_diagnostics():
         def decode(self, ids, skip_special_tokens=True):
             return "".join({2: "a", 3: "b"}.get(int(i), "") for i in ids)
 
-    model = _TinyLM(torch, T=4, V=8)
+    class _CountingLM(_TinyLM):
+        def __init__(self):
+            super().__init__(torch, T=4, V=8)
+            self.calls = 0
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                logits=self.w[: input_ids.shape[1]]
+                .unsqueeze(0)
+                .expand(input_ids.shape[0], -1, -1)
+            )
+
+    model = _CountingLM()
     samples = [
         (
             opd_mod._GenResult(
@@ -3845,6 +3738,7 @@ def test_resolve_samples_batched_mixes_distillation_and_defect_diagnostics():
                 gen_tokens=2,
                 truncated=True,
                 finish_reason="length",
+                skip_reason="truncated_rollout",
             ),
             None,
             [1],
@@ -3855,22 +3749,20 @@ def test_resolve_samples_batched_mixes_distillation_and_defect_diagnostics():
         _Tok(),
         "cpu",
         samples,
-        SimpleNamespace(kl_coef=1.0, stop_sequences=(), structured_outputs=""),
+        SimpleNamespace(kl_coef=1.0),
         microbatch=2,
         backward_scale=0.5,
-        eos_ids=frozenset({5}),
-        eos_diagnostic_count=[0],
     )
 
     assert [result.loss is not None for result in out] == [True, False]
     assert out[0].teacher_status == "ok"
-    assert out[0].eos_logprob is None
     assert out[1].teacher_status is None
     assert out[1].truncated is True
-    assert out[1].eos_logprob is not None
-    assert model.w.grad[0].abs().sum() > 0  # distilled content row
-    assert model.w.grad[1].abs().sum() == 0  # neither path uses this row
-    assert model.w.grad[2].abs().sum() == 0  # defect cap row is diagnostic only
+    assert out[1].skip_reason == "truncated_rollout"
+    assert model.calls == 1
+    assert model.w.grad[0].abs().sum() > 0
+    assert model.w.grad[1].abs().sum() == 0
+    assert model.w.grad[2].abs().sum() == 0
 
 
 def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
