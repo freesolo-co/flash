@@ -107,7 +107,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
-    # opd_eos_loss_coef (0.2.55) was removed: opd eos handling is fully managed with no train key.
+    # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
         value
@@ -164,8 +164,8 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. head removed it (opd eos handling is fully managed), so current TRAIN_SCHEMA_KEYS equals
-    # the latest historical shape minus that one key.
+    # did. opd has no auxiliary eos loss or user-facing eos-loss key, so current TRAIN_SCHEMA_KEYS
+    # equals the latest historical shape minus that one key.
     assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
@@ -175,22 +175,6 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
             "20c4452c",
             *({"699a8aab"} if key == "teacher_model" else set()),
         }
-
-
-def test_opd_eos_loss_coef_is_removed_and_managed() -> None:
-    # opd eos handling is fully managed: opd applies a defect-only eos objective with no user knob.
-    # an explicit numeric value is a hard ConfigError so stale configs fail loudly rather than
-    # silently doing nothing. a null value (old 0.2.5x clients serialize the field as null via
-    # dataclasses.asdict) and an absent key are both tolerated so those clients keep submitting.
-    with pytest.raises(ConfigError, match="opd_eos_loss_coef has been removed"):
-        spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0}))
-    with pytest.raises(ConfigError, match="opd_eos_loss_coef has been removed"):
-        spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5}))
-    # null -> tolerated (stripped before key validation), no error and no attribute on TrainSpec.
-    spec = spec_from_dict(_raw(**{"train.opd_eos_loss_coef": None}))
-    assert not hasattr(spec.train, "opd_eos_loss_coef")
-    # absent -> tolerated.
-    assert not hasattr(spec_from_dict(_raw()).train, "opd_eos_loss_coef")
 
 
 def test_falsy_algorithm_defaults_to_sft() -> None:

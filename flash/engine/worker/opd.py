@@ -362,8 +362,7 @@ def run_opd():
     print(
         f"[opd] gkd (groupwise reverse-KL) teacher={knobs.teacher_model} "
         f"epochs={knobs.epochs} warm_start={warm_start or 'none'} "
-        f"mode={'multi-turn' if multi_turn else 'single-turn'} "
-        "eos_loss_coef=0.0"
+        f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
     # The GLM teacher key is a platform-owned credential the control plane injects into the worker
@@ -623,7 +622,6 @@ def run_opd():
     # running mean of defect-row log p(any valid eos), surfaced in train_meta.
     eos_logprob_sum = 0.0
     eos_logprob_n = 0
-    eos_diagnostic_n = 0
     eos_diagnostic_count = [0]
     opt_steps = (
         0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
@@ -693,7 +691,7 @@ def run_opd():
         advanced by the caller once per generated rollout so its timing is unchanged."""
         nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
-        nonlocal eos_logprob_sum, eos_logprob_n, eos_diagnostic_n
+        nonlocal eos_logprob_sum, eos_logprob_n
         if r.teacher_status == "ok":
             teacher_ok += 1
         elif r.teacher_status == "transient":
@@ -702,8 +700,6 @@ def run_opd():
             teacher_error += 1
         if r.truncated:
             truncated_rollouts += 1
-        if r.eos_diagnostic or r.eos_logprob is not None:
-            eos_diagnostic_n += 1
         if r.eos_logprob is not None:
             eos_logprob_sum += r.eos_logprob
             eos_logprob_n += 1
@@ -1157,10 +1153,6 @@ def run_opd():
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or
             # distilled; their eos probability is measured only for diagnostics.
             "truncated_rollouts": truncated_rollouts,
-            # stable metric keys retained after removing the auxiliary eos loss. reinforced samples
-            # counts observed length-capped defects for compatibility with existing dashboards.
-            "eos_loss_coef": 0.0,
-            "eos_reinforced_samples": eos_diagnostic_n,
             "mean_eos_logprob": (eos_logprob_sum / eos_logprob_n) if eos_logprob_n else None,
             # deterministic generation-order diagnostics; neither value controls training.
             "final_empty_rate_ema": round(empty_ema, 5),
@@ -1256,8 +1248,6 @@ class SampleResult:
     group_granularity: float = 0.0
     # Machine-readable reason when loss is None. Used for skipped-step diagnostics and train_meta.
     skip_reason: str = ""
-    # true for every defect-gated length-capped rollout, including samples beyond the forward budget.
-    eos_diagnostic: bool = False
     # detached log p(any valid eos) at a budgeted defect's first post-content row, else none.
     eos_logprob: float | None = None
 
@@ -1747,7 +1737,6 @@ def _resolve_samples_batched(
                     truncated=True,
                     gen_tokens=gen.gen_tokens,
                     skip_reason="truncated_rollout",
-                    eos_diagnostic=True,
                 )
                 if eos_diagnostic_count is not None:
                     diagnostic_index = eos_diagnostic_count[0]
@@ -1875,7 +1864,6 @@ def _resolve_samples_batched(
             truncated=True,
             gen_tokens=p.gen_tokens,
             skip_reason="truncated_rollout",
-            eos_diagnostic=True,
             eos_logprob=eos_logprobs.get(p.idx),
         )
 

@@ -292,17 +292,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
-    # opd_eos_loss_coef was removed: opd applies a fully managed, defect-only eos objective with no
-    # user-facing weight. an explicit numeric value is a hard error so stale configs surface loudly;
-    # a null (old 0.2.5x clients serialize the field as null via dataclasses.asdict) or absent key is
-    # tolerated and stripped before key validation so it is not reported as an unknown key.
-    if "opd_eos_loss_coef" in train_raw:
-        if train_raw["opd_eos_loss_coef"] is not None:
-            raise ConfigError(
-                "train.opd_eos_loss_coef has been removed: opd applies no auxiliary eos loss "
-                "(termination is diagnosed and reported automatically)"
-            )
-        train_raw = {k: v for k, v in train_raw.items() if k != "opd_eos_loss_coef"}
     validate_train_keys(train_raw)
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:

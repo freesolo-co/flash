@@ -446,8 +446,8 @@ lora_rank = 32
 
 The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
 the zero-width stop token**. Termination defects are diagnosed and reported, but no auxiliary EOS loss
-is applied. Watch `truncated_rollouts`, `eos_reinforced_samples`, and `mean_eos_logprob` in the run
-metrics; warm-starting from an SFT adapter can still improve initial termination behavior.
+is applied. Watch `truncated_rollouts` and `mean_eos_logprob` in the run metrics; warm-starting from
+an SFT adapter can still improve initial termination behavior.
 
 A verbose teacher also hurts in a way termination diagnostics can't reach: it inflates the *content*
 the student distils toward — long per-turn reasoning and extra multi-turn looping — so episodes still

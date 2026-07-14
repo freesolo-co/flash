@@ -902,7 +902,7 @@ def _opd_harness(
         ((), '{"json_object":true}'),
     ],
 )
-def test_opd_train_meta_reports_zero_eos_loss_coef(
+def test_opd_train_meta_reports_termination_diagnostics(
     monkeypatch, stop_sequences, structured_outputs
 ):
     calls = 0
@@ -937,43 +937,8 @@ def test_opd_train_meta_reports_zero_eos_loss_coef(
     opd_mod.run_opd()
 
     notes = metas[-1]["notes"]
-    assert notes["eos_loss_coef"] == 0.0
     assert notes["truncated_rollouts"] == 1
-    assert notes["eos_reinforced_samples"] == 1
     assert notes["mean_eos_logprob"] == -2.0
-
-
-def test_opd_eos_reinforced_samples_counts_defects_beyond_logprob_budget(monkeypatch):
-    calls = 0
-
-    def _trained_sample(*, model, **_kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return opd_mod.SampleResult(
-                truncated=True,
-                gen_tokens=1,
-                skip_reason="truncated_rollout",
-                eos_diagnostic=True,
-                eos_logprob=None,
-            )
-        return opd_mod.SampleResult(
-            loss=model.w.float().sum() * 1e-6,
-            teacher_status="ok",
-            coverage=1.0,
-            gen_tokens=1,
-            teacher_tokens=1,
-        )
-
-    metas = []
-    opd_mod = _opd_harness(monkeypatch, sample_result=_trained_sample, metas=metas)
-
-    opd_mod.run_opd()
-
-    notes = metas[-1]["notes"]
-    assert notes["truncated_rollouts"] == 1
-    assert notes["eos_reinforced_samples"] == 1
-    assert notes["mean_eos_logprob"] is None
 
 
 def test_opd_rejects_tool_environments(monkeypatch):
@@ -3458,15 +3423,6 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
         _knobs("gpt-5.5")
 
 
-def test_job_spec_from_dict_ignores_removed_opd_eos_loss_coef():
-    from flash.spec import JobSpec
-
-    for value in (None, 0.0, 1.25):
-        spec = JobSpec.from_dict({"algorithm": "opd", "train": {"opd_eos_loss_coef": value}})
-        assert not hasattr(spec.train, "opd_eos_loss_coef")
-        assert "opd_eos_loss_coef" not in spec.to_dict()["train"]
-
-
 def test_opd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).
@@ -3819,7 +3775,6 @@ def test_eos_defect_diagnostics_never_add_auxiliary_gradients():
         )[0]
         assert defect_out.loss is None
         assert defect_out.truncated is True
-        assert defect_out.eos_diagnostic is True
         assert defect_out.eos_logprob is not None
         assert defect_model.grad_enabled_during_forward == [False]
         assert defect_model.w.grad is None
@@ -3858,7 +3813,7 @@ def test_eos_defect_diagnostic_budget_skips_k_plus_one_forward():
     )
 
     assert diagnostic_count == [opd_mod._EOS_DIAG_BUDGET + 1]
-    assert all(result.truncated and result.eos_diagnostic for result in out)
+    assert all(result.truncated for result in out)
     assert all(result.skip_reason == "truncated_rollout" for result in out)
     assert all(result.eos_logprob is not None for result in out[:-1])
     assert out[-1].eos_logprob is None
