@@ -598,6 +598,9 @@ def mark_deployment_pending(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
+        current = status.deployment if isinstance(status.deployment, dict) else {}
+        if current.get("state") in {"undeployed", _REVOCATION_RETRY_STATE}:
+            return status
         status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
@@ -611,8 +614,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
     with _STATUS_LOCK:
         status = get_status(run_id)
         current = status.deployment or {}
-        # Don't clobber a newer deployment attempt or an explicit undeploy.
-        if current.get("state") == "undeployed":
+        # don't clobber a newer deployment attempt, explicit undeploy, or pending revocation.
+        if current.get("state") in {"undeployed", _REVOCATION_RETRY_STATE}:
             return status
         if (
             current.get("requested_at") is not None

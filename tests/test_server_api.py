@@ -1436,6 +1436,7 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
 
     def fake_undeploy(target):
         assert target == run_id
+        assert runner.get_status(target).deployment["state"] == "revocation_failed"
         return {"run_id": run_id}
 
     real_mark_revocation_failed = runner.mark_deployment_revocation_failed
