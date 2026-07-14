@@ -159,6 +159,61 @@ def test_forward_teacher_pins_request_and_returns_visible_usage():
     assert result.ambiguous_paid_requests == 0
 
 
+def test_forward_teacher_caps_request_timeout_at_run_deadline(monkeypatch):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
+
+    captured = {}
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "102.5")
+    monkeypatch.setattr(forward_teacher_mod.time, "time", lambda: 100.0)
+
+    def opener(_request, timeout):
+        captured["timeout"] = timeout
+        return _Response(_payload())
+
+    ForwardTeacherClient(
+        "key",
+        seed=123,
+        opener=opener,
+        clock=iter([10.0, 10.25]).__next__,
+    ).generate([{"role": "user", "content": "x"}])
+
+    assert captured["timeout"] == pytest.approx(2.5)
+
+
+def test_forward_teacher_retry_wait_stops_at_run_deadline(monkeypatch):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
+
+    now = [100.0]
+    timeouts = []
+    sleeps = []
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
+    monkeypatch.setattr(forward_teacher_mod.time, "time", lambda: now[0])
+
+    def opener(_request, timeout):
+        timeouts.append(timeout)
+        raise urllib.error.URLError("private provider response")
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    with pytest.raises(ForwardTeacherTransientError, match="run wall deadline") as caught:
+        ForwardTeacherClient(
+            "key",
+            seed=123,
+            opener=opener,
+            sleep=sleep,
+            clock=lambda: now[0],
+        ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert timeouts == [1.0]
+    assert sleeps == [1.0]
+    assert caught.value.attempts == 1
+    assert caught.value.latency_seconds == pytest.approx(1.0)
+    assert caught.value.ambiguous_paid_requests == 1
+    assert "private" not in str(caught.value)
+
+
 @pytest.mark.parametrize("content", ["  visible answer", "visible answer  ", "visible answer\n"])
 def test_forward_teacher_preserves_visible_content_boundary_whitespace(content):
     result = ForwardTeacherClient(

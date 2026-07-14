@@ -71,6 +71,69 @@ def test_final_successful_opd_heartbeat_retains_cumulative_forward_teacher_telem
     }
 
 
+def test_terminal_success_heartbeats_retain_sanitized_forward_teacher_telemetry(monkeypatch):
+    from flash.engine import worker
+    from flash.engine.worker import finalize
+
+    telemetry = {
+        "forward_teacher_provider_requests": 5,
+        "forward_teacher_provider_generations": 4,
+        "forward_teacher_provider_failures": 1,
+        "forward_teacher_prompt_tokens": 101,
+        "forward_teacher_completion_tokens": 202,
+        "forward_teacher_attempts": 6,
+        "forward_teacher_retries": 1,
+        "forward_teacher_latency_seconds": 12.5,
+        "forward_teacher_ambiguous_paid_requests": 0,
+    }
+    beats = []
+    monkeypatch.setattr(worker, "require_active_env", lambda: type("Env", (), {"id": "env"})())
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **fields: beats.append((stage, fields)))
+    monkeypatch.setattr(worker, "gpu_diagnostics", lambda: {"gpu": "ok"})
+    monkeypatch.setattr(finalize, "gpu_diagnostics", lambda: {"gpu": "ok"})
+
+    finalize.write_train_meta(
+        phase="opd",
+        step=9,
+        adapter_dir="/tmp/adapter",
+        model_id="model",
+        train_wall=123.0,
+        setup_seconds=4.0,
+        train_tokens=0,
+        generated_tokens=202,
+        notes={},
+        forward_teacher_runtime_telemetry={
+            **telemetry,
+            "private_prompt": "must not escape",
+        },
+    )
+
+    assert [stage for stage, _fields in beats] == ["opd_train_done", "done"]
+    for _stage, fields in beats:
+        assert telemetry.items() <= fields.items()
+        assert "private_prompt" not in fields
+    assert "must not escape" not in repr(beats)
+
+    beats.clear()
+    finalize.write_train_meta(
+        phase="opd",
+        step=9,
+        adapter_dir="/tmp/adapter",
+        model_id="model",
+        train_wall=123.0,
+        setup_seconds=4.0,
+        train_tokens=0,
+        generated_tokens=202,
+        notes={},
+    )
+    assert [stage for stage, _fields in beats] == ["opd_train_done", "done"]
+    assert all(
+        not any(key.startswith("forward_teacher_") for key in fields)
+        for _stage, fields in beats
+    )
+
+
 def test_hybrid_eligibility_is_narrow_and_reports_sanitized_reason():
     eligible = OpdKnobs(teacher_model="accounts/fireworks/models/deepseek-v4-pro")
     assert _resolve_hybrid_eligibility(

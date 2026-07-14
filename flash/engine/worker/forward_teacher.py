@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import os
 import time
 import urllib.error
 import urllib.request
@@ -45,6 +46,20 @@ class ForwardTeacherTransientError(ForwardTeacherError):
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _remaining_run_wall_seconds() -> float | None:
+    raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
+    if raw_deadline is None:
+        return None
+    try:
+        deadline = float(raw_deadline)
+    except (TypeError, ValueError):
+        raise ForwardTeacherError("forward_teacher run wall deadline is invalid") from None
+    now = time.time()
+    if not math.isfinite(deadline) or deadline <= 0 or not math.isfinite(now) or now <= 0:
+        raise ForwardTeacherError("forward_teacher run wall deadline is invalid")
+    return max(0.0, deadline - now)
 
 
 @dataclass(frozen=True)
@@ -206,12 +221,14 @@ class ForwardTeacherClient:
         self._start_lock = Lock()
         self._last_request_started: float | None = None
 
-    def _pace_attempt(self) -> float:
+    def _pace_attempt(self, *, max_delay: float | None = None) -> float:
         with self._start_lock:
             now = self._clock()
             if self._last_request_started is not None:
                 delay = self._last_request_started + 2.0 - now
                 if delay > 0:
+                    if max_delay is not None:
+                        delay = min(delay, max_delay)
                     self._sleep(delay)
                     now = self._clock()
             self._last_request_started = now
@@ -413,10 +430,36 @@ class ForwardTeacherClient:
         }
         started = None
         ambiguous_paid_requests = 0
+
+        def deadline_failure(attempts: int) -> ForwardTeacherTransientError:
+            latency = self._clock() - started if started is not None else 0.0
+            return ForwardTeacherTransientError(
+                "forward_teacher request exceeded the run wall deadline",
+                attempts=attempts,
+                latency_seconds=latency,
+                ambiguous_paid_requests=ambiguous_paid_requests,
+            )
+
+        def remaining_or_fail(attempts: int) -> float | None:
+            remaining = _remaining_run_wall_seconds()
+            if remaining is not None and remaining <= 0:
+                raise deadline_failure(attempts)
+            return remaining
+
+        def retry_sleep(delay: float, attempts: int) -> None:
+            remaining = remaining_or_fail(attempts)
+            if remaining is not None:
+                delay = min(delay, remaining)
+            if delay > 0:
+                self._sleep(delay)
+
         for attempt in (1, 2):
-            attempt_started = self._pace_attempt()
+            remaining = remaining_or_fail(attempt - 1)
+            attempt_started = self._pace_attempt(max_delay=remaining)
+            remaining = remaining_or_fail(attempt - 1)
             if started is None:
                 started = attempt_started
+            request_timeout = self._timeout if remaining is None else min(self._timeout, remaining)
             request = urllib.request.Request(
                 FORWARD_TEACHER_URL, data=body, headers=headers, method="POST"
             )
@@ -440,7 +483,7 @@ class ForwardTeacherClient:
                 )
 
             try:
-                with self._opener(request, timeout=self._timeout) as response:
+                with self._opener(request, timeout=request_timeout) as response:
                     raw = response.read()
                 try:
                     payload = json.loads(raw.decode("utf-8"))
@@ -452,7 +495,7 @@ class ForwardTeacherClient:
                             ambiguous_increment=1,
                         ) from None
                     ambiguous_paid_requests += 1
-                    self._sleep(10.0)
+                    retry_sleep(10.0, attempt)
                     continue
                 latency = self._clock() - started
                 try:
@@ -484,7 +527,7 @@ class ForwardTeacherClient:
                         ambiguous_increment=1,
                     ) from None
                 ambiguous_paid_requests += 1
-                self._sleep(self._retry_after(exc.headers))
+                retry_sleep(self._retry_after(exc.headers), attempt)
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
                 if attempt == 2:
                     raise failure(
@@ -493,7 +536,7 @@ class ForwardTeacherClient:
                         ambiguous_increment=1,
                     ) from None
                 ambiguous_paid_requests += 1
-                self._sleep(10.0)
+                retry_sleep(10.0, attempt)
             except (TypeError, ValueError):
                 raise failure(
                     ForwardTeacherError,

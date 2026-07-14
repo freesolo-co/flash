@@ -1935,6 +1935,8 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     monkeypatch.setattr(torch.optim.AdamW, "step", _step)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
+    train_meta = []
+    monkeypatch.setattr(opd_mod._w, "write_train_meta", lambda **fields: train_meta.append(fields))
 
     opd_mod.run_opd()
 
@@ -1944,6 +1946,9 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     assert projected_microbatch_sizes == [1]
     assert forward_calls == [True]
     assert events == ["normalize", "projected", "step"]
+    assert train_meta[0]["forward_teacher_runtime_telemetry"][
+        "forward_teacher_provider_requests"
+    ] == 1
     assert opd_mod.OpdVllmRolloutEngine.instances[0].sync_count == 1
 
 

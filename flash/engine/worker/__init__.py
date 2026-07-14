@@ -64,6 +64,7 @@ from flash.engine.worker.heartbeat import (
     heartbeat,
     make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
+    sanitize_forward_teacher_runtime_telemetry,
 )
 from flash.engine.worker.hf import (
     _hf_upload,
@@ -257,7 +258,7 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
-def _finalize(metrics: RunMetrics):
+def _finalize(metrics: RunMetrics, *, forward_teacher_runtime_telemetry=None):
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -270,7 +271,10 @@ def _finalize(metrics: RunMetrics):
     # completed optimizer updates for opd; None (other phases) -> stepless as before.
     _step = metrics.step
     _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
-    heartbeat("done", **_step_field, gpu=gpu_diagnostics())
+    terminal_telemetry = sanitize_forward_teacher_runtime_telemetry(
+        forward_teacher_runtime_telemetry
+    )
+    heartbeat("done", **_step_field, **terminal_telemetry, gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 

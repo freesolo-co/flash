@@ -7,6 +7,7 @@ import os
 
 from flash.engine.accounting import RunMetrics, sanitize_worker_metrics
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import sanitize_forward_teacher_runtime_telemetry
 from flash.engine.worker.perf import gpu_diagnostics
 
 
@@ -21,6 +22,7 @@ def write_train_meta(
     notes,
     *,
     step=None,
+    forward_teacher_runtime_telemetry=None,
 ):
     env = _w.require_active_env()
     meta = sanitize_worker_metrics(
@@ -42,10 +44,14 @@ def write_train_meta(
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel between
     # here and DONE would otherwise re-price a fully-trained run to 0 steps (codex[bot]).
     _step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
+    terminal_telemetry = sanitize_forward_teacher_runtime_telemetry(
+        forward_teacher_runtime_telemetry
+    )
     _w.heartbeat(
         f"{phase}_train_done",
         **_step_field,
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
+        **terminal_telemetry,
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
@@ -73,4 +79,7 @@ def write_train_meta(
             "job_spec": _w.JOB_SPEC.to_dict() if _w.JOB_SPEC else None,
         },
     )
-    _w._finalize(m)
+    if terminal_telemetry:
+        _w._finalize(m, forward_teacher_runtime_telemetry=terminal_telemetry)
+    else:
+        _w._finalize(m)

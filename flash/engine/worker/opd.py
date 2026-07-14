@@ -1440,6 +1440,15 @@ def _run_opd(forward_teacher_accounting):
             ),
             **_w.wandb_run_info(),
         },
+        **(
+            {
+                "forward_teacher_runtime_telemetry": (
+                    forward_teacher_accounting.totals.runtime_telemetry()
+                )
+            }
+            if hybrid.enabled
+            else {}
+        ),
     )
     vllm_rollout.close()
     free_gpu(model)
