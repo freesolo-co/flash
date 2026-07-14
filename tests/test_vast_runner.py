@@ -1104,6 +1104,64 @@ def test_poll_deadline_accepts_late_success_marker(monkeypatch):
     assert res.ok
 
 
+def test_poll_deadline_waits_for_done_before_watchdog_marker_failure(monkeypatch):
+    reads = {"done": 0}
+
+    def late_done():
+        reads["done"] += 1
+        return "9999.5" if reads["done"] >= 2 else None
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done=late_done,
+        marker=_terminal_marker(
+            ok=False,
+            ts=10_000.0,
+            error="run wall deadline exceeded; self-terminating box",
+        ),
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+    assert reads["done"] == 2
+
+
+def test_poll_deadline_preserves_watchdog_failure_without_success_artifact(monkeypatch):
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        marker=_terminal_marker(
+            ok=False,
+            ts=10_000.0,
+            error="run wall deadline exceeded; self-terminating box",
+        ),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert not res.ok
+    assert res.failure == "job_failed"
+
+
 def test_poll_deadline_after_status_fetch_rereads_terminal_artifacts(monkeypatch):
     from flash.providers.vast import api as vast_api
 

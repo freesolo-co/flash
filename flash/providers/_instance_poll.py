@@ -210,6 +210,7 @@ def poll_instance_job(
     done_reader = adapter.done_reader
     marker_reader = adapter.marker_reader
     metrics_reader = adapter.metrics_reader
+    deferred_deadline_failure: PollResult | None = None
 
     def read_artifact(reader, *, force: bool, read_deadline_at: float | None):
         return reader(
@@ -316,7 +317,9 @@ def poll_instance_job(
         force: bool = True,
         *,
         read_deadline_at: float | None = absolute_deadline,
+        defer_deadline_failure: bool = False,
     ) -> PollResult | None:
+        nonlocal deferred_deadline_failure
         # The worker's terminal HF artifacts (DONE / attempt marker) -> a terminal PollResult when it
         # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
         # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
@@ -344,28 +347,41 @@ def poll_instance_job(
                 )
             if marker["ok"]:
                 return finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
-            return fail_from_marker(marker)
+            failure = fail_from_marker(marker)
+            # the watchdog marker can race a successful final marker or lagging done upload. only the
+            # deadline exit defers it; every other failure marker still terminates immediately.
+            if defer_deadline_failure and marker["error"].startswith(
+                "run wall deadline exceeded"
+            ):
+                deferred_deadline_failure = failure
+                return None
+            return failure
         return None
 
     def deadline_unless_terminal() -> PollResult:
+        nonlocal deferred_deadline_failure
         # the run deadline stops worker compute, not bounded observation of artifacts already committed
         # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
+        deferred_deadline_failure = None
         read_deadline = time.time() + (
             _TERMINAL_AFTER_DEAD_RETRIES * _TERMINAL_AFTER_DEAD_WAIT_S
         )
         terminal = _read_with_retries(
-            lambda: terminal_artifact_result(read_deadline_at=read_deadline),
+            lambda: terminal_artifact_result(
+                read_deadline_at=read_deadline,
+                defer_deadline_failure=True,
+            ),
             tries=_TERMINAL_AFTER_DEAD_RETRIES,
             wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
             say=say,
             message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
             deadline_at=read_deadline,
         )
-        return (
-            terminal
-            if terminal is not None
-            else PollResult(False, failure="stalled", detail="client-side deadline exceeded")
-        )
+        if terminal is not None:
+            return terminal
+        if deferred_deadline_failure is not None:
+            return deferred_deadline_failure
+        return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
 
     def stalled_unless_terminal(detail: str) -> PollResult:
         # A stall exit still checks for terminal artifacts — the worker may have finished right at the
