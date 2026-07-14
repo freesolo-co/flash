@@ -102,7 +102,7 @@ def cancel_run(run_id: str) -> RunStatus:
     if initial_status.state in TERMINAL_STATES and not initial_retry_revocation:
         return initial_status
     entered_deployed = initial_status.state == "deployed"
-    allow_from_terminal = entered_deployed or initial_active_deployment
+    allow_from_terminal = entered_deployed
 
     # revoke serving authority and stop any durable remote before waiting on the deploy lock.
     teardown_error: Exception | None = None
@@ -127,10 +127,6 @@ def cancel_run(run_id: str) -> RunStatus:
             status.state == "cancelled"
             and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
         )
-        active_deployment = _has_active_deployment(status)
-        allow_from_terminal = allow_from_terminal or active_deployment
-        if status.state in TERMINAL_STATES and not retry_revocation and not allow_from_terminal:
-            return status
         # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
         entered_deployed = entered_deployed or status.state == "deployed"
         allow_from_terminal = allow_from_terminal or entered_deployed
@@ -148,6 +144,8 @@ def cancel_run(run_id: str) -> RunStatus:
             _teardown_remote(remote, skip_cancel=same_remote and remote_cancelled)
         with contextlib.suppress(Exception):
             _gc_run_endpoints(cleanup_spec)
+        if not remote:
+            _teardown_remote(get_status(run_id).remote or {})
         cancel_charge_usd: float | None = None
         billing_diagnostic: dict = {}
         if bill_cancel:

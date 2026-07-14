@@ -520,7 +520,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     ]
 
 
-def test_cancel_timeout_rejects_unconfirmed_serving_revocation(monkeypatch):
+def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
     def request(method, path, body=None, timeout=None, progress=None):
@@ -530,13 +530,20 @@ def test_cancel_timeout_rejects_unconfirmed_serving_revocation(monkeypatch):
             return {
                 "run_id": "r1",
                 "state": "cancelled",
-                "deployment": {"state": "revocation_failed"},
+                "deployment": {
+                    "state": "revocation_failed",
+                    "retryable": True,
+                    "error": "backend unavailable",
+                },
             }
         raise AssertionError((method, path))
 
     monkeypatch.setattr(client, "_request", request)
 
-    with pytest.raises(ClientError, match="serving disablement is unconfirmed"):
+    with pytest.raises(
+        ClientError,
+        match="backend revocation is unconfirmed: backend unavailable; retry cancellation",
+    ):
         client.cancel_run("r1")
 
 

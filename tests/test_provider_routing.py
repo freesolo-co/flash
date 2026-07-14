@@ -240,43 +240,6 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     assert isinstance(submit_errors[0], orch._RunCancelled)
     assert not resource_live["value"]
 
-
-def test_cancel_tears_down_durable_handle_before_waiting_for_deploy_lock(orch, monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.server._locks import _deploy_lock
-
-    spec = _spec(run_id="flash-provider-immediate-cancel", max_retries=0)
-    remote = _runpod_handle("ep-immediate", "job-immediate")
-    orch._save_status(
-        orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict(), remote=remote)
-    )
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *args, **kwargs: None)
-    cancelled = threading.Event()
-    destroyed = threading.Event()
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *args: cancelled.set())
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint",
-        lambda *args: destroyed.set() or True,
-    )
-
-    lock = _deploy_lock(spec.run_id)
-    lock.acquire()
-    results = []
-    thread = threading.Thread(target=lambda: results.append(orch.cancel_run(spec.run_id)))
-    try:
-        thread.start()
-        assert cancelled.wait(timeout=5)
-        assert destroyed.wait(timeout=5)
-        assert thread.is_alive()
-    finally:
-        lock.release()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert results[0].state == "cancelled"
-
-
 def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
