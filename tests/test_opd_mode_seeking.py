@@ -5,6 +5,12 @@ import math
 import pytest
 import torch
 
+from flash.engine.worker.forward_teacher import (
+    FORWARD_TEACHER_TERMINAL,
+    ForwardTeacherRecordKind,
+    ForwardTeacherSemanticRecord,
+    ForwardTeacherTopLogprob,
+)
 from flash.engine.worker.opd import OpdKnobs, _resolve_hybrid_eligibility
 from flash.engine.worker.opd_soft_targets import (
     REPORTED_MASS_TOLERANCE,
@@ -16,29 +22,23 @@ from flash.engine.worker.opd_soft_targets import (
     projected_row_is_active,
     sparse_projected_conditional_cross_entropy,
 )
-from flash.engine.worker.parasail import (
-    PARASAIL_TERMINAL,
-    ParasailRecordKind,
-    ParasailSemanticRecord,
-    ParasailTopLogprob,
-)
 
 
-def test_final_successful_opd_heartbeat_retains_cumulative_parasail_telemetry(monkeypatch):
+def test_final_successful_opd_heartbeat_retains_cumulative_forward_teacher_telemetry(monkeypatch):
     from flash.engine.worker import opd
 
     telemetry = {
-        "parasail_logical_accepted_targets": 7,
-        "parasail_supervised_positions": 41,
-        "parasail_provider_requests": 5,
-        "parasail_provider_generations": 4,
-        "parasail_provider_failures": 1,
-        "parasail_prompt_tokens": 101,
-        "parasail_completion_tokens": 202,
-        "parasail_attempts": 6,
-        "parasail_retries": 1,
-        "parasail_latency_seconds": 12.5,
-        "parasail_ambiguous_paid_requests": 0,
+        "forward_teacher_logical_accepted_targets": 7,
+        "forward_teacher_supervised_positions": 41,
+        "forward_teacher_provider_requests": 5,
+        "forward_teacher_provider_generations": 4,
+        "forward_teacher_provider_failures": 1,
+        "forward_teacher_prompt_tokens": 101,
+        "forward_teacher_completion_tokens": 202,
+        "forward_teacher_attempts": 6,
+        "forward_teacher_retries": 1,
+        "forward_teacher_latency_seconds": 12.5,
+        "forward_teacher_ambiguous_paid_requests": 0,
     }
     captured = {}
 
@@ -59,7 +59,7 @@ def test_final_successful_opd_heartbeat_retains_cumulative_parasail_telemetry(mo
     opd._emit_opd_trained_heartbeat(
         opt_steps=9,
         train_wall=123.0,
-        parasail_accounting=_Accounting(),
+        forward_teacher_accounting=_Accounting(),
     )
 
     assert captured == {
@@ -112,14 +112,14 @@ def test_hybrid_eligibility_is_narrow_and_reports_sanitized_reason():
         assert unactivated.reason == reason
 
 
-def test_parasail_target_preparation_reports_partial_success_then_transient_failure(monkeypatch):
+def test_forward_teacher_target_preparation_reports_partial_success_then_transient_failure(monkeypatch):
     from types import SimpleNamespace
 
+    from flash.engine.worker.forward_teacher import ForwardTeacherTransientError
     from flash.engine.worker.opd import (
-        _ParasailPreparationError,
-        _prepare_parasail_targets,
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
     )
-    from flash.engine.worker.parasail import ParasailTransientError
 
     private = "private provider content must not leak"
     calls = []
@@ -128,8 +128,8 @@ def test_parasail_target_preparation_reports_partial_success_then_transient_fail
         def generate(self, messages):
             calls.append(messages)
             if len(calls) == 3:
-                raise ParasailTransientError(
-                    "parasail transport failure",
+                raise ForwardTeacherTransientError(
+                    "forward_teacher transport failure",
                     attempts=2,
                     latency_seconds=1.25,
                     ambiguous_paid_requests=1,
@@ -150,8 +150,8 @@ def test_parasail_target_preparation_reports_partial_success_then_transient_fail
     )
     batch = [(None, [{"role": "user", "content": value}], [1]) for value in ("a", "b", "c")]
 
-    with pytest.raises(_ParasailPreparationError, match="transport failure") as caught:
-        _prepare_parasail_targets(_Client(), object(), batch, max_length=8)
+    with pytest.raises(_ForwardTeacherPreparationError, match="transport failure") as caught:
+        _prepare_forward_teacher_targets(_Client(), object(), batch, max_length=8)
 
     stats = caught.value.stats
     assert caught.value.__cause__ is None
@@ -173,12 +173,12 @@ def test_parasail_target_preparation_reports_partial_success_then_transient_fail
     assert private not in repr(caught.value.runtime_telemetry)
 
 
-def test_parasail_target_preparation_accounts_provider_before_local_target_failure(monkeypatch):
+def test_forward_teacher_target_preparation_accounts_provider_before_local_target_failure(monkeypatch):
     from types import SimpleNamespace
 
     from flash.engine.worker.opd import (
-        _ParasailPreparationError,
-        _prepare_parasail_targets,
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
     )
 
     private = "private successful response"
@@ -201,8 +201,8 @@ def test_parasail_target_preparation_accounts_provider_before_local_target_failu
         ),
     )
 
-    with pytest.raises(_ParasailPreparationError, match="boundary mismatch") as caught:
-        _prepare_parasail_targets(
+    with pytest.raises(_ForwardTeacherPreparationError, match="boundary mismatch") as caught:
+        _prepare_forward_teacher_targets(
             _Client(),
             object(),
             [(None, [{"role": "user", "content": "prompt"}], [1])],
@@ -259,13 +259,13 @@ class _ProjectionTokenizer:
 
 
 def _visible_record(index, token, alternatives):
-    return ParasailSemanticRecord(
-        kind=ParasailRecordKind.VISIBLE_CONTENT,
+    return ForwardTeacherSemanticRecord(
+        kind=ForwardTeacherRecordKind.VISIBLE_CONTENT,
         index=index,
         token=token,
         logprob=math.log(0.5),
         top_logprobs=tuple(
-            ParasailTopLogprob(token=text, logprob=math.log(probability))
+            ForwardTeacherTopLogprob(token=text, logprob=math.log(probability))
             for text, probability in alternatives
         ),
     )
@@ -274,7 +274,7 @@ def _visible_record(index, token, alternatives):
 def test_projected_target_preparation_uses_visible_records_only_and_preserves_logical_weight():
     from types import SimpleNamespace
 
-    from flash.engine.worker.opd import _prepare_parasail_targets
+    from flash.engine.worker.opd import _prepare_forward_teacher_targets
 
     visible_records = (_visible_record(3, " visible", ((" visible", 0.6), (" shown", 0.2))),)
 
@@ -322,7 +322,7 @@ def test_projected_target_preparation_uses_visible_records_only_and_preserves_lo
     rollout_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
     rollout_prompt_ids = tokenizer(rollout_prompt, add_special_tokens=False).input_ids
     assert rollout_prompt_ids == [1]
-    targets, stats = _prepare_parasail_targets(
+    targets, stats = _prepare_forward_teacher_targets(
         _Client(),
         tokenizer,
         [(None, messages, rollout_prompt_ids), (None, messages, rollout_prompt_ids)],
@@ -378,7 +378,7 @@ def test_projected_target_telemetry_and_backward_count_only_entropy_active_rows(
                 latency_seconds=0.1,
             )
 
-    targets, stats = opd._prepare_parasail_targets(
+    targets, stats = opd._prepare_forward_teacher_targets(
         _Client(),
         object(),
         [(None, [{"role": "user", "content": "private prompt"}], [1])],
@@ -417,7 +417,7 @@ def test_projected_target_telemetry_and_backward_count_only_entropy_active_rows(
 def test_projected_target_preparation_accepts_all_unprojectable_visible_target_with_telemetry():
     from types import SimpleNamespace
 
-    from flash.engine.worker.opd import _prepare_parasail_targets
+    from flash.engine.worker.opd import _prepare_forward_teacher_targets
 
     class _Tok(_ProjectionTokenizer):
         pad_token_id = 0
@@ -445,7 +445,7 @@ def test_projected_target_preparation_accepts_all_unprojectable_visible_target_w
             )
 
     messages = [{"role": "user", "content": "private prompt"}]
-    targets, stats = _prepare_parasail_targets(
+    targets, stats = _prepare_forward_teacher_targets(
         _Client(),
         tokenizer,
         [(None, messages, [1])],
@@ -625,14 +625,14 @@ def test_projection_accepts_contextual_metaspace_decode_without_isolated_surface
     assert target.rows[0].probabilities == (1.0,)
 
 
-def test_validated_parasail_semantic_records_compose_with_projection():
-    from flash.engine.recipe import PARASAIL_MODEL_ID
-    from flash.engine.worker.parasail import ParasailClient
+def test_validated_forward_teacher_semantic_records_compose_with_projection():
+    from flash.engine.recipe import FORWARD_TEACHER_MODEL_ID
+    from flash.engine.worker.forward_teacher import ForwardTeacherClient
 
     realized_logprob = math.log(0.6)
-    result = ParasailClient._validate(
+    result = ForwardTeacherClient._validate(
         {
-            "model": PARASAIL_MODEL_ID,
+            "model": FORWARD_TEACHER_MODEL_ID,
             "choices": [
                 {
                     "index": 0,
@@ -657,9 +657,9 @@ def test_validated_parasail_semantic_records_compose_with_projection():
                                 ],
                             },
                             {
-                                "token": PARASAIL_TERMINAL,
+                                "token": FORWARD_TEACHER_TERMINAL,
                                 "logprob": -0.01,
-                                "top_logprobs": [{"token": PARASAIL_TERMINAL, "logprob": -0.01}],
+                                "top_logprobs": [{"token": FORWARD_TEACHER_TERMINAL, "logprob": -0.01}],
                             },
                         ]
                     },
@@ -781,12 +781,12 @@ def test_projection_keeps_zero_retained_mass_as_ineligible_position_telemetry():
 
 def test_projection_rejects_invalid_record_kind_with_sanitized_error():
     private = "private boundary payload"
-    record = ParasailSemanticRecord(
-        kind=ParasailRecordKind.THINK_BOUNDARY,
+    record = ForwardTeacherSemanticRecord(
+        kind=ForwardTeacherRecordKind.THINK_BOUNDARY,
         index=0,
         token=private,
         logprob=math.log(0.5),
-        top_logprobs=(ParasailTopLogprob(token=private, logprob=math.log(0.5)),),
+        top_logprobs=(ForwardTeacherTopLogprob(token=private, logprob=math.log(0.5)),),
     )
     tokenizer = _ProjectionTokenizer({"P": [1]}, {(1,): "P"})
 

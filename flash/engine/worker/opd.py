@@ -33,13 +33,13 @@ from dataclasses import dataclass
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import (
     FIREWORKS_DEEPSEEK_V4_PRO_MODEL_ID,
+    FORWARD_TEACHER_API_KEY_SECRET,
     HYBRID_OPD_ACTIVATION_ENV,
     HYBRID_OPD_ENTROPY_TAU_ENV,
     HYBRID_OPD_FORWARD_COEF_ENV,
     HYBRID_OPD_OBJECTIVE_ENV,
     HYBRID_OPD_OBJECTIVE_PROJECTED_SOFT,
     HYBRID_OPD_OBJECTIVE_REVERSE_ONLY,
-    PARASAIL_API_KEY_SECRET,
     RECIPE,
     resolve_teacher,
 )
@@ -455,26 +455,26 @@ def _normalize_accumulated_gradients(
 
 
 def run_opd():
-    parasail_accounting = _ParasailRuntimeAccounting()
+    forward_teacher_accounting = _ForwardTeacherRuntimeAccounting()
     try:
-        return _run_opd(parasail_accounting)
+        return _run_opd(forward_teacher_accounting)
     except Exception as exc:
-        parasail_accounting.attach(exc)
+        forward_teacher_accounting.attach(exc)
         raise
 
 
-def _emit_opd_trained_heartbeat(*, opt_steps: int, train_wall: float, parasail_accounting) -> None:
-    """Emit the final successful heartbeat with cumulative Parasail accounting intact."""
+def _emit_opd_trained_heartbeat(*, opt_steps: int, train_wall: float, forward_teacher_accounting) -> None:
+    """Emit the final successful heartbeat with cumulative ForwardTeacher accounting intact."""
     _w.heartbeat(
         "opd_trained",
         step=opt_steps,
         train_wall=train_wall,
         gpu=gpu_diagnostics(),
-        **parasail_accounting.totals.runtime_telemetry(),
+        **forward_teacher_accounting.totals.runtime_telemetry(),
     )
 
 
-def _run_opd(parasail_accounting):
+def _run_opd(forward_teacher_accounting):
     resume_ckpt = _w.hf_resume_checkpoint()
     if resume_ckpt:
         raise RuntimeError(
@@ -485,7 +485,7 @@ def _run_opd(parasail_accounting):
     import torch
     from transformers import AutoTokenizer
 
-    from flash.engine.worker.parasail import ParasailClient
+    from flash.engine.worker.forward_teacher import ForwardTeacherClient
     from flash.engine.worker.teacher import TeacherClient
 
     env = _w.require_active_env()
@@ -533,14 +533,14 @@ def _run_opd(parasail_accounting):
             "FIREWORKS_API_KEY configured in its environment."
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
-    parasail = None
+    forward_teacher = None
     if hybrid.enabled:
-        parasail_key = os.environ.get(PARASAIL_API_KEY_SECRET, "").strip()
-        if not parasail_key:
+        forward_teacher_key = os.environ.get(FORWARD_TEACHER_API_KEY_SECRET, "").strip()
+        if not forward_teacher_key:
             raise RuntimeError(
-                "opd hybrid requires the platform-managed Parasail credential; the worker injection is missing"
+                "opd hybrid requires the platform-managed ForwardTeacher credential; the worker injection is missing"
             )
-        parasail = ParasailClient(parasail_key, seed=_w.SEED)
+        forward_teacher = ForwardTeacherClient(forward_teacher_key, seed=_w.SEED)
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
@@ -773,7 +773,7 @@ def _run_opd(parasail_accounting):
     coverage_curve: list[float] = []
     generated_tokens = 0
     teacher_input_tokens = 0
-    parasail_accounting.totals = _ParasailBatchStats()
+    forward_teacher_accounting.totals = _ForwardTeacherBatchStats()
     forward_loss_curve: list[float] = []
     total_loss_curve: list[float] = []
     # length-capped rollouts and alignment granularity are surfaced in train_meta for diagnosis.
@@ -929,33 +929,33 @@ def _run_opd(parasail_accounting):
             if hybrid.enabled and hybrid_update_index != opt_steps:
                 # bind the logical data slice to the intended optimizer update. raw rollout retries
                 # still advance `step` for the global attempt bound, but they must not consume a new
-                # prompt slice or a new parasail target batch before this update lands.
+                # prompt slice or a new forward_teacher target batch before this update lands.
                 it = opt_steps
                 hybrid_batch = [
                     examples[(it * prompts_per_step + i) % len(examples)]
                     for i in range(prompts_per_step)
                 ]
-                preparation_failure: tuple[str, _ParasailBatchStats, bool] | None = None
+                preparation_failure: tuple[str, _ForwardTeacherBatchStats, bool] | None = None
                 try:
-                    forward_targets, parasail_stats = _prepare_parasail_targets(
-                        parasail,
+                    forward_targets, forward_teacher_stats = _prepare_forward_teacher_targets(
+                        forward_teacher,
                         tok,
                         hybrid_batch,
                         max_length=seq_cap,
                         entropy_tau=hybrid_settings.entropy_tau,
                     )
-                except _ParasailPreparationError as exc:
+                except _ForwardTeacherPreparationError as exc:
                     preparation_failure = (str(exc), exc.stats, exc.retriable)
                 if preparation_failure is not None:
                     reason, partial_stats, retriable = preparation_failure
-                    parasail_accounting.totals = parasail_accounting.totals.merged(partial_stats)
-                    telemetry = parasail_accounting.totals.runtime_telemetry()
+                    forward_teacher_accounting.totals = forward_teacher_accounting.totals.merged(partial_stats)
+                    telemetry = forward_teacher_accounting.totals.runtime_telemetry()
                     if retriable:
                         raise RetriableInfraError(reason, runtime_telemetry=telemetry) from None
-                    raise _ParasailPreparationError(
-                        reason, stats=parasail_accounting.totals, retriable=False
+                    raise _ForwardTeacherPreparationError(
+                        reason, stats=forward_teacher_accounting.totals, retriable=False
                     ) from None
-                parasail_accounting.totals = parasail_accounting.totals.merged(parasail_stats)
+                forward_teacher_accounting.totals = forward_teacher_accounting.totals.merged(forward_teacher_stats)
                 hybrid_update_index = opt_steps
             for no_signal_attempt in range(1, max_no_signal_attempts + 1):
                 if hybrid.enabled:
@@ -1237,7 +1237,7 @@ def _run_opd(parasail_accounting):
                 forward_loss=forward_loss,
                 total_loss=total_loss,
                 supervised_positions=supervised_position_count,
-                **(parasail_accounting.totals.runtime_telemetry() if hybrid.enabled else {}),
+                **(forward_teacher_accounting.totals.runtime_telemetry() if hybrid.enabled else {}),
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
             )
@@ -1329,7 +1329,7 @@ def _run_opd(parasail_accounting):
     _emit_opd_trained_heartbeat(
         opt_steps=opt_steps,
         train_wall=train_wall,
-        parasail_accounting=parasail_accounting,
+        forward_teacher_accounting=forward_teacher_accounting,
     )
 
     _w.write_train_meta(
@@ -1359,10 +1359,10 @@ def _run_opd(parasail_accounting):
             "reverse_loss_curve": loss_curve,
             "forward_loss_curve": forward_loss_curve,
             "total_loss_curve": total_loss_curve,
-            **parasail_accounting.totals.runtime_telemetry(),
+            **forward_teacher_accounting.totals.runtime_telemetry(),
             # compatibility aliases for existing train metadata consumers.
-            "parasail_accepted_targets": parasail_accounting.totals.logical_accepted_targets,
-            "parasail_generations": parasail_accounting.totals.provider_generations,
+            "forward_teacher_accepted_targets": forward_teacher_accounting.totals.logical_accepted_targets,
+            "forward_teacher_generations": forward_teacher_accounting.totals.provider_generations,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or
             # distilled.
@@ -1808,7 +1808,7 @@ def _nonnegative_float(value: object, *, default: float = 0.0) -> float:
 
 
 @dataclass(frozen=True)
-class _ParasailBatchStats:
+class _ForwardTeacherBatchStats:
     logical_accepted_targets: int = 0
     supervised_positions: int = 0
     visible_provider_positions: int = 0
@@ -1843,8 +1843,8 @@ class _ParasailBatchStats:
     def retries(self) -> int:
         return max(0, self.attempts - self.provider_requests)
 
-    def merged(self, other: _ParasailBatchStats) -> _ParasailBatchStats:
-        return _ParasailBatchStats(
+    def merged(self, other: _ForwardTeacherBatchStats) -> _ForwardTeacherBatchStats:
+        return _ForwardTeacherBatchStats(
             logical_accepted_targets=(
                 self.logical_accepted_targets + other.logical_accepted_targets
             ),
@@ -1895,44 +1895,44 @@ class _ParasailBatchStats:
 
     def runtime_telemetry(self) -> dict[str, int | float]:
         return {
-            "parasail_logical_accepted_targets": self.logical_accepted_targets,
-            "parasail_supervised_positions": self.supervised_positions,
-            "parasail_visible_provider_positions": self.visible_provider_positions,
-            "parasail_eligible_projected_rows": self.eligible_projected_rows,
-            "parasail_retained_support_entries": self.retained_support_entries,
-            "parasail_reported_mass_sum": self.reported_mass_sum,
-            "parasail_retained_mass_sum": self.retained_mass_sum,
-            "parasail_dropped_mass_sum": self.dropped_mass_sum,
-            "parasail_entropy_nats_sum": self.entropy_nats_sum,
-            "parasail_collision_count": self.collision_count,
-            "parasail_projected_drop_zero_token": self.projected_drop_zero_token,
-            "parasail_projected_drop_multi_token": self.projected_drop_multi_token,
-            "parasail_projected_drop_prefix_retokenization": (
+            "forward_teacher_logical_accepted_targets": self.logical_accepted_targets,
+            "forward_teacher_supervised_positions": self.supervised_positions,
+            "forward_teacher_visible_provider_positions": self.visible_provider_positions,
+            "forward_teacher_eligible_projected_rows": self.eligible_projected_rows,
+            "forward_teacher_retained_support_entries": self.retained_support_entries,
+            "forward_teacher_reported_mass_sum": self.reported_mass_sum,
+            "forward_teacher_retained_mass_sum": self.retained_mass_sum,
+            "forward_teacher_dropped_mass_sum": self.dropped_mass_sum,
+            "forward_teacher_entropy_nats_sum": self.entropy_nats_sum,
+            "forward_teacher_collision_count": self.collision_count,
+            "forward_teacher_projected_drop_zero_token": self.projected_drop_zero_token,
+            "forward_teacher_projected_drop_multi_token": self.projected_drop_multi_token,
+            "forward_teacher_projected_drop_prefix_retokenization": (
                 self.projected_drop_prefix_retokenization
             ),
-            "parasail_projected_drop_special_token": self.projected_drop_special_token,
-            "parasail_projected_drop_invalid_token_id": self.projected_drop_invalid_token_id,
-            "parasail_projected_drop_round_trip_mismatch": (
+            "forward_teacher_projected_drop_special_token": self.projected_drop_special_token,
+            "forward_teacher_projected_drop_invalid_token_id": self.projected_drop_invalid_token_id,
+            "forward_teacher_projected_drop_round_trip_mismatch": (
                 self.projected_drop_round_trip_mismatch
             ),
-            "parasail_projected_drop_realized_multi_token": (
+            "forward_teacher_projected_drop_realized_multi_token": (
                 self.projected_drop_realized_multi_token
             ),
-            "parasail_provider_requests": self.provider_requests,
-            "parasail_provider_generations": self.provider_generations,
-            "parasail_provider_failures": self.provider_failures,
-            "parasail_prompt_tokens": self.prompt_tokens,
-            "parasail_completion_tokens": self.completion_tokens,
-            "parasail_attempts": self.attempts,
-            "parasail_retries": self.retries,
-            "parasail_latency_seconds": self.latency_seconds,
-            "parasail_ambiguous_paid_requests": self.ambiguous_paid_requests,
+            "forward_teacher_provider_requests": self.provider_requests,
+            "forward_teacher_provider_generations": self.provider_generations,
+            "forward_teacher_provider_failures": self.provider_failures,
+            "forward_teacher_prompt_tokens": self.prompt_tokens,
+            "forward_teacher_completion_tokens": self.completion_tokens,
+            "forward_teacher_attempts": self.attempts,
+            "forward_teacher_retries": self.retries,
+            "forward_teacher_latency_seconds": self.latency_seconds,
+            "forward_teacher_ambiguous_paid_requests": self.ambiguous_paid_requests,
         }
 
 
-class _ParasailRuntimeAccounting:
+class _ForwardTeacherRuntimeAccounting:
     def __init__(self) -> None:
-        self.totals = _ParasailBatchStats()
+        self.totals = _ForwardTeacherBatchStats()
 
     def attach(self, exc: BaseException) -> None:
         if self.totals.provider_requests <= 0:
@@ -1940,10 +1940,10 @@ class _ParasailRuntimeAccounting:
         exc.runtime_telemetry = self.totals.runtime_telemetry()
 
 
-class _ParasailPreparationError(RuntimeError):
+class _ForwardTeacherPreparationError(RuntimeError):
     """Sanitized target-preparation failure with aggregate-only partial accounting."""
 
-    def __init__(self, reason: str, *, stats: _ParasailBatchStats, retriable: bool) -> None:
+    def __init__(self, reason: str, *, stats: _ForwardTeacherBatchStats, retriable: bool) -> None:
         super().__init__(reason)
         self.stats = stats
         self.retriable = bool(retriable)
@@ -1984,8 +1984,8 @@ def _derive_assistant_content_boundary(
     prompt_text = _render_chat(tok, prompt_messages, add_generation_prompt=True)
     rendered_full_text = _render_chat(tok, full_messages, add_generation_prompt=False)
 
-    marker_left = "__flash_parasail_content_begin_7d2f__"
-    marker_right = "__flash_parasail_content_end_7d2f__"
+    marker_left = "__flash_forward_teacher_content_begin_7d2f__"
+    marker_right = "__flash_forward_teacher_content_end_7d2f__"
     joined = prompt_text + rendered_full_text + visible_content
     if marker_left in joined or marker_right in joined:
         raise RuntimeError("opd hybrid target boundary marker collision")
@@ -2052,7 +2052,7 @@ def _build_projected_target(
     return target
 
 
-def _prepare_parasail_targets(
+def _prepare_forward_teacher_targets(
     client,
     tok,
     batch,
@@ -2060,22 +2060,22 @@ def _prepare_parasail_targets(
     max_length: int,
     entropy_tau: float | None = None,
 ):
-    sanitized: tuple[str, _ParasailBatchStats, bool] | None = None
+    sanitized: tuple[str, _ForwardTeacherBatchStats, bool] | None = None
     try:
-        return _prepare_parasail_targets_impl(
+        return _prepare_forward_teacher_targets_impl(
             client,
             tok,
             batch,
             max_length=max_length,
             entropy_tau=entropy_tau,
         )
-    except _ParasailPreparationError as exc:
+    except _ForwardTeacherPreparationError as exc:
         sanitized = (str(exc), exc.stats, exc.retriable)
     reason, stats, retriable = sanitized
-    raise _ParasailPreparationError(reason, stats=stats, retriable=retriable) from None
+    raise _ForwardTeacherPreparationError(reason, stats=stats, retriable=retriable) from None
 
 
-def _prepare_parasail_targets_impl(
+def _prepare_forward_teacher_targets_impl(
     client,
     tok,
     batch,
@@ -2085,30 +2085,30 @@ def _prepare_parasail_targets_impl(
 ):
     import json
 
-    from flash.engine.worker.parasail import ParasailError
+    from flash.engine.worker.forward_teacher import ForwardTeacherError
 
     targets: list[ProjectedTarget] = []
     cached: dict[tuple[str, tuple[int, ...]], ProjectedTarget] = {}
-    stats = _ParasailBatchStats()
+    stats = _ForwardTeacherBatchStats()
     for _example, messages, prompt_ids in batch:
         try:
             serialized_messages = json.dumps(
                 messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
         except (TypeError, ValueError, OverflowError):
-            raise _ParasailPreparationError(
+            raise _ForwardTeacherPreparationError(
                 "opd hybrid prompt serialization failed",
                 stats=stats,
                 retriable=False,
             ) from None
         key = (serialized_messages, tuple(prompt_ids))
         if key not in cached:
-            stats = stats.merged(_ParasailBatchStats(provider_requests=1))
+            stats = stats.merged(_ForwardTeacherBatchStats(provider_requests=1))
             try:
                 result = client.generate(messages)
-            except ParasailError as exc:
+            except ForwardTeacherError as exc:
                 stats = stats.merged(
-                    _ParasailBatchStats(
+                    _ForwardTeacherBatchStats(
                         provider_failures=1,
                         attempts=max(
                             1,
@@ -2120,24 +2120,24 @@ def _prepare_parasail_targets_impl(
                         ),
                     )
                 )
-                raise _ParasailPreparationError(
+                raise _ForwardTeacherPreparationError(
                     str(exc), stats=stats, retriable=bool(getattr(exc, "retriable", False))
                 ) from None
             except Exception:
                 stats = stats.merged(
-                    _ParasailBatchStats(
+                    _ForwardTeacherBatchStats(
                         provider_failures=1,
                         attempts=1,
                         ambiguous_paid_requests=1,
                     )
                 )
-                raise _ParasailPreparationError(
+                raise _ForwardTeacherPreparationError(
                     "opd hybrid provider target preparation failed",
                     stats=stats,
                     retriable=False,
                 ) from None
             try:
-                successful_stats = _ParasailBatchStats(
+                successful_stats = _ForwardTeacherBatchStats(
                     provider_generations=1,
                     prompt_tokens=_nonnegative_int(result.prompt_tokens),
                     completion_tokens=_nonnegative_int(result.completion_tokens),
@@ -2151,13 +2151,13 @@ def _prepare_parasail_targets_impl(
                 visible_records = result.parsed_completion.visible_content_records
             except Exception:
                 stats = stats.merged(
-                    _ParasailBatchStats(
+                    _ForwardTeacherBatchStats(
                         provider_generations=1,
                         attempts=1,
                         ambiguous_paid_requests=1,
                     )
                 )
-                raise _ParasailPreparationError(
+                raise _ForwardTeacherPreparationError(
                     "opd hybrid provider result accounting failed",
                     stats=stats,
                     retriable=False,
@@ -2173,9 +2173,9 @@ def _prepare_parasail_targets_impl(
                     max_length=max_length,
                 )
             except RuntimeError as exc:
-                raise _ParasailPreparationError(str(exc), stats=stats, retriable=False) from None
+                raise _ForwardTeacherPreparationError(str(exc), stats=stats, retriable=False) from None
             except Exception:
-                raise _ParasailPreparationError(
+                raise _ForwardTeacherPreparationError(
                     "opd hybrid local target preparation failed",
                     stats=stats,
                     retriable=False,
@@ -2184,7 +2184,7 @@ def _prepare_parasail_targets_impl(
         targets.append(target)
         rows = target.rows
         drops = target.drop_counts
-        target_stats = _ParasailBatchStats(
+        target_stats = _ForwardTeacherBatchStats(
             logical_accepted_targets=1,
             supervised_positions=sum(
                 projected_row_is_active(row, entropy_tau) for row in rows
@@ -2207,7 +2207,7 @@ def _prepare_parasail_targets_impl(
         )
         stats = stats.merged(target_stats)
     if not targets:
-        raise _ParasailPreparationError(
+        raise _ForwardTeacherPreparationError(
             "opd hybrid target batch is empty", stats=stats, retriable=False
         ) from None
     return targets, stats

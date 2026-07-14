@@ -747,8 +747,8 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
 
 
 def test_same_run_opd_checkpoint_fails_before_training_provider_requests(monkeypatch):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
     from flash.engine.worker import opd as opd_mod
-    from flash.engine.worker import parasail as parasail_mod
     from flash.engine.worker import teacher as teacher_mod
 
     calls = []
@@ -763,9 +763,9 @@ def test_same_run_opd_checkpoint_fails_before_training_provider_requests(monkeyp
         lambda *_args, **_kwargs: calls.append("teacher") or object(),
     )
     monkeypatch.setattr(
-        parasail_mod,
-        "ParasailClient",
-        lambda *_args, **_kwargs: calls.append("parasail") or object(),
+        forward_teacher_mod,
+        "ForwardTeacherClient",
+        lambda *_args, **_kwargs: calls.append("forward_teacher") or object(),
     )
 
     with pytest.raises(RuntimeError, match="checkpoint resume is not supported"):
@@ -921,7 +921,7 @@ def _opd_harness(
             if add_generation_prompt:
                 return "PROMPT"
             content = str(messages[-1].get("content", ""))
-            if content and not content.startswith("__flash_parasail_content_begin_"):
+            if content and not content.startswith("__flash_forward_teacher_content_begin_"):
                 self._visible_content = content
             return "PROMPT" + content + "END"
 
@@ -1102,7 +1102,7 @@ def test_opd_truncated_rollouts_bypass_teacher_and_gkd(monkeypatch, capsys):
 
     assert calls == {"teacher": 0, "gkd": 0}
     assert "truncated_rollout=1" in capsys.readouterr().out
-def _hybrid_parasail_result(
+def _hybrid_forward_teacher_result(
     *,
     content="target",
     prompt_tokens=3,
@@ -1110,21 +1110,21 @@ def _hybrid_parasail_result(
     attempts=1,
     latency_seconds=0.25,
 ):
-    from flash.engine.worker.parasail import (
-        ParasailRecordKind,
-        ParasailSemanticRecord,
-        ParasailTopLogprob,
+    from flash.engine.worker.forward_teacher import (
+        ForwardTeacherRecordKind,
+        ForwardTeacherSemanticRecord,
+        ForwardTeacherTopLogprob,
     )
 
     split = len(content) // 2
     parts = (content[:split], content[split:])
     visible_records = tuple(
-        ParasailSemanticRecord(
-            kind=ParasailRecordKind.VISIBLE_CONTENT,
+        ForwardTeacherSemanticRecord(
+            kind=ForwardTeacherRecordKind.VISIBLE_CONTENT,
             index=index,
             token=part,
             logprob=0.0,
-            top_logprobs=(ParasailTopLogprob(token=part, logprob=0.0),),
+            top_logprobs=(ForwardTeacherTopLogprob(token=part, logprob=0.0),),
         )
         for index, part in enumerate(parts)
     )
@@ -1140,12 +1140,12 @@ def _hybrid_parasail_result(
     )
 
 
-def _patch_hybrid_parasail(monkeypatch, *, generate=None):
-    from flash.engine.worker import parasail as parasail_mod
+def _patch_hybrid_forward_teacher(monkeypatch, *, generate=None):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
 
     calls = []
 
-    class _Parasail:
+    class _ForwardTeacher:
         def __init__(self, api_key, *, seed):
             calls.append(("init", {"api_key": api_key, "seed": seed}))
 
@@ -1153,10 +1153,10 @@ def _patch_hybrid_parasail(monkeypatch, *, generate=None):
             calls.append(("generate", messages))
             if generate is not None:
                 return generate(messages)
-            return _hybrid_parasail_result()
+            return _hybrid_forward_teacher_result()
 
-    monkeypatch.setattr(parasail_mod, "ParasailClient", _Parasail)
-    monkeypatch.setenv("PARASAIL_API_KEY", "unit-test-parasail-key")
+    monkeypatch.setattr(forward_teacher_mod, "ForwardTeacherClient", _ForwardTeacher)
+    monkeypatch.setenv("PARASAIL_API_KEY", "unit-test-forward_teacher-key")
     return calls
 
 
@@ -1441,21 +1441,21 @@ def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
     assert captured["key"] == "unit-test-teacher-key"
 
 
-def test_hybrid_opd_passes_authoritative_worker_seed_to_parasail(monkeypatch):
+def test_hybrid_opd_passes_authoritative_worker_seed_to_forward_teacher(monkeypatch):
     opd_mod = _opd_harness(
         monkeypatch,
         sample_result=_skip,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
     opd_mod._w.SEED = 4242
-    parasail_calls = _patch_hybrid_parasail(monkeypatch)
+    forward_teacher_calls = _patch_hybrid_forward_teacher(monkeypatch)
 
     with pytest.raises(RuntimeError, match="no trained step"):
         opd_mod.run_opd()
 
-    assert parasail_calls[0] == (
+    assert forward_teacher_calls[0] == (
         "init",
-        {"api_key": "unit-test-parasail-key", "seed": 4242},
+        {"api_key": "unit-test-forward_teacher-key", "seed": 4242},
     )
 
 
@@ -1468,7 +1468,7 @@ def test_opd_missing_teacher_key_raises_platform_managed_error(monkeypatch):
         opd_mod.run_opd()
 
 
-def test_hybrid_opd_requires_managed_parasail_key_before_gpu_wait(monkeypatch):
+def test_hybrid_opd_requires_managed_forward_teacher_key_before_gpu_wait(monkeypatch):
     opd_mod = _opd_harness(
         monkeypatch,
         sample_result=_skip,
@@ -1478,7 +1478,7 @@ def test_hybrid_opd_requires_managed_parasail_key_before_gpu_wait(monkeypatch):
     waited = []
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *_a, **_k: waited.append(True))
 
-    with pytest.raises(RuntimeError, match="platform-managed Parasail credential"):
+    with pytest.raises(RuntimeError, match="platform-managed ForwardTeacher credential"):
         opd_mod.run_opd()
 
     assert waited == []
@@ -1603,41 +1603,41 @@ def test_hybrid_runtime_settings_require_coef_and_reject_reverse_only_injection(
         _runtime_hybrid_settings(activated=False)
 
 
-def _parasail_runtime_telemetry(**overrides):
+def _forward_teacher_runtime_telemetry(**overrides):
     telemetry = {
-        "parasail_logical_accepted_targets": 0,
-        "parasail_supervised_positions": 0,
-        "parasail_visible_provider_positions": 0,
-        "parasail_eligible_projected_rows": 0,
-        "parasail_retained_support_entries": 0,
-        "parasail_reported_mass_sum": 0.0,
-        "parasail_retained_mass_sum": 0.0,
-        "parasail_dropped_mass_sum": 0.0,
-        "parasail_entropy_nats_sum": 0.0,
-        "parasail_collision_count": 0,
-        "parasail_projected_drop_zero_token": 0,
-        "parasail_projected_drop_multi_token": 0,
-        "parasail_projected_drop_prefix_retokenization": 0,
-        "parasail_projected_drop_special_token": 0,
-        "parasail_projected_drop_invalid_token_id": 0,
-        "parasail_projected_drop_round_trip_mismatch": 0,
-        "parasail_projected_drop_realized_multi_token": 0,
-        "parasail_provider_requests": 0,
-        "parasail_provider_generations": 0,
-        "parasail_provider_failures": 0,
-        "parasail_prompt_tokens": 0,
-        "parasail_completion_tokens": 0,
-        "parasail_attempts": 0,
-        "parasail_retries": 0,
-        "parasail_latency_seconds": 0.0,
-        "parasail_ambiguous_paid_requests": 0,
+        "forward_teacher_logical_accepted_targets": 0,
+        "forward_teacher_supervised_positions": 0,
+        "forward_teacher_visible_provider_positions": 0,
+        "forward_teacher_eligible_projected_rows": 0,
+        "forward_teacher_retained_support_entries": 0,
+        "forward_teacher_reported_mass_sum": 0.0,
+        "forward_teacher_retained_mass_sum": 0.0,
+        "forward_teacher_dropped_mass_sum": 0.0,
+        "forward_teacher_entropy_nats_sum": 0.0,
+        "forward_teacher_collision_count": 0,
+        "forward_teacher_projected_drop_zero_token": 0,
+        "forward_teacher_projected_drop_multi_token": 0,
+        "forward_teacher_projected_drop_prefix_retokenization": 0,
+        "forward_teacher_projected_drop_special_token": 0,
+        "forward_teacher_projected_drop_invalid_token_id": 0,
+        "forward_teacher_projected_drop_round_trip_mismatch": 0,
+        "forward_teacher_projected_drop_realized_multi_token": 0,
+        "forward_teacher_provider_requests": 0,
+        "forward_teacher_provider_generations": 0,
+        "forward_teacher_provider_failures": 0,
+        "forward_teacher_prompt_tokens": 0,
+        "forward_teacher_completion_tokens": 0,
+        "forward_teacher_attempts": 0,
+        "forward_teacher_retries": 0,
+        "forward_teacher_latency_seconds": 0.0,
+        "forward_teacher_ambiguous_paid_requests": 0,
     }
     telemetry.update(overrides)
     return telemetry
 
 
-def test_hybrid_opd_classifies_exhausted_parasail_outage_as_retriable(monkeypatch):
-    from flash.engine.worker.parasail import ParasailTransientError
+def test_hybrid_opd_classifies_exhausted_forward_teacher_outage_as_retriable(monkeypatch):
+    from flash.engine.worker.forward_teacher import ForwardTeacherTransientError
     from flash.engine.worker.perf import RetriableInfraError
 
     opd_mod = _opd_harness(
@@ -1645,11 +1645,11 @@ def test_hybrid_opd_classifies_exhausted_parasail_outage_as_retriable(monkeypatc
         sample_result=_skip,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(
+    _patch_hybrid_forward_teacher(
         monkeypatch,
         generate=lambda _messages: (_ for _ in ()).throw(
-            ParasailTransientError(
-                "parasail HTTP 503",
+            ForwardTeacherTransientError(
+                "forward_teacher HTTP 503",
                 attempts=2,
                 latency_seconds=1.5,
                 ambiguous_paid_requests=2,
@@ -1657,25 +1657,25 @@ def test_hybrid_opd_classifies_exhausted_parasail_outage_as_retriable(monkeypatc
         ),
     )
 
-    with pytest.raises(RetriableInfraError, match="parasail HTTP 503") as caught:
+    with pytest.raises(RetriableInfraError, match="forward_teacher HTTP 503") as caught:
         opd_mod.run_opd()
 
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
-    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
-        parasail_provider_requests=1,
-        parasail_provider_failures=1,
-        parasail_attempts=2,
-        parasail_retries=1,
-        parasail_latency_seconds=1.5,
-        parasail_ambiguous_paid_requests=2,
+    assert caught.value.runtime_telemetry == _forward_teacher_runtime_telemetry(
+        forward_teacher_provider_requests=1,
+        forward_teacher_provider_failures=1,
+        forward_teacher_attempts=2,
+        forward_teacher_retries=1,
+        forward_teacher_latency_seconds=1.5,
+        forward_teacher_ambiguous_paid_requests=2,
     )
 
 
 def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(monkeypatch):
     torch = pytest.importorskip("torch")
+    from flash.engine.worker.forward_teacher import ForwardTeacherTransientError
     from flash.engine.worker.opd import SampleResult
-    from flash.engine.worker.parasail import ParasailTransientError
     from flash.engine.worker.perf import RetriableInfraError
 
     def _one_update(*, model, **_kwargs):
@@ -1698,13 +1698,13 @@ def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(
     def _generate(_messages):
         calls.append(1)
         if len(calls) == 2:
-            raise ParasailTransientError(
-                "parasail transport failure",
+            raise ForwardTeacherTransientError(
+                "forward_teacher transport failure",
                 attempts=2,
                 latency_seconds=1.5,
                 ambiguous_paid_requests=2,
             )
-        return _hybrid_parasail_result(
+        return _hybrid_forward_teacher_result(
             content="private target",
             prompt_tokens=3,
             completion_tokens=2,
@@ -1712,7 +1712,7 @@ def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(
             latency_seconds=0.25,
         )
 
-    _patch_hybrid_parasail(monkeypatch, generate=_generate)
+    _patch_hybrid_forward_teacher(monkeypatch, generate=_generate)
     optimizer_steps = []
     real_step = torch.optim.AdamW.step
 
@@ -1726,31 +1726,31 @@ def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(
         opd_mod.run_opd()
 
     assert optimizer_steps == [True]
-    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
-        parasail_logical_accepted_targets=1,
-        parasail_supervised_positions=2,
-        parasail_visible_provider_positions=2,
-        parasail_eligible_projected_rows=2,
-        parasail_retained_support_entries=2,
-        parasail_reported_mass_sum=2.0,
-        parasail_retained_mass_sum=2.0,
-        parasail_provider_requests=2,
-        parasail_provider_generations=1,
-        parasail_provider_failures=1,
-        parasail_prompt_tokens=3,
-        parasail_completion_tokens=2,
-        parasail_attempts=4,
-        parasail_retries=2,
-        parasail_latency_seconds=1.75,
-        parasail_ambiguous_paid_requests=2,
+    assert caught.value.runtime_telemetry == _forward_teacher_runtime_telemetry(
+        forward_teacher_logical_accepted_targets=1,
+        forward_teacher_supervised_positions=2,
+        forward_teacher_visible_provider_positions=2,
+        forward_teacher_eligible_projected_rows=2,
+        forward_teacher_retained_support_entries=2,
+        forward_teacher_reported_mass_sum=2.0,
+        forward_teacher_retained_mass_sum=2.0,
+        forward_teacher_provider_requests=2,
+        forward_teacher_provider_generations=1,
+        forward_teacher_provider_failures=1,
+        forward_teacher_prompt_tokens=3,
+        forward_teacher_completion_tokens=2,
+        forward_teacher_attempts=4,
+        forward_teacher_retries=2,
+        forward_teacher_latency_seconds=1.75,
+        forward_teacher_ambiguous_paid_requests=2,
     )
     assert "private target" not in str(caught.value)
     assert "private target" not in repr(caught.value.runtime_telemetry)
 
 
-def test_hybrid_opd_keeps_permanent_parasail_failure_non_retriable(monkeypatch):
-    from flash.engine.worker.opd import _ParasailPreparationError
-    from flash.engine.worker.parasail import ParasailError
+def test_hybrid_opd_keeps_permanent_forward_teacher_failure_non_retriable(monkeypatch):
+    from flash.engine.worker.forward_teacher import ForwardTeacherError
+    from flash.engine.worker.opd import _ForwardTeacherPreparationError
     from flash.engine.worker.perf import RetriableInfraError
 
     opd_mod = _opd_harness(
@@ -1758,11 +1758,11 @@ def test_hybrid_opd_keeps_permanent_parasail_failure_non_retriable(monkeypatch):
         sample_result=_skip,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(
+    _patch_hybrid_forward_teacher(
         monkeypatch,
         generate=lambda _messages: (_ for _ in ()).throw(
-            ParasailError(
-                "parasail HTTP 400",
+            ForwardTeacherError(
+                "forward_teacher HTTP 400",
                 attempts=1,
                 latency_seconds=0.4,
                 ambiguous_paid_requests=0,
@@ -1770,16 +1770,16 @@ def test_hybrid_opd_keeps_permanent_parasail_failure_non_retriable(monkeypatch):
         ),
     )
 
-    with pytest.raises(_ParasailPreparationError, match="parasail HTTP 400") as caught:
+    with pytest.raises(_ForwardTeacherPreparationError, match="forward_teacher HTTP 400") as caught:
         opd_mod.run_opd()
     assert not isinstance(caught.value, RetriableInfraError)
     assert caught.value.retriable is False
-    assert caught.value.runtime_telemetry["parasail_provider_requests"] == 1
-    assert caught.value.runtime_telemetry["parasail_provider_failures"] == 1
-    assert caught.value.runtime_telemetry["parasail_attempts"] == 1
-    assert caught.value.runtime_telemetry["parasail_retries"] == 0
-    assert caught.value.runtime_telemetry["parasail_latency_seconds"] == pytest.approx(0.4)
-    assert caught.value.runtime_telemetry["parasail_ambiguous_paid_requests"] == 0
+    assert caught.value.runtime_telemetry["forward_teacher_provider_requests"] == 1
+    assert caught.value.runtime_telemetry["forward_teacher_provider_failures"] == 1
+    assert caught.value.runtime_telemetry["forward_teacher_attempts"] == 1
+    assert caught.value.runtime_telemetry["forward_teacher_retries"] == 0
+    assert caught.value.runtime_telemetry["forward_teacher_latency_seconds"] == pytest.approx(0.4)
+    assert caught.value.runtime_telemetry["forward_teacher_ambiguous_paid_requests"] == 0
 
 
 def test_hybrid_opd_activation_is_independent_of_ambient_world_size(monkeypatch):
@@ -1805,7 +1805,7 @@ def test_hybrid_opd_activation_is_independent_of_ambient_world_size(monkeypatch)
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
     monkeypatch.setenv("WORLD_SIZE", "2")
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
 
@@ -1828,7 +1828,7 @@ def test_hybrid_opd_activation_is_independent_of_ambient_world_size(monkeypatch)
 
 def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypatch):
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
     from flash.engine.worker.opd_soft_targets import (
         ProjectedPosition,
         ProjectedTarget,
@@ -1856,7 +1856,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
         group=3,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     row = ProjectedPosition(
         provider_record_index=0,
         logits_index=1,
@@ -1884,7 +1884,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
 
     def _prepare(*_args, **_kwargs):
         preparation_calls.append(True)
-        return [target], _ParasailBatchStats(
+        return [target], _ForwardTeacherBatchStats(
             logical_accepted_targets=1,
             supervised_positions=1,
             visible_provider_positions=1,
@@ -1901,7 +1901,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
             attempts=1,
         )
 
-    monkeypatch.setattr(opd_mod, "_prepare_parasail_targets", _prepare)
+    monkeypatch.setattr(opd_mod, "_prepare_forward_teacher_targets", _prepare)
     events = []
     projected_calls = []
     projected_microbatch_sizes = []
@@ -1949,7 +1949,7 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
 
 def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update(monkeypatch):
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
     from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
 
     def _one_update(*, model, **_kwargs):
@@ -1966,7 +1966,7 @@ def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update
         sample_result=_one_update,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     empty = ProjectedTarget(
         input_ids=(1,),
         positions=(),
@@ -1977,10 +1977,10 @@ def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update
     )
     monkeypatch.setattr(
         opd_mod,
-        "_prepare_parasail_targets",
+        "_prepare_forward_teacher_targets",
         lambda *_args, **_kwargs: (
             [empty],
-            _ParasailBatchStats(
+            _ForwardTeacherBatchStats(
                 logical_accepted_targets=1,
                 supervised_positions=0,
                 visible_provider_positions=1,
@@ -2077,7 +2077,7 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
             attempts=1,
         )
 
-    parasail_calls = _patch_hybrid_parasail(monkeypatch, generate=_generate)
+    forward_teacher_calls = _patch_hybrid_forward_teacher(monkeypatch, generate=_generate)
     monkeypatch.setattr(
         opd_mod.OpdVllmRolloutEngine,
         "generate",
@@ -2096,18 +2096,18 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
     )
 
     with pytest.raises(
-        opd_mod._ParasailPreparationError,
+        opd_mod._ForwardTeacherPreparationError,
         match="projected target rollout prompt mismatch",
     ):
         opd_mod.run_opd()
 
-    assert [kind for kind, _value in parasail_calls] == ["init", "generate"]
+    assert [kind for kind, _value in forward_teacher_calls] == ["init", "generate"]
     assert optimizer_steps == []
 
 
 def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
     from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
 
     def _one_update(*, model, **_kwargs):
@@ -2124,7 +2124,7 @@ def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
         sample_result=_one_update,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     target = ProjectedTarget(
         input_ids=(1,),
         positions=(),
@@ -2135,10 +2135,10 @@ def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
     )
     monkeypatch.setattr(
         opd_mod,
-        "_prepare_parasail_targets",
+        "_prepare_forward_teacher_targets",
         lambda *_args, **_kwargs: (
             [target],
-            _ParasailBatchStats(
+            _ForwardTeacherBatchStats(
                 logical_accepted_targets=1,
                 supervised_positions=1,
                 provider_requests=1,
@@ -2168,7 +2168,7 @@ def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
 @pytest.mark.parametrize("failure", ["provider", "target", "forward"])
 def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure):
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import SampleResult, _ParasailBatchStats
+    from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
     from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
 
     def _one_update(*, model, **_kwargs):
@@ -2185,9 +2185,9 @@ def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure
         sample_result=_one_update,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     if failure == "provider":
-        _patch_hybrid_parasail(
+        _patch_hybrid_forward_teacher(
             monkeypatch,
             generate=lambda _messages: (_ for _ in ()).throw(
                 RuntimeError("sanitized provider failure")
@@ -2196,7 +2196,7 @@ def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure
     elif failure == "target":
         monkeypatch.setattr(
             opd_mod,
-            "_prepare_parasail_targets",
+            "_prepare_forward_teacher_targets",
             lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("target failure")),
         )
     else:
@@ -2210,10 +2210,10 @@ def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure
         )
         monkeypatch.setattr(
             opd_mod,
-            "_prepare_parasail_targets",
+            "_prepare_forward_teacher_targets",
             lambda *_a, **_k: (
                 [target],
-                _ParasailBatchStats(
+                _ForwardTeacherBatchStats(
                     logical_accepted_targets=1,
                     supervised_positions=0,
                     provider_requests=1,
@@ -2243,18 +2243,18 @@ def test_hybrid_opd_failure_is_atomic_before_optimizer_step(monkeypatch, failure
 
     assert optimizer_steps == []
     if failure == "forward":
-        assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
-            parasail_logical_accepted_targets=1,
-            parasail_provider_requests=1,
-            parasail_provider_generations=1,
-            parasail_prompt_tokens=3,
-            parasail_completion_tokens=2,
-            parasail_attempts=1,
-            parasail_latency_seconds=0.25,
+        assert caught.value.runtime_telemetry == _forward_teacher_runtime_telemetry(
+            forward_teacher_logical_accepted_targets=1,
+            forward_teacher_provider_requests=1,
+            forward_teacher_provider_generations=1,
+            forward_teacher_prompt_tokens=3,
+            forward_teacher_completion_tokens=2,
+            forward_teacher_attempts=1,
+            forward_teacher_latency_seconds=0.25,
         )
 
 
-def test_hybrid_opd_finalization_failure_retains_parasail_telemetry(monkeypatch):
+def test_hybrid_opd_finalization_failure_retains_forward_teacher_telemetry(monkeypatch):
     def _one_update(*, model, **_kwargs):
         from flash.engine.worker.opd import SampleResult
 
@@ -2271,7 +2271,7 @@ def test_hybrid_opd_finalization_failure_retains_parasail_telemetry(monkeypatch)
         sample_result=_one_update,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
-    _patch_hybrid_parasail(monkeypatch)
+    _patch_hybrid_forward_teacher(monkeypatch)
     monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
     original = RuntimeError("metadata finalization failed")
@@ -2285,20 +2285,20 @@ def test_hybrid_opd_finalization_failure_retains_parasail_telemetry(monkeypatch)
         opd_mod.run_opd()
 
     assert caught.value is original
-    assert caught.value.runtime_telemetry == _parasail_runtime_telemetry(
-        parasail_logical_accepted_targets=1,
-        parasail_supervised_positions=2,
-        parasail_visible_provider_positions=2,
-        parasail_eligible_projected_rows=2,
-        parasail_retained_support_entries=2,
-        parasail_reported_mass_sum=2.0,
-        parasail_retained_mass_sum=2.0,
-        parasail_provider_requests=1,
-        parasail_provider_generations=1,
-        parasail_prompt_tokens=3,
-        parasail_completion_tokens=2,
-        parasail_attempts=1,
-        parasail_latency_seconds=0.25,
+    assert caught.value.runtime_telemetry == _forward_teacher_runtime_telemetry(
+        forward_teacher_logical_accepted_targets=1,
+        forward_teacher_supervised_positions=2,
+        forward_teacher_visible_provider_positions=2,
+        forward_teacher_eligible_projected_rows=2,
+        forward_teacher_retained_support_entries=2,
+        forward_teacher_reported_mass_sum=2.0,
+        forward_teacher_retained_mass_sum=2.0,
+        forward_teacher_provider_requests=1,
+        forward_teacher_provider_generations=1,
+        forward_teacher_prompt_tokens=3,
+        forward_teacher_completion_tokens=2,
+        forward_teacher_attempts=1,
+        forward_teacher_latency_seconds=0.25,
     )
 
 
@@ -2736,7 +2736,7 @@ def test_hybrid_no_signal_retry_group_does_not_count_as_skipped_update(monkeypat
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
         metas=metas,
     )
-    parasail_calls = _patch_hybrid_parasail(monkeypatch)
+    forward_teacher_calls = _patch_hybrid_forward_teacher(monkeypatch)
     monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
 
     opd_mod.run_opd()
@@ -2746,7 +2746,7 @@ def test_hybrid_no_signal_retry_group_does_not_count_as_skipped_update(monkeypat
     assert notes["opt_steps"] == 1
     assert notes["no_signal_resamples"] == 2
     assert notes["no_signal_skipped_steps"] == 0
-    assert [name for name, _payload in parasail_calls].count("generate") == 1
+    assert [name for name, _payload in forward_teacher_calls].count("generate") == 1
 
 
 def test_opd_no_signal_log_includes_skip_reasons(monkeypatch, capsys):

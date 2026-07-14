@@ -243,14 +243,14 @@ def test_worker_error_heartbeat_forwards_sanitized_exception_telemetry(monkeypat
     calls = []
     original = RuntimeError("private provider response")
     original.runtime_telemetry = {
-        "parasail_provider_requests": 1,
-        "parasail_provider_generations": 1,
-        "parasail_provider_failures": 0,
-        "parasail_prompt_tokens": 12,
-        "parasail_attempts": 1,
-        "parasail_retries": 0,
-        "parasail_latency_seconds": 0.25,
-        "parasail_ambiguous_paid_requests": 0,
+        "forward_teacher_provider_requests": 1,
+        "forward_teacher_provider_generations": 1,
+        "forward_teacher_provider_failures": 0,
+        "forward_teacher_prompt_tokens": 12,
+        "forward_teacher_attempts": 1,
+        "forward_teacher_retries": 0,
+        "forward_teacher_latency_seconds": 0.25,
+        "forward_teacher_ambiguous_paid_requests": 0,
         "private_target": "must not leave the worker",
     }
 
@@ -279,8 +279,8 @@ def test_worker_error_heartbeat_forwards_sanitized_exception_telemetry(monkeypat
     error_calls = [kwargs for stage, kwargs in calls if stage == "error_opd"]
     assert len(error_calls) == 2
     for payload in error_calls:
-        assert payload["parasail_provider_requests"] == 1
-        assert payload["parasail_provider_generations"] == 1
-        assert payload["parasail_prompt_tokens"] == 12
-        assert payload["parasail_latency_seconds"] == 0.25
+        assert payload["forward_teacher_provider_requests"] == 1
+        assert payload["forward_teacher_provider_generations"] == 1
+        assert payload["forward_teacher_prompt_tokens"] == 12
+        assert payload["forward_teacher_latency_seconds"] == 0.25
         assert "private_target" not in payload

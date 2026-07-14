@@ -79,66 +79,66 @@ _HB_CLAIM_SEQ = 0
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
-_PARASAIL_RUNTIME_TELEMETRY_FIELDS = frozenset(
+_FORWARD_TEACHER_RUNTIME_TELEMETRY_FIELDS = frozenset(
     {
-        "parasail_logical_accepted_targets",
-        "parasail_supervised_positions",
-        "parasail_visible_provider_positions",
-        "parasail_eligible_projected_rows",
-        "parasail_retained_support_entries",
-        "parasail_reported_mass_sum",
-        "parasail_retained_mass_sum",
-        "parasail_dropped_mass_sum",
-        "parasail_entropy_nats_sum",
-        "parasail_collision_count",
-        "parasail_projected_drop_zero_token",
-        "parasail_projected_drop_multi_token",
-        "parasail_projected_drop_prefix_retokenization",
-        "parasail_projected_drop_special_token",
-        "parasail_projected_drop_invalid_token_id",
-        "parasail_projected_drop_round_trip_mismatch",
-        "parasail_projected_drop_realized_multi_token",
-        "parasail_provider_requests",
-        "parasail_provider_generations",
-        "parasail_provider_failures",
-        "parasail_prompt_tokens",
-        "parasail_completion_tokens",
-        "parasail_attempts",
-        "parasail_retries",
-        "parasail_latency_seconds",
-        "parasail_ambiguous_paid_requests",
+        "forward_teacher_logical_accepted_targets",
+        "forward_teacher_supervised_positions",
+        "forward_teacher_visible_provider_positions",
+        "forward_teacher_eligible_projected_rows",
+        "forward_teacher_retained_support_entries",
+        "forward_teacher_reported_mass_sum",
+        "forward_teacher_retained_mass_sum",
+        "forward_teacher_dropped_mass_sum",
+        "forward_teacher_entropy_nats_sum",
+        "forward_teacher_collision_count",
+        "forward_teacher_projected_drop_zero_token",
+        "forward_teacher_projected_drop_multi_token",
+        "forward_teacher_projected_drop_prefix_retokenization",
+        "forward_teacher_projected_drop_special_token",
+        "forward_teacher_projected_drop_invalid_token_id",
+        "forward_teacher_projected_drop_round_trip_mismatch",
+        "forward_teacher_projected_drop_realized_multi_token",
+        "forward_teacher_provider_requests",
+        "forward_teacher_provider_generations",
+        "forward_teacher_provider_failures",
+        "forward_teacher_prompt_tokens",
+        "forward_teacher_completion_tokens",
+        "forward_teacher_attempts",
+        "forward_teacher_retries",
+        "forward_teacher_latency_seconds",
+        "forward_teacher_ambiguous_paid_requests",
     }
 )
-_PARASAIL_FLOAT_TELEMETRY_FIELDS = frozenset(
+_FORWARD_TEACHER_FLOAT_TELEMETRY_FIELDS = frozenset(
     {
-        "parasail_latency_seconds",
-        "parasail_reported_mass_sum",
-        "parasail_retained_mass_sum",
-        "parasail_dropped_mass_sum",
-        "parasail_entropy_nats_sum",
+        "forward_teacher_latency_seconds",
+        "forward_teacher_reported_mass_sum",
+        "forward_teacher_retained_mass_sum",
+        "forward_teacher_dropped_mass_sum",
+        "forward_teacher_entropy_nats_sum",
     }
 )
-_PARASAIL_ARITHMETIC_FIELDS = frozenset(
+_FORWARD_TEACHER_ARITHMETIC_FIELDS = frozenset(
     {
-        "parasail_provider_requests",
-        "parasail_provider_generations",
-        "parasail_provider_failures",
-        "parasail_attempts",
-        "parasail_retries",
+        "forward_teacher_provider_requests",
+        "forward_teacher_provider_generations",
+        "forward_teacher_provider_failures",
+        "forward_teacher_attempts",
+        "forward_teacher_retries",
     }
 )
 
 
-def sanitize_parasail_runtime_telemetry(values: object) -> dict[str, int | float]:
-    """Return only exact, internally consistent aggregate Parasail accounting fields."""
+def sanitize_forward_teacher_runtime_telemetry(values: object) -> dict[str, int | float]:
+    """Return only exact, internally consistent aggregate ForwardTeacher accounting fields."""
     if not isinstance(values, dict):
         return {}
     clean: dict[str, int | float] = {}
-    for key in _PARASAIL_RUNTIME_TELEMETRY_FIELDS:
+    for key in _FORWARD_TEACHER_RUNTIME_TELEMETRY_FIELDS:
         if key not in values:
             continue
         value = values[key]
-        if key in _PARASAIL_FLOAT_TELEMETRY_FIELDS:
+        if key in _FORWARD_TEACHER_FLOAT_TELEMETRY_FIELDS:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
             numeric = float(value)
@@ -148,16 +148,16 @@ def sanitize_parasail_runtime_telemetry(values: object) -> dict[str, int | float
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             clean[key] = value
 
-    complete = _PARASAIL_RUNTIME_TELEMETRY_FIELDS.issubset(values)
-    if complete and not _PARASAIL_RUNTIME_TELEMETRY_FIELDS.issubset(clean):
+    complete = _FORWARD_TEACHER_RUNTIME_TELEMETRY_FIELDS.issubset(values)
+    if complete and not _FORWARD_TEACHER_RUNTIME_TELEMETRY_FIELDS.issubset(clean):
         return {}
 
-    requests = clean.get("parasail_provider_requests")
-    attempts = clean.get("parasail_attempts")
-    retries = clean.get("parasail_retries")
-    generations = clean.get("parasail_provider_generations")
-    failures = clean.get("parasail_provider_failures")
-    ambiguous = clean.get("parasail_ambiguous_paid_requests")
+    requests = clean.get("forward_teacher_provider_requests")
+    attempts = clean.get("forward_teacher_attempts")
+    retries = clean.get("forward_teacher_retries")
+    generations = clean.get("forward_teacher_provider_generations")
+    failures = clean.get("forward_teacher_provider_failures")
+    ambiguous = clean.get("forward_teacher_ambiguous_paid_requests")
 
     if isinstance(attempts, int) and isinstance(ambiguous, int) and ambiguous > attempts:
         return {}
@@ -166,7 +166,7 @@ def sanitize_parasail_runtime_telemetry(values: object) -> dict[str, int | float
             return {}
         expected_retries = attempts - requests
         if retries is None:
-            clean["parasail_retries"] = expected_retries
+            clean["forward_teacher_retries"] = expected_retries
         elif retries != expected_retries:
             return {}
     if (
@@ -175,14 +175,14 @@ def sanitize_parasail_runtime_telemetry(values: object) -> dict[str, int | float
     ):
         return {}
 
-    if complete and not _PARASAIL_ARITHMETIC_FIELDS.issubset(clean):
+    if complete and not _FORWARD_TEACHER_ARITHMETIC_FIELDS.issubset(clean):
         return {}
     return clean
 
 
 def exception_runtime_telemetry(exc: BaseException) -> dict[str, int | float]:
     """Read the one allowlisted runtime telemetry container from an exception."""
-    return sanitize_parasail_runtime_telemetry(getattr(exc, "runtime_telemetry", None))
+    return sanitize_forward_teacher_runtime_telemetry(getattr(exc, "runtime_telemetry", None))
 
 
 def _dump_thread_stacks(reason: str) -> None:

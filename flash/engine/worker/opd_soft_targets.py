@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from flash.engine.worker.parasail import ParasailSemanticRecord
+    from flash.engine.worker.forward_teacher import ForwardTeacherSemanticRecord
 
 REPORTED_MASS_TOLERANCE = 1e-6
 
@@ -195,7 +195,7 @@ def _stable_logaddexp(left: float, right: float) -> float:
     return high + math.log1p(math.exp(low - high))
 
 
-def _reported_mass(record: ParasailSemanticRecord) -> float:
+def _reported_mass(record: ForwardTeacherSemanticRecord) -> float:
     candidate_logprobs = []
     for candidate in record.top_logprobs:
         value = getattr(candidate, "logprob", None)
@@ -213,7 +213,7 @@ def _reported_mass(record: ParasailSemanticRecord) -> float:
     return min(1.0, max(0.0, mass))
 
 
-def _provider_top_k_entropy(record: ParasailSemanticRecord) -> float:
+def _provider_top_k_entropy(record: ForwardTeacherSemanticRecord) -> float:
     masses = tuple(math.exp(float(candidate.logprob)) for candidate in record.top_logprobs)
     reported_mass = math.fsum(masses)
     if reported_mass <= 0:
@@ -226,7 +226,7 @@ def _provider_top_k_entropy(record: ParasailSemanticRecord) -> float:
 
 
 def _empty_position(
-    record: ParasailSemanticRecord,
+    record: ForwardTeacherSemanticRecord,
     *,
     reported_mass: float,
     provider_entropy: float,
@@ -255,7 +255,7 @@ def project_visible_records(
     tokenizer,
     *,
     prefix_text: str,
-    visible_records: Sequence[ParasailSemanticRecord],
+    visible_records: Sequence[ForwardTeacherSemanticRecord],
 ) -> ProjectedTarget:
     """Project visible teacher alternatives by exact contextual one-token extension.
 
