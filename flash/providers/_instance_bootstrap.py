@@ -63,15 +63,33 @@ def require_deadline_at(payload: dict) -> float:
     return deadline
 
 
-def arm_deadline_watchdog(deadline_at: float) -> tuple[threading.Timer, threading.Event]:
+def _publish_timeout_marker_then_exit(payload: dict, message: str) -> None:
+    print(f"FLASH: {message}", flush=True)
+
+    def _mark() -> None:
+        with contextlib.suppress(Exception):
+            write_attempt_marker(payload, ok=False, error=message)
+
+    marker_thread = threading.Thread(target=_mark, daemon=True)
+    marker_thread.start()
+    marker_thread.join(timeout=8.0)
+    os._exit(124)
+
+
+def arm_deadline_watchdog(
+    deadline_at: float,
+    payload: dict,
+) -> tuple[threading.Timer, threading.Event]:
     """Hard-stop setup or training that remains alive at the absolute cutoff."""
     done = threading.Event()
 
     def _fire() -> None:
         if done.is_set():
             return
-        print("FLASH: run wall deadline exceeded; self-terminating box", flush=True)
-        os._exit(124)
+        _publish_timeout_marker_then_exit(
+            payload,
+            "run wall deadline exceeded; self-terminating box",
+        )
 
     timer = threading.Timer(max(0.0, deadline_at - time.time()), _fire)
     timer.daemon = True
@@ -176,12 +194,18 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
     raise AssertionError("unreachable")
 
 
-def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
+def hf_upload(
+    payload: dict,
+    local_path: str,
+    repo_subpath: str,
+    *,
+    enforce_deadline: bool = True,
+) -> None:
     """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
 
-        if "deadline_at" in payload:
+        if enforce_deadline and "deadline_at" in payload:
             require_deadline_at(payload)
         HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
             path_or_fileobj=local_path,
@@ -458,12 +482,8 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
         raise RuntimeError("attempt marker state is invalid")
     if not isinstance(error, str):
         raise RuntimeError("attempt marker error is invalid")
-    deadline = _canonical_deadline_at(payload)
+    _canonical_deadline_at(payload)
     now = _finite_positive_number(time.time(), "current clock")
-    if ok and now >= deadline:
-        ok = False
-        error = "run wall deadline exceeded"
-        retriable = False
     marker = {
         "attempt": attempt,
         "error": error[-2000:],
@@ -475,7 +495,12 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
         json.dump(marker, f)
-    hf_upload(payload, p, f"{_arm(payload)}_attempt{attempt}.json")
+    hf_upload(
+        payload,
+        p,
+        f"{_arm(payload)}_attempt{attempt}.json",
+        enforce_deadline=False,
+    )
 
 
 def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event]:
@@ -488,18 +513,10 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     def _fire() -> None:
         if done.is_set():
             return
-        msg = "preload exceeded the run wall deadline; self-terminating box"
-        print(f"FLASH: {msg}", flush=True)
-
-        # upload the marker on a separate thread, then hard-exit even when the nic is hung.
-        def _mark() -> None:
-            with contextlib.suppress(Exception):
-                write_attempt_marker(payload, ok=False, error=msg)
-
-        marker_thread = threading.Thread(target=_mark, daemon=True)
-        marker_thread.start()
-        marker_thread.join(timeout=8.0)
-        os._exit(124)
+        _publish_timeout_marker_then_exit(
+            payload,
+            "preload exceeded the run wall deadline; self-terminating box",
+        )
 
     timer = threading.Timer(max(0.0, remaining), _fire)
     timer.daemon = True
@@ -619,7 +636,7 @@ def main() -> int:
             ok = not result.get("error") and not result.get("failed")
             error = "model preload failed" if not ok else ""
             return 0 if ok else 1
-        deadline_watchdog = arm_deadline_watchdog(deadline)
+        deadline_watchdog = arm_deadline_watchdog(deadline, payload)
         install_extra_pip(payload)
         # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
         # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.

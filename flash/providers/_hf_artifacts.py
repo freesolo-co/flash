@@ -31,8 +31,12 @@ def make_hf_text_reader(
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     state = {"last": 0.0}
 
-    def read(force: bool = False) -> str | None:
-        if not hf_repo or (deadline is not None and remaining_seconds(deadline) <= 0):
+    def read(
+        force: bool = False,
+        *,
+        deadline_at: float | None = deadline,
+    ) -> str | None:
+        if not hf_repo or (deadline_at is not None and remaining_seconds(deadline_at) <= 0):
             return None
         now = time.time()
         if not force and now - state["last"] < min_interval_s:

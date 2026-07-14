@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from flash.providers._deadline import remaining_seconds, require_deadline_at
+from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._hf_artifacts import (
     heartbeat_is_stale_prior_attempt,
     worker_flagged_retriable,
@@ -135,8 +135,6 @@ class InstancePollAdapter:
 def _decode_terminal_marker(
     raw: str,
     adapter: InstancePollAdapter,
-    *,
-    deadline_at: float | None,
 ) -> dict:
     marker = json.loads(raw)
     if not isinstance(marker, dict) or set(marker) != {
@@ -176,7 +174,6 @@ def _decode_terminal_marker(
         or not math.isfinite(ts)
         or ts < launch_floor
         or ts > now + 120.0
-        or (deadline_at is not None and marker["ok"] and ts >= deadline_at)
     ):
         raise ValueError("invalid terminal marker identity")
     return marker
@@ -214,6 +211,12 @@ def poll_instance_job(
     marker_reader = adapter.marker_reader
     metrics_reader = adapter.metrics_reader
 
+    def read_artifact(reader, *, force: bool, read_deadline_at: float | None):
+        return reader(
+            force=force,
+            **deadline_kwargs(reader, read_deadline_at),
+        )
+
     def finish_ok(
         end_ts_hint: float | str | None = None,
         *,
@@ -222,7 +225,11 @@ def poll_instance_job(
         # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
         # falling back to the poll_error retry on a DONE-without-metrics.
         raw = _read_with_retries(
-            lambda: metrics_reader(force=True),
+            lambda: read_artifact(
+                metrics_reader,
+                force=True,
+                read_deadline_at=read_deadline_at,
+            ),
             tries=_METRICS_AFTER_DONE_RETRIES,
             wait_s=_METRICS_AFTER_DONE_WAIT_S,
             say=say,
@@ -273,7 +280,7 @@ def poll_instance_job(
             and math.isfinite(now)
             and ts > launch_ts - 120.0
             and ts <= now + 120.0
-            and (absolute_deadline is None or ts < absolute_deadline)
+            and (absolute_deadline is None or ts <= absolute_deadline)
         )
 
     def finish_from_ok_marker(
@@ -283,7 +290,11 @@ def poll_instance_job(
     ) -> PollResult:
         # An ok marker means the worker finished (metrics.json was written first), even if DONE is stale.
         # Pass DONE only when fresh; else use the marker's own completion ts for the wall note.
-        d = done_reader(force=True)
+        d = read_artifact(
+            done_reader,
+            force=True,
+            read_deadline_at=read_deadline_at,
+        )
         fresh = d is not None and done_is_fresh(d)
         marker_ts = marker.get("ts") if isinstance(marker, dict) else None
         return finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
@@ -310,17 +321,21 @@ def poll_instance_job(
         # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
         # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
         # reads; False for the per-iteration loop poll, which already paces its own reads.
-        d = done_reader(force=force)
+        d = read_artifact(
+            done_reader,
+            force=force,
+            read_deadline_at=read_deadline_at,
+        )
         if d is not None and done_is_fresh(d):
             return finish_ok(d, read_deadline_at=read_deadline_at)
-        raw = marker_reader(force=force)
+        raw = read_artifact(
+            marker_reader,
+            force=force,
+            read_deadline_at=read_deadline_at,
+        )
         if raw is not None:
             try:
-                marker = _decode_terminal_marker(
-                    raw,
-                    adapter,
-                    deadline_at=absolute_deadline,
-                )
+                marker = _decode_terminal_marker(raw, adapter)
             except (TypeError, ValueError):
                 return PollResult(
                     False,

@@ -1020,6 +1020,90 @@ def test_poll_deadline_bounded_reread_accepts_late_terminal_artifacts(monkeypatc
     assert sleeps == [5.0, 5.0]
 
 
+def test_poll_done_at_exact_deadline_is_fresh(monkeypatch):
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done="10000.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+
+
+def test_poll_deadline_observes_hf_artifacts_during_bounded_reread(monkeypatch, tmp_path):
+    import huggingface_hub
+
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    done = tmp_path / "DONE"
+    done.write_text("9999.5")
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(json.dumps({"wall_seconds": 100, "cost_usd": 0.0}))
+    reads = []
+
+    def download(_repo, path_in_repo, **_kwargs):
+        reads.append(path_in_repo)
+        if path_in_repo.endswith("/DONE"):
+            return str(done)
+        if path_in_repo.endswith("/metrics.json"):
+            return str(metrics)
+        raise FileNotFoundError(path_in_repo)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(
+        vast_api,
+        "get_instance",
+        lambda _instance_id: pytest.fail("deadline polling must observe HF before provider status"),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+    assert any(path.endswith("/DONE") for path in reads)
+    assert any(path.endswith("/metrics.json") for path in reads)
+
+
+def test_poll_deadline_accepts_late_success_marker(monkeypatch):
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        marker=_terminal_marker(ok=True, ts=10_005.0),
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_005.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+
+
 def test_poll_deadline_after_status_fetch_rereads_terminal_artifacts(monkeypatch):
     from flash.providers.vast import api as vast_api
 
