@@ -175,6 +175,29 @@ def test_hybrid_eligibility_is_narrow_and_reports_sanitized_reason():
         assert unactivated.reason == reason
 
 
+def test_forward_teacher_local_validation_does_not_count_provider_request():
+    from flash.engine.worker.forward_teacher import ForwardTeacherClient
+    from flash.engine.worker.opd import (
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
+    )
+
+    client = ForwardTeacherClient(
+        "key",
+        seed=123,
+        opener=lambda *_args, **_kwargs: pytest.fail("transport must not open"),
+    )
+    batch = [(None, [{"role": "user", "content": ["not a string"]}], [1])]
+
+    with pytest.raises(_ForwardTeacherPreparationError, match="messages are invalid") as caught:
+        _prepare_forward_teacher_targets(client, object(), batch, max_length=8)
+
+    assert caught.value.stats.provider_requests == 0
+    assert caught.value.stats.provider_failures == 0
+    assert caught.value.stats.attempts == 0
+    assert caught.value.stats.ambiguous_paid_requests == 0
+
+
 def test_forward_teacher_target_preparation_reports_partial_success_then_transient_failure(monkeypatch):
     from types import SimpleNamespace
 

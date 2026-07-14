@@ -2112,17 +2112,15 @@ def _prepare_forward_teacher_targets_impl(
             ) from None
         key = (serialized_messages, tuple(prompt_ids))
         if key not in cached:
-            stats = stats.merged(_ForwardTeacherBatchStats(provider_requests=1))
             try:
                 result = client.generate(messages)
             except ForwardTeacherError as exc:
+                attempts = _nonnegative_int(getattr(exc, "attempts", 0))
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
-                        provider_failures=1,
-                        attempts=max(
-                            1,
-                            _nonnegative_int(getattr(exc, "attempts", 0)),
-                        ),
+                        provider_requests=1 if attempts > 0 else 0,
+                        provider_failures=1 if attempts > 0 else 0,
+                        attempts=attempts,
                         latency_seconds=_nonnegative_float(getattr(exc, "latency_seconds", 0.0)),
                         ambiguous_paid_requests=_nonnegative_int(
                             getattr(exc, "ambiguous_paid_requests", 0)
@@ -2135,6 +2133,7 @@ def _prepare_forward_teacher_targets_impl(
             except Exception:
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
+                        provider_requests=1,
                         provider_failures=1,
                         attempts=1,
                         ambiguous_paid_requests=1,
@@ -2147,6 +2146,7 @@ def _prepare_forward_teacher_targets_impl(
                 ) from None
             try:
                 successful_stats = _ForwardTeacherBatchStats(
+                    provider_requests=1,
                     provider_generations=1,
                     prompt_tokens=_nonnegative_int(result.prompt_tokens),
                     completion_tokens=_nonnegative_int(result.completion_tokens),
@@ -2161,6 +2161,7 @@ def _prepare_forward_teacher_targets_impl(
             except Exception:
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
+                        provider_requests=1,
                         provider_generations=1,
                         attempts=1,
                         ambiguous_paid_requests=1,

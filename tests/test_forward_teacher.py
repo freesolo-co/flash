@@ -654,6 +654,48 @@ def test_forward_teacher_accepts_and_classifies_pinned_semantic_completion_contr
     assert all(record.token not in diagnostic for record in parsed.records)
 
 
+def test_forward_teacher_allows_literal_think_boundaries_in_reasoning_and_content():
+    tokens = (
+        "explain ",
+        FORWARD_TEACHER_THINK_BOUNDARY,
+        " literally",
+        FORWARD_TEACHER_THINK_BOUNDARY,
+        "answer ",
+        FORWARD_TEACHER_THINK_BOUNDARY,
+        " text",
+        FORWARD_TEACHER_TERMINAL,
+    )
+    records = [
+        {
+            "token": token,
+            "logprob": -0.1,
+            "top_logprobs": [{"token": token, "logprob": -0.1}],
+        }
+        for token in tokens
+    ]
+    payload = _payload(
+        choices=[
+            _choice(
+                message={
+                    "reasoning": "".join(tokens[:3]),
+                    "content": "".join(tokens[4:7]),
+                },
+                logprobs={"content": records},
+            )
+        ],
+        usage={"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15},
+    )
+
+    result = ForwardTeacherClient(
+        "key", seed=123, opener=lambda *_args, **_kwargs: _Response(payload)
+    ).generate([{"role": "user", "content": "x"}])
+
+    parsed = result.parsed_completion
+    assert parsed.boundary_record.index == 3
+    assert parsed.hidden_reasoning_records[1].kind is ForwardTeacherRecordKind.HIDDEN_REASONING
+    assert parsed.visible_content_records[1].kind is ForwardTeacherRecordKind.VISIBLE_CONTENT
+
+
 def test_forward_teacher_rejects_completion_logprob_count_mismatch():
     with pytest.raises(ForwardTeacherError, match="token count is inconsistent"):
         ForwardTeacherClient(

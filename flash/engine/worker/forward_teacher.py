@@ -135,32 +135,39 @@ def _parse_semantic_completion(
     terminal_indices = [
         index for index, record in enumerate(records) if record.token == FORWARD_TEACHER_TERMINAL
     ]
-    if len(boundary_indices) != 1:
-        raise ForwardTeacherError(
-            f"forward_teacher semantic completion boundary count is invalid: count={len(boundary_indices)}"
-        )
     if len(terminal_indices) != 1:
         raise ForwardTeacherError(
             f"forward_teacher semantic completion terminal count is invalid: count={len(terminal_indices)}"
         )
-    boundary_index = boundary_indices[0]
     terminal_index = terminal_indices[0]
     if terminal_index != len(records) - 1:
         raise ForwardTeacherError("forward_teacher semantic completion terminal position is invalid")
-    if boundary_index >= terminal_index - 1:
-        raise ForwardTeacherError("forward_teacher semantic completion visible interval is empty")
 
-    hidden = records[:boundary_index]
-    visible = records[boundary_index + 1 : terminal_index]
-    if any(
-        record.token in (FORWARD_TEACHER_THINK_BOUNDARY, FORWARD_TEACHER_TERMINAL)
-        for record in (*hidden, *visible)
-    ):
-        raise ForwardTeacherError("forward_teacher semantic completion record ordering is invalid")
-    if "".join(record.token for record in hidden) != reasoning:
-        raise ForwardTeacherError("forward_teacher semantic completion reasoning reconstruction mismatch")
-    if "".join(record.token for record in visible) != content:
-        raise ForwardTeacherError("forward_teacher semantic completion content reconstruction mismatch")
+    matching_boundaries = [
+        index
+        for index in boundary_indices
+        if index < terminal_index - 1
+        and "".join(record.token for record in records[:index]) == reasoning
+        and "".join(record.token for record in records[index + 1 : terminal_index]) == content
+    ]
+    if len(matching_boundaries) != 1:
+        if len(boundary_indices) == 1:
+            candidate = boundary_indices[0]
+            if candidate >= terminal_index - 1:
+                raise ForwardTeacherError(
+                    "forward_teacher semantic completion visible interval is empty"
+                )
+            if "".join(record.token for record in records[:candidate]) != reasoning:
+                raise ForwardTeacherError(
+                    "forward_teacher semantic completion reasoning reconstruction mismatch"
+                )
+            raise ForwardTeacherError(
+                "forward_teacher semantic completion content reconstruction mismatch"
+            )
+        raise ForwardTeacherError(
+            f"forward_teacher semantic completion boundary count is invalid: count={len(matching_boundaries)}"
+        )
+    boundary_index = matching_boundaries[0]
 
     semantic_records = []
     for index, record in enumerate(records):
