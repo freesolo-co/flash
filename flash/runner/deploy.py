@@ -66,11 +66,14 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server._locks import _deploy_lock
 
     initial_status = get_status(run_id)
-    initial_retry_revocation = (
-        initial_status.state == "cancelled"
-        and (initial_status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
-    )
-    if initial_status.state in TERMINAL_STATES and not initial_retry_revocation:
+    initial_deployment_state = (initial_status.deployment or {}).get("state")
+    initial_retry_revocation = initial_deployment_state == _REVOCATION_RETRY_STATE
+    initial_has_active_deployment = initial_deployment_state not in (None, "undeployed", "dry_run")
+    if initial_status.state == "dry_run" or (
+        initial_status.state in TERMINAL_STATES
+        and not initial_retry_revocation
+        and not initial_has_active_deployment
+    ):
         return initial_status
     entered_deployed = initial_status.state == "deployed"
 
@@ -108,10 +111,16 @@ def cancel_run(run_id: str) -> RunStatus:
         # reread after the submission handshake releases the lock so a newly durable provider
         # handle is cancelled and destroyed rather than leaving an untracked paid resource.
         status = get_status(run_id)
-        retry_revocation = (
-            status.state == "cancelled"
-            and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
-        )
+        deployment_state = (status.deployment or {}).get("state")
+        retry_revocation = deployment_state == _REVOCATION_RETRY_STATE
+        has_active_deployment = deployment_state not in (None, "undeployed", "dry_run")
+        if status.state == "dry_run" or (
+            status.state in TERMINAL_STATES
+            and not retry_revocation
+            and not entered_deployed
+            and not has_active_deployment
+        ):
+            return status
         # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
         entered_deployed = entered_deployed or status.state == "deployed"
         public_spec = JobSpec.from_dict(status.spec)
@@ -121,7 +130,12 @@ def cancel_run(run_id: str) -> RunStatus:
         cleanup_spec = effective_spec or public_spec
         # a mid-training cancel is re-priced from the authoritative prepared spec. deployed runs
         # retain the completed quote, and revocation retries never alter billing.
-        bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
+        bill_cancel = (
+            bool(status.billing_context)
+            and status.state not in TERMINAL_STATES
+            and not entered_deployed
+            and not retry_revocation
+        )
         remote = status.remote or {}
         if remote != initial_remote:
             teardown_remote(remote)
@@ -149,7 +163,7 @@ def cancel_run(run_id: str) -> RunStatus:
                 }
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
-        if not retry_revocation:
+        if not retry_revocation and status.state != "cancelled":
             _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
         deployment_state = (final.deployment or {}).get("state")
