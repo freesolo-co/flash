@@ -393,6 +393,49 @@ def test_cancel_defers_networked_reconcile_until_after_gpu_teardown(tmp_path, mo
     assert out.deployment_cleanup is None
 
 
+def test_cancel_terminal_run_reconciles_pending_deployment_in_band(tmp_path, monkeypatch):
+    # A run already in a terminal state (not `deployed`) returns early from cancel, so its pending
+    # serving-adapter cleanup must be reconciled on the first pass rather than deferred to background
+    # recovery: a terminal run has no live training GPU to protect, so there is nothing to tear down
+    # first. Under the deferred (remote=False) first pass the networked read never ran and the FINAL
+    # deployment stayed advertised `ready`.
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    reads = []
+    monkeypatch.setattr(
+        deploy,
+        "owned_adapter_cleanup",
+        lambda _run_id, _deployment=None: reads.append("read") or None,
+    )
+    monkeypatch.setattr(
+        deploy,
+        "reconcile_owned_adapter_cleanup",
+        lambda *_args: pytest.fail("authoritative absence must retire the record without a reconcile"),
+    )
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-terminal-cleanup"})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="failed",
+            spec=spec.to_dict(),
+            deployment={"state": "ready", "mutation_id": "m3", "target_revision": 3},
+        )
+    )
+
+    out = orch.cancel_run(spec.run_id)
+
+    # The authoritative registry read ran in-band (the fix); the deployment is retired now, not left
+    # `ready` for background recovery.
+    assert reads == ["read"], "terminal cancel must reconcile the pending deployment in-band"
+    assert out.state == "failed", "an already-terminal run keeps its terminal state"
+    assert out.deployment["state"] == "undeployed"
+
+
 def test_cancel_persists_cleanup_intent_when_authoritative_read_raises(tmp_path, monkeypatch):
     # If the authoritative owned_adapter_cleanup read raises, cancel must NOT treat that as the adapter
     # being gone (which would drop the record at `ready` with the remote adapter still live). It

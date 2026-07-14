@@ -146,9 +146,12 @@ def cancel_run(run_id: str) -> RunStatus:
     with _deploy_lock(run_id):
         status = get_status(run_id)
         entered_deployed = status.state == "deployed"
-        # A deployed run has no live training GPU, so reconcile its serving adapter now. A run still
-        # training bills a GPU, so defer the networked adapter reconcile until after teardown below.
-        status = revoke_current_deployment_ownership(remote=entered_deployed)
+        # A deployed or already-terminal run has no live training GPU, so reconcile its serving
+        # adapter now: the terminal path returns early below, so deferring would leave the pending
+        # cleanup to background recovery. A run still training bills a GPU, so defer the networked
+        # adapter reconcile until after teardown below.
+        reconcile_now = entered_deployed or status.state in TERMINAL_STATES
+        status = revoke_current_deployment_ownership(remote=reconcile_now)
         if status.state in TERMINAL_STATES and not entered_deployed:
             return status
     # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
