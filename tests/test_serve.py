@@ -537,18 +537,6 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     assert posts == []
 
 
-def test_structured_outputs_body_helper():
-    from flash.serve.deploy import _structured_outputs_body
-
-    assert _structured_outputs_body("r1", "", thinking=False) is None
-    assert _structured_outputs_body("r1", "", thinking=True) is None
-    spec = json.dumps({"json": {"type": "object"}})
-    assert _structured_outputs_body("r1", spec, thinking=False) == {"json": {"type": "object"}}
-    assert _structured_outputs_body("r1", spec, thinking=True) == {"json": {"type": "object"}}
-    with pytest.raises(ValueError, match="corrupt train"):
-        _structured_outputs_body("r1", "{not json", thinking=True)
-
-
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `org_id` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""

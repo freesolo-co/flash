@@ -271,13 +271,6 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
-def _structured_outputs_body(
-    run_id: str, structured_outputs: str, *, thinking: bool
-) -> dict | None:
-    """Return the canonical shared structured-outputs registration field, when configured."""
-    return parse_structured_outputs(structured_outputs) if structured_outputs else None
-
-
 def _require_thinking_structured_outputs_capability(base: str) -> None:
     """Require serving support for deferring a structured constraint past reasoning."""
     url = f"{base}/healthz"
@@ -340,7 +333,7 @@ def deploy_adapter(
     if dry_run:
         return dep
     base = serving_base_url()
-    so_default = _structured_outputs_body(run_id, structured_outputs, thinking=thinking)
+    so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
     if thinking and so_default is not None:
         _require_thinking_structured_outputs_capability(base)
     body = {

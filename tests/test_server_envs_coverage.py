@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import subprocess
 import tarfile
+import time
 import types
 
 import pytest
@@ -435,6 +437,14 @@ def _smoke_response(content: str, finish_reason: str = "stop") -> dict:
     }
 
 
+def _schema_validation_child_pids() -> set[int | None]:
+    return {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.name == serving._JSON_SCHEMA_PROCESS_NAME
+    }
+
+
 def test_run_deployment_smoke_success_and_empty(monkeypatch):
     spec = _smoke_spec(thinking=False)
 
@@ -495,8 +505,25 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
             '<think>2+2</think>{"answer": "4"}',
             '{"answer": "4"}',
         ),
+        (
+            {
+                "json": {
+                    "type": "object",
+                    "properties": {"literal": {"type": "string"}},
+                    "required": ["literal"],
+                }
+            },
+            '<think>x</think>{"literal": "</think>"}',
+            '{"literal": "</think>"}',
+        ),
         ({"choice": ["4", "four"]}, "<think>2+2</think>4", "4"),
+        ({"choice": ["<think>4"]}, "<think>2+2</think><think>4", "<think>4"),
         ({"regex": "[0-9]+"}, "<think>2+2</think>4", "4"),
+        (
+            {"regex": "answer</think>literal"},
+            "<think>x</think>answer</think>literal",
+            "answer</think>literal",
+        ),
     ],
 )
 def test_thinking_structured_smoke_validates_only_answer_after_reasoning(
@@ -513,27 +540,42 @@ def test_thinking_structured_smoke_validates_only_answer_after_reasoning(
 
 
 def test_structured_smoke_rejects_external_schema_ref_without_network(monkeypatch):
-    import socket
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
 
-    connection_attempts: list[tuple] = []
+    requests: list[str] = []
 
-    def reject_connection(*args, **kwargs):
-        connection_attempts.append((args, kwargs))
-        raise AssertionError("external network access attempted")
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
 
-    monkeypatch.setattr(socket, "create_connection", reject_connection)
-    constraint = {"json": {"$ref": "http://127.0.0.1:9/schema.json"}}
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    constraint = {"json": {"$ref": f"http://127.0.0.1:{port}/schema.json"}}
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
         lambda **_k: _smoke_response("<think>2+2</think>{}"),
     )
 
-    with pytest.raises(ServingError, match="schema reference could not be resolved"):
-        serving._run_deployment_smoke(
-            "run-1", _smoke_spec(thinking=True, constraint=constraint)
-        )
-    assert connection_attempts == []
+    try:
+        with pytest.raises(ServingError, match="schema reference could not be resolved"):
+            serving._run_deployment_smoke(
+                "run-1", _smoke_spec(thinking=True, constraint=constraint)
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+    assert requests == []
 
 
 def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkeypatch):
@@ -556,6 +598,123 @@ def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkey
     assert "external retrieval" not in str(exc_info.value)
 
 
+def test_direct_structured_regex_timeout_is_bounded(monkeypatch):
+    answer = "a" * 10_000 + "!"
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ServingError, match=r"regex evaluation exceeded the 0\.05s deadline"):
+        serving._run_deployment_smoke(
+            "run-1",
+            _smoke_spec(thinking=True, constraint={"regex": "(a+)+$"}),
+        )
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize("keyword", ["pattern", "patternProperties"])
+def test_json_schema_pathological_regex_branch_times_out_before_fallback(monkeypatch, keyword):
+    pathological = "(a+)+$"
+    bad_value = "a" * 10_000 + "!"
+    if keyword == "pattern":
+        instance = bad_value
+        failing_branch = {"type": "string", "pattern": pathological}
+    else:
+        instance = {bad_value: 1}
+        failing_branch = {
+            "type": "object",
+            "patternProperties": {pathological: {"type": "integer"}},
+        }
+    schema = {"anyOf": [failing_branch, {"const": instance}]}
+    answer = json.dumps(instance)
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    children_before = _schema_validation_child_pids()
+    started = time.monotonic()
+    with pytest.raises(ServingError, match="wall-clock deadline"):
+        serving._run_deployment_smoke(
+            "run-1",
+            _smoke_spec(thinking=True, constraint={"json": schema}),
+        )
+    assert time.monotonic() - started < 5.0
+    assert _schema_validation_child_pids() == children_before
+
+
+def test_json_schema_not_combinator_timeout_cannot_invert_to_success(monkeypatch):
+    bad_value = "a" * 10_000 + "!"
+    schema = {"not": {"type": "string", "pattern": "(a+)+$"}}
+    answer = json.dumps(bad_value)
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    children_before = _schema_validation_child_pids()
+    started = time.monotonic()
+    with pytest.raises(ServingError, match="wall-clock deadline"):
+        serving._run_deployment_smoke(
+            "run-1",
+            _smoke_spec(thinking=True, constraint={"json": schema}),
+        )
+    assert time.monotonic() - started < 5.0
+    assert _schema_validation_child_pids() == children_before
+
+
+def test_json_schema_pattern_properties_unevaluated_timeout_is_killed(monkeypatch):
+    bad_key = "a" * 10_000 + "!"
+    instance = {bad_key: 1}
+    schema = {
+        "type": "object",
+        "patternProperties": {"(a+)+$": {"type": "integer"}},
+        "unevaluatedProperties": False,
+    }
+    answer = json.dumps(instance)
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    children_before = _schema_validation_child_pids()
+    started = time.monotonic()
+    with pytest.raises(ServingError, match="wall-clock deadline"):
+        serving._run_deployment_smoke(
+            "run-1",
+            _smoke_spec(thinking=True, constraint={"json": schema}),
+        )
+    assert time.monotonic() - started < 5.0
+    assert _schema_validation_child_pids() == children_before
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("constraint_kind", ["json", "json_object"])
+def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, constraint_kind):
+    if constraint_kind == "json":
+        constraint = {"json": {"type": "number"}}
+        answer = constant
+    else:
+        constraint = {"json_object": True}
+        answer = f'{{"value": {constant}}}'
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    with pytest.raises(ServingError, match="non-finite JSON constant"):
+        serving._run_deployment_smoke(
+            "run-1", _smoke_spec(thinking=True, constraint=constraint)
+        )
+
+
 @pytest.mark.parametrize(
     ("constraint", "content", "finish_reason", "match"),
     [
@@ -576,19 +735,13 @@ def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkey
             {"choice": ["4"]},
             "<think>x</think><think>4",
             "stop",
-            "opened a new <think> block",
+            "is not one of",
         ),
         (
             {"choice": ["4"]},
             "<think>x</think>garbage</think>4",
             "stop",
-            "additional </think> delimiter",
-        ),
-        (
-            {"json_object": True},
-            '<think>x</think>{"literal": "</think>"}',
-            "stop",
-            "additional </think> delimiter",
+            "is not one of",
         ),
         (
             {"choice": ["4"]},

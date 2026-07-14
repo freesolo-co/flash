@@ -9,10 +9,12 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import multiprocessing
 import re
 import time
 from typing import Annotated
 
+import regex as safe_regex
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema import SchemaError, ValidationError
@@ -51,7 +53,111 @@ def _reject_external_schema_reference(uri: str):
     raise NoSuchResource(ref=uri)
 
 
-_SCHEMA_REGISTRY = Registry(retrieve=_reject_external_schema_reference)
+_DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
+_JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
+_JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
+
+
+def _bounded_regex_fullmatch(pattern: str, value: str):
+    try:
+        return safe_regex.fullmatch(pattern, value, timeout=_DIRECT_REGEX_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise ServingError(
+            f"structured-output regex evaluation exceeded the {_DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
+        ) from exc
+
+
+def _sanitized_schema_error(exc: Exception) -> str:
+    message = getattr(exc, "message", str(exc))
+    return " ".join(str(message).split())[:500]
+
+
+def _json_schema_validation_worker(connection, instance, schema) -> None:
+    try:
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        registry = Registry(retrieve=_reject_external_schema_reference)
+        validator_class(schema, registry=registry).validate(instance)
+    except Unresolvable as exc:
+        outcome = ("reference", _sanitized_schema_error(exc))
+    except SchemaError as exc:
+        outcome = ("schema", _sanitized_schema_error(exc))
+    except ValidationError as exc:
+        outcome = ("validation", _sanitized_schema_error(exc))
+    except Exception as exc:
+        outcome = ("error", f"{type(exc).__name__}: {_sanitized_schema_error(exc)}")
+    else:
+        outcome = ("ok", "")
+    try:
+        connection.send(outcome)
+    finally:
+        connection.close()
+
+
+def _reap_schema_validation_process(process) -> None:
+    process.join(timeout=0.1)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=0.2)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def _validate_json_schema(instance, schema: dict) -> None:
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_json_schema_validation_worker,
+        args=(send_connection, instance, schema),
+        name=_JSON_SCHEMA_PROCESS_NAME,
+        daemon=True,
+    )
+    deadline = time.monotonic() + _JSON_SCHEMA_TIMEOUT_SECONDS
+    outcome: tuple[str, str] | None = None
+    try:
+        try:
+            process.start()
+        except Exception as exc:
+            raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
+        finally:
+            send_connection.close()
+        remaining = max(0.0, deadline - time.monotonic())
+        if receive_connection.poll(remaining):
+            try:
+                outcome = receive_connection.recv()
+            except EOFError:
+                outcome = None
+    finally:
+        receive_connection.close()
+        if process.pid is not None:
+            _reap_schema_validation_process(process)
+            process.close()
+
+    if outcome is None:
+        raise ServingError(
+            f"JSON schema validation exceeded the {_JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
+        )
+    status, detail = outcome
+    if status == "ok":
+        return
+    if status == "reference":
+        raise ServingError(f"configured JSON schema reference could not be resolved: {detail}")
+    if status == "schema":
+        raise ServingError(f"configured JSON schema is invalid: {detail}")
+    if status == "validation":
+        raise ServingError(f"structured smoke output violates the configured JSON schema: {detail}")
+    raise ServingError(f"JSON schema validation failed safely: {detail}")
+
+
+def _strict_json_loads(value: str):
+    def reject_constant(constant: str):
+        raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
+
+    try:
+        return json.loads(value, parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -112,16 +218,7 @@ def _thinking_structured_answer(content: str) -> str:
             "structured smoke generation for a thinking adapter never closed its reasoning with "
             "</think>"
         )
-    suffix = content[closed + len("</think>") :]
-    if "<think>" in suffix:
-        raise ServingError(
-            "structured smoke generation opened a new <think> block after reasoning closed"
-        )
-    if "</think>" in suffix:
-        raise ServingError(
-            "structured smoke generation returned an additional </think> delimiter in the answer"
-        )
-    answer = suffix.strip()
+    answer = content[closed + len("</think>") :].strip()
     if not answer:
         raise ServingError("structured smoke generation returned no answer after </think>")
     return answer
@@ -130,30 +227,20 @@ def _thinking_structured_answer(content: str) -> str:
 def _validate_structured_smoke(answer: str, constraint: dict) -> None:
     try:
         if "json" in constraint:
-            instance = json.loads(answer)
-            schema = constraint["json"]
-            validator_class = validator_for(schema)
-            validator_class.check_schema(schema)
-            validator_class(schema, registry=_SCHEMA_REGISTRY).validate(instance)
+            _validate_json_schema(_strict_json_loads(answer), constraint["json"])
         elif constraint.get("json_object") is True:
-            if not isinstance(json.loads(answer), dict):
+            if not isinstance(_strict_json_loads(answer), dict):
                 raise ServingError("structured smoke output is valid JSON but not a JSON object")
         elif "choice" in constraint:
             if answer not in constraint["choice"]:
                 raise ServingError(
                     f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
                 )
-        elif "regex" in constraint and re.fullmatch(str(constraint["regex"]), answer) is None:
+        elif "regex" in constraint and _bounded_regex_fullmatch(
+            str(constraint["regex"]), answer
+        ) is None:
             raise ServingError("structured smoke output does not match the configured regex")
-    except json.JSONDecodeError as exc:
-        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
-    except Unresolvable as exc:
-        raise ServingError(f"configured JSON schema reference could not be resolved: {exc}") from exc
-    except (ValidationError, SchemaError) as exc:
-        raise ServingError(
-            f"structured smoke output violates the configured JSON schema: {exc}"
-        ) from exc
-    except re.error as exc:
+    except safe_regex.error as exc:
         raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
 
 
