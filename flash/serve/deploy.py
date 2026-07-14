@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 READBACK_DELAY_SECONDS = 2.0
 ACTIVATION_READBACK_ATTEMPTS = 3
+THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 
 
 class ServingError(RuntimeError):
@@ -321,32 +322,34 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
-def _structured_outputs_body(
-    run_id: str, structured_outputs: str, *, thinking: bool
-) -> dict | None:
-    """The per-adapter structured-outputs serving default for the registration body, or None.
-
-    Returns the parsed canonical StructuredOutputsParams-kwargs dict when the run configured a
-    constraint AND is non-thinking; None otherwise (no default is registered). Non-thinking only:
-    serving sets no reasoning-parser, so a per-adapter grammar would bind from the very first
-    generated token and force a thinking adapter's ``<think>`` phase to open the schema (e.g. ``{``)
-    — strictly worse than serving it unconstrained. Training stays compatible with thinking via a
-    DEFERRED grammar (``reasoning_parser="deepseek_r1"`` holds the constraint until ``</think>``),
-    but serving has no such deferral, so we skip the serve-time default for thinking runs rather
-    than break reasoning. Raises ValueError on a corrupt spec — a wiring bug, since
-    ``[train].structured_outputs`` is already canonicalized at run creation (schema/fields.py), so
-    this cannot fire for a real run; it fails loudly rather than ever silently serving unconstrained."""
-    if not structured_outputs:
-        return None
-    if thinking:
-        logger.info(
-            "adapter %s trained with structured_outputs but thinking=True; not registering a "
-            "serving guided-decoding default — serving has no reasoning-parser deferral, so it "
-            "would bind the grammar from token 0 and suppress the <think> phase",
-            run_id,
+def _require_thinking_structured_outputs_capability(base: str) -> None:
+    """Require serving support for deferring a structured constraint past reasoning."""
+    url = f"{base}/healthz"
+    response = _serving_request("GET", url)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ServingError(
+            f"serving health check at {url} did not return valid JSON; cannot safely deploy a "
+            "thinking adapter with structured outputs"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ServingError(
+            f"serving health check at {url} returned a non-object payload; cannot safely deploy a "
+            "thinking adapter with structured outputs"
         )
-        return None
-    return parse_structured_outputs(structured_outputs)
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list):
+        raise ServingError(
+            f"serving health check at {url} must return a list field named capabilities; cannot "
+            "safely deploy a thinking adapter with structured outputs"
+        )
+    if THINKING_STRUCTURED_OUTPUTS_CAPABILITY not in capabilities:
+        raise ServingError(
+            f"serving health check at {url} is missing required capability "
+            f"{THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r}; cannot safely deploy a thinking adapter "
+            "with structured outputs"
+        )
 
 
 def deploy_adapter(
@@ -365,7 +368,11 @@ def deploy_adapter(
     on_state: Callable[[dict], None] | None = None,
     before_activate: Callable[[str, str], None] | None = None,
 ) -> Deployment:
-    """Register, verify, and atomically activate one immutable adapter revision."""
+    """Register, verify, and atomically activate one immutable adapter revision.
+
+    Thinking adapters with structured outputs require serving to advertise deferred constraint
+    support before the immutable revision is registered.
+    """
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
     dep = deployment_record(
@@ -388,6 +395,9 @@ def deploy_adapter(
     dep.adapter_revision = revision
     checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
     _require_serving_capabilities()
+    so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
+    if thinking and so_default is not None:
+        _require_thinking_structured_outputs_capability(serving_base_url())
 
     body = {
         "adapter_id": revision,
@@ -405,7 +415,6 @@ def deploy_adapter(
         },
         "thinking": bool(thinking),
     }
-    so_default = _structured_outputs_body(run_id, structured_outputs, thinking=thinking)
     if so_default is not None:
         body["structured_outputs"] = so_default
     normalized_org_id = (org_id or "").strip()
