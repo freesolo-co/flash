@@ -34,17 +34,30 @@ class OpdVllmOutput:
 
 
 def opd_lora_rank(model, default: int = 32) -> int:
-    """Best-effort PEFT LoRA rank for vLLM's max_lora_rank."""
+    """Best-effort maximum PEFT LoRA rank for vLLM's max_lora_rank."""
     cfgs = getattr(model, "peft_config", None) or {}
     cfg_iter = cfgs.values() if isinstance(cfgs, dict) else (cfgs,)
+    ranks: list[int] = []
     for cfg in cfg_iter:
         rank = getattr(cfg, "r", None)
-        if isinstance(rank, dict):
-            vals = [int(v) for v in rank.values() if isinstance(v, int) and v > 0]
-            if vals:
-                return max(vals)
-        if isinstance(rank, int) and rank > 0:
-            return rank
+        if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+            ranks.append(rank)
+        elif isinstance(rank, dict):
+            # Some PEFT configs express per-module ranks as a dict-valued `r`; take the max.
+            ranks.extend(
+                int(value)
+                for value in rank.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+        pattern = getattr(cfg, "rank_pattern", None)
+        if isinstance(pattern, dict):
+            ranks.extend(
+                int(value)
+                for value in pattern.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+    if ranks:
+        return max(ranks)
     try:
         return max(1, int(default))
     except (TypeError, ValueError):

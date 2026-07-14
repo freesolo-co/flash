@@ -9,6 +9,27 @@ from typing import ClassVar
 import pytest
 
 
+def test_opd_lora_rank_uses_maximum_default_and_pattern_rank():
+    from flash.engine.worker.opd_vllm import opd_lora_rank
+
+    model = SimpleNamespace(
+        peft_config={
+            "first": SimpleNamespace(r=16, rank_pattern={"a": 64}),
+            "second": SimpleNamespace(r=32, rank_pattern={"b": 8}),
+        }
+    )
+    assert opd_lora_rank(model) == 64
+
+
+def test_opd_lora_rank_reads_dict_valued_r():
+    # Some PEFT configs express per-module ranks via a dict-valued `r` (no rank_pattern); the
+    # max-rank path must honor it, else a rank-64 continued adapter initializes vLLM too small.
+    from flash.engine.worker.opd_vllm import opd_lora_rank
+
+    model = SimpleNamespace(peft_config={"only": SimpleNamespace(r={"q_proj": 64, "v_proj": 16})})
+    assert opd_lora_rank(model) == 64
+
+
 def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_path):
     """OPD's vLLM engine must generate with the latest saved adapter, not a stale LoRA."""
     from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine

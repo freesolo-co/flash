@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from flash.engine.accounting import RunMetrics
+from flash.engine.accounting import RunMetrics, sanitize_worker_metrics
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
 
@@ -23,16 +23,18 @@ def write_train_meta(
     step=None,
 ):
     env = _w.require_active_env()
-    meta = {
-        "phase": phase,
-        "adapter_dir": adapter_dir,
-        "model_id": model_id,
-        "train_wall": train_wall,
-        "setup_seconds": setup_seconds,
-        "train_tokens": train_tokens,
-        "generated_tokens": generated_tokens,
-        "notes": notes or {},
-    }
+    meta = sanitize_worker_metrics(
+        {
+            "phase": phase,
+            "adapter_dir": adapter_dir,
+            "model_id": model_id,
+            "train_wall": train_wall,
+            "setup_seconds": setup_seconds,
+            "train_tokens": train_tokens,
+            "generated_tokens": generated_tokens,
+            "notes": notes or {},
+        }
+    )
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
     _w.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
