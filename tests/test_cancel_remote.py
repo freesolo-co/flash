@@ -444,6 +444,57 @@ def test_contended_cancel_persists_retry_fence_before_blocking(tmp_path, monkeyp
     assert out.deployment["state"] == "undeployed"
 
 
+def test_contended_cancel_accepts_cleanup_completed_while_waiting(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-contended-cleanup-completed"
+    spec = _run_spec(run_id)
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={"state": "smoke_testing", "requested_at": 1.0},
+        )
+    )
+    observations = []
+
+    class ContendedLock:
+        held = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                return False
+            pending = orch.get_status(run_id)
+            observations.append(pending.deployment["state"])
+            assert pending.deployment["state"] == "revocation_failed"
+            cleaned = orch.mark_deployment_undeployed(run_id)
+            observations.append(cleaned.deployment["state"])
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held is True
+            self.held = False
+
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("completed cleanup must not be retried after lock acquisition"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert observations == ["revocation_failed", "undeployed"]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+
+
 def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
@@ -685,11 +736,17 @@ def test_cancel_generation_only_persistence_failure_has_not_required_outcome(tmp
         "undeploy_adapter",
         lambda _target: pytest.fail("backend revocation is not required without a deployment"),
     )
-    monkeypatch.setattr(
-        orch,
-        "mark_deployment_undeployed",
-        lambda _target: (_ for _ in ()).throw(OSError("generation store unavailable")),
-    )
+    initial_generation = orch.verified_adapter_revision_generation(run_id)
+    real_mark_undeployed = orch.mark_deployment_undeployed
+    attempts = []
+
+    def fail_once(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise OSError("generation store unavailable")
+        return real_mark_undeployed(target)
+
+    monkeypatch.setattr(orch, "mark_deployment_undeployed", fail_once)
 
     with pytest.raises(orch.DeploymentStatePersistenceError) as excinfo:
         orch.cancel_run(run_id)
@@ -697,8 +754,16 @@ def test_cancel_generation_only_persistence_failure_has_not_required_outcome(tmp
     assert excinfo.value.backend_outcome == "not_required"
     assert "backend revocation was not required" in str(excinfo.value)
     failed = orch.get_status(run_id)
-    assert failed.state == "cancelled"
+    assert failed.state == "running"
     assert failed.deployment is None
+    assert orch.verified_adapter_revision_generation(run_id) == initial_generation
+
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id, run_id]
+    assert retried.state == "cancelled"
+    assert retried.deployment is None
+    assert orch.verified_adapter_revision_generation(run_id) == initial_generation + 1
 
 
 @pytest.mark.parametrize(

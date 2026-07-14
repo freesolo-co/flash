@@ -264,6 +264,9 @@ def cancel_run(run_id: str) -> RunStatus:
         deployment_state, has_active_deployment = _deployment_state_and_requires_revocation(
             status.deployment
         )
+        if backend_reconcile_required and deployment_state in _INACTIVE_DEPLOYMENT_STATES:
+            # another cancellation or undeploy finished backend cleanup while this caller waited.
+            backend_reconcile_required = False
         retry_revocation = deployment_state == _REVOCATION_RETRY_STATE
         if (
             status.state in TERMINAL_STATES
@@ -344,7 +347,14 @@ def cancel_run(run_id: str) -> RunStatus:
         preserve_terminal_retry = (
             retry_revocation and status.state in TERMINAL_STATES and not entered_deployed
         )
-        if status.state != "cancelled" and not preserve_terminal_retry:
+        preserve_generation_retry = (
+            local_persistence_failure is not None and local_persistence_failure[1] == "not_required"
+        )
+        if (
+            status.state != "cancelled"
+            and not preserve_terminal_retry
+            and not preserve_generation_retry
+        ):
             # if a deployment-state persistence failure is already pending, this cancel/billing
             # write is best-effort: it must not mask the structured error the caller retries on
             # (a common run-status store outage would otherwise fail here and escape raw).

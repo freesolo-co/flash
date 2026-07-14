@@ -1494,11 +1494,16 @@ def test_cancel_local_persistence_failure_returns_structured_retryable_error(api
     key = _login()
     run_id = _make_run(api, key, "running")
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        runner,
-        "mark_deployment_undeployed",
-        lambda _target: (_ for _ in ()).throw(OSError("generation store unavailable")),
-    )
+    real_mark_undeployed = runner.mark_deployment_undeployed
+    attempts = []
+
+    def fail_once(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise OSError("generation store unavailable")
+        return real_mark_undeployed(target)
+
+    monkeypatch.setattr(runner, "mark_deployment_undeployed", fail_once)
 
     response = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
 
@@ -1509,6 +1514,12 @@ def test_cancel_local_persistence_failure_returns_structured_retryable_error(api
     assert detail["retryable"] is True
     assert detail["backend_outcome"] == "not_required"
     assert "backend revocation was not required" in detail["message"]
+    assert runner.get_status(run_id).state == "running"
+
+    retried = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+
+    assert retried.status_code == 200
+    assert attempts == [run_id, run_id]
     assert runner.get_status(run_id).state == "cancelled"
 
 
