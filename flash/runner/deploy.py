@@ -137,13 +137,12 @@ def cancel_run(run_id: str) -> RunStatus:
         with contextlib.suppress(Exception):
             effective_spec = effective_spec_from_status(status)
         cleanup_spec = effective_spec or public_spec
-        # a mid-training cancel is re-priced from the authoritative prepared spec. deployed runs
-        # retain the completed quote, and revocation retries never alter billing.
+        # a mid-training cancel is re-priced from the authoritative prepared spec, including
+        # revocation retries that are still non-terminal. deployed and terminal runs retain billing.
         bill_cancel = (
             bool(status.billing_context)
             and status.state not in TERMINAL_STATES
             and not entered_deployed
-            and not retry_revocation
         )
         remote = status.remote or {}
         same_remote = remote == initial_remote

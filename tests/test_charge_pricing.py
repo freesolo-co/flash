@@ -127,6 +127,46 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
     assert 0 < st.cost_usd < runner.charge_usd_for_spec(spec)
 
 
+def test_cancel_run_prices_nonterminal_revocation_retry_at_actual_steps(monkeypatch, tmp_path):
+    from flash.runner import deploy
+    from flash.serve import deploy as serve_deploy
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    spec = _spec()
+    full_quote = runner.charge_usd_for_spec(spec)
+    runner._save_status(
+        runner.RunStatus(
+            run_id="run-1",
+            state="running",
+            spec=spec.to_dict(),
+            cost_usd=full_quote,
+            billing_context={"org_id": "o"},
+            billing_state="pending",
+            last_heartbeat={"stage": "rl_step", "step": 10},
+            deployment={"state": "revocation_failed", "error": "backend unavailable"},
+        )
+    )
+    attempts = []
+
+    def retry_undeploy(run_id):
+        attempts.append(run_id)
+        if len(attempts) == 1:
+            raise RuntimeError("backend still unavailable")
+        return []
+
+    monkeypatch.setattr(serve_deploy, "undeploy_adapter", retry_undeploy)
+
+    deploy.cancel_run("run-1")
+
+    st = runner.get_status("run-1")
+    assert attempts == ["run-1", "run-1"]
+    assert st.state == "cancelled"
+    assert st.deployment["state"] == "undeployed"
+    assert st.cost_usd == runner.charge_usd_for_spec(spec, steps=10)
+    assert 0 < st.cost_usd < full_quote
+
+
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
     from flash.runner import deploy
 
