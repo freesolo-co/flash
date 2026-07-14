@@ -42,6 +42,13 @@ def opd_lora_rank(model, default: int = 32) -> int:
         rank = getattr(cfg, "r", None)
         if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
             ranks.append(rank)
+        elif isinstance(rank, dict):
+            # Some PEFT configs express per-module ranks as a dict-valued `r`; take the max.
+            ranks.extend(
+                int(value)
+                for value in rank.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
         pattern = getattr(cfg, "rank_pattern", None)
         if isinstance(pattern, dict):
             ranks.extend(

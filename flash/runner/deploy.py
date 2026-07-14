@@ -235,7 +235,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        _gc_run_endpoints(worker_spec)
+        # Only reap once the run is actually terminal. A non-terminal run here means another live
+        # supervisor already owns the durable handle (see _submit_seed_supervised); GC-ing would tear
+        # down its still-active provider resources.
+        if get_status(run_id).state in TERMINAL_STATES:
+            _gc_run_endpoints(worker_spec)
     return get_status(run_id)
 
 

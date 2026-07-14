@@ -198,7 +198,7 @@ def _public_status_spec(raw):
     if not isinstance(raw, dict):
         return raw
     try:
-        return JobSpec.from_dict(raw).to_dict()
+        data = JobSpec.from_dict(raw).to_dict()
     except Exception:
         data = dict(raw)
         train = data.get("train")
@@ -209,7 +209,43 @@ def _public_status_spec(raw):
             if init_ref is not None and (not isinstance(init_ref, str) or init_ref.strip()):
                 train.pop("lora_rank", None)
             data["train"] = train
-        return data
+    _redact_internal_adapter_ref(data)
+    return data
+
+
+def _redact_internal_adapter_ref(data: dict) -> None:
+    """Never surface an internal storage locator in the public spec.
+
+    A worker/effective or legacy record can persist ``train.init_from_adapter`` as the internal
+    storage ref ``<hf_repo>:<phase>/<run_id>[/checkpoints/step-N]``, which embeds the private HF
+    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``); a public ref
+    (``parse_adapter_storage_ref`` returns ``None``) is left untouched.
+    """
+    train = data.get("train")
+    if not isinstance(train, dict):
+        return
+    ref = train.get("init_from_adapter")
+    if not isinstance(ref, str) or not ref.strip():
+        return
+    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref
+
+    resolved = parse_adapter_storage_ref(ref)
+    if resolved is None:
+        return  # already a user-facing ref, not an internal storage locator
+    _repo, prefix = resolved
+    match = re.fullmatch(
+        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:/checkpoints/step-(?P<step>\d+))?",
+        prefix,
+    )
+    if match is None:
+        # Parseable storage ref with an unexpected prefix shape; drop rather than leak the repo.
+        train.pop("init_from_adapter", None)
+        return
+    step = match.group("step")
+    train["init_from_adapter"] = format_checkpoint_ref(
+        match.group("run"), int(step) if step is not None else None
+    )
 
 
 def _status_storage_dict(status: RunStatus) -> dict:

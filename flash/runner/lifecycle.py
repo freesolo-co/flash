@@ -74,7 +74,11 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
         _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
     finally:
         # GC registered endpoints — undeleted endpoints count against the account-wide worker quota.
-        _gc_run_endpoints(spec)
+        # Skip when the run is still non-terminal: that means another live supervisor already owns the
+        # durable handle (see _submit_seed_supervised's "already has a durable provider handle" bail),
+        # and reaping here would tear down its still-active provider resources.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            _gc_run_endpoints(spec)
 
 
 def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:

@@ -393,6 +393,35 @@ def test_public_status_redacts_identifiable_warmstart_fields_from_malformed_spec
     assert raw_spec["train"]["lora_rank"] == 64
 
 
+@pytest.mark.parametrize(
+    ("stored_ref", "expected_ref"),
+    [
+        ("private-owner/private-source:rl/source-run", "source-run"),
+        ("private-owner/private-source:rl/source-run/checkpoints/step-20", "source-run/step-20"),
+    ],
+)
+def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, expected_ref):
+    # A worker/effective or legacy record can persist the internal storage locator (which embeds the
+    # private HF repo) as a VALID spec that parses cleanly; the public status must rewrite it back to
+    # the user-facing checkpoint ref instead of leaking the repo.
+    import flash.runner as R
+
+    raw_spec = {
+        "run_id": "child-run",
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "gpu": {"type": "RTX 4090"},
+        "train": {"init_from_adapter": stored_ref, "init_from_adapter_revision": _REVISION},
+    }
+    status = R.RunStatus(run_id="child-run", state="running", spec=raw_spec)
+
+    public_spec = status.to_dict()["spec"]
+
+    assert public_spec["train"]["init_from_adapter"] == expected_ref
+    assert "private-source" not in json.dumps(public_spec)
+    assert "init_from_adapter_revision" not in public_spec["train"]
+
+
 @pytest.mark.parametrize("snapshot", [None, []])
 def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_path, snapshot):
     import flash.runner as R
