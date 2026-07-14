@@ -345,12 +345,21 @@ def cancel_run(run_id: str) -> RunStatus:
             retry_revocation and status.state in TERMINAL_STATES and not entered_deployed
         )
         if status.state != "cancelled" and not preserve_terminal_retry:
-            _update(
-                run_id,
-                "cancelled",
-                allow_from_terminal=entered_deployed,
-                **cancel_updates,
+            # if a deployment-state persistence failure is already pending, this cancel/billing
+            # write is best-effort: it must not mask the structured error the caller retries on
+            # (a common run-status store outage would otherwise fail here and escape raw).
+            update_ctx = (
+                contextlib.suppress(Exception)
+                if local_persistence_failure is not None
+                else contextlib.nullcontext()
             )
+            with update_ctx:
+                _update(
+                    run_id,
+                    "cancelled",
+                    allow_from_terminal=entered_deployed,
+                    **cancel_updates,
+                )
 
         with contextlib.suppress(Exception):
             from flash.server.checkpoints import register_checkpoints_best_effort

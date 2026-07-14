@@ -623,6 +623,54 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
+def test_cancel_persistence_failure_survives_failing_cancel_update(tmp_path, monkeypatch):
+    # when the deployment-state write fails AND the best-effort cancel/billing _update also fails
+    # (a single run-status store outage hits both), the structured persistence error must still
+    # escape with the correct backend_outcome, not the raw _update exception.
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    from flash.runner.deploy import DeploymentStatePersistenceError
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-double-persistence-failure"
+    spec = _run_spec(run_id)
+    revision = f"{run_id}@final." + "e" * 40
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={"state": "ready", "adapter_revision": revision},
+        )
+    )
+    orch.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=orch.verified_adapter_revision_generation(run_id),
+    )
+    backend_calls = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
+    monkeypatch.setattr(
+        orch,
+        "mark_deployment_undeployed",
+        lambda _target: (_ for _ in ()).throw(OSError("status store unavailable")),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_update",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("status store still unavailable")),
+    )
+
+    with pytest.raises(DeploymentStatePersistenceError) as excinfo:
+        orch.cancel_run(run_id)
+
+    # the raw _update OSError must not mask the structured, backend-confirmed persistence error.
+    assert not isinstance(excinfo.value, orch.DeploymentRevocationError)
+    assert excinfo.value.backend_outcome == "confirmed"
+    assert backend_calls == [run_id]
+
+
 def test_cancel_generation_only_persistence_failure_has_not_required_outcome(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
