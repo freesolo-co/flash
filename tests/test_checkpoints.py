@@ -376,7 +376,7 @@ class _FakeHfApiFiles:
     def __call__(self, *a, **k):  # stand in for HfApi(...)
         return self
 
-    def list_repo_files(self, repo, repo_type=None):
+    def list_repo_files(self, repo, repo_type=None, revision=None):
         return self._files
 
 

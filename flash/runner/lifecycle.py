@@ -74,14 +74,18 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
         _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
     finally:
         # GC registered endpoints — undeleted endpoints count against the account-wide worker quota.
-        _gc_run_endpoints(spec)
+        # Skip when the run is still non-terminal: that means another live supervisor already owns the
+        # durable handle (see _submit_seed_supervised's "already has a durable provider handle" bail),
+        # and reaping here would tear down its still-active provider resources.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            _gc_run_endpoints(spec)
 
 
 def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     """The spec the workers/loggers see for THIS attempt's allocated class."""
     if spec.gpu.type == gpu_type:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "type": gpu_type}
     return JobSpec.from_dict(d)
 
@@ -96,7 +100,7 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
 
     if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["gpu"] = {**d["gpu"], "network_volume": None}
     return JobSpec.from_dict(d)
 
@@ -143,12 +147,14 @@ def _submit_seed_supervised(
     from flash.providers.base import PollResult
     from flash.runner import (
         TERMINAL_STATES,
+        _persist_effective_worker_spec,
         _RunCancelled,
         _spec_with_gpu,
         _update,
         flash_code_prefix,
         get_status,
     )
+    from flash.server._locks import _deploy_lock
 
     code_prefix = code_prefix or flash_code_prefix()
     last_handle: dict = {}
@@ -158,24 +164,32 @@ def _submit_seed_supervised(
     current_attempt: dict = {"value": 0}
     # Tracks rN-suffixed retry endpoint ids that _gc_run_endpoints can't reconstruct by name.
     seen_endpoints: set[str] = set()
+    submission_lock = None
 
     def on_handle(handle: dict):
-        last_handle.clear()
-        last_handle.update(handle)
-        if handle.get("endpoint_id"):
-            seen_endpoints.add(handle["endpoint_id"])
-        _update(
-            spec.run_id,
-            "running",
-            remote={
-                **handle,
-                "seed": int(seed),
-                "allocated_gpu": current_gpu.get("name"),
-                "on_last_gpu": bool(current_on_last_gpu["value"]),
-                "attempt": int(current_attempt["value"]),
-                "code_prefix": code_prefix,
-            },
-        )
+        nonlocal submission_lock
+        try:
+            last_handle.clear()
+            last_handle.update(handle)
+            if handle.get("endpoint_id"):
+                seen_endpoints.add(handle["endpoint_id"])
+            _update(
+                spec.run_id,
+                "running",
+                remote={
+                    **handle,
+                    "seed": int(seed),
+                    "allocated_gpu": current_gpu.get("name"),
+                    "on_last_gpu": bool(current_on_last_gpu["value"]),
+                    "attempt": int(current_attempt["value"]),
+                    "code_prefix": code_prefix,
+                },
+            )
+        finally:
+            lock = submission_lock
+            submission_lock = None
+            if lock is not None:
+                lock.release()
 
     def _gc_seen_endpoints() -> None:
         if not seen_endpoints:
@@ -219,22 +233,30 @@ def _submit_seed_supervised(
 
             teardown_confirmed = True
             if last_handle.get("endpoint_id"):
-                try:
-                    from flash.providers import get_provider
-                    from flash.providers.base import JobHandle
+                from flash.providers import get_provider
+                from flash.providers.base import JobHandle
 
-                    rp = get_provider("runpod")
-                    rp_handle = JobHandle.from_dict(last_handle)
-                    rp.cancel(rp_handle)  # cancel_job (stop the running job)
-                    rp.destroy(rp_handle)  # delete_endpoint (drop the throttled/sick host)
+                rp = get_provider("runpod")
+                rp_handle = JobHandle.from_dict(last_handle)
+                with contextlib.suppress(Exception):
+                    rp.cancel(rp_handle)  # cancel_job is best-effort; endpoint deletion confirms teardown
+                try:
+                    rp.destroy(rp_handle)  # delete_endpoint drops the billable resource
                     print(
                         f"retry {attempt}: deleted endpoint {last_handle['endpoint_id']} "
                         "(escaping throttled/sick host)",
                         file=log,
                         flush=True,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    teardown_confirmed = False
+                    print(
+                        f"retry {attempt}: runpod endpoint {last_handle.get('endpoint_id')} teardown "
+                        f"UNCONFIRMED ({exc}); keeping the handle so the possibly-billing endpoint "
+                        "stays reachable for cleanup",
+                        file=log,
+                        flush=True,
+                    )
             elif last_handle.get("provider") in INSTANCE_PROVIDERS:
                 try:
                     from flash.providers import get_provider
@@ -276,10 +298,9 @@ def _submit_seed_supervised(
                     get_provider(last_handle["provider"]).gc(spec)
                 _gc_seen_endpoints()
                 raise RuntimeError(
-                    f"seed {seed}: previous attempt's {last_handle.get('provider')} instance "
-                    f"{last_handle.get('instance_id')} teardown could not be confirmed; failing to avoid "
-                    "double-provisioning a second worker over a possibly-live box (last: "
-                    f"{last_detail})"
+                    f"seed {seed}: previous attempt's {last_handle.get('provider')} resource teardown "
+                    "could not be confirmed; failing to avoid double-provisioning a second worker over "
+                    f"a possibly-live resource (last: {last_detail})"
                 )
         res = None
         alloc = None
@@ -350,27 +371,51 @@ def _submit_seed_supervised(
                 run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
             current_attempt["value"] = attempt
-            provider = get_provider(chosen.provider)
+            retry_delay = 0
+            submission_lock = _deploy_lock(spec.run_id)
+            submission_lock.acquire()
             try:
-                submit_kwargs = {
-                    "log": log,
-                    "on_handle": on_handle,
-                    "attempt": attempt,
-                    "on_last_gpu": on_last_gpu,
-                    "code_prefix": code_prefix,
-                }
-                if runtime_secrets:
-                    submit_kwargs["runtime_secrets"] = runtime_secrets
-                res = provider.submit_run(run_spec, seed, **submit_kwargs)
-            except Exception as exc:
-                from flash.providers.base import UnreconciledCreateError
+                latest = get_status(spec.run_id)
+                if latest.state in TERMINAL_STATES:
+                    raise _cancel()
+                if latest.remote:
+                    raise _RunCancelled(
+                        f"run {spec.run_id} already has a durable provider handle; not resubmitting"
+                    )
+                if not _persist_effective_worker_spec(run_spec):
+                    raise _cancel()
+                if get_status(spec.run_id).state in TERMINAL_STATES:
+                    raise _cancel()
+                provider = get_provider(chosen.provider)
+                try:
+                    submit_kwargs = {
+                        "log": log,
+                        "on_handle": on_handle,
+                        "attempt": attempt,
+                        "on_last_gpu": on_last_gpu,
+                        "code_prefix": code_prefix,
+                    }
+                    if runtime_secrets:
+                        submit_kwargs["runtime_secrets"] = runtime_secrets
+                    res = provider.submit_run(run_spec, seed, **submit_kwargs)
+                except Exception as exc:
+                    from flash.providers.base import UnreconciledCreateError
 
-                if isinstance(exc, UnreconciledCreateError):
-                    res = PollResult(False, failure="job_failed", detail=f"unreconciled create: {exc}")
-                else:
-                    res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                    if attempt < infra_budget:
-                        time.sleep(10 * (attempt + 1))  # let the transient clear
+                    if isinstance(exc, UnreconciledCreateError):
+                        res = PollResult(
+                            False, failure="job_failed", detail=f"unreconciled create: {exc}"
+                        )
+                    else:
+                        res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
+                        if attempt < infra_budget:
+                            retry_delay = 10 * (attempt + 1)
+            finally:
+                lock = submission_lock
+                submission_lock = None
+                if lock is not None:
+                    lock.release()
+            if retry_delay:
+                time.sleep(retry_delay)  # let the transient clear
         if res.ok:
             # A late worker success must not resurrect a cancelled run.
             try:
@@ -620,11 +665,14 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner import get_status
+    from flash.runner import effective_spec_from_status, get_status
 
     status = None
     with contextlib.suppress(Exception):
         status = get_status(spec.run_id)
+    if status is not None:
+        with contextlib.suppress(Exception):
+            spec = effective_spec_from_status(status)
     if status is not None and status.remote:
         try:
             from flash.providers import get_provider

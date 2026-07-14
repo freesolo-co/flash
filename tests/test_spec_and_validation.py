@@ -92,9 +92,9 @@ def test_spec_validation_rejections(overrides, match) -> None:
 
 
 def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
-    train_fields = fields(TrainSpec)
+    train_fields = [item for item in fields(TrainSpec) if item.metadata.get("introduced_in")]
 
-    assert all(item.metadata.get("introduced_in") for item in train_fields)
+    assert "init_from_adapter_revision" not in TRAIN_SCHEMA_KEYS
     assert frozenset(item.name for item in train_fields) == TRAIN_SCHEMA_KEYS
     assert {
         item.name: item.metadata["introduced_in"] for item in train_fields
@@ -175,6 +175,89 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
             "20c4452c",
             *({"699a8aab"} if key == "teacher_model" else set()),
         }
+
+
+def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
+    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
+        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+
+
+@pytest.mark.parametrize(
+    "lora_rank",
+    [
+        pytest.param(256, id="non-default"),
+        pytest.param(32, id="default"),
+        pytest.param(8, id="matching"),
+        pytest.param(None, id="null"),
+        pytest.param(0, id="invalid"),
+    ],
+)
+def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"train\.lora_rank cannot be set with train\.init_from_adapter because source adapter "
+            r"rank metadata is authoritative"
+        ),
+    ):
+        spec_from_dict(
+            _raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": lora_rank})
+        )
+
+
+def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> None:
+    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw["train"].pop("lora_rank")
+
+    spec = spec_from_dict(raw)
+
+    assert spec.train.init_from_adapter == "source-run"
+    assert spec.train.lora_rank == 32
+
+
+def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
+    spec = JobSpec.from_dict(
+        {
+            **BASE_RAW,
+            "train": {
+                **BASE_RAW["train"],
+                "init_from_adapter": "owner/runs:rl/source-run",
+                "init_from_adapter_revision": "a" * 40,
+                "lora_rank": 64,
+                "lora_alpha": 128,
+            },
+        }
+    )
+
+    public = spec.to_dict()
+    internal = spec.to_internal_dict()
+
+    assert "init_from_adapter_revision" not in public["train"]
+    assert "lora_rank" not in public["train"]
+    assert internal["train"]["init_from_adapter_revision"] == "a" * 40
+    assert internal["train"]["lora_rank"] == 64
+    assert JobSpec.from_dict(internal) == spec
+
+
+def test_public_warmstart_status_spec_round_trips_through_schema() -> None:
+    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw["train"].pop("lora_rank")
+    public = spec_from_dict(raw).to_dict()
+
+    restored = spec_from_dict(public)
+
+    assert restored.train.init_from_adapter == "source-run"
+    assert restored.train.lora_rank == 32
+
+
+@pytest.mark.parametrize("init_from_adapter", [None, "", "   "])
+def test_blank_or_null_init_adapter_preserves_explicit_rank(init_from_adapter) -> None:
+    spec = spec_from_dict(
+        _raw(**{"train.init_from_adapter": init_from_adapter, "train.lora_rank": 8})
+    )
+
+    assert spec.train.init_from_adapter == ""
+    assert spec.train.lora_rank == 8
 
 
 def test_falsy_algorithm_defaults_to_sft() -> None:
@@ -509,6 +592,20 @@ def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) ->
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(run_id="sft-no-examples", model="Qwen/Qwen3.5-0.8B", algorithm="sft")
     with pytest.raises(ValueError, match=r"max_examples.*positive"):
+        orch.submit_job(spec, dry_run=True)
+
+
+def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+    from flash.spec import JobSpec, TrainSpec
+
+    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    spec = JobSpec(
+        run_id="sft-warmstart",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
+    )
+    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
         orch.submit_job(spec, dry_run=True)
 
 

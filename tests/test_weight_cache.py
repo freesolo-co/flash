@@ -655,6 +655,61 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     assert _drop_weight_cache(_vol_spec(name=WEIGHT_CACHE_VOLUME_NAME)).gpu.network_volume is None
 
 
+def test_effective_spec_persists_managed_cache_removal(monkeypatch):
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec.from_dict(
+            {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
+        )
+        selected_dict = public.to_internal_dict()
+        selected_dict["gpu"]["network_volume"] = None
+        selected = JobSpec.from_dict(selected_dict)
+        runner._save_status(
+            runner.RunStatus(
+                run_id=public.run_id,
+                state="provisioning",
+                spec=public.to_dict(),
+            )
+        )
+
+        assert runner._persist_effective_worker_spec(selected)
+
+        stored = runner.get_status(public.run_id)
+        assert stored.effective_preparation["worker_spec"]["gpu"]["network_volume"] is None
+        assert stored.effective_preparation["adapter_identity"] is None
+        assert runner.effective_spec_from_status(stored).gpu.network_volume is None
+
+
+def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
+    import pytest
+
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec.from_dict(
+            {
+                **_vol_spec(name="org-1234-private").to_internal_dict(),
+                "run_id": "custom-cache-fallback",
+            }
+        )
+        selected_dict = public.to_internal_dict()
+        selected_dict["gpu"]["network_volume"] = None
+        selected = JobSpec.from_dict(selected_dict)
+        runner._save_status(
+            runner.RunStatus(
+                run_id=public.run_id,
+                state="provisioning",
+                spec=public.to_dict(),
+            )
+        )
+
+        with pytest.raises(ValueError, match="effective preparation"):
+            runner._persist_effective_worker_spec(selected)
+
+
 def _supervised_walk(monkeypatch, failures):
     """Run the supervised seed loop, returning per-attempt (gpu.network_volume, gpu.type) tuples.
 
