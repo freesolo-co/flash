@@ -436,6 +436,105 @@ def test_cancel_undeploys_active_deployment_after_terminal_transition_at_lock(
     assert out.deployment["state"] == "undeployed"
 
 
+def test_cancel_retries_revocation_after_terminal_transition_at_lock(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-terminal-revocation-retry"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={"state": "ready", "verification_race": True},
+        )
+    )
+
+    class RacingLock:
+        raced = False
+
+        def __enter__(self):
+            if not self.raced:
+                self.raced = True
+                orch._update(run_id, "done", cost_usd=1.0, artifacts_dir="/runs/finished")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    lock = RacingLock()
+    attempts = []
+
+    def undeploy(target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise deploy.ServingError("backend unavailable")
+        return ["endpoint"]
+
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: lock)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+
+    with pytest.raises(orch.DeploymentRevocationError):
+        orch.cancel_run(run_id)
+
+    failed = orch.get_status(run_id)
+    assert failed.state == "done"
+    assert failed.deployment["state"] == "revocation_failed"
+
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id, run_id]
+    assert retried.state == "done"
+    assert retried.deployment["state"] == "undeployed"
+
+
+def test_concurrent_cancel_does_not_rewrite_terminal_billing(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.server._locks as locks
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-double-cancel-billing"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            cost_usd=9.0,
+            billing_context={"org_id": "org-test"},
+        )
+    )
+
+    class ConcurrentCancelLock:
+        def __enter__(self):
+            orch._update(run_id, "cancelled", cost_usd=9.0)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    charges = []
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ConcurrentCancelLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "effective_spec_from_status", lambda _status: spec)
+    monkeypatch.setattr(orch, "actual_steps_run", lambda _status: 1)
+    monkeypatch.setattr(
+        orch,
+        "charge_usd_for_spec",
+        lambda *_args, **_kwargs: charges.append(1.0) or 1.0,
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.cost_usd == 9.0
+    assert charges == []
+
+
 def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):
     # Regression: the deployed branch used a bare _save_status OUTSIDE _STATUS_LOCK, which
     # persisted a stale pre-teardown snapshot and bypassed serialization. It must instead
