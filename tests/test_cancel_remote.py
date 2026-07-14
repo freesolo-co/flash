@@ -202,6 +202,47 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
+def test_cancel_run_tears_down_initial_remote_before_waiting_for_deploy_lock(
+    tmp_path, monkeypatch
+):
+    import flash.providers as providers
+    import flash.runner as orch
+    import flash.server._locks as locks
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-initial-remote"
+    remote = {"provider": "stub", "job_id": "initial-job"}
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(run_id=run_id, state="running", spec=spec.to_dict(), remote=remote)
+    )
+    calls = []
+
+    class StubProvider:
+        def cancel(self, handle):
+            calls.append(("cancel", handle.to_dict()))
+
+        def destroy(self, handle):
+            calls.append(("destroy", handle.to_dict()))
+
+    class ObservedLock:
+        def __enter__(self):
+            assert calls == [("cancel", remote), ("destroy", remote)]
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(providers, "get_provider", lambda provider: StubProvider())
+    monkeypatch.setattr(locks, "_deploy_lock", lambda target: ObservedLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert calls == [("cancel", remote), ("destroy", remote)]
+
+
 def test_cancel_run_tears_down_remote_handle_observed_after_entry(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
@@ -352,6 +393,47 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
     assert out.state == "cancelled"
     assert undeployed == [spec.run_id], "the raced-in deployment must be torn down, not orphaned"
     assert (out.deployment or {}).get("state") == "undeployed"
+
+
+def test_cancel_undeploys_active_deployment_after_terminal_transition_at_lock(
+    tmp_path, monkeypatch
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-terminal-at-lock"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=spec.to_dict(),
+            deployment={"state": "ready", "gpu": "RTX 5090"},
+        )
+    )
+    undeployed = []
+
+    class RacingLock:
+        def __enter__(self):
+            orch._update(run_id, "done", cost_usd=1.0, artifacts_dir="/runs/finished")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: RacingLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target: undeployed.append(target) or ["endpoint"]
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "done"
+    assert undeployed == [run_id]
+    assert out.deployment["state"] == "undeployed"
 
 
 def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):

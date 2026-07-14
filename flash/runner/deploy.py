@@ -91,6 +91,9 @@ def cancel_run(run_id: str) -> RunStatus:
             provider.destroy(handle)
         except Exception:
             pass
+
+    initial_remote = initial_status.remote or {}
+    teardown_remote(initial_remote)
     if initial_status.state == "deployed":
         try:
             from flash.serve.deploy import undeploy_adapter
@@ -109,8 +112,6 @@ def cancel_run(run_id: str) -> RunStatus:
             status.state == "cancelled"
             and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
         )
-        if status.state in TERMINAL_STATES and not retry_revocation and not entered_deployed:
-            return status
         # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
         entered_deployed = entered_deployed or status.state == "deployed"
         public_spec = JobSpec.from_dict(status.spec)
@@ -122,7 +123,8 @@ def cancel_run(run_id: str) -> RunStatus:
         # retain the completed quote, and revocation retries never alter billing.
         bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
         remote = status.remote or {}
-        teardown_remote(remote)
+        if remote != initial_remote:
+            teardown_remote(remote)
         with contextlib.suppress(Exception):
             _gc_run_endpoints(cleanup_spec)
         if not remote:
