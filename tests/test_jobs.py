@@ -2813,6 +2813,58 @@ def test_attach_completes_run(monkeypatch):
             assert json.load(f)["cost_usd"] == 0.2
 
 
+def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+
+        run_id = "attach-finally-status"
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=_spec(run_id).to_dict(),
+                remote={
+                    "endpoint_id": "ep-finally",
+                    "endpoint_name": "n",
+                    "job_id": "j-finally",
+                    "attempt": 0,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(True, metrics={"cost_usd": 0.2}),
+        )
+
+        real_get_status = orch.get_status
+        real_update = orch._update
+        fail_next_status_read = {"armed": False}
+
+        def update_then_arm_status_failure(run_id, state, **updates):
+            applied = real_update(run_id, state, **updates)
+            if state == "done":
+                fail_next_status_read["armed"] = True
+            return applied
+
+        def transiently_unreadable_status(run_id):
+            if fail_next_status_read["armed"]:
+                fail_next_status_read["armed"] = False
+                raise PermissionError("status file is transiently unreadable")
+            return real_get_status(run_id)
+
+        gc_calls = []
+        monkeypatch.setattr(orch, "_update", update_then_arm_status_failure)
+        monkeypatch.setattr(orch, "get_status", transiently_unreadable_status)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: gc_calls.append(spec.run_id))
+
+        status = orch.attach_run(run_id, log_stream=sys.stderr)
+
+        assert status.state == "done", "the final status read must not mask the completed outcome"
+        assert gc_calls == [run_id], "terminal endpoint cleanup must still run"
+
+
 def test_attach_requires_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)

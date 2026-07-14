@@ -131,6 +131,14 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         get_status,
     )
 
+    cleanup_terminal = False
+
+    def status_for_return() -> RunStatus:
+        nonlocal cleanup_terminal
+        current = get_status(run_id)
+        cleanup_terminal = current.state in TERMINAL_STATES
+        return current
+
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
@@ -157,7 +165,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
         res = get_provider(handle.provider).poll(handle, worker_spec, seed, log=log)
         if get_status(run_id).state == "cancelled":
-            return get_status(run_id)
+            return status_for_return()
         if not res.ok:
             # job ended not-ok, so any replacement must revalidate the pinned source before paid work.
             worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
@@ -196,12 +204,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not teardown_confirmed:
                 # Keep ``remote`` so the still-billing box stays reachable for the next recovery/sweep,
                 # and leave the run non-terminal (do not _update) so a future re-attach re-polls it.
-                return get_status(run_id)
+                return status_for_return()
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
-                return get_status(run_id)
+                return status_for_return()
             if code_prefix is None:
                 from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
@@ -214,7 +222,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 prior_cost=float(status.cost_usd or 0.0),
                 code_prefix=code_prefix,
             )
-            return get_status(run_id)
+            return status_for_return()
         if allocated_gpu and isinstance(res.metrics, dict):
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Add the recovered run's cost to any already booked before the restart so recovery
@@ -229,18 +237,22 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             raise _RunCancelled(f"run {run_id} was cancelled")
         _update(run_id, "done", cost_usd=charge_usd, artifacts_dir=artifacts_dir(public_spec))
+        cleanup_terminal = True
     except _RunCancelled:
-        pass  # cancel_run already wrote terminal `cancelled`
+        cleanup_terminal = True  # cancel_run already wrote terminal `cancelled`
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
+        cleanup_terminal = True
     finally:
-        # Only reap once the run is actually terminal. A non-terminal run here means another live
-        # supervisor already owns the durable handle (see _submit_seed_supervised); GC-ing would tear
-        # down its still-active provider resources.
-        if get_status(run_id).state in TERMINAL_STATES:
-            _gc_run_endpoints(worker_spec)
-    return get_status(run_id)
+        # only reap a positively observed terminal run. if the final status read is transiently
+        # unavailable, retain prior terminal knowledge without risking a live duplicate supervisor.
+        with contextlib.suppress(Exception):
+            cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
+        if cleanup_terminal:
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(worker_spec)
+    return status_for_return()
 
 
 def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
