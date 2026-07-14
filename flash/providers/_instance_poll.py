@@ -214,7 +214,11 @@ def poll_instance_job(
     marker_reader = adapter.marker_reader
     metrics_reader = adapter.metrics_reader
 
-    def finish_ok(end_ts_hint: float | str | None = None) -> PollResult:
+    def finish_ok(
+        end_ts_hint: float | str | None = None,
+        *,
+        read_deadline_at: float | None = absolute_deadline,
+    ) -> PollResult:
         # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
         # falling back to the poll_error retry on a DONE-without-metrics.
         raw = _read_with_retries(
@@ -223,7 +227,7 @@ def poll_instance_job(
             wait_s=_METRICS_AFTER_DONE_WAIT_S,
             say=say,
             message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
-            deadline_at=absolute_deadline,
+            deadline_at=read_deadline_at,
         )
         if raw is None:
             # DONE means the worker SIGNALLED SUCCESS; an unreadable metrics.json after the in-line
@@ -272,13 +276,17 @@ def poll_instance_job(
             and (absolute_deadline is None or ts < absolute_deadline)
         )
 
-    def finish_from_ok_marker(marker: dict | None = None) -> PollResult:
+    def finish_from_ok_marker(
+        marker: dict | None = None,
+        *,
+        read_deadline_at: float | None = absolute_deadline,
+    ) -> PollResult:
         # An ok marker means the worker finished (metrics.json was written first), even if DONE is stale.
         # Pass DONE only when fresh; else use the marker's own completion ts for the wall note.
         d = done_reader(force=True)
         fresh = d is not None and done_is_fresh(d)
         marker_ts = marker.get("ts") if isinstance(marker, dict) else None
-        return finish_ok(d if fresh else marker_ts)
+        return finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
 
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS flagged retriable (in the marker, or the worker's
@@ -293,14 +301,18 @@ def poll_instance_job(
             detail=adapter.failure_detail(marker),
         )
 
-    def terminal_artifact_result(force: bool = True) -> PollResult | None:
+    def terminal_artifact_result(
+        force: bool = True,
+        *,
+        read_deadline_at: float | None = absolute_deadline,
+    ) -> PollResult | None:
         # The worker's terminal HF artifacts (DONE / attempt marker) -> a terminal PollResult when it
         # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
         # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
         # reads; False for the per-iteration loop poll, which already paces its own reads.
         d = done_reader(force=force)
         if d is not None and done_is_fresh(d):
-            return finish_ok(d)
+            return finish_ok(d, read_deadline_at=read_deadline_at)
         raw = marker_reader(force=force)
         if raw is not None:
             try:
@@ -316,9 +328,29 @@ def poll_instance_job(
                     detail="terminal marker is invalid or unverifiable",
                 )
             if marker["ok"]:
-                return finish_from_ok_marker(marker)
+                return finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
             return fail_from_marker(marker)
         return None
+
+    def deadline_unless_terminal() -> PollResult:
+        # the run deadline stops worker compute, not bounded observation of artifacts already committed
+        # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
+        read_deadline = time.time() + (
+            _TERMINAL_AFTER_DEAD_RETRIES * _TERMINAL_AFTER_DEAD_WAIT_S
+        )
+        terminal = _read_with_retries(
+            lambda: terminal_artifact_result(read_deadline_at=read_deadline),
+            tries=_TERMINAL_AFTER_DEAD_RETRIES,
+            wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+            say=say,
+            message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
+            deadline_at=read_deadline,
+        )
+        return (
+            terminal
+            if terminal is not None
+            else PollResult(False, failure="stalled", detail="client-side deadline exceeded")
+        )
 
     def stalled_unless_terminal(detail: str) -> PollResult:
         # A stall exit still checks for terminal artifacts — the worker may have finished right at the
@@ -371,7 +403,7 @@ def poll_instance_job(
             and time.time() - start > deadline_s
         )
         if deadline_expired or legacy_deadline_expired:
-            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
+            return deadline_unless_terminal()
         try:
             inst = adapter.fetch_instance()
             poll_errors.reset()
@@ -403,7 +435,7 @@ def poll_instance_job(
                 )
             continue
         if absolute_deadline is not None and time.time() >= absolute_deadline:
-            return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
+            return deadline_unless_terminal()
         # The instance-detail route can transiently answer as if the instance were absent for healthy
         # (and brand-new) boxes. One missing read means nothing — only a sustained streak is a real
         # disappearance.

@@ -634,8 +634,8 @@ def main() -> int:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
-        if _finite_positive_number(time.time(), "current clock") >= deadline:
-            raise TimeoutError("run wall deadline exceeded")
+        # run_mode enforces the absolute subprocess deadline. once it returns, required completion
+        # artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
         if not os.path.exists("/tmp/metrics.json"):
             # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
             # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
@@ -659,8 +659,6 @@ def main() -> int:
                 f"failed upload after the local metrics.json was written); see "
                 f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
             )
-        if _finite_positive_number(time.time(), "current clock") >= deadline:
-            raise TimeoutError("run wall deadline exceeded")
         ok = True
     except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
         retriable = isinstance(exc, RetriableBootstrapError)

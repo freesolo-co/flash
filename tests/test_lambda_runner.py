@@ -1646,7 +1646,7 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
-def test_poll_recovered_deadline_starts_no_terminal_artifact_reads(monkeypatch):
+def test_poll_recovered_deadline_accepts_terminal_artifacts(monkeypatch):
     reads = {"done": 0, "metrics": 0}
 
     def done():
@@ -1667,9 +1667,8 @@ def test_poll_recovered_deadline_starts_no_terminal_artifact_reads(monkeypatch):
     res = jobs.poll_lambda_job(
         _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
     )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert reads == {"done": 0, "metrics": 0}
+    assert res.ok
+    assert reads == {"done": 1, "metrics": 1}
 
 
 def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):

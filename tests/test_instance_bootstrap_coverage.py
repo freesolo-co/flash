@@ -660,8 +660,11 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     assert events[-2:] == ["deadline_done", "deadline_cancel"]
 
 
-def test_main_converts_success_returning_at_deadline_to_failure(monkeypatch):
+@pytest.mark.parametrize("boundary", ["run_mode", "remote_confirmation"])
+def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, boundary):
     markers = []
+    remote_checks = []
+    clock = {"now": 100.0}
     payload = {
         "hf_repo": "org/repo",
         "job_spec_json": "{}",
@@ -687,22 +690,34 @@ def test_main_converts_success_returning_at_deadline_to_failure(monkeypatch):
         def cancel(self):
             return None
 
-    ticks = iter((100.0, 200.0))
-    monkeypatch.setattr(b.time, "time", lambda: next(ticks))
+    def run_mode(*_args):
+        clock["now"] = 200.0 if boundary == "run_mode" else 199.0
+        return 1
+
+    def remote_completion_confirmed(_payload):
+        remote_checks.append(True)
+        if boundary == "remote_confirmation":
+            clock["now"] = 200.0
+        return True
+
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
     monkeypatch.setattr(b, "load_payload", lambda: payload)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline: (_Timer(), _Done()))
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
-    monkeypatch.setattr(b, "run_mode", lambda *_args: 0)
+    monkeypatch.setattr(b, "run_mode", run_mode)
+    monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
+    monkeypatch.setattr(b, "remote_completion_confirmed", remote_completion_confirmed)
     monkeypatch.setattr(
         b,
         "write_attempt_marker",
         lambda _payload, ok, error="", retriable=False: markers.append((ok, error, retriable)),
     )
 
-    assert b.main() == 1
-    assert markers == [(False, "run wall deadline exceeded", False)]
+    assert b.main() == 0
+    assert remote_checks == [True]
+    assert markers == [(True, "", False)]
 
 
 # ---------------------------------------------------------------------------

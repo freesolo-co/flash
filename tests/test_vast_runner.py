@@ -981,7 +981,83 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     )  # the bounded read retried past the first miss (a single read would fail)
 
 
-def test_poll_deadline_starts_no_terminal_read_or_sleep(monkeypatch):
+def test_poll_deadline_bounded_reread_accepts_late_terminal_artifacts(monkeypatch):
+    reads = {"done": 0, "metrics": 0}
+    sleeps = []
+
+    def late_done():
+        reads["done"] += 1
+        return "9999.0" if reads["done"] >= 2 else None
+
+    def late_metrics():
+        reads["metrics"] += 1
+        return (
+            json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
+            if reads["metrics"] >= 2
+            else None
+        )
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done=late_done,
+        metrics=late_metrics,
+    )
+    monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(vast.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+    assert res.metrics["train_tokens"] == 4096
+    assert reads == {"done": 2, "metrics": 2}
+    assert sleeps == [5.0, 5.0]
+
+
+def test_poll_deadline_after_status_fetch_rereads_terminal_artifacts(monkeypatch):
+    from flash.providers.vast import api as vast_api
+
+    clock = {"now": 9_999.0}
+    reads = {"done": 0}
+
+    def late_done():
+        reads["done"] += 1
+        return "9999.5" if reads["done"] >= 2 else None
+
+    vast = _wire_poll(
+        monkeypatch,
+        instances=[{"actual_status": "running"}],
+        done=late_done,
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    )
+
+    def fetch_at_deadline(_instance_id):
+        clock["now"] = 10_000.0
+        return {"actual_status": "running"}
+
+    monkeypatch.setattr(vast_api, "get_instance", fetch_at_deadline)
+    monkeypatch.setattr(vast.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
+
+    res = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=15.0,
+        deadline_at=10_000.0,
+    )
+
+    assert res.ok
+    assert reads["done"] == 2
+
+
+def test_poll_deadline_terminal_reread_remains_bounded_for_stalled_job(monkeypatch):
     reads = {"done": 0}
     sleeps = []
 
@@ -1006,11 +1082,11 @@ def test_poll_deadline_starts_no_terminal_read_or_sleep(monkeypatch):
 
     assert not res.ok
     assert res.failure == "stalled"
-    assert reads["done"] == 0
-    assert sleeps == []
+    assert reads["done"] == 7
+    assert sleeps == [5.0] * 6
 
 
-def test_poll_interval_sleep_is_capped_to_deadline(monkeypatch):
+def test_poll_interval_and_terminal_reread_sleeps_are_bounded(monkeypatch):
     clock = {"now": 9_990.0}
     sleeps = []
     vast = _wire_poll(
@@ -1035,7 +1111,7 @@ def test_poll_interval_sleep_is_capped_to_deadline(monkeypatch):
 
     assert not res.ok
     assert res.failure == "stalled"
-    assert sleeps == [10.0]
+    assert sleeps == [10.0, *([5.0] * 6)]
 
 
 def test_poll_error_backoff_stops_at_absolute_deadline(monkeypatch):
@@ -1532,7 +1608,7 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
-def test_poll_recovered_deadline_starts_no_terminal_artifact_reads(monkeypatch):
+def test_poll_recovered_deadline_accepts_terminal_artifacts(monkeypatch):
     reads = {"done": 0, "metrics": 0}
 
     def done():
@@ -1553,9 +1629,8 @@ def test_poll_recovered_deadline_starts_no_terminal_artifact_reads(monkeypatch):
     res = vast.poll_vast_job(
         _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
     )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert reads == {"done": 0, "metrics": 0}
+    assert res.ok
+    assert reads == {"done": 1, "metrics": 1}
 
 
 def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
