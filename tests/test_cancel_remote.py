@@ -461,6 +461,14 @@ def test_contended_cancel_accepts_cleanup_completed_while_waiting(tmp_path, monk
         )
     )
     observations = []
+    undeployed_calls = []
+    original_mark_deployment_undeployed = orch.mark_deployment_undeployed
+
+    def track_mark_deployment_undeployed(target_run_id):
+        undeployed_calls.append(target_run_id)
+        return original_mark_deployment_undeployed(target_run_id)
+
+    monkeypatch.setattr(orch, "mark_deployment_undeployed", track_mark_deployment_undeployed)
 
     class ContendedLock:
         held = False
@@ -491,6 +499,7 @@ def test_contended_cancel_accepts_cleanup_completed_while_waiting(tmp_path, monk
     out = orch.cancel_run(run_id)
 
     assert observations == ["revocation_failed", "undeployed"]
+    assert undeployed_calls == [run_id]
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
 

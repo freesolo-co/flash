@@ -216,6 +216,7 @@ def cancel_run(run_id: str) -> RunStatus:
     backend_error: Exception | None = None
     local_persistence_failure: tuple[Exception, _BackendOutcome] | None = None
     backend_reconcile_required = False
+    cleanup_completed_while_waiting = False
     deploy_lock = _deploy_lock(run_id)
     lock_acquired = deploy_lock.acquire(blocking=False)
     lock_was_contended = not lock_acquired
@@ -267,6 +268,7 @@ def cancel_run(run_id: str) -> RunStatus:
         if backend_reconcile_required and deployment_state in _INACTIVE_DEPLOYMENT_STATES:
             # another cancellation or undeploy finished backend cleanup while this caller waited.
             backend_reconcile_required = False
+            cleanup_completed_while_waiting = True
         retry_revocation = deployment_state == _REVOCATION_RETRY_STATE
         if (
             status.state in TERMINAL_STATES
@@ -307,7 +309,7 @@ def cancel_run(run_id: str) -> RunStatus:
             else:
                 with contextlib.suppress(Exception):
                     mark_deployment_revocation_failed(run_id, str(backend_error))
-        elif not preserve_checkpoint:
+        elif not preserve_checkpoint and not cleanup_completed_while_waiting:
             # cancel always advances the local generation, including stale status projections.
             try:
                 mark_deployment_undeployed(run_id)
