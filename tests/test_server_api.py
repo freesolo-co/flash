@@ -1903,6 +1903,33 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
     assert resp.json()["endpoint_name"] == "old"
 
 
+@pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])
+def test_redeploy_after_inactive_deployment_state_is_allowed(
+    api, monkeypatch, deployment_state
+):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    status = runner.get_status(run_id)
+    status.deployment = {"state": deployment_state, "requested_at": 1.0}
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "deploy_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(ServingError("new adapter failed smoke")),
+    )
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "failed"
+    assert deployment["requested_at"] != 1.0
+
+
 def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod

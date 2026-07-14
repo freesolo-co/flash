@@ -599,7 +599,8 @@ def mark_deployment_pending(
         if expect_state is not None and status.state != expect_state:
             return status
         current = status.deployment if isinstance(status.deployment, dict) else {}
-        if current.get("state") in {"undeployed", _REVOCATION_RETRY_STATE}:
+        same_attempt = current.get("requested_at") == deployment.get("requested_at")
+        if same_attempt and current.get("state") in {"undeployed", _REVOCATION_RETRY_STATE}:
             return status
         status.deployment = deployment
         status.updated_at = time.time()
