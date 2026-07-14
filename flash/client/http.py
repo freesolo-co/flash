@@ -340,9 +340,23 @@ class ApiClient:
         deadline = time.monotonic() + 120.0
         last_state = "unknown"
         while True:
-            with contextlib.suppress(ClientError):
+            try:
                 status = self.get_run(run_id)
+            except ClientError:
+                pass
+            else:
                 last_state = str(status.get("state") or "unknown")
+                deployment = status.get("deployment") or {}
+                if (
+                    last_state == "cancelled"
+                    and isinstance(deployment, dict)
+                    and deployment.get("state") == "revocation_failed"
+                ):
+                    error = deployment.get("error") or "unknown backend teardown error"
+                    raise ClientError(
+                        "cancel request reached the control plane, but backend revocation is "
+                        f"unconfirmed: {error}; retry cancellation"
+                    ) from cause
                 if last_state in {"cancelled", "done", "failed", "dry_run"}:
                     return status
             if time.monotonic() >= deadline:

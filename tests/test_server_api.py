@@ -1885,31 +1885,37 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
     assert resp.json()["endpoint_name"] == "old"
 
 
-def test_activation_unknown_does_not_restore_previous_ready_deployment(api, monkeypatch):
+def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.serve.deploy import ActivationOutcomeUnknown
+    from flash.server.routes import serving
 
     key = _login()
     run_id = _make_run(api, key, "done")
     previous_revision = f"{run_id}@step-10." + "b" * 40
+    previous = {
+        "state": "ready",
+        "endpoint_name": "https://old.example",
+        "adapter_revision": previous_revision,
+    }
     runner.mark_deployed(
         run_id,
-        {
-            "state": "ready",
-            "endpoint_name": "https://old.example",
-            "adapter_revision": previous_revision,
-        },
+        previous,
         verification_generation=runner.verified_adapter_revision_generation(run_id),
     )
     attempted_revision = f"{run_id}@final." + "a" * 40
+    expected_revisions = []
 
     def fake_deploy(**kwargs):
+        expected_revisions.append(kwargs["expected_adapter_revision"])
         kwargs["before_activate"](attempted_revision, run_id)
         activating = runner.get_status(run_id).deployment
         assert activating["state"] == "reconciling"
         assert activating["activation_outcome_unknown"] is True
-        raise ActivationOutcomeUnknown(run_id, attempted_revision)
+        if len(expected_revisions) == 1:
+            raise ActivationOutcomeUnknown(run_id, attempted_revision)
+        return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(
@@ -1926,8 +1932,26 @@ def test_activation_unknown_does_not_restore_previous_ready_deployment(api, monk
     assert deployment["state"] == "reconciling"
     assert deployment["adapter_revision"] == attempted_revision
     assert deployment["activation_outcome_unknown"] is True
-    assert "previous_deployment" not in deployment
+    assert deployment["previous_deployment"] == previous
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
+
+    deployment["requested_at"] = 1.0
+    deployment["updated_at"] = 1.0
+    status = runner.get_status(run_id)
+    status.deployment = deployment
+    runner._save_status(status)
+
+    assert serving.recover_deployments() == 1
+    recovered = runner.get_status(run_id).deployment
+    assert recovered["state"] == "failed"
+    assert recovered["activation_outcome_unknown"] is True
+    assert recovered["previous_deployment"] == previous
+
+    retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["state"] == "ready"
+    assert expected_revisions == [previous_revision, previous_revision]
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):
@@ -2310,7 +2334,7 @@ def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
     assert "no active deployment" in response.json()["detail"]
 
 
-def test_chat_bare_alias_rejects_reconciling_activation_with_previous_ready(api, monkeypatch):
+def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -2337,11 +2361,13 @@ def test_chat_bare_alias_rejects_reconciling_activation_with_previous_ready(api,
             "previous_deployment": previous,
         },
     )
-    monkeypatch.setattr(
-        app_mod,
-        "serve_chat",
-        lambda **kwargs: pytest.fail("an uncertain alias target must not reach serving"),
-    )
+    served_revisions = []
+
+    def serve_chat(**kwargs):
+        served_revisions.append(kwargs["run_id"])
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
 
     response = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -2351,6 +2377,19 @@ def test_chat_bare_alias_rejects_reconciling_activation_with_previous_ready(api,
 
     assert response.status_code == 409
     assert "deployment is reconciling" in response.json()["detail"]
+    assert served_revisions == []
+
+    explicit = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "adapter_revision": previous_revision,
+        },
+        headers=_bearer(key),
+    )
+
+    assert explicit.status_code == 200, explicit.text
+    assert served_revisions == [previous_revision]
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
 
 

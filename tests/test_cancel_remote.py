@@ -202,6 +202,39 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
+def test_cancel_run_tears_down_remote_handle_observed_after_entry(tmp_path, monkeypatch):
+    import flash.providers as providers
+    import flash.runner as orch
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-late-remote"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(orch.RunStatus(run_id=run_id, state="running", spec=spec.to_dict()))
+    remote = {"provider": "stub", "job_id": "late-job"}
+    calls = []
+
+    class StubProvider:
+        def cancel(self, handle):
+            calls.append(("cancel", handle.to_dict()))
+
+        def destroy(self, handle):
+            calls.append(("destroy", handle.to_dict()))
+
+    def observe_remote(_spec):
+        status = orch.get_status(run_id)
+        status.remote = remote
+        orch._save_status(status)
+
+    monkeypatch.setattr(providers, "get_provider", lambda provider: StubProvider())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", observe_remote)
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert calls == [("cancel", remote), ("destroy", remote)]
+
+
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

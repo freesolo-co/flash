@@ -93,17 +93,22 @@ def cancel_run(run_id: str) -> RunStatus:
             initial_teardown_confirmed = True
         except Exception as exc:
             teardown_error = exc
-    if remote:
+
+    def teardown_remote(remote_handle: dict) -> None:
+        if not remote_handle:
+            return
         try:
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            handle = JobHandle.from_dict(remote)
+            handle = JobHandle.from_dict(remote_handle)
             provider = get_provider(handle.provider)
             provider.cancel(handle)
             provider.destroy(handle)
         except Exception:
             pass
+
+    teardown_remote(remote)
     with contextlib.suppress(Exception):
         _gc_run_endpoints(cleanup_spec)
     # price only from the validated effective snapshot. a missing or malformed private snapshot
@@ -129,6 +134,8 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):
+        if not remote:
+            teardown_remote(get_status(run_id).remote or {})
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
         if not retry_revocation:
@@ -475,7 +482,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             }
         else:
             failed = dict(deployment)
-            failed.pop("previous_deployment", None)
+            if not failed.get("activation_outcome_unknown"):
+                failed.pop("previous_deployment", None)
             state = (
                 "reconciling"
                 if failed.get("activation_outcome_unknown")

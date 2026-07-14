@@ -160,6 +160,17 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     return None
 
 
+def _activation_cas_predecessor(deployment: dict) -> dict | None:
+    ready = _previous_ready_deployment(deployment)
+    if ready is not None:
+        return ready
+    if deployment.get("activation_outcome_unknown"):
+        previous = deployment.get("previous_deployment")
+        if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
+            return dict(previous)
+    return None
+
+
 def _verified_adapter_revisions(status) -> set[str]:
     return set(read_verified_adapter_revisions(status.run_id))
 
@@ -733,7 +744,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
-        previous_deployment = _previous_ready_deployment(current_deployment)
+        previous_deployment = _activation_cas_predecessor(current_deployment)
         deploy_kwargs = {
             "run_id": run_id,
             "model": spec.model,
@@ -957,7 +968,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     deployment = status.deployment or {}
     deployment_state = deployment.get("state")
     ready_deployment = _previous_ready_deployment(deployment)
-    has_ready_deploy = ready_deployment is not None
+    has_ready_deploy = adapter_revision is not None or ready_deployment is not None
     if adapter_revision is None and ready_deployment is not None:
         ready_revision = ready_deployment.get("adapter_revision")
         parsed_ready_revision = (
