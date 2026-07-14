@@ -690,52 +690,10 @@ def cmd_undeploy(args) -> int:
     return 0
 
 
-def _deployment_summaries(rows: list[dict]) -> list[dict]:
-    summaries = []
-    for row in rows:
-        deployment = row.get("deployment") or {}
-        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
-        detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
-        summaries.append(
-            {
-                "run_id": run_id,
-                "checkpoint_step": deployment.get("checkpoint_step"),
-                "adapter_revision": deployment.get("adapter_revision"),
-                "state": deployment.get("state"),
-                "verified_at": deployment.get("verified_at"),
-                "openai_model": deployment.get("openai_model") or run_id,
-                "detail": detail,
-            }
-        )
-    return sorted(
-        summaries,
-        key=lambda row: (
-            row["run_id"],
-            row["checkpoint_step"] is None,
-            row["checkpoint_step"] if row["checkpoint_step"] is not None else 0,
-            row["adapter_revision"] or "",
-        ),
-    )
-
-
 def cmd_deployments(args) -> int:
-    rows = _deployment_summaries(client_from_config().deployments())
+    rows = client_from_config().deployments()
     if getattr(args, "json", False):
-        projected = [
-            {
-                key: row[key]
-                for key in (
-                    "run_id",
-                    "checkpoint_step",
-                    "adapter_revision",
-                    "state",
-                    "verified_at",
-                    "openai_model",
-                )
-            }
-            for row in rows
-        ]
-        print(json.dumps({"schema_version": 1, "deployments": projected}, sort_keys=True))
+        print(json.dumps(rows, indent=2))
         return 0
     if not rows:
         if render.styled():
@@ -751,12 +709,19 @@ def cmd_deployments(args) -> int:
         f"{'VERIFIED AT':<18}  {'OPENAI MODEL':<30}  DETAIL"
     )
     for row in rows:
-        step = "final" if row["checkpoint_step"] is None else str(row["checkpoint_step"])
-        verified_at = "-" if row["verified_at"] is None else str(row["verified_at"])
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        step = deployment.get("checkpoint_step")
+        step_text = "final" if step is None else str(step)
+        verified_at = deployment.get("verified_at")
+        verified_text = "-" if verified_at is None else str(verified_at)
+        revision = str(deployment.get("adapter_revision") or "-")
+        state = str(deployment.get("state") or "-")
+        openai_model = str(deployment.get("openai_model") or run_id)
+        detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
         print(
-            f"{row['run_id']:<30}  {step:<6}  {row['adapter_revision'] or '-'!s:<40}  "
-            f"{row['state'] or '-'!s:<14}  {verified_at:<18}  "
-            f"{row['openai_model']:<30}  {row['detail']}"
+            f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
+            f"{verified_text:<18}  {openai_model:<30}  {detail}"
         )
     return 0
 

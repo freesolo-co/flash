@@ -14,6 +14,7 @@ import httpx
 from flash._logging import get_logger
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
+from flash.schema import format_adapter_revision
 from flash.serve.urls import openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
@@ -163,8 +164,7 @@ class Deployment:
 
 
 def adapter_revision_id(run_id: str, checkpoint_step: int | None, hf_revision: str) -> str:
-    suffix = f"step-{checkpoint_step}" if checkpoint_step is not None else "final"
-    return f"{run_id}@{suffix}.{hf_revision}"
+    return format_adapter_revision(run_id, checkpoint_step, hf_revision)
 
 
 def resolve_hf_revision(hf_repo: str) -> str:
@@ -322,36 +322,6 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
-def _require_thinking_structured_outputs_capability(base: str) -> None:
-    """Require serving support for deferring a structured constraint past reasoning."""
-    url = f"{base}/healthz"
-    response = _serving_request("GET", url)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ServingError(
-            f"serving health check at {url} did not return valid JSON; cannot safely deploy a "
-            "thinking adapter with structured outputs"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ServingError(
-            f"serving health check at {url} returned a non-object payload; cannot safely deploy a "
-            "thinking adapter with structured outputs"
-        )
-    capabilities = payload.get("capabilities")
-    if not isinstance(capabilities, list):
-        raise ServingError(
-            f"serving health check at {url} must return a list field named capabilities; cannot "
-            "safely deploy a thinking adapter with structured outputs"
-        )
-    if THINKING_STRUCTURED_OUTPUTS_CAPABILITY not in capabilities:
-        raise ServingError(
-            f"serving health check at {url} is missing required capability "
-            f"{THINKING_STRUCTURED_OUTPUTS_CAPABILITY!r}; cannot safely deploy a thinking adapter "
-            "with structured outputs"
-        )
-
-
 def deploy_adapter(
     run_id: str,
     model: str,
@@ -365,7 +335,6 @@ def deploy_adapter(
     org_id: str | None = None,
     checkpoint_step: int | None = None,
     expected_adapter_revision: str | None = None,
-    on_state: Callable[[dict], None] | None = None,
     before_activate: Callable[[str, str], None] | None = None,
 ) -> Deployment:
     """Register, verify, and atomically activate one immutable adapter revision.
@@ -394,10 +363,8 @@ def deploy_adapter(
     revision = adapter_revision_id(run_id, checkpoint_step, hf_revision)
     dep.adapter_revision = revision
     checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
-    _require_serving_capabilities()
     so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
-    if thinking and so_default is not None:
-        _require_thinking_structured_outputs_capability(serving_base_url())
+    _require_serving_capabilities(thinking_structured_outputs=thinking and so_default is not None)
 
     body = {
         "adapter_id": revision,
@@ -441,7 +408,7 @@ def deploy_adapter(
             revision,
         )
 
-    _wait_revision_ready(revision, subfolder, expected_identity=body, on_state=on_state)
+    _wait_revision_ready(revision, subfolder, expected_identity=body)
     if before_activate is not None:
         before_activate(revision, checkpoint)
     activation = _activate_revision(
@@ -510,31 +477,49 @@ def _matches_revision_identity(record: dict, expected: dict) -> bool:
     )
 
 
-def _require_serving_capabilities() -> None:
+def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> None:
     required = {
         "immutable_adapter_revisions",
         "alias_compare_and_swap",
         "revision_provenance",
     }
+    if thinking_structured_outputs:
+        required.add(THINKING_STRUCTURED_OUTPUTS_CAPABILITY)
+    url = f"{serving_base_url()}/healthz"
+    response = _serving_request("GET", url)
     try:
-        payload = _serving_request("GET", f"{serving_base_url()}/healthz").json()
-    except (ServingError, ValueError) as exc:
+        payload = response.json()
+    except ValueError as exc:
         raise ServingError(
-            "serving_contract_unsupported: serving health did not advertise immutable deployment capabilities"
+            f"serving_contract_unsupported: serving health check at {url} did not return valid JSON"
         ) from exc
-    capabilities = set(payload.get("capabilities") or []) if isinstance(payload, dict) else set()
-    missing = sorted(required - capabilities)
+    if not isinstance(payload, dict):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} returned a non-object payload"
+        )
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} must return a list field "
+            "named capabilities"
+        )
+    if not all(isinstance(capability, str) for capability in capabilities):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} capabilities must be "
+            "strings"
+        )
+    missing = sorted(required - set(capabilities))
     if missing:
         raise ServingError(
-            "serving_contract_unsupported: serving is missing capabilities " + ", ".join(missing)
+            "serving_contract_unsupported: serving is missing required capabilities "
+            + ", ".join(missing)
         )
 
 
-def _lifecycle(record: dict) -> tuple[str, dict, dict | None]:
+def _revision_state(record: dict) -> tuple[str, object]:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     state = str(metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered")
-    timestamps = metadata.get("lifecycle_timestamps")
-    return state, timestamps if isinstance(timestamps, dict) else {}, metadata.get("failure")
+    return state, metadata.get("failure")
 
 
 def _wait_revision_ready(
@@ -542,7 +527,6 @@ def _wait_revision_ready(
     subfolder: str,
     *,
     expected_identity: dict | None = None,
-    on_state: Callable[[dict], None] | None = None,
 ) -> dict:
     last_state = "registered"
     last_read_error: ServingError | None = None
@@ -565,9 +549,7 @@ def _wait_revision_ready(
             raise ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"
             )
-        last_state, timestamps, failure = _lifecycle(record)
-        if on_state is not None:
-            on_state({"state": last_state, "timestamps": timestamps})
+        last_state, failure = _revision_state(record)
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"

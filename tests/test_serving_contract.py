@@ -36,7 +36,7 @@ def test_deploy_dry_run_has_no_user_facing_mode():
 def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
     monkeypatch.setattr(deploy_mod, "resolve_hf_revision", lambda repo: "a" * 40)
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", lambda: None)
+    monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", lambda **_kwargs: None)
 
 
 def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
@@ -274,7 +274,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "adapter_artifact_lora_rank", artifact_rank)
     monkeypatch.setattr(
-        deploy, "_require_serving_capabilities", lambda: events.append("capabilities")
+        deploy, "_require_serving_capabilities", lambda **_kwargs: events.append("capabilities")
     )
 
     def request(method, url, *, json=None, ok_statuses=()):
@@ -295,7 +295,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "_serving_request", request)
 
-    def wait_ready(adapter_revision, subfolder, *, expected_identity=None, on_state=None):
+    def wait_ready(adapter_revision, subfolder, *, expected_identity=None):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha
         events.append("ready")

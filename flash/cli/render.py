@@ -473,21 +473,23 @@ def runs_table(runs: list[dict]) -> str:
 def deployments_table(rows: list[dict]) -> str:
     body = []
     for row in rows:
-        state = str(row.get("state") or "?")
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        state = str(deployment.get("state") or "?")
         color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
-        step = row.get("checkpoint_step")
-        verified_at = row.get("verified_at")
-        detail = str(row.get("detail") or "")
+        step = deployment.get("checkpoint_step")
+        verified_at = deployment.get("verified_at")
+        detail = str(deployment.get("error") or deployment.get("detail") or "")
         if len(detail) > 64:
             detail = detail[:61] + "..."
         body.append(
             [
-                (row["run_id"], _ACCENT2),
+                (run_id, _ACCENT2),
                 ("final" if step is None else str(step), _TEAL),
-                (str(row.get("adapter_revision") or "-"), _ACCENT2),
+                (str(deployment.get("adapter_revision") or "-"), _ACCENT2),
                 (state, color),
                 ("-" if verified_at is None else str(verified_at), _GRAY),
-                (str(row.get("openai_model") or ""), _GREEN),
+                (str(deployment.get("openai_model") or run_id), _GREEN),
                 (detail, _GRAY),
             ]
         )

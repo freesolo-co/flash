@@ -1942,7 +1942,6 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     revision = f"{run_id}@final." + "d" * 40
 
     def fake_deploy(**kwargs):
-        kwargs["on_state"]({"state": "ready"})
         kwargs["before_activate"](revision, run_id)
         pytest.fail("failed smoke must block alias activation")
 
@@ -2033,7 +2032,6 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     import flash.runner as runner
     import flash.server.app as app_mod
     from flash.serve.deploy import ActivationOutcomeUnknown, ServingError
-    from flash.server.routes import serving
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -2058,14 +2056,17 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
 
     def fake_deploy(**kwargs):
         expected_revisions.append(kwargs["expected_adapter_revision"])
+        if len(expected_revisions) == 2:
+            retry_record = runner.get_status(run_id).deployment
+            assert retry_record["previous_deployment"]["adapter_revision"] == attempted_revision
+            assert retry_record["previous_deployment"]["state"] == "reconciling"
+            raise ServingError("retry failed before alias activation")
         kwargs["before_activate"](attempted_revision, run_id)
         activating = runner.get_status(run_id).deployment
         assert activating["state"] == "reconciling"
         assert activating["activation_outcome_unknown"] is True
         if len(expected_revisions) == 1:
             raise ActivationOutcomeUnknown(run_id, attempted_revision)
-        if len(expected_revisions) == 2:
-            raise ServingError("retry failed before alias activation")
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "adapter_alias_target", fake_alias_target)
@@ -2087,27 +2088,16 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     assert deployment["previous_deployment"] == previous
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
 
-    deployment["requested_at"] = 1.0
-    deployment["updated_at"] = 1.0
-    status = runner.get_status(run_id)
-    status.deployment = deployment
-    runner._save_status(status)
-
-    assert serving.recover_deployments() == 1
-    recovered = runner.get_status(run_id).deployment
-    assert recovered["state"] == "failed"
-    assert recovered["activation_outcome_unknown"] is True
-    assert recovered["previous_deployment"] == previous
-
     retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
     assert retry.status_code == 200, retry.text
     assert retry.json()["state"] == "failed"
     retry_failed = runner.get_status(run_id).deployment
     assert retry_failed["state"] == "failed"
-    assert retry_failed["adapter_revision"] == attempted_revision
+    assert retry_failed["adapter_revision"] is None
     assert retry_failed["activation_outcome_unknown"] is True
-    assert retry_failed["previous_deployment"] == previous
+    assert retry_failed["previous_deployment"]["adapter_revision"] == attempted_revision
+    assert retry_failed["previous_deployment"]["state"] == "reconciling"
 
     final_retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
@@ -2115,6 +2105,75 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     assert final_retry.json()["state"] == "ready"
     assert alias_reads == [run_id, run_id]
     assert expected_revisions == [previous_revision, attempted_revision, attempted_revision]
+
+
+def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    attempted_revision = f"{run_id}@final." + "a" * 40
+    stale_revision = f"{run_id}@step-10." + "b" * 40
+    live_revision = f"{run_id}@step-20." + "c" * 40
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "reconciling",
+        "adapter_revision": attempted_revision,
+        "activation_outcome_unknown": True,
+        "previous_deployment": {
+            "state": "ready",
+            "adapter_revision": stale_revision,
+            "checkpoint_step": 10,
+        },
+    }
+    runner._save_status(status)
+    runner.add_verified_adapter_revision(
+        run_id,
+        live_revision,
+        expected_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+
+    monkeypatch.setattr(app_mod, "adapter_alias_target", lambda _run_id: live_revision)
+
+    def fail_before_activation(**kwargs):
+        assert kwargs["expected_adapter_revision"] == live_revision
+        queued = runner.get_status(run_id).deployment
+        predecessor = queued["previous_deployment"]
+        assert predecessor == {
+            "run_id": run_id,
+            "adapter_revision": live_revision,
+            "checkpoint_step": 20,
+            "openai_model": run_id,
+            "state": "ready",
+        }
+        raise deploy.ServingError("retry failed before alias activation")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fail_before_activation)
+
+    retry = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert retry.status_code == 200, retry.text
+    failed = runner.get_status(run_id).deployment
+    assert failed["state"] == "failed"
+    assert failed["activation_outcome_unknown"] is True
+    assert failed["previous_deployment"]["checkpoint_step"] == 20
+
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the verified live checkpoint must remain serving"),
+    )
+
+    cancelled = runner.cancel_run(run_id)
+
+    assert cancelled.state == "cancelled"
+    assert cancelled.deployment["state"] == "ready"
+    assert cancelled.deployment["adapter_revision"] == live_revision
+    assert cancelled.deployment["checkpoint_step"] == 20
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({live_revision})
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):
@@ -2150,30 +2209,6 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     assert deployment["state"] == "ready"
     assert deployment["endpoint_name"] == "old"
     assert "smoke generation returned no content" in deployment["last_deploy_error"]
-
-
-def test_recover_deployments_restores_previous_ready_record(api):
-    import flash.runner as runner
-    from flash.server.routes import serving
-
-    key = _login()
-    run_id = _make_run(api, key, "deployed")
-    previous = {"state": "ready", "endpoint_name": "old", "adapter_hf_prefix": "rl/old/adapter"}
-    status = runner.get_status(run_id)
-    status.deployment = {
-        "state": "verifying",
-        "updated_at": 0.0,
-        "requested_at": 0.0,
-        "previous_deployment": previous,
-    }
-    runner._save_status(status)
-
-    assert serving.recover_deployments() == 1
-
-    deployment = runner.get_status(run_id).deployment
-    assert deployment["state"] == "ready"
-    assert deployment["endpoint_name"] == "old"
-    assert "interrupted" in deployment["last_deploy_error"]
 
 
 def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
@@ -2559,7 +2594,6 @@ def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, m
 def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
-    from flash.server.routes import serving
 
     key = _login()
     run_id = api.post(
@@ -2579,18 +2613,6 @@ def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
             },
             verification_generation=runner.verified_adapter_revision_generation(run_id),
         )
-    latest = runner.get_status(run_id)
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset(revisions)
-    runner.mark_deployment_pending(
-        run_id,
-        {
-            "state": "deploying",
-            "requested_at": 1.0,
-            "updated_at": 1.0,
-            "previous_deployment": latest.deployment,
-        },
-    )
-    assert serving.recover_deployments() == 1
     assert runner.read_verified_adapter_revisions(run_id) == frozenset(revisions)
     seen = []
 

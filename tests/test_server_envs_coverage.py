@@ -242,18 +242,17 @@ def test_github_download_wrapper_uses_default_repo(monkeypatch):
 
 
 def test_deployment_state_and_public_deployment():
-    original = {"a": 1, "state": "deploying"}
+    original = {"a": 1, "state": "queued"}
     out = serving._deployment_state(original, "ready", detail="done")
     assert out["state"] == "ready"
     assert out["detail"] == "done"
     assert out["a"] == 1
     assert isinstance(out["updated_at"], float)
     # The input is not mutated in place.
-    assert original == {"a": 1, "state": "deploying"}
+    assert original == {"a": 1, "state": "queued"}
 
     pub = serving._public_deployment(
         {
-            "run_id": "run-1",
             "state": "ready",
             "previous_deployment": {"x": 1},
             "endpoint_name": "https://serve.example",
@@ -263,65 +262,36 @@ def test_deployment_state_and_public_deployment():
         }
     )
     assert pub == {
-        "run_id": "run-1",
-        "checkpoint_step": None,
-        "adapter_revision": None,
         "state": "ready",
-        "verified_at": None,
-        "openai_model": "run-1",
         "endpoint_name": "https://serve.example",
         "openai_base_url": "https://serve.example/v1",
         "b": 2,
+        "run_id": None,
+        "checkpoint_step": None,
+        "adapter_revision": None,
+        "verified_at": None,
+        "openai_model": None,
     }
-
-    progressed = serving._deployment_state(
-        {"state": "loading", "registered_at": 1.0},
-        "registered",
-        registered_at=2.0,
-    )
-    assert progressed["state"] == "loading"
-    assert progressed["registered_at"] == 1.0
 
 
 def test_deployment_attempt_is_stale_branches():
     # Not in a busy state -> never stale.
     assert serving._deployment_attempt_is_stale({"state": "ready"}) is False
     # Busy with no timestamp -> treated as stale.
-    assert serving._deployment_attempt_is_stale({"state": "deploying"}) is True
+    assert serving._deployment_attempt_is_stale({"state": "queued"}) is True
     # Busy with an unparseable timestamp -> stale.
     assert (
-        serving._deployment_attempt_is_stale({"state": "verifying", "updated_at": "nope"}) is True
+        serving._deployment_attempt_is_stale({"state": "smoke_testing", "updated_at": "nope"})
+        is True
     )
     # Busy but recently updated (via injected `now`) -> not stale.
-    fresh = {"state": "registering", "updated_at": 1000.0}
+    fresh = {"state": "reconciling", "updated_at": 1000.0}
     assert serving._deployment_attempt_is_stale(fresh, now=1000.0 + 10) is False
     # Busy and older than the stale window -> stale.
-    old = {"state": "deploying", "requested_at": 1000.0}
+    old = {"state": "queued", "requested_at": 1000.0}
     assert (
         serving._deployment_attempt_is_stale(old, now=1000.0 + serving._DEPLOYMENT_STALE_SECONDS)
         is True
-    )
-
-
-def test_previous_ready_deployment():
-    # A currently-ready deployment is its own "previous ready" (a copy).
-    ready = {"state": "ready", "adapter_hf_prefix": "sft/r1/seed0/adapter"}
-    got = serving._previous_ready_deployment(ready)
-    assert got == ready
-    assert got is not ready
-    # A busy deployment falls back to a ready `previous_deployment`.
-    nested = {"state": "deploying", "previous_deployment": {"state": "deployed", "b": 2}}
-    assert serving._previous_ready_deployment(nested) == {"state": "deployed", "b": 2}
-    # terminal states never resurrect a preserved previous deployment.
-    undeployed = {"state": "undeployed", "previous_deployment": {"state": "ready"}}
-    assert serving._previous_ready_deployment(undeployed) is None
-    # Nothing ready anywhere -> None.
-    assert serving._previous_ready_deployment({"state": "deploying"}) is None
-    assert (
-        serving._previous_ready_deployment(
-            {"state": "deploying", "previous_deployment": {"state": "failed"}}
-        )
-        is None
     )
 
 
@@ -384,10 +354,10 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
 
     statuses = {
         # Busy with no timestamp -> stale.
-        "r-stale": types.SimpleNamespace(run_id="r-stale", deployment={"state": "deploying"}),
+        "r-stale": types.SimpleNamespace(run_id="r-stale", deployment={"state": "queued"}),
         # Busy but freshly updated -> not stale.
         "r-fresh": types.SimpleNamespace(
-            run_id="r-fresh", deployment={"state": "deploying", "updated_at": time.time()}
+            run_id="r-fresh", deployment={"state": "queued", "updated_at": time.time()}
         ),
     }
 
@@ -411,128 +381,41 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
     assert "control-plane restart" in failed["error"]
 
 
-def _smoke_result(
-    revision: str,
-    checkpoint: str,
-    content: str = "The answer is 4",
-    finish_reason: str = "stop",
-) -> dict:
-    hf_revision = revision.rsplit(".", 1)[-1]
-    return {
-        "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
-        "freesolo": {
-            "adapter_revision": revision,
-            "checkpoint": checkpoint,
-            "hf_revision": hf_revision,
-        },
-        "_freesolo_headers": {
-            "adapter_revision": revision,
-            "checkpoint": checkpoint,
-            "hf_revision": hf_revision,
-        },
-    }
-
-
-def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
-    revision = "run-1@final." + "a" * 40
-
-    class UntrustedEnvironment:
-        def __getattribute__(self, name):
-            pytest.fail(f"control-plane smoke accessed user environment field {name!r}")
-
-    spec = types.SimpleNamespace(
-        thinking=False,
-        train=types.SimpleNamespace(structured_outputs=""),
-        environment=UntrustedEnvironment(),
-    )
-    calls = []
-
-    def fake_serve_chat(**kwargs):
-        calls.append(kwargs)
-        return _smoke_result(revision, "run-1")
-
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = serving._run_deployment_smoke(
-        "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=10.0
-    )
-
-    assert out["verify_kind"] == "fixed_prompt"
-    assert out["verify_environment_id"] is None
-    assert out["verify_environment_revision"] is None
-    assert out["verify_turns"] == 1
-    assert out["verify_multi_turn"] is False
-    assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
-    assert calls[0]["expected_checkpoint"] == "run-1"
-    assert calls[0]["timeout_s"] <= 10.0
-
-
-def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
-    revision = "run-1@final." + "a" * 40
-    spec = types.SimpleNamespace(
-        thinking=False,
-        train=types.SimpleNamespace(structured_outputs=""),
-    )
-
-    def slow_serve_chat(**kwargs):
-        time.sleep(1.0)
-        return _smoke_result(revision, "run-1")
-
-    monkeypatch.setattr(serving._app, "serve_chat", slow_serve_chat)
-    started = time.monotonic()
-    with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
-        serving._run_deployment_smoke(
-            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.05
-        )
-    assert time.monotonic() - started < 0.5
-
-
-def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):
-    revision = "run-1@final." + "a" * 40
-    spec = types.SimpleNamespace(
-        thinking=False,
-        train=types.SimpleNamespace(structured_outputs=""),
-    )
-    monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
-        lambda **kwargs: pytest.fail("expired budget must not start a generation"),
-    )
-
-    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._run_deployment_smoke(
-            "run-1", spec, serving_model=revision, expected_checkpoint="run-1", budget_s=0.0
-        )
-
-
-_STRUCTURED_SMOKE_REVISION = "run-1@final." + "a" * 40
-
-
-def _structured_smoke_spec(*, thinking: bool, constraint: dict | None = None):
+def _smoke_spec(*, thinking: bool, constraint: dict | None = None):
     return types.SimpleNamespace(
         thinking=thinking,
         train=types.SimpleNamespace(
             structured_outputs="" if constraint is None else json.dumps(constraint)
         ),
-        environment=types.SimpleNamespace(id="owner/env", params={}, resolved_sha="b" * 40),
     )
 
 
-def _structured_smoke_response(content: str, finish_reason: str = "stop") -> dict:
-    return _smoke_result(
-        _STRUCTURED_SMOKE_REVISION,
-        "run-1",
-        content,
-        finish_reason=finish_reason,
-    )
+_SMOKE_REVISION = "run-1@final." + "a" * 40
 
 
-def _run_structured_smoke(monkeypatch, run_id: str, spec):
-    assert run_id == "run-1"
+def _smoke_response(content: str, finish_reason: str = "stop") -> dict:
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+        "freesolo": {
+            "adapter_revision": _SMOKE_REVISION,
+            "checkpoint": "run-1",
+            "hf_revision": "a" * 40,
+        },
+        "_freesolo_headers": {
+            "adapter_revision": _SMOKE_REVISION,
+            "checkpoint": "run-1",
+            "hf_revision": "a" * 40,
+        },
+    }
+
+
+def _run_smoke(spec, *, budget_s: float = 600.0):
     return serving._run_deployment_smoke(
-        run_id,
+        "run-1",
         spec,
-        serving_model=_STRUCTURED_SMOKE_REVISION,
-        expected_checkpoint=run_id,
+        serving_model=_SMOKE_REVISION,
+        expected_checkpoint="run-1",
+        budget_s=budget_s,
     )
 
 
@@ -544,16 +427,66 @@ def _schema_validation_child_pids() -> set[int | None]:
     }
 
 
-def test_run_deployment_smoke_success_and_empty(monkeypatch):
-    spec = _structured_smoke_spec(thinking=False)
+def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
+    class UntrustedEnvironment:
+        def __getattribute__(self, name):
+            pytest.fail(f"control-plane smoke accessed user environment field {name!r}")
+
+    spec = _smoke_spec(thinking=False)
+    spec.environment = UntrustedEnvironment()
+    calls = []
 
     def fake_serve_chat(**kwargs):
-        assert kwargs["run_id"] == _STRUCTURED_SMOKE_REVISION
-        assert kwargs["temperature"] == 0.0
-        return _structured_smoke_response("The answer is 4")
+        calls.append(kwargs)
+        return _smoke_response("The answer is 4")
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    out = _run_structured_smoke(monkeypatch, "run-1", spec)
+    out = _run_smoke(spec, budget_s=10.0)
+
+    assert out["verify_kind"] == "fixed_prompt"
+    assert out["verify_turns"] == 1
+    assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert calls[0]["expected_checkpoint"] == "run-1"
+    assert calls[0]["timeout_s"] <= 10.0
+
+
+def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
+    def slow_serve_chat(**kwargs):
+        time.sleep(1.0)
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", slow_serve_chat)
+    started = time.monotonic()
+    with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
+        _run_smoke(_smoke_spec(thinking=False), budget_s=0.05)
+    assert time.monotonic() - started < 0.5
+
+
+def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("expired budget must not start a generation"),
+    )
+
+    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
+        _run_smoke(_smoke_spec(thinking=False), budget_s=0.0)
+
+
+def test_run_deployment_smoke_success_and_empty(monkeypatch):
+    spec = _smoke_spec(thinking=False)
+
+    def fake_serve_chat(**kwargs):
+        assert kwargs["run_id"] == _SMOKE_REVISION
+        assert kwargs["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+        assert kwargs["temperature"] == 0.0
+        assert 0 < kwargs["timeout_s"] <= 600.0
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    out = _run_smoke(spec)
+    assert out["verify_kind"] == "fixed_prompt"
+    assert out["verify_turns"] == 1
     assert out["verify_finish_reason"] == "stop"
     assert out["verify_sample"] == "The answer is 4"
     assert out["thinking_tag"] is False
@@ -562,21 +495,19 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response("<think>still reasoning"),
+        lambda **_k: _smoke_response("<think>still reasoning"),
     )
-    thinking_out = _run_structured_smoke(
-        monkeypatch, "run-1", _structured_smoke_spec(thinking=True)
-    )
+    thinking_out = _run_smoke(_smoke_spec(thinking=True))
     assert thinking_out["thinking_tag"] is True
     assert thinking_out["verify_sample"] == "<think>still reasoning"
 
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response("   ", "length"),
+        lambda **_k: _smoke_response("   ", "length"),
     )
     with pytest.raises(ServingError, match="no content"):
-        _run_structured_smoke(monkeypatch, "run-1", spec)
+        _run_smoke(spec)
 
 
 @pytest.mark.parametrize(
@@ -628,12 +559,8 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
 def test_thinking_structured_smoke_validates_only_answer_after_reasoning(
     monkeypatch, constraint, content, sample
 ):
-    monkeypatch.setattr(
-        serving._app, "serve_chat", lambda **_k: _structured_smoke_response(content)
-    )
-    out = _run_structured_smoke(
-        monkeypatch, "run-1", _structured_smoke_spec(thinking=True, constraint=constraint)
-    )
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    out = _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
     assert out["verify_sample"] == sample
     assert out["verify_finish_reason"] == "stop"
     assert out["thinking_tag"] is True
@@ -664,14 +591,12 @@ def test_structured_smoke_rejects_external_schema_ref_without_network(monkeypatc
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response("<think>2+2</think>{}"),
+        lambda **_k: _smoke_response("<think>2+2</think>{}"),
     )
 
     try:
         with pytest.raises(ServingError, match="schema reference could not be resolved"):
-            _run_structured_smoke(
-                monkeypatch, "run-1", _structured_smoke_spec(thinking=True, constraint=constraint)
-            )
+            _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
     finally:
         server.shutdown()
         server.server_close()
@@ -689,13 +614,11 @@ def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkey
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response('<think>2+2</think>{"answer": "4"}'),
+        lambda **_k: _smoke_response('<think>2+2</think>{"answer": "4"}'),
     )
 
     with pytest.raises(ServingError, match="schema reference could not be resolved") as exc_info:
-        _run_structured_smoke(
-            monkeypatch, "run-1", _structured_smoke_spec(thinking=True, constraint=constraint)
-        )
+        _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
     assert "external retrieval" not in str(exc_info.value)
 
 
@@ -704,17 +627,37 @@ def test_direct_structured_regex_timeout_is_bounded(monkeypatch):
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(f"<think>x</think>{answer}"),
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
     started = time.monotonic()
     with pytest.raises(ServingError, match=r"regex evaluation exceeded the 0\.05s deadline"):
-        _run_structured_smoke(
-            monkeypatch,
-            "run-1",
-            _structured_smoke_spec(thinking=True, constraint={"regex": "(a+)+$"}),
+        _run_smoke(
+            _smoke_spec(thinking=True, constraint={"regex": "(a+)+$"}),
         )
     assert time.monotonic() - started < 1.0
+
+
+def test_json_schema_validation_respects_global_smoke_deadline(monkeypatch):
+    answer = json.dumps("a" * 10_000 + "!")
+    schema = {"type": "string", "pattern": "(a+)+$"}
+    monkeypatch.setattr(
+        serving._app,
+        "serve_chat",
+        lambda **_kwargs: _smoke_response(f"<think>x</think>{answer}"),
+    )
+
+    children_before = _schema_validation_child_pids()
+    started = time.monotonic()
+    with pytest.raises(
+        ServingError, match=r"deployment_smoke_timeout: bounded smoke exceeded 0\.2s"
+    ):
+        _run_smoke(
+            _smoke_spec(thinking=True, constraint={"json": schema}),
+            budget_s=0.2,
+        )
+    assert time.monotonic() - started < 1.5
+    assert _schema_validation_child_pids() == children_before
 
 
 @pytest.mark.parametrize("keyword", ["pattern", "patternProperties"])
@@ -735,16 +678,14 @@ def test_json_schema_pathological_regex_branch_times_out_before_fallback(monkeyp
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(f"<think>x</think>{answer}"),
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
     children_before = _schema_validation_child_pids()
     started = time.monotonic()
     with pytest.raises(ServingError, match="wall-clock deadline"):
-        _run_structured_smoke(
-            monkeypatch,
-            "run-1",
-            _structured_smoke_spec(thinking=True, constraint={"json": schema}),
+        _run_smoke(
+            _smoke_spec(thinking=True, constraint={"json": schema}),
         )
     assert time.monotonic() - started < 5.0
     assert _schema_validation_child_pids() == children_before
@@ -757,16 +698,14 @@ def test_json_schema_not_combinator_timeout_cannot_invert_to_success(monkeypatch
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(f"<think>x</think>{answer}"),
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
     children_before = _schema_validation_child_pids()
     started = time.monotonic()
     with pytest.raises(ServingError, match="wall-clock deadline"):
-        _run_structured_smoke(
-            monkeypatch,
-            "run-1",
-            _structured_smoke_spec(thinking=True, constraint={"json": schema}),
+        _run_smoke(
+            _smoke_spec(thinking=True, constraint={"json": schema}),
         )
     assert time.monotonic() - started < 5.0
     assert _schema_validation_child_pids() == children_before
@@ -784,16 +723,14 @@ def test_json_schema_pattern_properties_unevaluated_timeout_is_killed(monkeypatc
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(f"<think>x</think>{answer}"),
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
     children_before = _schema_validation_child_pids()
     started = time.monotonic()
     with pytest.raises(ServingError, match="wall-clock deadline"):
-        _run_structured_smoke(
-            monkeypatch,
-            "run-1",
-            _structured_smoke_spec(thinking=True, constraint={"json": schema}),
+        _run_smoke(
+            _smoke_spec(thinking=True, constraint={"json": schema}),
         )
     assert time.monotonic() - started < 5.0
     assert _schema_validation_child_pids() == children_before
@@ -811,13 +748,11 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(f"<think>x</think>{answer}"),
+        lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
     with pytest.raises(ServingError, match="non-finite JSON constant"):
-        _run_structured_smoke(
-            monkeypatch, "run-1", _structured_smoke_spec(thinking=True, constraint=constraint)
-        )
+        _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
 
 
 @pytest.mark.parametrize(
@@ -862,23 +797,17 @@ def test_thinking_structured_smoke_rejects_invalid_output(
     monkeypatch.setattr(
         serving._app,
         "serve_chat",
-        lambda **_k: _structured_smoke_response(content, finish_reason),
+        lambda **_k: _smoke_response(content, finish_reason),
     )
     with pytest.raises(ServingError, match=match):
-        _run_structured_smoke(
-            monkeypatch, "run-1", _structured_smoke_spec(thinking=True, constraint=constraint)
-        )
+        _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
 
 
 def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypatch):
     content = "  <think>literal</think>4  "
-    monkeypatch.setattr(
-        serving._app, "serve_chat", lambda **_k: _structured_smoke_response(content)
-    )
-    out = _run_structured_smoke(
-        monkeypatch,
-        "run-1",
-        _structured_smoke_spec(
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    out = _run_smoke(
+        _smoke_spec(
             thinking=False,
             constraint={"choice": ["<think>literal</think>4"]},
         ),

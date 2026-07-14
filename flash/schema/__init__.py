@@ -79,6 +79,15 @@ def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
     return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
 
 
+def format_adapter_revision(run_id: str, step: int | None, hf_revision: str) -> str:
+    """Format and validate a canonical immutable adapter revision."""
+    suffix = f"step-{int(step)}" if step is not None else "final"
+    revision = f"{run_id}@{suffix}.{hf_revision}"
+    if parse_adapter_revision(revision) is None:
+        raise ValueError("invalid immutable adapter revision components")
+    return revision
+
+
 def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
     """Internal storage reference for a run's adapter (or one saved step) on the artifact store."""
     suffix = f"/checkpoints/step-{int(step)}" if step is not None else ""

@@ -13,6 +13,12 @@ import types
 
 import pytest
 
+_IMMUTABLE_SERVING_CAPABILITIES = {
+    "immutable_adapter_revisions",
+    "alias_compare_and_swap",
+    "revision_provenance",
+}
+
 
 def _stub_adapter_config(
     monkeypatch,
@@ -21,6 +27,7 @@ def _stub_adapter_config(
     rank: int = 32,
     config: dict | None = None,
     tensor_files: dict[str, int | None] | None = None,
+    stub_capabilities: bool = True,
 ):
     cfg = tmp_path / "adapter_config.json"
     cfg.write_text(json.dumps({"r": rank} if config is None else config), encoding="utf-8")
@@ -54,7 +61,8 @@ def _stub_adapter_config(
 
     import flash.serve.deploy as deploy
 
-    monkeypatch.setattr(deploy, "_require_serving_capabilities", lambda: None)
+    if stub_capabilities:
+        monkeypatch.setattr(deploy, "_require_serving_capabilities", lambda **_kwargs: None)
     monkeypatch.setattr(deploy, "_wait_revision_ready", lambda *a, **k: {})
     monkeypatch.setattr(
         deploy,
@@ -81,7 +89,7 @@ def _capture_registration_body(
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
-    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
 
     seen: dict = {}
 
@@ -106,7 +114,10 @@ def _capture_registration_body(
 
     class _HealthResp(_Resp):
         def json(self):
-            return {"capabilities": [d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY]}
+            capabilities = set(_IMMUTABLE_SERVING_CAPABILITIES)
+            if deploy_kwargs.get("thinking") and deploy_kwargs.get("structured_outputs"):
+                capabilities.add(d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY)
+            return {"capabilities": sorted(capabilities)}
 
     def fake_get(url, **kwargs):
         if url == "https://serve.example/healthz":
@@ -145,8 +156,8 @@ def test_thinking_structured_dry_run_does_not_probe_capabilities(monkeypatch):
 
     monkeypatch.setattr(
         d,
-        "_require_thinking_structured_outputs_capability",
-        lambda _base: pytest.fail("dry run must not probe serving capabilities"),
+        "_require_serving_capabilities",
+        lambda **_kwargs: pytest.fail("dry run must not probe serving capabilities"),
     )
     dep = d.deploy_adapter(
         run_id="r1",
@@ -459,7 +470,10 @@ def test_deploy_registers_structured_outputs_default(monkeypatch, tmp_path, stub
         adapter_prefix="sft/flash-7-abcd/seed0",
         structured_outputs=spec,
     )
-    assert events == [("POST", "https://serve.example/adapters")]
+    assert events == [
+        ("GET", "https://serve.example/healthz"),
+        ("POST", "https://serve.example/adapters"),
+    ]
     assert body["structured_outputs"] == {"json": schema}
     # thinking default is still carried and independent of the constraint.
     assert body["thinking"] is False
@@ -509,7 +523,10 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 @pytest.mark.parametrize(
     ("health_case", "match"),
     [
-        ("missing", "missing required capability"),
+        ("missing_immutable_revisions", "immutable_adapter_revisions"),
+        ("missing_alias_cas", "alias_compare_and_swap"),
+        ("missing_provenance", "revision_provenance"),
+        ("missing_thinking_structured", "thinking_structured_outputs_deferred_v1"),
         ("malformed", "must return a list field named capabilities"),
         ("invalid_json", "did not return valid JSON"),
         ("http_error", "HTTP 503"),
@@ -522,7 +539,7 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
     posts: list[str] = []
 
     class _HealthResp:
@@ -540,7 +557,16 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
                 raise ValueError("not json")
             if health_case == "malformed":
                 return {"capabilities": "thinking_structured_outputs_deferred_v1"}
-            return {"capabilities": []}
+            capabilities = _IMMUTABLE_SERVING_CAPABILITIES | {
+                d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY
+            }
+            missing = {
+                "missing_immutable_revisions": "immutable_adapter_revisions",
+                "missing_alias_cas": "alias_compare_and_swap",
+                "missing_provenance": "revision_provenance",
+                "missing_thinking_structured": d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
+            }.get(health_case)
+            return {"capabilities": sorted(capabilities - ({missing} if missing else set()))}
 
     def fake_get(url, **_kwargs):
         assert url == "https://serve.example/healthz"

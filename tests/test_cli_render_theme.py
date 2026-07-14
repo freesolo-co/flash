@@ -157,9 +157,7 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
         render.deployed(
             {"run_id": "r", "state": "deployed", "endpoint_name": "ep", "openai_base_url": "u"}
         ),
-        render.undeployed(
-            {"run_id": "r", "disabled_aliases": ["r"], "disabled_revisions": []}
-        ),
+        render.undeployed({"run_id": "r", "deleted_endpoints": ["ep"]}),
         render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
         render.error("config invalid — bad [environment] id"),
         render.warn("FREESOLO_API_KEY is set — it will override the saved login"),
@@ -236,20 +234,18 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     assert "dry_run" not in dry
 
 
-def test_undeploy_confirms_teardown_and_names_immutable_ids(monkeypatch) -> None:
-    """`flash undeploy` confirms the teardown and names disabled immutable identities."""
+def test_undeploy_confirms_disabled_immutable_records(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
-    revision = "flash-1@final." + "a" * 40
     named = render.undeployed(
         {
             "run_id": "flash-1",
             "disabled_aliases": ["flash-1"],
-            "disabled_revisions": [revision],
+            "disabled_revisions": ["flash-1@final." + "a" * 40],
         }
     )
     assert "torn down flash-1" in named
-    assert revision in named
+    assert "flash-1@final" in named
     idempotent = render.undeployed(
         {"run_id": "flash-1", "disabled_aliases": [], "disabled_revisions": []}
     )
@@ -458,9 +454,7 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     assert "worker" not in out.split("details")[0]  # no empty heartbeat rows
 
     # malformed heartbeat fields must render defensively, never raise
-    weird = dict(
-        fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"}
-    )
+    weird = dict(fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"})
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row

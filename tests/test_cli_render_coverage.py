@@ -253,36 +253,11 @@ def test_humanize_age_buckets(monkeypatch) -> None:
 def test_deployments_table_truncates_long_detail(styled_plain) -> None:
     long_err = "E" * 100
     out = render.deployments_table(
-        [
-            {
-                "run_id": "r1",
-                "checkpoint_step": None,
-                "adapter_revision": "r1@final." + "a" * 40,
-                "state": "failed",
-                "verified_at": None,
-                "openai_model": "r1",
-                "detail": long_err,
-            }
-        ]
+        [{"run_id": "r1", "deployment": {"state": "failed", "error": long_err}}]
     )
     assert ("E" * 61 + "...") in out  # 61 chars + ellipsis
     assert long_err not in out  # the full 100-char string was truncated away
-    assert "final" in out
-    assert "r1@final." in out
-    assert "OPENAI MODEL" in out
     assert "failed" in out
-
-
-def test_undeployed_renders_disabled_immutable_ids(styled_plain) -> None:
-    out = render.undeployed(
-        {
-            "run_id": "run-1",
-            "disabled_aliases": ["run-1"],
-            "disabled_revisions": ["run-1@final." + "a" * 40],
-        }
-    )
-    assert "disabled" in out
-    assert "run-1@final." in out
 
 
 def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
