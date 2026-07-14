@@ -279,16 +279,28 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     return None
 
 
-def _deployment_cas_predecessor(deployment: dict) -> dict | None:
+def _deployment_predecessor(deployment: dict) -> dict | None:
     ready = _previous_ready_deployment(deployment)
     if ready is not None:
         return ready
-    if not deployment.get("activation_outcome_unknown"):
-        return None
-    previous = deployment.get("previous_deployment")
-    if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
-        return dict(previous)
+    if deployment.get("activation_outcome_unknown"):
+        previous = deployment.get("previous_deployment")
+        if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
+            return dict(previous)
     return None
+
+
+def _expected_adapter_revision(run_id: str, deployment: dict) -> str | None:
+    if deployment.get("activation_outcome_unknown"):
+        target = _app.adapter_alias_target(run_id)
+        if target is not None and parse_adapter_revision(target) is None:
+            raise ServingError(
+                f"serving alias {run_id} targets non-immutable identifier {target!r}"
+            )
+        return target
+    ready = _deployment_predecessor(deployment)
+    revision = ready.get("adapter_revision") if ready is not None else None
+    return revision if isinstance(revision, str) else None
 
 
 def _verified_adapter_revisions(status) -> set[str]:
@@ -521,10 +533,6 @@ def _run_deployment_smoke(
         "thinking_tag": thinking_tag,
         "verify_sample": last_answer[:160],
     }
-
-
-def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
-    return state_guard is not None and _app.get_status(run_id).state != state_guard
 
 
 def _finish_deployment_unlocked(
@@ -914,7 +922,21 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
-        previous_deployment = _deployment_cas_predecessor(current_deployment)
+        previous_deployment = _deployment_predecessor(current_deployment)
+        expected_adapter_revision = None
+        if not dry_run:
+            try:
+                expected_adapter_revision = _expected_adapter_revision(run_id, current_deployment)
+            except ServingError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "alias_reconciliation_failed",
+                        "run_id": run_id,
+                        "retryable": True,
+                        "message": str(exc),
+                    },
+                ) from exc
         deploy_kwargs = {
             "run_id": run_id,
             "model": spec.model,
@@ -924,15 +946,12 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
-            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
-            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
-            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            # a run trained with structured_outputs serves under the same grammar. thinking runs
+            # are registered only after serving advertises deferred post-reasoning constraints.
             "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
             "checkpoint_step": checkpoint_step,
-            "expected_adapter_revision": (
-                previous_deployment.get("adapter_revision") if previous_deployment else None
-            ),
+            "expected_adapter_revision": expected_adapter_revision,
         }
         if dry_run:
             try:

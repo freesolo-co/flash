@@ -568,6 +568,52 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     assert posts == []
 
 
+def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    ready = {
+        "adapter_id": revision,
+        "subfolder": "sft/run-1/seed0/adapter",
+        "metadata": {"lifecycle_state": "ready"},
+    }
+    outcomes = [
+        d.ServingError("temporary 503", status_code=503),
+        d.ServingError("connection reset"),
+        ready,
+    ]
+
+    def fake_registered_adapter(adapter_id):
+        assert adapter_id == revision
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    sleeps = []
+    monkeypatch.setattr(d, "_registered_adapter", fake_registered_adapter)
+    monkeypatch.setattr(d.time, "sleep", sleeps.append)
+
+    assert d._wait_revision_ready(revision, ready["subfolder"]) == ready
+    assert sleeps == [d.READBACK_DELAY_SECONDS, d.READBACK_DELAY_SECONDS]
+
+
+def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter",
+        lambda run_id: {"adapter_id": run_id, "metadata": {"alias_of": revision}},
+    )
+    assert d.adapter_alias_target("run-1") == revision
+
+    monkeypatch.setattr(d, "_registered_adapter", lambda run_id: {"adapter_id": run_id})
+    with pytest.raises(d.ServingError, match="legacy aliases are unsupported"):
+        d.adapter_alias_target("run-1")
+
+
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `org_id` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""

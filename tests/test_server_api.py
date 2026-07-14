@@ -1158,6 +1158,30 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.deployment = {"state": "failed", "activation_outcome_unknown": True}
+    runner._save_status(status)
+    monkeypatch.setattr(
+        app_mod,
+        "adapter_alias_target",
+        lambda _run_id: pytest.fail("dry-run deploy must not read the serving alias"),
+    )
+
+    dep = api.post(f"/v1/runs/{run_id}/deploy", json={"dry_run": True}, headers=_bearer(key))
+
+    assert dep.status_code == 200, dep.text
+    assert dep.json()["state"] == "dry_run"
+    assert runner.get_status(run_id).deployment == status.deployment
+
+
 def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod
@@ -2026,6 +2050,11 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     )
     attempted_revision = f"{run_id}@final." + "a" * 40
     expected_revisions = []
+    alias_reads = []
+
+    def fake_alias_target(alias_run_id):
+        alias_reads.append(alias_run_id)
+        return attempted_revision
 
     def fake_deploy(**kwargs):
         expected_revisions.append(kwargs["expected_adapter_revision"])
@@ -2037,6 +2066,7 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
             raise ActivationOutcomeUnknown(run_id, attempted_revision)
         return _FakeDeployment(kwargs["adapter_prefix"])
 
+    monkeypatch.setattr(app_mod, "adapter_alias_target", fake_alias_target)
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(
         app_mod,
@@ -2071,7 +2101,8 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
 
     assert retry.status_code == 200, retry.text
     assert retry.json()["state"] == "ready"
-    assert expected_revisions == [previous_revision, previous_revision]
+    assert alias_reads == [run_id]
+    assert expected_revisions == [previous_revision, attempted_revision]
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):

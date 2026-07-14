@@ -376,26 +376,6 @@ def test_resolve_deploy_step_branches(monkeypatch):
         assert exc.value.status_code == 400, bad
 
 
-def test_deployment_cas_lost(monkeypatch):
-    # No guard -> never lost, and get_status is not consulted.
-    monkeypatch.setattr(
-        serving._app,
-        "get_status",
-        lambda _r: pytest.fail("get_status must not be called without a guard"),
-    )
-    assert serving._deployment_cas_lost("run-1", None) is False
-
-    # Guard set and live state diverged -> lost; state matches -> not lost.
-    monkeypatch.setattr(
-        serving._app, "get_status", lambda _r: types.SimpleNamespace(state="cancelled")
-    )
-    assert serving._deployment_cas_lost("run-1", "deploying") is True
-    monkeypatch.setattr(
-        serving._app, "get_status", lambda _r: types.SimpleNamespace(state="deploying")
-    )
-    assert serving._deployment_cas_lost("run-1", "deploying") is False
-
-
 def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch):
     import time
 

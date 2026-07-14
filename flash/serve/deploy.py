@@ -545,12 +545,20 @@ def _wait_revision_ready(
     on_state: Callable[[dict], None] | None = None,
 ) -> dict:
     last_state = "registered"
+    last_read_error: ServingError | None = None
     for attempt in range(150):
         if attempt:
             time.sleep(READBACK_DELAY_SECONDS)
-        record = _registered_adapter(revision)
+        try:
+            record = _registered_adapter(revision)
+        except ServingError as exc:
+            if exc.status_code is not None and exc.status_code < 500:
+                raise
+            last_read_error = exc
+            continue
         if record is None:
             continue
+        last_read_error = None
         if expected_identity is not None and not _matches_revision_identity(
             record, expected_identity
         ):
@@ -566,6 +574,11 @@ def _wait_revision_ready(
             )
         if last_state == "ready" and _record_subfolder(record) == subfolder:
             return record
+    if last_read_error is not None:
+        raise ServingError(
+            f"adapter revision {revision} readiness could not be confirmed after transient "
+            f"serving errors: {last_read_error}"
+        ) from last_read_error
     raise ServingError(
         f"adapter revision {revision} remained {last_state!r}; the previous alias remains available"
     )
@@ -578,6 +591,19 @@ def _alias_target(record: dict | None) -> str | None:
     if isinstance(metadata, dict) and isinstance(metadata.get("alias_of"), str):
         return metadata["alias_of"]
     return None
+
+
+def adapter_alias_target(run_id: str) -> str | None:
+    """Read the authoritative immutable revision targeted by a mutable run alias."""
+    record = _registered_adapter(run_id)
+    if record is None:
+        return None
+    target = _alias_target(record)
+    if target is None:
+        raise ServingError(
+            f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
+        )
+    return target
 
 
 def _validate_activation_response(
