@@ -719,10 +719,13 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
-def test_chat_checkpoint_ref_uses_base_run_id(fake_client) -> None:
-    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 0
-    assert fake_client.calls[-1][0] == "chat_stream"
-    assert fake_client.calls[-1][1] == "flash-1"
+def test_chat_checkpoint_ref_is_rejected_without_client_call(fake_client, capsys) -> None:
+    calls_before = list(fake_client.calls)
+
+    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 1
+
+    assert fake_client.calls == calls_before
+    assert "full immutable adapter revision" in capsys.readouterr().err
 
 
 def test_chat_full_immutable_revision_reaches_client_unchanged(fake_client) -> None:

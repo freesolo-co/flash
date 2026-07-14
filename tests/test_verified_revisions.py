@@ -47,6 +47,38 @@ def _new_status(runner, run_id: str):
     )
 
 
+@pytest.mark.parametrize("helper_name", ["mark_deployed", "mark_checkpoint_deployed"])
+@pytest.mark.parametrize(
+    "revision",
+    [
+        None,
+        "ready-commit@final.short",
+        "another-run@final." + "a" * 40,
+    ],
+)
+def test_ready_commit_helpers_reject_noncanonical_revision(
+    monkeypatch, tmp_path, helper_name, revision
+):
+    import flash.runner as runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    run_id = "ready-commit"
+    runner._save_status(_new_status(runner, run_id))
+    deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    if revision is not None:
+        deployment["adapter_revision"] = revision
+
+    with pytest.raises(ValueError, match="full same-run adapter revision"):
+        getattr(runner, helper_name)(
+            run_id,
+            deployment,
+            verification_generation=runner.verified_adapter_revision_generation(run_id),
+        )
+
+    assert runner.get_status(run_id).deployment is None
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+
+
 @pytest.mark.parametrize(
     "raw",
     [

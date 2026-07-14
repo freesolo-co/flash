@@ -449,6 +449,68 @@ def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypat
     assert out["updated_at"] == "2026-07-12T12:00:15Z"
 
 
+def test_activation_commit_survives_lost_response_and_transient_readback_failure(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    previous = "flash-1@step-10." + "b" * 40
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+    )
+    readbacks = iter(
+        [
+            deploy.ServingError("readback unavailable"),
+            {
+                "adapter_id": "flash-1",
+                "metadata": {"record_type": "alias", "alias_of": previous},
+            },
+            {
+                "adapter_id": "flash-1",
+                "updated_at": "2026-07-12T12:00:15Z",
+                "metadata": {"record_type": "alias", "alias_of": revision},
+            },
+        ]
+    )
+
+    def read_alias(adapter_id):
+        value = next(readbacks)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(deploy, "_registered_adapter", read_alias)
+
+    out = deploy._activate_revision(
+        "flash-1", revision, "flash-1", expected_adapter_revision=previous
+    )
+
+    assert out["target_adapter_revision"] == revision
+    assert out["updated_at"] == "2026-07-12T12:00:15Z"
+
+
+def test_activation_lost_response_and_readback_remains_explicitly_unknown(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: (_ for _ in ()).throw(deploy.ServingError("readback unavailable")),
+    )
+
+    with pytest.raises(deploy.ActivationOutcomeUnknown, match="alias_activation_unknown"):
+        deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
+
+
 def test_activation_reconciliation_accepts_alias_without_updated_at(monkeypatch):
     import flash.serve.deploy as deploy
 
@@ -477,6 +539,7 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
     import flash.serve.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
         deploy,
         "_serving_request",
@@ -494,10 +557,37 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
         )
 
 
+def test_activation_divergence_requires_reconciliation(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    previous = "flash-1@step-10." + "b" * 40
+    revision = "flash-1@step-20." + "a" * 40
+    divergent = "flash-1@step-30." + "c" * 40
+    monkeypatch.setattr(
+        deploy,
+        "_serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id: {
+            "adapter_id": adapter_id,
+            "metadata": {"record_type": "alias", "alias_of": divergent},
+        },
+    )
+
+    with pytest.raises(deploy.ActivationOutcomeUnknown, match="activation diverged"):
+        deploy._activate_revision(
+            "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
+        )
+
+
 def test_activation_response_mismatch_reconciles_authoritative_previous_alias(monkeypatch):
     import flash.serve.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     revision = "flash-1@step-20." + "a" * 40
 
     class Resp:

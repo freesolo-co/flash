@@ -129,6 +129,24 @@ def _validate_chat_messages(messages: list[dict]) -> None:
             raise ClientError(f"chat messages[{index}] must be an object")
 
 
+def _parse_chat_target(target: str) -> tuple[str, str | None]:
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+
+    revision = parse_adapter_revision(target)
+    if revision is not None:
+        return revision[0], target.strip()
+    parsed = parse_checkpoint_ref(target)
+    if parsed is None:
+        raise ClientError("invalid run id: expected a bare RUN_ID or full immutable adapter revision")
+    run_id, step = parsed
+    if step is not None:
+        raise ClientError(
+            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
+            "run alias; use the full immutable adapter revision returned by flash deployments"
+        )
+    return run_id, None
+
+
 class ApiClient:
     def __init__(
         self,
@@ -399,20 +417,11 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
     ) -> dict:
-        from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-
-        revision = parse_adapter_revision(run_id)
-        parsed = parse_checkpoint_ref(run_id) if revision is None else None
-        if revision is None and parsed is None:
-            raise ClientError(
-                "invalid run id: expected RUN_ID, RUN_ID/step-N, or a full immutable "
-                "adapter revision"
-            )
-        base_run_id = revision[0] if revision is not None else parsed[0]
+        base_run_id, adapter_revision = _parse_chat_target(run_id)
         _validate_chat_messages(messages)
         body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        if revision is not None:
-            body["adapter_revision"] = run_id.strip()
+        if adapter_revision is not None:
+            body["adapter_revision"] = adapter_revision
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
@@ -427,16 +436,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
-        from flash.schema import parse_adapter_revision, parse_checkpoint_ref
-
-        revision = parse_adapter_revision(run_id)
-        parsed = parse_checkpoint_ref(run_id) if revision is None else None
-        if revision is None and parsed is None:
-            raise ClientError(
-                "invalid run id: expected RUN_ID, RUN_ID/step-N, or a full immutable "
-                "adapter revision"
-            )
-        base_run_id = revision[0] if revision is not None else parsed[0]
+        base_run_id, adapter_revision = _parse_chat_target(run_id)
         _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -450,7 +450,11 @@ class ApiClient:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "stream": True,
-                    **({"adapter_revision": run_id.strip()} if revision is not None else {}),
+                    **(
+                        {"adapter_revision": adapter_revision}
+                        if adapter_revision is not None
+                        else {}
+                    ),
                 }
             ).encode(),
             headers=headers,

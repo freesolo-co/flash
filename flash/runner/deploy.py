@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from flash.schema import parse_adapter_revision
 from flash.spec import JobSpec
 
 if TYPE_CHECKING:
@@ -22,12 +23,35 @@ if TYPE_CHECKING:
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
 _RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
 _DEPLOYMENT_BUSY_STATES = frozenset(
-    {"deploying", "queued", "registered", "downloading", "loading", "smoke_testing", "registering", "verifying"}
+    {
+        "deploying",
+        "queued",
+        "registered",
+        "downloading",
+        "loading",
+        "smoke_testing",
+        "registering",
+        "verifying",
+        "reconciling",
+    }
 )
+_REVOCATION_RETRY_STATE = "revocation_failed"
+
+
+class DeploymentRevocationError(RuntimeError):
+    """Backend revocation is unconfirmed after local serving authority was removed."""
+
+    def __init__(self, run_id: str, error: str):
+        super().__init__(
+            f"deployment_revocation_failed: local authorization for {run_id} was revoked, but "
+            f"backend disablement is unconfirmed: {error}; retry cancellation"
+        )
+        self.run_id = run_id
+        self.retryable = True
 
 
 def cancel_run(run_id: str) -> RunStatus:
-    """Cancel a run: stop the remote worker and mark it cancelled."""
+    """Cancel a run and fail closed if serving backend revocation is unconfirmed."""
     from flash.runner import (
         TERMINAL_STATES,
         _gc_run_endpoints,
@@ -35,32 +59,35 @@ def cancel_run(run_id: str) -> RunStatus:
         actual_steps_run,
         charge_usd_for_spec,
         get_status,
+        mark_deployment_revocation_failed,
         mark_deployment_undeployed,
     )
 
     status = get_status(run_id)
-    if status.state in TERMINAL_STATES:
+    retry_revocation = (
+        status.state == "cancelled"
+        and (status.deployment or {}).get("state") == _REVOCATION_RETRY_STATE
+    )
+    if status.state in TERMINAL_STATES and not retry_revocation:
         return status
-    # Only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
+    # only a deployed run can have a racing undeploy write `done`; a training `done` is genuine.
     entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
-    # A run cancelled MID-training is re-priced to how far it got: the same flash.cost estimate, but
-    # at the steps it actually ran instead of the planned steps. A `deployed` run already COMPLETED
-    # training (its cost_usd is the full quote), so it keeps that and isn't re-priced here. The price
-    # is snapshotted AFTER the remote worker is torn down (below), from the freshest persisted
-    # heartbeat, so a step the worker finished between this cancel request and teardown isn't
-    # undercounted.
-    bill_cancel = bool(status.billing_context) and not entered_deployed
+    # a mid-training cancel is re-priced to the work actually completed. deployed runs retain the
+    # completed training quote, and revocation retries never alter billing.
+    bill_cancel = bool(status.billing_context) and not entered_deployed and not retry_revocation
     remote = status.remote or {}
+    teardown_error: Exception | None = None
+    initial_teardown_confirmed = False
     if status.state == "deployed":
         try:
             from flash.serve.deploy import undeploy_adapter
 
             undeploy_adapter(run_id)
-            if status.deployment:
-                mark_deployment_undeployed(run_id)
-        except Exception:
-            pass
+            mark_deployment_undeployed(run_id)
+            initial_teardown_confirmed = True
+        except Exception as exc:
+            teardown_error = exc
     if remote:
         try:
             from flash.providers import get_provider
@@ -73,7 +100,6 @@ def cancel_run(run_id: str) -> RunStatus:
         except Exception:
             pass
     _gc_run_endpoints(spec)
-    # Price the cancel now that the worker is torn down, from the freshest persisted heartbeat.
     cancel_charge_usd: float | None = (
         charge_usd_for_spec(spec, steps=actual_steps_run(get_status(run_id)), fallback=0.0)
         if bill_cancel
@@ -82,22 +108,32 @@ def cancel_run(run_id: str) -> RunStatus:
     from flash.server._locks import _deploy_lock
 
     with _deploy_lock(run_id):
-        # Set the cancel charge (estimate at actual steps) when re-pricing a mid-training cancel; a
-        # deployed-then-cancelled run keeps its already-quoted cost_usd. The billing_retry sweep
-        # charges the run from cost_usd (idempotent by runId).
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
-        _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
+        if not retry_revocation:
+            _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
         final = get_status(run_id)
-        if (final.deployment or {}).get("state") not in (None, "undeployed", "dry_run"):
-            with contextlib.suppress(Exception):
+        deployment_state = (final.deployment or {}).get("state")
+        if deployment_state not in (None, "undeployed", "dry_run"):
+            try:
                 from flash.serve.deploy import undeploy_adapter
 
                 undeploy_adapter(run_id)
                 mark_deployment_undeployed(run_id)
+                teardown_error = None
+            except Exception as exc:
+                teardown_error = exc
+                mark_deployment_revocation_failed(run_id, str(exc))
+        elif teardown_error is not None:
+            mark_deployment_revocation_failed(run_id, str(teardown_error))
+        elif not initial_teardown_confirmed:
+            # cancel always advances the local generation, including stale status projections.
+            mark_deployment_undeployed(run_id)
         with contextlib.suppress(Exception):
             from flash.server.checkpoints import register_checkpoints_best_effort
 
             register_checkpoints_best_effort(get_status(run_id))
+    if teardown_error is not None:
+        raise DeploymentRevocationError(run_id, str(teardown_error)) from teardown_error
     return get_status(run_id)
 
 
@@ -254,12 +290,14 @@ def _commit_verified_deployment(
     verification_generation: int | None,
     commit: Callable[[], None],
 ) -> bool:
+    if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES:
+        raise ValueError("immutable deployment commit requires ready or deployed state")
     revision = deployment.get("adapter_revision")
-    if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES or not isinstance(
-        revision, str
-    ):
-        commit()
-        return True
+    parsed_revision = parse_adapter_revision(revision) if isinstance(revision, str) else None
+    if parsed_revision is None or parsed_revision[0] != run_id:
+        raise ValueError(
+            f"immutable deployment commit requires a full same-run adapter revision for {run_id}"
+        )
     if verification_generation is None:
         raise ValueError("immutable deployment commit requires a verification generation")
     from flash.runner.verified_revisions import commit_verified_adapter_revision
@@ -391,7 +429,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             return status
         previous = deployment.get("previous_deployment")
         if (
-            isinstance(previous, dict)
+            not deployment.get("activation_outcome_unknown")
+            and isinstance(previous, dict)
             and previous.get("state") in _RESTORABLE_DEPLOYMENT_STATES
         ):
             status.deployment = {
@@ -402,9 +441,38 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         else:
             failed = dict(deployment)
             failed.pop("previous_deployment", None)
-            status.deployment = {**failed, "state": "failed"}
+            state = (
+                "reconciling"
+                if failed.get("activation_outcome_unknown")
+                and failed.get("state") == "reconciling"
+                else "failed"
+            )
+            status.deployment = {**failed, "state": state}
         status.updated_at = time.time()
         _save_status(status)
+        return status
+
+
+def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
+    """Revoke local serving authority while retaining retryable backend cleanup state."""
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+
+        def _commit() -> None:
+            status.deployment = {
+                **(status.deployment or {}),
+                "state": "revocation_failed",
+                "error": error,
+                "retryable": True,
+                "updated_at": time.time(),
+            }
+            status.updated_at = time.time()
+            _save_status(status)
+
+        invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status
 
 

@@ -757,8 +757,15 @@ def cmd_chat(args) -> int:
     parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
     if revision is None and parsed is None:
         print(
-            f"invalid run/checkpoint reference {args.run_id!r} "
-            "(expected <run_id>, <run_id>/step-N, or a full immutable adapter revision)",
+            f"invalid chat target {args.run_id!r} "
+            "(expected a bare <run_id> or full immutable adapter revision)",
+            file=sys.stderr,
+        )
+        return 1
+    if revision is None and parsed[1] is not None:
+        print(
+            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
+            "run alias; use the full immutable adapter revision returned by `flash deployments`",
             file=sys.stderr,
         )
         return 1

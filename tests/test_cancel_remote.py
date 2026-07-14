@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 import flash.providers.runpod.train as ftrain
 from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
 
@@ -227,6 +229,55 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     assert out.deployment["state"] == "undeployed"
 
 
+def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    run_id = "flash-dep-revoke"
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    orch._save_status(orch.RunStatus(run_id=run_id, state="done", spec=spec.to_dict()))
+    revision = f"{run_id}@final." + "a" * 40
+    generation = orch.verified_adapter_revision_generation(run_id)
+    ready = orch.mark_deployed(
+        run_id,
+        {"state": "ready", "adapter_revision": revision, "endpoint_name": "https://serve.example"},
+        verification_generation=generation,
+    )
+    assert ready.state == "deployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({revision})
+
+    attempts = []
+
+    def fail_undeploy(target):
+        attempts.append(target)
+        raise deploy.ServingError("backend unavailable")
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", fail_undeploy)
+    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+
+    with pytest.raises(orch.DeploymentRevocationError) as excinfo:
+        orch.cancel_run(run_id)
+
+    assert excinfo.value.retryable is True
+    assert attempts == [run_id, run_id]
+    failed = orch.get_status(run_id)
+    assert failed.state == "cancelled"
+    assert failed.deployment["state"] == "revocation_failed"
+    assert failed.deployment["retryable"] is True
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: attempts.append(target) or {})
+    retried = orch.cancel_run(run_id)
+
+    assert attempts == [run_id, run_id, run_id]
+    assert retried.state == "cancelled"
+    assert retried.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
 def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path, monkeypatch):
     # Race: cancel_run enters on a non-`deployed` snapshot (state="running"), but a deploy lands during
     # teardown (running -> done -> deployed) before the terminal `cancelled` write. `deployed` is
@@ -252,7 +303,15 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     def gc_then_deploy(s):
         real_gc(s)
-        orch.mark_deployed(spec.run_id, {"state": "ready", "gpu": "RTX 5090"})
+        orch.mark_deployed(
+            spec.run_id,
+            {
+                "state": "ready",
+                "gpu": "RTX 5090",
+                "adapter_revision": f"{spec.run_id}@final." + "a" * 40,
+            },
+            verification_generation=orch.verified_adapter_revision_generation(spec.run_id),
+        )
 
     monkeypatch.setattr(orch, "_gc_run_endpoints", gc_then_deploy)
 

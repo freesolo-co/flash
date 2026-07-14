@@ -21,13 +21,14 @@ from flash.runner import (
     mark_deployed,
     mark_deployment_failed,
     mark_deployment_pending,
+    mark_deployment_revocation_failed,
     mark_undeployed,
     read_verified_adapter_revisions,
     verified_adapter_revision_generation,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import AdapterConfigMissing, ServingError
+from flash.serve.deploy import ActivationOutcomeUnknown, AdapterConfigMissing, ServingError
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server import db
@@ -46,6 +47,7 @@ _DEPLOYMENT_BUSY_STATES = {
     "smoke_testing",
     "registering",
     "verifying",
+    "reconciling",
 }
 _DEPLOYMENT_READY_STATES = {"ready", "deployed"}
 _DEPLOYMENT_STALE_SECONDS = 30 * 60
@@ -57,8 +59,9 @@ _DEPLOYMENT_ORDER = {
     "downloading": 2,
     "loading": 3,
     "smoke_testing": 4,
-    "ready": 5,
-    "failed": 6,
+    "reconciling": 5,
+    "ready": 6,
+    "failed": 7,
 }
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 # hard wall-clock budget for the whole smoke (environment setup + every generation turn),
@@ -148,7 +151,7 @@ def _previous_ready_deployment(deployment: dict) -> dict | None:
     state = deployment.get("state")
     if state in _DEPLOYMENT_READY_STATES:
         return dict(deployment)
-    if state not in _DEPLOYMENT_BUSY_STATES:
+    if state not in _DEPLOYMENT_BUSY_STATES or state == "reconciling":
         return None
     previous = deployment.get("previous_deployment")
     if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
@@ -386,8 +389,7 @@ def _finish_deployment_unlocked(
         )
         mark_deployment_pending(run_id, current)
 
-    def _before_activate(adapter_revision: str, checkpoint: str) -> None:
-        nonlocal current
+    def _assert_activation_fence() -> None:
         latest = _app.get_status(run_id)
         latest_deployment = latest.deployment or {}
         if (
@@ -411,10 +413,17 @@ def _finish_deployment_unlocked(
             raise ServingError(
                 f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
             )
+        expected_generation = deployment.get("verification_generation")
+        if verified_adapter_revision_generation(run_id) != expected_generation:
+            raise ServingError("deployment verification generation changed before alias activation")
+
+    def _before_activate(adapter_revision: str, checkpoint: str) -> None:
+        nonlocal current
+        _assert_activation_fence()
         # smoke is unconditional for real deployments: alias activation only ever follows a
         # verified generation against the immutable revision.
         current = _deployment_state(
-            current,
+            {**current, "adapter_revision": adapter_revision},
             "smoke_testing",
             detail="running bounded environment smoke",
             smoke_started_at=time.time(),
@@ -428,6 +437,17 @@ def _finish_deployment_unlocked(
                 expected_checkpoint=checkpoint,
             )
         )
+        current = _deployment_state(
+            current,
+            "reconciling",
+            detail="activating alias and reconciling the authoritative target",
+            activation_outcome_unknown=True,
+            activation_started_at=time.time(),
+        )
+        mark_deployment_pending(run_id, current)
+        # cancellation can revoke the ledger while smoke is blocked, so fence again immediately
+        # before deploy_adapter issues the activation request.
+        _assert_activation_fence()
 
     try:
         dep = _app.deploy_adapter(
@@ -437,6 +457,7 @@ def _finish_deployment_unlocked(
         )
         activated = True
         current = {**current, **dep.to_dict()}
+        current.pop("activation_outcome_unknown", None)
         current["verify"] = True
         current = _deployment_state(
             current,
@@ -512,6 +533,17 @@ def _finish_deployment_unlocked(
             _reconcile_commit_miss()
             return
     except Exception as exc:
+        if isinstance(exc, ActivationOutcomeUnknown):
+            reconciling = _deployment_state(
+                current,
+                "reconciling",
+                error=str(exc),
+                detail="alias activation outcome is unknown; authoritative reconciliation required",
+                activation_outcome_unknown=True,
+                reconciliation_started_at=time.time(),
+            )
+            mark_deployment_failed(run_id, reconciling)
+            return
         if activated:
             try:
                 latest = _app.get_status(run_id)
@@ -543,8 +575,10 @@ def _finish_deployment_unlocked(
                     f"{run_id}/step-{steps[-1]}` (available steps: "
                     f"{', '.join(str(step) for step in steps)})"
                 )
+        failed_source = dict(current)
+        failed_source.pop("activation_outcome_unknown", None)
         failed = _deployment_state(
-            current,
+            failed_source,
             "failed",
             error=error,
             detail="deployment failed; previous working alias was preserved",
@@ -782,13 +816,21 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 @router.delete("/v1/runs/{run_id}/deploy")
 def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
     with _app._deploy_lock(run_id):
-        status = owned_run(run_id, key)
+        owned_run(run_id, key)
         try:
             result = _app.undeploy_adapter(run_id)
         except ServingError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        if status.deployment:
-            mark_undeployed(run_id)
+            mark_deployment_revocation_failed(run_id, str(exc))
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "deployment_revocation_failed",
+                    "run_id": run_id,
+                    "retryable": True,
+                    "message": str(exc),
+                },
+            ) from exc
+        mark_undeployed(run_id)
         return result
 
 
@@ -881,6 +923,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     status = owned_run(run_id, key)
     adapter_revision = payload.get("adapter_revision")
     serving_model = run_id
+    verified_revisions = _verified_adapter_revisions(status)
     if adapter_revision is not None:
         parsed_revision = (
             parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
@@ -896,7 +939,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                 detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
             )
         serving_model = adapter_revision.strip()
-        if serving_model not in _verified_adapter_revisions(status):
+        if serving_model not in verified_revisions:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -906,7 +949,18 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
     deployment_state = deployment.get("state")
-    has_ready_deploy = _previous_ready_deployment(deployment) is not None
+    ready_deployment = _previous_ready_deployment(deployment)
+    has_ready_deploy = ready_deployment is not None
+    if adapter_revision is None and ready_deployment is not None:
+        ready_revision = ready_deployment.get("adapter_revision")
+        parsed_ready_revision = (
+            parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
+        )
+        has_ready_deploy = bool(
+            parsed_ready_revision is not None
+            and parsed_ready_revision[0] == run_id
+            and ready_revision in verified_revisions
+        )
     # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
     # a live adapter that /v1/deployments lists as active without requiring a final adapter.
     # Only block chat when there's no active deployment to serve.

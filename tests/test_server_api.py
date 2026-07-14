@@ -1237,6 +1237,135 @@ def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
     assert "run state changed from 'done' to 'cancelled'" in resp.json()["error"]
 
 
+def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatch):
+    import threading
+
+    import flash.runner as runner
+    import flash.serve.deploy as deploy_mod
+    import flash.server.app as app_mod
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    previous_revision = f"{run_id}@step-10." + "b" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://old.example",
+            "adapter_revision": previous_revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    attempted_revision = f"{run_id}@final." + "a" * 40
+    smoke_started = threading.Event()
+    release_smoke = threading.Event()
+    local_revoked = threading.Event()
+    activations = []
+    results: dict[str, object] = {}
+
+    def blocked_smoke(*args, **kwargs):
+        smoke_started.set()
+        if not release_smoke.wait(timeout=5):
+            raise TimeoutError("test did not release deployment smoke")
+        return {"verified_at": time.time()}
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](attempted_revision, run_id)
+        activations.append(attempted_revision)
+        raise AssertionError("activation must not run after cancellation wins")
+
+    def fake_undeploy(target):
+        assert target == run_id
+        return {"run_id": run_id}
+
+    real_mark_undeployed = runner.mark_deployment_undeployed
+
+    def mark_undeployed_then_release(target):
+        status = real_mark_undeployed(target)
+        local_revoked.set()
+        return status
+
+    monkeypatch.setattr(serving, "_run_deployment_smoke", blocked_smoke)
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
+    monkeypatch.setattr(runner, "mark_deployment_undeployed", mark_undeployed_then_release)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+
+    deploy_thread = threading.Thread(
+        target=lambda: results.setdefault(
+            "deploy",
+            api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key)),
+        )
+    )
+    deploy_thread.start()
+    assert smoke_started.wait(timeout=5)
+
+    def cancel_target():
+        try:
+            results["cancel"] = runner.cancel_run(run_id)
+        except BaseException as exc:
+            results["cancel_error"] = exc
+
+    cancel_thread = threading.Thread(target=cancel_target)
+    cancel_thread.start()
+    assert local_revoked.wait(timeout=5)
+    release_smoke.set()
+    deploy_thread.join(timeout=5)
+    cancel_thread.join(timeout=5)
+
+    assert not deploy_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert "cancel_error" not in results
+    assert activations == []
+    assert results["deploy"].status_code == 200
+    final = runner.get_status(run_id)
+    assert final.state == "cancelled"
+    assert final.deployment["state"] == "undeployed"
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+
+
+def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    attempts = []
+
+    def fail_undeploy(target):
+        attempts.append(target)
+        raise deploy_mod.ServingError("backend unavailable")
+
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", fail_undeploy)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+
+    response = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["code"] == "deployment_revocation_failed"
+    assert detail["run_id"] == run_id
+    assert detail["retryable"] is True
+    assert "backend unavailable" in detail["message"]
+    assert attempts == [run_id, run_id]
+    status = runner.get_status(run_id)
+    assert status.state == "cancelled"
+    assert status.deployment["state"] == "revocation_failed"
+    assert status.deployment["retryable"] is True
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+
+
 def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -1517,7 +1646,18 @@ def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     status.state = "done"
     status.deployment = {"state": "deploying", "updated_at": 0.0, "requested_at": 0.0}
     runner._save_status(status)
-    monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
+    revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, run_id),
+    )
 
     resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
 
@@ -1600,6 +1740,51 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
     assert deployment["endpoint_name"] == "old"
     assert deployment["last_deploy_error"] == "new adapter failed smoke"
     assert resp.json()["endpoint_name"] == "old"
+
+
+def test_activation_unknown_does_not_restore_previous_ready_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ActivationOutcomeUnknown
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    previous_revision = f"{run_id}@step-10." + "b" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://old.example",
+            "adapter_revision": previous_revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    attempted_revision = f"{run_id}@final." + "a" * 40
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](attempted_revision, run_id)
+        activating = runner.get_status(run_id).deployment
+        assert activating["state"] == "reconciling"
+        assert activating["activation_outcome_unknown"] is True
+        raise ActivationOutcomeUnknown(run_id, attempted_revision)
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(attempted_revision, run_id),
+    )
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "reconciling"
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "reconciling"
+    assert deployment["adapter_revision"] == attempted_revision
+    assert deployment["activation_outcome_unknown"] is True
+    assert "previous_deployment" not in deployment
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):
@@ -1834,7 +2019,16 @@ def test_chat_streams_deployed_run(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     seen = {}
 
@@ -1946,6 +2140,76 @@ def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monke
     assert "has not passed a successful deployment smoke" in response.json()["detail"]
 
 
+def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("status-only ready record must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    assert "no active deployment" in response.json()["detail"]
+
+
+def test_chat_bare_alias_rejects_reconciling_activation_with_previous_ready(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    previous_revision = f"{run_id}@step-10." + "b" * 40
+    previous = {
+        "state": "ready",
+        "endpoint_name": "https://old.example",
+        "adapter_revision": previous_revision,
+    }
+    runner.mark_deployed(
+        run_id,
+        previous,
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    runner.mark_deployment_pending(
+        run_id,
+        {
+            "state": "reconciling",
+            "requested_at": time.time(),
+            "updated_at": time.time(),
+            "activation_outcome_unknown": True,
+            "previous_deployment": previous,
+        },
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an uncertain alias target must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    assert "deployment is reconciling" in response.json()["detail"]
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
+
+
 def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -2015,7 +2279,16 @@ def test_chat_rejects_cross_run_immutable_revision(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -2048,7 +2321,16 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     seen = {}
 
@@ -2084,7 +2366,16 @@ def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     seen = {}
 
@@ -2125,9 +2416,18 @@ def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkey
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner.get_status(run_id)
-    status.state = "cancelled"  # cancelled, but with a live checkpoint deployment
-    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    status.state = "cancelled"
     runner._save_status(status)
+    revision = f"{run_id}@step-40." + "a" * 40
+    runner.mark_checkpoint_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
 
     monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
     with api.stream(
@@ -2207,7 +2507,16 @@ def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {
+            "state": "ready",
+            "endpoint_name": "https://serve.example",
+            "adapter_revision": revision,
+        },
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
     monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi"]))
 
     headers = {**_bearer(key), "content-type": "application/json"}
@@ -2244,8 +2553,42 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 
     resp = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
     assert resp.status_code == 502, resp.text
-    assert "serving backend unreachable" in resp.json()["detail"]
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
+    detail = resp.json()["detail"]
+    assert detail["code"] == "deployment_revocation_failed"
+    assert detail["retryable"] is True
+    assert "serving backend unreachable" in detail["message"]
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    deployment = runner.get_status(run_id).deployment
+    assert deployment["state"] == "revocation_failed"
+    assert deployment["retryable"] is True
+
+
+def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revision = f"{run_id}@final." + "f" * 40
+    generation = runner.verified_adapter_revision_generation(run_id)
+    assert runner.add_verified_adapter_revision(
+        run_id,
+        revision,
+        expected_generation=generation,
+    )
+    assert runner.get_status(run_id).deployment is None
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda target: {"run_id": target, "serving_deregistered": False},
+    )
+
+    response = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert runner.verified_adapter_revision_generation(run_id) == generation + 1
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner.get_status(run_id).deployment is None
 
 
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
@@ -2260,9 +2603,18 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
 
     spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-1"}
     runner._save_status(runner.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None))
-    out = runner.mark_deployed("dep-1", {"endpoint_name": "e"})
+    deployment = {
+        "state": "ready",
+        "endpoint_name": "e",
+        "adapter_revision": "dep-1@final." + "a" * 40,
+    }
+    out = runner.mark_deployed(
+        "dep-1",
+        deployment,
+        verification_generation=runner.verified_adapter_revision_generation("dep-1"),
+    )
     assert out.state == "deployed"
-    assert out.deployment == {"endpoint_name": "e"}
+    assert out.deployment == deployment
 
     # cancelled is sticky: the deploy must be refused, state preserved.
     runner._save_status(
@@ -2345,7 +2697,15 @@ def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monke
             finished_at=None,
         )
     )
-    out = runner.mark_deployed("dep-leg", {"endpoint_name": "e"})
+    out = runner.mark_deployed(
+        "dep-leg",
+        {
+            "state": "ready",
+            "endpoint_name": "e",
+            "adapter_revision": "dep-leg@final." + "a" * 40,
+        },
+        verification_generation=runner.verified_adapter_revision_generation("dep-leg"),
+    )
     assert out.state == "deployed"
     assert out.finished_at == teardown  # frozen to the real teardown time
     assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
@@ -2364,7 +2724,16 @@ def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monke
             deployment={"endpoint_name": "e"},
         )
     )
-    out2 = runner.mark_deployed("dep-leg2", {"endpoint_name": "e2"}, expect_state="deployed")
+    out2 = runner.mark_deployed(
+        "dep-leg2",
+        {
+            "state": "ready",
+            "endpoint_name": "e2",
+            "adapter_revision": "dep-leg2@final." + "b" * 40,
+        },
+        expect_state="deployed",
+        verification_generation=runner.verified_adapter_revision_generation("dep-leg2"),
+    )
     assert out2.state == "deployed"
     assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
 
@@ -2381,7 +2750,15 @@ def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monke
             reconciled_at=8_500.0,
         )
     )
-    out3 = runner.mark_deployed("dep-leg3", {"endpoint_name": "e3"})
+    out3 = runner.mark_deployed(
+        "dep-leg3",
+        {
+            "state": "ready",
+            "endpoint_name": "e3",
+            "adapter_revision": "dep-leg3@final." + "c" * 40,
+        },
+        verification_generation=runner.verified_adapter_revision_generation("dep-leg3"),
+    )
     assert out3.state == "deployed"
     assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
 
@@ -3330,15 +3707,22 @@ def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     captured = {}
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revision = f"{run_id}@step-40." + "a" * 40
 
     def fake_deploy(**kwargs):
         captured.update(kwargs)
+        kwargs["before_activate"](revision, f"{run_id}/step-40")
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, f"{run_id}/step-40"),
+    )
 
-    key = _login()
-    run_id = _make_run(api, key, "done")
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
     # Served the step-40 checkpoint's adapter, not the run's final adapter.
@@ -3420,14 +3804,21 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
     run_id = _make_run(api, key, "running")
+    revision = f"{run_id}@step-40." + "a" * 40
 
     def fake_deploy(**kwargs):
         status = runner.get_status(run_id)
         status.state = "done"
         runner._save_status(status)
+        kwargs["before_activate"](revision, f"{run_id}/step-40")
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: _smoke_chat_result(revision, f"{run_id}/step-40"),
+    )
 
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
@@ -3447,8 +3838,18 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
     key = _login()
     run_id = _make_run(api, key, "done")
 
+    final_deployment = {
+        "state": "ready",
+        "endpoint_name": "final",
+        "adapter_revision": f"{run_id}@final." + "f" * 40,
+    }
+
     def fake_deploy(**kwargs):
-        runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "final"})
+        runner.mark_deployed(
+            run_id,
+            final_deployment,
+            verification_generation=runner.verified_adapter_revision_generation(run_id),
+        )
         return _FakeDeployment(kwargs["adapter_prefix"])
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
@@ -3458,7 +3859,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
     assert undeploys == []
     status = runner.get_status(run_id)
     assert status.state == "deployed"
-    assert status.deployment == {"state": "ready", "endpoint_name": "final"}
+    assert status.deployment == final_deployment
 
 
 def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):

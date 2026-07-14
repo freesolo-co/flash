@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 READBACK_DELAY_SECONDS = 2.0
+ACTIVATION_READBACK_ATTEMPTS = 3
 
 
 class ServingError(RuntimeError):
@@ -28,6 +29,20 @@ class ServingError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ActivationOutcomeUnknown(ServingError):
+    """Alias activation cannot be resolved to the attempted or previous revision."""
+
+    def __init__(self, run_id: str, attempted_revision: str, *, detail: str | None = None):
+        reason = detail or "authoritative alias readback failed"
+        super().__init__(
+            "alias_activation_unknown: serving may have activated "
+            f"{attempted_revision} for {run_id}, but {reason}; retry deployment reconciliation "
+            "before treating either revision as authoritative"
+        )
+        self.run_id = run_id
+        self.attempted_revision = attempted_revision
 
 
 class AdapterConfigMissing(ServingError):
@@ -599,29 +614,48 @@ def _activate_revision(
             expected_adapter_revision=expected_adapter_revision,
         )
     except (ServingError, ValueError) as exc:
-        try:
-            alias = _registered_adapter(run_id)
-        except ServingError as read_exc:
-            raise exc from read_exc
-        target = _alias_target(alias)
-        if target == revision:
-            return {
-                "adapter_id": run_id,
-                "target_adapter_revision": revision,
-                "previous_adapter_revision": expected_adapter_revision,
-                "checkpoint": checkpoint,
-                "updated_at": alias.get("updated_at") if alias else None,
-            }
+        alias = None
+        read_error: ServingError | None = None
+        target = None
+        for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
+            if attempt:
+                time.sleep(READBACK_DELAY_SECONDS)
+            try:
+                alias = _registered_adapter(run_id)
+                read_error = None
+            except ServingError as read_exc:
+                read_error = read_exc
+                continue
+            target = _alias_target(alias)
+            if target == revision:
+                return {
+                    "adapter_id": run_id,
+                    "target_adapter_revision": revision,
+                    "previous_adapter_revision": expected_adapter_revision,
+                    "checkpoint": checkpoint,
+                    "updated_at": alias.get("updated_at") if alias else None,
+                }
+            if target not in (None, expected_adapter_revision):
+                break
+        if read_error is not None:
+            raise ActivationOutcomeUnknown(run_id, revision) from read_error
         if expected_adapter_revision is not None and target == expected_adapter_revision:
             raise ServingError(
                 f"alias activation was not committed; {run_id} still targets {target!r}"
             ) from exc
         if target is None:
-            raise ServingError(
-                f"alias activation outcome is ambiguous; {run_id} did not expose an alias target"
+            raise ActivationOutcomeUnknown(
+                run_id,
+                revision,
+                detail=(
+                    "alias activation outcome is ambiguous because authoritative readback exposed "
+                    "no target"
+                ),
             ) from exc
-        raise ServingError(
-            f"alias activation was superseded; {run_id} authoritatively targets {target!r}"
+        raise ActivationOutcomeUnknown(
+            run_id,
+            revision,
+            detail=f"alias activation diverged because authoritative readback targets {target!r}",
         ) from exc
 
 
