@@ -105,9 +105,10 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["hf_repo"] == "0.2.0"
     assert TRAIN_KEY_MIN_VERSIONS["max_context_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
-    assert TRAIN_KEY_MIN_VERSIONS["opd_eos_loss_coef"] == "0.2.55"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
+    # opd has no auxiliary eos loss or user-facing eos-loss key.
+    assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
         value
         for key, value in TRAIN_KEY_MIN_VERSIONS.items()
@@ -115,7 +116,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
         not in {
             "max_context_tokens",
             "max_completion_tokens",
-            "opd_eos_loss_coef",
             "teacher_model",
             "structured_outputs",
         }
@@ -163,7 +163,11 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    assert historical_shapes["861571e7"] == TRAIN_SCHEMA_KEYS
+    # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
+    # did. opd has no auxiliary eos loss or user-facing eos-loss key, so current TRAIN_SCHEMA_KEYS
+    # equals the latest historical shape minus that one key.
+    assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS
+    assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
     for key in ("structured_outputs", "teacher_model"):
         rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
@@ -254,19 +258,6 @@ def test_blank_or_null_init_adapter_preserves_explicit_rank(init_from_adapter) -
 
     assert spec.train.init_from_adapter == ""
     assert spec.train.lora_rank == 8
-
-
-def test_opd_eos_loss_coef_accepted_by_schema() -> None:
-    # Regression: opd_eos_loss_coef was added to flash.spec.TrainSpec + the worker, but NOT the
-    # client/server schema allowlist, so `[train] opd_eos_loss_coef` was hard-rejected as an unknown
-    # key at submit — the documented override never reached the worker. It must round-trip here.
-    assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 0.0})).train.opd_eos_loss_coef == 0.0
-    assert spec_from_dict(_raw(**{"train.opd_eos_loss_coef": 1.5})).train.opd_eos_loss_coef == 1.5
-    assert (
-        spec_from_dict(_raw()).train.opd_eos_loss_coef is None
-    )  # unset -> recipe default at resolve
-    with pytest.raises(ConfigError, match="opd_eos_loss_coef"):
-        spec_from_dict(_raw(**{"train.opd_eos_loss_coef": -1.0}))  # negative rejected (minimum 0)
 
 
 def test_falsy_algorithm_defaults_to_sft() -> None:

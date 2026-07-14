@@ -259,13 +259,16 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
             return "".join(table.get(int(i), "") for i in ids)
 
     knobs = OpdKnobs(stop_sequences=("</answer>",))
+    eos_ids = frozenset({99})
     truncated = _gen_from_vllm_output(
-        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs
+        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs, eos_ids
     )
     assert truncated.truncated is True
+    assert truncated.finish_reason == "length"
+    assert truncated.stop_reason is None
 
     stopped = _gen_from_vllm_output(
-        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs
+        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs, eos_ids
     )
     assert stopped.truncated is False
     assert stopped.skip is False
@@ -273,20 +276,35 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
     assert stopped.completion_text == "ok"
 
     length_stopped = _gen_from_vllm_output(
-        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="length"), _Tok(), knobs
+        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="length"), _Tok(), knobs, eos_ids
     )
     assert length_stopped.truncated is False
     assert length_stopped.skip is False
     assert length_stopped.completion_ids == [1]
     assert length_stopped.completion_text == "ok"
+    assert length_stopped.finish_reason == "length"
 
     length_eos = _gen_from_vllm_output(
-        OpdVllmOutput([1, 99], "ok", finish_reason="length"), _Tok(), OpdKnobs()
+        OpdVllmOutput([1, 99], "ok", finish_reason="length"),
+        _Tok(),
+        OpdKnobs(),
+        eos_ids,
     )
     assert length_eos.truncated is False
     assert length_eos.skip is False
     assert length_eos.completion_ids == [1, 99]
     assert length_eos.completion_text == "ok"
+    assert length_eos.terminal_eos_id == 99
+    stop_over_eos_over_length = _gen_from_vllm_output(
+        OpdVllmOutput([1, 99, 2], "ok</answer>", finish_reason="length", stop_reason="</answer>"),
+        _Tok(),
+        knobs,
+        eos_ids,
+    )
+    assert stop_over_eos_over_length.truncated is False
+    assert stop_over_eos_over_length.completion_ids == [1, 99]
+    assert stop_over_eos_over_length.completion_text == "ok"
+    assert stop_over_eos_over_length.terminal_eos_id == 99
 
 
 def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
@@ -602,6 +620,7 @@ def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_pa
         temperature=0.7,
         top_p=0.9,
         stop_sequences=("</answer>",),
+        eos_token_ids=(2, 73, 151645),
         structured_outputs=spec,
         adapter_root=str(tmp_path / "sync"),
     )
@@ -612,6 +631,7 @@ def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_pa
     assert isinstance(so, _SOParams)
     assert so.kwargs == spec
     assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]  # coexists with the stop knobs
+    assert _SamplingParams.last_kwargs["stop_token_ids"] == [2, 73, 151645]
 
 
 def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_path):
