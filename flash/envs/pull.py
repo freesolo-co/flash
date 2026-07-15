@@ -172,7 +172,6 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
     extract_validated_archive_members(
         reader,
         extract_base=root,
-        guard_root=root,
         content_byte_limit=loader._MAX_ARCHIVE_BYTES,
         extracted_member_limit=loader._MAX_ARCHIVE_MEMBERS,
         scanned_member_limit=loader._MAX_ARCHIVE_SCAN_MEMBERS,

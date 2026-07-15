@@ -49,12 +49,10 @@ def test_extract_validated_archive_members_public_boundary(tmp_path: Path) -> No
         lambda: RuntimeError("unexpected archive limit"),
     )
     observed: list[list[str]] = []
-    root = tmp_path.resolve()
 
     extract_validated_archive_members(
         reader,
         extract_base=tmp_path,
-        guard_root=root,
         content_byte_limit=2,
         extracted_member_limit=1,
         scanned_member_limit=2,

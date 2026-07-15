@@ -568,7 +568,6 @@ def _safe_extract_archive(
 
 def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
     """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    root = dest.resolve()
     want = [p for p in subdir.split("/") if p] if subdir else []
     top_dirs: set[str] = set()
     reader = LimitedArchiveReader(
@@ -581,7 +580,6 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     extract_validated_archive_members(
         reader,
         extract_base=dest,
-        guard_root=root,
         content_byte_limit=_MAX_ARCHIVE_BYTES,
         extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
         scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,

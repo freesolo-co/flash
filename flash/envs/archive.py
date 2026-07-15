@@ -15,10 +15,9 @@ from flash.envs.archive_policy import (
 
 
 def extract_validated_archive_members(
-    reader: BinaryIO | LimitedArchiveReader,
+    reader: LimitedArchiveReader,
     *,
     extract_base: Path,
-    guard_root: Path,
     content_byte_limit: int,
     extracted_member_limit: int,
     scanned_member_limit: int,
@@ -26,6 +25,7 @@ def extract_validated_archive_members(
     segment_observer: Callable[[list[str]], None] | None = None,
 ) -> None:
     """Extract validated tar members into ``extract_base`` within explicit limits."""
+    guard_root = extract_base.resolve()
     total = 0
     extracted = 0
     scanned = 0
