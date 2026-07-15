@@ -150,6 +150,10 @@ def verify_gpu(requested_gpu: str | None, *, exact_type: str = "") -> None:
                 f"requested={requested_canonical!r}, observed={observed_canonical!r}, "
                 f"device_name={live_name!r}; retrying on a correctly-provisioned GPU"
             )
+        # exact_type is the authoritative hardware pin and its vram sufficiency was validated at quote
+        # time. once the live card matches the pinned class, do not run the softer requested_gpu hint
+        # through _gpu_mismatch_reason, which may name a larger class and reject this correct card.
+        return
 
     live_cap = None
     live_vram_gb = None

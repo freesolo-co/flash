@@ -368,6 +368,25 @@ def vocab_size_for(model_id: str) -> int:
     return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
 
 
+def resolve_vocab_size(model_id: str, revision: str = "") -> int:
+    """vocab_size for a model, revision-aware when a commit is pinned (mirrors resolve_params_b).
+
+    catalog vocab by default; for a pinned revision, the hf config vocab validated against the
+    catalog (fail-closed, same as the vram path).
+    """
+    info = MODELS.get(model_id)
+    if revision:
+        from flash.engine.vram import _validated_revision_geometry, fetch_hf_model_geometry
+
+        if info is not None:
+            _params_b, vocab = _validated_revision_geometry(model_id, revision, info)
+            return int(vocab or info.vocab_size)
+        _p, vocab, _h, _l = fetch_hf_model_geometry(model_id, revision, strict=True)
+        if vocab:
+            return int(vocab)
+    return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
+
+
 def resolve_model(
     model_id: str,
     algorithm: str,
