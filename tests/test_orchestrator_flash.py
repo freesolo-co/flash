@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import tempfile
 
@@ -19,7 +20,9 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
         # _run_job_inner uploads the run code before training; stub it (no HF).
-        monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo")
+        monkeypatch.setattr(
+            "flash.providers._worker.upload_code", lambda repo=None, **_: "mock/repo"
+        )
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
@@ -49,6 +52,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type="RTX 4090"),
+            seed=123,
         )
         status = runner.submit_job(spec, dry_run=False, background=False)
 
@@ -58,6 +62,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
         assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
         assert captured["gpu"] == "RTX 4090"
+        assert captured["seed"] == 123
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
         metrics_path = os.path.join(tmp, "results", "runpod", "rl", status.run_id, "metrics.json")
@@ -485,7 +490,6 @@ def test_run_job_background_swallows_exception(monkeypatch):
         raise RuntimeError("seed 0 failed after retries: job_failed")
 
     # The wrapper dispatches through the package-level _run_job that tests patch.
-    monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
     monkeypatch.setattr(runner, "_run_job", boom)
     spec = type("S", (), {"run_id": "bg-run"})()
     # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
@@ -493,7 +497,7 @@ def test_run_job_background_swallows_exception(monkeypatch):
     assert calls["n"] == 1
 
 
-def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
+def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch, caplog):
     """If _run_job crashes BEFORE _run_job_inner persisted a terminal state (e.g. an import/resolve
     error), the daemon wrapper must still record a terminal `failed` (via terminal-sticky _update) so
     the run doesn't hang non-terminal forever."""
@@ -509,18 +513,23 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
         os.makedirs(runner.RUNS_DIR, exist_ok=True)
         # a non-terminal (queued) run, as submit_job persists before dispatching the daemon thread
         runner._save_status(RunStatus(run_id="bg-fail", state="queued", spec={}))
+        raw_message = "crashed before persisting terminal state"
 
         def boom(spec):
-            raise RuntimeError("crashed before persisting terminal state")
+            raise RuntimeError(raw_message)
 
-        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
+        caplog.set_level(logging.WARNING, logger=runner.__name__)
         spec = type("S", (), {"run_id": "bg-fail"})()
         runner._run_job_background(spec)  # must not raise
 
         status = runner.get_status("bg-fail")
         assert status.state == "failed"
-        assert "crashed before persisting" in (status.error or "")
+        safe_detail = "RuntimeError: background run failed"
+        assert status.error == safe_detail
+        assert raw_message not in (status.error or "")
+        assert f"background run bg-fail ended in error: {safe_detail}" in caplog.messages
+        assert raw_message not in caplog.text
 
 
 def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
@@ -544,7 +553,6 @@ def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
         def boom(spec):
             raise RuntimeError("generic wrapper-level error")
 
-        monkeypatch.setattr(runner, "_resolve_init_from_adapter", lambda spec: spec)
         monkeypatch.setattr(runner, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-done"})()
         runner._run_job_background(spec)  # must not raise

@@ -1,7 +1,7 @@
-"""delete_endpoint: a 404 (endpoint already gone) is a clean teardown, not a failure.
+"""delete_endpoint_for_key: a 404 under the owning account is a clean teardown.
 
 CPU-only; urllib mocked. Drives a real HTTPError through request_with_retries so the
-__cause__ chaining delete_endpoint relies on is genuinely exercised.
+__cause__ chaining used by key-addressed deletion is genuinely exercised.
 """
 
 from __future__ import annotations
@@ -35,36 +35,32 @@ def _patch_urlopen(monkeypatch, error):
 def test_delete_endpoint_404_reports_success(monkeypatch):
     from flash.providers.runpod import api as runpod_api
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(404, b'{"error": "endpoint does not exist"}'))
-    # Already gone == desired end state reached == clean teardown.
-    assert runpod_api.delete_endpoint("ep-gone") is True
+    # already gone == desired end state reached == clean teardown.
+    assert runpod_api.delete_endpoint_for_key("ep-gone", "rk-test") is True
 
 
 def test_delete_endpoint_other_error_reports_failure(monkeypatch):
     from flash.providers.runpod import api as runpod_api
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "forbidden"}'))
-    assert runpod_api.delete_endpoint("ep-denied") is False
+    assert runpod_api.delete_endpoint_for_key("ep-denied", "rk-test") is False
 
 
 def test_delete_endpoint_5xx_exhausted_reports_failure(monkeypatch):
     from flash.providers.runpod import api as runpod_api
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
-    # 5xx retries then raises "failed after N attempts" (no __cause__ HTTPError, no 404 text).
+    # 5xx retries then raises "failed after n attempts" (no __cause__ httperror, no 404 text).
     _patch_urlopen(monkeypatch, _http_error(500, b"boom"))
-    assert runpod_api.delete_endpoint("ep-flaky") is False
+    assert runpod_api.delete_endpoint_for_key("ep-flaky", "rk-test") is False
 
 
 def test_delete_endpoint_403_with_not_found_text_reports_failure(monkeypatch):
     """A 403 whose body says "does not exist" is still a 403 — must NOT be swallowed."""
     from flash.providers.runpod import api as runpod_api
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "endpoint does not exist"}'))
-    assert runpod_api.delete_endpoint("ep-denied") is False
+    assert runpod_api.delete_endpoint_for_key("ep-denied", "rk-test") is False
 
 
 def test_is_not_found_uses_cause_code_not_message():

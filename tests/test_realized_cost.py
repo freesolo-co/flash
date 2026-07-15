@@ -277,23 +277,51 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     # it, since `deployed` is non-terminal). Exercises the real on-disk record_realized_cost.
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
     now = 1_000_000.0
-    snapshot = _status(
+    created_at = now - 10_000.0
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+            "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
+            "gpu": {"type": "RTX 5090"},
+        },
         run_id="r-adv",
-        state="done",  # state as seen when the reconcile snapshot was taken
-        updated_at=now - 7200,
-        remote={"provider": "runpod", "endpoint_id": "ep-1"},
     )
-    # The run has since advanced to `deployed` on disk (serving stood up on the finished run).
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-1",
+        "endpoint_name": "flash-r-adv-a0",
+        "key_fingerprint": "rpk-0123456789ab",
+        "job_id": "job-1",
+        "attempt": 0,
+        "started_ts": created_at + 100.0,
+    }
+    snapshot = runner.RunStatus(
+        run_id="r-adv",
+        state="done",
+        spec=spec.to_dict(),
+        created_at=created_at,
+        updated_at=now - 7200,
+        finished_at=now - 7200,
+        remote=remote,
+    )
+    # the run has since advanced to `deployed` on disk (serving stood up on the finished run).
     runner._save_status(
         runner.RunStatus(
             run_id="r-adv",
             state="deployed",
-            spec={},
-            created_at=0.0,
+            spec=spec.to_dict(),
+            created_at=created_at,
             updated_at=now - 100,
-            remote={"provider": "runpod", "endpoint_id": "ep-1"},
+            finished_at=now - 7200,
+            remote=remote,
             deployment={"state": "active"},
-        )
+        ),
+        _run_deadline_at=created_at + float(spec.gpu.max_wall_seconds),
+        _next_attempt=1,
     )
     monkeypatch.setattr(
         reconcile,

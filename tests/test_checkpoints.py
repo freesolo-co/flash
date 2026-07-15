@@ -149,6 +149,21 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
     assert rec.uploads == []
 
 
+def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, monkeypatch):
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    ckpt = tmp_path / "checkpoint-5"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert rec.uploads == []
+
+
 # --------------------------------------------------------------------------------------------
 # Worker: make_checkpoint_upload_callback — durable flush of the final deployable checkpoint
 # --------------------------------------------------------------------------------------------
@@ -376,7 +391,7 @@ class _FakeHfApiFiles:
     def __call__(self, *a, **k):  # stand in for HfApi(...)
         return self
 
-    def list_repo_files(self, repo, repo_type=None):
+    def list_repo_files(self, repo, repo_type=None, revision=None):
         return self._files
 
 
@@ -438,7 +453,9 @@ def test_list_checkpoints_skips_step_without_weights(monkeypatch):
 
 
 def test_list_checkpoints_no_repo(monkeypatch):
-    spec = JobSpec.from_dict({**SPEC_DICT, "train": {"epochs": 1, "max_examples": 1, "hf_repo": ""}})
+    spec = JobSpec.from_dict(
+        {**SPEC_DICT, "train": {"epochs": 1, "max_examples": 1, "hf_repo": ""}}
+    )
     assert list_checkpoints(spec) == []
 
 
