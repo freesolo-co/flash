@@ -204,6 +204,7 @@ def build_worker_env(
         "RUN_ID": spec.run_id,
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
+        "SEED": str(int(seed)),
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
@@ -222,8 +223,8 @@ def build_worker_env(
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # RUN_ID/HF_REPO/FLASH_ARM are control-plane-owned: overriding them would orphan artifacts.
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
+    # run_id, hf_repo, flash_arm, and seed are control-plane-owned.
+    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
         if ku in _RESERVED_WORKER_ENV:
