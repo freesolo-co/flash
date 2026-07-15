@@ -623,10 +623,10 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert ("cancel", "flash-1") in fake_client.calls
 
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
 
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     err = capsys.readouterr().err
     assert "flash undeploy flash-1`" in err
     assert "flash undeploy flash-1/step-40`" not in err
@@ -634,7 +634,7 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["deployments"]) == 0
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
-    assert "https://serve.example/v1" in deployments_out
+    assert "REVISION" in deployments_out
 
     assert _run(["undeploy", "flash-1"]) == 0
     assert ("undeploy", "flash-1") in fake_client.calls
@@ -667,10 +667,17 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
-def test_chat_checkpoint_ref_uses_base_run_id(fake_client) -> None:
-    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 0
+def test_chat_checkpoint_ref_is_rejected(fake_client, capsys) -> None:
+    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 1
+    assert "full immutable adapter revision" in capsys.readouterr().err
+    assert not any(call[0] == "chat_stream" for call in fake_client.calls)
+
+
+def test_chat_accepts_full_immutable_revision(fake_client) -> None:
+    revision = "flash-1@step-40." + "a" * 40
+    assert _run(["chat", revision, "-m", "What is 6*7?"]) == 0
     assert fake_client.calls[-1][0] == "chat_stream"
-    assert fake_client.calls[-1][1] == "flash-1"
+    assert fake_client.calls[-1][1] == revision
 
 
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
@@ -964,7 +971,7 @@ def test_export_without_token_errors_cleanly(fake_client, monkeypatch, capsys, t
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
     assert _run(["deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
     assert "flash deployments" in err
@@ -973,15 +980,15 @@ def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
 
 def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
     assert _run(["deploy", "flash-1/step-40"]) == 0
-    assert ("deploy", "flash-1/step-40", {"dry_run": False, "verify": True}) in fake_client.calls
+    assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
 
 
-def test_deploy_no_verify_skips_server_smoke(fake_client, capsys) -> None:
-    assert _run(["deploy", "flash-1", "--no-verify"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False, "verify": False}) in fake_client.calls
-    assert not any(c[0] == "chat" for c in fake_client.calls)
-    assert "smoke verification was skipped" in capsys.readouterr().err
+def test_deploy_no_verify_flag_is_removed(fake_client) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["deploy", "flash-1", "--no-verify"])
+    assert excinfo.value.code == 2
+    assert not any(call[0] == "deploy" for call in fake_client.calls)
 
 
 def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, capsys) -> None:

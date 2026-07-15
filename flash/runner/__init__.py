@@ -1633,12 +1633,15 @@ def _save_status_unlocked(
 
 
 from flash.runner.deploy import (  # noqa: E402,F401
+    DeploymentRevocationError,
+    DeploymentStatePersistenceError,
     attach_run,
     cancel_run,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_failed,
     mark_deployment_pending,
+    mark_deployment_revocation_failed,
     mark_deployment_undeployed,
     mark_undeployed,
 )
@@ -1649,4 +1652,10 @@ from flash.runner.lifecycle import (  # noqa: E402,F401
     _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
+)
+from flash.runner.verified_revisions import (  # noqa: E402,F401
+    add_verified_adapter_revision,
+    clear_verified_adapter_revisions,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
 )
