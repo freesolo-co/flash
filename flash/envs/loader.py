@@ -536,22 +536,19 @@ def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path) -> Path:
                 tarball.unlink()
 
 
-def _safe_extract_archive(
-    tar_source: bytes | bytearray | Path, dest: Path, subdir: str = ""
-) -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+def _safe_extract_archive(tar_source: bytes | bytearray | Path, dest: Path) -> Path:
+    """Extract a GitHub repo tarball; expects a single top-level repo directory."""
     if isinstance(tar_source, (bytes, bytearray)):
         with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
             spill.write(tar_source)
             spill.seek(0)
-            return _safe_extract_archive_file(spill, dest, subdir)
+            return _safe_extract_archive_file(spill, dest)
     with tar_source.open("rb") as spill:
-        return _safe_extract_archive_file(spill, dest, subdir)
+        return _safe_extract_archive_file(spill, dest)
 
 
-def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    want = [part for part in subdir.split("/") if part]
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path) -> Path:
+    """Extract a GitHub repo tarball; expects a single top-level repo directory."""
     top_dirs: set[str] = set()
     reader = LimitedArchiveReader(
         gzip.GzipFile(fileobj=tar_file),
@@ -566,7 +563,6 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
         content_byte_limit=_MAX_ARCHIVE_BYTES,
         extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
         scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,
-        member_filter=lambda segments: not (want and segments[1 : 1 + len(want)] != want),
         segment_observer=lambda segments: top_dirs.add(segments[0]),
     )
     if len(top_dirs) != 1:
@@ -575,10 +571,7 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     if extracted_dir.exists() and not extracted_dir.is_dir():
         raise RuntimeError("environment archive had an unexpected layout")
     if not extracted_dir.is_dir():
-        if want:
-            extracted_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            raise RuntimeError("environment archive did not extract to a directory")
+        raise RuntimeError("environment archive did not extract to a directory")
     return extracted_dir
 
 
