@@ -51,8 +51,6 @@ def _external_key_prefix(token: str, identity: dict[str, Any]) -> str:
     prefix = _str_field(identity.get("key_prefix"))
     if prefix and prefix.startswith("fslo_"):
         return prefix
-    if not identity and token.startswith("fslo-user-"):
-        return "freesolo"
     return _freesolo_key_prefix(token)
 
 
@@ -145,11 +143,6 @@ def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     return out
 
 
-def _identity_email(identity: dict[str, Any]) -> str:
-    email = str(identity.get("email") or "").strip()
-    return email if "@" in email else ""
-
-
 def freesolo_base_url() -> str:
     """Freesolo backend base URL from env, trailing slash trimmed."""
     return (os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL).rstrip("/")
@@ -177,7 +170,7 @@ def _freesolo_verify(token: str) -> bool:
         if exc.code >= 500 or exc.code == 429:
             return False
         verified = False
-    except (urllib.error.URLError, OSError, ValueError):
+    except (OSError, ValueError):
         return False
     with _verify_cache_lock:
         _prune_verify_cache_locked(now)
@@ -201,7 +194,9 @@ def authenticate(authorization: str | None) -> dict | None:
         identity = _cached_identity(token)
         if not identity.get("org_slug"):
             return None
-        email = _identity_email(identity)
+        email = str(identity.get("email") or "").strip()
+        if "@" not in email:
+            email = ""
         row = db.lookup_key(token) or db.ensure_external_key(
             token,
             key_prefix=_external_key_prefix(token, identity),

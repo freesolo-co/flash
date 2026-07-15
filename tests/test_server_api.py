@@ -380,6 +380,34 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     assert not row.get("email")
 
 
+def test_invalid_external_email_is_not_persisted(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {
+            "email": "not-an-email",
+            "key_prefix": "fslo_invalidemail",
+            "org_slug": "acme",
+            "org_id": "org-acme",
+        },
+    )
+    captured = {}
+    ensure_external_key = auth_mod.db.ensure_external_key
+
+    def capture_ensure_external_key(token, *, key_prefix=None, email=None):
+        captured["email"] = email
+        return ensure_external_key(token, key_prefix=key_prefix, email=email)
+
+    monkeypatch.setattr(auth_mod.db, "ensure_external_key", capture_ensure_external_key)
+
+    assert auth_mod.authenticate("Bearer fslo-invalid-email") is not None
+    assert captured["email"] is None
+
+
 def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(api, monkeypatch):
     import flash.server.app as app_mod
 
@@ -655,6 +683,41 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
     state["code"] = 401
     assert auth_mod._freesolo_verify("bad") is False
     assert auth_mod._verify_cache.get("bad", (None,))[0] is False
+
+
+def test_freesolo_verify_discards_identity_on_exit_http_error(monkeypatch):
+    import io
+    import urllib.error
+
+    import flash.server.auth as auth_mod
+
+    importlib.reload(auth_mod)
+    auth_mod._verify_cache.clear()
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"email":"user@example.com","org_id":"org-1","org_slug":"acme"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            raise urllib.error.HTTPError(
+                "https://api.freesolo.co/api/auth/verify",
+                401,
+                "unauthorized",
+                {},
+                io.BytesIO(b'{"detail":"unauthorized"}'),
+            )
+
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+
+    assert auth_mod._freesolo_verify("tok") is False
+    verified, identity, _expires_at = auth_mod._verify_cache["tok"]
+    assert verified is False
+    assert identity == {}
 
 
 def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
