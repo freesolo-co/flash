@@ -163,6 +163,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
+        save_at_steps=t.save_at_steps,
     )
 
 
