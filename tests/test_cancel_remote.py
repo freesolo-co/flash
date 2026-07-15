@@ -930,6 +930,11 @@ def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypa
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
+        "adapter_alias_target",
+        lambda _target: pytest.fail("non-contended verified cancellation must not read the alias"),
+    )
+    monkeypatch.setattr(
+        deploy,
         "undeploy_adapter",
         lambda _target: pytest.fail("a valid checkpoint deployment must remain serving"),
     )
@@ -1019,6 +1024,12 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
             assert orch.verified_adapter_revision_generation(run_id) == (
                 attempted["verification_generation"] + 1
             )
+            stale_pending = orch.mark_deployment_pending(
+                run_id,
+                {**attempted, "state": "reconciling"},
+                owner_deployment=attempted,
+            )
+            assert stale_pending.deployment == previous
             stale = orch.mark_deployed(
                 run_id,
                 stale_commit,
@@ -1055,6 +1066,127 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
     assert out.state == "cancelled"
     assert out.deployment == previous
     assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+def test_cancel_contended_unknown_activation_is_fenced_before_wait(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-contended-unknown"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    generation = orch.verified_adapter_revision_generation(run_id)
+    attempted = {
+        "state": "reconciling",
+        "requested_at": 456.0,
+        "adapter_revision": _checkpoint_revision(run_id, 80, "b"),
+        "checkpoint_step": 80,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+        "verification_generation": generation,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = attempted
+    orch._save_status(status)
+
+    class ContendedLock:
+        held = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                return False
+            assert orch.verified_adapter_revision_generation(run_id) == generation + 1
+            assert orch.get_status(run_id).deployment == previous
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held is True
+            self.held = False
+
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
+    )
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("the safely recommitted predecessor must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment == previous
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+@pytest.mark.parametrize("restore_failure", ["miss", "raise"])
+def test_cancel_contended_predecessor_recommit_failure_stays_fenced_and_revokes(
+    tmp_path, monkeypatch, restore_failure
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-contended-restore-miss"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    attempted = {
+        "state": "smoke_testing",
+        "requested_at": 456.0,
+        "adapter_revision": _checkpoint_revision(run_id, 80, "b"),
+        "checkpoint_step": 80,
+        "previous_deployment": previous,
+        "verification_generation": orch.verified_adapter_revision_generation(run_id),
+    }
+    status = orch.get_status(run_id)
+    status.deployment = attempted
+    orch._save_status(status)
+    real_mark_checkpoint_deployed = orch.mark_checkpoint_deployed
+
+    def fail_predecessor_restore(*args, **kwargs):
+        owner = kwargs.get("owner_deployment")
+        if isinstance(owner, dict) and owner.get("state") == "revocation_failed":
+            if restore_failure == "raise":
+                real_mark_checkpoint_deployed(*args, **kwargs)
+                raise OSError("checkpoint restoration acknowledgement lost")
+            return orch.get_status(run_id)
+        return real_mark_checkpoint_deployed(*args, **kwargs)
+
+    class ContendedLock:
+        held = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                return False
+            fenced = orch.get_status(run_id)
+            assert fenced.deployment["state"] == "revocation_failed"
+            assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held is True
+            self.held = False
+
+    undeploys = []
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
+    monkeypatch.setattr(orch, "mark_checkpoint_deployed", fail_predecessor_restore)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
+    )
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    out = orch.cancel_run(run_id)
+
+    assert undeploys == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 @pytest.mark.parametrize("attempted_step", [None, 80])
@@ -1365,7 +1497,7 @@ def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_
 
 
 @pytest.mark.parametrize("live_verified", [False, True])
-def test_cancel_unknown_outcome_commits_attempted_live_checkpoint(
+def test_cancel_unknown_outcome_revokes_attempted_live_checkpoint(
     tmp_path, monkeypatch, live_verified
 ):
     import flash.runner as orch
@@ -1389,26 +1521,26 @@ def test_cancel_unknown_outcome_commits_attempted_live_checkpoint(
         "checkpoint_step": 20,
         "activation_outcome_unknown": True,
         "previous_deployment": stale_previous,
+        "verified_at": 123.0,
+        "verify_kind": "fixed_prompt",
+        "verify_turns": 1,
+        "verify_latency_s": 0.1,
+        "verify_finish_reason": "stop",
+        "thinking_tag": False,
+        "verify_sample": "4",
     }
     orch._save_status(status)
+    undeploys = []
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("the attempted live checkpoint must remain serving"),
-    )
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
 
     out = orch.cancel_run(run_id)
 
+    assert undeploys == [run_id]
     assert out.state == "cancelled"
-    assert out.deployment == {
-        "state": "ready",
-        "requested_at": 789.0,
-        "adapter_revision": live_revision,
-        "checkpoint_step": 20,
-    }
-    assert orch.read_verified_adapter_revisions(run_id) == frozenset({live_revision})
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path, monkeypatch):
@@ -1515,7 +1647,7 @@ def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, m
 
 def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    from flash.runner.deploy import _should_preserve_checkpoint_deployment
+    from flash.runner.deploy import _preservable_checkpoint_deployment
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-final-predecessor"
@@ -1526,17 +1658,21 @@ def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_
         expected_generation=orch.verified_adapter_revision_generation(run_id),
     )
 
-    assert not _should_preserve_checkpoint_deployment(
-        run_id,
-        {
-            "state": "failed",
-            "activation_outcome_unknown": True,
-            "previous_deployment": {
-                "state": "ready",
-                "adapter_revision": revision,
-                "checkpoint_step": None,
+    assert (
+        _preservable_checkpoint_deployment(
+            run_id,
+            {
+                "state": "failed",
+                "activation_outcome_unknown": True,
+                "previous_deployment": {
+                    "state": "ready",
+                    "adapter_revision": revision,
+                    "checkpoint_step": None,
+                },
             },
-        },
+            live_alias_target=revision,
+        )
+        is None
     )
 
 

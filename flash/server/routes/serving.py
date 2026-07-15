@@ -533,7 +533,7 @@ def _finish_deployment_unlocked(
             "smoke_testing",
             detail="running bounded fixed-prompt smoke",
         )
-        mark_deployment_pending(run_id, current)
+        mark_deployment_pending(run_id, current, owner_deployment=deployment)
         smoke_result.update(
             _run_deployment_smoke(
                 run_id,
@@ -548,7 +548,7 @@ def _finish_deployment_unlocked(
             detail="activating alias and reconciling the authoritative target",
             activation_outcome_unknown=True,
         )
-        mark_deployment_pending(run_id, current)
+        mark_deployment_pending(run_id, current, owner_deployment=deployment)
         # cancellation can revoke the ledger while smoke is blocked, so fence again immediately
         # before deploy_adapter issues the activation request.
         _assert_activation_fence()

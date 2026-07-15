@@ -572,6 +572,8 @@ def _wait_revision_ready(
                 raise
             last_read_error = exc
             continue
+        if time.monotonic() >= deadline:
+            break
         if record is None:
             continue
         last_read_error = None

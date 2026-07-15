@@ -654,6 +654,55 @@ def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     assert clock[0] == 105.0
 
 
+def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    real_wait_revision_ready = d._wait_revision_ready
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    monkeypatch.setattr(d, "_wait_revision_ready", real_wait_revision_ready)
+    monkeypatch.setattr(d, "resolve_hf_revision", lambda _repo: "a" * 40)
+    registration_body = {}
+
+    class Response:
+        status_code = 200
+
+    def request(method, url, *, json=None, ok_statuses=(), timeout_s=None):
+        assert method == "POST"
+        registration_body.update(json)
+        return Response()
+
+    clock = [100.0]
+
+    def registered(adapter_id, *, timeout_s=None):
+        assert adapter_id == registration_body["adapter_id"]
+        assert timeout_s == d.REVISION_READY_BUDGET_SECONDS
+        clock[0] += timeout_s
+        return {
+            **registration_body,
+            "metadata": {**registration_body["metadata"], "lifecycle_state": "ready"},
+        }
+
+    activations = []
+    monkeypatch.setattr(d, "_serving_request", request)
+    monkeypatch.setattr(d, "_registered_adapter", registered)
+    monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        d,
+        "_activate_revision",
+        lambda *args, **kwargs: activations.append((args, kwargs)),
+    )
+
+    with pytest.raises(d.ServingError, match="remained 'registered'"):
+        d.deploy_adapter(
+            run_id="run-expiry",
+            model="Qwen/Qwen3.5-4B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/run-expiry/seed0",
+        )
+
+    assert activations == []
+
+
 def test_registered_adapter_caps_request_timeout(monkeypatch):
     import flash.serve.deploy as d
 

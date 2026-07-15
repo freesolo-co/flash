@@ -1510,6 +1510,163 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     assert runner.read_verified_adapter_revisions(run_id) == frozenset()
 
 
+@pytest.mark.parametrize("attempt_kind", ["final", "checkpoint"])
+def test_contended_cancel_revokes_activation_completed_after_predecessor_restore(
+    api, monkeypatch, attempt_kind
+):
+    import threading
+
+    import flash.runner as runner
+    import flash.serve.deploy as deploy_mod
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+    from flash.server.routes import serving
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    initial_state = "done" if attempt_kind == "final" else "running"
+    run_id = _make_run(api, key, initial_state)
+    previous_revision = f"{run_id}@step-40." + "b" * 40
+    previous = {
+        "state": "ready",
+        "endpoint_name": "https://old.example",
+        "adapter_revision": previous_revision,
+        "checkpoint_step": 40,
+    }
+    runner.mark_checkpoint_deployed(
+        run_id,
+        previous,
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    initial_generation = runner.verified_adapter_revision_generation(run_id)
+    if attempt_kind == "final":
+        attempted_revision = f"{run_id}@final." + "a" * 40
+        expected_checkpoint = run_id
+        payload = {}
+        checkpoint_step = None
+    else:
+        attempted_revision = f"{run_id}@step-80." + "a" * 40
+        expected_checkpoint = f"{run_id}/step-80"
+        payload = {"step": 80}
+        checkpoint_step = 80
+
+    smoke_started = threading.Event()
+    release_smoke = threading.Event()
+    cancellation_snapshotted = threading.Event()
+    activation_started = threading.Event()
+    predecessor_restored = threading.Event()
+    release_activation = threading.Event()
+    live_alias = {"target": previous_revision}
+    alias_reads = []
+    undeploys = []
+    results: dict[str, object] = {}
+
+    def blocked_smoke(*args, **kwargs):
+        smoke_started.set()
+        if not release_smoke.wait(timeout=5):
+            raise TimeoutError("test did not release deployment smoke")
+        return {
+            "verified_at": time.time(),
+            "verify_kind": "fixed_prompt",
+            "verify_turns": 1,
+            "verify_latency_s": 0.1,
+            "verify_finish_reason": "stop",
+            "thinking_tag": False,
+            "verify_sample": "4",
+        }
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](attempted_revision, expected_checkpoint)
+        activation_started.set()
+        if not release_activation.wait(timeout=5):
+            raise TimeoutError("test did not release alias activation")
+        live_alias["target"] = attempted_revision
+        return Deployment(
+            run_id=run_id,
+            model=SPEC["model"],
+            adapter_hf_prefix=f"{kwargs['adapter_prefix']}/adapter",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            openai_base_url="https://serve.example/v1",
+            adapter_revision=attempted_revision,
+            checkpoint_step=checkpoint_step,
+        )
+
+    real_mark_revocation_failed = runner.mark_deployment_revocation_failed
+
+    def fence_after_activation_started(target, error):
+        if "in-progress deployment" in error:
+            cancellation_snapshotted.set()
+            release_smoke.set()
+            if not activation_started.wait(timeout=5):
+                raise TimeoutError("worker did not cross the final activation fence")
+        return real_mark_revocation_failed(target, error)
+
+    real_mark_checkpoint_deployed = runner.mark_checkpoint_deployed
+
+    def observe_restore(*args, **kwargs):
+        status = real_mark_checkpoint_deployed(*args, **kwargs)
+        owner = kwargs.get("owner_deployment")
+        if isinstance(owner, dict) and owner.get("state") == "revocation_failed":
+            assert kwargs["verification_generation"] == initial_generation + 1
+            if status.deployment == previous:
+                predecessor_restored.set()
+        return status
+
+    def alias_target(target):
+        alias_reads.append(target)
+        return live_alias["target"]
+
+    monkeypatch.setattr(serving, "_run_deployment_smoke", blocked_smoke)
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(runner, "mark_deployment_revocation_failed", fence_after_activation_started)
+    monkeypatch.setattr(runner, "mark_checkpoint_deployed", observe_restore)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy_mod, "adapter_alias_target", alias_target)
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    deploy_thread = threading.Thread(
+        target=lambda: results.setdefault(
+            "deploy",
+            api.post(
+                f"/v1/runs/{run_id}/deploy",
+                json=payload,
+                headers=_bearer(key),
+            ),
+        )
+    )
+    deploy_thread.start()
+    assert smoke_started.wait(timeout=5)
+
+    def cancel_target():
+        try:
+            results["cancel"] = runner.cancel_run(run_id)
+        except BaseException as exc:
+            results["cancel_error"] = exc
+
+    cancel_thread = threading.Thread(target=cancel_target)
+    cancel_thread.start()
+    assert cancellation_snapshotted.wait(timeout=5)
+    assert predecessor_restored.wait(timeout=5)
+    assert runner.verified_adapter_revision_generation(run_id) == initial_generation + 1
+    assert runner.get_status(run_id).deployment == previous
+    release_activation.set()
+    deploy_thread.join(timeout=5)
+    cancel_thread.join(timeout=5)
+
+    assert not deploy_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert "cancel_error" not in results
+    assert results["deploy"].status_code == 200
+    assert alias_reads == [run_id]
+    assert undeploys == [run_id]
+    final = runner.get_status(run_id)
+    assert final.state == "cancelled"
+    assert final.deployment["state"] == "undeployed"
+    assert final.deployment.get("adapter_revision") != attempted_revision
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+
+
 def test_cancel_local_persistence_failure_returns_structured_retryable_error(api, monkeypatch):
     import flash.runner as runner
     from flash.runner.deploy import DeploymentStatePersistenceError
