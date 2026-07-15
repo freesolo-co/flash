@@ -77,6 +77,68 @@ def test_grpo_positive_max_steps_is_authoritative():
     assert _spec_steps(_spec(**{"train.max_steps": 0})) == 50
 
 
+def test_required_save_density_adds_wall_time_and_cost_without_changing_steps():
+    from flash.cost.analytical import estimate_cost
+
+    for method in ("sft", "grpo"):
+        common = {
+            "model_id": "Qwen/Qwen3.5-4B",
+            "method": method,
+            "steps": 10,
+            "seq_len": 1024,
+            "batch_size": 4,
+        }
+        if method == "grpo":
+            common.update(completion_len=128, group_size=2)
+        baseline = RunConfig(**common)
+        sparse = RunConfig(**common, save_at_steps=(5,))
+        dense = RunConfig(**common, save_at_steps=(2, 4, 6, 8))
+
+        baseline_estimate = estimate_cost(baseline)
+        sparse_estimate = estimate_cost(sparse)
+        dense_estimate = estimate_cost(dense)
+
+        assert baseline.steps == sparse.steps == dense.steps == 10
+        assert baseline_estimate.train_seconds < sparse_estimate.train_seconds
+        assert sparse_estimate.train_seconds < dense_estimate.train_seconds
+        assert baseline_estimate.total_usd < sparse_estimate.total_usd < dense_estimate.total_usd
+
+
+def test_opd_required_saves_add_overhead_without_changing_steps():
+    from flash.cost.analytical import estimate_cost
+
+    common = {
+        "model_id": "Qwen/Qwen3.5-4B",
+        "method": "opd",
+        "steps": 10,
+        "seq_len": 1024,
+        "batch_size": 4,
+        "completion_len": 128,
+        "group_size": 1,
+    }
+    baseline = RunConfig(**common)
+    withsave = RunConfig(**common, save_at_steps=(2, 4, 6))
+
+    # opd publishes a deployable adapter at each exact save, so exact saves cost wall/dollars too.
+    assert baseline.steps == withsave.steps == 10
+    assert estimate_cost(withsave).train_seconds > estimate_cost(baseline).train_seconds
+    assert estimate_cost(withsave).total_usd > estimate_cost(baseline).total_usd
+
+
+def test_partial_reprice_survives_required_saves_beyond_completed_steps():
+    from flash.runner import charge_usd_for_spec
+
+    raw = copy.deepcopy(GRPO_RAW)
+    raw["train"].update({"max_steps": 100, "save_at_steps": [50, 100]})
+    spec = spec_from_dict(raw)
+
+    # cancel at step 10: the saves at 50/100 never landed, so repricing to a 10-step horizon must
+    # drop them rather than trip RunConfig's save_at_steps<=steps guard and collapse to the fallback.
+    charge = charge_usd_for_spec(spec, steps=10, fallback=-1.0)
+    assert charge != -1.0
+    assert charge > 0.0
+
+
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"

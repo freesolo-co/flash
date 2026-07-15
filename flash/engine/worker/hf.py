@@ -20,8 +20,8 @@ from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 
 
-class CheckpointLandmarkError(RuntimeError):
-    """permanent checkpoint landmark contract failure."""
+class RequiredSaveError(RuntimeError):
+    """permanent exact-save contract failure."""
 
 
 def error_artifact_name(mode: str, attempt: int = 0) -> str:
@@ -333,19 +333,17 @@ def publish_deployable_checkpoint(
 ) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable per-step path.
 
-    Historical callers remain best-effort. ``required=True`` fails loudly when an exact landmark
+    Periodic saves remain best-effort. ``required=True`` fails loudly when an exact required save
     cannot be published.
     """
     if not _w.HF_REPO:
         if required:
-            raise CheckpointLandmarkError(
-                f"checkpoint landmark step {step} has no artifact repository"
-            )
+            raise RequiredSaveError(f"required save step {step} has no artifact repository")
         return None
     if not _has_deployable_adapter(ckpt_dir):
         if required:
-            raise CheckpointLandmarkError(
-                f"checkpoint landmark step {step} has no deployable adapter in {ckpt_dir}"
+            raise RequiredSaveError(
+                f"required save step {step} has no deployable adapter in {ckpt_dir}"
             )
         return None
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
@@ -374,7 +372,7 @@ def publish_deployable_checkpoint(
                     break
     if required:
         raise RetriableInfraError(
-            f"checkpoint landmark step {step} deployable upload failed"
+            f"required save step {step} deployable upload failed"
         ) from last_error
     return None
 
@@ -383,6 +381,30 @@ def publish_deployable_checkpoint(
 # upload, so a transient HF error is retried until the step lands rather than costing the step.
 _CKPT_UPLOAD_RETRIES = 3
 _CKPT_UPLOAD_BACKOFF_S = 5.0
+
+
+def _deployable_adapter_on_hf(step: int) -> bool:
+    """True when a required step's deployable adapter is durably present on hf.
+
+    Resume credits a required save only after confirming its published adapter exists, so
+    on_train_end verifies the durability guarantee against hf instead of assuming it from the
+    restored step counter (a pre-resume worker could have advanced past the step without ever
+    landing its deployable). publish_deployable_checkpoint uploads the adapter folder in a single
+    atomic upload_folder commit, so the config marker's presence implies the whole folder landed.
+
+    Raises RetriableInfraError when hf cannot be reached: a transient lookup outage must retry the
+    resume, not be misread as a permanently-missing required save. file_exists returns False cleanly
+    for a genuinely absent file (that stays uncredited and fails completeness in on_train_end).
+    """
+    if not _w.HF_REPO:
+        return False
+    marker = f"{hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
+    try:
+        return bool(
+            _w.hf_api().file_exists(repo_id=_w.HF_REPO, filename=marker, repo_type="dataset")
+        )
+    except Exception as e:
+        raise RetriableInfraError(f"could not verify required save step {step} on hf") from e
 
 
 def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
@@ -441,22 +463,7 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
             break
 
 
-def make_checkpoint_landmark_callback(checkpoint_landmarks):
-    """Force trainer saves at the requested exact optimizer steps."""
-    from transformers import TrainerCallback
-
-    requested = frozenset(int(step) for step in checkpoint_landmarks)
-
-    class _CheckpointLandmarks(TrainerCallback):
-        def on_step_end(self, args, state, control, **kwargs):
-            if int(getattr(state, "global_step", 0) or 0) in requested:
-                control.should_save = True
-            return control
-
-    return _CheckpointLandmarks()
-
-
-def make_checkpoint_upload_callback(checkpoint_landmarks=()):
+def make_checkpoint_upload_callback(save_at_steps=()):
     """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
 
     Uploads are SYNCHRONOUS: on_save blocks the training loop until the checkpoint is durably on
@@ -469,7 +476,7 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
 
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
-    required_steps = frozenset(int(step) for step in checkpoint_landmarks)
+    required_steps = frozenset(int(step) for step in save_at_steps)
     deployable_steps: set[int] = set()
 
     def _publish_deployable(ckpt_dir: str, step: int) -> None:
@@ -522,7 +529,7 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
                     _upload_once(step, ckpt_dir)
                     uploaded_steps.add(step)
                     return True
-                except CheckpointLandmarkError:
+                except RequiredSaveError:
                     raise
                 except Exception as e:
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
@@ -543,11 +550,20 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
         return False
 
     class _CheckpointUpload(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if int(getattr(state, "global_step", 0) or 0) in required_steps:
+                control.should_save = True
+            return control
+
         def on_train_begin(self, args, state, control, **kwargs):
+            # resume credits a required save only when its deployable adapter is verified on hf.
+            # crediting straight from the restored step counter would let on_train_end report a
+            # required save as satisfied even if the pre-resume worker never durably uploaded it.
             resumed_step = int(getattr(state, "global_step", 0) or 0)
-            resumed_landmarks = {step for step in required_steps if step <= resumed_step}
-            deployable_steps.update(resumed_landmarks)
-            uploaded_steps.update(resumed_landmarks)
+            for step in required_steps:
+                if step <= resumed_step and _deployable_adapter_on_hf(step):
+                    deployable_steps.add(step)
+                    uploaded_steps.add(step)
             return control
 
         def on_save(self, args, state, control, **kwargs):
@@ -560,25 +576,23 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
             step = int(state.global_step)
             if not _w.HF_REPO:
                 if step in required_steps:
-                    raise RuntimeError(
-                        f"checkpoint landmark step {step} has no artifact repository"
-                    )
+                    raise RuntimeError(f"required save step {step} has no artifact repository")
                 return
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if not os.path.isdir(ckpt_dir):
                 if step in required_steps:
                     raise RuntimeError(
-                        f"checkpoint landmark step {step} has no trainer checkpoint directory"
+                        f"required save step {step} has no trainer checkpoint directory"
                     )
                 return
             if not _upload_with_retries(step, ckpt_dir):
                 if step in required_steps and step not in deployable_steps:
                     raise RetriableInfraError(
-                        f"checkpoint landmark step {step} was not durably published"
+                        f"required save step {step} was not durably published"
                     )
                 print(
                     f"[ckpt] step {step} resume checkpoint not durable on HF after retries; "
-                    "the deployable landmark is preserved and on_train_end will re-flush the latest "
+                    "the deployable adapter save is preserved and on_train_end will re-flush the latest "
                     "checkpoint."
                 )
 
@@ -588,7 +602,7 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
             # every step it saw, so this only publishes an as-yet-unuploaded latest step.
             if not _w.HF_REPO:
                 if required_steps:
-                    raise RuntimeError("checkpoint landmarks have no artifact repository")
+                    raise RuntimeError("required saves have no artifact repository")
                 return
             latest = _latest_checkpoint_dir(args.output_dir)
             if latest is not None:
@@ -601,16 +615,14 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
                 ):
                     if step in required_steps and step not in deployable_steps:
                         raise RetriableInfraError(
-                            f"checkpoint landmark step {step} was not durably published"
+                            f"required save step {step} was not durably published"
                         )
                     print(
                         f"[ckpt] final resume checkpoint step {step} not durable on HF after retries; "
-                        "the deployable landmark is preserved."
+                        "the deployable adapter save is preserved."
                     )
             missing_required = sorted(required_steps - deployable_steps)
             if missing_required:
-                raise RuntimeError(
-                    f"checkpoint landmarks were not durably published: {missing_required}"
-                )
+                raise RuntimeError(f"required saves were not durably published: {missing_required}")
 
     return _CheckpointUpload()

@@ -203,6 +203,7 @@ def test_build_worker_env():
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=8),
+        seed=0,
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"

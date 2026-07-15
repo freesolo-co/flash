@@ -27,8 +27,10 @@ def _spec(gpu_type="RTX 4090", **gpu_kw) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
+            # authoritative seed 0 matches the literal seed threaded into every provider call below.
+            "seed": 0,
             "run_id": "flash-1700000000-abcd1234",
-            "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
+            "train": {"epochs": 1, "hf_repo": "org/repo"},
             "gpu": gpu,
         }
     )

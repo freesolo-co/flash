@@ -28,6 +28,7 @@ def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
+            "seed": 0,
             "train": {"epochs": 1, "hf_repo": "org/repo"},
             "gpu": gpu,
         }
@@ -163,7 +164,8 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     from flash.providers.lambdalabs.jobs import builders
     from flash.providers.runpod.train import WORKER_IMAGE
 
-    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_TEMPLATE"):
+        monkeypatch.delenv(key, raising=False)
 
     # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE
