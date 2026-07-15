@@ -117,6 +117,12 @@ def test_forward_teacher_rejects_invalid_seed(seed):
         ForwardTeacherClient("key", seed=seed)
 
 
+@pytest.mark.parametrize("max_attempts", [None, True, 1, 2.0, "5"])
+def test_forward_teacher_rejects_invalid_max_attempts(max_attempts):
+    with pytest.raises(ForwardTeacherError, match="max_attempts is invalid"):
+        ForwardTeacherClient("key", seed=123, max_attempts=max_attempts)
+
+
 def test_forward_teacher_pins_request_and_returns_visible_usage():
     captured = {}
 
@@ -526,6 +532,7 @@ def test_forward_teacher_exhausted_retry_counts_each_unavailable_usage_once():
         ForwardTeacherClient(
             "key",
             seed=123,
+            max_attempts=2,
             opener=opener,
             sleep=lambda _delay: None,
             clock=iter([10.0, 10.25, 20.0, 20.5]).__next__,
@@ -557,7 +564,7 @@ def test_forward_teacher_exhausts_insufficient_system_resources_as_transient():
         ForwardTeacherTransientError, match="insufficient system resources"
     ) as caught:
         ForwardTeacherClient(
-            "key", seed=123, opener=opener, sleep=lambda _delay: None
+            "key", seed=123, max_attempts=2, opener=opener, sleep=lambda _delay: None
         ).generate([{"role": "user", "content": "private prompt"}])
 
     assert calls == [1, 1]
@@ -668,9 +675,107 @@ def test_forward_teacher_retries_once_and_parses_only_delta_retry_after(retry_af
     )
     assert len(starts) == 2
     assert starts[1] - starts[0] == pytest.approx(max(2.0, expected))
-    assert sum(sleeps) == pytest.approx(max(2.0, expected))
+    assert sleeps == pytest.approx([max(2.0, expected)])
     assert result.latency_seconds == pytest.approx(max(2.0, expected))
     assert result.attempts == 2
+
+
+def test_forward_teacher_rides_out_repeated_429s_with_exponential_backoff():
+    max_attempts = 5
+    now = [100.0]
+    starts = []
+    sleeps = []
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    def opener(*_args, **_kwargs):
+        starts.append(now[0])
+        if len(starts) < max_attempts:
+            raise _http_error(429, "1")
+        return _Response(_payload())
+
+    result = ForwardTeacherClient(
+        "key",
+        seed=123,
+        max_attempts=max_attempts,
+        opener=opener,
+        sleep=sleep,
+        clock=lambda: now[0],
+    ).generate([{"role": "user", "content": "x"}])
+
+    assert starts == pytest.approx([100.0, 102.0, 106.0, 114.0, 130.0])
+    assert sleeps == pytest.approx([2.0, 4.0, 8.0, 16.0])
+    assert result.attempts == max_attempts
+    assert result.latency_seconds == pytest.approx(30.0)
+    assert result.ambiguous_paid_requests == 0
+    assert result.provider_generations == 1
+
+
+def test_forward_teacher_all_429s_exhaust_default_max_attempts():
+    expected_attempts = 5
+    now = [100.0]
+    calls = []
+    sleeps = []
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    def opener(*_args, **_kwargs):
+        calls.append(1)
+        raise _http_error(429, "1")
+
+    with pytest.raises(ForwardTeacherTransientError, match="HTTP 429") as caught:
+        ForwardTeacherClient(
+            "key",
+            seed=123,
+            opener=opener,
+            sleep=sleep,
+            clock=lambda: now[0],
+        ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert len(calls) == expected_attempts
+    assert sleeps == pytest.approx([2.0, 4.0, 8.0, 16.0])
+    assert caught.value.attempts == expected_attempts
+    assert caught.value.latency_seconds == pytest.approx(30.0)
+    assert caught.value.ambiguous_paid_requests == 0
+    assert caught.value.provider_generations == 0
+    assert "private prompt" not in str(caught.value)
+
+
+def test_forward_teacher_retry_sleep_is_capped_by_run_deadline(monkeypatch):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
+
+    now = [100.0]
+    timeouts = []
+    sleeps = []
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "103.0")
+    monkeypatch.setattr(forward_teacher_mod.time, "time", lambda: now[0])
+
+    def opener(_request, timeout):
+        timeouts.append(timeout)
+        raise _http_error(429, "30")
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    with pytest.raises(ForwardTeacherTransientError, match="run wall deadline") as caught:
+        ForwardTeacherClient(
+            "key",
+            seed=123,
+            opener=opener,
+            sleep=sleep,
+            clock=lambda: now[0],
+        ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert timeouts == pytest.approx([3.0])
+    assert sleeps == pytest.approx([3.0])
+    assert caught.value.attempts == 1
+    assert caught.value.latency_seconds == pytest.approx(3.0)
+    assert caught.value.ambiguous_paid_requests == 0
 
 
 def test_forward_teacher_retry_after_one_still_waits_two_seconds_between_attempt_starts():
@@ -707,6 +812,7 @@ def test_forward_teacher_exhausted_transient_http_error_is_typed_and_bounded(cod
         ForwardTeacherClient(
             "key",
             seed=123,
+            max_attempts=2,
             opener=opener,
             sleep=lambda _s: None,
             clock=iter([30.0, 32.0, 32.75]).__next__,
@@ -739,10 +845,10 @@ def test_forward_teacher_retries_http_200_decode_failures_with_start_pacing(firs
         [{"role": "user", "content": "x"}]
     )
 
-    assert starts == [10.0, 20.0]
-    assert sleeps == [10.0]
+    assert starts == [10.0, 12.0]
+    assert sleeps == [2.0]
     assert result.attempts == 2
-    assert result.latency_seconds == pytest.approx(10.0)
+    assert result.latency_seconds == pytest.approx(2.0)
     assert result.ambiguous_paid_requests == 1
 
 
@@ -755,9 +861,9 @@ def test_forward_teacher_exhausted_http_200_decode_failure_is_sanitized_and_tran
         return _RawResponse(body)
 
     with pytest.raises(ForwardTeacherTransientError, match="response decoding failure") as caught:
-        ForwardTeacherClient("key", seed=123, opener=opener, sleep=lambda _delay: None).generate(
-            [{"role": "user", "content": "private prompt"}]
-        )
+        ForwardTeacherClient(
+            "key", seed=123, max_attempts=2, opener=opener, sleep=lambda _delay: None
+        ).generate([{"role": "user", "content": "private prompt"}])
 
     assert calls == [1, 1]
     assert caught.value.attempts == 2
@@ -793,9 +899,9 @@ def test_forward_teacher_incomplete_read_remains_transient_and_bounded():
         raise http.client.IncompleteRead(b"sensitive partial response", 99)
 
     with pytest.raises(ForwardTeacherTransientError, match="transport failure") as caught:
-        ForwardTeacherClient("key", seed=123, opener=opener, sleep=lambda _delay: None).generate(
-            [{"role": "user", "content": "private prompt"}]
-        )
+        ForwardTeacherClient(
+            "key", seed=123, max_attempts=2, opener=opener, sleep=lambda _delay: None
+        ).generate([{"role": "user", "content": "private prompt"}])
 
     assert calls == [1, 1]
     assert caught.value.attempts == 2
@@ -933,9 +1039,9 @@ def test_forward_teacher_transport_is_bounded_and_exception_is_sanitized():
         raise urllib.error.URLError(f"transport included {secret} {prompt}")
 
     with pytest.raises(ForwardTeacherTransientError) as caught:
-        ForwardTeacherClient(secret, seed=123, opener=opener, sleep=lambda _s: None).generate(
-            [{"role": "user", "content": prompt}]
-        )
+        ForwardTeacherClient(
+            secret, seed=123, max_attempts=2, opener=opener, sleep=lambda _s: None
+        ).generate([{"role": "user", "content": prompt}])
     assert len(calls) == 2
     text = str(caught.value)
     assert secret not in text

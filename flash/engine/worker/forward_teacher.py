@@ -212,6 +212,7 @@ class ForwardTeacherClient:
         *,
         seed: int,
         timeout: float = 90.0,
+        max_attempts: int = 5,
         opener: Callable | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.perf_counter,
@@ -220,6 +221,8 @@ class ForwardTeacherClient:
             raise ForwardTeacherError("forward_teacher credential is unavailable")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**31 - 1:
             raise ForwardTeacherError("forward_teacher seed is invalid")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 2:
+            raise ForwardTeacherError("forward_teacher max_attempts is invalid")
         try:
             timeout = float(timeout)
         except (TypeError, ValueError, OverflowError):
@@ -229,6 +232,7 @@ class ForwardTeacherClient:
         self._api_key = api_key
         self._seed = seed
         self._timeout = timeout
+        self._max_attempts = max_attempts
         self._opener = opener or urllib.request.build_opener(_RejectRedirects()).open
         self._sleep = sleep
         self._clock = clock
@@ -495,6 +499,9 @@ class ForwardTeacherClient:
                 raise deadline_failure(attempts)
             return remaining
 
+        def backoff(attempts: int) -> float:
+            return min(60.0, 2.0 * (2 ** (attempts - 1)))
+
         def retry_sleep(delay: float, attempts: int) -> None:
             remaining = remaining_or_fail(attempts)
             if remaining is not None:
@@ -524,7 +531,7 @@ class ForwardTeacherClient:
                 completion_tokens=completion_tokens,
             )
 
-        for attempt in (1, 2):
+        for attempt in range(1, self._max_attempts + 1):
             remaining = remaining_or_fail(attempt - 1)
             attempt_started = self._pace_attempt(max_delay=remaining)
             if started is None:
@@ -542,14 +549,14 @@ class ForwardTeacherClient:
                     payload = json.loads(raw.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     ambiguous_paid_requests += 1
-                    if attempt == 2:
+                    if attempt == self._max_attempts:
                         raise failure(
                             ForwardTeacherTransientError,
                             "forward_teacher response decoding failure",
                             attempts=attempt,
                             ambiguous_increment=0,
                         ) from None
-                    retry_sleep(10.0, attempt)
+                    retry_sleep(backoff(attempt), attempt)
                     continue
                 latency = self._clock() - started
                 try:
@@ -570,7 +577,7 @@ class ForwardTeacherClient:
                         prompt_tokens += usage[0]
                         completion_tokens += usage[1]
                     if exc.retriable:
-                        if attempt == 2:
+                        if attempt == self._max_attempts:
                             raise failure(
                                 ForwardTeacherTransientError,
                                 str(exc),
@@ -578,7 +585,7 @@ class ForwardTeacherClient:
                                 ambiguous_increment=0,
                                 latency_seconds=latency,
                             ) from None
-                        retry_sleep(10.0, attempt)
+                        retry_sleep(backoff(attempt), attempt)
                         continue
                     raise failure(
                         ForwardTeacherError,
@@ -608,16 +615,16 @@ class ForwardTeacherClient:
                         attempts=attempt,
                         ambiguous_increment=0,
                     ) from None
-                if attempt == 2:
+                if attempt == self._max_attempts:
                     raise failure(
                         ForwardTeacherTransientError,
                         f"forward_teacher HTTP {exc.code}",
                         attempts=attempt,
                         ambiguous_increment=0,
                     ) from None
-                retry_sleep(self._retry_after(exc.headers), attempt)
+                retry_sleep(max(self._retry_after(exc.headers), backoff(attempt)), attempt)
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
-                if attempt == 2:
+                if attempt == self._max_attempts:
                     raise failure(
                         ForwardTeacherTransientError,
                         "forward_teacher transport failure",
@@ -625,7 +632,7 @@ class ForwardTeacherClient:
                         ambiguous_increment=1,
                     ) from None
                 ambiguous_paid_requests += 1
-                retry_sleep(10.0, attempt)
+                retry_sleep(backoff(attempt), attempt)
             except (TypeError, ValueError):
                 raise failure(
                     ForwardTeacherError,
@@ -635,7 +642,7 @@ class ForwardTeacherClient:
                 ) from None
         raise ForwardTeacherTransientError(
             "forward_teacher request attempts exhausted",
-            attempts=2,
+            attempts=self._max_attempts,
             latency_seconds=(self._clock() - started) if started is not None else 0.0,
             ambiguous_paid_requests=ambiguous_paid_requests,
             provider_generations=provider_generations,
