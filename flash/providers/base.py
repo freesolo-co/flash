@@ -203,14 +203,19 @@ def _alias_keys(name: str) -> set[str]:
     return keys
 
 
-_ALIASES: dict[str, str] = {}
+_ALIAS_TARGETS: dict[str, set[str]] = {}
 for _info in _GPU_INFO_ALL.values():
     for _provider_name in (_info.name, _info.vast_name, *_info.vast_aliases):
         if not _provider_name:
             continue
         for _k in _alias_keys(_provider_name):
-            _ALIASES[_k] = _info.name
-# Full marketing names (nvidia-smi / RunPod API) and historical aliases not covered by generic rules.
+            _ALIAS_TARGETS.setdefault(_k, set()).add(_info.name)
+_ALIASES: dict[str, str] = {
+    key: next(iter(targets)) for key, targets in _ALIAS_TARGETS.items() if len(targets) == 1
+}
+# exact canonical names always resolve to themselves even if a provider spelling collides with them.
+_ALIASES.update({_info.name.lower(): _info.name for _info in _GPU_INFO_ALL.values()})
+# full marketing names (nvidia-smi / runpod api) and historical aliases not covered by generic rules.
 _ALIASES.update(
     {
         "nvidia geforce rtx 4090": "RTX 4090",

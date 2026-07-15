@@ -101,11 +101,12 @@ def test_search_offers_applies_exact_gpu_names_server_side(monkeypatch):
     calls = _capture_urlopen(monkeypatch, [{"offers": []}])
     vast_api.search_offers(
         81920,
+        max_vram_mb=81920,
         gpu_names=("H100 SXM", "H100 PCIE"),
     )
 
     query = calls[0][2]["q"]
-    assert query["gpu_ram"] == {"gte": 81920}
+    assert query["gpu_ram"] == {"gte": 81920, "lte": 81920}
     assert query["gpu_name"] == {"in": ["H100 SXM", "H100 PCIE"]}
 
 

@@ -70,6 +70,26 @@ def test_spec_parsers_accept_valid_spec_without_execution_controls():
     assert JobSpec.from_dict(raw).model == raw["model"]
 
 
+def test_schema_defers_exact_vram_rejection_for_authored_revision(monkeypatch):
+    import flash.providers.allocator as allocator
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = _minimal_spec_dict()
+    raw.update(model="Qwen/Qwen3.5-9B", model_revision="refs/pr/123")
+    raw["gpu"] = {"exact_type": "RTX 4090"}
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("revision-authored parse must defer exact sizing")
+
+    monkeypatch.setattr(allocator, "required_vram_gb", fail_if_called)
+    assert spec_from_dict(raw).gpu.exact_type == "RTX 4090"
+
+    raw["model_revision"] = ""
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *args, **kwargs: 80)
+    with pytest.raises(ConfigError, match="requires at least"):
+        spec_from_dict(raw)
+
+
 def test_prepare_job_resolves_ref_to_sha_with_operator_token(monkeypatch):
     import huggingface_hub
 
@@ -186,6 +206,33 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
     with pytest.raises(ValueError, match="geometry incompatible"):
         vram.model_required_vram_gb(
             "Qwen/Qwen3.5-0.8B", "sft", model_revision="e" * 40
+        )
+
+
+def test_check_fit_pinned_metadata_failure_is_unknown_but_sizing_stays_strict(monkeypatch):
+    import flash.engine.vram as vram
+
+    failure = RuntimeError("metadata unavailable")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", fail)
+
+    estimate = vram.check_fit(
+        "owner/model",
+        "sft",
+        "RTX 4090",
+        model_revision="a" * 40,
+    )
+    assert estimate.verdict == "unknown"
+    assert estimate.params_b is None
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        vram.model_required_vram_gb(
+            "owner/model",
+            "sft",
+            model_revision="a" * 40,
         )
 
 

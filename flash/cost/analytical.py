@@ -259,20 +259,43 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             raise ValueError(
                 f"no configured provider can provision exact_type {config.exact_type!r}"
             )
-        rates = {
-            name: gpu_hourly_usd(
-                gpu, provider=name, max_wall_seconds=market_wall_s, min_vram_gb=need
+        rates: dict[str, float] = {}
+        for name in eligible:
+            if name == "vast":
+                from flash.providers.vast.pricing import live_offer_rates
+
+                live = live_offer_rates(
+                    max_wall_seconds=market_wall_s,
+                    min_vram_gb=need,
+                    exact_type=config.exact_type,
+                )
+                if gpu not in live:
+                    continue
+                rates[name] = live[gpu]
+            else:
+                rates[name] = gpu_hourly_usd(
+                    gpu,
+                    provider=name,
+                    max_wall_seconds=market_wall_s,
+                    min_vram_gb=need,
+                    exact_type=config.exact_type,
+                )
+        if not rates:
+            raise ValueError(
+                f"no configured provider has live capacity for exact_type {config.exact_type!r}"
             )
-            for name in eligible
-        }
-        quote_provider = min(eligible, key=rates.__getitem__)
+        quote_provider = min(rates, key=rates.__getitem__)
         hourly = rates[quote_provider]
     else:
         # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
         # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
         # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.
         hourly = gpu_hourly_usd(
-            gpu, provider=quote_provider, max_wall_seconds=market_wall_s, min_vram_gb=need
+            gpu,
+            provider=quote_provider,
+            max_wall_seconds=market_wall_s,
+            min_vram_gb=need,
+            exact_type=config.exact_type,
         )
 
     setup = setup_seconds(config)

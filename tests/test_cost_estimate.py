@@ -310,6 +310,82 @@ def test_gpu_hourly_usd_vast_floors_rate_at_required_vram(monkeypatch):
     assert rate == 1.20  # live offer rate, not the static catalog fallback
 
 
+def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.cost.facts import gpu_hourly_usd
+    from flash.providers.vast import jobs as vast
+
+    seen: list[str] = []
+
+    def fake_usable(min_vram_gb, disk_gb, *args, exact_type="", **kwargs):
+        seen.append(exact_type)
+        return [SimpleNamespace(gpu="A100 SXM 40GB", dph_total=0.77)]
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+
+    exact = gpu_hourly_usd(
+        "A100 SXM 40GB",
+        provider="vast",
+        min_vram_gb=40,
+        exact_type="A100 SXM 40GB",
+    )
+    unconstrained = gpu_hourly_usd(
+        "A100 SXM 40GB",
+        provider="vast",
+        min_vram_gb=40,
+    )
+
+    assert exact == 0.77
+    assert unconstrained == 0.77
+    assert seen == ["A100 SXM 40GB", ""]
+
+
+def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.cost.analytical as analytical
+    from flash.providers.vast import jobs as vast
+
+    seen: list[str] = []
+
+    def fake_usable(min_vram_gb, disk_gb, *args, exact_type="", **kwargs):
+        seen.append(exact_type)
+        return [SimpleNamespace(gpu="H100", dph_total=2.17)]
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", fake_usable)
+    monkeypatch.setattr(analytical, "available_providers", lambda: ("vast",))
+
+    explicit = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            10,
+            provider="vast",
+            exact_type="H100",
+        )
+    )
+    automatic = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
+
+    assert (explicit.provider, explicit.gpu_hourly_usd) == ("vast", 2.17)
+    assert (automatic.provider, automatic.gpu_hourly_usd) == ("vast", 2.17)
+    assert seen == ["H100", "H100"]
+
+
+def test_estimate_auto_exact_vast_requires_constrained_live_capacity(monkeypatch):
+    import flash.cost.analytical as analytical
+    from flash.providers.vast import jobs as vast
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(analytical, "available_providers", lambda: ("vast",))
+
+    with pytest.raises(ValueError, match="live capacity"):
+        estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
+
+
 def test_a100_sxm_40gb_has_real_tflops_not_default():
     # Codex: the 40 GB A100 SXM4 class (selectable for Lambda/Vast) must carry a real TFLOPS entry, or
     # gpu_tflops() falls to the 100-default and inflates its seconds_per_step / quoted cost ~3x. It has

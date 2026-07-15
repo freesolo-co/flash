@@ -137,6 +137,8 @@ def usable_offers(
     )
     search_vram_gb = max(min_vram_gb, exact_info.vram_gb if exact_info is not None else 0)
     search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
+    if exact_info is not None:
+        search_kwargs["max_vram_mb"] = int(exact_info.vram_gb * 1024)
     rows = vast_api.search_offers(
         int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,

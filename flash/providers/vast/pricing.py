@@ -57,7 +57,9 @@ def live_candidate_rates(
     return rates
 
 
-def _fetch_offer_rates(max_wall_seconds: float, min_vram_gb: int = 0) -> dict[str, float]:
+def _fetch_offer_rates(
+    max_wall_seconds: float, min_vram_gb: int = 0, exact_type: str = ""
+) -> dict[str, float]:
     """Friendly-name -> cheapest LIVE $/hr for the managed classes with a usable offer (NO static
     merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it).
 
@@ -74,7 +76,11 @@ def _fetch_offer_rates(max_wall_seconds: float, min_vram_gb: int = 0) -> dict[st
     # page and crowds managed classes off it. No managed class is smaller than the floor, so none is
     # excluded; 0 if nothing is managed. A caller-supplied ``min_vram_gb`` raises it further.
     vram_floor = int(min((i.vram_gb for i in GPU_INFO.values() if i.vast_name), default=0))
-    return live_candidate_rates(max(vram_floor, int(min_vram_gb)), max_wall_seconds=max_wall_seconds)
+    return live_candidate_rates(
+        max(vram_floor, int(min_vram_gb)),
+        max_wall_seconds=max_wall_seconds,
+        exact_type=exact_type,
+    )
 
 
 def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str, float]:
@@ -110,7 +116,9 @@ def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str
     return merged
 
 
-def live_offer_rates(max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> dict[str, float]:
+def live_offer_rates(
+    max_wall_seconds: float = 0.0, min_vram_gb: int = 0, exact_type: str = ""
+) -> dict[str, float]:
     """Friendly-name -> cheapest live $/hr for ONLY classes with a rentable offer (NO static merge);
     ``{}`` offline / without ``VAST_API_KEY`` / on any fetch failure.
 
@@ -125,13 +133,22 @@ def live_offer_rates(max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> dic
     if not os.environ.get("VAST_API_KEY"):
         return {}
     try:
-        return _fetch_offer_rates(max_wall_seconds, min_vram_gb=min_vram_gb)
+        return _fetch_offer_rates(
+            max_wall_seconds,
+            min_vram_gb=min_vram_gb,
+            exact_type=exact_type,
+        )
     except Exception as exc:
         logger.warning("live vast offer rates unavailable (%s)", exc)
         return {}
 
 
-def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0, min_vram_gb: int = 0) -> float:
+def hourly_rate(
+    gpu_name: str,
+    max_wall_seconds: float = 0.0,
+    min_vram_gb: int = 0,
+    exact_type: str = "",
+) -> float:
     """$/hr for one friendly GPU name (cheapest live offer if available, else static).
 
     ``max_wall_seconds`` (>0) prices against offers that outlast the run's wall cap (see ``live_rates``)
@@ -144,6 +161,15 @@ def hourly_rate(gpu_name: str, max_wall_seconds: float = 0.0, min_vram_gb: int =
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
+    if exact_type:
+        exact = live_offer_rates(
+            max_wall_seconds=max_wall_seconds,
+            min_vram_gb=min_vram_gb,
+            exact_type=exact_type,
+        )
+        if name in exact:
+            return exact[name]
+        return _static_rates().get(name) or 0.0
     if min_vram_gb > 0:
         floored = live_offer_rates(max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
         if name in floored:

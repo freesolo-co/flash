@@ -15,6 +15,19 @@ def test_canonical_gpu_aliases():
     assert canonical_gpu("NVIDIA A100-SXM4-40GB") == "A100 SXM 40GB"
 
 
+def test_ambiguous_provider_aliases_are_not_user_canonicalizable():
+    from flash.providers.base import UnsupportedGpuError, canonical_gpu, vast_gpu_for_offer
+
+    for alias in ("A100 SXM4", "NVIDIA A100 SXM4"):
+        with pytest.raises(UnsupportedGpuError):
+            canonical_gpu(alias)
+
+    assert canonical_gpu("A100 SXM 40GB") == "A100 SXM 40GB"
+    assert canonical_gpu("A100 SXM") == "A100 SXM"
+    assert vast_gpu_for_offer("A100 SXM4", 40 * 1024) == "A100 SXM 40GB"
+    assert vast_gpu_for_offer("A100 SXM4", 80 * 1024) == "A100 SXM"
+
+
 def test_unknown_gpu_rejected():
     from flash.providers.base import UnsupportedGpuError, canonical_gpu
 

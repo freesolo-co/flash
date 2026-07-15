@@ -168,7 +168,30 @@ def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
     vast.usable_offers(24, disk_gb=60, exact_type="H100")
 
     assert captured["min_vram_mb"] == int(80 * 1024 * vast._SEARCH_VRAM_SLACK)
+    assert captured["max_vram_mb"] == 80 * 1024
     assert captured["gpu_names"] == ("H100 SXM", "H100 PCIE")
+
+
+def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, **kwargs):
+        captured.update(min_vram_mb=min_vram_mb, **kwargs)
+        return []
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    vast.usable_offers(24, disk_gb=60, exact_type="A100 SXM 40GB")
+
+    assert captured["min_vram_mb"] == int(40 * 1024 * vast._SEARCH_VRAM_SLACK)
+    assert captured["max_vram_mb"] == 40 * 1024
+    assert captured["gpu_names"] == ("A100 SXM4", "A100 PCIE")
+
+    captured.clear()
+    vast.usable_offers(24, disk_gb=60)
+    assert "max_vram_mb" not in captured
 
 
 def test_usable_offers_threads_duration_floor(monkeypatch):

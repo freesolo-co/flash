@@ -890,11 +890,13 @@ def check_fit(
     """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises."""
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
     if params_b is None:
-        params_b = (
-            fetch_hf_params_b(model_id, revision=model_revision, strict=True)
-            if model_revision
-            else fetch_hf_params_b(model_id)
-        )
+        if model_revision:
+            try:
+                params_b = fetch_hf_params_b(model_id, revision=model_revision, strict=True)
+            except Exception:
+                params_b = None
+        else:
+            params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
     est = estimate_vram_gb(params_b, algorithm, quant)
