@@ -414,9 +414,9 @@ def test_error_artifact_name_is_per_phase_and_attempt():
     assert error_artifact_name("rl") == "error_rl_attempt0.txt"
     assert error_artifact_name("rl", 0) != error_artifact_name("rl", 1)
     assert error_artifact_name("sft", 2) == "error_sft_attempt2.txt"
-    # str-typed ATTEMPT env value coerces cleanly
-    assert error_artifact_name("sft", "3") == "error_sft_attempt3.txt"
-    assert error_artifact_name("sft", "") == "error_sft_attempt0.txt"
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            error_artifact_name("sft", invalid)
 
 
 def test_train_body_imports_every_name_it_uses():

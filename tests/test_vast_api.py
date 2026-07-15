@@ -157,6 +157,7 @@ def test_create_instance_success_and_rejection(monkeypatch):
     with pytest.raises(vast_api.VastApiError, match="rejected") as exc_info:
         vast_api.create_instance(123, **kwargs)
     assert vast_api.create_error_is_ambiguous(exc_info.value) is False
+    assert "provider body secret" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("status", [404, 410])
@@ -307,6 +308,52 @@ def test_create_instance_malformed_response_is_ambiguous(monkeypatch, body):
     assert "provider body secret" not in str(exc_info.value)
 
 
+def test_create_instance_diagnostics_never_render_opaque_response_body(monkeypatch):
+    import traceback
+
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    private = "opaque-private-sentinel-7f3c"
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
+
+    for response, expected in (
+        ({"success": False, "error": private}, vast_api.VastCreateRejected),
+        ({"success": None, "error": private}, vast_api.VastAmbiguousCreate),
+    ):
+        _capture_urlopen(monkeypatch, [response])
+        with pytest.raises(expected) as exc_info:
+            vast_api.create_instance(123, **kwargs)
+        detail = str(exc_info.value)
+        assert private not in detail
+        assert "create_instance(123)" in detail
+
+    private_http = urllib.error.HTTPError(
+        "https://console.vast.ai/api/v0/asks/123/",
+        409,
+        private,
+        None,
+        io.BytesIO(json.dumps({"error": private}).encode()),
+    )
+    _capture_urlopen(monkeypatch, [private_http])
+    with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    detail = str(exc_info.value)
+    formatted = "".join(
+        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
+    )
+    assert private not in detail
+    assert private not in formatted
+    assert "HTTP 409" in detail
+    assert "/v0/asks/123/" in detail
+
+
 def test_create_instance_is_not_retried(monkeypatch):
     """Fix #4: ``PUT /asks/{id}`` is non-idempotent (each success rents a NEW instance),
     so a transient failure must NOT be blindly retried — a retry on a timeout where Vast
@@ -412,7 +459,7 @@ def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
     # total and non-throwing so it flows to ambiguous instead of escaping as a valueerror.
     for bad in ("not-a-number", {"id": 1}, [7], "²", True, -3, 0):
         _capture_urlopen(monkeypatch, [{"success": True, "new_contract": bad}])
-        with pytest.raises(vast_api.VastAmbiguousCreate, match="no instance id") as ei:
+        with pytest.raises(vast_api.VastAmbiguousCreate, match="no usable instance id") as ei:
             vast_api.create_instance(123, **kwargs)
         assert vast_api.create_error_is_ambiguous(ei.value) is True
 

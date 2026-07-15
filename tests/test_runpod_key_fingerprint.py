@@ -75,3 +75,42 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
 
     with pytest.raises(api.RunpodApiError):
         api.delete_endpoint_for_fingerprint("ep-1", "rpk-no-such-account")  # no pool key matches
+
+
+def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypatch):
+    from flash.providers.runpod import api, keys
+
+    _reset_pool(monkeypatch, "secretA,secretB")
+    owner = api.key_fingerprint("secretA")
+    calls = []
+
+    def request(key, url, **kwargs):
+        calls.append((key, url, kwargs.get("method", "GET")))
+        if url.endswith("/run"):
+            return {"id": "job-1"}
+        if "/status/" in url:
+            return {"status": "IN_PROGRESS"}
+        if "/cancel/" in url:
+            return {"id": "job-1", "status": "CANCELLED"}
+        return {}
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", request)
+    keys.advance_key()
+    assert keys.active_key() == "secretB"
+
+    assert api.submit_job(
+        "ep-1",
+        {"x": 1},
+        key_fingerprint=owner,
+        deadline_at=4_000_000_000.0,
+    ) == "job-1"
+    assert api.job_status(
+        "ep-1",
+        "job-1",
+        key_fingerprint=owner,
+        deadline_at=4_000_000_000.0,
+    )["status"] == "IN_PROGRESS"
+    assert api.cancel_job("ep-1", "job-1", key_fingerprint=owner)["status"] == "CANCELLED"
+    assert api.delete_endpoint_for_fingerprint("ep-1", owner) is True
+
+    assert [key for key, _url, _method in calls] == ["secretA"] * 4

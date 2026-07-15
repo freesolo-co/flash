@@ -13,6 +13,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
+from flash.diagnostics import sanitize_diagnostic
 from flash.providers._deadline import remaining_seconds, require_deadline_at
 
 _HTTP_404_RE = re.compile(r"\bhttp 404\b")
@@ -129,11 +130,9 @@ class RestClient:
                     raw = b""
                     with contextlib.suppress(Exception):
                         raw = e.read()
-                    err = self.error_cls(
-                        f"{method} {target} -> HTTP {e.code}; provider detail suppressed"
-                    )
-                    # retain the body as structured metadata for provider-specific classification
-                    # without exposing it through the exception message.
+                    reason = sanitize_diagnostic(e.reason, limit=200)
+                    err = self.error_cls(f"{method} {target} -> HTTP {e.code}: {reason}")
+                    # retain the body as structured metadata for provider-specific classification.
                     err.response_body = raw
                     raise err from e
                 last = e
@@ -153,8 +152,9 @@ class RestClient:
                 if delay > 0:
                     time.sleep(delay)
         # Chain last so is_not_found and failover_predicate can inspect the HTTPError code.
+        error_kind = type(last).__name__ if last is not None else "unknown error"
         raise self.error_cls(
-            f"{method} {target} failed after {retries + 1} attempts; provider detail suppressed"
+            f"{method} {target} failed after {retries + 1} attempts ({error_kind})"
         ) from last
 
     def request_with_retries_for_key(

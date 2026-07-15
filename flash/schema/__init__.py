@@ -33,10 +33,13 @@ from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-# The ONE public checkpoint/adapter reference grammar: `<run_id>` (a run's trained adapter) or
-# `<run_id>/step-N` (a specific saved checkpoint listed by `flash checkpoints`). The control plane
-# resolves it to the internal storage reference below; users never see or write storage refs.
+# canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
+# revisions additionally lock that checkpoint identity to the exact hugging face commit.
 _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
+_ADAPTER_REVISION_RE = re.compile(
+    rf"^(?P<run_id>{_RUN_ID_RE})@(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\."
+    r"(?P<hf_revision>[0-9a-f]{40})$"
+)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -59,9 +62,31 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
         return None
 
 
+def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
+    """Parse a locked immutable adapter revision into ``(run_id, step|None, hf_revision)``."""
+    match = _ADAPTER_REVISION_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    step = match.group("step")
+    return (
+        match.group("run_id"),
+        int(step) if step is not None else None,
+        match.group("hf_revision"),
+    )
+
+
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
     """Format the canonical short reference: `<run_id>` or `<run_id>/step-N`."""
     return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
+
+
+def format_adapter_revision(run_id: str, step: int | None, hf_revision: str) -> str:
+    """Format and validate a canonical immutable adapter revision."""
+    suffix = f"step-{int(step)}" if step is not None else "final"
+    revision = f"{run_id}@{suffix}.{hf_revision}"
+    if parse_adapter_revision(revision) is None:
+        raise ValueError("invalid immutable adapter revision components")
+    return revision
 
 
 def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
@@ -301,7 +326,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
     gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
-    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=1)
+    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
     gpu_options = {}
     if gpu_max_retries is not None:
         gpu_options["max_retries"] = gpu_max_retries

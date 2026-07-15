@@ -8,59 +8,26 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import threading
 import time
 
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
+from flash.diagnostics import sanitize_diagnostic
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 
-
-def opd_training_started_artifact_name(attempt=0) -> str:
-    """Immutable aggregate-only evidence that an OPD attempt may mutate optimizer state."""
-    return f"opd_training_started_attempt{int(attempt or 0)}.json"
+_MAX_ATTEMPT_ID = (1 << 63) - 1
 
 
-def persist_opd_training_started() -> None:
-    """Persist optimizer-start evidence before the first mutation or abort permanently."""
-    attempt = _w.ATTEMPT
-    run_id = _w.RUN_ID
-    ts = time.time()
-    if (
-        isinstance(attempt, bool)
-        or not isinstance(attempt, int)
-        or attempt < 0
-        or not isinstance(run_id, str)
-        or not run_id
-        or isinstance(ts, bool)
-        or not isinstance(ts, (int, float))
-        or not math.isfinite(ts)
-    ):
-        raise RuntimeError("opd optimizer-start marker identity is invalid")
-    name = opd_training_started_artifact_name(attempt)
-    path = f"/tmp/{name}"
-    payload = {
-        "attempt": attempt,
-        "run_id": run_id,
-        "training_started": True,
-        "ts": ts,
-    }
-    with open(path, "w") as f:
-        json.dump(payload, f, sort_keys=True, separators=(",", ":"))
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        _w.hf_upload_file(path, name, required=True)
-    except Exception:
-        raise RuntimeError("opd optimizer-start marker persistence failed") from None
-
-
-def error_artifact_name(mode: str, attempt=0) -> str:
+def error_artifact_name(mode: str, attempt: int = 0) -> str:
     """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
     attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
-    return f"error_{mode}_attempt{int(attempt or 0)}.txt"
+    if isinstance(attempt, bool) or not isinstance(attempt, int):
+        raise ValueError("attempt must be a nonnegative integer")
+    if attempt < 0 or attempt > _MAX_ATTEMPT_ID:
+        raise ValueError("attempt must be a bounded nonnegative integer")
+    return f"error_{mode}_attempt{attempt}.txt"
 
 
 def hf_api():
@@ -84,7 +51,7 @@ def _sleep_with_hf_deadline(delay: float) -> bool:
     remaining = _require_hf_deadline_allowance()
     sleep_for = delay if remaining is None else min(delay, remaining)
     if sleep_for <= 0:
-        return True
+        return False
     time.sleep(sleep_for)
     remaining = _w._remaining_worker_wall_seconds()
     return remaining is None or remaining > 0
@@ -98,26 +65,32 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
     if not _w.HF_REPO:
         return True
     attempts = 3 if required else 1
+    last_err: Exception | None = None
     for attempt in range(attempts):
         try:
             _require_hf_deadline_allowance()
             do_upload()
             return True
-        except Exception:
+        except Exception as e:
+            last_err = e
+            detail = sanitize_diagnostic(e, limit=500)
             if required and attempt + 1 < attempts:
-                print(f"{label} retry {attempt + 1}/{attempts}; provider detail suppressed")
+                print(f"{label} retry {attempt + 1}/{attempts}: {detail}")
                 try:
                     if not _sleep_with_hf_deadline(5 * (attempt + 1)):
                         break
                 except Exception:
                     break
                 continue
-            if required:
-                break
-            print(f"{label} warn; provider detail suppressed")
-            return False
+            if not required:
+                print(f"{label} warn: {detail}")
+                return False
+            break
     if required:
-        raise RetriableInfraError(f"required upload of {repo_subpath!r} failed") from None
+        detail = sanitize_diagnostic(last_err, limit=500)
+        raise RetriableInfraError(
+            f"required upload of {repo_subpath!r} failed: {detail}"
+        ) from last_err
     return False
 
 
@@ -159,8 +132,8 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
                 for row in rows:
                     f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
             _w.hf_upload_file(path, repo_name)
-    except Exception:
-        print(f"debug upload warn ({repo_name}); provider detail suppressed")
+    except Exception as e:
+        print(f"debug upload warn ({repo_name}): {e}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
@@ -207,8 +180,8 @@ def hf_resume_checkpoint() -> str | None:
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
         return path
-    except Exception:
-        print("hf_resume_checkpoint warn; provider detail suppressed")
+    except Exception as e:
+        print("hf_resume_checkpoint warn:", e)
         return None
 
 
@@ -311,8 +284,8 @@ def prefetch_model(model_id: str) -> float:
             )
             if shared_hub:
                 _link_base_model_into_ephemeral_cache(model_id, shared_hub)
-        except Exception:
-            print("prefetch_model warn; provider detail suppressed")
+        except Exception as e:
+            print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",
@@ -373,8 +346,8 @@ def publish_deployable_checkpoint(
             )
             _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
-        except Exception:
-            print(f"[ckpt] deployable publish warn (step {step}); provider detail suppressed")
+        except Exception as e:
+            print(f"[ckpt] deployable publish warn (step {step}):", e)
             if attempt + 1 < retries:
                 try:
                     if not _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
@@ -426,8 +399,8 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     try:
         _require_hf_deadline_allowance()
         files = api.list_repo_files(repo_id=_w.HF_REPO, repo_type="dataset")
-    except Exception:
-        print("ckpt prune warn (list); provider detail suppressed")
+    except Exception as e:
+        print("ckpt prune warn (list):", e)
         return
     stale: set[str] = set()
     for f in files:
@@ -441,7 +414,8 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
         try:
             _require_hf_deadline_allowance()
             api.delete_folder(path_in_repo=folder, repo_id=_w.HF_REPO, repo_type="dataset")
-        except Exception:
+        except Exception as e:
+            print(f"ckpt prune warn ({folder}):", e)
             break
 
 
@@ -505,21 +479,21 @@ def make_checkpoint_upload_callback():
                     _upload_once(step, ckpt_dir)
                     uploaded_steps.add(step)
                     return True
-                except Exception:
+                except Exception as e:
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
                         print(
-                            f"[ckpt] step {step} upload retry {attempt + 1}/"
-                            f"{_CKPT_UPLOAD_RETRIES}; provider detail suppressed"
+                            f"[ckpt] step {step} upload retry {attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
                         )
                         try:
-                            if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
+                            if not _sleep_with_hf_deadline(
+                                _CKPT_UPLOAD_BACKOFF_S * (attempt + 1)
+                            ):
                                 break
                         except Exception:
                             break
                     else:
                         print(
-                            f"[ckpt] step {step} upload failed after "
-                            f"{_CKPT_UPLOAD_RETRIES} attempts; provider detail suppressed"
+                            f"[ckpt] step {step} upload FAILED after {_CKPT_UPLOAD_RETRIES} attempts: {e}"
                         )
                         with contextlib.suppress(Exception):
                             _w.heartbeat("checkpoint_upload_failed", step=step)

@@ -843,13 +843,7 @@ def _run_opd(forward_teacher_accounting):
         aggregates, and refresh the stall clock. Called after vLLM generation and teacher scoring;
         ``samples_seen`` is advanced by the caller once per generated rollout so its timing is
         unchanged."""
-        nonlocal \
-            teacher_ok, \
-            teacher_transient, \
-            teacher_error, \
-            truncated_rollouts, \
-            step_loss, \
-            step_cov
+        nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         if r.teacher_status == "ok":
             teacher_ok += 1
@@ -899,7 +893,6 @@ def _run_opd(forward_teacher_accounting):
     max_teacher_workers = _opd_teacher_workers(
         knobs.prompts_per_step * knobs.group_size, teacher_batch_size
     )
-
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -1193,13 +1186,10 @@ def _run_opd(forward_teacher_accounting):
                 opd_phase_counts["forward_objective_batches"] += 1
             optimizer_started = time.perf_counter()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            if opt_steps == 0:
-                _w.persist_opd_training_started()
             optimizer.step()
             opd_phase_seconds["optimizer_step"] += time.perf_counter() - optimizer_started
             opd_phase_counts["optimizer_steps"] += 1
             opt_steps += 1
-            _w.OPD_OPTIMIZER_STEPS = opt_steps
             # On-policy means the next rollout must sample from the just-updated student LoRA.
             # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
             # post-final vLLM sync that can fail after all optimizer updates have already landed.
@@ -1417,9 +1407,7 @@ def _run_opd(forward_teacher_accounting):
                 else None
             ),
             "opd_rollout_pipeline_max_chunks": (
-                _opd_rollout_pipeline_max_chunks(prompts_per_step * group)
-                if not multi_turn
-                else None
+                _opd_rollout_pipeline_max_chunks(prompts_per_step * group) if not multi_turn else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
@@ -1728,9 +1716,7 @@ def _score_many(
                 for _ in pendings
             ]
         return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
-    return [
-        _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
-    ]
+    return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
 
 
 @dataclass(frozen=True)
@@ -2306,10 +2292,12 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     )
     student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
     student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
-    teacher_logsum_t = torch.tensor(prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device)
-    coeffs = (
-        kl_coef * (student_group_logsum - teacher_logsum_t) / group_lengths_t.to(dtype=sp_t.dtype)
+    teacher_logsum_t = torch.tensor(
+        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
     )
+    coeffs = kl_coef * (
+        student_group_logsum - teacher_logsum_t
+    ) / group_lengths_t.to(dtype=sp_t.dtype)
     coeff_vec = coeffs.index_select(0, group_ids_t)
     sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()
@@ -2419,9 +2407,13 @@ def _resolve_samples_batched(
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+            attention_mask = torch.zeros(
+                (len(seqs), max_len), dtype=torch.long, device=device
+            )
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                input_ids[row, : len(seq)] = torch.tensor(
+                    seq, dtype=torch.long, device=device
+                )
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
             losses = []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -81,9 +82,8 @@ class PollErrorTracker:
 
     def record(self, exc: Exception, *, deadline_at: float | None = None) -> bool:
         """Register a poll error and back off no later than the absolute deadline."""
-        del exc
         self._count += 1
-        self._say(f"poll error ({self._count}); provider detail suppressed")
+        self._say(f"poll error ({self._count}): {type(exc).__name__}")
         if self._count >= self._max_errors:
             return True
         delay = min(60, self._interval_s * self._count)
@@ -325,25 +325,13 @@ def surface_heartbeat(
 
 
 _MAX_ATTEMPT_ID = (1 << 63) - 1
-_MAX_ATTEMPT_DECIMAL_DIGITS = len(str(_MAX_ATTEMPT_ID))
 
 
 def _attempt_int(value: Any) -> int | None:
-    """Parse a bounded nonnegative attempt identity from int or legacy ascii decimal text."""
-    if isinstance(value, bool):
+    """Validate a bounded nonnegative integer attempt identity."""
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    if isinstance(value, int):
-        return value if 0 <= value <= _MAX_ATTEMPT_ID else None
-    if isinstance(value, str):
-        if (
-            not value
-            or len(value) > _MAX_ATTEMPT_DECIMAL_DIGITS
-            or any(char < "0" or char > "9" for char in value)
-        ):
-            return None
-        parsed = int(value)
-        return parsed if parsed <= _MAX_ATTEMPT_ID else None
-    return None
+    return value if 0 <= value <= _MAX_ATTEMPT_ID else None
 
 
 def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
@@ -360,23 +348,22 @@ def heartbeat_progress_ts(
     """Return (ts, fresh): ts is the heartbeat's own timestamp clamped to [launch, now]; fresh is
     False for a prior-attempt leftover (retries reuse the same seed heartbeat path).
 
-    Use the heartbeat's own ts, not poll time — a stale-before-reattach heartbeat must not buy a fresh
-    stall window. launch_ts=0.0 means unknown; attempt mismatches are still rejected."""
+    Use the heartbeat's own ts, not poll time, so stale pre-reattach state buys no fresh window."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
         ts = float(ts)
     except (TypeError, ValueError):
         return now, False
-    lo = (
-        float(launch_ts) if launch_ts else 0.0
-    )  # unknown launch -> floor 0.0 (all heartbeats fresh)
-    fresh = ts >= lo
-    # Worker stamps attempt as a str env var, poller passes int; coerce both before comparing.
+    try:
+        lo = float(launch_ts)
+    except (TypeError, ValueError):
+        return now, False
+    if not math.isfinite(lo) or lo <= 0 or not math.isfinite(ts):
+        return now, False
     hb_attempt = (
         _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
     )
     cur_attempt = _attempt_int(current_attempt)
-    if fresh and current_attempt is not None and (cur_attempt is None or hb_attempt != cur_attempt):
-        fresh = False
+    fresh = ts >= lo and cur_attempt is not None and hb_attempt == cur_attempt
     return min(now, max(lo, ts)), fresh

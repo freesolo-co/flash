@@ -1,71 +1,69 @@
 from __future__ import annotations
 
 import logging
-import subprocess
-import sys
-import threading
 import time
-from pathlib import Path
 
 import pytest
 
 from flash.providers._hf_retry import hf_call
 
 
-def test_hf_call_times_out_while_callback_is_in_flight() -> None:
-    release = threading.Event()
-    started = threading.Event()
+def test_hf_call_returns_real_success_after_deadline() -> None:
+    mutations: list[str] = []
 
-    def hang() -> None:
-        started.set()
-        release.wait()
+    def finish_late() -> str:
+        time.sleep(0.03)
+        mutations.append("done")
+        return "uploaded"
 
-    before = time.monotonic()
-    try:
-        with pytest.raises(TimeoutError, match="upload exceeded the run wall deadline"):
-            hf_call(
-                hang,
-                "upload",
-                logger=logging.getLogger(__name__),
-                deadline_at=time.time() + 0.05,
-            )
-        assert time.monotonic() - before < 0.5
-        assert started.wait(timeout=0.5)
-    finally:
-        release.set()
-
-
-def test_hf_call_timeout_does_not_block_interpreter_shutdown() -> None:
-    script = """
-import logging
-import threading
-import time
-
-from flash.providers._hf_retry import hf_call
-
-
-def hang():
-    threading.Event().wait()
-
-
-try:
-    hf_call(
-        hang,
-        "download",
+    result = hf_call(
+        finish_late,
+        "upload",
         logger=logging.getLogger(__name__),
-        deadline_at=time.time() + 0.05,
-    )
-except TimeoutError:
-    print("timed-out", flush=True)
-"""
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).parents[1],
-        capture_output=True,
-        text=True,
-        timeout=2.0,
-        check=False,
+        deadline_at=time.time() + 0.01,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "timed-out"
+    assert result == "uploaded"
+    assert mutations == ["done"]
+
+
+def test_hf_call_returns_real_failure_after_deadline_without_retry() -> None:
+    attempts = 0
+
+    class TransientError(RuntimeError):
+        response = type("Response", (), {"status_code": 503, "headers": {}})()
+
+    def fail_late() -> None:
+        nonlocal attempts
+        attempts += 1
+        time.sleep(0.03)
+        raise TransientError("provider unavailable")
+
+    with pytest.raises(TransientError, match="provider unavailable"):
+        hf_call(
+            fail_late,
+            "download",
+            logger=logging.getLogger(__name__),
+            deadline_at=time.time() + 0.01,
+            retry_delays=(0.0,),
+        )
+
+    assert attempts == 1
+
+
+def test_hf_call_starts_no_attempt_after_deadline() -> None:
+    called = False
+
+    def call() -> None:
+        nonlocal called
+        called = True
+
+    with pytest.raises(TimeoutError, match="upload exceeded the run wall deadline"):
+        hf_call(
+            call,
+            "upload",
+            logger=logging.getLogger(__name__),
+            deadline_at=time.time() - 1.0,
+        )
+
+    assert called is False

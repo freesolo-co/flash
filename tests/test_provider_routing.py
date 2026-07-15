@@ -9,6 +9,8 @@ import pytest
 
 from flash.spec import JobSpec
 
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 4090", "max_retries": 2}
@@ -38,16 +40,29 @@ def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
     )
 
 
-def _lambda_handle(instance_id="i1"):
-    return {"provider": "lambda", "instance_id": instance_id, "region": "us-east-1", "name": "n"}
+def _lambda_handle(instance_id="i1", attempt=0):
+    return {
+        "provider": "lambda",
+        "instance_id": instance_id,
+        "instance_type": "gpu_1x_a100",
+        "region": "us-east-1",
+        "name": "n",
+        "gpu": "A100",
+        "hourly_usd": 1.0,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j"):
+def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
         "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
     }
 
 
@@ -86,7 +101,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         captured["gpu_type"] = run_spec.gpu.type
         captured["runtime_secrets"] = dict(runtime_secrets or {})
         if on_handle:
-            on_handle(_runpod_handle())
+            on_handle(_runpod_handle(attempt=attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -176,17 +191,17 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
         assert allow_poll.wait(timeout=5)
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    def cancel_job(endpoint_id, job_id):
+    def cancel_job(endpoint_id, job_id, **_kw):
         cancelled_handles.append((endpoint_id, job_id))
 
-    def delete_endpoint(endpoint_id):
+    def delete_endpoint(endpoint_id, _fingerprint):
         destroyed_handles.append(endpoint_id)
         resource_live["value"] = False
         return True
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
     submit_errors = []
 
@@ -227,8 +242,7 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
     assert cancel_results[0].state == "cancelled"
     status = orch.get_status(spec.run_id)
     assert status.state == "cancelled"
-    assert status.remote["endpoint_id"] == "ep-handshake"
-    assert status.remote["job_id"] == "job-handshake"
+    assert status.remote is None
     assert cancelled_handles == [("ep-handshake", "job-handshake")]
     assert "ep-handshake" in destroyed_handles
     assert not resource_live["value"]
@@ -536,16 +550,16 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda e, j: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+        lambda e, j, **_kw: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted.append(e) or True)
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
         if attempt == 0:
-            on_handle(_runpod_handle("ep1", "j1"))
+            on_handle(_runpod_handle("ep1", "j1", attempt))
             return PollResult(False, failure="stalled", detail="no worker progress")
-        on_handle(_runpod_handle("ep2", "j2"))
+        on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -579,8 +593,8 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
     monkeypatch.setattr(
         runpod_api,
-        "delete_endpoint",
-        lambda endpoint_id: deleted_endpoints.append(endpoint_id) or False,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: deleted_endpoints.append(endpoint_id) or False,
     )
     monkeypatch.setattr(
         RunpodProvider,
@@ -590,7 +604,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_attempts.append(attempt)
-        on_handle(_runpod_handle("ep-unconfirmed", "job-unconfirmed"))
+        on_handle(_runpod_handle("ep-unconfirmed", "job-unconfirmed", attempt))
         return PollResult(False, failure="stalled", detail="no worker progress")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -631,9 +645,9 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     submitted = []
     on_last_gpu = []
@@ -642,7 +656,7 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted.append(run_spec.gpu.type)
         on_last_gpu.append(kwargs.get("on_last_gpu", False))
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         failure = next(failure_iter)
         detail = "CUDA out of memory" if failure == "oom" else "x"
         return PollResult(False, failure=failure, detail=detail)
@@ -765,15 +779,15 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     rp_gpus, lam_gpus = [], []
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep1", "j1"))
+        on_handle(_runpod_handle("ep1", "j1", attempt))
         return PollResult(
             False, failure="no_capacity", detail="job stuck IN_QUEUE (no RunPod capacity)"
         )
@@ -781,7 +795,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle())
+            on_handle(_lambda_handle(attempt=attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -797,8 +811,8 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_auto_cache_run_does_not_add_submission_at_zero_retries(orch, monkeypatch):
-    """max_retries=0 permits exactly one provider submission, including cached runs."""
+def test_auto_cache_run_gets_free_cacheless_fallback_at_zero_retries(orch, monkeypatch):
+    """max_retries=0 still permits one free cacheless fallback for a shared-cache run."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -813,9 +827,9 @@ def test_auto_cache_run_does_not_add_submission_at_zero_retries(orch, monkeypatc
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     volumes_seen = []
 
@@ -823,7 +837,7 @@ def test_auto_cache_run_does_not_add_submission_at_zero_retries(orch, monkeypatc
         vol = getattr(run_spec.gpu, "network_volume", None)
         volumes_seen.append(vol)
         if on_handle:
-            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
         # fallback attempt -> success.
         if vol == WEIGHT_CACHE_VOLUME_NAME:
@@ -835,9 +849,9 @@ def test_auto_cache_run_does_not_add_submission_at_zero_retries(orch, monkeypatc
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    with pytest.raises(RuntimeError, match="cache DC set starved"):
-        orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME]
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
 
 
 def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
@@ -864,9 +878,9 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     seen = []
 
@@ -874,7 +888,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
         vol = getattr(run_spec.gpu, "network_volume", None)
         seen.append((run_spec.gpu.type, vol))
         if on_handle:
-            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         # Cache attempt AND its cache-less same-class fallback both starve; only the walk to the OTHER
         # class (the genuine retry that must survive the cache drop) succeeds.
         if run_spec.gpu.type == "RTX 6000 Ada":
@@ -913,16 +927,18 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     terminated = []
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api,
+        "terminate_instance_confirmed",
+        lambda instance_id: terminated.append(instance_id),
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
 
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle("i-broken"))
+            on_handle(_lambda_handle("i-broken", attempt))
         return PollResult(
             False,
             failure="job_preempted",
@@ -931,7 +947,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep2", "j2"))
+        on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_lam)
@@ -964,15 +980,15 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
         Candidate("runpod", "H100", 0.49, 48),  # the cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", lambda instance_id: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
 
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle())
+            on_handle(_lambda_handle(attempt=attempt))
         return PollResult(
             False,
             failure="stalled",
@@ -981,7 +997,7 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep3", "j3"))
+        on_handle(_runpod_handle("ep3", "j3", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_lam)
@@ -1015,7 +1031,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     assert calls == [0]
 
 
-def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
+def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import train as rp_train
 
@@ -1023,19 +1039,20 @@ def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda e, j: cancelled_jobs.append((e, j)) or {"id": j, "status": "CANCELLED"},
+        lambda e, j, **_kw: cancelled_jobs.append((e, j)) or {"id": j, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted_eps.append(e) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted_eps.append(e) or True)
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
     spec = _spec()
     st = _seed_status(orch, spec)
     st.state = "running"
     st.remote = {"endpoint_id": "ep1", "endpoint_name": "n", "job_id": "j1"}
     orch._save_status(st)
-    out = orch.cancel_run(spec.run_id)
-    assert out.state == "cancelled"
-    assert cancelled_jobs == [("ep1", "j1")]
-    assert "ep1" in deleted_eps
+    with pytest.raises(RuntimeError, match="exact cleanup target could not be preserved"):
+        orch.cancel_run(spec.run_id)
+    assert cancelled_jobs == []
+    assert deleted_eps == []
+    assert orch.get_status(spec.run_id).remote == st.remote
 
 
 def test_config_gpu_fields(monkeypatch):

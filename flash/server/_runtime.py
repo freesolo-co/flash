@@ -241,17 +241,8 @@ def _confirm_run_clear(spec) -> bool:
 
 
 def _recovery_block_reason(spec) -> str | None:
-    from flash.runner import _opd_progress_detected, _spec_with_remaining_wall
+    from flash.runner import _spec_with_remaining_wall
 
-    if spec.algorithm == "opd":
-        try:
-            if _opd_progress_detected(spec.run_id):
-                return (
-                    "opd progress was detected; automatic recovery is blocked because opd "
-                    "checkpoint resume is not supported"
-                )
-        except RuntimeError as exc:
-            return str(exc)
     try:
         _spec_with_remaining_wall(spec, require_provider_minimum=True)
     except RuntimeError as exc:

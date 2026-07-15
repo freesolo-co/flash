@@ -154,12 +154,14 @@ def _rejection_from_body(offer_id: int, body: dict) -> VastApiError | None:
     contract = body.get("new_contract")
     if contract:
         err = VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned contradictory rejection with contract "
-            "evidence; provider detail suppressed; possible billed contract"
+            f"create_instance({offer_id}) returned success=false with contract evidence "
+            "(contradictory response; possible billed contract)"
         )
         err.contract_id = _usable_contract_id(contract)
         return err
-    return VastCreateRejected(f"create_instance({offer_id}) rejected; provider detail suppressed")
+    return VastCreateRejected(
+        f"create_instance({offer_id}) rejected (success=false with no contract evidence)"
+    )
 
 
 def _http_error_response(error: VastApiError) -> dict | None:
@@ -233,25 +235,33 @@ def create_instance(
         if response is not None:
             classified = _rejection_from_body(offer_id, response)
             if classified is not None:
-                raise classified from getattr(e, "__cause__", e)
+                raise classified from None
         cause = getattr(e, "__cause__", None)
+        if isinstance(cause, urllib.error.HTTPError):
+            raise VastAmbiguousCreate(
+                f"create_instance({offer_id}) HTTP {cause.code} on {target} was not a definitive "
+                "rejection (possible billed contract)"
+            ) from None
         if isinstance(cause, (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException)):
             raise VastAmbiguousCreate(
-                f"create_instance({offer_id}) response unreadable; provider detail suppressed; "
-                "possible billed contract"
+                f"create_instance({offer_id}) response unreadable "
+                f"({type(cause).__name__}; possible billed contract)"
             ) from None
-        raise
-    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException):
+        raise VastAmbiguousCreate(
+            f"create_instance({offer_id}) failed without a definitive rejection classification "
+            f"on {target} ({type(e).__name__}; possible billed contract)"
+        ) from None
+    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException) as exc:
         # an unreadable response may mean vast billed a contract before the response failed.
         # surface an ambiguous create so the caller reconciles instead of leaking the contract.
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) response unreadable; provider detail suppressed; "
-            "possible billed contract"
+            f"create_instance({offer_id}) response unreadable "
+            f"({type(exc).__name__}; possible billed contract)"
         ) from None
     if not isinstance(out, dict):
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned an ambiguous response; "
-            "provider detail suppressed; possible billed contract"
+            f"create_instance({offer_id}) returned a non-object response "
+            f"({type(out).__name__}; possible billed contract)"
         )
     classified = _rejection_from_body(offer_id, out)
     if classified is not None:
@@ -259,13 +269,13 @@ def create_instance(
     parsed_id = _usable_contract_id(out.get("new_contract"))
     if out.get("success") is not True:
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned an ambiguous response; "
-            "provider detail suppressed; possible billed contract"
+            f"create_instance({offer_id}) returned an ambiguous success classification "
+            "(possible billed contract)"
         )
     if parsed_id is None:
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned no instance id usable; "
-            "provider detail suppressed; possible billed contract"
+            f"create_instance({offer_id}) returned no usable instance id "
+            "(possible billed contract)"
         )
     return parsed_id
 
@@ -309,8 +319,7 @@ def get_instance(
         # the poller counts it as a bounded, retryable poll_error instead of a false healthy read.
         if out.get("success") is False:
             raise VastApiError(
-                f"vast instance-detail error envelope for {int(instance_id)}; "
-                "provider detail suppressed"
+                f"vast instance-detail error envelope for {int(instance_id)}: {repr(out)[:1000]}"
             )
         return out
     return None

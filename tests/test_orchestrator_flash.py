@@ -523,9 +523,10 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch, c
 
         status = runner.get_status("bg-fail")
         assert status.state == "failed"
-        assert status.error == "run failed; detail suppressed"
+        safe_detail = "RuntimeError: background run failed"
+        assert status.error == safe_detail
         assert raw_message not in (status.error or "")
-        assert "background run bg-fail ended in error; detail suppressed" in caplog.messages
+        assert f"background run bg-fail ended in error: {safe_detail}" in caplog.messages
         assert raw_message not in caplog.text
 
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._deadline import deadline_kwargs
 from flash.providers._instance import InstanceJobHandle
 from flash.providers._instance_provider import InstanceProvider
 from flash.providers.base import (
@@ -95,27 +94,14 @@ class VastProvider(InstanceProvider):
             deadline_at=deadline_at,
         )
 
-    def _teardown_reattached(
-        self,
-        handle: JobHandle,
-        spec,
-        *,
-        deadline_at: float | None,
-    ) -> None:
+    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
         from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
-        if not _best_effort_destroy(
-            handle.instance_id,
-            context="poll recovery teardown",
-            **deadline_kwargs(_best_effort_destroy, deadline_at),
-        ):
+        if not _best_effort_destroy(handle.instance_id, context="poll recovery teardown"):
             # unconfirmed teardown: the active-run sweep shields this label, so escalate to a
             # run-scoped reap by label (re-lists + retries, not active-shielded), mirroring the
             # submit_run_vast teardown finally.
-            destroy_run_instances(
-                spec.run_id,
-                **deadline_kwargs(destroy_run_instances, deadline_at),
-            )
+            destroy_run_instances(spec.run_id)
 
     def _gc(self, run_id: str) -> None:
         from flash.providers.vast.jobs import destroy_run_instances
@@ -175,15 +161,15 @@ class VastProvider(InstanceProvider):
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.vast.jobs import cancel
 
-        cancel(handle.to_dict())
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        cancel(strict.to_dict())
 
     def destroy(self, handle: JobHandle) -> None:
         from flash.providers.vast import api as vast_api
         from flash.providers.vast.jobs import _best_effort_destroy
 
-        iid = handle.to_dict().get("instance_id")
-        if not iid:
-            return
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        iid = strict.instance_id
         # Reuse the canonical best-effort teardown (it warns on an unconfirmed success:false/breakdown and
         # passes iid through unconverted), but RE-RAISE on failure so this suppress-wrapped path falls back
         # to sweep_orphans rather than recording a false success.

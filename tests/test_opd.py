@@ -24,73 +24,6 @@ from flash.engine.worker.tokenizer_align import (
 )
 
 
-def test_opd_training_started_marker_is_attempt_scoped_and_aggregate(monkeypatch):
-    from pathlib import Path
-
-    import flash.engine.worker as worker
-    from flash.engine.worker import hf as hf_mod
-
-    uploads = []
-
-    def _capture(local_path, repo_subpath, required=False):
-        uploads.append(
-            (local_path, repo_subpath, required, json.loads(Path(local_path).read_text()))
-        )
-
-    monkeypatch.setattr(worker, "ATTEMPT", 3)
-    monkeypatch.setattr(worker, "RUN_ID", "opd-marker-run")
-    monkeypatch.setattr(hf_mod.time, "time", lambda: 1234.5)
-    monkeypatch.setattr(worker, "hf_upload_file", _capture)
-    marker_path = Path("/tmp/opd_training_started_attempt3.json")
-    try:
-        hf_mod.persist_opd_training_started()
-    finally:
-        marker_path.unlink(missing_ok=True)
-
-    assert uploads == [
-        (
-            str(marker_path),
-            "opd_training_started_attempt3.json",
-            True,
-            {
-                "attempt": 3,
-                "run_id": "opd-marker-run",
-                "training_started": True,
-                "ts": 1234.5,
-            },
-        )
-    ]
-    assert type(uploads[0][3]["attempt"]) is int
-    assert type(uploads[0][3]["training_started"]) is bool
-    assert type(uploads[0][3]["run_id"]) is str
-    assert type(uploads[0][3]["ts"]) is float
-
-
-def test_opd_training_started_marker_upload_failure_is_generic(monkeypatch):
-    import flash.engine.worker as worker
-    from flash.engine.worker import hf as hf_mod
-
-    monkeypatch.setattr(worker, "ATTEMPT", 4)
-    monkeypatch.setattr(worker, "RUN_ID", "opd-marker-upload-failure")
-    monkeypatch.setattr(
-        worker,
-        "hf_upload_file",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret payload")),
-    )
-    try:
-        with pytest.raises(
-            RuntimeError, match="optimizer-start marker persistence failed"
-        ) as caught:
-            hf_mod.persist_opd_training_started()
-    finally:
-        from pathlib import Path
-
-        Path("/tmp/opd_training_started_attempt4.json").unlink(missing_ok=True)
-
-    assert "secret payload" not in str(caught.value)
-    assert caught.value.__cause__ is None
-
-
 def _student(spans):
     return [StudentToken(token_id=i, start=a, end=b) for i, (a, b) in enumerate(spans)]
 
@@ -945,8 +878,6 @@ def _opd_harness(
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
-        persist_opd_training_started=lambda: None,
-        OPD_OPTIMIZER_STEPS=0,
         write_train_meta=(
             (lambda **k: metas.append(k))
             if metas is not None
@@ -1313,7 +1244,6 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         prefetch_model=lambda mid, **_kwargs: 0.0,
         hf_resume_checkpoint=lambda: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
-        persist_opd_training_started=lambda: None,
         hf_upload_folder=lambda *a, **k: None,
         write_train_meta=lambda **k: meta.update(k),
         wandb_report_to=lambda: [],
@@ -1997,7 +1927,6 @@ def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update
     assert events == ["clip", "step"]
     assert len(clip_gradient_sums) == 1
     assert clip_gradient_sums[0] > 0
-    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 1
 
 
 def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeypatch):
@@ -2380,73 +2309,6 @@ def test_opd_resolves_one_halt_set_for_generation(monkeypatch):
 
     assert len(calls) == 1
     assert opd_mod.OpdVllmRolloutEngine.instances[0].eos_token_ids == (5, 7)
-
-
-def test_opd_marker_failure_aborts_before_first_optimizer_step(monkeypatch):
-    torch = pytest.importorskip("torch")
-
-    def _one_update(*, model, **_kwargs):
-        from flash.engine.worker.opd import SampleResult
-
-        return SampleResult(
-            loss=model.w.float().sum() * 1e-6,
-            teacher_status="ok",
-            coverage=1.0,
-            gen_tokens=1,
-            teacher_tokens=1,
-        )
-
-    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update)
-    optimizer_steps = []
-    monkeypatch.setattr(
-        torch.optim.AdamW,
-        "step",
-        lambda *_args, **_kwargs: optimizer_steps.append(True),
-    )
-    monkeypatch.setattr(
-        opd_mod._w,
-        "persist_opd_training_started",
-        lambda: (_ for _ in ()).throw(RuntimeError("marker persistence failed")),
-    )
-
-    with pytest.raises(RuntimeError, match="marker persistence failed"):
-        opd_mod.run_opd()
-
-    assert optimizer_steps == []
-    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 0
-
-
-def test_opd_successful_update_then_vllm_sync_failure_preserves_progress(monkeypatch):
-    pytest.importorskip("torch")
-
-    def _one_update(*, model, **_kwargs):
-        from flash.engine.worker.opd import SampleResult
-
-        return SampleResult(
-            loss=model.w.float().sum() * 1e-6,
-            teacher_status="ok",
-            coverage=1.0,
-            gen_tokens=1,
-            teacher_tokens=1,
-        )
-
-    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=2)
-    markers = []
-    monkeypatch.setattr(opd_mod._w, "persist_opd_training_started", lambda: markers.append(True))
-    original_sync = opd_mod.OpdVllmRolloutEngine.sync_from_model
-
-    def _fail_second_sync(engine, model):
-        if engine.sync_count == 1:
-            raise RuntimeError("vllm synchronization failed")
-        return original_sync(engine, model)
-
-    monkeypatch.setattr(opd_mod.OpdVllmRolloutEngine, "sync_from_model", _fail_second_sync)
-
-    with pytest.raises(RuntimeError, match="vllm synchronization failed"):
-        opd_mod.run_opd()
-
-    assert markers == [True]
-    assert opd_mod._w.OPD_OPTIMIZER_STEPS == 1
 
 
 def test_opd_accounts_teacher_scores_as_they_finish(monkeypatch):
@@ -4146,6 +4008,43 @@ def test_teacher_validation_error_never_exposes_provider_payload(monkeypatch):
     assert sensitive_token not in detail
     assert sensitive_completion not in detail
     assert "private-prompt" not in detail
+
+
+def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
+    import io
+    import traceback
+    import urllib.error
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    private = b"opaque-private-teacher-sentinel-91ad"
+
+    def raise_http(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            403,
+            private.decode(),
+            {},
+            io.BytesIO(private),
+        )
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", raise_http)
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
+
+    with pytest.raises(TeacherError) as exc_info:
+        client.score("P", "hi")
+
+    detail = str(exc_info.value)
+    formatted = "".join(
+        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
+    )
+    assert exc_info.value.permanent is True
+    assert "teacher HTTP 403" in detail
+    assert "/completions" in detail
+    assert "permanent" in detail
+    assert private.decode() not in detail
+    assert private.decode() not in formatted
 
 
 def test_teacher_score_rejects_non_list_logprob_fields_as_permanent(monkeypatch):

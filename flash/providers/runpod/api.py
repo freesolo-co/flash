@@ -117,23 +117,6 @@ def list_endpoints_by_key(
     return by_fingerprint, failed
 
 
-def find_endpoints_by_name(
-    substr: str,
-    *,
-    deadline_at: float | None = None,
-) -> list[dict]:
-    return [e for e in list_endpoints(deadline_at=deadline_at) if substr in (e.get("name") or "")]
-
-
-def delete_endpoint(endpoint_id: str) -> bool:
-    try:
-        request_with_retries(f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2)
-        return True
-    except RunpodApiError as e:
-        # 404 = already gone = clean teardown; anything else is a real failure.
-        return _is_not_found(e)
-
-
 def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
     """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
     try:
@@ -148,17 +131,6 @@ def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
 def _is_not_found(err: RunpodApiError) -> bool:
     """True when the error represents a genuine 404 (endpoint already gone)."""
     return is_not_found(err)
-
-
-def endpoint_health(
-    endpoint_id: str,
-    *,
-    deadline_at: float | None = None,
-) -> dict:
-    return request_with_retries(
-        f"{QUEUE_BASE}/{endpoint_id}/health",
-        deadline_at=deadline_at,
-    )
 
 
 def endpoint_health_for_key(
@@ -198,10 +170,12 @@ def submit_job(
     endpoint_id: str,
     input_payload: dict,
     *,
+    key_fingerprint: str,
     deadline_at: float,
 ) -> str:
-    """POST /run -> job id (async queue submission)."""
-    out = request_with_retries(
+    """POST /run through the endpoint's owning account and return the job id."""
+    out = _CLIENT.request_with_retries_for_key(
+        _key_for_fingerprint(key_fingerprint),
         f"{QUEUE_BASE}/{endpoint_id}/run",
         method="POST",
         body={"input": input_payload},
@@ -218,18 +192,23 @@ def job_status(
     endpoint_id: str,
     job_id: str,
     *,
+    key_fingerprint: str,
     deadline_at: float | None = None,
 ) -> dict:
-    """GET /status/<job_id> -> {status, output?, error?, ...}."""
-    return request_with_retries(
+    """GET /status/<job_id> through the endpoint's owning account."""
+    return _CLIENT.request_with_retries_for_key(
+        _key_for_fingerprint(key_fingerprint),
         f"{QUEUE_BASE}/{endpoint_id}/status/{job_id}",
         deadline_at=deadline_at,
     )
 
 
-def cancel_job(endpoint_id: str, job_id: str) -> dict:
-    return request_with_retries(
-        f"{QUEUE_BASE}/{endpoint_id}/cancel/{job_id}", method="POST", retries=2
+def cancel_job(endpoint_id: str, job_id: str, *, key_fingerprint: str) -> dict:
+    return _CLIENT.request_with_retries_for_key(
+        _key_for_fingerprint(key_fingerprint),
+        f"{QUEUE_BASE}/{endpoint_id}/cancel/{job_id}",
+        method="POST",
+        retries=2,
     )
 
 

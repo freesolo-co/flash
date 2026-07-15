@@ -15,6 +15,7 @@ from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
     ConfigError,
+    parse_adapter_revision,
     spec_from_dict,
     train_schema_metadata,
     validate_train_keys,
@@ -44,6 +45,13 @@ def _raw(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 # schema validation error paths
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("step", ["00", "01"])
+def test_parse_adapter_revision_rejects_zero_padded_steps(step):
+    revision = f"run-a@step-{step}." + "a" * 40
+
+    assert parse_adapter_revision(revision) is None
 
 
 @pytest.mark.parametrize(
@@ -443,10 +451,10 @@ def test_gpu_integer_fields_reject_invalid_values(key: str, value, match: str) -
 def test_gpu_retry_and_wall_minimums() -> None:
     with pytest.raises(ConfigError, match=r"gpu\.max_retries must be >= 0"):
         spec_from_dict(_raw(**{"gpu.max_retries": -1}))
-    for value in (0, -1, -3600):
-        with pytest.raises(ConfigError, match=r"gpu\.max_wall_seconds must be >= 1"):
+    for value in (59, 1, 0, -1, -3600):
+        with pytest.raises(ConfigError, match=r"gpu\.max_wall_seconds must be >= 60"):
             spec_from_dict(_raw(**{"gpu.max_wall_seconds": value}))
-    assert spec_from_dict(_raw(**{"gpu.max_wall_seconds": 1})).gpu.max_wall_seconds == 1
+    assert spec_from_dict(_raw(**{"gpu.max_wall_seconds": 60})).gpu.max_wall_seconds == 60
 
 
 def test_environment_subfields_reject_wrong_types() -> None:
@@ -597,15 +605,15 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     from flash.client.specs import spec_payload
 
     spec = spec_from_dict(
-        _raw(**{"gpu.max_retries": 0, "gpu.max_wall_seconds": 30}), run_id="gpu-rt"
+        _raw(**{"gpu.max_retries": 0, "gpu.max_wall_seconds": 60}), run_id="gpu-rt"
     )
     payload = spec_payload(spec)
     assert payload["gpu"]["max_retries"] == 0
-    assert payload["gpu"]["max_wall_seconds"] == 30
+    assert payload["gpu"]["max_wall_seconds"] == 60
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.max_retries == 0
-    assert reparsed.gpu.max_wall_seconds == 30
+    assert reparsed.gpu.max_wall_seconds == 60
     assert reparsed.gpu.type == spec.gpu.type
 
 

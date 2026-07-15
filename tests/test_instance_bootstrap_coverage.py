@@ -581,6 +581,53 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
     assert "final-after-delay" in uploads[-1][1]
 
 
+def test_run_mode_waits_for_periodic_uploader_before_final_upload(monkeypatch):
+    periodic_started = threading.Event()
+    release_periodic = threading.Event()
+    events = []
+
+    class _WaitForUploaderProc(_FakeProc):
+        def wait(self, timeout=None):
+            assert periodic_started.wait(1.0)
+            return self.returncode
+
+    def upload(_payload, _path, _subpath):
+        if threading.current_thread() is runner:
+            events.append("final")
+            return
+        events.append("periodic-start")
+        periodic_started.set()
+        assert release_periodic.wait(2.0)
+        events.append("periodic-finish")
+
+    monkeypatch.setattr(b, "_CONSOLE_UPLOAD_INTERVAL_S", 0.001)
+    monkeypatch.setattr(b, "hf_upload", upload)
+    monkeypatch.setattr(
+        b.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _WaitForUploaderProc(["hello\n"], rc=0),
+    )
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    result = []
+
+    runner = threading.Thread(
+        target=lambda: result.append(
+            b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 100)
+        )
+    )
+    runner.start()
+    assert periodic_started.wait(1.0)
+    assert runner.is_alive()
+    assert events == ["periodic-start"]
+
+    release_periodic.set()
+    runner.join(2.0)
+
+    assert not runner.is_alive()
+    assert result == [0]
+    assert events == ["periodic-start", "periodic-finish", "final"]
+
+
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
@@ -637,7 +684,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
-        lambda deadline: events.append(("watchdog", deadline)) or (_Timer(), _Done()),
+        lambda deadline, _payload: events.append(("watchdog", deadline)) or (_Timer(), _Done()),
     )
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: events.append("install"))
     monkeypatch.setattr(b, "fetch_code", lambda _payload: events.append("code"))
@@ -702,7 +749,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
 
     monkeypatch.setattr(b.time, "time", lambda: clock["now"])
     monkeypatch.setattr(b, "load_payload", lambda: payload)
-    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline: (_Timer(), _Done()))
+    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline, _payload: (_Timer(), _Done()))
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
@@ -725,7 +772,11 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
 # ---------------------------------------------------------------------------
 def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch):
     uploads: list[tuple] = []
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
+    monkeypatch.setattr(
+        b,
+        "hf_upload",
+        lambda p, path, sub, **kwargs: uploads.append((path, sub, kwargs)),
+    )
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     payload = {
         "hf_repo": "o/r",
@@ -741,9 +792,10 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     long_error = "E" * 3000
     b.write_attempt_marker(payload, ok=False, error=long_error, retriable=True)
 
-    path, sub = uploads[-1]
+    path, sub, kwargs = uploads[-1]
     assert path == "/tmp/attempt_marker.json"
     assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
+    assert kwargs == {"enforce_deadline": False}
     with open(path) as f:
         marker = json.load(f)
     assert marker["ok"] is False
@@ -755,7 +807,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     assert len(marker["error"]) == 2000
 
 
-def test_write_attempt_marker_uses_truthful_late_timestamp(monkeypatch):
+def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
     monkeypatch.setattr(b, "hf_upload", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(b.time, "time", lambda: 205.0)
     payload = {
@@ -774,9 +826,9 @@ def test_write_attempt_marker_uses_truthful_late_timestamp(monkeypatch):
 
     with open("/tmp/attempt_marker.json") as f:
         marker = json.load(f)
-    assert marker["ok"] is False
+    assert marker["ok"] is True
     assert marker["retriable"] is False
-    assert marker["error"] == "run wall deadline exceeded"
+    assert marker["error"] == ""
     assert marker["ts"] == 205.0
 
 
@@ -800,6 +852,57 @@ def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
         b.write_attempt_marker(payload, ok=False, error="safe", retriable=True)
 
     assert uploads == []
+
+
+# ---------------------------------------------------------------------------
+# deadline watchdogs: marker publication before hard exit
+# ---------------------------------------------------------------------------
+def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
+    marks: list[tuple] = []
+    exits: list[int] = []
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
+    )
+    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
+    payload = {
+        "deadline_at": 160.0,
+        "run_created_at": 100.0,
+        "run_max_wall_seconds": 60.0,
+        "flash_arm": "vast",
+        "attempt": 0,
+        "run_id": "run",
+        "hf_repo": "o/r",
+        "env": {},
+    }
+
+    timer, done = b.arm_deadline_watchdog(160.0, payload)
+    timer.cancel()
+    timer.function()
+
+    assert not done.is_set()
+    assert marks == [(False, "run wall deadline exceeded; self-terminating box")]
+    assert exits == [124]
+
+
+def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeypatch):
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    exits = []
+
+    def blocked_writer(*_args, **_kwargs):
+        writer_started.set()
+        release_writer.wait(2.0)
+
+    monkeypatch.setattr(b, "_TERMINAL_MARKER_GRACE_S", 0.01)
+    monkeypatch.setattr(b, "write_attempt_marker", blocked_writer)
+    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
+
+    b._publish_timeout_marker_then_exit({}, "deadline reached")
+
+    assert writer_started.is_set()
+    assert exits == [124]
+    release_writer.set()
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +970,7 @@ def test_run_preload_records_download_failure(tmp_path, monkeypatch):
     )
     assert r["preloaded"] == []
     assert r["already_cached"] == []
-    assert r["failed"]["a/b"] == "download failed"
+    assert r["failed"]["a/b"] == "RuntimeError: network exploded"
 
 
 # ---------------------------------------------------------------------------

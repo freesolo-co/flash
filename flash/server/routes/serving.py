@@ -6,15 +6,22 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 
 from __future__ import annotations
 
-import contextlib
+import json
 import math
+import multiprocessing
 import re
 import time
 from typing import Annotated
 
+import regex as safe_regex
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from jsonschema import SchemaError, ValidationError
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
+from flash.engine.structured_outputs import parse_structured_outputs
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -22,10 +29,19 @@ from flash.runner import (
     mark_deployed,
     mark_deployment_failed,
     mark_deployment_pending,
+    mark_deployment_revocation_failed,
     mark_undeployed,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
-from flash.serve.deploy import AdapterConfigMissing, ServingError
+from flash.schema import parse_adapter_revision
+from flash.serve.deploy import (
+    ActivationOutcomeUnknown,
+    AdapterConfigMissing,
+    RetryableServingUnavailable,
+    ServingError,
+)
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server import db
@@ -35,10 +51,176 @@ from flash.spec import JobSpec
 
 router = APIRouter()
 
-_DEPLOYMENT_BUSY_STATES = {"deploying", "registering", "verifying"}
+_DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing", "reconciling"}
 _DEPLOYMENT_READY_STATES = {"ready", "deployed"}
 _DEPLOYMENT_STALE_SECONDS = 30 * 60
+
+
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+# hard wall-clock budget for the trusted fixed-prompt generation and validation.
+# it remains below the deployment stale threshold.
+_SMOKE_BUDGET_SECONDS = 600.0
+
+
+def _smoke_timeout_error(budget_s: float) -> ServingError:
+    return ServingError(f"deployment_smoke_timeout: bounded smoke exceeded {budget_s:g}s")
+
+
+def _bounded_call(fn, *, deadline: float, budget_s: float):
+    """run the trusted smoke call within the remaining global deadline."""
+    import threading
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _smoke_timeout_error(budget_s)
+    result: dict = {}
+
+    def _target() -> None:
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # re-raised on the caller thread below
+            result["error"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout=remaining)
+    if thread.is_alive():
+        raise _smoke_timeout_error(budget_s)
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _reject_external_schema_reference(uri: str):
+    raise NoSuchResource(ref=uri)
+
+
+_DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
+_JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
+_JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
+
+
+def _bounded_regex_fullmatch(pattern: str, value: str, *, deadline: float, budget_s: float):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _smoke_timeout_error(budget_s)
+    global_deadline_limits = remaining <= _DIRECT_REGEX_TIMEOUT_SECONDS
+    timeout = min(_DIRECT_REGEX_TIMEOUT_SECONDS, remaining)
+    try:
+        return safe_regex.fullmatch(pattern, value, timeout=timeout)
+    except TimeoutError as exc:
+        if global_deadline_limits:
+            raise _smoke_timeout_error(budget_s) from exc
+        raise ServingError(
+            f"structured-output regex evaluation exceeded the {_DIRECT_REGEX_TIMEOUT_SECONDS:.2f}s deadline"
+        ) from exc
+
+
+def _sanitized_schema_error(exc: Exception) -> str:
+    message = getattr(exc, "message", str(exc))
+    return " ".join(str(message).split())[:500]
+
+
+def _json_schema_validation_worker(connection, instance, schema) -> None:
+    try:
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        registry = Registry(retrieve=_reject_external_schema_reference)
+        validator_class(schema, registry=registry).validate(instance)
+    except Unresolvable as exc:
+        outcome = ("reference", _sanitized_schema_error(exc))
+    except SchemaError as exc:
+        outcome = ("schema", _sanitized_schema_error(exc))
+    except ValidationError as exc:
+        outcome = ("validation", _sanitized_schema_error(exc))
+    except Exception as exc:
+        outcome = ("error", f"{type(exc).__name__}: {_sanitized_schema_error(exc)}")
+    else:
+        outcome = ("ok", "")
+    try:
+        connection.send(outcome)
+    finally:
+        connection.close()
+
+
+def _reap_schema_validation_process(process, *, deadline: float) -> None:
+    remaining = max(0.0, deadline - time.monotonic())
+    process.join(timeout=min(0.1, remaining))
+    if process.is_alive():
+        process.terminate()
+        remaining = max(0.0, deadline - time.monotonic())
+        process.join(timeout=min(0.2, remaining))
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
+    now = time.monotonic()
+    if deadline <= now:
+        raise _smoke_timeout_error(budget_s)
+    local_deadline = now + _JSON_SCHEMA_TIMEOUT_SECONDS
+    validation_deadline = min(deadline, local_deadline)
+    global_deadline_limits = deadline <= local_deadline
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_json_schema_validation_worker,
+        args=(send_connection, instance, schema),
+        name=_JSON_SCHEMA_PROCESS_NAME,
+        daemon=True,
+    )
+    outcome: tuple[str, str] | None = None
+    timed_out = False
+    try:
+        try:
+            process.start()
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                raise _smoke_timeout_error(budget_s) from exc
+            raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
+        finally:
+            send_connection.close()
+        remaining = max(0.0, validation_deadline - time.monotonic())
+        if receive_connection.poll(remaining):
+            try:
+                outcome = receive_connection.recv()
+            except EOFError:
+                outcome = None
+        else:
+            timed_out = True
+    finally:
+        receive_connection.close()
+        if process.pid is not None:
+            _reap_schema_validation_process(process, deadline=deadline)
+            process.close()
+
+    if outcome is None:
+        if timed_out and global_deadline_limits:
+            raise _smoke_timeout_error(budget_s)
+        raise ServingError(
+            f"JSON schema validation exceeded the {_JSON_SCHEMA_TIMEOUT_SECONDS:.1f}s wall-clock deadline"
+        )
+    status, detail = outcome
+    if status == "ok":
+        return
+    if status == "reference":
+        raise ServingError(f"configured JSON schema reference could not be resolved: {detail}")
+    if status == "schema":
+        raise ServingError(f"configured JSON schema is invalid: {detail}")
+    if status == "validation":
+        raise ServingError(f"structured smoke output violates the configured JSON schema: {detail}")
+    raise ServingError(f"JSON schema validation failed safely: {detail}")
+
+
+def _strict_json_loads(value: str):
+    def reject_constant(constant: str):
+        raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
+
+    try:
+        return json.loads(value, parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
 def _deployment_state(deployment: dict, state: str, **fields) -> dict:
@@ -46,7 +228,19 @@ def _deployment_state(deployment: dict, state: str, **fields) -> dict:
 
 
 def _public_deployment(deployment: dict) -> dict:
-    return public_deployment(deployment)
+    out = public_deployment(deployment)
+    run_id = out.get("run_id")
+    out.update(
+        {
+            "run_id": run_id,
+            "checkpoint_step": out.get("checkpoint_step"),
+            "adapter_revision": out.get("adapter_revision"),
+            "state": out.get("state"),
+            "verified_at": out.get("verified_at"),
+            "openai_model": out.get("openai_model") or run_id,
+        }
+    )
+    return out
 
 
 def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:
@@ -61,12 +255,67 @@ def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) 
 
 
 def _previous_ready_deployment(deployment: dict) -> dict | None:
-    if deployment.get("state") in _DEPLOYMENT_READY_STATES:
+    state = deployment.get("state")
+    if state in _DEPLOYMENT_READY_STATES:
         return dict(deployment)
+    if state not in _DEPLOYMENT_BUSY_STATES or state == "reconciling":
+        return None
     previous = deployment.get("previous_deployment")
     if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
         return dict(previous)
     return None
+
+
+def _deployment_predecessor(deployment: dict) -> dict | None:
+    ready = _previous_ready_deployment(deployment)
+    if ready is not None:
+        return ready
+    if deployment.get("activation_outcome_unknown"):
+        previous = deployment.get("previous_deployment")
+        if isinstance(previous, dict) and previous.get("state") in _DEPLOYMENT_READY_STATES:
+            return dict(previous)
+    return None
+
+
+def _activation_predecessor(run_id: str, deployment: dict) -> tuple[str | None, dict | None]:
+    if not deployment.get("activation_outcome_unknown"):
+        predecessor = _deployment_predecessor(deployment)
+        revision = predecessor.get("adapter_revision") if predecessor is not None else None
+        return (revision if isinstance(revision, str) else None), predecessor
+
+    target = _app.adapter_alias_target(run_id)
+    if target is None:
+        return None, None
+    parsed_target = parse_adapter_revision(target)
+    if parsed_target is None or parsed_target[0] != run_id:
+        raise ServingError(f"serving alias {run_id} targets invalid revision {target!r}")
+
+    nested = deployment.get("previous_deployment")
+    candidates = [deployment, nested if isinstance(nested, dict) else None]
+    predecessor = next(
+        (
+            dict(candidate)
+            for candidate in candidates
+            if candidate is not None and candidate.get("adapter_revision") == target
+        ),
+        {
+            "run_id": run_id,
+            "adapter_revision": target,
+            "checkpoint_step": parsed_target[1],
+            "openai_model": run_id,
+        },
+    )
+    predecessor.pop("previous_deployment", None)
+    predecessor.pop("activation_outcome_unknown", None)
+    predecessor.pop("error", None)
+    predecessor["state"] = (
+        "ready" if target in read_verified_adapter_revisions(run_id) else "reconciling"
+    )
+    return target, predecessor
+
+
+def _verified_adapter_revisions(status) -> set[str]:
+    return set(read_verified_adapter_revisions(status.run_id))
 
 
 def recover_deployments() -> int:
@@ -92,59 +341,140 @@ def recover_deployments() -> int:
     return recovered
 
 
-def _run_deployment_smoke(run_id: str, spec: JobSpec) -> dict:
-    started = time.monotonic()
-    result = _app.serve_chat(
-        run_id=run_id,
-        messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-        temperature=0.0,
-        max_tokens=256,
-        thinking=spec.thinking,
-    )
-    latency = time.monotonic() - started
+def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
     if not content.strip():
+        raise ServingError(f"smoke generation returned no content (finish_reason={finish!r})")
+    provenance = result.get("freesolo")
+    if not isinstance(provenance, dict):
+        raise ServingError("smoke response omitted immutable revision provenance")
+    if provenance.get("adapter_revision") != adapter_revision:
+        raise ServingError("smoke response returned the wrong adapter revision")
+    if provenance.get("checkpoint") != checkpoint:
+        raise ServingError("smoke response returned the wrong checkpoint")
+    hf_revision = adapter_revision.rsplit(".", 1)[-1]
+    if provenance.get("hf_revision") != hf_revision:
+        raise ServingError("smoke response returned the wrong Hub revision")
+    headers = result.get("_freesolo_headers")
+    expected_headers = {
+        "adapter_revision": adapter_revision,
+        "checkpoint": checkpoint,
+        "hf_revision": hf_revision,
+    }
+    if headers != expected_headers:
+        raise ServingError("smoke response returned mismatched provenance headers")
+    return content, finish
+
+
+def _thinking_structured_answer(content: str) -> str:
+    closed = content.find("</think>")
+    if closed < 0:
         raise ServingError(
-            f"smoke generation returned no content (finish_reason={finish!r}) after {latency:.1f}s"
+            "structured smoke generation for a thinking adapter never closed its reasoning with "
+            "</think>"
         )
+    answer = content[closed + len("</think>") :].strip()
+    if not answer:
+        raise ServingError("structured smoke generation returned no answer after </think>")
+    return answer
+
+
+def _validate_structured_smoke(
+    answer: str, constraint: dict, *, deadline: float, budget_s: float
+) -> None:
+    if time.monotonic() >= deadline:
+        raise _smoke_timeout_error(budget_s)
+    try:
+        if "json" in constraint:
+            _validate_json_schema(
+                _strict_json_loads(answer),
+                constraint["json"],
+                deadline=deadline,
+                budget_s=budget_s,
+            )
+        elif constraint.get("json_object") is True:
+            if not isinstance(_strict_json_loads(answer), dict):
+                raise ServingError("structured smoke output is valid JSON but not a JSON object")
+        elif "choice" in constraint:
+            if answer not in constraint["choice"]:
+                raise ServingError(
+                    f"structured smoke output {answer!r} is not one of {constraint['choice']!r}"
+                )
+        elif (
+            "regex" in constraint
+            and _bounded_regex_fullmatch(
+                str(constraint["regex"]), answer, deadline=deadline, budget_s=budget_s
+            )
+            is None
+        ):
+            raise ServingError("structured smoke output does not match the configured regex")
+    except safe_regex.error as exc:
+        raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
+
+
+def _run_deployment_smoke(
+    run_id: str,
+    spec: JobSpec,
+    *,
+    serving_model: str,
+    expected_checkpoint: str,
+    budget_s: float = _SMOKE_BUDGET_SECONDS,
+) -> dict:
+    started = time.monotonic()
+    deadline = started + budget_s
+    train = getattr(spec, "train", None)
+    constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _smoke_timeout_error(budget_s)
+        try:
+
+            def _smoke_call(timeout_s: float = remaining):
+                return _app.serve_chat(
+                    run_id=serving_model,
+                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    temperature=0.0,
+                    max_tokens=256,
+                    thinking=spec.thinking,
+                    expected_checkpoint=expected_checkpoint,
+                    timeout_s=timeout_s,
+                    retry_unavailable=True,
+                )
+
+            result = _bounded_call(
+                _smoke_call,
+                deadline=deadline,
+                budget_s=budget_s,
+            )
+        except RetryableServingUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _smoke_timeout_error(budget_s) from exc
+            time.sleep(min(exc.retry_after_seconds, remaining))
+            continue
+        break
+    content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
+    if constraint and spec.thinking and finish == "length":
+        raise ServingError("structured smoke generation was truncated at the maximum token length")
+    answer = (
+        _thinking_structured_answer(content) if constraint and spec.thinking else content.strip()
+    )
+    if constraint:
+        _validate_structured_smoke(answer, constraint, deadline=deadline, budget_s=budget_s)
+    if time.monotonic() > deadline:
+        raise _smoke_timeout_error(budget_s)
     return {
         "verified_at": time.time(),
-        "verify_latency_s": latency,
+        "verify_kind": "fixed_prompt",
+        "verify_turns": 1,
+        "verify_latency_s": time.monotonic() - started,
         "verify_finish_reason": finish,
         "thinking_tag": "<think>" in content or "</think>" in content,
-        "verify_sample": content.strip()[:160],
+        "verify_sample": answer[:160],
     }
-
-
-def _deployment_cas_lost(run_id: str, state_guard: str | None) -> bool:
-    return state_guard is not None and _app.get_status(run_id).state != state_guard
-
-
-def _adapter_prefix_from_deployment(deployment: dict) -> str:
-    subfolder = deployment.get("adapter_hf_prefix")
-    if not isinstance(subfolder, str) or not subfolder.endswith("/adapter"):
-        raise ServingError(
-            "previous deployment record is missing adapter_hf_prefix; "
-            "cannot restore serving registry"
-        )
-    return subfolder[: -len("/adapter")]
-
-
-def _rollback_registered_deployment(
-    *, run_id: str, deploy_kwargs: dict, previous_deployment: dict | None
-) -> None:
-    if isinstance(previous_deployment, dict):
-        _app.deploy_adapter(
-            **{
-                **deploy_kwargs,
-                "adapter_prefix": _adapter_prefix_from_deployment(previous_deployment),
-                "dry_run": False,
-            }
-        )
-    else:
-        _app.undeploy_adapter(run_id)
 
 
 def _finish_deployment_unlocked(
@@ -156,7 +486,6 @@ def _finish_deployment_unlocked(
     deploy_kwargs: dict,
     deployment: dict,
     prev_state: str,
-    verify: bool,
 ) -> None:
     spec = JobSpec.from_dict(spec_dict)
     active = _app.get_status(run_id).deployment or {}
@@ -165,44 +494,172 @@ def _finish_deployment_unlocked(
         or active.get("state") not in _DEPLOYMENT_BUSY_STATES
     ):
         return
-    current = _deployment_state(deployment, "registering", detail="registering adapter")
-    mark_deployment_pending(run_id, current)
-    registered = False
-    try:
-        dep = _app.deploy_adapter(**deploy_kwargs)
-        registered = True
-        previous_deployment = deployment.get("previous_deployment")
-        current = dep.to_dict()
-        if previous_deployment:
-            current["previous_deployment"] = previous_deployment
-        if checkpoint_step is not None:
-            current["checkpoint_step"] = checkpoint_step
-        current["verify"] = verify
-        state_guard = prev_state
+    current = dict(deployment)
+    smoke_result: dict = {}
+    activated = False
+
+    def _assert_activation_fence() -> None:
+        latest = _app.get_status(run_id)
+        latest_deployment = latest.deployment or {}
+        if (
+            latest_deployment.get("requested_at") != deployment.get("requested_at")
+            or latest_deployment.get("state") not in _DEPLOYMENT_BUSY_STATES
+        ):
+            raise ServingError("deployment attempt was superseded before alias activation")
         if is_checkpoint:
-            state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-        if _deployment_cas_lost(run_id, state_guard):
-            with contextlib.suppress(Exception):
-                _app.undeploy_adapter(run_id)
-            return
-        if verify:
-            current = _deployment_state(current, "verifying", detail="running smoke generation")
-            mark_deployment_pending(run_id, current)
-            current = _deployment_state(current, "ready", **_run_deployment_smoke(run_id, spec))
-        else:
-            current = _deployment_state(current, "ready", detail="registered; smoke skipped")
+            if prev_state in _app._DEPLOYABLE_STATES and latest.state != prev_state:
+                raise ServingError(
+                    f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
+                )
+            if latest.state in {"cancelled", "failed", "dry_run"} and latest.state != prev_state:
+                raise ServingError(
+                    f"run became {latest.state!r} before checkpoint alias activation"
+                )
+        elif latest.state != prev_state:
+            raise ServingError(
+                f"run state changed from {prev_state!r} to {latest.state!r} before alias activation"
+            )
+        expected_generation = deployment.get("verification_generation")
+        if verified_adapter_revision_generation(run_id) != expected_generation:
+            raise ServingError("deployment verification generation changed before alias activation")
+
+    def _before_activate(adapter_revision: str, checkpoint: str) -> None:
+        nonlocal current
+        _assert_activation_fence()
+        # smoke is unconditional for real deployments: alias activation only ever follows a
+        # verified generation against the immutable revision.
+        current = _deployment_state(
+            {**current, "adapter_revision": adapter_revision},
+            "smoke_testing",
+            detail="running bounded fixed-prompt smoke",
+        )
+        mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        smoke_result.update(
+            _run_deployment_smoke(
+                run_id,
+                spec,
+                serving_model=adapter_revision,
+                expected_checkpoint=checkpoint,
+            )
+        )
+        current = _deployment_state(
+            current,
+            "reconciling",
+            detail="activating alias and reconciling the authoritative target",
+            activation_outcome_unknown=True,
+        )
+        mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        # cancellation can revoke the ledger while smoke is blocked, so fence again immediately
+        # before deploy_adapter issues the activation request.
+        _assert_activation_fence()
+
+    try:
+        dep = _app.deploy_adapter(**deploy_kwargs, before_activate=_before_activate)
+        activated = True
+        current = {**current, **dep.to_dict()}
+        current.pop("activation_outcome_unknown", None)
+        current["verify"] = True
+        current = _deployment_state(
+            current,
+            "ready",
+            detail="immutable revision verified and alias activated",
+            **smoke_result,
+        )
+        verification_generation = current.get("verification_generation")
         current = _public_deployment(current)
 
-        if is_checkpoint:
-            marked = mark_checkpoint_deployed(run_id, current, expect_state=state_guard)
-        else:
-            marked = mark_deployed(run_id, current, expect_state=prev_state)
-        cas_failed = marked.deployment != current if is_checkpoint else marked.state != "deployed"
-        if state_guard is not None and cas_failed:
-            with contextlib.suppress(Exception):
-                _app.undeploy_adapter(run_id)
+        def _commit_ready() -> bool:
+            state_guard = prev_state
+            if is_checkpoint:
+                state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
+                marked = mark_checkpoint_deployed(
+                    run_id,
+                    current,
+                    expect_state=state_guard,
+                    verification_generation=verification_generation,
+                )
+                return marked.deployment == current
+            marked = mark_deployed(
+                run_id,
+                current,
+                expect_state=prev_state,
+                verification_generation=verification_generation,
+            )
+            return marked.state == "deployed" and marked.deployment == current
+
+        def _reconcile_commit_miss() -> None:
+            # deploy_adapter already flipped the serving alias when this runs, so a lost
+            # control-plane cas must never be dropped silently — and the alias is never
+            # reverted here (post-promotion recovery reads the authoritative alias; a revert
+            # could clobber a newer deployment).
+            latest = _app.get_status(run_id)
+            latest_deployment = latest.deployment or {}
+            owned = latest_deployment.get("requested_at") == deployment.get("requested_at")
+            if owned and latest_deployment.get("state") in _DEPLOYMENT_BUSY_STATES:
+                # this attempt still owns the record; only the run state moved under the
+                # guard. retry the write once against the fresh state.
+                if is_checkpoint:
+                    marked = mark_checkpoint_deployed(
+                        run_id,
+                        current,
+                        verification_generation=verification_generation,
+                    )
+                else:
+                    marked = mark_deployed(
+                        run_id,
+                        current,
+                        expect_state=latest.state,
+                        verification_generation=verification_generation,
+                    )
+                if marked.deployment == current:
+                    return
+                latest = marked
+                latest_deployment = latest.deployment or {}
+            # superseded, undeployed, or uncommittable: a newer actor owns the record now, so
+            # log the divergence loudly but never write over what that actor recorded — a
+            # clobber here would erase a concurrent final deploy's ready record or resurrect
+            # an explicit undeploy.
+            divergence = (
+                "deployment_record_diverged: serving alias targets "
+                f"{current.get('adapter_revision')} but the deployment record moved to "
+                f"{latest_deployment.get('state')!r} (run state {latest.state!r}) during "
+                "activation; serving alias left as activated"
+            )
+            print(f"deploy[{run_id}]: {divergence}", flush=True)
+
+        if not _commit_ready():
+            _reconcile_commit_miss()
             return
     except Exception as exc:
+        if isinstance(exc, ActivationOutcomeUnknown):
+            reconciling = _deployment_state(
+                current,
+                "reconciling",
+                error=str(exc),
+                detail="alias activation outcome is unknown; authoritative reconciliation required",
+                activation_outcome_unknown=True,
+            )
+            mark_deployment_failed(run_id, reconciling)
+            return
+        if activated:
+            try:
+                latest = _app.get_status(run_id)
+                latest_deployment = latest.deployment or {}
+                if (
+                    latest_deployment.get("adapter_revision") == current.get("adapter_revision")
+                    and latest_deployment.get("state") in _DEPLOYMENT_READY_STATES
+                ):
+                    return
+                if not _commit_ready():
+                    _reconcile_commit_miss()
+            except Exception as recovery_exc:
+                divergence = (
+                    "deployment_record_diverged: serving alias was activated for "
+                    f"{current.get('adapter_revision')} but ready-state recovery failed after "
+                    f"{exc!r}: {recovery_exc!r}"
+                )
+                print(f"deploy[{run_id}]: {divergence}", flush=True)
+            return
         error = str(exc)
         if not is_checkpoint and isinstance(exc, AdapterConfigMissing):
             steps = [c["step"] for c in _app.list_checkpoints(spec)]
@@ -212,35 +669,17 @@ def _finish_deployment_unlocked(
                     f"{deployment.get('adapter_hf_prefix')} (the run likely never finalized); "
                     f"deploy a saved checkpoint instead, e.g. `flash deploy "
                     f"{run_id}/step-{steps[-1]}` (available steps: "
-                    f"{', '.join(str(s) for s in steps)})"
+                    f"{', '.join(str(step) for step in steps)})"
                 )
+        failed_source = dict(current)
+        if not deployment.get("activation_outcome_unknown"):
+            failed_source.pop("activation_outcome_unknown", None)
         failed = _deployment_state(
-            current,
+            failed_source,
             "failed",
             error=error,
-            detail="deployment failed; retry `flash deploy` after fixing the error",
+            detail="deployment failed; previous working alias was preserved",
         )
-        if registered:
-            previous_deployment = deployment.get("previous_deployment")
-            rollback_error = None
-            try:
-                _rollback_registered_deployment(
-                    run_id=run_id,
-                    deploy_kwargs=deploy_kwargs,
-                    previous_deployment=previous_deployment,
-                )
-            except Exception as rollback_exc:
-                rollback_error = str(rollback_exc)
-            if rollback_error:
-                failed.pop("previous_deployment", None)
-                failed["rollback_error"] = rollback_error
-                failed["detail"] = (
-                    "deployment failed and serving rollback failed; operator cleanup required"
-                )
-            elif isinstance(previous_deployment, dict):
-                failed["detail"] = "deployment failed; restored previous deployment"
-            else:
-                failed["detail"] = "deployment failed; deregistered adapter"
         mark_deployment_failed(run_id, failed)
 
 
@@ -347,11 +786,28 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         dry_run = _require_bool(payload, "dry_run", False)
-        verify = _require_bool(payload, "verify", True)
+        # smoke verification is mandatory for every real deployment: a loadable-but-broken
+        # revision must never become the bare-run alias target. reject an explicit opt-out
+        # before anything is queued or registered (dry runs never register or activate, so
+        # the flag is meaningless there too).
+        if _require_bool(payload, "verify", True) is False:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "verify=false is not supported: deployment smoke verification is "
+                    "mandatory before alias activation"
+                ),
+            )
         current_deployment = status.deployment or {}
+        current_deployment_state = current_deployment.get("state")
+        completed_unknown_activation = (
+            current_deployment_state == "reconciling"
+            and current_deployment.get("activation_outcome_unknown") is True
+        )
         if (
             not dry_run
-            and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
+            and current_deployment_state in _DEPLOYMENT_BUSY_STATES
+            and not completed_unknown_activation
             and not _deployment_attempt_is_stale(current_deployment)
         ):
             raise HTTPException(
@@ -378,6 +834,23 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         prev_state = status.state
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
+        previous_deployment = _deployment_predecessor(current_deployment)
+        expected_adapter_revision = None
+        if not dry_run:
+            try:
+                expected_adapter_revision, previous_deployment = _activation_predecessor(
+                    run_id, current_deployment
+                )
+            except ServingError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "alias_reconciliation_failed",
+                        "run_id": run_id,
+                        "retryable": True,
+                        "message": str(exc),
+                    },
+                ) from exc
         deploy_kwargs = {
             "run_id": run_id,
             "model": spec.model,
@@ -387,11 +860,12 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
             "thinking": spec.thinking,
-            # a run trained with structured_outputs serves under the SAME grammar (guided-decoding
-            # parity), so it doesn't drift at unconstrained serving; deploy_adapter registers it as
-            # the per-adapter default (non-thinking runs only — see _structured_outputs_body).
+            # a run trained with structured_outputs serves under the same grammar. thinking runs
+            # are registered only after serving advertises deferred post-reasoning constraints.
             "structured_outputs": spec.train.structured_outputs,
             "org_id": deploy_org_id,
+            "checkpoint_step": checkpoint_step,
+            "expected_adapter_revision": expected_adapter_revision,
         }
         if dry_run:
             try:
@@ -420,20 +894,23 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 run_id=run_id,
                 model=spec.model,
                 adapter_prefix=deploy_prefix,
-                state="deploying",
+                state="queued",
+                checkpoint_step=checkpoint_step,
             ).to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         dep_dict = _deployment_state(
             dep_dict,
-            "deploying",
+            "queued",
             detail="deployment queued",
-            verify=verify,
+            verify=True,
             requested_at=time.time(),
         )
+        dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
+        if current_deployment.get("activation_outcome_unknown"):
+            dep_dict["activation_outcome_unknown"] = True
         if is_checkpoint:
             dep_dict["checkpoint_step"] = checkpoint_step
-        previous_deployment = _previous_ready_deployment(current_deployment)
         if previous_deployment:
             dep_dict["previous_deployment"] = previous_deployment
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
@@ -451,7 +928,6 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             "deploy_kwargs": deploy_kwargs,
             "deployment": dep_dict,
             "prev_state": prev_state,
-            "verify": verify,
         }
     ran_sync = _app.start_deployment_job(_finish_deployment, **job_kwargs)
     if ran_sync:
@@ -462,21 +938,22 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 @router.delete("/v1/runs/{run_id}/deploy")
 def undeploy(run_id: str, key: Annotated[dict, Depends(require_key)]):
     with _app._deploy_lock(run_id):
-        status = owned_run(run_id, key)
+        owned_run(run_id, key)
         try:
-            deleted = _app.undeploy_adapter(run_id)
+            result = _app.undeploy_adapter(run_id)
         except ServingError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # Idempotent: clear local record even if serving side already had no adapter.
-        if status.deployment:
-            mark_undeployed(run_id)
-        # serving_deregistered=False means serving had nothing to delete (already gone or never
-        # actually registered) — the record teardown above still happened either way.
-        return {
-            "run_id": run_id,
-            "deleted_endpoints": deleted,
-            "serving_deregistered": bool(deleted),
-        }
+            mark_deployment_revocation_failed(run_id, str(exc))
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "deployment_revocation_failed",
+                    "run_id": run_id,
+                    "retryable": True,
+                    "message": str(exc),
+                },
+            ) from exc
+        mark_undeployed(run_id)
+        return result
 
 
 @router.post("/v1/runs/{run_id}/export")
@@ -566,10 +1043,46 @@ def deployments(key: Annotated[dict, Depends(require_key)]):
 def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
     messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
+    adapter_revision = payload.get("adapter_revision")
+    serving_model = run_id
+    verified_revisions = _verified_adapter_revisions(status)
+    if adapter_revision is not None:
+        parsed_revision = (
+            parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
+        )
+        if parsed_revision is None:
+            raise HTTPException(
+                status_code=400,
+                detail="adapter_revision must be a full immutable adapter revision",
+            )
+        if parsed_revision[0] != run_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
+            )
+        serving_model = adapter_revision.strip()
+        if serving_model not in verified_revisions:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"adapter_revision {serving_model} has not passed a successful deployment smoke"
+                ),
+            )
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
     deployment_state = deployment.get("state")
-    has_ready_deploy = deployment_state in {"ready", "deployed"}
+    ready_deployment = _previous_ready_deployment(deployment)
+    has_ready_deploy = adapter_revision is not None or ready_deployment is not None
+    if adapter_revision is None and ready_deployment is not None:
+        ready_revision = ready_deployment.get("adapter_revision")
+        parsed_ready_revision = (
+            parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
+        )
+        has_ready_deploy = bool(
+            parsed_ready_revision is not None
+            and parsed_ready_revision[0] == run_id
+            and ready_revision in verified_revisions
+        )
     # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
     # a live adapter that /v1/deployments lists as active without requiring a final adapter.
     # Only block chat when there's no active deployment to serve.
@@ -629,7 +1142,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         if payload.get("stream") is True:
             return StreamingResponse(
                 _app.serve_chat_stream(
-                    run_id=run_id,
+                    run_id=serving_model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -638,7 +1151,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                 media_type="text/plain; charset=utf-8",
             )
         return _app.serve_chat(
-            run_id=run_id,
+            run_id=serving_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,

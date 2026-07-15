@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import threading
 import time
 from typing import Any
 
+from flash.diagnostics import sanitize_diagnostic
 from flash.providers.base import canonical_gpu, gpu_short
 from flash.providers.runpod.gpus import flash_gpu
 from flash.providers.runpod.train.deps import (
@@ -197,6 +199,7 @@ def _train_body(input_data: dict) -> dict:
     import json
     import math
     import os
+    import re
     import subprocess
     import sys
     import tempfile
@@ -206,6 +209,25 @@ def _train_body(input_data: dict) -> dict:
     from email.utils import parsedate_to_datetime
 
     from huggingface_hub import snapshot_download
+
+    def _safe_detail(value, secrets=None, limit=1000):
+        text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        values = {**os.environ, **(secrets or {})}
+        for key, secret in values.items():
+            upper = str(key).upper()
+            if secret and (
+                upper in {"AUTHORIZATION", "HF_TOKEN"}
+                or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
+            ):
+                text = text.replace(str(secret), "<redacted>")
+        text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+        text = re.sub(
+            r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+            r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)",
+            lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+            text,
+        )
+        return text[:limit]
 
     if input_data.get("mode") == "preload":
         overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
@@ -255,7 +277,7 @@ def _train_body(input_data: dict) -> dict:
                 )
                 done.append(repo_id)
             except Exception as exc:
-                failed[repo_id] = str(exc)[:300]
+                failed[repo_id] = _safe_detail(exc, overrides, 300)
         return {
             "preloaded": done,
             "already_cached": already,
@@ -392,13 +414,20 @@ def _train_body(input_data: dict) -> dict:
                         raise
                     retry_after = _hf_retry_after(exc)
                     delay = retry_after if retry_after is not None else retry_delays[attempt]
-                    delay = min(delay, _require_deadline_allowance())
+                    try:
+                        delay = min(delay, _require_deadline_allowance())
+                    except TimeoutError:
+                        raise exc from None
                     print(
-                        f"{label} transient Hugging Face error; provider detail suppressed; "
-                        f"retrying in {delay:.0f}s",
+                        f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                        f"{_safe_detail(exc, overrides, 500)}",
                         flush=True,
                     )
                     time.sleep(delay)
+                    try:
+                        _require_deadline_allowance()
+                    except TimeoutError:
+                        raise exc from None
             raise AssertionError("unreachable")
 
         def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
@@ -481,7 +510,7 @@ def _train_body(input_data: dict) -> dict:
                     f.seek(max(0, f.tell() - tail_bytes))
                     tail = f.read().decode("utf-8", "replace")
                 with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
-                    f.write(tail)
+                    f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=console + ".tail",
@@ -489,8 +518,8 @@ def _train_body(input_data: dict) -> dict:
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
-            except Exception:
-                print("console upload warn; provider detail suppressed")
+            except Exception as e:
+                print("console upload warn:", _safe_detail(e, env))
 
         def run_mode(mode: str, check: bool) -> int:
             """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
@@ -505,7 +534,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "flash.engine.worker"],
+                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,
@@ -727,16 +756,20 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
                     continue
 
 
+def _endpoint_name_matches_run(name: str, target: str) -> bool:
+    canonical = str(name or "").removeprefix("live-")
+    return canonical == target or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
+
+
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
-    """Return resource ids whose name contains ``target`` (live resources are prefixed with ``live-``)."""
+    """Return exact base and canonical retry endpoint resource ids for one run."""
     if not target:
         return []
-    out = []
-    for uid, res in (resources or {}).items():
-        name = str(getattr(res, "name", "") or "")
-        if target in name:
-            out.append(uid)
-    return out
+    return [
+        uid
+        for uid, resource in (resources or {}).items()
+        if _endpoint_name_matches_run(getattr(resource, "name", ""), target)
+    ]
 
 
 def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
@@ -753,14 +786,18 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             isolate_flash_state(_run_suffix(run_id))
             from runpod_flash.core.resources.resource_manager import ResourceManager
         except Exception as exc:
-            return [{"success": False, "name": target, "message": f"flash unavailable: {exc}"}]
+            detail = sanitize_diagnostic(exc, limit=1000)
+            return [{"success": False, "name": target, "message": f"flash unavailable: {detail}"}]
 
         try:
             rm = ResourceManager()
             resources = rm.list_all_resources()
             uids = _select_endpoint_resources(resources, target)
         except Exception as exc:
-            return [{"success": False, "name": target, "message": f"resource lookup failed: {exc}"}]
+            detail = sanitize_diagnostic(exc, limit=1000)
+            return [
+                {"success": False, "name": target, "message": f"resource lookup failed: {detail}"}
+            ]
 
         async def _undeploy_all() -> list:
             out = []
@@ -772,7 +809,13 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                         await rm.undeploy_resource(uid, resource_name=name, force_remove=True)
                     )
                 except Exception as exc:
-                    out.append({"success": False, "name": name, "message": str(exc)})
+                    out.append(
+                        {
+                            "success": False,
+                            "name": name,
+                            "message": sanitize_diagnostic(exc, limit=1000),
+                        }
+                    )
             return out
 
         try:
@@ -800,30 +843,60 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                     raise TimeoutError("undeploy timed out after 30s")
                 results = _out[0]
         except Exception as exc:
-            results = [{"success": False, "name": target, "message": str(exc)}]
-
-    # Registry-less fallback: per-process state means a fresh container can't see the endpoint.
-    # Delete by reconstructed name via REST so the worker doesn't stay live.
-    rest_confirmed_absent = False
-    if not uids:
-        try:
-            from flash.providers.runpod import api as runpod_api
-
-            matches = [
-                e for e in runpod_api.find_endpoints_by_name(target) if e.get("name") == target
+            results = [
+                {
+                    "success": False,
+                    "name": target,
+                    "message": sanitize_diagnostic(exc, limit=1000),
+                }
             ]
-            for ep in matches:
-                if runpod_api.delete_endpoint(ep["id"]):
-                    results.append(
-                        {"success": True, "name": target, "message": "deleted via REST API"}
-                    )
-            rest_confirmed_absent = not matches
-        except Exception as exc:
-            # Can't prove endpoint is gone — do NOT treat as absent; slot stays held.
-            logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
-    # Release only when the endpoint is provably gone; do NOT release on failure (may still be live).
-    if any(r.get("success") for r in results) or (not uids and rest_confirmed_absent):
+    # registry-less cleanup must inspect every configured account and exact retry suffix.
+    rest_confirmed_clear = False
+    try:
+        from flash.providers.runpod import api as runpod_api
+
+        by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
+        rest_confirmed_clear = not failed_fingerprints
+        for fingerprint, endpoints in by_fingerprint.items():
+            for endpoint in endpoints:
+                if not _endpoint_name_matches_run(endpoint.get("name", ""), target):
+                    continue
+                endpoint_id = endpoint.get("id")
+                if not endpoint_id or not runpod_api.delete_endpoint_for_fingerprint(
+                    endpoint_id, fingerprint
+                ):
+                    rest_confirmed_clear = False
+                    results.append(
+                        {
+                            "success": False,
+                            "name": endpoint.get("name") or target,
+                            "message": "REST endpoint deletion was unconfirmed",
+                        }
+                    )
+                    continue
+                results.append(
+                    {
+                        "success": True,
+                        "name": endpoint.get("name") or target,
+                        "message": "deleted via REST API",
+                    }
+                )
+        if failed_fingerprints:
+            results.append(
+                {
+                    "success": False,
+                    "name": target,
+                    "message": (
+                        f"could not enumerate {len(failed_fingerprints)} configured RunPod account(s)"
+                    ),
+                }
+            )
+    except Exception as exc:
+        logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
+
+    # release only when every configured account authoritatively confirms cleanup.
+    if rest_confirmed_clear:
         _release_endpoint_slot(target)
 
     with contextlib.suppress(Exception):

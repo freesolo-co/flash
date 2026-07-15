@@ -8,8 +8,55 @@ import tempfile
 
 import pytest
 
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
-def test_background_run_suppresses_exception_content(monkeypatch, caplog):
+
+def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": endpoint_id,
+        "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "attempt": attempt,
+        "started_ts": started_ts,
+        **extra,
+    }
+    if job_id is not None:
+        remote["job_id"] = job_id
+    return remote
+
+
+def _lambda_remote(instance_id="instance", attempt=0, started_ts=1.0, **extra):
+    return {
+        "provider": "lambda",
+        "instance_id": instance_id,
+        "instance_type": "gpu_1x_a100",
+        "region": "us-east-1",
+        "name": f"flash-{instance_id}",
+        "gpu": "A100",
+        "hourly_usd": 1.0,
+        "attempt": attempt,
+        "started_ts": started_ts,
+        **extra,
+    }
+
+
+def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
+    return {
+        "provider": "vast",
+        "instance_id": instance_id,
+        "offer_id": 101,
+        "machine_id": 202,
+        "label": f"flash-{instance_id}",
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.5,
+        "attempt": attempt,
+        "started_ts": started_ts,
+        **extra,
+    }
+
+
+def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     import logging
     from types import SimpleNamespace
 
@@ -37,11 +84,11 @@ def test_background_run_suppresses_exception_content(monkeypatch, caplog):
         (
             spec.run_id,
             "failed",
-            {"error": "run failed; detail suppressed"},
+            {"error": "RuntimeError: background run failed"},
         )
     ]
     assert "private provider response" not in caplog.text
-    assert "detail suppressed" in caplog.text
+    assert "RuntimeError: background run failed" in caplog.text
 
 
 def test_list_and_cancel(monkeypatch):
@@ -153,13 +200,16 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     assert raw[runner._NEXT_ATTEMPT_KEY] == 0
 
 
-def test_legacy_run_deadline_derives_from_created_at_and_persisted_spec(monkeypatch, tmp_path):
+
+def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
+    import os
+
     import flash.runner as runner
     from flash.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
-        run_id="legacy-deadline",
+        run_id="missing-deadline",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=900),
@@ -172,10 +222,15 @@ def test_legacy_run_deadline_derives_from_created_at_and_persisted_spec(monkeypa
             created_at=123.0,
         )
     )
+    path = runner.runs_file_path(spec.run_id, ".json")
+    raw = runner._load_status_json(spec.run_id)
+    raw.pop(runner._RUN_DEADLINE_AT_KEY)
+    with open(path, "w") as file:
+        json.dump(raw, file)
+    assert os.path.exists(path)
 
-    assert runner._load_run_deadline_at(spec.run_id) == 1023.0
-    assert runner._remaining_run_wall_seconds(spec.run_id, now=1000.0) == 23.0
-    assert runner._load_status_json(spec.run_id)[runner._RUN_DEADLINE_AT_KEY] == 1023.0
+    with pytest.raises(RuntimeError, match="persisted run wall deadline is missing"):
+        runner._load_run_deadline_at(spec.run_id)
 
 
 @pytest.mark.parametrize(
@@ -250,23 +305,21 @@ def test_persisted_run_deadline_rejects_nonpositive_or_nonfinite_values(
 
 
 @pytest.mark.parametrize("created_at", [0, -1, float("nan"), float("inf"), float("-inf")])
-def test_legacy_run_deadline_rejects_invalid_creation_time(monkeypatch, tmp_path, created_at):
+def test_status_save_rejects_invalid_creation_time(monkeypatch, tmp_path, created_at):
     import flash.runner as runner
     from flash.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="invalid-legacy-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=created_at,
-        )
-    )
-
     with pytest.raises(RuntimeError, match="run wall deadline is invalid"):
-        runner._load_run_deadline_at(spec.run_id)
+        runner._save_status(
+            runner.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                created_at=created_at,
+            )
+        )
 
 
 def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
@@ -591,12 +644,12 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         def submit_run(self, _spec, _seed, *, on_handle, attempt, **_kwargs):
             self.attempts.append(attempt)
             on_handle(
-                {
-                    "provider": "runpod",
-                    "endpoint_id": f"endpoint-{attempt}",
-                    "job_id": f"job-{attempt}",
-                    "attempt": attempt,
-                }
+                _runpod_remote(
+                    endpoint_id=f"endpoint-{attempt}",
+                    job_id=f"job-{attempt}",
+                    attempt=attempt,
+                    started_ts=float(attempt + 1),
+                )
             )
             if attempt == 0:
                 return PollResult(False, failure="poll_error", detail="transient")
@@ -664,12 +717,12 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
             if attempt == 0:
                 raise RuntimeError("provider accepted create but response was lost")
             on_handle(
-                {
-                    "provider": "runpod",
-                    "endpoint_id": "endpoint-1",
-                    "job_id": "job-1",
-                    "attempt": attempt,
-                }
+                _runpod_remote(
+                    endpoint_id="endpoint-1",
+                    job_id="job-1",
+                    attempt=attempt,
+                    started_ts=float(attempt + 1),
+                )
             )
             return PollResult(True, metrics={"wall_seconds": 1.0})
 
@@ -739,12 +792,12 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             self.walls.append(run_spec.gpu.max_wall_seconds)
             self.attempts.append(attempt)
             on_handle(
-                {
-                    "provider": "runpod",
-                    "endpoint_id": f"endpoint-{attempt}",
-                    "job_id": f"job-{attempt}",
-                    "attempt": attempt,
-                }
+                _runpod_remote(
+                    endpoint_id=f"endpoint-{attempt}",
+                    job_id=f"job-{attempt}",
+                    attempt=attempt,
+                    started_ts=float(attempt + 1),
+                )
             )
             if attempt == 0:
                 now["value"] = 180.0
@@ -1090,9 +1143,9 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
 @pytest.mark.parametrize(
     "remote",
     [
-        {"provider": "runpod", "endpoint_id": "endpoint", "job_id": "job"},
-        {"provider": "runpod", "endpoint_id": "endpoint"},
-        {"provider": "vast", "instance_id": 7},
+        _runpod_remote(attempt=2),
+        _runpod_remote(job_id=None, attempt=2),
+        _vast_remote(attempt=2),
     ],
 )
 def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
@@ -1108,7 +1161,7 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
-            remote={**remote, "attempt": 2},
+            remote=remote,
         )
     )
 
@@ -1120,16 +1173,16 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     ("original", "newer"),
     [
         (
-            {"provider": "runpod", "endpoint_id": "endpoint", "job_id": "job-old"},
-            {"provider": "runpod", "endpoint_id": "endpoint", "job_id": "job-new"},
+            _runpod_remote(job_id="job-old", attempt=1),
+            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
         ),
         (
-            {"provider": "runpod", "endpoint_id": "endpoint"},
-            {"provider": "runpod", "endpoint_id": "endpoint", "job_id": "job-new"},
+            _runpod_remote(job_id=None, attempt=1),
+            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
         ),
         (
-            {"provider": "lambda", "instance_id": "instance-old"},
-            {"provider": "lambda", "instance_id": "instance-new"},
+            _lambda_remote(instance_id="instance-old", attempt=1),
+            _lambda_remote(instance_id="instance-new", attempt=2, started_ts=2.0),
         ),
     ],
 )
@@ -1161,17 +1214,8 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     runs_dir = str(tmp_path / "runs")
     monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
     spec = JobSpec(run_id="cleanup-dedup", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    public_remote = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-a",
-        "job_id": "job-a",
-        "attempt": 0,
-    }
-    cleanup_remote = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-b",
-        "attempt": 1,
-    }
+    public_remote = _runpod_remote("endpoint-a", "job-a", attempt=0)
+    cleanup_remote = _runpod_remote("endpoint-b", None, attempt=1, started_ts=2.0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1206,23 +1250,19 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    confirmed = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-confirmed",
-        "job_id": "job-confirmed",
-        "attempt": 1,
-    }
-    endpoint_only = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-only",
-        "attempt": 2,
-    }
-    unconfirmed = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-unconfirmed",
-        "job_id": "job-unconfirmed",
-        "attempt": 3,
-    }
+    confirmed = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=1)
+    endpoint_only = _runpod_remote(
+        "endpoint-only",
+        None,
+        attempt=2,
+        started_ts=2.0,
+    )
+    unconfirmed = _runpod_remote(
+        "endpoint-unconfirmed",
+        "job-unconfirmed",
+        attempt=3,
+        started_ts=3.0,
+    )
     for remote in (confirmed, endpoint_only, unconfirmed):
         assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
 
@@ -1236,16 +1276,19 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
                 raise RuntimeError("cancellation unconfirmed")
 
         def destroy(self, handle):
-            events.append(("destroy", handle.to_dict()["endpoint_id"]))
+            endpoint_id = handle.to_dict()["endpoint_id"]
+            events.append(("destroy", endpoint_id))
+            if endpoint_id == "endpoint-unconfirmed":
+                raise RuntimeError("endpoint deletion unconfirmed")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
     attempted = runner._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
-        ("runpod", "endpoint-confirmed", "job-confirmed"),
-        ("runpod", "endpoint-only", None),
-        ("runpod", "endpoint-unconfirmed", "job-unconfirmed"),
+        ("runpod", 1, "endpoint-confirmed", "job-confirmed", _RUNPOD_FINGERPRINT),
+        ("runpod", 2, "endpoint-only", None, _RUNPOD_FINGERPRINT),
+        ("runpod", 3, "endpoint-unconfirmed", "job-unconfirmed", _RUNPOD_FINGERPRINT),
     }
     assert events == [
         ("cancel", "endpoint-confirmed"),
@@ -1259,71 +1302,31 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
-@pytest.mark.parametrize(
-    ("state", "expected"),
-    [("queued", 0), ("provisioning", 1), ("running", 1)],
-)
-def test_legacy_attempt_inference_is_state_aware(state, expected):
+
+def test_next_attempt_requires_persisted_integer_identity():
     import flash.runner as runner
 
-    assert runner._infer_next_attempt({"state": state, "remote": None}) == expected
+    assert runner._infer_next_attempt({"next_attempt": 0}) == 0
+    assert runner._infer_next_attempt({"next_attempt": 7}) == 7
+    for raw in ({}, {"next_attempt": True}, {"next_attempt": -1}, {"next_attempt": "1"}):
+        with pytest.raises(RuntimeError, match="next attempt identity"):
+            runner._infer_next_attempt(raw)
 
 
-@pytest.mark.parametrize(
-    ("remote", "expected"),
-    [
-        ({"provider": "runpod", "endpoint_id": "endpoint", "job_id": "job"}, 1),
-        ({"provider": "runpod", "endpoint_id": "endpoint", "attempt": "0"}, 1),
-        ({"provider": "runpod", "endpoint_id": "endpoint", "attempt": "007"}, 8),
-        ({"provider": "vast", "instance_id": 7, "attempt": 7}, 8),
-    ],
-)
-def test_legacy_remote_attempt_reserves_the_next_namespace(remote, expected):
-    import flash.runner as runner
-
-    assert runner._infer_next_attempt({"state": "running", "remote": remote}) == expected
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        {"state": "running", "next_attempt": True},
-        {"state": "running", "next_attempt": -1},
-        {"state": "running", "next_attempt": "1"},
-        {"state": "running", "remote": "invalid"},
-        {"state": "running", "remote": {}},
-        {
-            "state": "running",
-            "remote": {"provider": "runpod", "endpoint_id": "endpoint", "attempt": True},
-        },
-        {
-            "state": "running",
-            "remote": {"provider": "runpod", "endpoint_id": "endpoint", "attempt": -1},
-        },
-        {"remote": None},
-    ],
-)
-def test_malformed_attempt_evidence_fails_closed(raw):
-    import flash.runner as runner
-
-    with pytest.raises(RuntimeError, match=r"attempt|state"):
-        runner._infer_next_attempt(raw)
-
-
-def test_legacy_handleless_running_run_does_not_reuse_attempt_zero(monkeypatch, tmp_path):
+def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="legacy-running-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
     runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
     raw = runner._load_status_json(spec.run_id)
-    raw.pop(runner._NEXT_ATTEMPT_KEY, None)
-    with open(runner.runs_file_path(spec.run_id, ".json"), "w") as f:
-        json.dump(raw, f)
+    raw.pop(runner._NEXT_ATTEMPT_KEY)
+    with open(runner.runs_file_path(spec.run_id, ".json"), "w") as file:
+        json.dump(raw, file)
 
-    assert runner._reserve_attempt(spec.run_id) == 1
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 2
+    with pytest.raises(RuntimeError, match="next attempt identity is missing"):
+        runner._reserve_attempt(spec.run_id)
 
 
 def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatch, tmp_path):
@@ -1404,559 +1407,25 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
     assert raw[runner._RUN_DEADLINE_AT_KEY] == 300.0
 
 
-@pytest.mark.parametrize("progress", [False, True], ids=["pre-progress", "post-progress"])
-def test_opd_retry_is_allowed_only_before_training_progress(monkeypatch, tmp_path, progress):
-    import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id=f"opd-retry-{progress}",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        gpu=GpuSpec(type="RTX 4090", max_retries=1),
-    )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
-        _next_attempt=0,
-    )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
-    monkeypatch.setattr(
-        allocator,
-        "allocate",
-        lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
-            hourly_usd=0.69,
-            min_vram_gb=24,
-            candidates=(candidate,),
-        ),
-    )
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
-    class FakeProvider:
-        supports_weight_cache = False
 
-        def __init__(self):
-            self.attempts = []
 
-        def submit_run(self, _spec, _seed, *, attempt, **_kwargs):
-            self.attempts.append(attempt)
-            if attempt == 0:
-                if progress:
-                    runner.record_heartbeat(spec.run_id, {"stage": "opd_step"})
-                return PollResult(False, failure="poll_error", detail="transient")
-            return PollResult(True, metrics={"wall_seconds": 1.0})
 
-    provider = FakeProvider()
-    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    if progress:
-        with pytest.raises(RuntimeError, match="opd progress was detected"):
-            lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
-        assert provider.attempts == [0]
-    else:
-        lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
-        assert provider.attempts == [0, 1]
 
 
-def test_opd_retry_reads_immutable_attempt_marker_before_resubmitting(monkeypatch, tmp_path):
-    import io
 
-    import huggingface_hub
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 200.0)
-    spec = JobSpec(
-        run_id="opd-marker-retry",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(type="RTX 4090", max_wall_seconds=1000, max_retries=1),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-        ),
-        _next_attempt=0,
-    )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
-    monkeypatch.setattr(
-        allocator,
-        "allocate",
-        lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
-            hourly_usd=0.69,
-            min_vram_gb=24,
-            candidates=(candidate,),
-        ),
-    )
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
-    marker_reads = []
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "attempt": 0,
-                "run_id": spec.run_id,
-                "training_started": True,
-                "ts": 150.0,
-            }
-        )
-    )
 
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
 
-        def file_exists(self, **kwargs):
-            marker_reads.append(kwargs)
-            return True
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
 
-    class _Provider:
-        supports_weight_cache = False
-
-        def __init__(self):
-            self.attempts = []
-
-        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
-            self.attempts.append(attempt)
-            on_handle(
-                {
-                    "provider": "runpod",
-                    "endpoint_id": "endpoint-0",
-                    "job_id": "job-0",
-                    "started_ts": 100.0,
-                }
-            )
-            return PollResult(False, failure="poll_error", detail="worker stopped")
-
-    provider = _Provider()
-    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
-
-    with pytest.raises(RuntimeError, match="opd progress was detected"):
-        lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
-
-    assert provider.attempts == [0]
-    assert marker_reads == [
-        {
-            "repo_id": "owner/run-artifacts",
-            "filename": f"{spec.phase}/{spec.run_id}/opd_training_started_attempt0.json",
-            "repo_type": "dataset",
-        }
-    ]
-
-
-def test_opd_retry_fails_closed_when_immutable_marker_cannot_be_read(monkeypatch, tmp_path):
-    import io
-
-    import huggingface_hub
-
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.runner import lifecycle
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="opd-marker-read-failure",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(type="RTX 4090", max_retries=1),
-    )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
-        _next_attempt=0,
-    )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
-    monkeypatch.setattr(
-        allocator,
-        "allocate",
-        lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
-            hourly_usd=0.69,
-            min_vram_gb=24,
-            candidates=(candidate,),
-        ),
-    )
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **_kwargs):
-            raise OSError("secret provider payload")
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-
-    class _Provider:
-        supports_weight_cache = False
-
-        def __init__(self):
-            self.attempts = []
-
-        def submit_run(self, _spec, _seed, *, attempt, **_kwargs):
-            self.attempts.append(attempt)
-            return PollResult(False, failure="poll_error", detail="worker stopped")
-
-    provider = _Provider()
-    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
-
-    with pytest.raises(RuntimeError) as caught:
-        lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
-
-    assert str(caught.value) == (
-        "immutable OPD optimizer-start evidence could not be verified; retry is blocked"
-    )
-    assert caught.value.__cause__ is None
-    assert "secret provider payload" not in str(caught.value)
-    assert provider.attempts == [0]
-
-
-def test_opd_optimizer_start_evidence_starts_no_hf_read_at_deadline(monkeypatch, tmp_path):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 150.0)
-    spec = JobSpec(
-        run_id="expired-opd-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=100),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={"attempt": 0, "started_ts": 100.0},
-        ),
-        _next_attempt=1,
-    )
-    reads = []
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **kwargs):
-            reads.append(kwargs)
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-
-    with pytest.raises(RuntimeError, match="could not be verified"):
-        runner._immutable_opd_progress_detected(runner._load_status_json(spec.run_id), spec)
-
-    assert reads == []
-
-
-def test_opd_optimizer_start_evidence_starts_no_download_after_deadline(monkeypatch, tmp_path):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    clock = iter([149.0, 149.0, 150.0])
-    monkeypatch.setattr(runner.time, "time", lambda: next(clock))
-    spec = JobSpec(
-        run_id="deadline-crossing-opd-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=100),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={"attempt": 0, "started_ts": 100.0},
-        ),
-        _next_attempt=1,
-    )
-    downloads = []
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **_kwargs):
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
-        lambda **kwargs: downloads.append(kwargs),
-    )
-
-    with pytest.raises(RuntimeError, match="could not be verified"):
-        runner._immutable_opd_progress_detected(runner._load_status_json(spec.run_id), spec)
-
-    assert downloads == []
-
-
-def test_opd_optimizer_start_marker_requires_exact_run_attempt_window(monkeypatch, tmp_path):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 200.0)
-    spec = JobSpec(
-        run_id="strict-opd-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=1000),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={"attempt": 0, "started_ts": 100.0},
-        ),
-        _next_attempt=1,
-    )
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "attempt": 0,
-                "run_id": spec.run_id,
-                "training_started": True,
-                "ts": 150.0,
-            }
-        )
-    )
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **_kwargs):
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
-
-    raw = runner._load_status_json(spec.run_id)
-    assert runner._immutable_opd_progress_detected(raw, spec) is True
-
-
-@pytest.mark.parametrize("unsafe_now", [True, 0.0, -1.0, float("nan"), float("inf")])
-def test_opd_optimizer_start_marker_rejects_unsafe_current_clock(monkeypatch, tmp_path, unsafe_now):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: unsafe_now)
-    spec = JobSpec(
-        run_id="unsafe-clock-opd-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=1000),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={"attempt": 0, "started_ts": 1.0},
-        ),
-        _next_attempt=1,
-    )
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "attempt": 0,
-                "run_id": spec.run_id,
-                "training_started": True,
-                "ts": 1.0,
-            }
-        )
-    )
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **_kwargs):
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
-
-    with pytest.raises(
-        RuntimeError,
-        match="immutable OPD optimizer-start evidence could not be verified; retry is blocked",
-    ):
-        runner._immutable_opd_progress_detected(runner._load_status_json(spec.run_id), spec)
-
-
-@pytest.mark.parametrize(
-    ("marker", "remote"),
-    [
-        ("not-json", {"attempt": 0, "started_ts": 100.0}),
-        ([], {"attempt": 0, "started_ts": 100.0}),
-        (
-            {"attempt": 0, "run_id": "other", "training_started": True, "ts": 150.0},
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {"attempt": 1, "run_id": "invalid-opd-marker", "training_started": True, "ts": 150.0},
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {
-                "attempt": True,
-                "run_id": "invalid-opd-marker",
-                "training_started": True,
-                "ts": 150.0,
-            },
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {
-                "attempt": 0,
-                "run_id": "invalid-opd-marker",
-                "training_started": True,
-                "ts": float("nan"),
-            },
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {"attempt": 0, "run_id": "invalid-opd-marker", "training_started": True, "ts": 99.0},
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {"attempt": 0, "run_id": "invalid-opd-marker", "training_started": True, "ts": 1051.0},
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {
-                "attempt": 0,
-                "run_id": "invalid-opd-marker",
-                "training_started": True,
-                "ts": 150.0,
-                "extra": "field",
-            },
-            {"attempt": 0, "started_ts": 100.0},
-        ),
-        (
-            {"attempt": 0, "run_id": "invalid-opd-marker", "training_started": True, "ts": 150.0},
-            None,
-        ),
-    ],
-    ids=[
-        "malformed-json",
-        "non-object",
-        "wrong-run",
-        "wrong-attempt",
-        "bool-attempt",
-        "nonfinite-ts",
-        "before-launch",
-        "after-deadline",
-        "extra-field",
-        "missing-control-plane-identity",
-    ],
-)
-def test_opd_optimizer_start_marker_rejects_unverifiable_content(
-    monkeypatch, tmp_path, marker, remote
-):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 200.0)
-    spec = JobSpec(
-        run_id="invalid-opd-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=1000),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote=remote,
-        ),
-        _next_attempt=1,
-    )
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(marker if isinstance(marker, str) else json.dumps(marker))
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **_kwargs):
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
-
-    with pytest.raises(
-        RuntimeError,
-        match="immutable OPD optimizer-start evidence could not be verified; retry is blocked",
-    ):
-        runner._immutable_opd_progress_detected(runner._load_status_json(spec.run_id), spec)
-
-
-@pytest.mark.parametrize(
-    ("persisted_attempt", "expected_next"),
-    [(1, 2), (None, 1)],
-    ids=["persisted-attempt-1", "legacy-missing-attempt"],
-)
-def test_attach_failed_worker_resumes_with_next_attempt_identity(
-    monkeypatch, tmp_path, persisted_attempt, expected_next
-):
+def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tmp_path):
+    persisted_attempt = 1
+    expected_next = 2
     import io
 
     import flash.providers as providers
@@ -1972,14 +1441,12 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-old",
-        "job_id": "job-old",
-        "code_prefix": "code/revision",
-    }
-    if persisted_attempt is not None:
-        remote["attempt"] = persisted_attempt
+    remote = _runpod_remote(
+        "endpoint-old",
+        "job-old",
+        attempt=persisted_attempt,
+        code_prefix="code/revision",
+    )
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1989,6 +1456,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(
             remote=remote,
         ),
         _run_deadline_at=300.0,
+        _next_attempt=2,
     )
     monkeypatch.setattr(runner.time, "time", lambda: 100.0)
     poll_walls = []
@@ -2044,14 +1512,10 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
             state="running",
             spec=spec.to_dict(),
             created_at=100.0,
-            remote={
-                "provider": "runpod",
-                "endpoint_id": "endpoint-old",
-                "job_id": "job-old",
-                "attempt": 0,
-            },
+            remote=_runpod_remote("endpoint-old", "job-old", attempt=0),
         ),
         _run_deadline_at=220.0,
+        _next_attempt=1,
     )
     monkeypatch.setattr(runner.time, "time", lambda: 221.0)
     polled = []
@@ -2100,12 +1564,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
         model="Qwen/Qwen3.5-4B",
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-old",
-        "job_id": "job-old",
-        "attempt": 0,
-    }
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -2115,6 +1574,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
             remote=remote,
         ),
         _run_deadline_at=220.0,
+        _next_attempt=1,
     )
     monkeypatch.setattr(runner.time, "time", lambda: 221.0)
 
@@ -2141,171 +1601,10 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     assert "deadline exhausted" in status.error
 
 
-def test_attach_opd_immutable_progress_does_not_resubmit_after_heartbeat_overwrite(
-    monkeypatch, tmp_path
-):
-    import io
-
-    import huggingface_hub
-
-    import flash.providers as providers
-    import flash.runner as runner
-    from flash.providers.base import PollResult
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 200.0)
-    spec = JobSpec(
-        run_id="attach-opd-progress",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=1000),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={
-                "provider": "runpod",
-                "endpoint_id": "endpoint-old",
-                "job_id": "job-old",
-                "attempt": 0,
-                "started_ts": 100.0,
-            },
-            last_heartbeat={"stage": "liveness", "step": 0},
-        ),
-        _run_deadline_at=1050.0,
-        _next_attempt=1,
-    )
-    marker_reads = []
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "attempt": 0,
-                "run_id": spec.run_id,
-                "training_started": True,
-                "ts": 150.0,
-            }
-        )
-    )
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **kwargs):
-            marker_reads.append(kwargs)
-            return True
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
-    resumed = []
-
-    class Provider:
-        def poll(self, *_args, **_kwargs):
-            return PollResult(False, failure="poll_error", detail="worker stopped")
-
-        def cancel(self, _handle):
-            return None
-
-        def destroy(self, _handle):
-            return None
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
-
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
-
-    assert resumed == []
-    assert marker_reads == [
-        {
-            "repo_id": "owner/run-artifacts",
-            "filename": f"{spec.phase}/{spec.run_id}/opd_training_started_attempt0.json",
-            "repo_type": "dataset",
-        }
-    ]
-    assert status.state == "failed"
-    assert status.remote is None
-    assert "opd progress was detected" in status.error
-    assert "resume is not supported" in status.error
 
 
-def test_opd_progress_marker_survives_later_nonprogress_heartbeat(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.spec import JobSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="sticky-opd-progress", model="Qwen/Qwen3.5-4B", algorithm="opd")
-    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
-
-    runner.record_heartbeat(spec.run_id, {"stage": "opd_step", "step": 0})
-    runner.record_heartbeat(spec.run_id, {"stage": "liveness", "step": 0})
-
-    assert runner._opd_progress_detected(spec.run_id) is True
-    assert runner._load_status_json(spec.run_id)[runner._OPD_PROGRESS_KEY] is True
 
 
-def test_opd_immutable_progress_checks_every_reserved_attempt(monkeypatch, tmp_path):
-    import huggingface_hub
-
-    import flash.runner as runner
-    from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner.time, "time", lambda: 200.0)
-    spec = JobSpec(
-        run_id="opd-reserved-attempt-markers",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        train=TrainSpec(hf_repo="owner/run-artifacts"),
-        gpu=GpuSpec(max_wall_seconds=1000),
-    )
-    runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=50.0,
-            remote={"attempt": 2, "started_ts": 100.0},
-            last_heartbeat={"stage": "liveness", "step": 0},
-        ),
-        _next_attempt=3,
-    )
-    marker_paths = []
-    marker_path = tmp_path / "marker.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "attempt": 2,
-                "run_id": spec.run_id,
-                "training_started": True,
-                "ts": 150.0,
-            }
-        )
-    )
-
-    class _Api:
-        def __init__(self, **_kwargs):
-            pass
-
-        def file_exists(self, **kwargs):
-            marker_paths.append(kwargs["filename"])
-            return kwargs["filename"].endswith("attempt2.json")
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(marker_path))
-
-    assert runner._opd_progress_detected(spec.run_id) is True
-    assert marker_paths == [
-        f"{spec.phase}/{spec.run_id}/opd_training_started_attempt0.json",
-        f"{spec.phase}/{spec.run_id}/opd_training_started_attempt1.json",
-        f"{spec.phase}/{spec.run_id}/opd_training_started_attempt2.json",
-    ]
 
 
 def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
@@ -2320,13 +1619,15 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
-        jobs, "deploy_train_endpoint", lambda *_args, **_kwargs: ("endpoint", "name")
+        jobs,
+        "deploy_train_endpoint",
+        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
     monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         jobs.runpod_api,
         "submit_job",
-        lambda _endpoint, payload: payloads.append(payload) or "job",
+        lambda _endpoint, payload, **_kwargs: payloads.append(payload) or "job",
     )
     monkeypatch.setattr(
         jobs,
@@ -2340,6 +1641,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         attempt=2,
         code_prefix="code/revision",
         on_handle=handles.append,
+        deadline_at=10_000_000_000.0,
     )
 
     assert payloads[0]["env"]["ATTEMPT"] == "2"
@@ -2394,12 +1696,11 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             self.submits.append(attempt)
             runner._update(spec.run_id, "cancelled")
             on_handle(
-                {
-                    "provider": "runpod",
-                    "endpoint_id": "endpoint-race",
-                    "job_id": "job-race",
-                    "attempt": attempt,
-                }
+                _runpod_remote(
+                    "endpoint-race",
+                    "job-race",
+                    attempt=attempt,
+                )
             )
             raise AssertionError("terminal handle callback must not return")
 
@@ -2434,12 +1735,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         assert status.remote["attempt"] == 0
         raw = runner._load_status_json(spec.run_id)
         assert raw[runner._CLEANUP_REMOTES_KEY] == [
-            {
-                "provider": "runpod",
-                "endpoint_id": "endpoint-race",
-                "job_id": "job-race",
-                "attempt": 0,
-            }
+            _runpod_remote("endpoint-race", "job-race", attempt=0)
         ]
 
 
@@ -2476,18 +1772,8 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
             candidates=(candidate,),
         ),
     )
-    remote_a = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-a",
-        "job_id": "job-a",
-        "attempt": 0,
-    }
-    remote_b = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint-b",
-        "job_id": "job-b",
-        "attempt": 0,
-    }
+    remote_a = _runpod_remote("endpoint-a", "job-a", attempt=0)
+    remote_b = _runpod_remote("endpoint-b", "job-b", attempt=0)
 
     class Provider:
         supports_weight_cache = False

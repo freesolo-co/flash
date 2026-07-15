@@ -21,7 +21,6 @@ import abc
 from collections.abc import Callable
 from typing import Any
 
-from flash.providers._deadline import deadline_kwargs
 from flash.providers._instance import InstanceJobHandle
 from flash.providers.base import GpuClass, JobHandle, PollResult
 
@@ -78,13 +77,7 @@ class InstanceProvider(abc.ABC):
     ) -> PollResult: ...
 
     @abc.abstractmethod
-    def _teardown_reattached(
-        self,
-        handle: JobHandle,
-        spec,
-        *,
-        deadline_at: float | None,
-    ) -> None:
+    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
         """Destroy an instance recovered via ``poll`` (attach has no submit teardown to lean on)."""
 
     @abc.abstractmethod
@@ -167,11 +160,7 @@ class InstanceProvider(abc.ABC):
         finally:
             # attach_run has no submit-time teardown; destroy the reattached instance here so a recovered run stops billing.
             with contextlib.suppress(Exception):
-                self._teardown_reattached(
-                    h,
-                    spec,
-                    **deadline_kwargs(self._teardown_reattached, _deadline_at),
-                )
+                self._teardown_reattached(h, spec)
 
     def gc(self, spec) -> None:
         self._gc(spec.run_id)
