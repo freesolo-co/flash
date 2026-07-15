@@ -229,6 +229,82 @@ def test_required_save_fails_when_trainer_checkpoint_is_missing(monkeypatch, tmp
         )
 
 
+def test_transient_required_deployable_failure_retries_before_full_state(monkeypatch, tmp_path):
+    fake_transformers = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    fake_transformers.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    checkpoint = tmp_path / "checkpoint-4"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    calls = {"deployable": 0, "resume": 0}
+
+    def publish_once_then_succeed(*_args, **_kwargs):
+        calls["deployable"] += 1
+        if calls["deployable"] == 1:
+            raise ConnectionError("hf deployable upload unavailable")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_hf, "publish_deployable_checkpoint", publish_once_then_succeed)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    worker.make_checkpoint_upload_callback((4,)).on_save(
+        SimpleNamespace(output_dir=str(tmp_path)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert calls == {"deployable": 2, "resume": 1}
+
+
+def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    calls = {"resume": 0, "deployable": 0}
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    def publish_once_then_succeed():
+        calls["deployable"] += 1
+        if calls["deployable"] == 1:
+            raise ConnectionError("hf deployable upload unavailable")
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    assert worker_hf.upload_resume_checkpoint(
+        4, str(tmp_path), after_upload=publish_once_then_succeed
+    )
+    assert calls == {"resume": 1, "deployable": 2}
+
+
 def test_permanent_required_save_failure_is_not_retried(monkeypatch, tmp_path):
     fake_transformers = types.ModuleType("transformers")
 
@@ -264,7 +340,18 @@ def test_permanent_required_save_failure_is_not_retried(monkeypatch, tmp_path):
     assert calls == 1
 
 
-def test_resume_upload_failure_preserves_published_required_save(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("save_at_steps", "required", "hook"),
+    [
+        ((4,), True, "on_save"),
+        ((4,), True, "on_train_end"),
+        ((), False, "on_save"),
+        ((), False, "on_train_end"),
+    ],
+)
+def test_resume_upload_failure_requires_full_state_only_at_exact_save(
+    monkeypatch, tmp_path, save_at_steps, required, hook
+):
     fake_transformers = types.ModuleType("transformers")
 
     class TrainerCallback:
@@ -287,6 +374,7 @@ def test_resume_upload_failure_preserves_published_required_save(monkeypatch, tm
             if kwargs["path_in_repo"].endswith("/checkpoints/step-4/adapter"):
                 calls["deployable"] += 1
                 return
+            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
             calls["resume"] += 1
             raise RuntimeError("resume upload unavailable")
 
@@ -294,13 +382,20 @@ def test_resume_upload_failure_preserves_published_required_save(monkeypatch, tm
     monkeypatch.setattr(worker, "hf_api", lambda: ResumeFailingApi())
     monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-    callback = worker.make_checkpoint_upload_callback((4,))
+    callback = worker.make_checkpoint_upload_callback(save_at_steps)
 
-    callback.on_save(
-        SimpleNamespace(output_dir=str(tmp_path)),
-        SimpleNamespace(global_step=4),
-        SimpleNamespace(),
-    )
+    def save():
+        getattr(callback, hook)(
+            SimpleNamespace(output_dir=str(tmp_path)),
+            SimpleNamespace(global_step=4),
+            SimpleNamespace(),
+        )
+
+    if required:
+        with pytest.raises(worker.RetriableInfraError, match="full-state checkpoint"):
+            save()
+    else:
+        save()
 
     assert calls == {"deployable": 1, "resume": 3}
 
@@ -411,7 +506,7 @@ def test_required_save_fails_when_publication_never_lands(monkeypatch, tmp_path)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
     callback = worker.make_checkpoint_upload_callback((4,))
 
-    with pytest.raises(worker.RetriableInfraError, match="not durably published"):
+    with pytest.raises(worker.RetriableInfraError, match="deployable upload failed"):
         callback.on_save(
             SimpleNamespace(output_dir=str(tmp_path)),
             SimpleNamespace(global_step=4),
@@ -460,7 +555,9 @@ def test_worker_seed_prefers_jobspec_when_present():
     assert _resolve_worker_seed(None, "-1") == 42
 
 
-@pytest.mark.parametrize("key", ["SEED", "seed", "Run_Id", "HF_REPO", "flash_arm"])
+@pytest.mark.parametrize(
+    "key", ["SEED", "seed", "Run_Id", "HF_REPO", "flash_arm", "FLASH_OPD_RESUME_REVISION"]
+)
 def test_worker_env_rejects_control_plane_owned_keys(key, tmp_path):
     with pytest.raises(ValueError, match="control-plane key"):
         JobSpec(worker_env={key: "override"})
@@ -547,6 +644,19 @@ def test_runtime_secret_cannot_override_control_plane_seed():
     spec = JobSpec(model="m", seed=987, environment=EnvironmentSpec(id="e", secrets=("SEED",)))
     env = build_worker_env(spec, 987, runtime_secrets={"SEED": "7"})
     assert env["SEED"] == "987"
+
+
+def test_provider_worker_env_carries_control_plane_resume_revision():
+    from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
+    from flash.providers._worker import build_worker_env
+
+    spec = JobSpec(model="m", algorithm="opd", seed=987)
+    env = build_worker_env(
+        spec,
+        987,
+        runtime_secrets={OPD_RESUME_REVISION_ENV: "a" * 40},
+    )
+    assert env[OPD_RESUME_REVISION_ENV] == "a" * 40
 
 
 def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):

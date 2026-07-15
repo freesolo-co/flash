@@ -11,6 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._deadline import deadline_kwargs
 from flash.spec import JobSpec, require_matching_seed
 
@@ -207,6 +208,7 @@ def _submit_seed_supervised(
         _spec_with_remaining_wall,
         _TerminalHandleRace,
         _update,
+        _verified_opd_retry_state,
         flash_code_prefix,
         get_status,
     )
@@ -355,11 +357,20 @@ def _submit_seed_supervised(
         except RuntimeError:
             _gc_seen_endpoints()
             raise
+        if spec.algorithm == "opd":
+            expected_next_attempt, opd_resume_revision = _verified_opd_retry_state(spec.run_id)
+        else:
+            expected_next_attempt, opd_resume_revision = None, None
         attempt = _reserve_attempt(
             spec.run_id,
             minimum_attempt=attempt_start if local_attempt == 0 else 0,
+            expected_next_attempt=expected_next_attempt,
         )
         current_attempt["value"] = attempt
+        attempt_runtime_secrets = dict(runtime_secrets or {})
+        attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
+        if opd_resume_revision is not None:
+            attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
         res = None
         alloc = None
         chosen = None
@@ -467,8 +478,8 @@ def _submit_seed_supervised(
                         "code_prefix": code_prefix,
                         "_deadline_at": _load_run_deadline_at(spec.run_id),
                     }
-                    if runtime_secrets:
-                        submit_kwargs["runtime_secrets"] = runtime_secrets
+                    if attempt_runtime_secrets:
+                        submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
                     res = provider.submit_run(run_spec, seed, **submit_kwargs)
                 except _TerminalHandleRace:
                     raise
