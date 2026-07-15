@@ -55,7 +55,6 @@ WORKER_DEPS = [
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
-WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
 # back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
@@ -77,15 +76,6 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
         return override
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
-        template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
-        if template:
-            return template.format(
-                base_image=WORKER_IMAGE,
-                gpu=info.name,
-                gpu_short=info.short,
-                sm=info.sm,
-                sm_num=info.sm.removeprefix("sm"),
-            )
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
