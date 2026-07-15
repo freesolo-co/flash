@@ -5,17 +5,20 @@ code-prefix validation, the Hugging Face transient-retry machinery (status/Retry
 backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
 preload branch. Everything is CPU-only and offline: the huggingface_hub package is stubbed via
-sys.modules, subprocess.Popen is faked, os._exit is monkeypatched, and time.sleep is neutralized so
-no test ever waits on real backoff.
+sys.modules, subprocess.Popen is faked, and targeted real multiprocessing children exercise uploader
+reaping without making network requests.
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import multiprocessing
+import signal
 import subprocess
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -24,6 +27,44 @@ from flash.providers import _instance_bootstrap as b
 from flash.providers._deadline import deadline_kwargs
 
 CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+
+
+def _sleeping_upload_child():
+    time.sleep(60.0)
+
+
+def _sigterm_ignoring_final_upload(payload, _console, _mode, _extra):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    payload["ready"].set()
+    while True:
+        time.sleep(1.0)
+
+
+class _InspectableProcess:
+    def __init__(self, process):
+        self._process = process
+        self.close_called = False
+
+    def start(self):
+        self._process.start()
+
+    def join(self, timeout=None):
+        self._process.join(timeout)
+
+    def is_alive(self):
+        return self._process.is_alive()
+
+    def terminate(self):
+        self._process.terminate()
+
+    def kill(self):
+        self._process.kill()
+
+    def close(self):
+        self.close_called = True
+
+    def close_real(self):
+        self._process.close()
 
 
 def _install_fake_hf(monkeypatch, **attrs):
@@ -501,8 +542,16 @@ def _disable_periodic_console_upload(monkeypatch):
     )
 
 
-def _run_final_console_upload_inline(payload, console, mode, extra, cleanup_deadline_at):
-    assert cleanup_deadline_at > b.time.time()
+def _run_final_console_upload_inline(
+    payload,
+    console,
+    mode,
+    extra,
+    upload_deadline_at,
+    reaping_deadline_at,
+):
+    assert upload_deadline_at < reaping_deadline_at
+    assert upload_deadline_at > b.time.time()
     b._upload_console_snapshot(payload, console, mode, extra)
     return True
 
@@ -536,8 +585,8 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
 
 def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatch):
     clock = {"now": 100.0}
-    deadline = clock["now"] + 0.30
-    cleanup_deadline = deadline - b._TERMINAL_BOOKKEEPING_RESERVE_S
+    deadline = clock["now"] + b._CONSOLE_UPLOAD_REAP_RESERVE_S + 1.0
+    upload_deadline, reaping_deadline = b._upload_cleanup_deadlines(deadline)
     events = []
     _disable_periodic_console_upload(monkeypatch)
 
@@ -588,9 +637,13 @@ def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatc
     events.append(("marker", marker_started_at, uploader.is_alive()))
     assert not uploader.is_alive()
     assert [event[1] for event in events if event[0] == "join"] == pytest.approx(
-        [cleanup_deadline - 100.0, 0.0, 0.0]
+        [
+            upload_deadline - 100.0,
+            b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+            b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        ]
     )
-    assert marker_started_at == pytest.approx(cleanup_deadline)
+    assert marker_started_at == pytest.approx(reaping_deadline)
     assert deadline - marker_started_at == pytest.approx(b._TERMINAL_BOOKKEEPING_RESERVE_S)
     assert [event[0] for event in events].index("kill") < [event[0] for event in events].index("marker")
     assert events[-1] == ("marker", marker_started_at, False)
@@ -674,8 +727,8 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
 
 def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeypatch):
     clock = {"now": 100.0}
-    deadline = clock["now"] + 0.30
-    cleanup_deadline = deadline - b._TERMINAL_BOOKKEEPING_RESERVE_S
+    deadline = clock["now"] + b._CONSOLE_UPLOAD_REAP_RESERVE_S + 1.0
+    upload_deadline, reaping_deadline = b._upload_cleanup_deadlines(deadline)
     events = []
 
     class _HungUploader:
@@ -710,7 +763,7 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     monkeypatch.setattr(
         b,
         "_upload_console_tail_bounded",
-        lambda *_args: pytest.fail("final uploader must not start after cleanup deadline"),
+        lambda *_args: pytest.fail("final uploader must not start after upload deadline"),
     )
     monkeypatch.setattr(
         b.subprocess,
@@ -726,12 +779,134 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     assert stop_upload.is_set()
     assert not uploader.is_alive()
     assert [event[1] for event in events if event[0] == "join"] == pytest.approx(
-        [cleanup_deadline - 100.0, 0.0, 0.0]
+        [
+            upload_deadline - 100.0,
+            b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+            b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        ]
     )
-    assert marker_started_at == pytest.approx(cleanup_deadline)
+    assert marker_started_at == pytest.approx(reaping_deadline)
     assert deadline - marker_started_at == pytest.approx(b._TERMINAL_BOOKKEEPING_RESERVE_S)
     assert [event[0] for event in events].index("kill") < [event[0] for event in events].index("marker")
     assert events[-1] == ("marker", marker_started_at, False)
+
+
+def test_stop_upload_process_reaps_real_sleeping_child_before_marker_reserve():
+    context = multiprocessing.get_context("spawn")
+    process = _InspectableProcess(
+        context.Process(target=_sleeping_upload_child, daemon=True)
+    )
+    stop_upload = context.Event()
+    process.start()
+    try:
+        upload_deadline = time.time() + 0.25
+        reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+
+        clean = b._stop_upload_process(
+            process,
+            stop_upload,
+            upload_deadline,
+            reaping_deadline,
+        )
+        finished_at = time.time()
+
+        assert clean is False
+        assert stop_upload.is_set()
+        assert process.is_alive() is False
+        assert process.close_called is True
+        assert finished_at < reaping_deadline
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+        process.close_real()
+
+
+def test_final_upload_reaps_real_sigterm_ignoring_child_before_marker_reserve(monkeypatch):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    processes = []
+
+    class _RecordingContext:
+        def Process(self, **kwargs):
+            process = _InspectableProcess(context.Process(**kwargs))
+            processes.append(process)
+            return process
+
+    monkeypatch.setattr(b.multiprocessing, "get_context", lambda _method: _RecordingContext())
+    monkeypatch.setattr(b, "_upload_console_snapshot", _sigterm_ignoring_final_upload)
+    upload_deadline = time.time() + 2.0
+    reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+
+    try:
+        clean = b._upload_console_tail_bounded(
+            {"ready": ready},
+            "/tmp/unused-console.txt",
+            "sft",
+            "",
+            upload_deadline,
+            reaping_deadline,
+        )
+        finished_at = time.time()
+        process = processes[0]
+
+        assert ready.is_set()
+        assert clean is False
+        assert process.is_alive() is False
+        assert process.close_called is True
+        assert finished_at < reaping_deadline
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+                process.join(b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+            process.close_real()
+
+
+def test_unreaped_uploader_exits_before_terminal_bookkeeping(monkeypatch):
+    clock = {"now": 100.0}
+    events = []
+
+    class _HardExit(BaseException):
+        pass
+
+    class _NeverDeadUploader:
+        def join(self, timeout=None):
+            events.append(("join", timeout))
+            clock["now"] += timeout or 0.0
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            events.append(("terminate", clock["now"]))
+
+        def kill(self):
+            events.append(("kill", clock["now"]))
+
+        def close(self):
+            pytest.fail("a live uploader must not be closed")
+
+    def hard_exit(code):
+        events.append(("exit", code, clock["now"]))
+        raise _HardExit
+
+    upload_deadline = clock["now"] + 0.5
+    reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(b.os, "_exit", hard_exit)
+
+    with pytest.raises(_HardExit):
+        b._stop_upload_process(
+            _NeverDeadUploader(),
+            threading.Event(),
+            upload_deadline,
+            reaping_deadline,
+        )
+
+    assert clock["now"] == pytest.approx(reaping_deadline)
+    assert events[-1] == ("exit", 124, reaping_deadline)
+    assert [event[0] for event in events].count("kill") == 2
 
 
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
