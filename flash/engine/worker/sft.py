@@ -9,6 +9,13 @@ import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
+from flash.engine.steps import (
+    configure_trainer_save_schedule,
+    final_save_due,
+    resolve_update_horizon,
+    sft_update_steps,
+    validate_save_steps,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.packing import (
@@ -39,6 +46,7 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
 
 
 def _pretokenize_completion_only(texts, tokenizer, max_length):
@@ -114,12 +122,41 @@ def select_sft_examples(train, max_examples, seed):
     return train
 
 
+def sft_completed_train_tokens(
+    tokens_per_epoch: int,
+    epochs: int,
+    derived_steps: int,
+    completed_steps: int,
+) -> int:
+    """Estimate tokens processed from completed updates while preserving epoch accounting at parity."""
+    epoch_tokens = max(0, int(tokens_per_epoch)) * max(0, int(epochs))
+    completed = max(0, int(completed_steps))
+    derived = max(1, int(derived_steps))
+    if completed == derived:
+        return epoch_tokens
+    if completed == 0 or epoch_tokens == 0:
+        return 0
+    return max(1, round(epoch_tokens * completed / derived))
+
+
+def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
+    """True when a max_steps-authoritative run completed fewer updates than requested.
+
+    with max_steps authoritative, trl's max_steps override lands a fresh run exactly on the horizon,
+    and a resume from a checkpoint past a lowered horizon does zero new steps yet holds a fully-trained
+    adapter (final_step >= horizon). fail loudly only on a genuine under-run, mirroring grpo
+    (steps_run < steps) and opd (opt_steps < steps).
+    """
+    return int(max_steps) > 0 and int(final_step) < int(update_horizon)
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoTokenizer
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
+    seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     t_start = time.time()
     _w.heartbeat("sft_start", gpu=gpu_diagnostics())
@@ -141,9 +178,7 @@ def run_sft():
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
-        train = select_sft_examples(
-            env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED
-        )
+        train = select_sft_examples(env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED)
         texts = []
         multiturn_targets = 0
         for ex in train:
@@ -271,7 +306,8 @@ def run_sft():
         lora_rank=_gc_lora_rank,
     )
 
-    max_steps = int(_t.max_steps or 0 if _t and _t.max_steps is not None else 0)
+    max_steps = int(_t.max_steps or 0) if _t else 0
+    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -292,7 +328,7 @@ def run_sft():
         "dataloader_num_workers": 4,
         "dataloader_pin_memory": True,
         "dataloader_persistent_workers": True,
-        "seed": _w.SEED,
+        "seed": backend_seed(_w.SEED),
         "gradient_checkpointing": _grad_ckpt,
         # MoE / GatedDeltaNet hybrids re-dispatch tokens (MoE router) or lay out custom-kernel
         # saved tensors differently on recompute, so non-reentrant checkpointing's metadata-equality
@@ -310,10 +346,12 @@ def run_sft():
         cfg_kwargs["use_liger_kernel"] = False
     if max_steps > 0:
         cfg_kwargs["max_steps"] = max_steps
+    configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
     # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
     # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
     _pure_attn = model_is_pure_attention(model_id)
     _gdn = model_is_gdn_hybrid(model_id)
+    _bfd_block_count: int | None = None
     _fa_ok = _flash_attn_available()
     if _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
@@ -354,7 +392,8 @@ def run_sft():
             )
     if cfg_kwargs.get("packing"):
         _bfd_ids = [r["input_ids"] for r in _pretok]
-        _bfd_ex = len(_bfd_ids) / max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
+        _bfd_block_count = max(1, len(pack_token_ids(_bfd_ids, sft_max_len)))
+        _bfd_ex = len(_bfd_ids) / _bfd_block_count
         cfg_kwargs["gradient_accumulation_steps"] = max(
             1, math.ceil(effective_batch / max(1.0, per_device_bs * _bfd_ex))
         )
@@ -458,6 +497,17 @@ def run_sft():
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = model_init_kwargs
+    examples_per_update = int(cfg_kwargs["per_device_train_batch_size"]) * int(
+        cfg_kwargs["gradient_accumulation_steps"]
+    )
+    derived_steps = sft_update_steps(
+        epochs=epochs,
+        example_count=len(ds),
+        examples_per_update=examples_per_update,
+        packed_block_count=_bfd_block_count if cfg_kwargs.get("packing") else None,
+    )
+    update_horizon = resolve_update_horizon(derived_steps, max_steps)
+    validate_save_steps(save_at_steps, update_horizon)
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
@@ -525,9 +575,8 @@ def run_sft():
     # from recycling the worker. include_torch=False: side-thread torch.cuda telemetry serializes on
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
-        sft_model = _w.prepare_fresh_lora_base(
-            model_id, model_id, model_init_kwargs, phase="sft"
-        )
+        seed_training_rngs(_w.SEED)
+        sft_model = _w.prepare_fresh_lora_base(model_id, model_id, model_init_kwargs, phase="sft")
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
         trainer = _SFT(
@@ -537,7 +586,10 @@ def run_sft():
             peft_config=_w.make_lora(model_id),
             processing_class=tok,
             data_collator=_collator,
-            callbacks=[_w.make_sft_heartbeat_callback(), _w.make_checkpoint_upload_callback()],
+            callbacks=[
+                _w.make_sft_heartbeat_callback(),
+                _w.make_checkpoint_upload_callback(save_at_steps),
+            ],
         )
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
         # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
@@ -572,6 +624,10 @@ def run_sft():
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
+    if sft_under_ran(_final_step, update_horizon, max_steps):
+        raise RuntimeError(
+            f"sft completed {_final_step}/{update_horizon} requested optimizer updates"
+        )
     # adapter save + required upload can take minutes on a slow HF; keep the heartbeat fresh.
     # keepalive=True: _final_step is CONSTANT here (training is done), so without it every finalize
     # ping is a bare liveness that does NOT advance the provider's stall clock — a finalize outlasting
@@ -585,12 +641,17 @@ def run_sft():
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # Ensure `flash deploy RUN_ID/step-<final>` always resolves: save_steps may not align with the last step.
-        if _final_step:
+        # preserve the final checkpoint only when exact save steps are not configured.
+        if final_save_due(_final_step, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _final_step)
     _w.heartbeat("sft_trained", train_wall=train_wall, step=_final_step, gpu=gpu_diagnostics())
 
-    train_tokens = _total_tok * epochs
+    train_tokens = sft_completed_train_tokens(
+        _total_tok,
+        epochs,
+        derived_steps,
+        _final_step,
+    )
     _w.write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,

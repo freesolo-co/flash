@@ -29,7 +29,14 @@ from flash.schema.fields import (
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.spec import (
+    FIXED_SEED,
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    parse_seed,
+)
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -202,6 +209,13 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+def _job_seed(raw: dict[str, Any]) -> int:
+    try:
+        return parse_seed(raw.get("seed", FIXED_SEED))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     ref_raw = train_raw.get("init_from_adapter")
     if ref_raw is None:
@@ -228,6 +242,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "algorithm",
         "model_policy",
         "thinking",
+        "seed",
         "environment",
         "train",
         "gpu",
@@ -383,16 +398,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
-    spec = JobSpec(
-        model=model,
-        algorithm=algorithm,
-        environment=EnvironmentSpec(
-            id=str(env_raw.get("id") or ""),
-            params=dict(env_raw.get("params") or {}),
-            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
-            secrets=environment_secrets,
-        ),
-        train=TrainSpec(
+    try:
+        train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
@@ -410,16 +417,31 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
-            # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
+            # opd-only managed teacher alias, validated against the allow-list; "" -> default glm 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
-            # minimum=0: explicit 0 means "no cap" per TrainSpec contract
-            max_steps=_train_int(train_raw, "max_steps", minimum=0),
+            # minimum=0: explicit 0 means "no cap" per trainspec contract
+            max_steps=train_raw.get("max_steps"),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            save_at_steps=train_raw.get("save_at_steps"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+    spec = JobSpec(
+        model=model,
+        algorithm=algorithm,
+        environment=EnvironmentSpec(
+            id=str(env_raw.get("id") or ""),
+            params=dict(env_raw.get("params") or {}),
+            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+            secrets=environment_secrets,
         ),
+        train=train_spec,
         gpu=GpuSpec(type=gpu_type, **gpu_options),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
+        seed=_job_seed(raw),
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,

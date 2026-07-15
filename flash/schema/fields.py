@@ -8,7 +8,7 @@ from typing import Any
 
 from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec
+from flash.spec import WandbSpec, validate_worker_env_reserved
 
 
 def _section_int(
@@ -277,6 +277,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "RUN_ID",
         "HF_REPO",
         "FLASH_ARM",
+        "SEED",
     }
 )
 
@@ -307,6 +308,10 @@ def _worker_env(raw: Any) -> dict[str, str]:
         raise ConfigError("[worker_env] must be a table of string key/values")
     env = {str(k): str(v) for k, v in raw.items()}
     _validate_env_var_names(env, "[worker_env]")
+    try:
+        validate_worker_env_reserved(env)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     # [worker_env] is serialized into job_spec_json (persisted + logged) — must not carry secrets.
     # Match by word components (not substring): KEY only flagged when qualified by a credential context.
     _secret_words = {

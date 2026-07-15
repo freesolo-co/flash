@@ -12,7 +12,12 @@ from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
-from flash.spec import JobSpec
+from flash.spec import (
+    RESERVED_WORKER_ENV_KEYS,
+    JobSpec,
+    require_matching_seed,
+    validate_worker_env_reserved,
+)
 
 # Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
 logger = get_logger("flash.providers.runpod.train")
@@ -205,7 +210,9 @@ def build_worker_env(
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
-    # GRPO uses a non-expandable alloc conf: expandable_segments crashes the vLLM sleep-mode engine.
+    canonical_seed = require_matching_seed(spec, seed)
+    validate_worker_env_reserved(spec.worker_env)
+    # grpo uses a non-expandable alloc conf: expandable_segments crashes the vllm sleep-mode engine.
     # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
     # SFT and OPD have NO vLLM sleep engine and allocate large HF generate/logit tensors, so both take
     # the anti-fragmentation expandable allocator up front: OPD was previously lumped in with RL here
@@ -221,6 +228,7 @@ def build_worker_env(
         "RUN_ID": spec.run_id,
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
+        "SEED": str(canonical_seed),
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
@@ -239,12 +247,8 @@ def build_worker_env(
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # RUN_ID/HF_REPO/FLASH_ARM are control-plane-owned: overriding them would orphan artifacts.
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
-        if ku in _RESERVED_WORKER_ENV:
-            continue
         if ku in _REMOVED_OPTIMIZATION_ENV:
             logger.warning(
                 "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
@@ -253,7 +257,14 @@ def build_worker_env(
             )
             continue
         env[str(k)] = str(v)
-    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+    # runtime secrets and declared env secrets may never clobber a control-plane-owned key: the
+    # canonical seed, run id, hf repo, and arm are set above, and a runtime seed override would break
+    # the authoritative-seed invariant regardless of how environment.secrets was populated.
+    allowed_runtime_secrets = {
+        k
+        for k in (set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
+        if k.upper() not in RESERVED_WORKER_ENV_KEYS
+    }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)

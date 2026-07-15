@@ -8,7 +8,13 @@ import time
 
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
-from flash.engine.steps import on_policy_steps
+from flash.engine.steps import (
+    configure_trainer_save_schedule,
+    final_save_due,
+    on_policy_steps,
+    resolve_update_horizon,
+    validate_save_steps,
+)
 from flash.engine.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
@@ -32,6 +38,12 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
+
+
+def grpo_under_ran(steps_run: int, steps: int) -> bool:
+    """return true when grpo completes fewer optimizer updates than requested."""
+    return int(steps_run) < int(steps)
 
 
 def run_rl():
@@ -39,6 +51,7 @@ def run_rl():
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
+    seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     t_start = time.time()
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
@@ -301,14 +314,19 @@ def run_rl():
             "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
         )
     epochs = int(_t.epochs) if _t and _t.epochs is not None else RECIPE.rl.num_epochs
-    steps = on_policy_steps(
+    derived_steps = on_policy_steps(
         epochs=epochs,
         prompt_count=len(prompts),
         prompts_per_step=batching["unique_prompts_per_step"],
     )
+    configured_max_steps = getattr(_t, "max_steps", None) if _t else None
+    steps = resolve_update_horizon(derived_steps, configured_max_steps)
+    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
+    validate_save_steps(save_at_steps, steps)
     print(
         f"[rl] epochs={epochs} over {len(prompts)} retained prompt(s) at "
-        f"{batching['unique_prompts_per_step']} unique_prompts/step -> steps={steps}"
+        f"{batching['unique_prompts_per_step']} unique_prompts/step -> "
+        f"derived_steps={derived_steps} update_horizon={steps}"
     )
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
@@ -341,7 +359,7 @@ def run_rl():
         "bf16": True,
         "report_to": _w.wandb_report_to(),
         "run_name": _w.wandb_run_name(),
-        "seed": _w.SEED,
+        "seed": backend_seed(_w.SEED),
         "gradient_checkpointing": grad_checkpointing_on(model_id, vllm_max_len),
         # MoE needs REENTRANT recompute: its router re-dispatches tokens on the backward recompute,
         # so non-reentrant's metadata-equality assert fires on the first backward and kills the run
@@ -361,6 +379,7 @@ def run_rl():
         # 8-bit paged AdamW: colocated GRPO is memory-tight, so int8 state paged to host RAM.
         "optim": fused_optim_name(),
     }
+    configure_trainer_save_schedule(grpo_kwargs, save_at_steps)
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
     # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
@@ -474,6 +493,7 @@ def run_rl():
     # Continue the SFT adapter when train.init_from_adapter is set, else a fresh LoRA on the id.
     # The warm-start path downloads the adapter and loads it as the trainable adapter on the base
     # (VL checkpoints load the full multimodal model, still just an adapter — no on-disk merge copy).
+    seed_training_rngs(_w.SEED)
     with liveness_heartbeat("rl_adapter_loading"):
         init_model, init_peft = _w._init_adapter_model(model_id)
     # _init_adapter_model returns peft_config=None only for a warm-start (the prior adapter is loaded
@@ -621,7 +641,10 @@ def run_rl():
             reward_funcs=reward_fn,
             peft_config=init_peft,
             processing_class=tok,
-            callbacks=[hb_cb, _w.make_checkpoint_upload_callback()],
+            callbacks=[
+                hb_cb,
+                _w.make_checkpoint_upload_callback(save_at_steps),
+            ],
             **extra_trainer_kwargs,
         )
         # Apply chalk's standalone kernels on trainer.model (the authoritative target).
@@ -689,6 +712,10 @@ def run_rl():
             f"[resume] no new reward in this worker but resumed checkpoint already reached "
             f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
+    # only a genuine under-run fails: a resume already at/past target does zero new steps yet holds a
+    # fully-trained policy (_steps_run >= steps, _resumed_complete above), matching opd (opt_steps < steps).
+    if grpo_under_ran(_steps_run, steps):
+        raise RuntimeError(f"grpo completed {_steps_run}/{steps} requested optimizer updates")
     # adapter save + required upload can take minutes on a 35B; keep the heartbeat fresh through the
     # whole finalize. keepalive=True:
     # _steps_run is CONSTANT here (training is done), so without it every finalize ping is a bare
@@ -706,15 +733,8 @@ def run_rl():
         # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs
         # likewise deploy their single adapter directly).
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # Guarantee the FINAL training step is always a deployable checkpoint, not just an unlabeled
-        # `<prefix>/adapter`. The per-save callback only publishes per-step snapshots at save_steps
-        # boundaries (and on_train_end re-flushes the latest such boundary), so a final step that
-        # doesn't land on one would have NO `RUN_ID/step-N` entry even though it IS the served
-        # default adapter. Publish the just-saved final adapter here, keyed by the true final
-        # global_step: same bytes as `<prefix>/adapter`, so `RUN_ID/step-<final>` always resolves to
-        # exactly the deployed default. Idempotent (content-addressed path) when the step already
-        # aligned, and best-effort (never fails a paid run).
-        if _steps_run:
+        # preserve the final checkpoint only when exact save steps are not configured.
+        if final_save_due(_steps_run, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
     _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
 

@@ -320,6 +320,8 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
+            # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
+            "seed": 0,
             "run_id": run_id,
             "train": {"epochs": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,

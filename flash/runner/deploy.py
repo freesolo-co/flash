@@ -567,7 +567,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     import sys
 
     from flash.runner import (
-        FIXED_SEED,
         TERMINAL_STATES,
         _compare_and_clear_remote,
         _gc_run_endpoints,
@@ -609,7 +608,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         worker_spec = effective_spec_from_status(status)
         persisted_remote = dict(status.remote)
         remote = dict(persisted_remote)
-        seed = int(remote.pop("seed", FIXED_SEED))
+        seed = int(remote.pop("seed", worker_spec.seed))
         code_prefix = remote.pop("code_prefix", None)
         provider_name = remote.get("provider")
         if not isinstance(provider_name, str) or not provider_name:

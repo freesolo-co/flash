@@ -95,6 +95,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
+# seed = 42                 # reproducible per-run seed; omitted defaults to 42
 
 [environment]
 id = "your-org/my-env"      # the id printed by `flash env push`
@@ -105,6 +106,8 @@ id = "your-org/my-env"      # the id printed by `flash env push`
 [train]
 epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
+# max_steps = 100           # positive values set the exact optimizer-update horizon
+# save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
@@ -113,7 +116,8 @@ lora_alpha = 64
 GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
 `train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
 and run artifacts are stored in a private environment-scoped repo with content-addressed
-Flash code snapshots. Compose or tweak configs without editing files: `--config
+Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
+`SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
 extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
 
 ### 4. Submit
@@ -376,7 +380,11 @@ init_from_adapter = "<sft-run-id>"
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
-optimizer-step counts are derived from those epochs.
+optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
+derived count with an exact update horizon for every algorithm. `[train] save_at_steps`
+requires a positive `max_steps` so its horizon is authoritative even when SFT packing changes the
+realized batch shape. When non-empty, exact save steps suppress periodic `save_every` checkpoints, and the
+run fails if a requested exact save cannot be saved and published.
 
 ---
 
