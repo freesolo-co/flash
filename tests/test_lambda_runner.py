@@ -220,11 +220,10 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
 
 
 def test_build_worker_env_exports_attempt():
-    # the worker stamps every heartbeat with os.environ["ATTEMPT"], and the control-plane
-    # attempt-mismatch gate (worker_flagged_retriable / heartbeat_is_stale_prior_attempt) dates/rejects
-    # a heartbeat by that attempt. The shared instance bootstrap (Vast + Lambda) must EXPORT ATTEMPT, or
-    # the instance worker's heartbeats carry an empty attempt and a prior attempt's late retriable
-    # heartbeat can't be rejected -> a deterministic current-attempt marker could flip to job_preempted.
+    # the worker stamps every heartbeat with os.environ["ATTEMPT"], and worker_flagged_retriable
+    # accepts only matching attempt and timestamp provenance. the shared instance bootstrap (Vast + Lambda)
+    # must export ATTEMPT, or a worker on a nonzero retry defaults to attempt 0 and its current heartbeat is
+    # rejected as mismatched, potentially losing valid retriable evidence.
     from flash.providers import _instance_bootstrap as lb
 
     payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
