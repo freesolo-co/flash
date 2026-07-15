@@ -1116,6 +1116,9 @@ def test_cancel_checkpoint_restore_survives_owned_run_state_race(
     real_mark_checkpoint_deployed = orch.mark_checkpoint_deployed
 
     def race_run_state(*args, **kwargs):
+        if kwargs.get("retain_only_revision"):
+            assert kwargs["owner_deployment"] == previous
+            return real_mark_checkpoint_deployed(*args, **kwargs)
         assert kwargs["owner_deployment"] == busy
         assert "expect_state" not in kwargs
         raced = orch.get_status(run_id)
@@ -1244,6 +1247,9 @@ def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_
     real_mark_checkpoint_deployed = orch.mark_checkpoint_deployed
 
     def persist_then_raise(*args, **kwargs):
+        if kwargs.get("retain_only_revision"):
+            assert kwargs["owner_deployment"] == previous
+            return real_mark_checkpoint_deployed(*args, **kwargs)
         assert kwargs["owner_deployment"] == busy
         real_mark_checkpoint_deployed(*args, **kwargs)
         raise OSError("checkpoint status write acknowledgement lost")
@@ -1307,9 +1313,7 @@ def test_cancel_unknown_outcome_commits_attempted_live_checkpoint(
         "adapter_revision": live_revision,
         "checkpoint_step": 20,
     }
-    assert orch.read_verified_adapter_revisions(run_id) == frozenset(
-        {stale_previous["adapter_revision"], live_revision}
-    )
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({live_revision})
 
 
 def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path, monkeypatch):
@@ -1613,6 +1617,90 @@ def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
     assert first.deployment == second.deployment == deployment
     assert orch.read_verified_adapter_revisions(run_id) == frozenset(
         {deployment["adapter_revision"]}
+    )
+
+
+def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-prune"
+    preserved = _ready_checkpoint(orch, run_id, 40, remote=None)
+    older_revisions = {
+        _checkpoint_revision(run_id, 20, "b"),
+        f"{run_id}@final." + "c" * 40,
+    }
+    for revision in older_revisions:
+        orch.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=orch.verified_adapter_revision_generation(run_id),
+        )
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("the preserved checkpoint must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment == preserved
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset(
+        {preserved["adapter_revision"]}
+    )
+
+
+def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.runner.verified_revisions as verified_revisions
+    import flash.serve.deploy as deploy
+    from flash.runner.deploy import DeploymentStatePersistenceError
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-prune-retry"
+    preserved = _ready_checkpoint(orch, run_id, 40, remote=None)
+    older_revision = _checkpoint_revision(run_id, 20, "b")
+    orch.add_verified_adapter_revision(
+        run_id,
+        older_revision,
+        expected_generation=orch.verified_adapter_revision_generation(run_id),
+    )
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("ledger persistence failure must not revoke serving"),
+    )
+    real_write = verified_revisions._write_unlocked
+
+    def fail_prune(runs_dir, path, generation, revisions):
+        if revisions == [preserved["adapter_revision"]]:
+            raise OSError("verified revision ledger unavailable")
+        return real_write(runs_dir, path, generation, revisions)
+
+    monkeypatch.setattr(verified_revisions, "_write_unlocked", fail_prune)
+
+    with pytest.raises(DeploymentStatePersistenceError) as excinfo:
+        orch.cancel_run(run_id)
+
+    assert excinfo.value.backend_outcome == "not_required"
+    failed = orch.get_status(run_id)
+    assert failed.state == "running"
+    assert failed.deployment == preserved
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset(
+        {older_revision, preserved["adapter_revision"]}
+    )
+
+    monkeypatch.setattr(verified_revisions, "_write_unlocked", real_write)
+    retried = orch.cancel_run(run_id)
+
+    assert retried.state == "cancelled"
+    assert retried.deployment == preserved
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset(
+        {preserved["adapter_revision"]}
     )
 
 

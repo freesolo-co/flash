@@ -215,6 +215,7 @@ def cancel_run(run_id: str) -> RunStatus:
         mark_checkpoint_deployed,
         mark_deployment_revocation_failed,
         mark_deployment_undeployed,
+        read_verified_adapter_revisions,
         verified_adapter_revision_generation,
     )
     from flash.server._locks import _deploy_lock
@@ -357,6 +358,31 @@ def cancel_run(run_id: str) -> RunStatus:
                     or not _is_preservable_checkpoint_deployment(run_id, status.deployment)
                 ):
                     preserved_checkpoint = None
+            entered_deployed = entered_deployed or status.state == "deployed"
+        if preserved_checkpoint is not None:
+            preserved_revision = preserved_checkpoint.get("adapter_revision")
+            owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
+            try:
+                status = mark_checkpoint_deployed(
+                    run_id,
+                    preserved_checkpoint,
+                    verification_generation=verified_adapter_revision_generation(run_id),
+                    owner_deployment=owner_deployment,
+                    retain_only_revision=True,
+                )
+                if (
+                    status.deployment != preserved_checkpoint
+                    or not isinstance(preserved_revision, str)
+                    or read_verified_adapter_revisions(run_id)
+                    != frozenset({preserved_revision})
+                ):
+                    raise RuntimeError(
+                        "authoritative checkpoint preservation did not prune verified revisions"
+                    )
+            except Exception as exc:
+                raise DeploymentStatePersistenceError(
+                    run_id, str(exc), backend_outcome="not_required"
+                ) from exc
             entered_deployed = entered_deployed or status.state == "deployed"
         preserve_checkpoint = preserved_checkpoint is not None
         backend_error: Exception | None = None
@@ -608,6 +634,7 @@ def _commit_verified_deployment(
     *,
     verification_generation: int | None,
     commit: Callable[[], None],
+    retain_only_revision: bool = False,
 ) -> bool:
     if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES:
         raise ValueError("immutable deployment commit requires ready or deployed state")
@@ -626,6 +653,7 @@ def _commit_verified_deployment(
         revision,
         expected_generation=verification_generation,
         commit=commit,
+        retain_only_revision=retain_only_revision,
     )
 
 
@@ -678,6 +706,7 @@ def mark_checkpoint_deployed(
     *,
     verification_generation: int | None = None,
     owner_deployment: dict | None = None,
+    retain_only_revision: bool = False,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -709,6 +738,7 @@ def mark_checkpoint_deployed(
             deployment,
             verification_generation=verification_generation,
             commit=_commit,
+            retain_only_revision=retain_only_revision,
         ):
             return get_status(run_id)
         return status
