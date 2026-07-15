@@ -82,7 +82,7 @@ def _on_policy_requested_prompts_per_step(spec) -> int:
 
 def _on_policy_prompts_per_step(spec, examples: int) -> int:
     requested = _on_policy_requested_prompts_per_step(spec)
-    return max(1, min(requested, max(1, int(examples))))
+    return min(requested, max(1, int(examples)))
 
 
 def _sft_realized_batch(spec) -> int:
@@ -104,16 +104,6 @@ def _sft_realized_batch(spec) -> int:
     )
 
 
-def _sft_steps_from_examples(spec, examples: int, *, apply_cap: bool) -> int:
-    t = spec.train
-    derived = sft_update_steps(
-        epochs=_sft_epochs(spec),
-        example_count=examples,
-        examples_per_update=_sft_realized_batch(spec),
-    )
-    return resolve_update_horizon(derived, t.max_steps) if apply_cap else derived
-
-
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
@@ -130,7 +120,13 @@ def spec_steps(spec) -> int:
         return resolve_update_horizon(derived, spec.train.max_steps)
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.
-    return _sft_steps_from_examples(spec, _sft_example_count(spec), apply_cap=True)
+    examples = _sft_example_count(spec)
+    derived = sft_update_steps(
+        epochs=_sft_epochs(spec),
+        example_count=examples,
+        examples_per_update=_sft_realized_batch(spec),
+    )
+    return resolve_update_horizon(derived, spec.train.max_steps)
 
 
 def runconfig_from_spec(spec) -> RunConfig:
