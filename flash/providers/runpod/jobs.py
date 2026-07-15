@@ -808,7 +808,7 @@ def submit_run(
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
-        "seed": int(seed),
+        "seed": spec.seed,
         "env": worker_env,
         "extra_pip": extra_pip,
         "code_prefix": code_prefix or flash_code_prefix(),

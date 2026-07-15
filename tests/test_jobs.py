@@ -527,18 +527,20 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         "started_ts": 1.0,
     }
 
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, 0)
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, spec.seed)
     assert captured["queue_grace_s"] == 900.0
     assert captured["throttled_grace_s"] == 900.0
     assert captured["current_attempt"] == 2
 
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec, 0)
+    PROVIDER.poll(
+        JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec, spec.seed
+    )
     assert captured["queue_grace_s"] == 300.0
     assert captured["current_attempt"] == 0
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        PROVIDER.poll(JobHandle.from_dict(base), spec, 0)
+        PROVIDER.poll(JobHandle.from_dict(base), spec, spec.seed)
 
 
 def test_submit_run_payload_carries_code_prefix(monkeypatch):
@@ -568,7 +570,7 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
     pinned_prefix = "code/0123456789abcdef0123456789abcdef/flash"
     assert jobs.submit_run(
         spec,
-        seed=0,
+        seed=spec.seed,
         code_prefix=pinned_prefix,
         deadline_at=10_000_000_000.0,
     ).ok
@@ -610,7 +612,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     with pytest.raises(RuntimeError) as caught:
         jobs.submit_run(
             spec,
-            0,
+            spec.seed,
             attempt=4,
             on_handle=handles.append,
             deadline_at=10_000_000_000.0,
@@ -657,7 +659,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
         jobs.submit_run(
             spec,
-            0,
+            spec.seed,
             attempt=4,
             on_handle=handles.append,
             deadline_at=10_000_000_000.0,
@@ -749,7 +751,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
     monkeypatch.setattr(jobs, "poll_job", fake_poll)
     provider = RunpodProvider()
-    assert provider.submit_run(spec, seed=0, _deadline_at=deadline_at).ok
+    assert provider.submit_run(spec, seed=spec.seed, _deadline_at=deadline_at).ok
     handle = JobHandle.from_dict(
         _runpod_handle_dict(
             jobs,
@@ -758,7 +760,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
             job_id="job-1",
         )
     )
-    assert provider.poll(handle, spec, seed=0, _deadline_at=deadline_at).ok
+    assert provider.poll(handle, spec, seed=spec.seed, _deadline_at=deadline_at).ok
 
     assert captured == [deadline_at, deadline_at]
 
@@ -795,7 +797,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        jobs.submit_run(spec, seed=0, deadline_at=200.0)
+        jobs.submit_run(spec, seed=spec.seed, deadline_at=200.0)
 
     assert submitted == []
     assert deleted == ["ep"]
@@ -982,7 +984,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
     monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
     monkeypatch.setattr(jobs, "make_hf_failure_detail_reader", fake_failure_reader)
     spec = types.SimpleNamespace(
-        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo="org/repo")
+        phase="sft", run_id="r1", seed=0, train=types.SimpleNamespace(hf_repo="org/repo")
     )
 
     handle = base.JobHandle(
@@ -996,7 +998,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
             "started_ts": 12_345.0,
         },
     )
-    RunpodProvider().poll(handle, spec, 0)
+    RunpodProvider().poll(handle, spec, spec.seed)
     assert captured["current_attempt"] == 2
     assert captured["failure_attempt"] == 2
     assert captured["handle"].attempt == 2
@@ -1013,7 +1015,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
         },
     )
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, 0)
+        RunpodProvider().poll(handle, spec, spec.seed)
 
 
 @pytest.mark.parametrize("raw_attempt", ["", "x", None, True, -1, 1.5])
@@ -1029,7 +1031,7 @@ def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not poll")),
     )
     spec = types.SimpleNamespace(
-        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+        phase="sft", run_id="r1", seed=0, train=types.SimpleNamespace(hf_repo=None)
     )
     handle = base.JobHandle(
         provider="runpod",
@@ -1044,7 +1046,7 @@ def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_
     )
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, 0)
+        RunpodProvider().poll(handle, spec, spec.seed)
 
 
 def test_reattach_rejects_endpoint_only_handle(monkeypatch):
@@ -1059,7 +1061,7 @@ def test_reattach_rejects_endpoint_only_handle(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not poll")),
     )
     spec = types.SimpleNamespace(
-        phase="sft", run_id="r1", train=types.SimpleNamespace(hf_repo=None)
+        phase="sft", run_id="r1", seed=0, train=types.SimpleNamespace(hf_repo=None)
     )
     handle = base.JobHandle(
         provider="runpod",
@@ -1073,7 +1075,7 @@ def test_reattach_rejects_endpoint_only_handle(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="endpoint-only"):
-        RunpodProvider().poll(handle, spec, 0)
+        RunpodProvider().poll(handle, spec, spec.seed)
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):

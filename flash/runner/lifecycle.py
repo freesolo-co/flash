@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 
 from flash.providers._deadline import deadline_kwargs
-from flash.spec import JobSpec
+from flash.spec import JobSpec, require_matching_seed
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
@@ -191,6 +191,7 @@ def _submit_seed_supervised(
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
+    seed = require_matching_seed(spec, seed)
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
     from flash.providers.base import PollResult

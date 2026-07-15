@@ -115,7 +115,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
-    assert TRAIN_KEY_MIN_VERSIONS["checkpoint_landmarks"] == "0.2.57"
+    assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -127,7 +127,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "max_completion_tokens",
             "teacher_model",
             "structured_outputs",
-            "checkpoint_landmarks",
+            "save_at_steps",
         }
     } == {"0.2.0"}
 
@@ -174,9 +174,9 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. current adds checkpoint_landmarks and removes the legacy opd eos key.
+    # did. current adds save_at_steps and removes the legacy opd eos key.
     assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
-        "checkpoint_landmarks"
+        "save_at_steps"
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
@@ -590,9 +590,11 @@ def test_sft_caps_parse_from_toml() -> None:
     )
     assert spec.train.max_steps == 50
     assert spec.train.max_examples == 200
-    # explicit 0 means "no cap" (not rejected); negatives are rejected.
-    spec0 = spec_from_dict(_raw(**{"train.max_steps": 0}), run_id="caps-0")
-    assert spec0.train.max_steps == 0
+    # explicit non-positive max_steps (0 or negative) is not rejected: it canonicalizes to none so a
+    # single sentinel means "use the derived horizon" (max_examples still rejects negatives below).
+    for bad in (0, -7):
+        spec_np = spec_from_dict(_raw(**{"train.max_steps": bad}), run_id="caps-np")
+        assert spec_np.train.max_steps is None
     with pytest.raises(ConfigError, match="max_examples must be >= 0"):
         spec_from_dict(_raw(**{"train.max_examples": -5}))
 
