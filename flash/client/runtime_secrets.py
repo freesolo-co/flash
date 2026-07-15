@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# only secrets useful to every algorithm belong here. algorithm-specific secrets must be declared
-# by the job spec; client collection, server validation, and worker injection add those declarations.
+# only user-supplied secrets useful to every algorithm belong here. other user-supplied secrets must
+# be declared by the job spec; platform-managed credentials are injected separately.
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
 

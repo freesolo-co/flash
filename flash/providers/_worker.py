@@ -14,7 +14,7 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec
 
-# Pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
+# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
 # after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
 logger = get_logger("flash.providers.runpod.train")
 

@@ -2225,7 +2225,7 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
-    # Lambda has capacity -> a real launch target exists.
+    # lambda has capacity -> a real launch target exists.
     monkeypatch.setattr(
         lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")]
     )

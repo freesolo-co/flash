@@ -223,7 +223,7 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 
 # unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
 # at 16x-cost defaults. managed fields remain recognized in their canonical sections so a
-# a round trip through public serialization does not fail re-validation on submit.
+# round trip through public serialization does not fail re-validation on submit.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",

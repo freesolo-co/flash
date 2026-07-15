@@ -1,7 +1,7 @@
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is referenced by name in flash/providers/_worker.py:WORKER_IMAGE. It MUST be
+# this image name is defined in flash/providers/_worker.py. it must be
 # published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
@@ -78,7 +78,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds — keep this SHA in lockstep with flash/providers/_worker.py:WORKER_DEPS.
+# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_worker.py.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
