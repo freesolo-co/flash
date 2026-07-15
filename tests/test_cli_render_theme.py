@@ -234,19 +234,21 @@ def test_deploy_dry_run_is_not_a_false_success(monkeypatch) -> None:
     assert "dry_run" not in dry
 
 
-def test_undeploy_confirms_teardown_and_names_endpoints(monkeypatch) -> None:
-    """`flash undeploy` always confirms the teardown: the server clears the deployment record
-    idempotently, so an empty `deleted_endpoints` (the serving adapter was already gone / 404) is
-    still a real teardown, not a no-op the response can prove. A real deregistration names what
-    was removed; the empty case must never claim nothing was torn down."""
+def test_undeploy_confirms_disabled_immutable_records(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
-    # a real teardown confirms and names what was deregistered
-    named = render.undeployed({"run_id": "flash-1", "deleted_endpoints": ["live-x"]})
+    named = render.undeployed(
+        {
+            "run_id": "flash-1",
+            "disabled_aliases": ["flash-1"],
+            "disabled_revisions": ["flash-1@final." + "a" * 40],
+        }
+    )
     assert "torn down flash-1" in named
-    assert "live-x" in named
-    # an idempotent teardown (serving adapter already gone) still confirms — no false no-op
-    idempotent = render.undeployed({"run_id": "flash-1", "deleted_endpoints": []})
+    assert "flash-1@final" in named
+    idempotent = render.undeployed(
+        {"run_id": "flash-1", "disabled_aliases": [], "disabled_revisions": []}
+    )
     assert "torn down flash-1" in idempotent
 
 
@@ -452,9 +454,7 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     assert "worker" not in out.split("details")[0]  # no empty heartbeat rows
 
     # malformed heartbeat fields must render defensively, never raise
-    weird = dict(
-        fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"}
-    )
+    weird = dict(fresh, last_heartbeat={"stage": 123, "step": "seven", "ts": "not-a-number"})
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row

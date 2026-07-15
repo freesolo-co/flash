@@ -29,9 +29,14 @@ import threading
 from flash import __version__
 from flash.runner import get_status, prepare_job, submit_job
 from flash.runner.checkpoints import list_checkpoints
+from flash.serve.deploy import (
+    adapter_alias_target,
+    deploy_adapter,
+    deployment_record,
+    undeploy_adapter,
+)
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
-from flash.serve.deploy import deploy_adapter, deployment_record, undeploy_adapter
 from flash.serve.export import export_adapter
 
 from . import db
@@ -64,6 +69,7 @@ __all__ = [
     "_reconcile_cost_loop",
     "_repo_cleanup_loop",
     "_worker_artifacts",
+    "adapter_alias_target",
     "create_app",
     "deploy_adapter",
     "deployment_record",
