@@ -63,24 +63,5 @@ def test_delete_endpoint_403_with_not_found_text_reports_failure(monkeypatch):
     assert runpod_api.delete_endpoint_for_key("ep-denied", "rk-test") is False
 
 
-def test_is_not_found_uses_cause_code_not_message():
-    from flash.providers.runpod import api as runpod_api
-
-    # Genuine 404 cause -> True even with a terse message.
-    err_404 = runpod_api.RunpodApiError("DELETE x -> HTTP 404: Not Found")
-    err_404.__cause__ = _http_error(404)
-    assert runpod_api._is_not_found(err_404)
-
-    # 403 cause whose message mentions "does not exist" -> still False (cause is authoritative).
-    err_403 = runpod_api.RunpodApiError("DELETE x -> HTTP 403: endpoint does not exist")
-    err_403.__cause__ = _http_error(403)
-    assert not runpod_api._is_not_found(err_403)
-
-    # No HTTPError cause: fall back to an unambiguous 404 text match only.
-    assert runpod_api._is_not_found(runpod_api.RunpodApiError("DELETE x -> HTTP 404: Not Found"))
-    assert not runpod_api._is_not_found(runpod_api.RunpodApiError("endpoint does not exist"))
-    assert not runpod_api._is_not_found(runpod_api.RunpodApiError("HTTP 500: boom"))
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

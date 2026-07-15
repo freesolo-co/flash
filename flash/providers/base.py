@@ -461,7 +461,7 @@ class Provider(Protocol):
     name: str
 
     def is_configured(self) -> bool:
-        """Whether this provider is usable right now (creds present, net reachable)."""
+        """Whether this provider is enabled on this control plane; does not probe network reachability."""
         ...
 
     def preflight(self, require_hf: bool = True) -> list[str]:

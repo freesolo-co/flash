@@ -25,12 +25,6 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
 )
 
 
-def _clean_base_model(base_model: str) -> str:
-    if not isinstance(base_model, str) or not base_model.strip():
-        raise RuntimeError("base_model is required to export adapter metadata")
-    return base_model.strip()
-
-
 def _rewrite_adapter_config_base_model(
     adapter_dir: Path, base_model: str, base_model_revision: str = ""
 ) -> bool:
@@ -112,7 +106,9 @@ def export_adapter(
     private: bool = True,
 ) -> str:
     """Copy adapter ``source_repo:{source_subfolder}`` into ``dest_repo`` and return its URL."""
-    base_model = _clean_base_model(base_model)
+    if not isinstance(base_model, str) or not base_model.strip():
+        raise RuntimeError("base_model is required to export adapter metadata")
+    base_model = base_model.strip()
     HfApi, snapshot_download = _hf_api()
     read_token = source_token or os.environ.get("HF_TOKEN")
     if not read_token:

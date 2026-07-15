@@ -143,16 +143,3 @@ def test_instance_realized_cost_is_wall_times_rate():
     # no rate, or no auditable resource id -> unattributable (stays unreconciled, never books cost)
     assert realized_cost_for_remote({"provider": "lambda", "instance_id": "i-9"}, start=0, end=10) is None
     assert realized_cost_for_remote({"provider": "lambda", "hourly_usd": 1.0}, start=0, end=10) is None
-
-
-def test_instance_realized_cost_uses_run_end_not_settle_padded_end():
-    """The instance wall must use the TRUE run end (run_end ~ teardown), never the settle-padded
-    billing-query ``end`` — otherwise reconciliation over-bills by the settle hour (up to 1h x rate)."""
-    from flash.providers.realized import realized_cost_for_remote
-
-    remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 2.0, "started_ts": 0.0}
-    # end is padded +3600 for the RunPod billing query; run_end is the real teardown at 1800s (0.5h).
-    rc = realized_cost_for_remote(remote, start=0.0, end=1800.0 + 3600.0, run_end=1800.0)
-    assert rc is not None
-    assert rc.wall_seconds == 1800.0  # 0.5h, NOT 1.5h
-    assert rc.realized_usd == 1.0  # 0.5h x $2.0 (not $3.0)

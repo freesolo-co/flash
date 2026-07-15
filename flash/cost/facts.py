@@ -1,9 +1,8 @@
-"""Static lookup facts for the cost model: GPU price/VRAM/compute + cheapest-fit
-selection, model size/quant, and reward-grader latency. Pure tables + accessors."""
+"""Catalog facts and provider-aware pricing accessors for the cost model."""
 
 from __future__ import annotations
 
-from flash.catalog import MODELS
+from flash.catalog import MODELS, ModelInfo
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -126,25 +125,24 @@ def pick_gpu(
     return best.name
 
 
-def total_params_b(model_id: str) -> float:
-    """Total parameter count (billions) for a catalog model."""
+def _catalog_model_info(model_id: str) -> ModelInfo:
     info = MODELS.get(model_id)
     if info is None:
         raise ValueError(
             f"unknown model {model_id!r}; cost estimation supports catalog models only "
             f"({', '.join(MODELS)})"
         )
-    return info.params_b
+    return info
+
+
+def total_params_b(model_id: str) -> float:
+    """Total parameter count (billions) for a catalog model."""
+    return _catalog_model_info(model_id).params_b
 
 
 def active_params_b(model_id: str) -> float:
     """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM."""
-    info = MODELS.get(model_id)
-    if info is None:
-        raise ValueError(
-            f"unknown model {model_id!r}; cost estimation supports catalog models only "
-            f"({', '.join(MODELS)})"
-        )
+    info = _catalog_model_info(model_id)
     return info.active_params_b or info.params_b
 
 
@@ -177,11 +175,11 @@ AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
     """(input, output) $/1M tokens for a teacher model.
 
-    Routes through resolve_teacher — the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
+    Routes through resolve_teacher, the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
     the one source of teacher prices. ``teacher_model`` is the Fireworks model id chosen via ``[train]
-    teacher_model``, or "" for the default GLM 5.2 teacher. Static/offline like gpu_hourly_usd (needs
-    NO FIREWORKS_API_KEY): opd echo-scores completions (max_tokens=0) so only the INPUT column is
-    billed, but both are returned. An unsupported value falls back defensively to the default rate."""
+    teacher_model``, or "" for the default GLM 5.2 teacher. Teacher pricing is static, offline, and
+    credential-free. OPD echo-scores completions (max_tokens=0), so only the input column is billed,
+    but both are returned. An unsupported value falls back defensively to the default rate."""
     from flash.engine.recipe import resolve_teacher
 
     try:

@@ -154,9 +154,9 @@ class CostEstimate:
     """A pre-flight estimate.
 
     ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
-    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) is
-    itemized as a diagnostic but NOT part of ``total_usd``: the teacher runs on the user's own
-    Fireworks key, so Fireworks bills them directly.
+    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) uses
+    the platform-managed teacher key and remains itemized separately from the customer GPU charge,
+    so it is not included in ``total_usd``.
     """
 
     model_id: str
@@ -167,15 +167,15 @@ class CostEstimate:
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
-    setup_seconds: float  # cold start: boot + deps + model load (+ vLLM init for GRPO)
+    setup_seconds: float  # cold start: boot + deps + model load (+ vllm init for grpo/opd)
     seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
-    # opd only: external Fireworks teacher token spend (0.0 for sft/grpo). Billed by Fireworks
+    # opd only: external fireworks teacher token spend (0.0 for sft/grpo). billed by fireworks
     # to the platform-managed teacher key (users don't supply one), tracked separately from the
-    # platform-billed GPU charge — so it is NOT part of total_usd; shown as its own itemized
+    # platform-billed gpu charge, so it is not part of total_usd and is shown as its own itemized
     # diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()

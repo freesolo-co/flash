@@ -1,9 +1,9 @@
-from flash.providers.base import get_gpu_info
-from flash.providers.runpod.train.deps import (
+from flash.providers._worker import (
     BAKED_PER_SM_ARCHES,
     WORKER_IMAGE,
     worker_image_for_gpu,
 )
+from flash.providers.base import get_gpu_info
 
 
 def _clear_image_env(monkeypatch):
@@ -55,25 +55,24 @@ def test_worker_image_falls_back_to_base_for_unbaked_arch(monkeypatch):
     assert worker_image_for_gpu("RTX 5090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm120"
 
 
-def test_worker_image_template_can_define_arch_tags(monkeypatch):
+def test_worker_image_ignores_unsupported_template_values(monkeypatch):
     _clear_image_env(monkeypatch)
+
     monkeypatch.setenv(
         "FLASH_WORKER_IMAGE_TEMPLATE",
-        "ghcr.io/freesolo-co/flash-worker:cu128-{sm}-{gpu_short}",
+        "ghcr.io/freesolo-co/flash-worker:stale-{sm}",
     )
+    assert worker_image_for_gpu("H100") == "ghcr.io/freesolo-co/flash-worker:cu128-sm90"
 
-    assert worker_image_for_gpu("H100") == "ghcr.io/freesolo-co/flash-worker:cu128-sm90-h100"
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_TEMPLATE", "{malformed")
+    assert worker_image_for_gpu("H100") == "ghcr.io/freesolo-co/flash-worker:cu128-sm90"
 
 
-def test_per_sm_and_template_never_leak_into_live_endpoints(monkeypatch):
-    # per-sm and template images are durable runpod queue-worker images (cmd runs rp_handler.py); they
-    # must not route into the live-endpoint path (allow_default=False), which expects none unless the
-    # absolute flash_worker_image override names a live-compatible image.
+def test_per_sm_never_leaks_into_live_endpoints(monkeypatch):
+    # per-sm images are durable runpod queue-worker images (cmd runs rp_handler.py); they must not
+    # route into the live-endpoint path (allow_default=False), which expects none unless the absolute
+    # image override names a live-compatible image.
     _clear_image_env(monkeypatch)
-    monkeypatch.setenv(
-        "FLASH_WORKER_IMAGE_TEMPLATE",
-        "ghcr.io/freesolo-co/flash-worker:cu128-{sm}",
-    )
 
     assert worker_image_for_gpu("RTX 4090", allow_default=False) is None
     # the absolute override is still honored on the live path

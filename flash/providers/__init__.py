@@ -8,10 +8,11 @@ owns pricing, provisioning, polling, cancellation, and teardown.
   lambda      Lambda Cloud GPU instances (instance-based complement; iff LAMBDA_API_KEY set)
   vast        Vast.ai verified-datacenter containers (live-market complement; iff VAST_API_KEY set)
 
-This module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
-``allocator.allocate`` iterates the active provider list below; ``available_providers`` narrows
-it to the ones configured on THIS control plane (Lambda/Vast are opt-in via their operator
-keys, so a box without them silently behaves exactly as the RunPod-only setup).
+this module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
+``allocator.allocate`` iterates providers enabled by ``available_providers()`` in registered
+``PROVIDER_NAMES`` order. ``Provider.is_configured()`` controls control-plane enablement; preflight
+separately checks required credentials and configuration. neither check implies network reachability
+or live capacity. Lambda/Vast opt in with operator keys; RunPod reports missing credentials at preflight.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from functools import cache
 
 from flash.providers.base import Provider
 
-# Registry / iteration order only — NOT a selection preference. Allocation ranks candidates purely
-# by price (see allocator.allocate), so runpod/lambda/vast get no tie-break edge from this order.
+# registry order is not a primary selection preference. it affects only exact full-key allocation
+# ties through Python's stable sort.
 PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
 # Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the
@@ -54,10 +55,10 @@ def _get_provider(key: str) -> Provider:
 
 
 def available_providers() -> tuple[str, ...]:
-    """Provider names whose credentials are present on this control plane."""
+    """provider names enabled by Provider.is_configured(); network and capacity are not checked."""
     return tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
 
 
 def configured_providers() -> list[Provider]:
-    """The ``Provider`` objects available right now (see ``available_providers``)."""
+    """enabled Provider objects in registered order (see available_providers)."""
     return [get_provider(n) for n in available_providers()]
