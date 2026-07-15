@@ -300,28 +300,108 @@ def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) 
     process.join(min(max_wait_s, remaining))
 
 
-def _reap_upload_process(process, reaping_deadline_at: float, warning: str) -> None:
-    if process.is_alive():
-        process.terminate()
-        _join_upload_process_before(
+def _defer_upload_cleanup_error(deferred_error, operation, *args, **kwargs):
+    try:
+        return deferred_error, operation(*args, **kwargs), True
+    except BaseException as exc:
+        return exc if deferred_error is None else deferred_error, None, False
+
+
+def _cleanup_upload_process(
+    process,
+    initial_deadline_at: float,
+    initial_wait_s: float,
+    reaping_deadline_at: float,
+    warning: str,
+    stop_upload=None,
+) -> bool:
+    """reap an uploader before propagating the first cleanup interruption."""
+    deferred_error = None
+    if stop_upload is not None:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            stop_upload.set,
+        )
+    deferred_error, _, _ = _defer_upload_cleanup_error(
+        deferred_error,
+        _join_upload_process_before,
+        process,
+        initial_deadline_at,
+        initial_wait_s,
+    )
+    deferred_error, alive, checked = _defer_upload_cleanup_error(
+        deferred_error,
+        process.is_alive,
+    )
+    clean = checked and alive is False
+    dead = clean
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.terminate,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
             process,
             reaping_deadline_at,
             _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
         )
-    if process.is_alive():
-        process.kill()
-        _join_upload_process_before(
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.kill,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
             process,
             reaping_deadline_at,
             _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
         )
-    if process.is_alive():
-        print(warning, flush=True)
-        with contextlib.suppress(Exception):
-            process.kill()
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.kill,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
+            process,
+            reaping_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        _defer_upload_cleanup_error(deferred_error, print, warning, flush=True)
         os._exit(124)
         raise AssertionError("unreachable")
-    process.close()
+
+    deferred_error, _, _ = _defer_upload_cleanup_error(
+        deferred_error,
+        process.close,
+    )
+    if deferred_error is not None:
+        raise deferred_error
+    return clean
 
 
 def _stop_upload_process(
@@ -331,19 +411,14 @@ def _stop_upload_process(
     reaping_deadline_at: float,
 ) -> bool:
     """stop and reap an uploader before terminal-marker bookkeeping."""
-    stop_upload.set()
-    _join_upload_process_before(
+    return _cleanup_upload_process(
         process,
         upload_deadline_at,
         _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
-    )
-    clean = not process.is_alive()
-    _reap_upload_process(
-        process,
         reaping_deadline_at,
         "console uploader remained alive after kill; exiting before terminal bookkeeping",
+        stop_upload,
     )
-    return clean
 
 
 def _start_console_uploader(payload: dict, console: str, mode: str):
@@ -376,18 +451,13 @@ def _upload_console_tail_bounded(
         daemon=True,
     )
     process.start()
-    _join_upload_process_before(
+    return _cleanup_upload_process(
         process,
         upload_deadline_at,
         _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
-    )
-    clean = not process.is_alive()
-    _reap_upload_process(
-        process,
         reaping_deadline_at,
         "final console uploader remained alive after kill; exiting before terminal bookkeeping",
     )
-    return clean
 
 
 def hf_file_exists(payload: dict, repo_subpath: str) -> bool:

@@ -570,6 +570,51 @@ class _ReapTrackedUploader:
         self.close_called = True
 
 
+class _InterruptingCleanupUploader:
+    def __init__(self, operation, error, events, clock):
+        self.operation = operation
+        self.error = error
+        self.events = events
+        self.clock = clock
+        self.alive = True
+        self.calls = {"join": 0, "terminate": 0, "kill": 0, "close": 0}
+
+    def start(self):
+        self.events.append(("start", self.clock["now"]))
+
+    def join(self, timeout=None):
+        self.calls["join"] += 1
+        self.events.append(("join", timeout))
+        if self.operation == "join" and self.calls["join"] == 1:
+            raise self.error
+        self.clock["now"] += timeout or 0.0
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls["terminate"] += 1
+        self.events.append(("terminate", self.clock["now"]))
+        if self.operation == "terminate" and self.calls["terminate"] == 1:
+            raise self.error
+        if self.operation != "kill":
+            self.alive = False
+
+    def kill(self):
+        self.calls["kill"] += 1
+        self.events.append(("kill", self.clock["now"]))
+        if self.operation == "kill" and self.calls["kill"] == 1:
+            raise self.error
+        self.alive = False
+
+    def close(self):
+        self.calls["close"] += 1
+        self.events.append(("close", self.clock["now"]))
+        assert self.alive is False
+        if self.operation == "close" and self.calls["close"] == 1:
+            raise self.error
+
+
 def _disable_periodic_console_upload(monkeypatch):
     monkeypatch.setattr(
         b,
@@ -714,6 +759,130 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(
     assert retriable is False
     assert uploader_alive is False
     assert uploader_closed is True
+
+
+@pytest.mark.parametrize("cleanup_path", ["periodic", "final"])
+@pytest.mark.parametrize("operation", ["join", "terminate", "kill", "close"])
+@pytest.mark.parametrize(
+    ("error_type", "error_value"),
+    [(KeyboardInterrupt, "interrupted"), (SystemExit, 17)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_uploader_cleanup_defers_base_exception_until_dead_before_marker(
+    monkeypatch,
+    cleanup_path,
+    operation,
+    error_type,
+    error_value,
+):
+    clock = {"now": 100.0}
+    events = []
+    error = error_type(error_value)
+    uploader = _InterruptingCleanupUploader(operation, error, events, clock)
+    stop_upload = threading.Event()
+    initial_timeout = (
+        b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        if cleanup_path == "periodic"
+        else b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+    )
+    upload_deadline = clock["now"] + initial_timeout
+    reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+
+    if cleanup_path == "final":
+
+        class _Context:
+            def Process(self, **kwargs):
+                assert kwargs["target"] is b._upload_console_snapshot
+                return uploader
+
+        monkeypatch.setattr(b.multiprocessing, "get_context", lambda _method: _Context())
+
+    def cleanup_then_publish_marker():
+        try:
+            if cleanup_path == "periodic":
+                b._stop_upload_process(
+                    uploader,
+                    stop_upload,
+                    upload_deadline,
+                    reaping_deadline,
+                )
+            else:
+                b._upload_console_tail_bounded(
+                    {},
+                    "/tmp/unused-console.txt",
+                    "sft",
+                    "",
+                    upload_deadline,
+                    reaping_deadline,
+                )
+        finally:
+            events.append(("marker", clock["now"], uploader.is_alive()))
+
+    with pytest.raises(error_type) as raised:
+        cleanup_then_publish_marker()
+
+    assert raised.value is error
+    if cleanup_path == "periodic":
+        assert stop_upload.is_set()
+    assert uploader.is_alive() is False
+    assert uploader.calls["close"] == 1
+    event_names = [event[0] for event in events]
+    assert event_names.index("close") < event_names.index("marker")
+    assert events[-1] == ("marker", clock["now"], False)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_value"),
+    [(KeyboardInterrupt, "interrupted"), (SystemExit, 17)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_uploader_cleanup_preserves_first_base_exception_over_cleanup_noise(
+    monkeypatch,
+    error_type,
+    error_value,
+):
+    clock = {"now": 100.0}
+    original_error = error_type(error_value)
+
+    class _NoisyCleanupUploader:
+        def __init__(self):
+            self.alive = True
+            self.join_calls = 0
+
+        def join(self, timeout=None):
+            self.join_calls += 1
+            if self.join_calls == 1:
+                raise original_error
+            clock["now"] += timeout or 0.0
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            raise RuntimeError("terminate cleanup noise")
+
+        def kill(self):
+            self.alive = False
+
+        def close(self):
+            raise RuntimeError("close cleanup noise")
+
+    uploader = _NoisyCleanupUploader()
+    upload_deadline = clock["now"] + b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+    reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+
+    with pytest.raises(error_type) as raised:
+        b._stop_upload_process(
+            uploader,
+            threading.Event(),
+            upload_deadline,
+            reaping_deadline,
+        )
+
+    assert raised.value is original_error
+    assert uploader.is_alive() is False
 
 
 def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatch):
@@ -1185,6 +1354,75 @@ def test_unreaped_uploader_exits_before_terminal_bookkeeping(monkeypatch):
     assert clock["now"] == pytest.approx(reaping_deadline)
     assert events[-1] == ("exit", 124, reaping_deadline)
     assert [event[0] for event in events].count("kill") == 2
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_value"),
+    [(KeyboardInterrupt, "interrupted"), (SystemExit, 17)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_unreapable_uploader_with_interrupt_exits_before_marker(
+    monkeypatch,
+    error_type,
+    error_value,
+):
+    clock = {"now": 100.0}
+    events = []
+    error = error_type(error_value)
+
+    class _HardExit(BaseException):
+        pass
+
+    class _InterruptedNeverDeadUploader:
+        def __init__(self):
+            self.join_calls = 0
+
+        def join(self, timeout=None):
+            self.join_calls += 1
+            events.append(("join", timeout))
+            if self.join_calls == 1:
+                events.append(("interrupt", error))
+                raise error
+            clock["now"] += timeout or 0.0
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            events.append(("terminate", clock["now"]))
+
+        def kill(self):
+            events.append(("kill", clock["now"]))
+
+        def close(self):
+            pytest.fail("a live uploader must not be closed")
+
+    def hard_exit(code):
+        events.append(("exit", code, clock["now"]))
+        raise _HardExit
+
+    def cleanup_then_publish_marker():
+        b._stop_upload_process(
+            _InterruptedNeverDeadUploader(),
+            threading.Event(),
+            upload_deadline,
+            reaping_deadline,
+        )
+        events.append(("marker", clock["now"]))
+
+    upload_deadline = clock["now"] + 0.5
+    reaping_deadline = upload_deadline + b._CONSOLE_UPLOAD_REAP_RESERVE_S
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(b.os, "_exit", hard_exit)
+
+    with pytest.raises(_HardExit):
+        cleanup_then_publish_marker()
+
+    assert ("interrupt", error) in events
+    assert clock["now"] == pytest.approx(reaping_deadline)
+    assert events[-1] == ("exit", 124, reaping_deadline)
+    assert [event[0] for event in events].count("kill") == 2
+    assert all(event[0] != "marker" for event in events)
 
 
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
