@@ -409,8 +409,8 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
 
     assert caught.value.attempts == 1
     assert caught.value.latency_seconds == pytest.approx(0.25)
-    assert caught.value.ambiguous_paid_requests == 0
     valid_usage = match != "arithmetic"
+    assert caught.value.ambiguous_paid_requests == int(not valid_usage)
     assert caught.value.provider_generations == int(valid_usage)
     assert caught.value.prompt_tokens == (7 if valid_usage else 0)
     assert caught.value.completion_tokens == (6 if valid_usage else 0)
@@ -424,6 +424,28 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
     }
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {"prompt_tokens": 7, "completion_tokens": "6", "total_tokens": 13},
+    ],
+)
+def test_forward_teacher_counts_usage_unavailable_http_200_as_ambiguous(usage):
+    with pytest.raises(ForwardTeacherError, match="usage") as caught:
+        ForwardTeacherClient(
+            "key",
+            seed=123,
+            opener=lambda *_args, **_kwargs: _Response(_payload(usage=usage)),
+        ).generate([{"role": "user", "content": "x"}])
+
+    assert caught.value.attempts == 1
+    assert caught.value.ambiguous_paid_requests == 1
+    assert caught.value.provider_generations == 0
+    assert caught.value.prompt_tokens == 0
+    assert caught.value.completion_tokens == 0
 
 
 def test_forward_teacher_retries_insufficient_system_resources_once():

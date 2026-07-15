@@ -564,6 +564,7 @@ class ForwardTeacherClient:
                         usage = self._validated_usage(payload)
                     except ForwardTeacherError:
                         usage = None
+                        ambiguous_paid_requests += 1
                     if usage is not None:
                         provider_generations += 1
                         prompt_tokens += usage[0]
