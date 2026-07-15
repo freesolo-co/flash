@@ -323,3 +323,30 @@ def test_worker_error_heartbeat_forwards_sanitized_exception_telemetry(monkeypat
         assert payload["forward_teacher_prompt_tokens"] == 12
         assert payload["forward_teacher_latency_seconds"] == 0.25
         assert "private_target" not in payload
+
+
+def test_forward_teacher_telemetry_keeps_paid_retry_and_local_failure_accounting():
+    from flash.engine.worker.heartbeat import sanitize_forward_teacher_runtime_telemetry
+    from flash.engine.worker.opd import _ForwardTeacherBatchStats
+
+    stats = _ForwardTeacherBatchStats(
+        provider_requests=1,
+        provider_generations=2,
+        provider_failures=1,
+        prompt_tokens=14,
+        completion_tokens=12,
+        attempts=2,
+        latency_seconds=3.5,
+    )
+    telemetry = stats.runtime_telemetry()
+
+    assert sanitize_forward_teacher_runtime_telemetry(telemetry) == telemetry
+    assert (
+        sanitize_forward_teacher_runtime_telemetry(
+            {
+                **telemetry,
+                "forward_teacher_provider_generations": 3,
+            }
+        )
+        == {}
+    )

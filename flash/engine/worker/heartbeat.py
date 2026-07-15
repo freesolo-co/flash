@@ -168,9 +168,13 @@ def sanitize_forward_teacher_runtime_telemetry(values: object) -> dict[str, int 
             clean["forward_teacher_retries"] = expected_retries
         elif retries != expected_retries:
             return {}
+    if isinstance(requests, int) and isinstance(failures, int) and failures > requests:
+        return {}
+    if isinstance(attempts, int) and isinstance(generations, int) and generations > attempts:
+        return {}
     if (
         all(isinstance(value, int) for value in (requests, generations, failures))
-        and generations + failures != requests
+        and generations + failures < requests
     ):
         return {}
 
