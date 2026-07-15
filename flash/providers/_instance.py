@@ -232,12 +232,14 @@ def build_payload(
         strip_runpod_volume_env,
     )
     from flash.runner import flash_code_prefix
+    from flash.spec import require_matching_seed
 
-    # Strip the RunPod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
+    canonical_seed = require_matching_seed(spec, seed)
+    # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
     env = strip_runpod_volume_env(
         build_worker_env(
             spec,
-            seed,
+            canonical_seed,
             runtime_secrets=runtime_secrets,
         )
     )
@@ -253,7 +255,7 @@ def build_payload(
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "run_id": spec.run_id,
-        "seed": int(seed),
+        "seed": spec.seed,
         "flash_arm": arm,
         "env": env,
         # per-run env wheel + opt-in chalk spec; the bootstrap pip-installs extra_pip for every job.

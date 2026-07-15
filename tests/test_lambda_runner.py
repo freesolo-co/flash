@@ -28,6 +28,7 @@ def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
+            "seed": 0,
             "train": {"epochs": 1, "hf_repo": "org/repo"},
             "gpu": gpu,
         }
