@@ -584,8 +584,17 @@ def fetch_hf_model_geometry(
 
 def _validated_revision_geometry(model_id: str, revision: str, info):
     params_b, vocab, hidden, layers = fetch_hf_model_geometry(model_id, revision, strict=True)
+    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
+    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
+    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
+    # the precise mis-provisioning this pin exists to prevent.
+    if params_b is None:
+        raise ValueError(
+            f"model_revision for {model_id!r} exposes no parameter-count metadata "
+            f"(no safetensors.total); cannot size the pinned revision"
+        )
     mismatches: list[str] = []
-    if params_b is not None and info.params_b > 0:
+    if info.params_b > 0:
         delta = abs(params_b - info.params_b) / info.params_b
         if delta > 0.05:
             mismatches.append("parameter count")
@@ -600,7 +609,7 @@ def _validated_revision_geometry(model_id: str, revision: str, info):
             f"model_revision for {model_id!r} has geometry incompatible with the catalog: "
             f"{', '.join(mismatches)}"
         )
-    return params_b or info.params_b, vocab or info.vocab_size
+    return params_b, vocab or info.vocab_size
 
 
 def model_required_vram_gb(

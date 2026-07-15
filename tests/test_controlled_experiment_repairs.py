@@ -209,6 +209,34 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
         )
 
 
+def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
+    monkeypatch, tmp_path
+):
+    # A pinned revision whose Hub metadata exposes no safetensors.total cannot be sized. Revision-aware
+    # sizing is authoritative and must fail closed rather than silently reuse the catalog default-revision
+    # param count (which would size the exact-GPU preflight on weights the worker never loads).
+    import flash.engine.vram as vram
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"vocab_size": 248320, "hidden_size": 1024, "num_hidden_layers": 28})
+    )
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
+
+    class NoParamApi:
+        def __init__(self, *, token):
+            pass
+
+        def model_info(self, model, **kwargs):
+            return SimpleNamespace(safetensors=SimpleNamespace(total=None))
+
+    monkeypatch.setattr("huggingface_hub.HfApi", NoParamApi)
+    with pytest.raises(ValueError, match="no parameter-count metadata"):
+        vram.model_required_vram_gb(
+            "Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40
+        )
+
+
 def test_check_fit_pinned_metadata_failure_is_unknown_but_sizing_stays_strict(monkeypatch):
     import flash.engine.vram as vram
 
