@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
+from .opd_retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
@@ -106,7 +107,9 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
-RESERVED_WORKER_ENV_KEYS = frozenset({"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED"})
+RESERVED_WORKER_ENV_KEYS = frozenset(
+    {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED", OPD_RESUME_REVISION_ENV}
+)
 
 
 def validate_worker_env_reserved(worker_env: Any) -> None:

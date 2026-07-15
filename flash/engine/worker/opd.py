@@ -22,6 +22,9 @@ module is CPU/offline-safe.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
+import math
 import os
 import random
 import time
@@ -46,6 +49,7 @@ from flash.engine.structured_outputs import (
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import RequiredSaveError, _deployable_adapter_on_hf
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
     _rollout_terminated,
@@ -74,14 +78,92 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
-from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rng import (
+    backend_seed,
+    capture_training_rng_state,
+    restore_training_rng_state,
+    rollout_request_seed,
+    seed_training_rngs,
+)
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
+from flash.opd_retry_contract import (
+    OPD_RESUME_STATE_VERSION,
+    opd_resume_checkpoint_complete,
+    validate_opd_resume_state_metadata,
+)
 
 OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
+
+
+def _cumulative_train_wall_seconds(baseline: float, started_at: float, now: float) -> float:
+    """return cumulative training-loop wall time across replacement attempts."""
+    elapsed = max(0.0, float(now) - float(started_at))
+    total = float(baseline) + elapsed
+    if not math.isfinite(total) or total < 0:
+        raise RuntimeError("opd cumulative training wall time is invalid")
+    return total
+
+
+def _require_restored_opd_state(state: dict | None) -> dict:
+    """fail terminally when a downloaded checkpoint cannot be restored."""
+    if state is None:
+        raise RuntimeError(
+            "opd resume checkpoint is present but could not be restored; "
+            "refusing to train fresh after possible prior optimizer mutation"
+        )
+    return state
+
+
+def _reconcile_required_opd_deployable(
+    checkpoint_dir: str, opt_steps: int, save_at_steps: tuple[int, ...]
+) -> None:
+    """Publish a missed required companion directly from the restored checkpoint."""
+    if opt_steps not in save_at_steps or _deployable_adapter_on_hf(opt_steps):
+        return
+    _publish_opd_deployable(
+        checkpoint_dir,
+        opt_steps,
+        as_default=False,
+        save_required=True,
+    )
+
+
+def _opd_prompt_pool_fingerprint(examples: list[tuple[object, object, list[int]]]) -> str:
+    """hash the exact ordered filtered prompt pool without exposing prompt content."""
+    digest = hashlib.sha256()
+    for example, messages, prompt_ids in examples:
+        encoded = json.dumps(
+            [example, messages, [int(token) for token in prompt_ids]],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _apply_opd_optimizer_update(
+    *, model, optimizer, torch, opt_steps: int, nseq: int, accum_target: int
+) -> int:
+    """Apply one OPD update with the mutation marker immediately before optimizer mutation."""
+    if nseq <= 0 or accum_target <= 0:
+        raise ValueError("opd optimizer update requires positive sequence counts")
+    if nseq != accum_target:
+        scale = accum_target / nseq
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+    if opt_steps == 0:
+        _w.publish_opd_optimizer_start_marker()
+    optimizer.step()
+    return opt_steps + 1
 
 
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
@@ -481,6 +563,7 @@ def run_opd():
             "prompts — failing before the training loop instead of dropping every prompt for "
             "every step and burning the GPU allocation."
         )
+    prompt_pool_fingerprint = _opd_prompt_pool_fingerprint(examples)
     if n_over_budget:
         print(
             f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
@@ -589,7 +672,6 @@ def run_opd():
             seed=backend_seed(_w.SEED),
             **vllm_kwargs,
         )
-        vllm_rollout.sync_from_model(model)
     vllm_init_seconds = time.time() - t_vllm_init
     print(f"[opd] vLLM rollout initialized in {vllm_init_seconds:.1f}s")
 
@@ -604,25 +686,62 @@ def run_opd():
     # loss/coverage per optimizer step; the worker exit path (__init__.py) calls wandb_finish.
     _wandb_on = bool(_w.wandb_report_to())
 
-    resume_ckpt = _w.hf_resume_checkpoint()
+    # full-state resume matches sft/rl, which resume through trainer.train(resume_from_checkpoint).
+    # download errors fail closed to a retry so a replacement never trains fresh after possible mutation;
+    # confirmed checkpoint absence still means this is a legitimate fresh start.
+    resume_revision = _w.OPD_RESUME_REVISION or None
+    resume_ckpt = _w.hf_resume_checkpoint(
+        fail_closed=bool(resume_revision), revision=resume_revision
+    )
+    resume_state = None
     if resume_ckpt:
-        print("[opd] resume-from-checkpoint is not yet supported for opd; starting fresh")
+        resume_state = _require_restored_opd_state(
+            _restore_opd_full_state(
+                resume_ckpt,
+                model=model,
+                optimizer=optimizer,
+                torch=torch,
+                max_opt_steps=steps,
+                prompt_pool_fingerprint=prompt_pool_fingerprint,
+            )
+        )
+        _reconcile_required_opd_deployable(
+            resume_ckpt,
+            int(resume_state["opt_steps"]),
+            knobs.save_at_steps,
+        )
+        print(
+            f"[opd] resumed from {resume_ckpt}: opt_steps={resume_state['opt_steps']} "
+            f"step={resume_state['step']}"
+        )
+
+    # synchronize exactly once before the first rollout. resumed runs reconcile the restored required
+    # checkpoint companion first, so an initial sync failure cannot strand a missing deployable.
+    with liveness_heartbeat("opd_vllm_initializing"):
+        vllm_rollout.sync_from_model(model)
+
+    def _resumed(key, default):
+        """Restored accumulator value, or the fresh-start default when not resuming."""
+        if resume_state is not None and key in resume_state:
+            return resume_state[key]
+        return default
 
     out_dir = f"/tmp/opd_seed{_w.SEED}"
     adapter_dir = f"{out_dir}/adapter"
     os.makedirs(out_dir, exist_ok=True)
 
-    loss_curve: list[float] = []
-    coverage_curve: list[float] = []
-    generated_tokens = 0
-    teacher_input_tokens = 0
+    loss_curve: list[float] = list(_resumed("loss_curve", []))
+    coverage_curve: list[float] = list(_resumed("coverage_curve", []))
+    generated_tokens = int(_resumed("generated_tokens", 0))
+    teacher_input_tokens = int(_resumed("teacher_input_tokens", 0))
     # length-capped rollouts and alignment granularity are surfaced in train_meta for diagnosis.
-    truncated_rollouts = 0
-    granularity_sum = 0.0
-    granularity_n = 0
-    opt_steps = (
-        0  # optimizer steps actually applied (< steps if any iteration had no teacher signal)
-    )
+    truncated_rollouts = int(_resumed("truncated_rollouts", 0))
+    granularity_sum = float(_resumed("granularity_sum", 0.0))
+    granularity_n = int(_resumed("granularity_n", 0))
+    # optimizer steps actually applied (< steps if any iteration had no teacher signal). on resume this
+    # is the restored count and loss_curve/coverage_curve above carry the matching per-step history, so
+    # the honest-metrics invariant (loss_curve length == opt_steps) holds across the restart.
+    opt_steps = int(_resumed("opt_steps", 0))
     _reset_peak = getattr(_w, "_reset_peak_gpu", None)
     if _reset_peak:
         _reset_peak()
@@ -632,15 +751,41 @@ def run_opd():
     # opd_step heartbeat whenever a sample advances — parity with sft/rl. Without a progress callback
     # opd's liveness thread emitted only liveness=True pings that share the opd_step upload-throttle
     # slot and could suppress the main thread's per-sample progress uploads (codex[bot]).
-    samples_seen = 0
+    samples_seen = int(_resumed("samples_seen", 0))
+    rollout_seed_ordinal = int(_resumed("rollout_seed_ordinal", 0))
     # No-signal accounting: distinguish a run that trained nothing because the TEACHER was down
     # (transient) from one where scoring succeeded but never aligned — the former is retriable infra.
-    teacher_ok = 0
-    teacher_transient = 0
-    teacher_error = 0
-    skip_counts: Counter[str] = Counter()
-    no_signal_resamples = 0
-    no_signal_skipped_steps = 0
+    teacher_ok = int(_resumed("teacher_ok", 0))
+    teacher_transient = int(_resumed("teacher_transient", 0))
+    # restored failures remain cumulative; only new failures make this attempt's shortfall retriable.
+    teacher_transient_baseline = teacher_transient
+    teacher_error = int(_resumed("teacher_error", 0))
+    skip_counts: Counter[str] = Counter(_resumed("skip_counts", {}))
+    no_signal_resamples = int(_resumed("no_signal_resamples", 0))
+    no_signal_skipped_steps = int(_resumed("no_signal_skipped_steps", 0))
+
+    def _generate_with_rollout_seeds(prompt_ids_batch, *, max_tokens):
+        nonlocal rollout_seed_ordinal
+        request_seeds = [
+            rollout_request_seed(_w.SEED, rollout_seed_ordinal + offset)
+            for offset in range(len(prompt_ids_batch))
+        ]
+        generations = _generate_many_vllm(
+            vllm_rollout,
+            tok,
+            prompt_ids_batch,
+            knobs,
+            generation_eos_ids,
+            max_tokens=max_tokens,
+            request_seeds=request_seeds,
+        )
+        if len(generations) != len(prompt_ids_batch):
+            raise RuntimeError(
+                f"opd vLLM returned {len(generations)} generations for "
+                f"{len(prompt_ids_batch)} requests"
+            )
+        rollout_seed_ordinal += len(generations)
+        return generations
 
     # OPD rollouts always use the colocated vLLM engine. The HF model remains the authoritative
     # training target for the GKD loss forward/backward; vLLM only samples the current LoRA.
@@ -654,8 +799,10 @@ def run_opd():
     mt_max_turns = 0
     mt_engine_max_len = 0
     generate_fn = env_glue_fn = render_fn = None
-    episodes_seen = 0
-    mt_turn_records = 0  # total per-turn records produced across all episodes (multi-turn only)
+    episodes_seen = int(_resumed("episodes_seen", 0))
+    mt_turn_records = int(
+        _resumed("mt_turn_records", 0)
+    )  # total per-turn records produced across all episodes (multi-turn only)
     if multi_turn:
         from flash.engine.multiturn_rollout import (
             make_env_glue,
@@ -672,14 +819,7 @@ def run_opd():
 
         def generate_fn(prefix_ids, max_new):
             """One turn's generation through the colocated vLLM engine."""
-            return _generate_many_vllm(
-                vllm_rollout,
-                tok,
-                [prefix_ids],
-                knobs,
-                generation_eos_ids,
-                max_tokens=max(1, int(max_new)),
-            )[0]
+            return _generate_with_rollout_seeds([prefix_ids], max_tokens=max(1, int(max_new)))[0]
 
     def _account(r):
         """Consume one sample's SampleResult: tally teacher health / truncations, advance the step
@@ -721,8 +861,9 @@ def run_opd():
         _opd_progress(opt_steps, nseq)
 
     t_train = time.time()
-    opd_phase_seconds: Counter[str] = Counter()
-    opd_phase_counts: Counter[str] = Counter()
+    train_wall_baseline = float(_resumed("train_wall_seconds", 0.0))
+    opd_phase_seconds: Counter[str] = Counter(_resumed("opd_phase_seconds", {}))
+    opd_phase_counts: Counter[str] = Counter(_resumed("opd_phase_counts", {}))
     # Drive the loop by optimizer UPDATES, not raw iterations. A no-signal iteration (empty
     # completions / a flaky teacher) skips optimizer.step() below, so `for step in range(steps)` could
     # exit with opt_steps < steps -- shipping an under-trained adapter as the served DEFAULT while the
@@ -732,7 +873,11 @@ def run_opd():
     # waste a requested optimizer update. Bound total attempts so a persistently degraded teacher cannot
     # spin unboundedly -- the post-loop guard then turns a shortfall into a RETRY, not a silent
     # under-trained publish.
-    step = 0
+    # data cursor: the batch at each iteration is a pure function of `step` (examples is a seeded
+    # deterministic shuffle rebuilt identically every worker start), so restoring this int restores the
+    # exact data position -- the dataset itself is never persisted. max_iters stays absolute.
+    step = int(_resumed("step", 0))
+    final_adapter_staged = False
     max_iters = 3 * steps + 10
     max_no_signal_attempts = 3
     teacher_batch_size = _opd_teacher_batch_size(knobs.prompts_per_step * knobs.group_size)
@@ -906,13 +1051,8 @@ def run_opd():
                             keepalive=True,
                         ):
                             rollout_started = time.perf_counter()
-                            gens = _generate_many_vllm(
-                                vllm_rollout,
-                                tok,
-                                chunk_prompts,
-                                knobs,
-                                generation_eos_ids,
-                                max_tokens=knobs.max_completion,
+                            gens = _generate_with_rollout_seeds(
+                                chunk_prompts, max_tokens=knobs.max_completion
                             )
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
@@ -958,31 +1098,19 @@ def run_opd():
                 break
             if nseq == 0:
                 continue
-            # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
-            # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
-            # silently smaller update.
-            if nseq != accum_target:
-                scale = accum_target / nseq
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+            # each seq's grad was scaled by 1/accum_target; the mutation boundary rescales a partial
+            # step, clips, publishes the first-update marker, mutates the optimizer, then increments.
             optimizer_started = time.perf_counter()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            optimizer.step()
+            opt_steps = _apply_opd_optimizer_update(
+                model=model,
+                optimizer=optimizer,
+                torch=torch,
+                opt_steps=opt_steps,
+                nseq=nseq,
+                accum_target=accum_target,
+            )
             opd_phase_seconds["optimizer_step"] += time.perf_counter() - optimizer_started
             opd_phase_counts["optimizer_steps"] += 1
-            opt_steps += 1
-            # On-policy means the next rollout must sample from the just-updated student LoRA.
-            # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
-            # post-final vLLM sync that can fail after all optimizer updates have already landed.
-            if opt_steps < steps:
-                with liveness_heartbeat(
-                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
-                ):
-                    sync_started = time.perf_counter()
-                    vllm_rollout.sync_from_model(model)
-                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
-                    opd_phase_counts["vllm_syncs"] += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
@@ -1012,23 +1140,119 @@ def run_opd():
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
                 )
-            # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
-            # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
-            # warm-start/deploy from step-N would use fewer updates than its name implies.
-            if save_step_due(opt_steps, knobs.save_at_steps, knobs.save_every):
-                _save_adapter(model, tok, adapter_dir)
+            # checkpoint on optimizer-step count, not the loop index: a `step-n` artifact must
+            # contain n real updates. the final optimizer state is always a required recovery boundary,
+            # even when the configured deployable schedule does not select that step.
+            checkpoint_due = save_step_due(
+                opt_steps, knobs.save_at_steps, knobs.save_every
+            )
+            is_final_step = opt_steps == steps
+            if checkpoint_due or is_final_step:
                 is_required_save = opt_steps in knobs.save_at_steps
-                _publish_opd_deployable(
-                    adapter_dir,
-                    opt_steps,
-                    as_default=False,
-                    best_effort=not is_required_save,
-                    save_required=is_required_save,
-                )
+                publish_periodic = checkpoint_due and not is_required_save and not is_final_step
+                if is_required_save or publish_periodic:
+                    _save_adapter(model, tok, adapter_dir)
+                    if is_final_step:
+                        final_adapter_staged = True
+                checkpoint_accounting = {
+                    "loss_curve": list(loss_curve),
+                    "coverage_curve": list(coverage_curve),
+                    "generated_tokens": int(generated_tokens),
+                    "teacher_input_tokens": int(teacher_input_tokens),
+                    "truncated_rollouts": int(truncated_rollouts),
+                    "granularity_sum": float(granularity_sum),
+                    "granularity_n": int(granularity_n),
+                    "samples_seen": int(samples_seen),
+                    "teacher_ok": int(teacher_ok),
+                    "teacher_transient": int(teacher_transient),
+                    "teacher_error": int(teacher_error),
+                    "skip_counts": dict(skip_counts),
+                    "no_signal_resamples": int(no_signal_resamples),
+                    "no_signal_skipped_steps": int(no_signal_skipped_steps),
+                    "episodes_seen": int(episodes_seen),
+                    "mt_turn_records": int(mt_turn_records),
+                    "opd_phase_seconds": dict(opd_phase_seconds),
+                    "opd_phase_counts": dict(opd_phase_counts),
+                    "train_wall_seconds": _cumulative_train_wall_seconds(
+                        train_wall_baseline, t_train, time.time()
+                    ),
+                }
 
-    train_wall = time.time() - t_train
+                def _publish_step_deployable(
+                    _opt_steps=opt_steps, _required=is_required_save
+                ) -> None:
+                    _publish_opd_deployable(
+                        adapter_dir,
+                        _opt_steps,
+                        as_default=False,
+                        best_effort=not _required,
+                        save_required=_required,
+                    )
+
+                # exact boundaries keep full state and their required companion in one transaction.
+                # nonfinal periodic publications stay ordered before sync but are fully best-effort.
+                # final periodic or otherwise unscheduled steps publish only full state here; finalization
+                # stages and publishes the deployable once after recovery state is known durable.
+                if is_required_save:
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=True,
+                        after_upload=_publish_step_deployable,
+                    )
+                elif is_final_step:
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=True,
+                    )
+                else:
+                    _publish_step_deployable()
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=False,
+                    )
+            # on-policy means the next rollout must sample from the just-updated student lora. a due
+            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip the
+            # final sync because no rollout remains and the final adapter is saved from the hf model.
+            if opt_steps < steps:
+                with liveness_heartbeat(
+                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
+                ):
+                    sync_started = time.perf_counter()
+                    vllm_rollout.sync_from_model(model)
+                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
+                    opd_phase_counts["vllm_syncs"] += 1
+
+    train_wall = _cumulative_train_wall_seconds(train_wall_baseline, t_train, time.time())
     if not loss_curve:
-        if teacher_ok == 0 and teacher_transient > 0:
+        # use attempt-local failures for retry classification, not the cumulative reporting counter.
+        if teacher_ok == 0 and (teacher_transient - teacher_transient_baseline) > 0:
             # No sample ever got a teacher score and every failure was a RETRYABLE outage (5xx /
             # timeout / rate-limit): a Fireworks outage that happened to span the whole run. Raise a
             # retriable infra error so the supervisor RETRIES (the run isn't broken), instead of the
@@ -1056,24 +1280,26 @@ def run_opd():
             f"{no_signal_resamples} no-signal resamples, {no_signal_skipped_steps} no-signal skipped "
             f"steps, skip reasons: {_format_skip_counts(skip_counts)})"
         )
-        if teacher_transient > 0:
+        # use attempt-local failures for retry classification, not the cumulative reporting counter.
+        if (teacher_transient - teacher_transient_baseline) > 0:
             # SOME scoring calls hit a RETRYABLE teacher outage: a healthier teacher next attempt may
             # complete the remaining updates, so RETRY rather than ship short (codex[bot]).
             raise RetriableInfraError(
                 f"{diag} — retrying rather than publishing an under-trained adapter billed as full steps."
             )
-        # No transient teacher failures: the shortfall is DETERMINISTIC (over-budget prompts /
-        # non-terminated or empty rollouts / zero teacher↔student alignment). OPD has no resume, so a
-        # retry restarts from step 0 with the same seed/model/data and reproduces the identical skips —
-        # burning GPU on an unfixable run and masking the real config/model problem. Fail PERMANENTLY
-        # with the skip diagnostics so the user fixes the env/model instead (codex[bot]).
+        # no transient teacher failures: the shortfall is deterministic (over-budget prompts,
+        # non-terminated or empty rollouts, or zero teacher-to-student alignment). some updates may have
+        # landed, but retrying the same seed, model, data, and restored cursor reproduces the insufficient
+        # successful-update rate. fail permanently with the skip diagnostics so the user fixes the setup.
         raise RuntimeError(
-            f"{diag} — the shortfall is deterministic (no transient teacher failures), so a retry would "
-            "repeat it (opd has no resume). Fix the setup: shorten prompts, enable stop_sequences or a "
-            "warm-start so rollouts terminate, or verify the teacher tokenizer aligns to the student."
+            f"{diag}; the shortfall is deterministic (no transient teacher failures), so resuming the "
+            "same seed, model, data, and rollout position would repeat the insufficient successful-update "
+            "rate. Fix the setup: shorten prompts, enable stop_sequences or a warm-start so rollouts "
+            "terminate, or verify the teacher tokenizer aligns to the student."
         )
 
-    _save_adapter(model, tok, adapter_dir)
+    if not final_adapter_staged:
+        _save_adapter(model, tok, adapter_dir)
     # keep the served default while suppressing unrequested final checkpoints.
     _publish_opd_deployable(
         adapter_dir,
@@ -1364,10 +1590,13 @@ def _generate_many_vllm(
     eos_ids,
     *,
     max_tokens: int,
+    request_seeds: list[int] | None = None,
 ) -> list[_GenResult]:
     return [
         _gen_from_vllm_output(out, tok, knobs, eos_ids)
-        for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
+        for out in rollout.generate(
+            prompt_ids_batch, max_tokens=max_tokens, request_seeds=request_seeds
+        )
     ]
 
 
@@ -1742,6 +1971,198 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
     raise RuntimeError("opd scored samples must be resolved through _resolve_samples_batched")
 
 
+def _is_lora_adapter_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    adapter_parts = {
+        "lora_A",
+        "lora_B",
+        "lora_embedding_A",
+        "lora_embedding_B",
+        "lora_magnitude_vector",
+    }
+    return any(part in adapter_parts for part in key.split("."))
+
+
+def _save_opd_resume_checkpoint(
+    *,
+    model,
+    tok,
+    optimizer,
+    torch,
+    out_dir: str,
+    opt_steps: int,
+    step: int,
+    accounting: dict,
+    rollout_seed_ordinal: int,
+    prompt_pool_fingerprint: str,
+    required: bool = False,
+    after_upload=None,
+) -> None:
+    """Persist and upload one latest-only OPD full-state resume checkpoint."""
+    import shutil
+
+    local_dir = os.path.join(out_dir, "resume_ckpt")
+    try:
+        shutil.rmtree(local_dir, ignore_errors=True)
+        os.makedirs(local_dir, exist_ok=True)
+        model.save_pretrained(local_dir)
+        tok.save_pretrained(local_dir)
+        torch.save(optimizer.state_dict(), os.path.join(local_dir, "optimizer.pt"))
+        torch.save(capture_training_rng_state(torch), os.path.join(local_dir, "rng_state.pth"))
+        payload = dict(accounting)
+        payload.update(
+            {
+                "contract_version": OPD_RESUME_STATE_VERSION,
+                "seed": int(_w.SEED),
+                "opt_steps": int(opt_steps),
+                "step": int(step),
+                "rollout_seed_ordinal": int(rollout_seed_ordinal),
+                "prompt_pool_fingerprint": str(prompt_pool_fingerprint),
+            }
+        )
+        state_path = os.path.join(local_dir, "opd_state.json")
+        with open(state_path, "w") as f:
+            json.dump(payload, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        if required:
+            raise RetriableInfraError(
+                f"required opd full-state checkpoint construction failed at step {opt_steps}"
+            ) from e
+        print(f"[opd] resume checkpoint save failed at opt_steps={opt_steps}; training continues: {e}")
+        return
+
+    try:
+        if after_upload is None:
+            uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir)
+        else:
+            uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir, after_upload=after_upload)
+    except (RequiredSaveError, RetriableInfraError) as e:
+        if required:
+            raise
+        print(
+            f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues: {e}"
+        )
+        return
+    except Exception as e:
+        if required:
+            raise RetriableInfraError(
+                f"required opd full-state checkpoint upload failed at step {opt_steps}"
+            ) from e
+        print(
+            f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues: {e}"
+        )
+        return
+    if uploaded:
+        return
+    if required:
+        raise RetriableInfraError(
+            f"required opd full-state checkpoint upload failed at step {opt_steps}"
+        )
+    print(
+        f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues"
+    )
+
+
+def _restore_opd_full_state(
+    ckpt_dir: str,
+    *,
+    model,
+    optimizer,
+    torch,
+    prompt_pool_fingerprint: str,
+    max_opt_steps: int | None = None,
+) -> dict | None:
+    """Restore adapter + adam moments + rng + accounting from a resume checkpoint dir, in place.
+
+    Returns the parsed accounting state (including ``opt_steps`` and ``step``) on success, or None when
+    the dir is not a usable resume checkpoint for THIS run: incomplete files, wrong schema version, a
+    different seed, or a byte-level load failure. The caller treats None-on-a-downloaded-checkpoint as
+    fail-closed (it refuses to train fresh after a possible prior optimizer mutation). LoRA weights are
+    copied IN PLACE into the already-constructed peft model so the optimizer's parameter references
+    (created over ``model.parameters()``) stay valid and the loaded adam moments keep applying to them.
+    """
+    try:
+        basenames = os.listdir(ckpt_dir)
+    except OSError:
+        return None
+    if not opd_resume_checkpoint_complete(basenames):
+        return None
+    try:
+        with open(os.path.join(ckpt_dir, "opd_state.json")) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    _base = os.path.basename(ckpt_dir.rstrip("/"))
+    if not _base.startswith("checkpoint-"):
+        return None
+    _suffix = _base[len("checkpoint-") :]
+    if not _suffix.isdigit():
+        return None
+    _dir_step = int(_suffix)
+    if _dir_step <= 0 or _suffix != str(_dir_step):
+        return None
+    # validate every dependency-free json invariant before touching adapter or optimizer state.
+    try:
+        state = validate_opd_resume_state_metadata(
+            state,
+            expected_seed=int(_w.SEED),
+            checkpoint_step=_dir_step,
+        )
+    except ValueError:
+        return None
+    if state["prompt_pool_fingerprint"] != prompt_pool_fingerprint:
+        return None
+    opt_steps = state["opt_steps"]
+    if max_opt_steps is not None and opt_steps > max_opt_steps:
+        return None
+    try:
+        from peft import load_peft_weights, set_peft_model_state_dict
+
+        param_device = next(p for p in model.parameters() if p.requires_grad).device
+        _peft_load = set_peft_model_state_dict(
+            model, load_peft_weights(ckpt_dir, device=str(param_device))
+        )
+        _missing = getattr(_peft_load, "missing_keys", None) or []
+        _unexpected = getattr(_peft_load, "unexpected_keys", None) or []
+        _missing_adapter = [key for key in _missing if _is_lora_adapter_key(key)]
+        if _missing_adapter or _unexpected:
+            print(
+                "[opd] resume adapter incompatible: "
+                f"missing={_missing_adapter} unexpected={_unexpected}"
+            )
+            return None
+        # weights_only=false: these are this run's own trusted artifacts (adam moments, and an rng blob
+        # carrying python/numpy state), not plain tensor files, so torch 2.6+'s weights_only default
+        # would reject them.
+        optimizer.load_state_dict(
+            torch.load(
+                os.path.join(ckpt_dir, "optimizer.pt"),
+                map_location=param_device,
+                weights_only=False,
+            )
+        )
+        rng = torch.load(
+            os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu", weights_only=False
+        )
+    except MemoryError:
+        raise
+    except Exception as e:
+        cuda_oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if isinstance(cuda_oom_type, type) and isinstance(e, cuda_oom_type):
+            raise
+        print(f"[opd] resume checkpoint at {ckpt_dir} failed to load: {e}")
+        return None
+    # rng is part of the semantic continuation contract. a downloaded replacement checkpoint whose
+    # generator state cannot be restored is unusable and must never degrade to fresh training.
+    if not restore_training_rng_state(torch, rng):
+        print(f"[opd] resume checkpoint at {ckpt_dir} has incompatible rng state")
+        return None
+    return state
+
+
 def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
     model.save_pretrained(adapter_dir)
@@ -1763,13 +2184,7 @@ def _publish_opd_deployable(
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         if publish_checkpoint:
             if save_required:
-                _w.publish_deployable_checkpoint(
-                    adapter_dir,
-                    step,
-                    retries=3,
-                    backoff_s=5.0,
-                    required=True,
-                )
+                _w.publish_deployable_checkpoint(adapter_dir, step, required=True)
             else:
                 _w.publish_deployable_checkpoint(adapter_dir, step)
     except Exception as e:
