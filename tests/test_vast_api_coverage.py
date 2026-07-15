@@ -107,7 +107,7 @@ def test_create_instance_success_body_without_contract_is_ambiguous(monkeypatch)
         {"success": True, "new_contract": None},
     ):
         _capture_urlopen(monkeypatch, [body])
-        with pytest.raises(vast_api.VastApiError, match="returned no instance id") as ei:
+        with pytest.raises(vast_api.VastApiError, match="returned no usable instance id") as ei:
             vast_api.create_instance(123, **kwargs)
         assert isinstance(ei.value, vast_api.VastAmbiguousCreate)
         assert vast_api.create_error_is_ambiguous(ei.value) is True

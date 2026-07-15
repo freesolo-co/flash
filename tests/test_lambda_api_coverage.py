@@ -221,7 +221,7 @@ def test_launch_instance_builds_body_and_returns_first_id(monkeypatch):
 
     def fake(path, method="GET", body=None, retries=4, base_delay=2.0):
         seen.update(path=path, method=method, body=body, retries=retries)
-        return {"data": {"instance_ids": ["i-abc", "i-def"]}}
+        return {"data": {"instance_ids": ["i-abc"]}}
 
     monkeypatch.setattr(lambda_api, "request_with_retries", fake)
     iid = lambda_api.launch_instance(
@@ -270,11 +270,11 @@ def test_launch_instance_raises_when_no_instance_id(monkeypatch):
     }
     # success-shaped dict but no instance_ids -> LambdaApiError
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
-    with pytest.raises(lambda_api.LambdaApiError, match="returned no instance id"):
+    with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
         lambda_api.launch_instance(**kwargs)
     # a non-dict payload (ids can't be read) -> same guard
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": []})
-    with pytest.raises(lambda_api.LambdaApiError, match="returned no instance id"):
+    with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
         lambda_api.launch_instance(**kwargs)
 
 
@@ -440,6 +440,39 @@ def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
     assert deleted == ["good1", "42"]
     # each surviving id was terminated ONE AT A TIME (batch endpoint 400s the whole set on one bad id)
     assert [b["instance_ids"] for b in bodies] == [["good1"], ["bad"], ["42"]]
+
+
+def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
+    lambda_api.terminate_instance_confirmed("i-1")
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: [])
+    with pytest.raises(lambda_api.LambdaApiError, match="was not confirmed"):
+        lambda_api.terminate_instance_confirmed("i-1")
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(
+        lambda_api,
+        "get_instance",
+        lambda iid, *, strict: {"id": iid, "status": "terminating"},
+    )
+    with pytest.raises(lambda_api.LambdaApiError, match="remains"):
+        lambda_api.terminate_instance_confirmed("i-1")
+
+
+def test_strict_instance_reads_reject_malformed_success_payloads(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
+    with pytest.raises(lambda_api.LambdaApiError, match=r"listing.*malformed"):
+        lambda_api.list_instances(strict=True)
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": []})
+    with pytest.raises(lambda_api.LambdaApiError, match=r"lookup.*malformed"):
+        lambda_api.get_instance("i-1", strict=True)
 
 
 # ---------------------------------------------------------------------------

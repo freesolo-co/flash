@@ -11,15 +11,8 @@ RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
 class RetriableInfraError(RuntimeError):
     """Infrastructure failure the control plane should retry on a fresh worker."""
 
-    def __init__(
-        self,
-        reason: str,
-        *,
-        runtime_telemetry: dict[str, int | float | bool] | None = None,
-    ) -> None:
+    def __init__(self, reason: str):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
-        if runtime_telemetry is not None:
-            self.runtime_telemetry = dict(runtime_telemetry)
 
 
 def cuda_oom_count() -> int:
@@ -55,9 +48,7 @@ def is_cuda_oom(exc: BaseException | None) -> bool:
         pass
     msg = str(exc).lower()
     if (
-        re.search(
-            r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization", msg
-        )
+        re.search(r"free memory on device\s+cuda:\d+.*less than desired gpu memory utilization", msg)
         or "no available memory for the cache blocks" in msg
     ):
         return True
@@ -125,7 +116,9 @@ def _gpu_mismatch_reason(
             f"host driver CUDA {driver_cuda:g} < {floor:g} required for {info.name} ({info.sm})"
         )
     if live_vram_gb is not None and live_vram_gb < info.vram_gb * 0.9:
-        reasons.append(f"only {live_vram_gb:.1f} GB VRAM but {info.name} needs ~{info.vram_gb} GB")
+        reasons.append(
+            f"only {live_vram_gb:.1f} GB VRAM but {info.name} needs ~{info.vram_gb} GB"
+        )
     exp_major = _sm_major(info.sm)
     if live_cap is not None and exp_major is not None and live_cap[0] < exp_major:
         reasons.append(

@@ -6,11 +6,13 @@ import base64
 import hashlib
 import io
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from flash.providers._deadline import remaining_seconds
+from flash.providers._deadline import remaining_seconds, require_deadline_at
+from flash.providers._poll import _attempt_int
 
 # Bounded so the name is never truncated at launch — truncation desyncs the sweep-matched prefix.
 _MAX_NAME = 60
@@ -45,10 +47,9 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
         seed_i = int(seed)
     except (TypeError, ValueError):
         seed_i = 0
-    try:
-        attempt_i = int(attempt)
-    except (TypeError, ValueError):
-        attempt_i = 0
+    attempt_i = _attempt_int(attempt)
+    if attempt_i is None:
+        raise ValueError("instance attempt identity is invalid")
     seed_s, attempt_s = str(seed_i), str(attempt_i)
     # Bound the whole suffix to _SUFFIX_BUDGET: split the digit budget between attempt and seed.
     digit_budget = _SUFFIX_BUDGET - len("-s-a")
@@ -104,19 +105,36 @@ class InstanceJobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> InstanceJobHandle:
+        if d.get("provider") != cls.provider:
+            raise ValueError(f"persisted {cls.provider} provider identity is invalid")
         try:
             instance_id = cls._coerce_instance_id(d["instance_id"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"corrupt {cls.provider} handle: missing/non-numeric instance_id "
-                f"({d.get('instance_id')!r}) in persisted handle {d!r}"
-            ) from exc
+            raise ValueError(f"persisted {cls.provider} instance identity is invalid") from exc
+        attempt = _attempt_int(d.get("attempt"))
+        if attempt is None:
+            raise ValueError(f"persisted {cls.provider} attempt identity is invalid")
+        started_raw = d.get("started_ts")
+        if isinstance(started_raw, bool) or not isinstance(started_raw, (int, float)):
+            raise ValueError(f"persisted {cls.provider} launch timestamp is invalid")
+        started_ts = float(started_raw)
+        if not math.isfinite(started_ts) or started_ts <= 0:
+            raise ValueError(f"persisted {cls.provider} launch timestamp is invalid")
+        gpu = d.get("gpu")
+        if not isinstance(gpu, str) or not gpu:
+            raise ValueError(f"persisted {cls.provider} gpu identity is invalid")
+        hourly_raw = d.get("hourly_usd")
+        if isinstance(hourly_raw, bool) or not isinstance(hourly_raw, (int, float)):
+            raise ValueError(f"persisted {cls.provider} hourly rate is invalid")
+        hourly_usd = float(hourly_raw)
+        if not math.isfinite(hourly_usd) or hourly_usd < 0:
+            raise ValueError(f"persisted {cls.provider} hourly rate is invalid")
         return cls(
             instance_id=instance_id,
-            gpu=str(d.get("gpu") or ""),
-            hourly_usd=float(d.get("hourly_usd") or 0),
-            attempt=int(d.get("attempt") or 0),
-            started_ts=float(d.get("started_ts") or 0),
+            gpu=gpu,
+            hourly_usd=hourly_usd,
+            attempt=attempt,
+            started_ts=started_ts,
             **cls._extra_from_dict(d),
         )
 
@@ -225,6 +243,10 @@ def build_payload(
     )
     if cache_host_mount and not env.get("FLASH_WEIGHT_CACHE_DIR") and not env.get("HF_HOME"):
         env["FLASH_WEIGHT_CACHE_DIR"] = f"{CACHE_HF_HOME}/hub"
+    absolute_deadline = require_deadline_at(deadline_at)
+    attempt_id = _attempt_int(attempt)
+    if attempt_id is None:
+        raise ValueError("instance attempt identity is invalid")
     max_wall_seconds = float(spec.gpu.max_wall_seconds)
     payload = {
         "hf_repo": spec.train.hf_repo,
@@ -239,10 +261,10 @@ def build_payload(
         + chalk_extra_pip(spec),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "code_prefix": code_prefix or flash_code_prefix(),
-        "deadline_at": deadline_at,
-        "run_created_at": deadline_at - max_wall_seconds if deadline_at is not None else None,
+        "deadline_at": absolute_deadline,
+        "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
-        "attempt": int(attempt),
+        "attempt": attempt_id,
     }
     if cache_host_mount:
         payload["cache_host_mount"] = cache_host_mount

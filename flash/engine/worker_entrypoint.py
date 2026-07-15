@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-WORKER_FAILURE_LINE = "worker failure; detail suppressed"
+WORKER_FAILURE_LINE = "managed worker failed; inspect worker artifacts"
 
 
 def main() -> int:
@@ -16,9 +16,8 @@ def main() -> int:
 
     try:
         worker.main()
-    except BaseException as exc:
-        if not isinstance(exc, Exception):
-            print(WORKER_FAILURE_LINE, file=sys.stderr, flush=True)
+    except BaseException:
+        print(WORKER_FAILURE_LINE, file=sys.stderr, flush=True)
         return 1
     return 0
 

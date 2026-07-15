@@ -400,7 +400,9 @@ class JobHandle:
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
         d = dict(d)
-        provider = d.pop("provider", "runpod")
+        provider = d.pop("provider", None)
+        if not isinstance(provider, str) or not provider:
+            raise ValueError("persisted provider identity is missing or invalid")
         return cls(provider=provider, data=d)
 
 

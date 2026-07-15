@@ -22,6 +22,7 @@ import huggingface_hub
 import pytest
 
 import flash.engine.worker as worker
+from flash.engine.worker_entrypoint import WORKER_FAILURE_LINE
 
 
 class _HardExit(BaseException):
@@ -36,7 +37,6 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
     monkeypatch.setattr(worker, "HF_REPO", "")  # skip the idempotency DONE check
     monkeypatch.setattr(worker, "RUN_MODE", "sft")
-    monkeypatch.setattr(worker, "OPD_OPTIMIZER_STEPS", 0)
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
@@ -63,9 +63,48 @@ def _run_safe_entrypoint(tmp_path, sitecustomize):
 def _assert_safe_entrypoint_failure(result, secret):
     combined = result.stdout + result.stderr
     assert result.returncode != 0
-    assert combined.strip() == worker.WORKER_FAILURE_LINE
+    assert combined.strip() == WORKER_FAILURE_LINE
     assert secret not in combined
     assert "Traceback" not in combined
+
+
+def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
+    secret = "managed-private-provider-response"
+    result = _run_safe_entrypoint(
+        tmp_path,
+        "import flash.engine.worker as worker\n"
+        "def fail():\n"
+        f"    raise RuntimeError({secret!r})\n"
+        "worker.main = fail\n",
+    )
+    _assert_safe_entrypoint_failure(result, secret)
+
+
+def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
+    secret = "direct-worker-diagnostic"
+    (tmp_path / "sitecustomize.py").write_text(
+        "import flash.engine.worker as worker\n"
+        "def fail():\n"
+        f"    raise RuntimeError({secret!r})\n"
+        "worker.main = fail\n"
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "flash.engine.worker"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert combined.count("Traceback") == 1
+    assert secret in combined
 
 
 def test_worker_hard_exits_zero_on_success(monkeypatch):

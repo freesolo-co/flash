@@ -74,7 +74,7 @@ def list_instance_types(
         return _types_cache["data"]
     out = _data(request_with_retries("/instance-types", deadline_at=deadline_at))
     if not isinstance(out, dict):
-        raise LambdaApiError("unexpected /instance-types response; provider detail suppressed")
+        raise LambdaApiError(f"unexpected /instance-types response: {repr(out)[:1000]}")
     _types_cache.update(ts=now, data=out)
     return out
 
@@ -156,12 +156,12 @@ def launch_instance(
         )
     )
     ids = out.get("instance_ids") if isinstance(out, dict) else None
-    if not ids:
+    instance_id = ids[0] if isinstance(ids, list) and len(ids) == 1 else None
+    if not isinstance(instance_id, str) or not instance_id:
         raise LambdaApiError(
-            f"launch({instance_type_name}@{region_name}) returned no instance id; "
-            "provider detail suppressed"
+            f"launch({instance_type_name}@{region_name}) returned an invalid instance identity"
         )
-    return str(ids[0])
+    return instance_id
 
 
 # IMPORTANT: Lambda filesystem paths are ASYMMETRIC by design — LIST uses /file-systems (hyphenated),
@@ -204,10 +204,11 @@ def delete_filesystem(
             **({} if deadline_at is None else {"deadline_at": deadline_at}),
         )
         return True
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "lambda delete_filesystem(%s) failed; provider detail suppressed",
+            "lambda delete_filesystem(%s) failed (%s)",
             filesystem_id,
+            type(exc).__name__,
         )
         return False
 
@@ -250,6 +251,7 @@ def get_instance(
     instance_id: str,
     *,
     deadline_at: float | None = None,
+    strict: bool = False,
 ) -> dict | None:
     """Instance detail dict, or None once it no longer exists (terminated)."""
     try:
@@ -262,12 +264,24 @@ def get_instance(
             return None
         raise
     data = _data(out)
-    return data if isinstance(data, dict) else None
+    if isinstance(data, dict):
+        return data
+    if strict:
+        raise LambdaApiError("lambda instance lookup returned a malformed response")
+    return None
 
 
-def list_instances(*, deadline_at: float | None = None) -> list[dict]:
+def list_instances(
+    *,
+    deadline_at: float | None = None,
+    strict: bool = False,
+) -> list[dict]:
     out = _data(request_with_retries("/instances", deadline_at=deadline_at))
-    return out if isinstance(out, list) else []
+    if isinstance(out, list):
+        return out
+    if strict:
+        raise LambdaApiError("lambda instance listing returned a malformed response")
+    return []
 
 
 def terminate_instances(
@@ -288,6 +302,22 @@ def terminate_instances(
                 **({} if deadline_at is None else {"deadline_at": deadline_at}),
             )
             deleted.append(iid)
-        except Exception:
-            logger.warning("lambda terminate(%s) failed; provider detail suppressed", iid)
+        except Exception as exc:
+            logger.warning("lambda terminate(%s) failed (%s)", iid, type(exc).__name__)
     return deleted
+
+
+def terminate_instance_confirmed(instance_id: str) -> None:
+    """Terminate one exact instance and prove both acceptance and disappearance.
+
+    This cleanup intentionally has no run-deadline dependency: a box that outlived its run must still
+    be removable. Any unconfirmed step raises so replacement provisioning keeps the persisted handle.
+    """
+    iid = str(instance_id).strip()
+    if not iid:
+        raise LambdaApiError("lambda instance teardown identity is invalid")
+    deleted = terminate_instances([iid])
+    if deleted != [iid]:
+        raise LambdaApiError(f"lambda terminate({iid}) was not confirmed")
+    if get_instance(iid, strict=True) is not None:
+        raise LambdaApiError(f"lambda instance {iid} remains after confirmed termination")

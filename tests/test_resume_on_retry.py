@@ -32,6 +32,7 @@ from flash.spec import JobSpec
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
 INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
 # ============================================================================================
@@ -339,12 +340,43 @@ def _alloc():
     )
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j"):
+def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
         "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
+
+
+def _vast_handle(attempt=0):
+    return {
+        "provider": "vast",
+        "instance_id": attempt + 1,
+        "offer_id": 100 + attempt,
+        "machine_id": 200 + attempt,
+        "label": f"flash-retry-{attempt}",
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.5,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
+
+
+def _lambda_handle(attempt=0):
+    return {
+        "provider": "lambda",
+        "instance_id": f"i-{attempt + 1}",
+        "instance_type": "gpu_1x_a10",
+        "region": "us-east-1",
+        "name": f"flash-retry-{attempt}",
+        "gpu": "A10",
+        "hourly_usd": 1.29,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
     }
 
 
@@ -362,9 +394,9 @@ def orch(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda _endpoint_id, job_id: {"id": job_id, "status": "CANCELLED"},
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda *a, **k: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
     return runner
 
 
@@ -387,7 +419,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         calls.append((run_spec.run_id, seed))
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
             return PollResult(False, failure=failure, detail="infra")
         return PollResult(True, metrics={"train_tokens": 4096})
@@ -411,35 +443,38 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
     preserved (not cleared) for the run's outer GC."""
     import flash.providers as providers
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
 
     submits = []
     gc_calls = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(attempt)
-        on_handle(
-            {"provider": "vast", "instance_id": f"i{attempt}"}
-        )  # vast handle drives the teardown
-        return PollResult(False, failure="stalled", detail="infra")  # attempt 0 fails infra-shaped
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    vast_candidate = Candidate("vast", "RTX 4090", 0.5, 24)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("vast", "RTX 4090", 0.5, 12, (vast_candidate,)),
+    )
 
     class _RaisingVast:
-        def destroy(self, handle):  # unconfirmed teardown
+        def submit_run(self, run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+            submits.append(attempt)
+            on_handle(_vast_handle(attempt))
+            return PollResult(False, failure="stalled", detail="infra")
+
+        def destroy(self, handle):
             from flash.providers.vast import api as vast_api
 
             raise vast_api.VastApiError("destroy unconfirmed (success:false)")
 
-        def gc(self, spec):  # run-scoped force-reap by label
+        def gc(self, spec):
             gc_calls.append(spec.run_id)
 
+    vast_provider = _RaisingVast()
     real_get = providers.get_provider
     monkeypatch.setattr(
         providers,
         "get_provider",
-        lambda name: _RaisingVast() if name == "vast" else real_get(name),
+        lambda name: vast_provider if name == "vast" else real_get(name),
     )
 
     spec = _spec()
@@ -455,10 +490,58 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     # handle preserved (not cleared) so the run's outer GC can still reach the box
     remote = orch.get_status(spec.run_id).remote
     assert remote is not None
-    assert remote.get("instance_id") == "i0"
+    assert remote.get("instance_id") == 1
 
 
-@pytest.mark.parametrize("teardown_failure", ["cancel", "delete_false", "delete_exception"])
+def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+
+    submits = []
+    gc_calls = []
+    candidate = Candidate("lambda", "A10", 1.29, 24)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate,)),
+    )
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        submits.append(attempt)
+        on_handle(_lambda_handle(attempt))
+        return PollResult(False, failure="stalled", detail="infra")
+
+    def unconfirmed(_instance_id):
+        raise lambda_api.LambdaApiError("private provider termination response")
+
+    monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_submit)
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", unconfirmed)
+    monkeypatch.setattr(
+        lambda_jobs,
+        "terminate_run_instances",
+        lambda run_id: gc_calls.append(run_id) or [],
+    )
+
+    spec = _spec(**{"type": "A10"})
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0]
+    assert gc_calls == [spec.run_id]
+    assert "teardown unconfirmed" in log.getvalue()
+    assert "private" not in log.getvalue()
+    assert "private" not in str(caught.value)
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("instance_id") == "i-1"
+
+
+@pytest.mark.parametrize("teardown_failure", ["delete_false", "delete_exception"])
 def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     orch, monkeypatch, teardown_failure
 ):
@@ -472,16 +555,16 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         return PollResult(False, failure="stalled", detail="infra")
 
-    def cancel_job(endpoint_id, job_id):
+    def cancel_job(endpoint_id, job_id, **_kw):
         teardown_events.append(("cancel", endpoint_id, job_id))
         if teardown_failure == "cancel":
             raise RuntimeError("private cancellation response")
         return {"id": job_id, "status": "CANCELLED"}
 
-    def delete_endpoint(endpoint_id):
+    def delete_endpoint(endpoint_id, _fingerprint):
         teardown_events.append(("delete", endpoint_id))
         if teardown_failure == "delete_false":
             return False
@@ -491,7 +574,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", delete_endpoint)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
     monkeypatch.setattr(runpod_train, "terminate_endpoint", lambda *_args, **_kwargs: None)
 
     spec = _spec()
@@ -531,7 +614,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda eid, jid: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
+        lambda eid, jid, **_kw: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
     )
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
@@ -543,7 +626,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
             # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
             # attempt), so the next retry has no stale handle to re-tear-down.
             return PollResult(False, failure="no_capacity", detail="search flaked")
-        on_handle(_runpod_handle("ep2", "j2"))  # fresh endpoint on the final retry
+        on_handle(_runpod_handle("ep2", "j2", 2))  # fresh endpoint on the final retry
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)

@@ -28,14 +28,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
-from flash.providers._hf_artifacts import (
-    heartbeat_is_stale_prior_attempt,
-    worker_flagged_retriable,
-)
+from flash.providers._hf_artifacts import worker_flagged_retriable
 from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     PollErrorTracker,
+    _attempt_int,
     heartbeat_progress_ts,
     is_training_heartbeat,
     make_say,
@@ -95,12 +93,7 @@ class InstancePollAdapter:
     instance_id: object
     run_id: str
     current_attempt: int
-    launch_ts: (
-        float  # now-floored; 0.0 launch means "unknown" -> falls back to now (elapsed math + cost)
-    )
-    dating_launch: (
-        float  # TRUE launch (0.0 == unknown, NOT now-floored) for heartbeat attempt-dating
-    )
+    launch_ts: float
 
     # Terminal-artifact readers (built from the provider's monkeypatchable ``_make_hf_file_reader``).
     done_reader: Callable[..., str | None]
@@ -150,7 +143,7 @@ def _decode_terminal_marker(
     ts = marker["ts"]
     error = marker["error"]
     now = time.time()
-    launch_floor = adapter.dating_launch or adapter.launch_ts
+    launch_floor = adapter.launch_ts
     if (
         isinstance(launch_floor, bool)
         or not isinstance(launch_floor, (int, float))
@@ -160,9 +153,8 @@ def _decode_terminal_marker(
         or not isinstance(now, (int, float))
         or not math.isfinite(now)
         or now <= 0
-        or isinstance(attempt, bool)
-        or not isinstance(attempt, int)
-        or attempt != adapter.current_attempt
+        or _attempt_int(attempt) is None
+        or attempt != _attempt_int(adapter.current_attempt)
         or type(marker["run_id"]) is not str
         or marker["run_id"] != adapter.run_id
         or type(marker["ok"]) is not bool
@@ -189,13 +181,12 @@ def poll_instance_job(
     stall_after_s: float,
     first_liveness_s: float,
     load_timeout_s: float,
-    deadline_s: float | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (the shared kernel behind poll_vast_job /
     poll_lambda_job).
 
-    COMPLETED     fresh DONE sentinel on HF -> metrics.json (cost stamped by the adapter).
+    COMPLETED     strict ok marker on HF -> metrics.json (cost stamped by the adapter).
     job_failed    attempt marker with ok=false (a real worker error; fails fast unless flagged retriable).
     job_preempted instance died without DONE/marker (host loss) -> infra-shaped, retried.
     stalled       never left loading within ``load_timeout_s``; OR running but emitted NO liveness within
@@ -205,8 +196,14 @@ def poll_instance_job(
     """
     say = make_say(log)
     launch_ts = adapter.launch_ts
+    if (
+        isinstance(launch_ts, bool)
+        or not isinstance(launch_ts, (int, float))
+        or not math.isfinite(launch_ts)
+        or launch_ts <= 0
+    ):
+        raise ValueError("persisted instance launch timestamp is invalid")
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
-    dating_launch = adapter.dating_launch
     done_reader = adapter.done_reader
     marker_reader = adapter.marker_reader
     metrics_reader = adapter.metrics_reader
@@ -305,7 +302,7 @@ def poll_instance_job(
         # heartbeat for a RetriableInfraError). Gate the heartbeat flag to THIS attempt so a stale
         # retriable=True from a prior attempt can't turn a fast-fail into a GPU-burning retry loop.
         retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(
-            heartbeat_reader, launch_ts=dating_launch, current_attempt=adapter.current_attempt
+            heartbeat_reader, launch_ts=launch_ts, current_attempt=adapter.current_attempt
         )
         return PollResult(
             False,
@@ -320,43 +317,32 @@ def poll_instance_job(
         defer_deadline_failure: bool = False,
     ) -> PollResult | None:
         nonlocal deferred_deadline_failure
-        # The worker's terminal HF artifacts (DONE / attempt marker) -> a terminal PollResult when it
-        # definitively finished or errored, else None. The SINGLE terminal detector shared by the poll
-        # loop and every give-up path. ``force`` bypasses the read cache: True for the one-shot give-up
-        # reads; False for the per-iteration loop poll, which already paces its own reads.
-        d = read_artifact(
-            done_reader,
-            force=force,
-            read_deadline_at=read_deadline_at,
-        )
-        if d is not None and done_is_fresh(d):
-            return finish_ok(d, read_deadline_at=read_deadline_at)
+        # the strict attempt marker is the sole terminal authority. done may help timestamp a
+        # marker-authorized success, but it cannot complete a run by itself.
         raw = read_artifact(
             marker_reader,
             force=force,
             read_deadline_at=read_deadline_at,
         )
-        if raw is not None:
-            try:
-                marker = _decode_terminal_marker(raw, adapter)
-            except (TypeError, ValueError):
-                return PollResult(
-                    False,
-                    failure="job_failed",
-                    detail="terminal marker is invalid or unverifiable",
-                )
-            if marker["ok"]:
-                return finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
-            failure = fail_from_marker(marker)
-            # the watchdog marker can race a successful final marker or lagging done upload. only the
-            # deadline exit defers it; every other failure marker still terminates immediately.
-            if defer_deadline_failure and marker["error"].startswith(
-                "run wall deadline exceeded"
-            ):
-                deferred_deadline_failure = failure
-                return None
-            return failure
-        return None
+        if raw is None:
+            return None
+        try:
+            marker = _decode_terminal_marker(raw, adapter)
+        except (TypeError, ValueError):
+            return PollResult(
+                False,
+                failure="job_failed",
+                detail="terminal marker is invalid or unverifiable",
+            )
+        if marker["ok"]:
+            return finish_from_ok_marker(marker, read_deadline_at=read_deadline_at)
+        failure = fail_from_marker(marker)
+        # the watchdog marker can race a successful final marker or lagging done upload. only the
+        # deadline exit defers it; every other failure marker still terminates immediately.
+        if defer_deadline_failure and marker["error"].startswith("run wall deadline exceeded"):
+            deferred_deadline_failure = failure
+            return None
+        return failure
 
     def deadline_unless_terminal() -> PollResult:
         nonlocal deferred_deadline_failure
@@ -427,13 +413,7 @@ def poll_instance_job(
     liveness_absent_polls = 0
     missing_streak = 0
     while True:
-        deadline_expired = absolute_deadline is not None and time.time() >= absolute_deadline
-        legacy_deadline_expired = (
-            absolute_deadline is None
-            and deadline_s is not None
-            and time.time() - start > deadline_s
-        )
-        if deadline_expired or legacy_deadline_expired:
+        if absolute_deadline is not None and time.time() >= absolute_deadline:
             return deadline_unless_terminal()
         try:
             inst = adapter.fetch_instance()
@@ -522,18 +502,12 @@ def poll_instance_job(
             # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):
             # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
             err = adapter.read_current_error()
-            # Error files are attempt-scoped but the heartbeat is run-scoped: gate the crash evidence on
-            # heartbeat provenance (dated by dating_launch, the TRUE launch) so a stale prior-attempt
-            # heartbeat can't flip a genuine host-loss retry into a fast-fail job_failed.
-            crash_evidence_is_current = not heartbeat_is_stale_prior_attempt(
-                heartbeat_reader, launch_ts=dating_launch, current_attempt=adapter.current_attempt
-            )
+            # error files are attempt-scoped, so a present file already belongs to this exact handle.
             worker_crashed = (
                 bool(err and err.strip())
-                and crash_evidence_is_current
                 and not worker_flagged_retriable(
                     heartbeat_reader,
-                    launch_ts=dating_launch,
+                    launch_ts=launch_ts,
                     current_attempt=adapter.current_attempt,
                 )
             )
@@ -566,8 +540,8 @@ def poll_instance_job(
         # Load timeout: a box that never left loading/unknown within load_timeout_s never started. But a
         # fresh heartbeat PROVES the worker booted even while the detail API lags in loading/unknown
         # (never flipping to 'running'), so it disarms this — else a healthy, heartbeating box is torn
-        # down on a lagging status feed. deadline_s (+ the finally destroy and periodic sweep) stays the
-        # ultimate spend backstop once this is disarmed. ORDER MATTERS: this runs AFTER the heartbeat read
+        # down on a lagging status feed. the absolute deadline remains the spend backstop once this is
+        # disarmed. order matters: this runs after the heartbeat read
         # above, so THIS tick's first fresh heartbeat (which sets seen_fresh_hb) disarms the timeout on the
         # very iteration it arrives — a heartbeat landing exactly at the timeout mark must not be raced by
         # a stale seen_fresh_hb from the prior tick.

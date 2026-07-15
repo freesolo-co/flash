@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from flash.providers._deadline import deadline_kwargs
+from flash.providers._poll import _attempt_int
 from flash.schema import format_adapter_revision, parse_adapter_revision
 from flash.spec import JobSpec
 
@@ -559,6 +560,8 @@ def cancel_run(run_id: str) -> RunStatus:
     finally:
         if lock_acquired:
             deploy_lock.release()
+
+
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
@@ -569,7 +572,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _compare_and_clear_remote,
         _gc_run_endpoints,
         _load_run_deadline_at,
-        _opd_progress_detected,
         _persist_metrics,
         _run_training,
         _RunCancelled,
@@ -608,17 +610,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         remote = dict(persisted_remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
-        if (remote.get("provider") or "runpod") == "runpod":
-            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-
-            recovered_attempt = RunpodJobHandle.from_dict(remote).attempt
-        else:
-            try:
-                recovered_attempt = max(0, int(remote.get("attempt") or 0))
-            except (TypeError, ValueError):
-                recovered_attempt = 0
-        # legacy handles without an attempt predate persisted retry identities and represent attempt 0;
-        # resuming at 1 preserves reverse-only recovery while avoiding the known attempt-0 artifact.
+        provider_name = remote.get("provider")
+        if not isinstance(provider_name, str) or not provider_name:
+            raise ValueError("persisted provider identity is missing or invalid")
+        recovered_attempt = _attempt_int(remote.get("attempt"))
+        if recovered_attempt is None:
+            raise ValueError("persisted attempt identity is missing or invalid")
         next_attempt = recovered_attempt + 1
         # The class the run actually provisioned (a policy retry may have walked past the
         # provisional spec.gpu.type). The in-process success path stamps this into metrics;
@@ -666,22 +663,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 return status_for_return()
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(worker_spec)
-            opd_progress_detected = public_spec.algorithm == "opd" and _opd_progress_detected(
-                run_id
-            )
             if not _compare_and_clear_remote(run_id, persisted_remote):
                 print(
                     f"attach: {run_id} persisted remote changed before clear; not resuming",
                     file=log,
                 )
-                return status_for_return()
-            if opd_progress_detected:
-                detail = (
-                    "opd progress was detected; automatic recovery is blocked because opd checkpoint "
-                    "resume is not supported"
-                )
-                _update(run_id, "failed", error=detail)
-                print(f"attach: {run_id} {detail}", file=log)
                 return status_for_return()
             try:
                 _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
@@ -694,8 +680,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return status_for_return()
             print(
-                f"attach: {run_id} resubmitting before the run-global wall deadline"
-                + ("" if public_spec.algorithm == "opd" else " from the latest checkpoint"),
+                f"attach: {run_id} resubmitting from the latest checkpoint before the "
+                "run-global wall deadline",
                 file=log,
             )
             if code_prefix is None:

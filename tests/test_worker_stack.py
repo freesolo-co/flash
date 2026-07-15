@@ -1143,10 +1143,11 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, 
     monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
     monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: next(remaining))
     monkeypatch.setattr(worker.time, "sleep", sleeps.append)
+    monkeypatch.setenv("HF_TOKEN", "bearer-secret")
 
     def boom():
         calls.append("upload")
-        raise OSError("authorization-bearer-secret provider-body-private")
+        raise OSError("Authorization: Bearer bearer-secret provider-body-private")
 
     with pytest.raises(RetriableInfraError):
         worker._hf_upload(boom, "DONE", required=True, label="DONE")
@@ -1154,8 +1155,8 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, 
     assert calls == ["upload"]
     assert sleeps == [2.0]
     output = capsys.readouterr().out
-    assert "authorization-bearer-secret" not in output
-    assert "provider-body-private" not in output
+    assert "bearer-secret" not in output
+    assert "provider-body-private" in output
 
 
 def test_optional_upload_without_deadline_preserves_single_attempt(monkeypatch):

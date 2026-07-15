@@ -326,7 +326,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
     gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
-    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=1)
+    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
     gpu_options = {}
     if gpu_max_retries is not None:
         gpu_options["max_retries"] = gpu_max_retries

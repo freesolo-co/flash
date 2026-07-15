@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
 from flash.catalog import ModelInfo, resolve_model
-from flash.providers._deadline import remaining_seconds
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
 
@@ -34,13 +33,11 @@ _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 _STATUS_LOCK = threading.Lock()
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
-_OPD_PROGRESS_KEY = "opd_progress_detected"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
-        _OPD_PROGRESS_KEY,
         _CLEANUP_REMOTES_KEY,
     }
 )
@@ -181,20 +178,14 @@ def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
 
 
 def _load_run_deadline_at(run_id: str) -> float:
-    """Return and durably backfill the canonical submission-to-terminal deadline."""
+    """Return the persisted canonical submission-to-terminal deadline."""
     raw = _load_status_json(run_id)
-    status, canonical = _canonical_run_deadline(raw)
-    stored = raw.get(_RUN_DEADLINE_AT_KEY, _PRIVATE_VALUE_UNSET)
-    if stored is not _PRIVATE_VALUE_UNSET:
-        return _checked_stored_run_deadline(stored, canonical)
-    with _status_guard(run_id):
-        raw = _load_status_json(run_id)
-        status, canonical = _canonical_run_deadline(raw)
-        stored = raw.get(_RUN_DEADLINE_AT_KEY, _PRIVATE_VALUE_UNSET)
-        if stored is not _PRIVATE_VALUE_UNSET:
-            return _checked_stored_run_deadline(stored, canonical)
-        _save_status_unlocked(status, _run_deadline_at=canonical)
-    return canonical
+    _status, canonical = _canonical_run_deadline(raw)
+    if _RUN_DEADLINE_AT_KEY not in raw:
+        raise RuntimeError(
+            "persisted run wall deadline is missing; no further provisioning is allowed"
+        )
+    return _checked_stored_run_deadline(raw[_RUN_DEADLINE_AT_KEY], canonical)
 
 
 def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> float:
@@ -230,36 +221,12 @@ def _spec_with_remaining_wall(
 
 
 def _infer_next_attempt(raw: dict) -> int:
-    if _NEXT_ATTEMPT_KEY in raw:
-        stored = raw[_NEXT_ATTEMPT_KEY]
-        if (
-            isinstance(stored, int)
-            and not isinstance(stored, bool)
-            and _attempt_int(stored) is not None
-        ):
-            return stored
+    if _NEXT_ATTEMPT_KEY not in raw:
+        raise RuntimeError("stored next attempt identity is missing")
+    stored = raw[_NEXT_ATTEMPT_KEY]
+    if _attempt_int(stored) is None:
         raise RuntimeError("stored next attempt identity is invalid")
-
-    remote = raw.get("remote")
-    if remote is not None:
-        if _remote_resource_identity(remote) is None:
-            raise RuntimeError("remote attempt evidence is invalid")
-        if "attempt" not in remote:
-            remote_attempt = 0
-        else:
-            remote_attempt = _attempt_int(remote.get("attempt"))
-            if remote_attempt is None:
-                raise RuntimeError("remote attempt evidence is invalid")
-        if remote_attempt >= _MAX_ATTEMPT_ID:
-            raise RuntimeError("remote attempt identity is exhausted")
-        return remote_attempt + 1
-
-    state = raw.get("state")
-    if state == "queued":
-        return 0
-    if isinstance(state, str) and state:
-        return 1
-    raise RuntimeError("run state is invalid for attempt allocation")
+    return stored
 
 
 def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
@@ -276,129 +243,6 @@ def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
         _save_status_unlocked(status, _next_attempt=attempt + 1)
         return attempt
 
-
-def _opd_training_started_artifact_name(attempt: int) -> str:
-    return f"opd_training_started_attempt{int(attempt)}.json"
-
-
-def _immutable_opd_progress_detected(raw: dict, spec: JobSpec) -> bool:
-    """Check strict run- and attempt-scoped immutable optimizer-start evidence."""
-    if not spec.train.hf_repo:
-        return False
-    try:
-        from huggingface_hub import HfApi, hf_hub_download
-
-        api = HfApi(token=os.environ.get("HF_TOKEN"))
-        _status, deadline = _canonical_run_deadline(raw)
-        now = time.time()
-        if (
-            isinstance(now, bool)
-            or not isinstance(now, (int, float))
-            or not math.isfinite(now)
-            or now <= 0
-        ):
-            raise ValueError("invalid clock")
-        remote = raw.get("remote")
-        for attempt in range(_infer_next_attempt(raw)):
-            path = f"{spec.phase}/{spec.run_id}/{_opd_training_started_artifact_name(attempt)}"
-            if remaining_seconds(deadline) <= 0:
-                raise TimeoutError("run wall deadline exceeded")
-            if not api.file_exists(
-                repo_id=spec.train.hf_repo,
-                filename=path,
-                repo_type="dataset",
-            ):
-                continue
-            if remaining_seconds(deadline) <= 0:
-                raise TimeoutError("run wall deadline exceeded")
-            local_path = hf_hub_download(
-                repo_id=spec.train.hf_repo,
-                filename=path,
-                repo_type="dataset",
-                token=os.environ.get("HF_TOKEN"),
-            )
-            if os.path.getsize(local_path) > 16_384:
-                raise ValueError("marker too large")
-            with open(local_path, encoding="utf-8") as f:
-                marker = json.load(f)
-            if not isinstance(marker, dict) or set(marker) != {
-                "attempt",
-                "run_id",
-                "training_started",
-                "ts",
-            }:
-                raise ValueError("invalid marker schema")
-            marker_attempt = marker["attempt"]
-            marker_ts = marker["ts"]
-            if (
-                isinstance(marker_attempt, bool)
-                or not isinstance(marker_attempt, int)
-                or marker_attempt != attempt
-                or marker["run_id"] != spec.run_id
-                or type(marker["run_id"]) is not str
-                or marker["training_started"] is not True
-                or isinstance(marker_ts, bool)
-                or not isinstance(marker_ts, (int, float))
-                or not math.isfinite(marker_ts)
-            ):
-                raise ValueError("invalid marker identity")
-            if not isinstance(remote, dict):
-                raise ValueError("missing attempt identity")
-            remote_attempt = remote.get("attempt")
-            started_ts = remote.get("started_ts")
-            if (
-                isinstance(remote_attempt, bool)
-                or not isinstance(remote_attempt, int)
-                or remote_attempt != attempt
-                or isinstance(started_ts, bool)
-                or not isinstance(started_ts, (int, float))
-                or not math.isfinite(started_ts)
-                or started_ts <= 0
-                or marker_ts < started_ts
-                or marker_ts > deadline
-                or marker_ts > now + 120.0
-            ):
-                raise ValueError("marker is outside attempt window")
-            return True
-    except Exception:
-        raise RuntimeError(
-            "immutable OPD optimizer-start evidence could not be verified; retry is blocked"
-        ) from None
-    return False
-
-
-def _heartbeat_proves_opd_progress(heartbeat: dict | None) -> bool:
-    if not isinstance(heartbeat, dict):
-        return False
-    stage = str(heartbeat.get("stage") or "")
-    step = heartbeat.get("step")
-    if stage == "opd_step":
-        return True
-    if stage == "opd_trained":
-        return True
-    if stage.startswith("checkpoint_"):
-        return True
-    return isinstance(step, (int, float)) and step > 0
-
-
-def _opd_progress_detected(run_id: str) -> bool:
-    """Conservatively detect persisted OPD work that cannot yet be resumed safely."""
-    raw = _load_status_json(run_id)
-    if raw.get(_OPD_PROGRESS_KEY) is True:
-        return True
-    status = _runstatus_from_json(raw)
-    try:
-        spec = JobSpec.from_dict(status.spec)
-        if spec.algorithm != "opd":
-            return False
-    except Exception:
-        return False
-    deployment = status.deployment if isinstance(status.deployment, dict) else {}
-    return (
-        _immutable_opd_progress_detected(raw, spec)
-        or _heartbeat_proves_opd_progress(status.last_heartbeat)
-        or deployment.get("checkpoint_step") is not None
-    )
 
 
 @dataclass
@@ -726,12 +570,13 @@ def _run_job_background(
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
             _run_job(spec)
-    except Exception:
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: background run failed"
         with contextlib.suppress(Exception):
             if get_status(spec.run_id).state not in TERMINAL_STATES:
-                _update(spec.run_id, "failed", error="run failed; detail suppressed")
+                _update(spec.run_id, "failed", error=detail)
         logging.getLogger(__name__).warning(
-            "background run %s ended in error; detail suppressed", spec.run_id
+            "background run %s ended in error: %s", spec.run_id, detail
         )
 
 
@@ -1281,13 +1126,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        opd_progress = _PRIVATE_VALUE_UNSET
-        with contextlib.suppress(Exception):
-            if JobSpec.from_dict(status.spec).algorithm == "opd" and _heartbeat_proves_opd_progress(
-                hb
-            ):
-                opd_progress = True
-        _save_status_unlocked(status, _opd_progress=opd_progress)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -1327,24 +1166,43 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
-    """Return the exact provider resource identity used for compare-and-clear."""
+    """Return the exact strict provider resource identity used for compare-and-clear."""
     if not isinstance(remote, dict):
         return None
-    provider = remote.get("provider") or "runpod"
-    if not isinstance(provider, str) or not provider:
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            handle = RunpodJobHandle.from_dict(remote)
+            return provider, handle.attempt, handle.endpoint_id, handle.job_id, handle.key_fingerprint
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            handle = LambdaJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.instance_type,
+                handle.region,
+                handle.name,
+            )
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            handle = VastJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.offer_id,
+                handle.machine_id,
+                handle.label,
+            )
+    except (TypeError, ValueError):
         return None
-    if provider == "runpod":
-        endpoint_id = remote.get("endpoint_id")
-        job_id = remote.get("job_id")
-        if not isinstance(endpoint_id, str) or not endpoint_id:
-            return None
-        if job_id is not None and (not isinstance(job_id, str) or not job_id):
-            return None
-        return provider, endpoint_id, job_id
-    instance_id = remote.get("instance_id")
-    if instance_id is None or isinstance(instance_id, bool) or str(instance_id) == "":
-        return None
-    return provider, str(instance_id)
+    return None
 
 
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
@@ -1369,27 +1227,26 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
 
 
 def _canonical_cleanup_remote(remote: object) -> dict | None:
-    """Return the safe teardown fields for one exact resource and reserved attempt."""
-    identity = _remote_resource_identity(remote)
-    if identity is None or not isinstance(remote, dict):
+    """Return the complete strict teardown handle for one exact resource."""
+    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
         return None
-    attempt = _attempt_int(remote.get("attempt"))
-    if attempt is None:
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            return RunpodJobHandle.from_dict(remote).to_dict()
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            return LambdaJobHandle.from_dict(remote).to_dict()
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            return VastJobHandle.from_dict(remote).to_dict()
+    except (TypeError, ValueError):
         return None
-    provider = identity[0]
-    if provider == "runpod":
-        record = {
-            "provider": provider,
-            "endpoint_id": identity[1],
-            "attempt": attempt,
-        }
-        if identity[2] is not None:
-            record["job_id"] = identity[2]
-        return record
-    instance_id = remote.get("instance_id")
-    if isinstance(instance_id, bool) or not isinstance(instance_id, (int, str)):
-        return None
-    return {"provider": provider, "instance_id": instance_id, "attempt": attempt}
+    return None
 
 
 def _cleanup_remote_key(remote: object) -> tuple | None:
@@ -1577,15 +1434,22 @@ def _save_status(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
-    _opd_progress: bool | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
+        if not os.path.exists(runs_file_path(status.run_id, ".json")):
+            if _run_deadline_at is _PRIVATE_VALUE_UNSET:
+                spec = JobSpec.from_dict(status.spec)
+                _run_deadline_at = _require_valid_deadline(
+                    _require_valid_deadline(status.created_at)
+                    + _require_valid_deadline(spec.gpu.max_wall_seconds)
+                )
+            if _next_attempt is _PRIVATE_VALUE_UNSET:
+                _next_attempt = 0
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
-            _opd_progress=_opd_progress,
             _cleanup_remotes=_cleanup_remotes,
         )
 
@@ -1595,7 +1459,6 @@ def _save_status_unlocked(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
-    _opd_progress: bool | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
@@ -1605,7 +1468,6 @@ def _save_status_unlocked(
     private_values = {
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
-        _OPD_PROGRESS_KEY: _opd_progress,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
     }
     data = _status_storage_dict(status)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._deadline import deadline_kwargs
 from flash.providers._instance import InstanceJobHandle
 from flash.providers._instance_provider import InstanceProvider
 from flash.providers.base import (
@@ -90,19 +89,10 @@ class LambdaProvider(InstanceProvider):
             deadline_at=deadline_at,
         )
 
-    def _teardown_reattached(
-        self,
-        handle: JobHandle,
-        spec,
-        *,
-        deadline_at: float | None,
-    ) -> None:
+    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
         from flash.providers.lambdalabs import api as lambda_api
 
-        lambda_api.terminate_instances(
-            [handle.instance_id],
-            **deadline_kwargs(lambda_api.terminate_instances, deadline_at),
-        )
+        lambda_api.terminate_instance_confirmed(handle.instance_id)
 
     def _gc(self, run_id: str) -> None:
         from flash.providers.lambdalabs.jobs import terminate_run_instances
@@ -118,6 +108,12 @@ class LambdaProvider(InstanceProvider):
         from flash.providers.lambdalabs.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
+
+    def run_instances_remaining(self, run_id: str) -> list[str]:
+        """Exact run-owned instance ids still observable after cleanup."""
+        from flash.providers.lambdalabs.jobs import run_instances_remaining
+
+        return run_instances_remaining(run_id)
 
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
@@ -157,4 +153,4 @@ def _terminate_handle_instance(handle: JobHandle) -> None:
 
     d = handle.to_dict()
     if d.get("instance_id"):
-        lambda_api.terminate_instances([str(d["instance_id"])])
+        lambda_api.terminate_instance_confirmed(str(d["instance_id"]))

@@ -7,10 +7,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from logging import Logger
-from queue import Empty, Queue
-from threading import Thread
-from typing import TypeVar, cast
+from typing import TypeVar
 
+from flash.diagnostics import sanitize_diagnostic
 from flash.providers._deadline import remaining_seconds, require_deadline_at
 
 T = TypeVar("T")
@@ -56,31 +55,9 @@ def hf_retry_after(
 
 
 def _call_before_deadline(call: Callable[[], T], label: str, deadline: float) -> T:
-    remaining = remaining_seconds(deadline)
-    if remaining <= 0:
+    if remaining_seconds(deadline) <= 0:
         raise TimeoutError(f"{label} exceeded the run wall deadline")
-
-    outcome: Queue[tuple[bool, object]] = Queue(maxsize=1)
-
-    def invoke() -> None:
-        try:
-            outcome.put((True, call()))
-        except BaseException as exc:
-            outcome.put((False, exc))
-
-    # python cannot stop a running thread, so use a daemon to bound the caller without
-    # keeping interpreter shutdown alive if the hugging face request never returns.
-    worker = Thread(target=invoke, name="flash-hf-call", daemon=True)
-    worker.start()
-    try:
-        succeeded, value = outcome.get(timeout=remaining)
-    except Empty:
-        raise TimeoutError(f"{label} exceeded the run wall deadline") from None
-    if succeeded:
-        return cast(T, value)
-    if not isinstance(value, BaseException):
-        raise AssertionError("hugging face call produced an invalid failure outcome")
-    raise value
+    return call()
 
 
 def hf_call(
@@ -105,14 +82,16 @@ def hf_call(
             if deadline is not None:
                 remaining = remaining_seconds(deadline)
                 if remaining <= 0:
-                    raise TimeoutError(f"{label} exceeded the run wall deadline") from None
+                    raise
                 delay = min(delay, remaining)
             logger.warning(
                 "%s transient Hugging Face error; retrying in %.0fs: %s",
                 label,
                 delay,
-                exc,
+                sanitize_diagnostic(exc, limit=500),
             )
             if delay > 0:
                 sleep(delay)
+            if deadline is not None and remaining_seconds(deadline) <= 0:
+                raise
     raise AssertionError("unreachable")

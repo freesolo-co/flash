@@ -22,6 +22,8 @@ import types
 
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
     return JobSpec(model="m", gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu))
@@ -207,8 +209,10 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod import auth, jobs, keys
 
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    keys.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -224,12 +228,17 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
-    eid, _name = jobs.deploy_train_endpoint("RTX 4090", spec=_vol_spec(), disk_gb=None)
+    eid, _name, fingerprint = jobs.deploy_train_endpoint(
+        "RTX 4090",
+        spec=_vol_spec(),
+        disk_gb=None,
+    )
     assert eid == "ep-abc"
+    assert fingerprint == jobs.runpod_api.key_fingerprint("test-key")
     assert len(captured["volume"]) == _ndc()  # EAGER: a volume in every storage DC
     assert len(captured["datacenter"]) == _ndc()  # allowed across all storage DCs
     assert len({v.name for v in captured["volume"]}) == _ndc()  # distinct per-DC names
@@ -240,8 +249,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod import auth, jobs, keys
 
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    keys.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -257,7 +268,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
@@ -492,7 +503,13 @@ def test_instance_payload_strips_runpod_volume_redirect():
         "/runpod-volume"
     )  # leak source
     for arm in ("lambda",):
-        env = _instance.build_payload(spec, seed=0, attempt=0, arm=arm)["env"]
+        env = _instance.build_payload(
+            spec,
+            seed=0,
+            attempt=0,
+            arm=arm,
+            deadline_at=10_000_000_000.0,
+        )["env"]
         assert not env.get("FLASH_WEIGHT_CACHE_DIR", "").startswith("/runpod-volume"), arm
 
 
@@ -1271,7 +1288,8 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "ensure_filesystem",
-        lambda name, region: ensured.append((name, region)) or f"/lambda/nfs/{name}",
+        lambda name, region, deadline_at=None: ensured.append((name, region))
+        or f"/lambda/nfs/{name}",
     )
     out = preload.provision_lambda_filesystems()
     # one create-if-absent per region, with the managed cache name
@@ -1287,7 +1305,7 @@ def test_provision_lambda_skips_failed_region(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.runpod import preload
 
-    def flaky(name, region):
+    def flaky(name, region, deadline_at=None):
         if region == "bad-1":
             raise lambda_api.LambdaApiError("region down")
         return f"/lambda/nfs/{name}"
@@ -1337,16 +1355,21 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     calls = {}
 
     def fake_deploy(
-        gpu, execution_timeout_ms=None, name_suffix=None, spec=None, endpoint_kwargs=None
+        gpu,
+        execution_timeout_ms=None,
+        name_suffix=None,
+        spec=None,
+        endpoint_kwargs=None,
+        deadline_at=None,
     ):
         calls["gpu"] = gpu
         calls["suffix"] = name_suffix
         calls["endpoint_kwargs"] = endpoint_kwargs
-        return "ep-1", "name-1"
+        return "ep-1", "name-1", _RUNPOD_FINGERPRINT
 
     submitted = {}
 
-    def fake_submit(eid, payload):
+    def fake_submit(eid, payload, **_kw):
         submitted["eid"] = eid
         submitted["payload"] = payload
         return "job-1"
@@ -1354,11 +1377,11 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     deleted = []
     monkeypatch.setattr(preload, "deploy_train_endpoint", fake_deploy)
     monkeypatch.setattr(preload.runpod_api, "submit_job", fake_submit)
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
     monkeypatch.setattr(
         preload.runpod_api,
         "job_status",
-        lambda eid, jid: {"status": "COMPLETED", "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]}},
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]}},
     )
 
     out = preload._preload_one_dc(
@@ -1400,14 +1423,14 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
     monkeypatch.setattr(
         preload,
         "deploy_train_endpoint",
-        lambda *a, **k: ("ep-9", "name-9"),
+        lambda *a, **k: ("ep-9", "name-9", _RUNPOD_FINGERPRINT),
     )
-    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, payload: "job-9")
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, payload, **_kw: "job-9")
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
     monkeypatch.setattr(
         preload.runpod_api,
         "job_status",
-        lambda eid, jid: {"status": "FAILED", "error": "boom"},
+        lambda eid, jid, **_kw: {"status": "FAILED", "error": "boom"},
     )
 
     out = preload._preload_one_dc(
@@ -1420,13 +1443,21 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
 def _stub_preload_deploy(monkeypatch, job_output):
     from flash.providers.runpod import preload
 
-    monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "n"))
-    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p: "job")
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: None)
+    monkeypatch.setattr(
+        preload,
+        "deploy_train_endpoint",
+        lambda *a, **k: ("ep", "n", _RUNPOD_FINGERPRINT),
+    )
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p, **_kw: "job")
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, _fingerprint: None,
+    )
     monkeypatch.setattr(
         preload.runpod_api,
         "job_status",
-        lambda eid, jid: {"status": "COMPLETED", "output": job_output},
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": job_output},
     )
 
 
@@ -1550,6 +1581,7 @@ def test_instance_build_payload_preload_mode():
         0,
         0,
         arm="lambda",
+        deadline_at=10_000_000_000.0,
         cache_host_mount="/lambda/nfs/flash-weights",
         mode="preload",
         models=["a/b", "c/d"],
@@ -1567,7 +1599,7 @@ def test_instance_build_payload_no_mode_by_default():
     from flash.providers import _instance
 
     p = _instance.build_payload(
-        _preload_spec(), 0, 0, arm="lambda", cache_host_mount="/lambda/nfs/flash-weights"
+        _preload_spec(), 0, 0, arm="lambda", deadline_at=10_000_000_000.0, cache_host_mount="/lambda/nfs/flash-weights"
     )
     assert "mode" not in p  # ordinary train payload
     assert "models" not in p
@@ -1589,7 +1621,7 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
         }
     )
     p = _instance.build_payload(
-        spec, 0, 0, arm="lambda", cache_host_mount="/lambda/nfs/flash-weights"
+        spec, 0, 0, arm="lambda", deadline_at=10_000_000_000.0, cache_host_mount="/lambda/nfs/flash-weights"
     )
     # the user's HF_HOME survives, and the platform cache redirect is NOT installed on top of it.
     assert p["env"]["HF_HOME"] == "/custom/hf"
@@ -1829,6 +1861,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
         0,
         0,
         arm="lambda",
+        deadline_at=10_000_000_000.0,
         cache_host_mount="/lambda/nfs/flash-weights",
         mode="preload",
         models=["a/b"],
@@ -1888,6 +1921,7 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
         attempt=0,
         mode="preload",
         models=["Qwen/Qwen3.5-0.8B"],
+        deadline_at=10_000_000_000.0,
     )
     # decode the base64 payload embedded in the cache user_data
     ud = launched["user_data"]

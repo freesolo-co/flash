@@ -581,6 +581,53 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
     assert "final-after-delay" in uploads[-1][1]
 
 
+def test_run_mode_waits_for_periodic_uploader_before_final_upload(monkeypatch):
+    periodic_started = threading.Event()
+    release_periodic = threading.Event()
+    events = []
+
+    class _WaitForUploaderProc(_FakeProc):
+        def wait(self, timeout=None):
+            assert periodic_started.wait(1.0)
+            return self.returncode
+
+    def upload(_payload, _path, _subpath):
+        if threading.current_thread() is runner:
+            events.append("final")
+            return
+        events.append("periodic-start")
+        periodic_started.set()
+        assert release_periodic.wait(2.0)
+        events.append("periodic-finish")
+
+    monkeypatch.setattr(b, "_CONSOLE_UPLOAD_INTERVAL_S", 0.001)
+    monkeypatch.setattr(b, "hf_upload", upload)
+    monkeypatch.setattr(
+        b.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _WaitForUploaderProc(["hello\n"], rc=0),
+    )
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    result = []
+
+    runner = threading.Thread(
+        target=lambda: result.append(
+            b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 100)
+        )
+    )
+    runner.start()
+    assert periodic_started.wait(1.0)
+    assert runner.is_alive()
+    assert events == ["periodic-start"]
+
+    release_periodic.set()
+    runner.join(2.0)
+
+    assert not runner.is_alive()
+    assert result == [0]
+    assert events == ["periodic-start", "periodic-finish", "final"]
+
+
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
@@ -838,6 +885,26 @@ def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
     assert exits == [124]
 
 
+def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeypatch):
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    exits = []
+
+    def blocked_writer(*_args, **_kwargs):
+        writer_started.set()
+        release_writer.wait(2.0)
+
+    monkeypatch.setattr(b, "_TERMINAL_MARKER_GRACE_S", 0.01)
+    monkeypatch.setattr(b, "write_attempt_marker", blocked_writer)
+    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
+
+    b._publish_timeout_marker_then_exit({}, "deadline reached")
+
+    assert writer_started.is_set()
+    assert exits == [124]
+    release_writer.set()
+
+
 # ---------------------------------------------------------------------------
 # _arm_preload_wall_cap: the _fire watchdog path
 # ---------------------------------------------------------------------------
@@ -903,7 +970,7 @@ def test_run_preload_records_download_failure(tmp_path, monkeypatch):
     )
     assert r["preloaded"] == []
     assert r["already_cached"] == []
-    assert r["failed"]["a/b"] == "download failed"
+    assert r["failed"]["a/b"] == "RuntimeError: network exploded"
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -24,6 +25,26 @@ _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
+_TERMINAL_MARKER_GRACE_S = 0.25
+_MAX_ATTEMPT_ID = (1 << 63) - 1
+_SECRET_RE = re.compile(
+    r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+    r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)"
+)
+
+
+def _safe_detail(value: object, limit: int = 1000) -> str:
+    text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+    for key, secret in os.environ.items():
+        upper = key.upper()
+        if secret and (
+            upper in {"AUTHORIZATION", "HF_TOKEN"}
+            or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
+        ):
+            text = text.replace(secret, "<redacted>")
+    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+    text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
+    return text[:limit]
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -65,15 +86,21 @@ def require_deadline_at(payload: dict) -> float:
 
 def _publish_timeout_marker_then_exit(payload: dict, message: str) -> None:
     print(f"FLASH: {message}", flush=True)
+    marker_done = threading.Event()
 
-    def _mark() -> None:
-        with contextlib.suppress(Exception):
-            write_attempt_marker(payload, ok=False, error=message)
+    def _publish() -> None:
+        try:
+            with contextlib.suppress(Exception):
+                write_attempt_marker(payload, ok=False, error=message)
+        finally:
+            marker_done.set()
 
-    marker_thread = threading.Thread(target=_mark, daemon=True)
-    marker_thread.start()
-    marker_thread.join(timeout=8.0)
-    os._exit(124)
+    try:
+        marker_thread = threading.Thread(target=_publish, daemon=True)
+        marker_thread.start()
+        marker_done.wait(_TERMINAL_MARKER_GRACE_S)
+    finally:
+        os._exit(124)
 
 
 def arm_deadline_watchdog(
@@ -185,8 +212,8 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
                     raise TimeoutError(f"{label} exceeded the run wall deadline") from None
                 delay = min(delay, remaining)
             print(
-                f"{label} transient Hugging Face error; provider detail suppressed; "
-                f"retrying in {delay:.0f}s",
+                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                f"{_safe_detail(exc, 500)}",
                 flush=True,
             )
             if delay > 0:
@@ -213,8 +240,8 @@ def hf_upload(
             repo_id=payload["hf_repo"],
             repo_type="dataset",
         )
-    except Exception:
-        print(f"hf upload warn ({repo_subpath}); provider detail suppressed", flush=True)
+    except Exception as exc:
+        print(f"hf upload warn ({repo_subpath}): {_safe_detail(exc)}", flush=True)
 
 
 def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
@@ -235,9 +262,9 @@ def remote_completion_confirmed(payload: dict) -> bool:
     """True iff DONE + metrics.json are on HF. Local /tmp/metrics.json is not sufficient proof."""
     try:
         return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
-    except Exception:
-        # read errors are infra-shaped; treat them as unconfirmed without exposing provider detail.
-        print("remote-completion check warn; provider detail suppressed", flush=True)
+    except Exception as exc:
+        # read errors are infra-shaped and leave completion unconfirmed.
+        print(f"remote-completion check warn: {_safe_detail(exc)}", flush=True)
         return False
 
 
@@ -285,8 +312,11 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
-    # Drives the poller's stale-heartbeat rejection across retries.
-    env["ATTEMPT"] = str(int(payload.get("attempt") or 0))
+    # drives the poller's stale-heartbeat rejection across retries.
+    attempt = payload.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise RuntimeError("bootstrap attempt identity is invalid")
+    env["ATTEMPT"] = str(attempt)
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
@@ -385,7 +415,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         if extra:
             tail += extra
         with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write(tail)
+            f.write(_safe_detail(tail, 64_000))
         hf_upload(payload, tail_path, f"console_{mode}.txt")
 
     stop_upload = threading.Event()
@@ -394,8 +424,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         while not stop_upload.wait(upload_interval):
             try:
                 upload_console_tail()
-            except Exception:
-                print("console upload warn; provider detail suppressed", flush=True)
+            except Exception as exc:
+                print(f"console upload warn: {_safe_detail(exc)}", flush=True)
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
@@ -421,8 +451,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                             return
                         print(line, end="", flush=True)
                         cf.write(line)
-            except BaseException:
-                print("console pump warn; provider detail suppressed", flush=True)
+            except BaseException as exc:
+                print(f"console pump warn: {_safe_detail(exc)}", flush=True)
             finally:
                 pump_done.set()
 
@@ -457,14 +487,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             with pump_write_lock:
                 pump_writes_enabled = False
         stop_upload.set()
-        uploader.join(timeout=1.0)
+        uploader.join()
     try:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
         upload_console_tail(extra)
-    except Exception:
-        print("console upload warn; provider detail suppressed", flush=True)
+    except Exception as exc:
+        print(f"console upload warn: {_safe_detail(exc)}", flush=True)
     if timed_out:
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
@@ -474,7 +504,11 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     """Upload one identity-bound terminal marker using the strict poller schema."""
     attempt = payload.get("attempt")
     run_id = payload.get("run_id")
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or not 0 <= attempt <= _MAX_ATTEMPT_ID
+    ):
         raise RuntimeError("attempt marker identity is invalid")
     if not isinstance(run_id, str) or not run_id:
         raise RuntimeError("attempt marker identity is invalid")
@@ -486,7 +520,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     now = _finite_positive_number(time.time(), "current clock")
     marker = {
         "attempt": attempt,
-        "error": error[-2000:],
+        "error": _safe_detail(error, 2000),
         "ok": ok,
         "retriable": retriable,
         "run_id": run_id,
@@ -577,9 +611,9 @@ def run_preload(payload: dict) -> dict:
             )
             done.append(repo_id)
             print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
-        except Exception:
-            failed[repo_id] = "download failed"
-            print(f"preload FAILED {repo_id}; provider detail suppressed", flush=True)
+        except Exception as exc:
+            failed[repo_id] = _safe_detail(exc)
+            print(f"preload FAILED {repo_id}: {_safe_detail(exc)}", flush=True)
     return {"preloaded": done, "already_cached": already, "failed": failed}
 
 
@@ -598,8 +632,8 @@ def main() -> int:
 
             if importlib.util.find_spec("hf_transfer") is not None:
                 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        except Exception:
-            print("hf_transfer setup skipped; detail suppressed", flush=True)
+        except Exception as exc:
+            print("hf_transfer setup skipped:", exc, flush=True)
         deadline = require_deadline_at(payload)
         if payload.get("mode") == "preload":
             deadline_watchdog = _arm_preload_wall_cap(payload)
@@ -615,9 +649,9 @@ def main() -> int:
                 hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
                 try:
                     confirmed = hf_file_exists(payload, "preload_result.json")
-                except Exception:
+                except Exception as exc:
                     print(
-                        "preload_result.json upload confirm warn; provider detail suppressed",
+                        f"preload_result.json upload confirm warn: {_safe_detail(exc)}",
                         flush=True,
                     )
                 if confirmed:
@@ -679,13 +713,9 @@ def main() -> int:
         ok = True
     except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
         retriable = isinstance(exc, RetriableBootstrapError)
-        if isinstance(exc, TimeoutError):
-            error = "run wall deadline exceeded"
-        elif retriable:
-            error = "bootstrap infrastructure failure"
-        else:
-            error = "bootstrap worker failure"
-        print(f"bootstrap failed: {type(exc).__name__}; detail suppressed", flush=True)
+        detail = _safe_detail(exc, 1800)
+        error = f"run wall deadline exceeded: {detail}" if isinstance(exc, TimeoutError) else detail
+        print(f"bootstrap failed: {error}", flush=True)
     finally:
         write_attempt_marker(payload, ok, error, retriable=retriable)
         if deadline_watchdog is not None:

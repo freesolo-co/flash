@@ -2937,6 +2937,43 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
     assert ei.value.permanent is False
 
 
+def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
+    import io
+    import traceback
+    import urllib.error
+
+    import flash.engine.worker.teacher as tm
+    from flash.engine.worker.teacher import TeacherError
+
+    private = b"opaque-private-teacher-sentinel-91ad"
+
+    def raise_http(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            403,
+            private.decode(),
+            {},
+            io.BytesIO(private),
+        )
+
+    monkeypatch.setattr(tm.urllib.request, "urlopen", raise_http)
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
+
+    with pytest.raises(TeacherError) as exc_info:
+        client.score("P", "hi")
+
+    detail = str(exc_info.value)
+    formatted = "".join(
+        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
+    )
+    assert exc_info.value.permanent is True
+    assert "teacher HTTP 403" in detail
+    assert "/completions" in detail
+    assert "permanent" in detail
+    assert private.decode() not in detail
+    assert private.decode() not in formatted
+
+
 def test_teacher_score_rejects_non_list_logprob_fields_as_permanent(monkeypatch):
     """Regression (codex[bot], teacher.py:130): the length check assumes tokens/token_logprobs/
     text_offset are sequences. A malformed 200 with token_logprobs=null (or a scalar text_offset) makes

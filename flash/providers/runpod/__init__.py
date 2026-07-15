@@ -136,28 +136,33 @@ class RunpodProvider:
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
-        d = handle.to_dict()
-        endpoint_id = d.get("endpoint_id")
-        job_id = d.get("job_id")
-        if not endpoint_id or not job_id:
+        strict = RunpodJobHandle.from_dict(handle.to_dict())
+        if not strict.job_id:
             raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
-        response = runpod_api.cancel_job(endpoint_id, job_id)
+        response = runpod_api.cancel_job(
+            strict.endpoint_id,
+            strict.job_id,
+            key_fingerprint=strict.key_fingerprint,
+        )
         if (
             not isinstance(response, dict)
-            or response.get("id") != job_id
+            or response.get("id") != strict.job_id
             or response.get("status") != "CANCELLED"
         ):
             raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
 
     def destroy(self, handle: JobHandle) -> None:
         from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
-        d = handle.to_dict()
-        endpoint_id = d.get("endpoint_id")
-        if endpoint_id and not runpod_api.delete_endpoint(endpoint_id):
+        strict = RunpodJobHandle.from_dict(handle.to_dict())
+        if not runpod_api.delete_endpoint_for_fingerprint(
+            strict.endpoint_id, strict.key_fingerprint
+        ):
             raise runpod_api.RunpodApiError(
-                f"runpod delete_endpoint({endpoint_id}) unconfirmed; endpoint may still bill"
+                f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"
             )
 
     def gc(self, spec) -> None:
