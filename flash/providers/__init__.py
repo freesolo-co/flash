@@ -21,8 +21,8 @@ from functools import cache
 
 from flash.providers.base import Provider
 
-# Registry / iteration order only — NOT a selection preference. Allocation ranks candidates purely
-# by price (see allocator.allocate), so runpod/lambda/vast get no tie-break edge from this order.
+# registry order is not a primary selection preference. it affects only exact full-key allocation
+# ties through Python's stable sort.
 PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
 
 # Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the

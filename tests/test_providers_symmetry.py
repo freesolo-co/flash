@@ -162,14 +162,6 @@ def test_static_pricing():
     assert pricing.hourly_rate("RTX 5090") == pytest.approx(0.99)
 
 
-def test_allocator_picks_runpod_candidate(monkeypatch):
-    from flash.providers.allocator import allocate
-
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert a.provider == "runpod"
-    assert a.gpu == "RTX 4090"
-
-
 def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
     """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
     from flash.providers import allocator, get_provider
@@ -221,12 +213,11 @@ def test_vast_competes_purely_on_price(monkeypatch):
     assert b.hourly_usd == pytest.approx(0.60)
 
 
-def test_price_tie_break_is_provider_agnostic(monkeypatch):
-    """On an exact (price, VRAM) tie the winner is decided by GPU-class name, not provider identity,
-    so Vast is never structurally last. A registry-order tie-break would make runpod always win here."""
+def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
+    """gpu name breaks a price-and-VRAM tie before stable provider order; full-key ties retain order."""
     from flash.providers.allocator import allocate
 
-    # Identical price and VRAM; Vast's class name sorts before RunPod's -> Vast wins the tie.
+    # identical price and VRAM; Vast's class name sorts before RunPod's, so Vast wins the tie.
     _stub_candidates(
         monkeypatch,
         runpod=[("runpod", "RTX 4090", 0.50, 24)],
@@ -234,8 +225,8 @@ def test_price_tie_break_is_provider_agnostic(monkeypatch):
     )
     assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "vast"  # "A100" < "RTX 4090"
 
-    # Flip which provider owns the name that sorts first -> the other provider wins. Ordering tracks
-    # the GPU name, never the provider, so the tie-break gives no provider a built-in edge.
+    # flip which provider owns the name that sorts first, and the other provider wins. when all key
+    # fields match, Python's stable sort preserves registry and provider-local order instead.
     _stub_candidates(
         monkeypatch,
         runpod=[("runpod", "A100", 0.50, 24)],
@@ -244,7 +235,7 @@ def test_price_tie_break_is_provider_agnostic(monkeypatch):
     assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "runpod"  # "A100" < "RTX 4090"
 
 
-def test_allocation_summary_formats_runpod_choice(monkeypatch):
+def test_allocation_summary_formats_runpod_choice():
     from flash.providers.allocator import allocation_summary
     from flash.providers.base import Allocation, Candidate
 

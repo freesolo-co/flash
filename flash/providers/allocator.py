@@ -53,10 +53,10 @@ def allocate(
     constraints = AllocationConstraints(disk_gb=disk_gb, max_wall_seconds=max_wall_seconds)
     candidates: list[Candidate] = []
     lookup_failed = False
-    # RunPod prices off a static table (no live lookup), so it never blips; Lambda/Vast query live
-    # capacity and can. A per-provider blip degrades to the others (we just skip it), but we remember it
-    # so an EMPTY result can be told apart from a genuine no-fit below. RunPod runs through the same
-    # try harmlessly (it never raises CapacityLookupError), so a 4th provider needs no edit here.
+    # runpod prices off a static table (no live lookup), so it never blips; lambda/vast query live
+    # capacity and can. a per-provider blip degrades to the others (we just skip it), but we remember it
+    # so an empty result can be told apart from a genuine no-fit below.
+    # runpod uses the same loop but does not raise CapacityLookupError.
     for name in available:
         try:
             candidates += get_provider(name).live_candidates(need, constraints)
@@ -76,8 +76,8 @@ def allocate(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
             f"({', '.join(available) or '(none)'}); the run genuinely exceeds every active GPU class"
         )
-    # Cheapest first; ties broken by VRAM (prefer smaller), then GPU class name. The tie-break is
-    # provider-agnostic, so runpod/lambda/vast compete purely on price with no structural edge.
+    # cheapest first; ties break by VRAM, then GPU class name. sorting is stable, so provider and
+    # provider-local order apply only when all three key fields match.
     ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, c.gpu))
     best = ranked[0]
     return Allocation(
