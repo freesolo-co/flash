@@ -448,6 +448,54 @@ def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
     assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["timeout_s"] <= 10.0
+    assert calls[0]["retry_unavailable"] is True
+
+
+def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise serving.RetryableServingUnavailable("adapter_loading", 0.25)
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving.time, "sleep", sleeps.append)
+
+    out = _run_smoke(_smoke_spec(thinking=False), budget_s=10.0)
+
+    assert out["verify_sample"] == "The answer is 4"
+    assert sleeps == [0.25]
+    assert len(calls) == 2
+    assert 0 < calls[1]["timeout_s"] <= calls[0]["timeout_s"] <= 10.0
+
+
+def test_run_deployment_smoke_retry_stays_inside_wall_clock_budget(monkeypatch):
+    clock = [100.0]
+    calls = []
+    sleeps = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        raise serving.RetryableServingUnavailable("engine_unavailable", 10.0)
+
+    def fake_sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(serving.time, "sleep", fake_sleep)
+
+    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
+        _run_smoke(_smoke_spec(thinking=False), budget_s=2.0)
+
+    assert len(calls) == 1
+    assert calls[0]["timeout_s"] == 2.0
+    assert sleeps == [2.0]
+    assert clock[0] == 102.0
 
 
 def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):

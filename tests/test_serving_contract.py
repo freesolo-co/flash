@@ -416,7 +416,11 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
         },
     }
     mismatched = {**expected, "repo_id": "other/repo"}
-    monkeypatch.setattr(deploy, "_registered_adapter", lambda adapter_id: mismatched)
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id, **_kwargs: mismatched,
+    )
 
     with pytest.raises(deploy.ServingError, match="different immutable identity"):
         deploy._wait_revision_ready(

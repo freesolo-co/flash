@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Callable, Iterator
@@ -21,8 +22,10 @@ logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 READBACK_DELAY_SECONDS = 2.0
+REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+_RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 
 
 class ServingError(RuntimeError):
@@ -45,6 +48,18 @@ class ActivationOutcomeUnknown(ServingError):
         )
         self.run_id = run_id
         self.attempted_revision = attempted_revision
+
+
+class RetryableServingUnavailable(ServingError):
+    """a recognized serving cold-start envelope that may be retried within a caller deadline."""
+
+    def __init__(self, code: str, retry_after_seconds: float):
+        super().__init__(
+            f"serving_retryable_unavailable: {code}",
+            status_code=503,
+        )
+        self.code = code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AdapterConfigMissing(ServingError):
@@ -89,10 +104,12 @@ def _serving_request(
     *,
     json: dict | None = None,
     ok_statuses: tuple[int, ...] = (),
+    timeout_s: float | None = None,
 ) -> httpx.Response:
     """Issue a request to the serving backend; translates failures into ServingError."""
-    # follow_redirects: Modal 303-redirects slow requests to an async-result poll URL.
-    kwargs: dict = {"headers": _internal_key_header(), "timeout": 60.0, "follow_redirects": True}
+    # follow_redirects: modal 303-redirects slow requests to an async-result poll url.
+    timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
+    kwargs: dict = {"headers": _internal_key_header(), "timeout": timeout, "follow_redirects": True}
     if json is not None:
         kwargs["json"] = json
     try:
@@ -434,9 +451,14 @@ def _adapter_url(adapter_id: str) -> str:
     return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
 
 
-def _registered_adapter(adapter_id: str) -> dict | None:
+def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
     """Read one authoritative adapter record, including disabled records."""
-    resp = _serving_request("GET", _adapter_url(adapter_id), ok_statuses=(404,))
+    resp = _serving_request(
+        "GET",
+        _adapter_url(adapter_id),
+        ok_statuses=(404,),
+        timeout_s=timeout_s,
+    )
     if resp.status_code == 404:
         return None
     try:
@@ -527,14 +549,24 @@ def _wait_revision_ready(
     subfolder: str,
     *,
     expected_identity: dict | None = None,
+    budget_s: float = REVISION_READY_BUDGET_SECONDS,
 ) -> dict:
+    deadline = time.monotonic() + max(0.0, float(budget_s))
     last_state = "registered"
     last_read_error: ServingError | None = None
-    for attempt in range(150):
-        if attempt:
-            time.sleep(READBACK_DELAY_SECONDS)
+    first_read = True
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not first_read:
+            time.sleep(min(READBACK_DELAY_SECONDS, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+        first_read = False
         try:
-            record = _registered_adapter(revision)
+            record = _registered_adapter(revision, timeout_s=remaining)
         except ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
@@ -712,6 +744,39 @@ def undeploy_adapter(run_id: str) -> dict:
     return payload
 
 
+def _retryable_smoke_unavailable(
+    response: httpx.Response,
+    *,
+    requested_model: str,
+) -> RetryableServingUnavailable | None:
+    if response.status_code != 503:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return None
+    error = payload["error"]
+    code = error.get("code")
+    if (
+        error.get("type") != "adapter_unavailable"
+        or error.get("retryable") is not True
+        or code not in _RETRYABLE_SMOKE_503_CODES
+        or error.get("requested_model") != requested_model
+        or error.get("adapter_revision") != requested_model
+    ):
+        return None
+    raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
+    try:
+        retry_after_seconds = float(raw_delay)
+    except (TypeError, ValueError):
+        retry_after_seconds = READBACK_DELAY_SECONDS
+    if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+        retry_after_seconds = READBACK_DELAY_SECONDS
+    return RetryableServingUnavailable(str(code), retry_after_seconds)
+
+
 def chat(
     run_id: str,
     messages: list[dict],
@@ -720,11 +785,12 @@ def chat(
     thinking: bool = False,
     expected_checkpoint: str | None = None,
     timeout_s: float | None = None,
+    retry_unavailable: bool = False,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
-    ``timeout_s`` overrides the default 30-minute request timeout; deployment smoke passes its
-    remaining budget here so one hanging generation cannot pin a deployment past its deadline.
+    ``timeout_s`` overrides the default 30-minute request timeout. deployment smoke also enables
+    recognized unavailable-envelope classification so its caller can retry within one deadline.
     """
     base = serving_openai_base_url()
     body = {
@@ -742,6 +808,10 @@ def chat(
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
     with httpx.Client(follow_redirects=True, max_redirects=100, timeout=timeout) as client:
         resp = client.post(f"{base}/chat/completions", json=body, headers=headers)
+    if retry_unavailable:
+        retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
+        if retryable_error is not None:
+            raise retryable_error
     resp.raise_for_status()
     payload = resp.json()
     if expected_checkpoint and isinstance(payload, dict):

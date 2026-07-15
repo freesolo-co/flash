@@ -305,7 +305,6 @@ def cancel_run(run_id: str) -> RunStatus:
                 status = mark_checkpoint_deployed(
                     run_id,
                     preserved_checkpoint,
-                    expect_state=status.state,
                     verification_generation=verified_adapter_revision_generation(run_id),
                     owner_deployment=owner_deployment,
                 )

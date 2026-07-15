@@ -36,7 +36,12 @@ from flash.runner import (
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import ActivationOutcomeUnknown, AdapterConfigMissing, ServingError
+from flash.serve.deploy import (
+    ActivationOutcomeUnknown,
+    AdapterConfigMissing,
+    RetryableServingUnavailable,
+    ServingError,
+)
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server import db
@@ -421,22 +426,36 @@ def _run_deployment_smoke(
     deadline = started + budget_s
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
-    result = _bounded_call(
-        lambda: _app.serve_chat(
-            run_id=serving_model,
-            messages=[{"role": "user", "content": _SMOKE_PROMPT}],
-            temperature=0.0,
-            max_tokens=256,
-            thinking=spec.thinking,
-            expected_checkpoint=expected_checkpoint,
-            timeout_s=remaining,
-        ),
-        deadline=deadline,
-        budget_s=budget_s,
-    )
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _smoke_timeout_error(budget_s)
+        try:
+
+            def _smoke_call(timeout_s: float = remaining):
+                return _app.serve_chat(
+                    run_id=serving_model,
+                    messages=[{"role": "user", "content": _SMOKE_PROMPT}],
+                    temperature=0.0,
+                    max_tokens=256,
+                    thinking=spec.thinking,
+                    expected_checkpoint=expected_checkpoint,
+                    timeout_s=timeout_s,
+                    retry_unavailable=True,
+                )
+
+            result = _bounded_call(
+                _smoke_call,
+                deadline=deadline,
+                budget_s=budget_s,
+            )
+        except RetryableServingUnavailable as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _smoke_timeout_error(budget_s) from exc
+            time.sleep(min(exc.retry_after_seconds, remaining))
+            continue
+        break
     content, finish = _smoke_provenance(result, serving_model, expected_checkpoint)
     if constraint and spec.thinking and finish == "length":
         raise ServingError("structured smoke generation was truncated at the maximum token length")
@@ -780,13 +799,15 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 ),
             )
         current_deployment = status.deployment or {}
+        current_deployment_state = current_deployment.get("state")
+        completed_unknown_activation = (
+            current_deployment_state == "reconciling"
+            and current_deployment.get("activation_outcome_unknown") is True
+        )
         if (
             not dry_run
-            and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
-            and not (
-                current_deployment.get("state") == "reconciling"
-                and current_deployment.get("activation_outcome_unknown")
-            )
+            and current_deployment_state in _DEPLOYMENT_BUSY_STATES
+            and not completed_unknown_activation
             and not _deployment_attempt_is_stale(current_deployment)
         ):
             raise HTTPException(

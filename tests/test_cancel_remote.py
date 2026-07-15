@@ -1023,6 +1023,90 @@ def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_p
     assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
 
 
+@pytest.mark.parametrize(
+    ("raced_state", "expected_state"),
+    [("done", "cancelled"), ("failed", "failed")],
+)
+def test_cancel_checkpoint_restore_survives_owned_run_state_race(
+    tmp_path, monkeypatch, raced_state, expected_state
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = f"flash-checkpoint-state-race-{raced_state}"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    busy = {
+        "state": "reconciling",
+        "requested_at": 456.0,
+        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = busy
+    orch._save_status(status)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
+    )
+    real_mark_checkpoint_deployed = orch.mark_checkpoint_deployed
+
+    def race_run_state(*args, **kwargs):
+        assert kwargs["owner_deployment"] == busy
+        assert "expect_state" not in kwargs
+        raced = orch.get_status(run_id)
+        assert raced.deployment == busy
+        raced.state = raced_state
+        orch._save_status(raced)
+        return real_mark_checkpoint_deployed(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "mark_checkpoint_deployed", race_run_state)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the still-owned checkpoint must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == expected_state
+    assert out.deployment == previous
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+def test_checkpoint_restore_owner_fence_rejects_newer_attempt(tmp_path, monkeypatch):
+    import flash.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-stale-restore"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    stale_owner = {
+        "state": "reconciling",
+        "requested_at": 100.0,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    newer_attempt = {
+        "state": "queued",
+        "requested_at": 200.0,
+        "previous_deployment": previous,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = newer_attempt
+    orch._save_status(status)
+
+    out = orch.mark_checkpoint_deployed(
+        run_id,
+        previous,
+        owner_deployment=stale_owner,
+        verification_generation=orch.verified_adapter_revision_generation(run_id),
+    )
+
+    assert out.deployment == newer_attempt
+    assert orch.get_status(run_id).deployment == newer_attempt
+
+
 def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority(
     tmp_path, monkeypatch
 ):

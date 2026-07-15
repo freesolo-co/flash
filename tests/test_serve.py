@@ -609,8 +609,10 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
         ready,
     ]
 
-    def fake_registered_adapter(adapter_id):
+    def fake_registered_adapter(adapter_id, *, timeout_s=None):
         assert adapter_id == revision
+        assert timeout_s is not None
+        assert timeout_s > 0
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -622,6 +624,54 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
 
     assert d._wait_revision_ready(revision, ready["subfolder"]) == ready
     assert sleeps == [d.READBACK_DELAY_SECONDS, d.READBACK_DELAY_SECONDS]
+
+
+def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+    clock = [100.0]
+    request_timeouts = []
+
+    def fake_registered_adapter(adapter_id, *, timeout_s=None):
+        assert adapter_id == revision
+        request_timeouts.append(timeout_s)
+        clock[0] += 3.0 if len(request_timeouts) == 1 else float(timeout_s)
+        raise d.ServingError("slow transient read", status_code=503)
+
+    def fake_sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(d, "READBACK_DELAY_SECONDS", 1.0)
+    monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(d.time, "sleep", fake_sleep)
+    monkeypatch.setattr(d, "_registered_adapter", fake_registered_adapter)
+
+    with pytest.raises(d.ServingError, match="readiness could not be confirmed"):
+        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+
+    assert request_timeouts == [5.0, 1.0]
+    assert clock[0] == 105.0
+
+
+def test_registered_adapter_caps_request_timeout(monkeypatch):
+    import flash.serve.deploy as d
+
+    seen = {}
+
+    class Response:
+        status_code = 404
+
+    def fake_get(url, **kwargs):
+        seen["url"] = url
+        seen.update(kwargs)
+        return Response()
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+
+    assert d._registered_adapter("run-1", timeout_s=0.75) is None
+    assert seen["timeout"] == 0.75
 
 
 def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
@@ -849,6 +899,120 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
+
+
+def test_chat_classifies_recognized_retryable_smoke_503(monkeypatch):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+
+    class Response:
+        status_code = 503
+
+        def __init__(self):
+            self.headers = {"Retry-After": "1.5"}
+
+        def json(self):
+            return {
+                "error": {
+                    "type": "adapter_unavailable",
+                    "code": "adapter_loading",
+                    "message": "adapter revision is loading",
+                    "retryable": True,
+                    "requested_model": revision,
+                    "adapter_revision": revision,
+                    "retry_after_seconds": 2,
+                }
+            }
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(d.httpx, "Client", Client)
+
+    with pytest.raises(d.RetryableServingUnavailable) as exc_info:
+        d.chat(
+            revision,
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
+
+    assert exc_info.value.code == "adapter_loading"
+    assert exc_info.value.retry_after_seconds == 1.5
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {
+            "type": "adapter_unavailable",
+            "code": "adapter_load_failed",
+            "retryable": True,
+        },
+        {
+            "type": "adapter_unavailable",
+            "code": "adapter_loading",
+            "retryable": False,
+        },
+    ],
+)
+def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
+    import flash.serve.deploy as d
+
+    revision = "run-1@final." + "a" * 40
+
+    class Response:
+        status_code = 503
+
+        def __init__(self):
+            self.headers = {"Retry-After": "1"}
+            self.request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+
+        def json(self):
+            return {
+                "error": {
+                    **error,
+                    "requested_model": revision,
+                    "adapter_revision": revision,
+                }
+            }
+
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("unavailable", request=self.request, response=self)
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(d.httpx, "Client", Client)
+
+    with pytest.raises(d.httpx.HTTPStatusError):
+        d.chat(
+            revision,
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
