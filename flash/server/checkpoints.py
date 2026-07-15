@@ -1,4 +1,4 @@
-"""Mirror a run's deployable RL checkpoints to the freesolo backend.
+"""Mirror a run's deployable training checkpoints to the freesolo backend.
 
 The worker streams each step's LoRA adapter to the run's HF repo; HF is the source of truth
 for what's deployable. This module persists that list to the backend's ``run_checkpoints``
@@ -18,7 +18,6 @@ quietly (HF stays the source of truth) — only genuine backend failures warn.""
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
@@ -93,7 +92,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         register_run_checkpoints(
             internal_key=token, status=status, checkpoints=checkpoints
         )
-    except (ValueError, urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")
         return 0
     _log(f"[ckpt] registered {len(checkpoints)} checkpoint(s) for {status.run_id}")
