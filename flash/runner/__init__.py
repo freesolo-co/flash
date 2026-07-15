@@ -99,11 +99,15 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
         planned = int(cfg.steps or 0)
         if planned > 0:
             n = min(n, planned)
+        # a partial (cancelled) reprice only counts required saves that could already have landed by
+        # the completed step; keeping a save beyond the reduced horizon would also trip the run
+        # config's save_at_steps <= steps guard and drop the whole estimate to the fallback.
+        reached_saves = tuple(s for s in cfg.save_at_steps if s <= n)
         if not cfg.is_grpo and cfg.train_tokens and planned > 0:
             scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
-            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens)
+            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens, save_at_steps=reached_saves)
         else:
-            cfg = replace(cfg, steps=n)
+            cfg = replace(cfg, steps=n, save_at_steps=reached_saves)
         return float(estimate_cost(cfg).total_usd)
     except Exception:
         return float(fallback)
@@ -242,7 +246,6 @@ def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
             raise RuntimeError("run attempt identity is exhausted")
         _save_status_unlocked(status, _next_attempt=attempt + 1)
         return attempt
-
 
 
 @dataclass
@@ -1175,7 +1178,13 @@ def _remote_resource_identity(remote: object) -> tuple | None:
             from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
             handle = RunpodJobHandle.from_dict(remote)
-            return provider, handle.attempt, handle.endpoint_id, handle.job_id, handle.key_fingerprint
+            return (
+                provider,
+                handle.attempt,
+                handle.endpoint_id,
+                handle.job_id,
+                handle.key_fingerprint,
+            )
         if provider == "lambda":
             from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
 

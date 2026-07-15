@@ -32,11 +32,11 @@ from dataclasses import dataclass
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE, resolve_teacher
 from flash.engine.steps import (
-    checkpoint_step_due,
-    final_checkpoint_due,
+    final_save_due,
     on_policy_steps,
     resolve_update_horizon,
-    validate_checkpoint_horizon,
+    save_step_due,
+    validate_save_steps,
 )
 from flash.engine.structured_outputs import (
     describe_structured_outputs,
@@ -164,7 +164,7 @@ class OpdKnobs:
     kl_coef: float = 1.0
     save_every: int = 0
     max_steps: int = 0
-    checkpoint_landmarks: tuple[int, ...] = ()
+    save_at_steps: tuple[int, ...] = ()
     max_length: int = 0
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
     # scores/trains on text past the intended answer boundary.
@@ -224,7 +224,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
         kl_coef=kl_coef,
         save_every=int(opt("save_every", 0) or 20),
         max_steps=int(opt("max_steps", 0) or 0),
-        checkpoint_landmarks=tuple(getattr(t, "checkpoint_landmarks", ()) or ()),
+        save_at_steps=tuple(getattr(t, "save_at_steps", ()) or ()),
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
         structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
@@ -498,7 +498,7 @@ def run_opd():
         prompts_per_step=prompts_per_step,
     )
     steps = resolve_update_horizon(derived_steps, knobs.max_steps)
-    validate_checkpoint_horizon(knobs.checkpoint_landmarks, steps)
+    validate_save_steps(knobs.save_at_steps, steps)
     print(
         f"[opd] epochs={knobs.epochs} over {len(examples)} retained prompt(s) at "
         f"{prompts_per_step} prompts/step -> derived_steps={derived_steps} "
@@ -1015,15 +1015,15 @@ def run_opd():
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
             # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
             # warm-start/deploy from step-N would use fewer updates than its name implies.
-            if checkpoint_step_due(opt_steps, knobs.checkpoint_landmarks, knobs.save_every):
+            if save_step_due(opt_steps, knobs.save_at_steps, knobs.save_every):
                 _save_adapter(model, tok, adapter_dir)
-                is_landmark = opt_steps in knobs.checkpoint_landmarks
+                is_required_save = opt_steps in knobs.save_at_steps
                 _publish_opd_deployable(
                     adapter_dir,
                     opt_steps,
                     as_default=False,
-                    best_effort=not is_landmark,
-                    checkpoint_required=is_landmark,
+                    best_effort=not is_required_save,
+                    save_required=is_required_save,
                 )
 
     train_wall = time.time() - t_train
@@ -1074,12 +1074,12 @@ def run_opd():
         )
 
     _save_adapter(model, tok, adapter_dir)
-    # keep the served default while suppressing non-landmark final checkpoints.
+    # keep the served default while suppressing unrequested final checkpoints.
     _publish_opd_deployable(
         adapter_dir,
         opt_steps,
         as_default=True,
-        publish_checkpoint=final_checkpoint_due(opt_steps, knobs.checkpoint_landmarks),
+        publish_checkpoint=final_save_due(opt_steps, knobs.save_at_steps),
     )
     # step=opt_steps on this (unthrottled) final ping AND on the opd_train_done ping below keeps the
     # persisted heartbeat's step at the true completed count. Without it, a cancel landing after the
@@ -1755,14 +1755,14 @@ def _publish_opd_deployable(
     as_default: bool,
     best_effort: bool = False,
     publish_checkpoint: bool = True,
-    checkpoint_required: bool = False,
+    save_required: bool = False,
 ) -> None:
     """Publish the served default and, when requested, the step checkpoint."""
     try:
         if as_default:
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         if publish_checkpoint:
-            if checkpoint_required:
+            if save_required:
                 _w.publish_deployable_checkpoint(
                     adapter_dir,
                     step,

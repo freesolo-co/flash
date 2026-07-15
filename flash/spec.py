@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
+
+# default for old payloads and callers that do not select a per-run seed.
+FIXED_SEED = 42
+_MAX_SEED = 2**63 - 1
 
 
 def _str_tuple(value: Any) -> tuple[str, ...]:
@@ -79,13 +83,60 @@ def _opt_float(value: Any) -> float | None:
     return float(value)
 
 
-def _seed(value: Any) -> int:
+def parse_seed(value: Any = FIXED_SEED) -> int:
     """Parse one bounded nonnegative per-run seed without coercing floats or bools."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("seed must be an integer")
-    if value < 0 or value > 2**63 - 1:
-        raise ValueError("seed must be between 0 and 9223372036854775807")
+    if value < 0 or value > _MAX_SEED:
+        raise ValueError(f"seed must be between 0 and {_MAX_SEED}")
     return value
+
+
+def parse_max_steps(value: Any) -> int | None:
+    """Parse the optional exact optimizer-update horizon without numeric coercion.
+
+    a positive value is the authoritative update horizon. absent or non-positive (zero or negative)
+    means "use the derived update count", canonicalized to none so a single sentinel represents
+    "not authoritative" everywhere (parse, serialize, resolve_update_horizon, save_at_steps).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("train.max_steps must be an integer or null")
+    return value if value > 0 else None
+
+
+RESERVED_WORKER_ENV_KEYS = frozenset({"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED"})
+
+
+def validate_worker_env_reserved(worker_env: Any) -> None:
+    """Reject worker env overrides for control-plane-owned fields."""
+    if not isinstance(worker_env, dict):
+        return
+    conflicts = sorted(
+        str(key) for key in worker_env if str(key).upper() in RESERVED_WORKER_ENV_KEYS
+    )
+    if conflicts:
+        detail = (
+            "; set top-level seed instead"
+            if any(key.upper() == "SEED" for key in conflicts)
+            else ""
+        )
+        raise ValueError(
+            f"[worker_env] must not override control-plane key(s): {', '.join(conflicts)}{detail}"
+        )
+
+
+def require_matching_seed(spec: JobSpec, seed: Any) -> int:
+    """Require the retained provider seed argument to match the authoritative JobSpec seed."""
+    provided = parse_seed(seed)
+    canonical = parse_seed(spec.seed)
+    if provided != canonical:
+        raise ValueError(
+            f"provider seed {provided} does not match JobSpec.seed {canonical}; "
+            "use spec.seed as the provider seed"
+        )
+    return canonical
 
 
 def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
@@ -120,10 +171,6 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# default for old payloads and callers that do not select a per-run seed.
-FIXED_SEED = 42
-
-
 @dataclass(frozen=True)
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -143,7 +190,7 @@ class TrainSpec:
     max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     save_every: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_steps: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    checkpoint_landmarks: tuple[int, ...] = field(default=(), metadata={"introduced_in": "0.2.57"})
+    save_at_steps: tuple[int, ...] = field(default=(), metadata={"introduced_in": "0.2.57"})
     max_examples: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     group_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -158,22 +205,20 @@ class TrainSpec:
     # "accounts/fireworks/models/glm-5p2"). "" => the recipe default (GLM 5.2).
     teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
     stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
-    # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
-    # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
+    # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once
+    # at parse time (schema/fields.py) so worker/hub/api hops carry one stable string form.
     structured_outputs: str = field(default="", metadata={"introduced_in": "0.2.56"})
 
     def __post_init__(self) -> None:
-        landmarks = parse_positive_int_tuple(
-            self.checkpoint_landmarks, name="train.checkpoint_landmarks"
-        )
-        object.__setattr__(self, "checkpoint_landmarks", landmarks)
-        max_steps = int(self.max_steps or 0)
-        if landmarks and max_steps <= 0:
-            raise ValueError("train.checkpoint_landmarks requires positive train.max_steps")
-        if landmarks and landmarks[-1] > max_steps:
-            raise ValueError(
-                "train.checkpoint_landmarks cannot contain a step beyond train.max_steps"
-            )
+        max_steps = parse_max_steps(self.max_steps)
+        save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="train.save_at_steps")
+        object.__setattr__(self, "max_steps", max_steps)
+        object.__setattr__(self, "save_at_steps", save_at_steps)
+        effective_max_steps = max_steps or 0
+        if save_at_steps and effective_max_steps <= 0:
+            raise ValueError("train.save_at_steps requires positive train.max_steps")
+        if save_at_steps and save_at_steps[-1] > effective_max_steps:
+            raise ValueError("train.save_at_steps cannot contain a step beyond train.max_steps")
 
 
 @dataclass(frozen=True)
@@ -203,15 +248,16 @@ class JobSpec:
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
     seed: int = FIXED_SEED
-    # Per-run env overrides forwarded to the GPU worker; never put secrets here.
+    # per-run env overrides forwarded to the gpu worker; never put secrets here.
     worker_env: dict[str, str] = field(default_factory=dict)
-    # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
+    # "catalog" (curated models only) or "allow" (any hf model that fits the gpu).
     model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
 
     def __post_init__(self) -> None:
-        _seed(self.seed)
+        object.__setattr__(self, "seed", parse_seed(self.seed))
+        validate_worker_env_reserved(self.worker_env)
 
     @property
     def phase(self) -> str:
@@ -242,7 +288,14 @@ class JobSpec:
                 "local environment paths are no longer supported; the worker only runs "
                 "published Freesolo environment ids"
             )
-        train = data.get("train") or {}
+        train = data.get("train", {})
+        if train is None:
+            train = {}
+        if not isinstance(train, dict):
+            raise TypeError("train must be an object")
+        unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
+        if unknown_train:
+            raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")
         gpu = data.get("gpu") or {}
         return cls(
             model=data.get("model", cls.model),
@@ -265,10 +318,8 @@ class JobSpec:
                 batch_size=_opt_int(train.get("batch_size")),
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
-                max_steps=_opt_int(train.get("max_steps")),
-                checkpoint_landmarks=parse_positive_int_tuple(
-                    train.get("checkpoint_landmarks"), name="train.checkpoint_landmarks"
-                ),
+                max_steps=parse_max_steps(train.get("max_steps")),
+                save_at_steps=train.get("save_at_steps"),
                 max_examples=_opt_int(train.get("max_examples")),
                 group_size=_opt_int(train.get("group_size")),
                 temperature=_opt_float(train.get("temperature")),
@@ -292,11 +343,11 @@ class JobSpec:
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),
-            seed=_seed(data.get("seed", FIXED_SEED)),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
+            seed=parse_seed(data.get("seed", FIXED_SEED)),
         )
 
     @classmethod
