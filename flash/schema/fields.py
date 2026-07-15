@@ -293,7 +293,7 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
     """Parse [environment].secrets as declared worker env-var secret names."""
     if raw is None:
         return ()
-    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+    if not isinstance(raw, (list, tuple)):
         raise ConfigError("[environment] secrets must be a list of environment variable names")
     if not all(isinstance(name, str) for name in raw):
         raise ConfigError("[environment] secrets entries must be strings")

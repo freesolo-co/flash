@@ -30,7 +30,7 @@ from flash.schema.fields import (
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.spec import FIXED_SEED, EnvironmentSpec, GpuSpec, JobSpec, TrainSpec, parse_seed
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -55,12 +55,7 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
     if match is None:
         return None
     step = match.group("step")
-    if step is None:
-        return match.group("run_id"), None
-    try:
-        return match.group("run_id"), int(step)
-    except ValueError:
-        return None
+    return match.group("run_id"), int(step) if step is not None else None
 
 
 def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
@@ -171,13 +166,12 @@ def spec_and_train_keys_from_file(
     return spec_from_dict(raw, run_id=run_id), authored_train_keys
 
 
-def _deep_merge(base: dict, extra: dict) -> dict:
+def _deep_merge(base: dict, extra: dict) -> None:
     for k, v in extra.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
             _deep_merge(base[k], v)
         else:
             base[k] = v
-    return base
 
 
 def _apply_override(raw: dict, item: str) -> None:
@@ -204,12 +198,10 @@ def _apply_override(raw: dict, item: str) -> None:
 
 
 def _job_seed(raw: dict[str, Any]) -> int:
-    value = raw.get("seed", 42)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError("seed must be an integer")
-    if value < 0 or value > 2**63 - 1:
-        raise ConfigError("seed must be between 0 and 9223372036854775807")
-    return value
+    try:
+        return parse_seed(raw.get("seed", FIXED_SEED))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
@@ -229,9 +221,9 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# Unknown tables are rejected loudly: a stray [grpo] table silently dropped GRPO knobs and trained
-# at 16x-cost defaults. Platform-managed keys (gpu, run_id, hf_repo) remain recognized (not
-# rejected) so a round-tripped JobSpec.to_dict() doesn't fail re-validation on submit.
+# unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
+# at 16x-cost defaults. managed fields remain recognized in their canonical sections so a
+# a round trip through public serialization does not fail re-validation on submit.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
@@ -393,10 +385,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
     max_steps = _train_int(train_raw, "max_steps", minimum=0)
     checkpoint_landmarks = _train_positive_int_tuple(train_raw, "checkpoint_landmarks")
-    if checkpoint_landmarks and not max_steps:
-        raise ConfigError("train.checkpoint_landmarks requires positive train.max_steps")
-    if checkpoint_landmarks and checkpoint_landmarks[-1] > int(max_steps or 0):
-        raise ConfigError("train.checkpoint_landmarks cannot contain a step beyond train.max_steps")
+    if checkpoint_landmarks:
+        if not max_steps:
+            raise ConfigError("train.checkpoint_landmarks requires positive train.max_steps")
+        if checkpoint_landmarks[-1] > max_steps:
+            raise ConfigError(
+                "train.checkpoint_landmarks cannot contain a step beyond train.max_steps"
+            )
 
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
@@ -461,9 +456,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
 
 def _validate_sft(spec: JobSpec) -> None:
-    """SFT contract: positive epochs, and a positive row count to price/train against."""
-    if spec.train.epochs is not None and spec.train.epochs <= 0:
-        raise ConfigError("train.epochs must be positive for SFT")
+    """validate sft row-count and structured-output constraints."""
     if int(spec.train.max_examples or 0) <= 0:
         raise ConfigError(
             "train.max_examples must be set to a positive row count for SFT "
@@ -479,7 +472,7 @@ def _validate_sft(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """GRPO contract: epochs derive passes over retained prompts."""
+    """validate the grpo group-size constraint."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
@@ -488,10 +481,7 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """OPD contract: epochs derive passes over retained prompts.
-
-    The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
-    the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
+    """validate that the opd context budget leaves room for a prompt."""
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is
@@ -533,8 +523,3 @@ def _validate_spec(spec: JobSpec) -> None:
         spec.environment.id,
         '[environment] id must be a Freesolo environment id (for example "your-name/your-env")',
     )
-    if spec.train.lora_rank <= 0:
-        raise ConfigError("train.lora_rank must be positive")
-    # lora_alpha=0 produces a no-op adapter (zero scaling at serve) — reject up front.
-    if spec.train.lora_alpha <= 0:
-        raise ConfigError("train.lora_alpha must be positive")

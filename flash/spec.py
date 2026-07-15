@@ -79,7 +79,7 @@ def _opt_float(value: Any) -> float | None:
     return float(value)
 
 
-def _seed(value: Any) -> int:
+def parse_seed(value: Any) -> int:
     """Parse one bounded nonnegative per-run seed without coercing floats or bools."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("seed must be an integer")
@@ -211,7 +211,7 @@ class JobSpec:
     wandb: WandbSpec = field(default_factory=WandbSpec)
 
     def __post_init__(self) -> None:
-        _seed(self.seed)
+        parse_seed(self.seed)
 
     @property
     def phase(self) -> str:
@@ -292,7 +292,7 @@ class JobSpec:
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),
-            seed=_seed(data.get("seed", FIXED_SEED)),
+            seed=parse_seed(data.get("seed", FIXED_SEED)),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
