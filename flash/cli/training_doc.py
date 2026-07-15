@@ -95,6 +95,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
+# seed = 42                 # reproducible per-run seed; omitted defaults to 42
 
 [environment]
 id = "your-org/my-env"      # the id printed by `flash env push`
@@ -105,6 +106,8 @@ id = "your-org/my-env"      # the id printed by `flash env push`
 [train]
 epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
+# max_steps = 100           # positive values set the exact optimizer-update horizon
+# save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
@@ -113,7 +116,8 @@ lora_alpha = 64
 GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
 `train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
 and run artifacts are stored in a private environment-scoped repo with content-addressed
-Flash code snapshots. Compose or tweak configs without editing files: `--config
+Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
+`SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
 extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
 
 ### 4. Submit
@@ -355,13 +359,12 @@ Pick SFT when you already have good answers and want the model to imitate them.
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. Warm-start CONTINUES the one SFT adapter in place — GRPO/OPD keep training
   the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
-  adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank`. Set
-  `lora_rank` EQUAL to the SFT run's rank and within the serving cap (some serving models
-  allow rank 128, larger serving paths cap at 64). Flash preflights both before the run:
-  it rejects an adapter over the cap, and rejects a `lora_rank` that disagrees with the
-  continued adapter — because the trainer ignores `lora_rank` for a warm-start but the
-  cost/GPU-allocation/GRPO-sleep sizing all read it, so a mismatch mis-quotes and mis-sizes
-  the run.
+  adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
+  serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
+  for a warm-start: the source adapter's rank/alpha metadata is authoritative. Flash reads the
+  rank from the source adapter and uses it for cost, GPU allocation, and GRPO-sleep sizing, so
+  setting `lora_rank` alongside `init_from_adapter` is rejected at submit; it also rejects a
+  source adapter whose rank exceeds the serving cap.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
@@ -371,14 +374,17 @@ algorithm = "grpo"
 # the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
 # specific checkpoint listed by `flash checkpoints <run-id>`
 init_from_adapter = "<sft-run-id>"
-lora_rank = 32     # MUST equal the SFT run's lora_rank (32 above): the warm-start continues that
-                   # adapter at its rank; a mismatch is rejected at submit
-lora_alpha = 64
+# do NOT set lora_rank / lora_alpha for a warm-start: the source adapter's rank and alpha
+# metadata are authoritative, and setting lora_rank alongside init_from_adapter is rejected
 ```
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
-optimizer-step counts are derived from those epochs.
+optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
+derived count with an exact update horizon for every algorithm. `[train] save_at_steps`
+requires a positive `max_steps` so its horizon is authoritative even when SFT packing changes the
+realized batch shape. When non-empty, exact save steps suppress periodic `save_every` checkpoints, and the
+run fails if a requested exact save cannot be saved and published.
 
 ---
 
@@ -442,29 +448,24 @@ lora_rank = 32
 #                                                       # glm-5.2 (default) | deepseek-v4-pro | kimi-k2.6
 #                                                       # (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
-# opd_eos_loss_coef = 0.5                               # terminal-EOS reinforcement; raise if the
-#                                                       # student runs past the length cap without
-#                                                       # stopping, 0 to disable
 ```
 
 The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
-the zero-width stop token** — distilling toward a verbose teacher (e.g. GLM-5.2) erodes the student's
-termination and rollouts run away to `max_completion_tokens`. `opd_eos_loss_coef` (default 0.5) adds a
-bounded, self-limiting behaviour-cloning term that reinstates the stop signal on rollouts that
-terminated naturally; watch `truncated_rollouts` fall and `mean_eos_logprob` rise in the run metrics.
-Warm-starting from an SFT adapter (which already encodes termination) compounds it.
+the zero-width stop token**. No auxiliary EOS loss is applied. `truncated_rollouts` records completions
+that reached the length cap without EOS or a configured stop. Warm-starting from an SFT adapter can
+still improve initial termination behavior.
 
-A verbose teacher also hurts in a way the stop-token term can't reach: it inflates the *content* the
-student distils toward — long per-turn reasoning and extra multi-turn looping — so episodes still
-forfeit against the length/turn budget even once EOS is supervised. Because the teacher scores the
+A verbose teacher can also inflate the *content* the student distils toward through long per-turn
+reasoning and extra multi-turn looping, so episodes still forfeit against the length/turn budget
+regardless of stop-token behavior. Because the teacher scores the
 student's rollouts **conditioned on your environment's own system prompt**, you can shrink its target
 distribution at the source: give the prompt used for OPD rollouts a **hard, specific reasoning
 budget** — e.g. "reason in at most two or three sentences, then act; once you have started, do not
 reconsider" — rather than a vague "be brief." The phrasing matters. A soft brevity request can
 **backfire on a thinking teacher**, trimming the median while *inflating* the long tail (the model
 spirals when told to be brief on a problem it finds hard), which is exactly the tail that drives
-runaway. Constrain the content with the prompt and reinstate the stop with `opd_eos_loss_coef` —
-they are complementary, and both assume the teacher is still strong at the task (vet it first, above).
+runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
+failures. This assumes the teacher is still strong at the task (vet it first, above).
 
 ---
 
@@ -525,7 +526,7 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 | Repetition / looping collapse | the same phrase repeats until truncation | repetition or length penalty; lower `temperature` |
 | Overthinking / verbose reasoning | reasoning eats the whole token budget | `thinking_length_penalty_coef`; tighten the prompt with a *hard, specific* budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail |
 | Completion truncation | answers cut off mid-thought | raise `max_completion_tokens` / `max_context_tokens` |
-| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | raise `opd_eos_loss_coef` and warm-start from SFT — the reverse-KL can't supervise the stop token on its own. Also shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task — a bad teacher is distilled in, not out. |
+| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | No auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the *teacher's* reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out. |
 | Unparsed / over-escaped output | reward can't read the answer | robust parser; return `0.0` on parse fail; format gate |
 | Wrapper / markdown around structured output | prose around the JSON/answer | a format gate; `stop_sequences` |
 | Uniform-reward groups | every rollout in a group scores the same → no gradient | shape the reward for partial credit; raise `temperature` |

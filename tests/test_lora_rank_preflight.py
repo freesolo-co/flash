@@ -1,138 +1,294 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
-from flash.lora_rank import preflight_init_adapter_lora_rank, resolve_adapter_ref
+from flash.lora_rank import (
+    adapter_artifact_identity,
+    alpha_from_adapter_config,
+    inspect_adapter_config,
+    preflight_init_adapter_lora_rank,
+    rank_from_adapter_config,
+    resolve_adapter_ref,
+)
 from flash.schema import spec_from_dict
 
 _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
-def _spec(*, model: str = "Qwen/Qwen3.5-4B", rank: int = 16, algorithm: str = "grpo"):
-    train = {
-        "epochs": 1,
-        "max_examples": 8,
-        "lora_rank": rank,
-    }
+def _spec(*, rank: int = 16, alpha: int = 32):
     spec = spec_from_dict(
         {
-            "model": model,
-            "algorithm": algorithm,
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-            "train": train,
+            "train": {
+                "epochs": 1,
+                "max_examples": 8,
+                "lora_rank": rank,
+                "lora_alpha": alpha,
+            },
         }
     )
     return replace(spec, train=replace(spec.train, init_from_adapter=_ADAPTER_REF))
 
 
-def _loader(config):
-    return lambda adapter_ref, token: config
+def _config(**overrides):
+    config = {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "r": 16,
+        "lora_alpha": 32,
+    }
+    config.update(overrides)
+    return config
 
 
-def test_init_adapter_preflight_rejects_adapter_rank_above_serving_cap():
-    # Qwen3.5-4B serving cap is now max_lora_rank=64 (doubled from 32); a rank-96 adapter still exceeds it.
-    spec = _spec(rank=16)
-
-    with pytest.raises(ValueError, match=r"has rank 96.*serving max_lora_rank=64"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 96}))
-
-
-def test_init_adapter_preflight_allows_empty_vl_patterns():
-    spec = _spec(rank=16)
-
-    preflight_init_adapter_lora_rank(
-        spec,
-        config_loader=_loader({"r": 16, "rank_pattern": {}, "alpha_pattern": {}}),
+def test_rank_and_alpha_use_maximum_pattern_values():
+    config = _config(
+        rank_pattern={"a": 64, "b": 8},
+        alpha_pattern={"a": 128, "b": 16},
     )
+    assert rank_from_adapter_config(config, source="adapter") == 64
+    assert alpha_from_adapter_config(config, source="adapter") == 128
 
 
-@pytest.mark.parametrize("value", [0, "", [], False])
-def test_init_adapter_preflight_rejects_falsey_invalid_rank_pattern(value):
-    # rank_from_adapter_config rejects a non-Mapping rank_pattern (falsey-but-not-None values are the
-    # tricky cases); alpha_pattern is no longer inspected by the single-adapter rank preflight.
-    spec = _spec(rank=16)
+def test_preflight_accepts_child_rank_and_alpha_mismatches():
+    metadata = preflight_init_adapter_lora_rank(
+        _spec(rank=8, alpha=16),
+        config_loader=lambda _ref, _token, _revision: _config(r=64, lora_alpha=128),
+    )
+    assert metadata is not None
+    assert metadata.rank == 64
+    assert metadata.alpha == 128
 
-    with pytest.raises(ValueError, match="rank_pattern"):
+
+def test_preflight_rejects_adapter_rank_above_serving_cap():
+    with pytest.raises(ValueError, match=r"rank 96.*serving max_lora_rank=64"):
         preflight_init_adapter_lora_rank(
-            spec,
-            config_loader=_loader({"r": 16, "rank_pattern": value}),
+            _spec(), config_loader=lambda _ref, _token, _revision: _config(r=96)
         )
 
 
-def test_init_adapter_preflight_checks_adapter_rank_for_sft_warm_start():
-    # Qwen3.5-0.8B serving cap is now max_lora_rank=128 (doubled from 64); a rank-160 adapter exceeds it.
-    spec = _spec(model="Qwen/Qwen3.5-0.8B", rank=32, algorithm="sft")
-
-    with pytest.raises(ValueError, match=r"has rank 160.*serving max_lora_rank=128"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 160}))
-
-
-def test_init_adapter_preflight_rejects_lora_rank_below_source_rank():
-    # The reported bug: a rank-64 source with the default lora_rank=32 fits the serving cap (64) but
-    # would be cost/allocator/GRPO-sleep sized as rank 32 and then run/serve at the source's rank 64.
-    spec = _spec(model="Qwen/Qwen3.5-4B", rank=32)
-
-    with pytest.raises(
-        ValueError, match=r"train\.lora_rank=32 does not match.*rank 64.*Set train\.lora_rank=64"
-    ):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 64}))
+@pytest.mark.parametrize("field", ["rank_pattern", "alpha_pattern"])
+@pytest.mark.parametrize("value", [0, "", [], False])
+def test_preflight_rejects_invalid_patterns(field, value):
+    with pytest.raises(ValueError, match=field):
+        preflight_init_adapter_lora_rank(
+            _spec(), config_loader=lambda _ref, _token, _revision: _config(**{field: value})
+        )
 
 
-def test_init_adapter_preflight_rejects_lora_rank_above_source_rank():
-    # A too-high lora_rank is also a mismatch: the continued adapter is rank 16, so sizing at 32 is
-    # wrong (and misleading) even though it merely over-provisions rather than OOMs.
-    spec = _spec(model="Qwen/Qwen3.5-4B", rank=32)
-
-    with pytest.raises(ValueError, match=r"train\.lora_rank=32 does not match.*rank 16"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 16}))
-
-
-def test_init_adapter_preflight_allows_lora_rank_matching_source_rank():
-    # The common warm-start: lora_rank equals the continued source adapter's rank -> passes.
-    spec = _spec(model="Qwen/Qwen3.5-4B", rank=64)
-
-    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 64}))
+@pytest.mark.parametrize("value", [None, "", "IA3"])
+def test_inspection_requires_lora_peft_type(value):
+    with pytest.raises(ValueError, match="peft_type must be LORA"):
+        inspect_adapter_config(
+            _config(peft_type=value), source="adapter", target_model="Qwen/Qwen3.5-4B"
+        )
 
 
-def test_init_adapter_preflight_serving_cap_precedes_rank_mismatch():
-    # When the source both exceeds the cap AND mismatches lora_rank, the cap violation (the harder
-    # blocker) is reported first so the user fixes the undeployable rank before the sizing mismatch.
-    spec = _spec(model="Qwen/Qwen3.5-4B", rank=32)
-
-    with pytest.raises(ValueError, match=r"has rank 128.*serving max_lora_rank=64"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 128}))
+def test_inspection_rejects_incompatible_task_type():
+    with pytest.raises(ValueError, match="task_type must be CAUSAL_LM"):
+        inspect_adapter_config(
+            _config(task_type="SEQ_CLS"), source="adapter", target_model="Qwen/Qwen3.5-4B"
+        )
 
 
-def _open_policy_spec(*, rank: int):
-    # Open-policy / uncataloged model -> serving_lora_rank_cap is None (no serving entry).
-    from flash.spec import JobSpec, TrainSpec
+def test_inspection_rejects_incompatible_base_model():
+    with pytest.raises(ValueError, match=r"base model.*does not match target model"):
+        inspect_adapter_config(
+            _config(base_model_name_or_path="Qwen/Qwen3.5-0.8B"),
+            source="adapter",
+            target_model="Qwen/Qwen3.5-4B",
+        )
 
-    return JobSpec(
-        model="mistralai/Mistral-7B-v0.1",
-        algorithm="grpo",
-        model_policy="allow",
-        train=TrainSpec(
-            epochs=1, max_examples=8, lora_rank=rank, init_from_adapter=_ADAPTER_REF
-        ),
+
+def test_inspection_allows_empty_optional_compatibility_fields():
+    metadata = inspect_adapter_config(
+        _config(base_model_name_or_path="", task_type=""),
+        source="adapter",
+        target_model="Qwen/Qwen3.5-4B",
+    )
+    assert metadata.rank == 16
+    assert metadata.alpha == 32
+
+
+def test_inspection_requires_alpha_metadata():
+    config = _config()
+    config.pop("lora_alpha")
+    with pytest.raises(ValueError, match="no LoRA alpha metadata"):
+        inspect_adapter_config(config, source="adapter", target_model="Qwen/Qwen3.5-4B")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.5, float("nan"), float("inf"), [], {}, "1.5", "nan", "inf", "x"],
+)
+def test_rank_metadata_rejects_non_integral_or_malformed_values(value):
+    with pytest.raises(ValueError, match="invalid r"):
+        rank_from_adapter_config(_config(r=value), source="adapter")
+
+
+@pytest.mark.parametrize("value", [1, 1.0, "1", "+1", "1.0", "1e0"])
+def test_rank_metadata_accepts_deliberate_integral_representations(value):
+    assert rank_from_adapter_config(_config(r=value), source="adapter") == 1
+
+
+def test_rank_metadata_parses_large_integral_decimal_string_exactly():
+    assert (
+        rank_from_adapter_config(_config(r="9007199254740993.0"), source="adapter")
+        == 9007199254740993
     )
 
 
-def test_init_adapter_preflight_rejects_rank_mismatch_for_uncapped_model():
-    # No serving cap, but the mismatch is cap-INDEPENDENT: cost/allocator/GRPO-sleep still read
-    # train.lora_rank, so a rank-64 source with lora_rank=32 is billed and placed at 32 then OOMs at 64.
-    spec = _open_policy_spec(rank=32)
-
-    with pytest.raises(ValueError, match=r"train\.lora_rank=32 does not match.*rank 64"):
-        preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 64}))
+def test_rank_metadata_rejects_inexact_decimal_string():
+    with pytest.raises(ValueError, match="invalid r"):
+        rank_from_adapter_config(_config(r="1.0000000000000001"), source="adapter")
 
 
-def test_init_adapter_preflight_allows_matching_rank_for_uncapped_model():
-    # A capless model with lora_rank equal to the continued adapter's rank passes.
-    spec = _open_policy_spec(rank=64)
+@pytest.mark.parametrize("value", [Decimal("1"), Decimal("1.0"), Decimal("1E0")])
+def test_rank_metadata_accepts_integral_decimal_values(value):
+    # load_hf_adapter_config parses json floats as decimal, so decimal instances reach the parser.
+    assert rank_from_adapter_config(_config(r=value), source="adapter") == 1
 
-    preflight_init_adapter_lora_rank(spec, config_loader=_loader({"r": 64}))
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("1.5"), Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity")],
+)
+def test_rank_metadata_rejects_non_integral_decimal_values(value):
+    with pytest.raises(ValueError, match="invalid r"):
+        rank_from_adapter_config(_config(r=value), source="adapter")
+
+
+@pytest.mark.parametrize("value", [Decimal("0"), Decimal("-1")])
+def test_rank_metadata_rejects_non_positive_decimal_values(value):
+    with pytest.raises(ValueError, match="non-positive r"):
+        rank_from_adapter_config(_config(r=value), source="adapter")
+
+
+_FLOAT_CONFIG_JSON = (
+    '{"peft_type": "LORA", "task_type": "CAUSAL_LM",'
+    ' "base_model_name_or_path": "Qwen/Qwen3.5-4B",'
+    ' "r": 16.0, "lora_alpha": 64.0, "lora_dropout": 0.05}'
+)
+
+
+def _parsed_config(text: str = _FLOAT_CONFIG_JSON):
+    # mirror load_hf_adapter_config: floats arrive as decimal, not float.
+    return json.loads(text, parse_float=Decimal)
+
+
+def test_preflight_parses_decimal_typed_topology_from_real_json():
+    config = _parsed_config()
+    assert isinstance(config["r"], Decimal)
+    assert isinstance(config["lora_alpha"], Decimal)
+    metadata = preflight_init_adapter_lora_rank(
+        _spec(), config_loader=lambda _ref, _token, _revision: config
+    )
+    assert metadata is not None
+    assert metadata.rank == 16
+    assert metadata.alpha == 64
+
+
+def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
+    import huggingface_hub
+
+    state = {"oid": "sha256:weights-v1"}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_paths_info(self, repo_id, paths, repo_type, revision=None):
+            assert repo_id == "owner/runs"
+            assert repo_type == "dataset"
+            assert revision is None
+            return [
+                SimpleNamespace(
+                    path="sft/sft-run/adapter/adapter_model.safetensors",
+                    blob_id=None,
+                    size=123,
+                    lfs={"sha256": state["oid"], "size": 123},
+                )
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    first = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
+    second = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
+    assert first == second
+    assert first.weight_filename == "adapter_model.safetensors"
+    changed_config = adapter_artifact_identity(_ADAPTER_REF, _config(lora_alpha=64), token="token")
+    assert changed_config.digest != first.digest
+    state["oid"] = "sha256:weights-v2"
+    changed_weight = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
+    assert changed_weight.digest != first.digest
+
+
+def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
+    import huggingface_hub
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_paths_info(self, repo_id, paths, repo_type, revision=None):
+            return [
+                SimpleNamespace(
+                    path="sft/sft-run/adapter/adapter_model.safetensors",
+                    blob_id=None,
+                    size=123,
+                    lfs={"sha256": "sha256:weights-v1", "size": 123},
+                )
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    first = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
+    second = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
+    assert first == second
+    changed_float = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(_FLOAT_CONFIG_JSON.replace("0.05", "0.10")),
+        token="token",
+    )
+    assert changed_float.digest != first.digest
+    # a json string spelling the same numeral must not collide with the decimal value.
+    string_typed = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(
+            _FLOAT_CONFIG_JSON.replace('"lora_dropout": 0.05', '"lora_dropout": "0.05"')
+        ),
+        token="token",
+    )
+    assert string_typed.digest != first.digest
+    magic_object = adapter_artifact_identity(
+        _ADAPTER_REF,
+        _parsed_config(
+            _FLOAT_CONFIG_JSON.replace(
+                '"lora_dropout": 0.05',
+                '"lora_dropout": {"__decimal__": "0.05"}',
+            )
+        ),
+        token="token",
+    )
+    assert magic_object.digest != first.digest
+    assert magic_object.config_sha256 != first.config_sha256
+
+    integer_config = _config()
+    integer_identity = adapter_artifact_identity(_ADAPTER_REF, integer_config, token="token")
+    legacy_bytes = json.dumps(
+        integer_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert integer_identity.config_sha256 == hashlib.sha256(legacy_bytes).hexdigest()
 
 
 def test_lora_rank_uses_schema_adapter_storage_ref_parser():

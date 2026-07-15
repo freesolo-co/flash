@@ -53,6 +53,7 @@ class LambdaProvider(InstanceProvider):
         attempt: int,
         runtime_secrets: dict[str, str] | None,
         code_prefix: str | None,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.lambdalabs.jobs import submit_run_lambda
 
@@ -64,6 +65,7 @@ class LambdaProvider(InstanceProvider):
             attempt=attempt,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            deadline_at=deadline_at,
         )
 
     def _poll_job(
@@ -74,7 +76,7 @@ class LambdaProvider(InstanceProvider):
         *,
         log: Any,
         heartbeat_reader: Any,
-        deadline_s: float,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.lambdalabs.jobs import poll_lambda_job
 
@@ -84,19 +86,13 @@ class LambdaProvider(InstanceProvider):
             seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
-            deadline_s=deadline_s,
+            deadline_at=deadline_at,
         )
-
-    def _reattach_deadline(self, spec) -> float:
-        from flash.providers.lambdalabs.jobs import PROVISION_GRACE_S
-
-        # Lambda floors AFTER adding grace (Vast floors before); the formulas intentionally differ.
-        return max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
 
     def _teardown_reattached(self, handle: JobHandle, spec) -> None:
         from flash.providers.lambdalabs import api as lambda_api
 
-        lambda_api.terminate_instances([handle.instance_id])
+        lambda_api.terminate_instance_confirmed(handle.instance_id)
 
     def _gc(self, run_id: str) -> None:
         from flash.providers.lambdalabs.jobs import terminate_run_instances
@@ -112,6 +108,12 @@ class LambdaProvider(InstanceProvider):
         from flash.providers.lambdalabs.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
+
+    def run_instances_remaining(self, run_id: str) -> list[str]:
+        """Exact run-owned instance ids still observable after cleanup."""
+        from flash.providers.lambdalabs.jobs import run_instances_remaining
+
+        return run_instances_remaining(run_id)
 
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
@@ -151,4 +153,4 @@ def _terminate_handle_instance(handle: JobHandle) -> None:
 
     d = handle.to_dict()
     if d.get("instance_id"):
-        lambda_api.terminate_instances([str(d["instance_id"])])
+        lambda_api.terminate_instance_confirmed(str(d["instance_id"]))

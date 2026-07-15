@@ -22,9 +22,15 @@ import types
 
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
-    return JobSpec(model="m", gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu))
+    return JobSpec(
+        model="m",
+        gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu),
+        seed=0,
+    )
 
 
 def _ndc() -> int:
@@ -55,7 +61,9 @@ def test_default_spec_has_no_volume():
 def test_legacy_datacenter_key_tolerated():
     # A stale spec from the reverted single-DC pin may still carry gpu.datacenter; it must be
     # ignored (the DC set is deploy-time policy now), not raise.
-    spec = JobSpec.from_dict({"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}})
+    spec = JobSpec.from_dict(
+        {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
+    )
     assert spec.gpu.network_volume == "v"
     assert not hasattr(spec.gpu, "datacenter")
 
@@ -64,11 +72,18 @@ def test_network_volume_gb_tolerant_of_bad_values():
     # Platform-managed field: null/empty/"0"/0/negative/non-numeric/missing -> default 100 (never
     # crash int(), never round-trip a nonsensical size). Valid positive sizes pass through.
     for raw in (None, "", 0, "0", -5, "-5", "abc", True, False):
-        spec = JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}})
+        spec = JobSpec.from_dict(
+            {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
+        )
         assert spec.gpu.network_volume_gb == 100, f"{raw!r} should default to 100"
-    assert JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v"}}).gpu.network_volume_gb == 100
+    assert (
+        JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v"}}).gpu.network_volume_gb
+        == 100
+    )
     for raw in (200, "150"):
-        spec = JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}})
+        spec = JobSpec.from_dict(
+            {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
+        )
         assert spec.gpu.network_volume_gb == int(raw)
 
 
@@ -135,7 +150,10 @@ def test_weight_cache_volume_name_includes_datacenter():
 
     from flash.providers.runpod import jobs
 
-    assert jobs.weight_cache_volume_name("flash-weights", DataCenter.US_CA_2) == "flash-weights-us-ca-2"
+    assert (
+        jobs.weight_cache_volume_name("flash-weights", DataCenter.US_CA_2)
+        == "flash-weights-us-ca-2"
+    )
 
 
 def test_weight_cache_volumes_empty_without_volume_name():
@@ -195,8 +213,10 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod import auth, jobs, keys
 
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    keys.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -212,12 +232,17 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
-    eid, _name = jobs.deploy_train_endpoint("RTX 4090", spec=_vol_spec(), disk_gb=None)
+    eid, _name, fingerprint = jobs.deploy_train_endpoint(
+        "RTX 4090",
+        spec=_vol_spec(),
+        disk_gb=None,
+    )
     assert eid == "ep-abc"
+    assert fingerprint == jobs.runpod_api.key_fingerprint("test-key")
     assert len(captured["volume"]) == _ndc()  # EAGER: a volume in every storage DC
     assert len(captured["datacenter"]) == _ndc()  # allowed across all storage DCs
     assert len({v.name for v in captured["volume"]}) == _ndc()  # distinct per-DC names
@@ -228,8 +253,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod import auth, jobs, keys
 
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    keys.reset()
     captured: dict = {}
 
     class RecEndpoint:
@@ -245,7 +272,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
@@ -266,7 +293,12 @@ def test_weight_cache_env_is_base_model_scoped():
     # shared multi-tenant mount — issue #252). The executable kernel-JIT caches are also never on it.
     assert env == {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
     assert "HF_HOME" not in env
-    for k in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "TILELANG_CACHE_DIR", "TORCH_EXTENSIONS_DIR"):
+    for k in (
+        "TRITON_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TILELANG_CACHE_DIR",
+        "TORCH_EXTENSIONS_DIR",
+    ):
         assert k not in env
 
 
@@ -288,7 +320,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 def test_build_worker_env_no_cache_without_volume():
     from flash.providers.runpod.train.deps import build_worker_env
 
-    env = build_worker_env(JobSpec(model="m"), 0)
+    env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
     assert "FLASH_WEIGHT_CACHE_DIR" not in env
     assert "HF_HOME" not in env
@@ -298,7 +330,9 @@ def test_build_worker_env_per_run_override_wins():
     from flash.providers.runpod.train.deps import build_worker_env
 
     spec = _vol_spec()
-    spec = JobSpec.from_dict({**spec.to_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}})
+    spec = JobSpec.from_dict(
+        {**spec.to_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}}
+    )
     # a per-run [worker_env] override is merged last and must win over the cache redirect.
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
 
@@ -319,7 +353,9 @@ def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
 
     monkeypatch.setattr(deps.os.path, "isdir", lambda p: True)
     env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
-    assert deps.drop_unmounted_cache_env(env) == {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
+    assert deps.drop_unmounted_cache_env(env) == {
+        "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +374,12 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     calls = []
 
     def _fake_snapshot(repo_id, cache_dir=None, ignore_patterns=None, **kw):
-        calls.append({"repo_id": repo_id, "cache_dir": cache_dir, "ignore_patterns": ignore_patterns})
-        if cache_dir:  # simulate a real download landing on the (mount) cache: create the repo folder
+        calls.append(
+            {"repo_id": repo_id, "cache_dir": cache_dir, "ignore_patterns": ignore_patterns}
+        )
+        if (
+            cache_dir
+        ):  # simulate a real download landing on the (mount) cache: create the repo folder
             folder = "models--" + repo_id.replace("/", "--")
             os.makedirs(os.path.join(cache_dir, folder, "snapshots"), exist_ok=True)
         return cache_dir or "/ephemeral"
@@ -366,10 +406,13 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
     hf.prefetch_model("Qwen/Qwen3.5-0.8B")
 
     # downloaded straight onto the shared mount, NOT the ephemeral default
-    assert calls == [{
-        "repo_id": "Qwen/Qwen3.5-0.8B", "cache_dir": shared_hub,
-        "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-    }]
+    assert calls == [
+        {
+            "repo_id": "Qwen/Qwen3.5-0.8B",
+            "cache_dir": shared_hub,
+            "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+        }
+    ]
     folder = "models--Qwen--Qwen3.5-0.8B"
     dst = ephemeral_hub / folder
     # the base model is now visible in the ephemeral cache as a SYMLINK pointing back to the mount
@@ -402,7 +445,19 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
 
     hf.prefetch_model("Qwen/Qwen3.5-0.8B")
 
-    assert calls[0]["cache_dir"] is None  # mount absent -> ephemeral, never the missing /runpod-volume path
+    assert (
+        calls[0]["cache_dir"] is None
+    )  # mount absent -> ephemeral, never the missing /runpod-volume path
+
+
+def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
+    hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
+    monkeypatch.setattr(hf._w, "_remaining_worker_wall_seconds", lambda: 0.0)
+
+    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+
+    assert calls == []
 
 
 def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, monkeypatch):
@@ -429,7 +484,12 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
     from flash.providers.runpod.train.deps import strip_runpod_volume_env
 
-    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "X": "/runpod-volume/foo", "KEEP": "v", "HF_TOKEN": "t"}
+    env = {
+        "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
+        "X": "/runpod-volume/foo",
+        "KEEP": "v",
+        "HF_TOKEN": "t",
+    }
     out = strip_runpod_volume_env(env)
     assert "FLASH_WEIGHT_CACHE_DIR" not in out
     assert "X" not in out
@@ -443,9 +503,17 @@ def test_instance_payload_strips_runpod_volume_redirect():
     from flash.providers.runpod.train.deps import build_worker_env
 
     spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
-    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith("/runpod-volume")  # leak source
+    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
+        "/runpod-volume"
+    )  # leak source
     for arm in ("lambda",):
-        env = _instance.build_payload(spec, seed=0, attempt=0, arm=arm)["env"]
+        env = _instance.build_payload(
+            spec,
+            seed=0,
+            attempt=0,
+            arm=arm,
+            deadline_at=10_000_000_000.0,
+        )["env"]
         assert not env.get("FLASH_WEIGHT_CACHE_DIR", "").startswith("/runpod-volume"), arm
 
 
@@ -475,8 +543,12 @@ def test_assign_weight_cache_skips_open_model_policy():
     # is never redirected onto the shared mount — the weights stay on the worker's ephemeral disk.
     from flash import runner
 
-    out = runner._assign_weight_cache_volume(JobSpec(model="some-org/private-model", run_id="r", model_policy="allow"))
-    assert out.gpu.network_volume is None  # cache-less: no shared-mount redirect for a possibly-private model
+    out = runner._assign_weight_cache_volume(
+        JobSpec(model="some-org/private-model", run_id="r", model_policy="allow")
+    )
+    assert (
+        out.gpu.network_volume is None
+    )  # cache-less: no shared-mount redirect for a possibly-private model
 
 
 def test_assign_weight_cache_strips_preset_shared_cache_on_open_model():
@@ -484,10 +556,18 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_open_model():
     # spec that ALREADY pinned the SHARED cache name must be FORCED cache-less, not bypass the gate.
     from flash import runner
 
-    spec = JobSpec.from_dict({
-        "model": "some-org/private-model", "run_id": "r", "model_policy": "allow",
-        "gpu": {"type": "A10", "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": 100},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": "some-org/private-model",
+            "run_id": "r",
+            "model_policy": "allow",
+            "gpu": {
+                "type": "A10",
+                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume_gb": 100,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume is None  # the pre-set shared cache was stripped
 
@@ -496,10 +576,18 @@ def test_assign_weight_cache_keeps_per_org_volume_on_open_model():
     # A NON-shared (per-org / custom) volume on an open run is the intended escape hatch — left intact.
     from flash import runner
 
-    spec = JobSpec.from_dict({
-        "model": "some-org/private-model", "run_id": "r", "model_policy": "allow",
-        "gpu": {"type": "A10", "network_volume": "org-123-private-cache", "network_volume_gb": 100},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": "some-org/private-model",
+            "run_id": "r",
+            "model_policy": "allow",
+            "gpu": {
+                "type": "A10",
+                "network_volume": "org-123-private-cache",
+                "network_volume_gb": 100,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "org-123-private-cache"  # not the shared cache -> kept
 
@@ -544,10 +632,18 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
-    spec = JobSpec.from_dict({
-        "model": info.id, "run_id": "r", "model_policy": "catalog",
-        "gpu": {"type": "B200", "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": 100},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": info.id,
+            "run_id": "r",
+            "model_policy": "catalog",
+            "gpu": {
+                "type": "B200",
+                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume_gb": 100,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume is None  # oversized -> the pre-set shared cache was stripped
 
@@ -559,10 +655,18 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
-    spec = JobSpec.from_dict({
-        "model": info.id, "run_id": "r", "model_policy": "catalog",
-        "gpu": {"type": "H100", "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": 100},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": info.id,
+            "run_id": "r",
+            "model_policy": "catalog",
+            "gpu": {
+                "type": "H100",
+                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume_gb": 100,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "flash-weights"  # fits -> kept
 
@@ -574,10 +678,18 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
     from flash.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
-    spec = JobSpec.from_dict({
-        "model": info.id, "run_id": "r", "model_policy": "catalog",
-        "gpu": {"type": "B200", "network_volume": "org-123-big-cache", "network_volume_gb": 400},
-    })
+    spec = JobSpec.from_dict(
+        {
+            "model": info.id,
+            "run_id": "r",
+            "model_policy": "catalog",
+            "gpu": {
+                "type": "B200",
+                "network_volume": "org-123-big-cache",
+                "network_volume_gb": 400,
+            },
+        }
+    )
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "org-123-big-cache"  # custom volume honored despite size
 
@@ -653,6 +765,61 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     assert out.gpu.network_volume == "org-1234-private"
     # the SHARED cache, by contrast, IS dropped
     assert _drop_weight_cache(_vol_spec(name=WEIGHT_CACHE_VOLUME_NAME)).gpu.network_volume is None
+
+
+def test_effective_spec_persists_managed_cache_removal(monkeypatch):
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec.from_dict(
+            {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
+        )
+        selected_dict = public.to_internal_dict()
+        selected_dict["gpu"]["network_volume"] = None
+        selected = JobSpec.from_dict(selected_dict)
+        runner._save_status(
+            runner.RunStatus(
+                run_id=public.run_id,
+                state="provisioning",
+                spec=public.to_dict(),
+            )
+        )
+
+        assert runner._persist_effective_worker_spec(selected)
+
+        stored = runner.get_status(public.run_id)
+        assert stored.effective_preparation["worker_spec"]["gpu"]["network_volume"] is None
+        assert stored.effective_preparation["adapter_identity"] is None
+        assert runner.effective_spec_from_status(stored).gpu.network_volume is None
+
+
+def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
+    import pytest
+
+    from tests._helpers.runner import fresh_runner
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = fresh_runner(tmp, monkeypatch)
+        public = JobSpec.from_dict(
+            {
+                **_vol_spec(name="org-1234-private").to_internal_dict(),
+                "run_id": "custom-cache-fallback",
+            }
+        )
+        selected_dict = public.to_internal_dict()
+        selected_dict["gpu"]["network_volume"] = None
+        selected = JobSpec.from_dict(selected_dict)
+        runner._save_status(
+            runner.RunStatus(
+                run_id=public.run_id,
+                state="provisioning",
+                spec=public.to_dict(),
+            )
+        )
+
+        with pytest.raises(ValueError, match="effective preparation"):
+            runner._persist_effective_worker_spec(selected)
 
 
 def _supervised_walk(monkeypatch, failures):
@@ -766,19 +933,29 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # pretend the volume IS mounted
     calls = []
 
-    def fake_snapshot(repo_id, token=None, cache_dir=None, local_files_only=False, ignore_patterns=None):
-        calls.append({"repo": repo_id, "cache_dir": cache_dir, "probe": local_files_only,
-                      "ignore": ignore_patterns})
+    def fake_snapshot(
+        repo_id, token=None, cache_dir=None, local_files_only=False, ignore_patterns=None
+    ):
+        calls.append(
+            {
+                "repo": repo_id,
+                "cache_dir": cache_dir,
+                "probe": local_files_only,
+                "ignore": ignore_patterns,
+            }
+        )
         if local_files_only:
             raise FileNotFoundError("not cached yet")  # force the real download path
         return "/somewhere"
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
-    out = endpoints._train_body({
-        "mode": "preload",
-        "models": ["Qwen/Qwen3.5-0.8B"],
-        "env": {"HF_HOME": "/runpod-volume/hf-cache", "HF_TOKEN": "t"},
-    })
+    out = endpoints._train_body(
+        {
+            "mode": "preload",
+            "models": ["Qwen/Qwen3.5-0.8B"],
+            "env": {"HF_HOME": "/runpod-volume/hf-cache", "HF_TOKEN": "t"},
+        }
+    )
     assert out["preloaded"] == ["Qwen/Qwen3.5-0.8B"]
     # both the probe and the real download must target the on-volume HF hub dir, not the default
     assert calls
@@ -803,14 +980,17 @@ def test_preload_rejects_non_volume_hf_home(monkeypatch):
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # even with the mount present...
     calls = []
     monkeypatch.setattr(
-        huggingface_hub, "snapshot_download",
+        huggingface_hub,
+        "snapshot_download",
         lambda *a, **k: calls.append(k) or "/x",
     )
     for bad in (None, "", "/root/.cache/huggingface", "/tmp/hf"):
         env = {"HF_TOKEN": "t"}
         if bad is not None:
             env["HF_HOME"] = bad
-        out = endpoints._train_body({"mode": "preload", "models": ["Qwen/Qwen3.5-0.8B"], "env": env})
+        out = endpoints._train_body(
+            {"mode": "preload", "models": ["Qwen/Qwen3.5-0.8B"], "env": env}
+        )
         assert out["preloaded"] == []
         assert out["already_cached"] == []
         assert "HF_HOME rooted at /runpod-volume" in out["error"]
@@ -981,10 +1161,13 @@ def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
     from flash.providers.runpod import preload
 
     monkeypatch.setattr(
-        lambda_api, "list_filesystems",
+        lambda_api,
+        "list_filesystems",
         lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("LAMBDA_API_KEY not set")),
     )
-    assert preload.teardown_lambda_filesystems() == []  # absent provider -> nothing reclaimed, no raise
+    assert (
+        preload.teardown_lambda_filesystems() == []
+    )  # absent provider -> nothing reclaimed, no raise
 
 
 def test_teardown_cli_reclaims_all_providers(monkeypatch):
@@ -992,7 +1175,9 @@ def test_teardown_cli_reclaims_all_providers(monkeypatch):
     from flash.providers.runpod import preload
 
     monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: ["flash-weights-us-ca-2"])
-    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: ["lambda:us-east-1/flash-weights"])
+    monkeypatch.setattr(
+        preload, "teardown_lambda_filesystems", lambda: ["lambda:us-east-1/flash-weights"]
+    )
     assert preload.main(["--teardown"]) == 0
 
 
@@ -1028,7 +1213,11 @@ def test_teardown_continues_when_runpod_unconfigured(monkeypatch):
 
     lam = []
     monkeypatch.setattr(preload, "teardown_weight_cache", _boom)
-    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: lam.append(1) or ["lambda:us-east-1/flash-weights"])
+    monkeypatch.setattr(
+        preload,
+        "teardown_lambda_filesystems",
+        lambda: lam.append(1) or ["lambda:us-east-1/flash-weights"],
+    )
     # RunPod raises but the instance provider still gets cleaned up best-effort; the CLI still exits 0.
     assert preload.main(["--teardown"]) == 0
     assert lam == [1]
@@ -1039,8 +1228,14 @@ def test_scoped_teardown_is_runpod_only(monkeypatch):
     from flash.providers.runpod import preload
 
     seen = {}
-    monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: seen.setdefault("dcs", dcs) or ["flash-weights-us-ca-2"])
-    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: seen.setdefault("lambda", True) or [])
+    monkeypatch.setattr(
+        preload,
+        "teardown_weight_cache",
+        lambda dcs: seen.setdefault("dcs", dcs) or ["flash-weights-us-ca-2"],
+    )
+    monkeypatch.setattr(
+        preload, "teardown_lambda_filesystems", lambda: seen.setdefault("lambda", True) or []
+    )
     assert preload.main(["--teardown", "--datacenters", "US-CA-2"]) == 0
     assert seen["dcs"] == ["US-CA-2"]  # the RunPod scope was honored
     assert "lambda" not in seen  # instance providers were NOT touched
@@ -1056,8 +1251,12 @@ def test_teardown_empty_datacenters_scope_is_refused(monkeypatch):
     from flash.providers.runpod import preload
 
     called = {}
-    monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: called.setdefault("runpod", dcs) or [])
-    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: called.setdefault("lambda", True) or [])
+    monkeypatch.setattr(
+        preload, "teardown_weight_cache", lambda dcs: called.setdefault("runpod", dcs) or []
+    )
+    monkeypatch.setattr(
+        preload, "teardown_lambda_filesystems", lambda: called.setdefault("lambda", True) or []
+    )
     for scope in ("", " , , ", "   "):  # empty, all-commas, all-whitespace -> parse to zero ids
         called.clear()
         assert preload.main(["--teardown", "--datacenters", scope]) == 2
@@ -1087,14 +1286,22 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     from flash.providers.runpod import preload
 
     ensured = []
-    monkeypatch.setattr(lambda_api, "all_regions", lambda: ["us-east-1", "us-west-2", "europe-central-1"])
     monkeypatch.setattr(
-        lambda_api, "ensure_filesystem",
-        lambda name, region: ensured.append((name, region)) or f"/lambda/nfs/{name}",
+        lambda_api, "all_regions", lambda: ["us-east-1", "us-west-2", "europe-central-1"]
+    )
+    monkeypatch.setattr(
+        lambda_api,
+        "ensure_filesystem",
+        lambda name, region, deadline_at=None: ensured.append((name, region))
+        or f"/lambda/nfs/{name}",
     )
     out = preload.provision_lambda_filesystems()
     # one create-if-absent per region, with the managed cache name
-    assert ensured == [("flash-weights", "us-east-1"), ("flash-weights", "us-west-2"), ("flash-weights", "europe-central-1")]
+    assert ensured == [
+        ("flash-weights", "us-east-1"),
+        ("flash-weights", "us-west-2"),
+        ("flash-weights", "europe-central-1"),
+    ]
     assert out == ["lambda:us-east-1", "lambda:us-west-2", "lambda:europe-central-1"]
 
 
@@ -1102,7 +1309,7 @@ def test_provision_lambda_skips_failed_region(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.runpod import preload
 
-    def flaky(name, region):
+    def flaky(name, region, deadline_at=None):
         if region == "bad-1":
             raise lambda_api.LambdaApiError("region down")
         return f"/lambda/nfs/{name}"
@@ -1118,7 +1325,8 @@ def test_provision_lambda_no_key_is_noop(monkeypatch):
     from flash.providers.runpod import preload
 
     monkeypatch.setattr(
-        lambda_api, "all_regions",
+        lambda_api,
+        "all_regions",
         lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("LAMBDA_API_KEY not set")),
     )
     assert preload.provision_lambda_filesystems() == []
@@ -1136,7 +1344,11 @@ def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
     from flash.providers.runpod import preload
 
     called = {"n": 0}
-    monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: called.__setitem__("n", called["n"] + 1) or [])
+    monkeypatch.setattr(
+        preload,
+        "provision_lambda_filesystems",
+        lambda: called.__setitem__("n", called["n"] + 1) or [],
+    )
     assert preload.main(["--provision", "--dry-run"]) == 0
     assert called["n"] == 0  # dry-run touches no provider
 
@@ -1146,15 +1358,22 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
 
     calls = {}
 
-    def fake_deploy(gpu, execution_timeout_ms=None, name_suffix=None, spec=None, endpoint_kwargs=None):
+    def fake_deploy(
+        gpu,
+        execution_timeout_ms=None,
+        name_suffix=None,
+        spec=None,
+        endpoint_kwargs=None,
+        deadline_at=None,
+    ):
         calls["gpu"] = gpu
         calls["suffix"] = name_suffix
         calls["endpoint_kwargs"] = endpoint_kwargs
-        return "ep-1", "name-1"
+        return "ep-1", "name-1", _RUNPOD_FINGERPRINT
 
     submitted = {}
 
-    def fake_submit(eid, payload):
+    def fake_submit(eid, payload, **_kw):
         submitted["eid"] = eid
         submitted["payload"] = payload
         return "job-1"
@@ -1162,15 +1381,20 @@ def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     deleted = []
     monkeypatch.setattr(preload, "deploy_train_endpoint", fake_deploy)
     monkeypatch.setattr(preload.runpod_api, "submit_job", fake_submit)
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
     monkeypatch.setattr(
-        preload.runpod_api, "job_status",
-        lambda eid, jid: {"status": "COMPLETED", "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]}},
+        preload.runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": {"preloaded": ["Qwen/Qwen3.5-0.8B"]}},
     )
 
     out = preload._preload_one_dc(
-        "EU-RO-1", ["Qwen/Qwen3.5-0.8B"], token="tok", gpu="RTX 4090",
-        timeout_s=60, poll_interval_s=0.0,
+        "EU-RO-1",
+        ["Qwen/Qwen3.5-0.8B"],
+        token="tok",
+        gpu="RTX 4090",
+        timeout_s=60,
+        poll_interval_s=0.0,
     )
 
     assert out["status"] == "ok"
@@ -1201,14 +1425,16 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
 
     deleted = []
     monkeypatch.setattr(
-        preload, "deploy_train_endpoint",
-        lambda *a, **k: ("ep-9", "name-9"),
+        preload,
+        "deploy_train_endpoint",
+        lambda *a, **k: ("ep-9", "name-9", _RUNPOD_FINGERPRINT),
     )
-    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, payload: "job-9")
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: deleted.append(eid))
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, payload, **_kw: "job-9")
+    monkeypatch.setattr(preload.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint: deleted.append(eid))
     monkeypatch.setattr(
-        preload.runpod_api, "job_status",
-        lambda eid, jid: {"status": "FAILED", "error": "boom"},
+        preload.runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "FAILED", "error": "boom"},
     )
 
     out = preload._preload_one_dc(
@@ -1221,12 +1447,21 @@ def test_preload_one_dc_tears_down_on_failure(monkeypatch):
 def _stub_preload_deploy(monkeypatch, job_output):
     from flash.providers.runpod import preload
 
-    monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "n"))
-    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p: "job")
-    monkeypatch.setattr(preload.runpod_api, "delete_endpoint", lambda eid: None)
     monkeypatch.setattr(
-        preload.runpod_api, "job_status",
-        lambda eid, jid: {"status": "COMPLETED", "output": job_output},
+        preload,
+        "deploy_train_endpoint",
+        lambda *a, **k: ("ep", "n", _RUNPOD_FINGERPRINT),
+    )
+    monkeypatch.setattr(preload.runpod_api, "submit_job", lambda eid, p, **_kw: "job")
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, _fingerprint: None,
+    )
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": job_output},
     )
 
 
@@ -1234,10 +1469,17 @@ def test_preload_one_dc_partial_when_a_model_fails(monkeypatch):
     # A COMPLETED job whose handler reports per-model failures is NOT a fully warmed region.
     from flash.providers.runpod import preload
 
-    _stub_preload_deploy(monkeypatch, {
-        "preloaded": ["a"], "already_cached": [], "failed": {"b": "gated repo"},
-    })
-    out = preload._preload_one_dc("US-CA-2", ["a", "b"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0)
+    _stub_preload_deploy(
+        monkeypatch,
+        {
+            "preloaded": ["a"],
+            "already_cached": [],
+            "failed": {"b": "gated repo"},
+        },
+    )
+    out = preload._preload_one_dc(
+        "US-CA-2", ["a", "b"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0
+    )
     assert out["status"] == "partial"
     assert out["result"]["failed"] == {"b": "gated repo"}
 
@@ -1246,11 +1488,18 @@ def test_preload_one_dc_error_when_volume_not_mounted(monkeypatch):
     # The handler's mount-not-mounted hard error must surface as a DC-level error (not silent ok).
     from flash.providers.runpod import preload
 
-    _stub_preload_deploy(monkeypatch, {
-        "preloaded": [], "already_cached": [], "failed": {},
-        "error": "weight-cache volume not mounted at /runpod-volume",
-    })
-    out = preload._preload_one_dc("US-CA-2", ["a"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0)
+    _stub_preload_deploy(
+        monkeypatch,
+        {
+            "preloaded": [],
+            "already_cached": [],
+            "failed": {},
+            "error": "weight-cache volume not mounted at /runpod-volume",
+        },
+    )
+    out = preload._preload_one_dc(
+        "US-CA-2", ["a"], token=None, gpu="g", timeout_s=60, poll_interval_s=0.0
+    )
     assert out["status"] == "error"
     assert "not mounted" in out["error"]
 
@@ -1264,10 +1513,13 @@ def test_preload_branch_errors_when_volume_not_mounted(monkeypatch):
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     monkeypatch.setattr(_os.path, "isdir", lambda p: False)  # /runpod-volume not mounted
-    out = endpoints._train_body({
-        "mode": "preload", "models": ["Qwen/Qwen3.5-0.8B"],
-        "env": {"HF_HOME": "/runpod-volume/hf-cache"},
-    })
+    out = endpoints._train_body(
+        {
+            "mode": "preload",
+            "models": ["Qwen/Qwen3.5-0.8B"],
+            "env": {"HF_HOME": "/runpod-volume/hf-cache"},
+        }
+    )
     assert out["preloaded"] == []
     assert "not mounted" in out["error"]
 
@@ -1309,20 +1561,35 @@ def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
 # Instance-provider WARM — the baked download-only preload mode + payload plumbing
 # ---------------------------------------------------------------------------
 def _preload_spec():
-    return JobSpec.from_dict({
-        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
-        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "org/repo"},
-        "gpu": {"type": "A10", "max_wall_seconds": 3600,
-                "network_volume": "flash-weights", "network_volume_gb": 100},
-    })
+    return JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "run_id": "flash-1700000000-abcd1234",
+            "train": {"epochs": 1, "max_examples": 8, "hf_repo": "org/repo"},
+            "gpu": {
+                "type": "A10",
+                "max_wall_seconds": 3600,
+                "network_volume": "flash-weights",
+                "network_volume_gb": 100,
+            },
+        }
+    )
 
 
 def test_instance_build_payload_preload_mode():
     from flash.providers import _instance
 
+    spec = _preload_spec()
     p = _instance.build_payload(
-        _preload_spec(), 0, 0, arm="lambda",
-        cache_host_mount="/lambda/nfs/flash-weights", mode="preload", models=["a/b", "c/d"],
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
+        mode="preload",
+        models=["a/b", "c/d"],
     )
     assert p["mode"] == "preload"
     assert p["models"] == ["a/b", "c/d"]
@@ -1336,8 +1603,15 @@ def test_instance_build_payload_preload_mode():
 def test_instance_build_payload_no_mode_by_default():
     from flash.providers import _instance
 
-    p = _instance.build_payload(_preload_spec(), 0, 0, arm="lambda",
-                                cache_host_mount="/lambda/nfs/flash-weights")
+    spec = _preload_spec()
+    p = _instance.build_payload(
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
+    )
     assert "mode" not in p  # ordinary train payload
     assert "models" not in p
 
@@ -1347,13 +1621,24 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
     with RunPod, where the worker_env override wins), and disables the platform cache redirect."""
     from flash.providers import _instance
 
-    spec = JobSpec.from_dict({
-        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
-        "train": {"max_examples": 8, "hf_repo": "org/repo"},
-        "gpu": {"type": "A10", "max_wall_seconds": 3600, "network_volume": "flash-weights"},
-        "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
-    })
-    p = _instance.build_payload(spec, 0, 0, arm="lambda", cache_host_mount="/lambda/nfs/flash-weights")
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "run_id": "flash-1700000000-abcd1234",
+            "train": {"max_examples": 8, "hf_repo": "org/repo"},
+            "gpu": {"type": "A10", "max_wall_seconds": 3600, "network_volume": "flash-weights"},
+            "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
+        }
+    )
+    p = _instance.build_payload(
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
+    )
     # the user's HF_HOME survives, and the platform cache redirect is NOT installed on top of it.
     assert p["env"]["HF_HOME"] == "/custom/hf"
     assert "FLASH_WEIGHT_CACHE_DIR" not in p["env"]
@@ -1363,7 +1648,9 @@ def test_instance_preload_requires_mounted_cache():
     from flash.providers import _instance_bootstrap as b
 
     # FLASH_WEIGHT_CACHE_DIR rooted at an UNMOUNTED cache -> refuse (would warm ephemeral disk), no download
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": "/weight-cache/hf-cache/hub"}, "models": ["x/y"]})
+    r = b.run_preload(
+        {"env": {"FLASH_WEIGHT_CACHE_DIR": "/weight-cache/hf-cache/hub"}, "models": ["x/y"]}
+    )
     assert r["preloaded"] == []
     assert r["failed"] == {}
     assert "not mounted" in r["error"]
@@ -1387,12 +1674,21 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     cache_dir_env = str(tmp_path / "hf-cache" / "hub")
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env, "HF_TOKEN": "t"}, "models": ["a/b"]})
+    r = b.run_preload(
+        {"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env, "HF_TOKEN": "t"}, "models": ["a/b"]}
+    )
     assert r["preloaded"] == ["a/b"]
     assert not r["failed"]
     assert calls[0]["cache_dir"] == str(tmp_path / "hf-cache" / "hub")  # straight into the mount
     assert calls[0]["token"] == "t"
-    assert calls[0]["ignore_patterns"] == ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
+    assert calls[0]["ignore_patterns"] == [
+        "*.pth",
+        "*.gguf",
+        "original/*",
+        "*.onnx",
+        "*.msgpack",
+        "*.h5",
+    ]
 
 
 def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypatch):
@@ -1437,9 +1733,17 @@ def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeyp
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _boom
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    cache_dir_env = str(tmp_path / "hf-cache" / "hub")  # grandparent (the mount) exists but has no sentinel
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
-                       "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
+    cache_dir_env = str(
+        tmp_path / "hf-cache" / "hub"
+    )  # grandparent (the mount) exists but has no sentinel
+    r = b.run_preload(
+        {
+            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
+            "models": ["a/b"],
+            "cache_block_device": True,
+            "cache_mount_marker": ".flash-cache-mounted",
+        }
+    )
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
 
@@ -1463,8 +1767,14 @@ def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, mon
     mount = tmp_path
     (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
     cache_dir_env = str(mount / "hf-cache" / "hub")
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
-                       "cache_block_device": True, "cache_mount_marker": ".flash-cache-mounted"})
+    r = b.run_preload(
+        {
+            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
+            "models": ["a/b"],
+            "cache_block_device": True,
+            "cache_mount_marker": ".flash-cache-mounted",
+        }
+    )
     assert r["preloaded"] == ["a/b"]
     assert not r["failed"]
 
@@ -1492,8 +1802,12 @@ def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
     assert "touch '/lambda/nfs/flash-weights/.flash-cache-mounted'" in pre
     # No-op for block-volume (handled by the block preamble) and for cold runs.
-    assert _instance._cache_nfs_mount_check(
-        {"cache_host_mount": "/mnt/cache", "cache_block_device": True}) == ""
+    assert (
+        _instance._cache_nfs_mount_check(
+            {"cache_host_mount": "/mnt/cache", "cache_block_device": True}
+        )
+        == ""
+    )
     assert _instance._cache_nfs_mount_check({}) == ""
 
 
@@ -1510,9 +1824,16 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = _boom
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    cache_dir_env = str(tmp_path / "hf-cache" / "hub")  # grandparent (the mount) exists but has no sentinel
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
-                       "cache_mount_marker": ".flash-cache-mounted"})  # NFS: no cache_block_device
+    cache_dir_env = str(
+        tmp_path / "hf-cache" / "hub"
+    )  # grandparent (the mount) exists but has no sentinel
+    r = b.run_preload(
+        {
+            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
+            "models": ["a/b"],
+            "cache_mount_marker": ".flash-cache-mounted",
+        }
+    )  # NFS: no cache_block_device
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
     assert "NFS" in r["error"]
@@ -1536,8 +1857,13 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     (tmp_path / ".flash-cache-mounted").write_text("")
     cache_dir_env = str(tmp_path / "hf-cache" / "hub")
-    r = b.run_preload({"env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env}, "models": ["a/b"],
-                       "cache_mount_marker": ".flash-cache-mounted"})
+    r = b.run_preload(
+        {
+            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
+            "models": ["a/b"],
+            "cache_mount_marker": ".flash-cache-mounted",
+        }
+    )
     assert r["preloaded"] == ["a/b"]
 
 
@@ -1546,30 +1872,40 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
     can require the sentinel regardless of substrate."""
     from flash.providers import _instance
 
+    spec = _preload_spec()
     p = _instance.build_payload(
-        _preload_spec(), 0, 0, arm="lambda",
-        cache_host_mount="/lambda/nfs/flash-weights", mode="preload", models=["a/b"],
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
+        mode="preload",
+        models=["a/b"],
     )
     assert p["cache_mount_marker"] == _instance.CACHE_MOUNT_MARKER
     assert "cache_block_device" not in p  # NFS, not a block volume
 
 
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
-    """run_preload has no worker subprocess, so the preload branch arms a wall-cap watchdog timer that
-    hard-exits the box if a download hangs past max_wall_s. The timer is cancellable on a clean finish."""
+    """run_preload has no worker subprocess, so the preload branch arms an absolute-deadline watchdog
+    that hard-exits the box if a download hangs past deadline_at. The timer is cancellable on finish."""
     from flash.providers import _instance_bootstrap as b
 
-    cap = b._arm_preload_wall_cap({"max_wall_s": 999})
-    assert cap is not None
-    timer, done = cap  # (timer, done-event): the caller sets `done` then cancels on a clean finish
+    now = 1_000.0
+    monkeypatch.setattr(b.time, "time", lambda: now)
+    timer, done = b._arm_preload_wall_cap(
+        {
+            "deadline_at": now + 999,
+            "run_created_at": now,
+            "run_max_wall_seconds": 999,
+        }
+    )
     assert timer.is_alive()
     assert not done.is_set()
     # A clean finish sets `done` so a wall expiry racing it no-ops in _fire, then cancels the timer.
     done.set()
     timer.cancel()
-    # No cap requested -> no timer (e.g. a 0/absent wall).
-    assert b._arm_preload_wall_cap({"max_wall_s": 0}) is None
-    assert b._arm_preload_wall_cap({}) is None
 
 
 def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
@@ -1581,18 +1917,29 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     from flash.providers.lambdalabs import jobs
 
     launched = {}
-    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")
+    monkeypatch.setattr(
+        lambda_api,
+        "ensure_filesystem",
+        lambda n, r, deadline_at=None: f"/lambda/nfs/{n}",
+    )
     monkeypatch.setattr(lambda_api, "resolve_ssh_key_names", lambda: ["k"], raising=False)
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["k"])
     monkeypatch.setattr(
-        lambda_api, "launch_instance",
+        lambda_api,
+        "launch_instance",
         lambda **kw: launched.update(kw) or "i-123",
     )
     from tests.test_lambda_runner import _inst  # reuse the runner's instance candidate
 
+    spec = _preload_spec()
     jobs.launch_and_submit(
-        _preload_spec(), seed=0, instances=[_inst()], attempt=0,
-        mode="preload", models=["Qwen/Qwen3.5-0.8B"],
+        spec,
+        seed=spec.seed,
+        instances=[_inst()],
+        attempt=0,
+        mode="preload",
+        models=["Qwen/Qwen3.5-0.8B"],
+        deadline_at=10_000_000_000.0,
     )
     # decode the base64 payload embedded in the cache user_data
     ud = launched["user_data"]
@@ -1619,11 +1966,18 @@ def _wire_warm(monkeypatch, marker):
     launched, terminated = [], []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
     monkeypatch.setattr(
-        preload, "make_hf_text_reader",
-        lambda repo, path, min_interval_s=45.0: (lambda force=False: _json.dumps(marker) if marker else None),
+        preload,
+        "make_hf_text_reader",
+        lambda repo, path, min_interval_s=45.0: (
+            lambda force=False: _json.dumps(marker) if marker else None
+        ),
     )
 
     def fake_launch(spec, seed, instances, attempt=0, mode=None, models=None, **k):
+        # the preload launch must thread the spec's authoritative seed: the real
+        # build_payload/build_worker_env path calls require_matching_seed, so a stale seed=0
+        # against the default spec.seed would crash every real preload launch.
+        assert seed == spec.seed, (seed, spec.seed)
         launched.append((instances[0].region, mode, tuple(models or [])))
 
     monkeypatch.setattr(lj, "launch_and_submit", fake_launch)
@@ -1633,8 +1987,13 @@ def _wire_warm(monkeypatch, marker):
 
 def test_warm_instances_one_launch_per_region_and_terminates(monkeypatch):
     preload, lj, launched, terminated = _wire_warm(
-        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}})
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1"), _cand("us-east-1"), _cand("us-west-2")])
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(
+        lj,
+        "usable_instances",
+        lambda gpu: [_cand("us-east-1"), _cand("us-east-1"), _cand("us-west-2")],
+    )
 
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
@@ -1646,7 +2005,8 @@ def test_warm_instances_one_launch_per_region_and_terminates(monkeypatch):
 
 def test_warm_instance_partial_when_a_model_failed(monkeypatch):
     preload, lj, _launched, terminated = _wire_warm(
-        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {"c/d": "gated"}})
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {"c/d": "gated"}}
+    )
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
     res = preload.warm_instances(models=["a/b", "c/d"], timeout_s=5, poll_interval_s=0.0)
     assert [r["status"] for r in res] == ["partial"]
@@ -1662,7 +2022,8 @@ def test_warm_instance_times_out_when_no_marker(monkeypatch):
     # which the effective-budget floor of 60 would otherwise impose). sleep is a no-op.
     clock = {"t": 0.0}
     fake_time = _types.SimpleNamespace(
-        time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e6))
+        time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e6)
+    )
     monkeypatch.setattr(preload, "time", fake_time)
     res = preload.warm_instances(models=["a/b"], timeout_s=0, poll_interval_s=0.0)
     assert [r["status"] for r in res] == ["timeout"]
@@ -1684,15 +2045,19 @@ def test_warm_poll_budget_matches_worker_wall_cap_below_floor(monkeypatch):
     wall_caps = []
     orig_spec = preload._preload_instance_spec
     monkeypatch.setattr(
-        preload, "_preload_instance_spec",
+        preload,
+        "_preload_instance_spec",
         lambda gpu, run_id, wall_s=1800: wall_caps.append(wall_s) or orig_spec(gpu, run_id, wall_s),
     )
     # Fake clock that ticks 1 (virtual) second per sleep, so we can read how long the poll ran.
     clock = {"t": 1000.0}
     start = clock["t"]
     monkeypatch.setattr(
-        preload, "time",
-        _types.SimpleNamespace(time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)),
+        preload,
+        "time",
+        _types.SimpleNamespace(
+            time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)
+        ),
     )
 
     res = preload.warm_instances(models=["a/b"], timeout_s=10, poll_interval_s=0.0)  # 10 < 60 floor
@@ -1709,12 +2074,15 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
 
     terminated = []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
-    monkeypatch.setattr(preload, "make_hf_text_reader", lambda *a, **k: (lambda force=False: None))
+    monkeypatch.setattr(preload, "make_hf_text_reader", lambda *a, **k: lambda force=False: None)
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
-    monkeypatch.setattr(lj, "launch_and_submit",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity")))
+    monkeypatch.setattr(
+        lj, "launch_and_submit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity"))
+    )
     monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
-    res = preload.warm_instances(models=["a/b"], providers=["lambda"], timeout_s=5, poll_interval_s=0.0)
+    res = preload.warm_instances(
+        models=["a/b"], providers=["lambda"], timeout_s=5, poll_interval_s=0.0
+    )
     assert res[0]["status"] == "error"
     assert "no capacity" in res[0]["error"]
     assert len(terminated) == 1  # finally still tears down
@@ -1747,10 +2115,15 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
     clock = {"t": 1000.0}
     start = clock["t"]
     monkeypatch.setattr(
-        preload, "time",
-        _types.SimpleNamespace(time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)),
+        preload,
+        "time",
+        _types.SimpleNamespace(
+            time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)
+        ),
     )
-    res = preload.warm_instances(models=["a/b"], providers=["lambda"], timeout_s=600, poll_interval_s=0.0)
+    res = preload.warm_instances(
+        models=["a/b"], providers=["lambda"], timeout_s=600, poll_interval_s=0.0
+    )
     assert res[0]["status"] == "error"
     assert "image pull failed" in res[0]["error"]
     assert clock["t"] - start < 5  # bailed immediately, did NOT poll the full 600s
@@ -1777,6 +2150,7 @@ def test_warm_instances_uses_per_provider_default_gpu(monkeypatch):
         def _u(gpu):
             seen[provider] = gpu
             return []
+
         return _u
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
@@ -1795,6 +2169,7 @@ def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
         def _u(gpu):
             seen[provider] = gpu
             return []
+
         return _u
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
@@ -1815,7 +2190,9 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
     from flash.providers.runpod import preload
 
     # Lambda (an unfiltered provider) has capacity -> a real launch target exists.
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")])
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")]
+    )
     monkeypatch.setattr(
         lj,
         "launch_and_submit",
@@ -1840,7 +2217,9 @@ def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
     monkeypatch.setattr(
         preload,
         "_ensure_status_repo",
-        lambda token: (_ for _ in ()).throw(AssertionError("status repo must not be required with no targets")),
+        lambda token: (_ for _ in ()).throw(
+            AssertionError("status repo must not be required with no targets")
+        ),
     )
     assert preload.warm_instances(models=["a/b"]) == []
 
@@ -1849,7 +2228,9 @@ def test_warm_instances_cli_dry_run(monkeypatch):
     from flash.providers.runpod import preload
 
     called = {"n": 0}
-    monkeypatch.setattr(preload, "warm_instances", lambda **k: called.__setitem__("n", called["n"] + 1) or [])
+    monkeypatch.setattr(
+        preload, "warm_instances", lambda **k: called.__setitem__("n", called["n"] + 1) or []
+    )
     assert preload.main(["--warm-instances", "--dry-run"]) == 0
     assert called["n"] == 0  # dry-run launches nothing
 

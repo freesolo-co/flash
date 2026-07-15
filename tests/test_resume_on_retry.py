@@ -32,6 +32,7 @@ from flash.spec import JobSpec
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
 INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
 # ============================================================================================
@@ -118,7 +119,9 @@ def fake_transformers(monkeypatch):
     return mod
 
 
-def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_streams_full_state_checkpoint_latest_only(
+    tmp_path, monkeypatch, fake_transformers
+):
     """on_save streams the resume checkpoint to <prefix>/checkpoint/checkpoint-<N>, pruned latest-only.
 
     This is the upload a preempted run resumes FROM, so it must (a) keep the trainer state
@@ -156,7 +159,9 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(tmp_path, mon
     assert "ignore_patterns" not in up
 
 
-def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_also_publishes_deployable_snapshot(
+    tmp_path, monkeypatch, fake_transformers
+):
     """Each save additionally mirrors an adapter-only, NON-pruned per-step deployable snapshot.
 
     The two paths are distinct: the resume stream (above) is full-state + latest-only; the
@@ -172,7 +177,9 @@ def test_upload_callback_also_publishes_deployable_snapshot(tmp_path, monkeypatc
         SimpleNamespace(),
     )
 
-    deployable = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")]
+    deployable = [
+        u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")
+    ]
     assert len(deployable) == 1
     up = deployable[0]
     # Adapter-only (trainer state stripped) and accumulating (never pruned).
@@ -193,7 +200,9 @@ def test_upload_callback_noop_without_repo(tmp_path, monkeypatch, fake_transform
     assert rec.uploads == []
 
 
-def test_upload_callback_skips_when_checkpoint_dir_missing(tmp_path, monkeypatch, fake_transformers):
+def test_upload_callback_skips_when_checkpoint_dir_missing(
+    tmp_path, monkeypatch, fake_transformers
+):
     """A save event whose checkpoint folder isn't on disk yet must not push a phantom commit."""
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
@@ -252,15 +261,94 @@ def test_hf_resume_checkpoint_returns_latest_step(monkeypatch, resume_run_id):
     path = worker.hf_resume_checkpoint()
 
     assert path is not None
-    assert path.endswith("checkpoint-80"), "must resume from the highest streamed step, not the first"
+    assert path.endswith("checkpoint-80"), (
+        "must resume from the highest streamed step, not the first"
+    )
     assert os.path.isdir(path)
+
+
+def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
+    monkeypatch, resume_run_id
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    seen = {}
+
+    def snapshot(**kwargs):
+        seen.update(kwargs)
+        base = os.path.join(
+            kwargs["local_dir"], "rl", resume_run_id, "checkpoint"
+        )
+        for name in ("checkpoint-40", "checkpoint-latest", "checkpoint-80"):
+            os.makedirs(os.path.join(base, name), exist_ok=True)
+        return kwargs["local_dir"]
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+
+    path = worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+    assert seen["revision"] == "pinned-sha"
+    assert path is not None
+    assert path.endswith("checkpoint-80")
+
+
+@pytest.mark.parametrize("name", ["checkpoint-0", "checkpoint-040"])
+def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(
+    monkeypatch, resume_run_id, name
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+
+    def snapshot(**kwargs):
+        base = os.path.join(kwargs["local_dir"], "rl", resume_run_id, "checkpoint", name)
+        os.makedirs(base, exist_ok=True)
+        return kwargs["local_dir"]
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
+        worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+
+def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(
+    monkeypatch, resume_run_id
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+
+    def snapshot(**kwargs):
+        base = os.path.join(kwargs["local_dir"], "rl", resume_run_id, "checkpoint")
+        for name in ("checkpoint-0", "checkpoint-040", "checkpoint-40"):
+            os.makedirs(os.path.join(base, name), exist_ok=True)
+        return kwargs["local_dir"]
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+
+    path = worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+    assert path is not None
+    assert path.endswith("checkpoint-40")
 
 
 def test_hf_resume_checkpoint_none_without_repo(monkeypatch):
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, repo="")
-    # No repo -> short-circuit to None; snapshot_download must never be reached.
+    # no repo is a legitimate fresh start only when the control plane did not require resume.
     assert worker.hf_resume_checkpoint() is None
+
+
+def test_hf_resume_checkpoint_required_without_repo_raises(monkeypatch):
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, repo="")
+    with pytest.raises(RetriableInfraError, match="has no artifact repository"):
+        worker.hf_resume_checkpoint(revision="pinned-sha")
 
 
 def test_hf_resume_checkpoint_none_when_nothing_streamed(monkeypatch, resume_run_id):
@@ -285,8 +373,119 @@ def test_hf_resume_checkpoint_swallows_download_error(monkeypatch, resume_run_id
     assert worker.hf_resume_checkpoint() is None
 
 
+def test_hf_resume_checkpoint_starts_no_download_at_deadline(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **kwargs: pytest.fail("snapshot download must not start at the deadline"),
+    )
+
+    assert worker.hf_resume_checkpoint() is None
+
+
+def test_hf_resume_checkpoint_fail_closed_on_download_error(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+
+    def _boom(**_):
+        raise RuntimeError("hf down")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint fetch failed"):
+        worker.hf_resume_checkpoint(fail_closed=True)
+
+
+def test_hf_resume_checkpoint_fail_closed_at_deadline(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **kwargs: pytest.fail("snapshot download must not start at the deadline"),
+    )
+
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint fetch failed"):
+        worker.hf_resume_checkpoint(fail_closed=True)
+
+
+def test_hf_resume_checkpoint_fail_closed_allows_confirmed_absence(
+    monkeypatch, resume_run_id
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+
+    assert worker.hf_resume_checkpoint(fail_closed=True) is None
+
+
+def test_hf_resume_checkpoint_pinned_missing_base_raises(monkeypatch, resume_run_id):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
+        worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+
+def test_hf_resume_checkpoint_pinned_absence_clears_stale_local_state(
+    monkeypatch, resume_run_id
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+    stale = os.path.join(
+        "/tmp/resume", "rl", resume_run_id, "checkpoint", "checkpoint-80"
+    )
+    os.makedirs(stale, exist_ok=True)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
+        worker.hf_resume_checkpoint(revision="pinned-sha")
+
+    assert not os.path.exists(stale)
+
+
+def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(
+    monkeypatch, resume_run_id
+):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    from flash.engine.worker.perf import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
+
+    def snapshot(**kwargs):
+        base = os.path.join(
+            kwargs["local_dir"], "rl", resume_run_id, "checkpoint", "checkpoint-latest"
+        )
+        os.makedirs(base, exist_ok=True)
+        return kwargs["local_dir"]
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+
+    with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
+        worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
+
+
 # ============================================================================================
-# 3. CONTROL PLANE — _submit_seed_supervised relaunches the same run on infra-shaped failure
+# 3. control plane - _submit_seed_supervised relaunches the same run on infra-shaped failure
 # ============================================================================================
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 4090", "max_retries": 2}
@@ -295,6 +494,8 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
+            # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
+            "seed": 0,
             "run_id": run_id,
             "train": {"epochs": 1, "hf_repo": "owner/runs"},
             "gpu": gpu,
@@ -315,12 +516,43 @@ def _alloc():
     )
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j"):
+def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
         "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
+
+
+def _vast_handle(attempt=0):
+    return {
+        "provider": "vast",
+        "instance_id": attempt + 1,
+        "offer_id": 100 + attempt,
+        "machine_id": 200 + attempt,
+        "label": f"flash-retry-{attempt}",
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.5,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
+
+
+def _lambda_handle(attempt=0):
+    return {
+        "provider": "lambda",
+        "instance_id": f"i-{attempt + 1}",
+        "instance_type": "gpu_1x_a10",
+        "region": "us-east-1",
+        "name": f"flash-retry-{attempt}",
+        "gpu": "A10",
+        "hourly_usd": 1.29,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
     }
 
 
@@ -335,8 +567,12 @@ def orch(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     # The retry loop tears the prior attempt's endpoint down before relaunching; keep it off-network.
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda *a, **k: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
     return runner
 
 
@@ -359,7 +595,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         calls.append((run_spec.run_id, seed))
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
             return PollResult(False, failure=failure, detail="infra")
         return PollResult(True, metrics={"train_tokens": 4096})
@@ -383,33 +619,38 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
     preserved (not cleared) for the run's outer GC."""
     import flash.providers as providers
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
 
     submits = []
     gc_calls = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(attempt)
-        on_handle({"provider": "vast", "instance_id": f"i{attempt}"})  # vast handle drives the teardown
-        return PollResult(False, failure="stalled", detail="infra")  # attempt 0 fails infra-shaped
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    vast_candidate = Candidate("vast", "RTX 4090", 0.5, 24)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("vast", "RTX 4090", 0.5, 12, (vast_candidate,)),
+    )
 
     class _RaisingVast:
-        def destroy(self, handle):  # unconfirmed teardown
+        def submit_run(self, run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+            submits.append(attempt)
+            on_handle(_vast_handle(attempt))
+            return PollResult(False, failure="stalled", detail="infra")
+
+        def destroy(self, handle):
             from flash.providers.vast import api as vast_api
 
             raise vast_api.VastApiError("destroy unconfirmed (success:false)")
 
-        def gc(self, spec):  # run-scoped force-reap by label
+        def gc(self, spec):
             gc_calls.append(spec.run_id)
 
+    vast_provider = _RaisingVast()
     real_get = providers.get_provider
     monkeypatch.setattr(
         providers,
         "get_provider",
-        lambda name: _RaisingVast() if name == "vast" else real_get(name),
+        lambda name: vast_provider if name == "vast" else real_get(name),
     )
 
     spec = _spec()
@@ -421,11 +662,113 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 
     assert submits == [0], "must NOT launch a second worker over a possibly-live box"
     assert gc_calls == [spec.run_id], "force-reap the run's label before failing terminally"
-    assert "teardown UNCONFIRMED" in log.getvalue()
+    assert "teardown unconfirmed" in log.getvalue()
     # handle preserved (not cleared) so the run's outer GC can still reach the box
     remote = orch.get_status(spec.run_id).remote
     assert remote is not None
-    assert remote.get("instance_id") == "i0"
+    assert remote.get("instance_id") == 1
+
+
+def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+
+    submits = []
+    gc_calls = []
+    candidate = Candidate("lambda", "A10", 1.29, 24)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate,)),
+    )
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        submits.append(attempt)
+        on_handle(_lambda_handle(attempt))
+        return PollResult(False, failure="stalled", detail="infra")
+
+    def unconfirmed(_instance_id):
+        raise lambda_api.LambdaApiError("private provider termination response")
+
+    monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_submit)
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", unconfirmed)
+    monkeypatch.setattr(
+        lambda_jobs,
+        "terminate_run_instances",
+        lambda run_id: gc_calls.append(run_id) or [],
+    )
+
+    spec = _spec(**{"type": "A10"})
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0]
+    assert gc_calls == [spec.run_id]
+    assert "teardown unconfirmed" in log.getvalue()
+    assert "private" not in log.getvalue()
+    assert "private" not in str(caught.value)
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("instance_id") == "i-1"
+
+
+@pytest.mark.parametrize("teardown_failure", ["delete_false", "delete_exception"])
+def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
+    orch, monkeypatch, teardown_failure
+):
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import train as runpod_train
+
+    submits = []
+    teardown_events = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(attempt)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        return PollResult(False, failure="stalled", detail="infra")
+
+    def cancel_job(endpoint_id, job_id, **_kw):
+        teardown_events.append(("cancel", endpoint_id, job_id))
+        if teardown_failure == "cancel":
+            raise RuntimeError("private cancellation response")
+        return {"id": job_id, "status": "CANCELLED"}
+
+    def delete_endpoint(endpoint_id, _fingerprint):
+        teardown_events.append(("delete", endpoint_id))
+        if teardown_failure == "delete_false":
+            return False
+        if teardown_failure == "delete_exception":
+            raise RuntimeError("private deletion response")
+        return True
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+    monkeypatch.setattr(runpod_train, "terminate_endpoint", lambda *_args, **_kwargs: None)
+
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submits == [0]
+    assert teardown_events[:2] == [("cancel", "ep0", "j0"), ("delete", "ep0")]
+    assert "teardown unconfirmed" in log.getvalue()
+    assert "private" not in log.getvalue()
+    assert "private" not in str(caught.value)
+    remote = orch.get_status(spec.run_id).remote
+    assert remote is not None
+    assert remote.get("endpoint_id") == "ep0"
+    assert remote.get("job_id") == "j0"
 
 
 def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, monkeypatch):
@@ -444,7 +787,11 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
     # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
     cancels: list[str] = []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda eid, jid: cancels.append(eid))
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda eid, jid, **_kw: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
+    )
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
@@ -455,7 +802,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
             # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
             # attempt), so the next retry has no stale handle to re-tear-down.
             return PollResult(False, failure="no_capacity", detail="search flaked")
-        on_handle(_runpod_handle("ep2", "j2"))  # fresh endpoint on the final retry
+        on_handle(_runpod_handle("ep2", "j2", 2))  # fresh endpoint on the final retry
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
@@ -467,7 +814,9 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     metrics = orch._submit_seed_supervised(spec, 0, log)
 
     assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
-    assert cancels == ["ep0"], "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+    assert cancels == ["ep0"], (
+        "ep0 must be torn down exactly once, never re-torn after confirmed clear"
+    )
 
 
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):

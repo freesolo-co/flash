@@ -9,6 +9,27 @@ from typing import ClassVar
 import pytest
 
 
+def test_opd_lora_rank_uses_maximum_default_and_pattern_rank():
+    from flash.engine.worker.opd_vllm import opd_lora_rank
+
+    model = SimpleNamespace(
+        peft_config={
+            "first": SimpleNamespace(r=16, rank_pattern={"a": 64}),
+            "second": SimpleNamespace(r=32, rank_pattern={"b": 8}),
+        }
+    )
+    assert opd_lora_rank(model) == 64
+
+
+def test_opd_lora_rank_reads_dict_valued_r():
+    # Some PEFT configs express per-module ranks via a dict-valued `r` (no rank_pattern); the
+    # max-rank path must honor it, else a rank-64 continued adapter initializes vLLM too small.
+    from flash.engine.worker.opd_vllm import opd_lora_rank
+
+    model = SimpleNamespace(peft_config={"only": SimpleNamespace(r={"q_proj": 64, "v_proj": 16})})
+    assert opd_lora_rank(model) == 64
+
+
 def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_path):
     """OPD's vLLM engine must generate with the latest saved adapter, not a stale LoRA."""
     from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
@@ -130,12 +151,14 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
 
     class _FakeLLM:
         batch_sizes: ClassVar[list[int]] = []
+        request_seeds: ClassVar[list[int]] = []
 
         def __init__(self, **_kwargs):
             pass
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
             _FakeLLM.batch_sizes.append(len(prompts))
+            _FakeLLM.request_seeds.extend(params.kwargs["seed"] for params in sampling_params)
             return [
                 SimpleNamespace(
                     outputs=[
@@ -174,9 +197,12 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
     )
     engine.sync_from_model(_Model())
 
-    out = engine.generate([[1], [2], [3], [4], [5]], max_tokens=5)
+    out = engine.generate(
+        [[1], [2], [3], [4], [5]], max_tokens=5, request_seeds=[11, 12, 13, 14, 15]
+    )
 
     assert _FakeLLM.batch_sizes == [2, 2, 1]
+    assert _FakeLLM.request_seeds == [11, 12, 13, 14, 15]
     assert [item.token_ids for item in out] == [[3], [3], [3], [3], [3]]
 
 
@@ -238,13 +264,16 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
             return "".join(table.get(int(i), "") for i in ids)
 
     knobs = OpdKnobs(stop_sequences=("</answer>",))
+    eos_ids = frozenset({99})
     truncated = _gen_from_vllm_output(
-        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs
+        OpdVllmOutput([1], "ok", finish_reason="length"), _Tok(), knobs, eos_ids
     )
     assert truncated.truncated is True
+    assert truncated.finish_reason == "length"
+    assert truncated.stop_reason is None
 
     stopped = _gen_from_vllm_output(
-        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs
+        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="stop"), _Tok(), knobs, eos_ids
     )
     assert stopped.truncated is False
     assert stopped.skip is False
@@ -252,20 +281,35 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
     assert stopped.completion_text == "ok"
 
     length_stopped = _gen_from_vllm_output(
-        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="length"), _Tok(), knobs
+        OpdVllmOutput([1, 2], "ok</answer>", finish_reason="length"), _Tok(), knobs, eos_ids
     )
     assert length_stopped.truncated is False
     assert length_stopped.skip is False
     assert length_stopped.completion_ids == [1]
     assert length_stopped.completion_text == "ok"
+    assert length_stopped.finish_reason == "length"
 
     length_eos = _gen_from_vllm_output(
-        OpdVllmOutput([1, 99], "ok", finish_reason="length"), _Tok(), OpdKnobs()
+        OpdVllmOutput([1, 99], "ok", finish_reason="length"),
+        _Tok(),
+        OpdKnobs(),
+        eos_ids,
     )
     assert length_eos.truncated is False
     assert length_eos.skip is False
     assert length_eos.completion_ids == [1, 99]
     assert length_eos.completion_text == "ok"
+    assert length_eos.terminal_eos_id == 99
+    stop_over_eos_over_length = _gen_from_vllm_output(
+        OpdVllmOutput([1, 99, 2], "ok</answer>", finish_reason="length", stop_reason="</answer>"),
+        _Tok(),
+        knobs,
+        eos_ids,
+    )
+    assert stop_over_eos_over_length.truncated is False
+    assert stop_over_eos_over_length.completion_ids == [1, 99]
+    assert stop_over_eos_over_length.completion_text == "ok"
+    assert stop_over_eos_over_length.terminal_eos_id == 99
 
 
 def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
@@ -581,6 +625,7 @@ def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_pa
         temperature=0.7,
         top_p=0.9,
         stop_sequences=("</answer>",),
+        eos_token_ids=(2, 73, 151645),
         structured_outputs=spec,
         adapter_root=str(tmp_path / "sync"),
     )
@@ -591,6 +636,7 @@ def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_pa
     assert isinstance(so, _SOParams)
     assert so.kwargs == spec
     assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]  # coexists with the stop knobs
+    assert _SamplingParams.last_kwargs["stop_token_ids"] == [2, 73, 151645]
 
 
 def test_opd_vllm_structured_outputs_never_silently_dropped(monkeypatch, tmp_path):
@@ -728,7 +774,9 @@ def test_opd_vllm_constrained_generate_uses_fresh_params_per_request(monkeypatch
             return [
                 SimpleNamespace(
                     outputs=[
-                        SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
+                        SimpleNamespace(
+                            token_ids=[3], text="x", finish_reason="stop", stop_reason=None
+                        )
                     ]
                 )
                 for _ in prompts
@@ -785,7 +833,11 @@ def test_normalize_output_marks_grammar_forced_positions():
         text="ok",
         finish_reason="stop",
         stop_reason=None,
-        logprobs=[{3: _lp(0.0), 99: _lp(neg_inf)}, {4: _lp(-0.3), 9: _lp(-1.4)}, {5: _lp(0.0), 88: _lp(neg_inf)}],
+        logprobs=[
+            {3: _lp(0.0), 99: _lp(neg_inf)},
+            {4: _lp(-0.3), 9: _lp(-1.4)},
+            {5: _lp(0.0), 88: _lp(neg_inf)},
+        ],
     )
     out = _normalize_output(SimpleNamespace(outputs=[comp]))
     assert out.forced == (True, False, True)

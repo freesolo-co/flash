@@ -8,6 +8,8 @@ Covers:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 
@@ -18,7 +20,18 @@ def _spec():
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
     )
+
+
+def _run_deadline_fields() -> dict[str, float | int]:
+    run_created_at = time.time()
+    run_max_wall_seconds = 3600
+    return {
+        "run_created_at": run_created_at,
+        "run_max_wall_seconds": run_max_wall_seconds,
+        "deadline_at": run_created_at + run_max_wall_seconds,
+    }
 
 
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
@@ -64,6 +77,7 @@ def test_build_worker_env_opd_uses_expandable_allocator(monkeypatch):
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
     )
     env = build_worker_env(opd_spec, 0)
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
@@ -106,7 +120,10 @@ def test_build_worker_env_forwards_managed_teacher_key_for_opd_only(monkeypatch)
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "platform-managed-teacher")
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B", algorithm="opd", train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs")
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
     )
     assert build_worker_env(opd_spec, 0).get("FIREWORKS_API_KEY") == "platform-managed-teacher"
     # grpo/sft don't use a teacher, so the key is not forwarded to those workers.
@@ -125,6 +142,7 @@ def test_build_worker_env_managed_teacher_key_is_authoritative_no_byo(monkeypatc
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env", secrets=("FIREWORKS_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
     )
     env = build_worker_env(opd_spec, 0, runtime_secrets={"FIREWORKS_API_KEY": "byo-user-key"})
     assert env["FIREWORKS_API_KEY"] == "platform-managed-teacher"
@@ -156,6 +174,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
     )
 
     env = build_worker_env(
@@ -243,6 +262,7 @@ def _spec_worker_env(worker_env: dict):
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
+        seed=0,
         worker_env=dict(worker_env),
     )
 
@@ -322,6 +342,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="myorg/runs"),
+        seed=0,
     )
     assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
@@ -351,7 +372,12 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(epochs=1, max_examples=2))
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, max_examples=2),
+        seed=0,
+    )
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
@@ -398,9 +424,9 @@ def test_error_artifact_name_is_per_phase_and_attempt():
     assert error_artifact_name("rl") == "error_rl_attempt0.txt"
     assert error_artifact_name("rl", 0) != error_artifact_name("rl", 1)
     assert error_artifact_name("sft", 2) == "error_sft_attempt2.txt"
-    # str-typed ATTEMPT env value coerces cleanly
-    assert error_artifact_name("sft", "3") == "error_sft_attempt3.txt"
-    assert error_artifact_name("sft", "") == "error_sft_attempt0.txt"
+    for invalid in ("3", "", True, 1.5, -1, 1 << 63):
+        with pytest.raises(ValueError, match="attempt must be"):
+            error_artifact_name("sft", invalid)
 
 
 def test_train_body_imports_every_name_it_uses():
@@ -466,6 +492,7 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
                 "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
                 "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
                 "code_prefix": "../code/flash",
+                **_run_deadline_fields(),
             }
         )
 
@@ -509,6 +536,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
                     "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
                     "extra_pip": ["git+https://github.com/freesolo-co/chalk.git@abc123"],
                     "code_prefix": "../code/flash",
+                    **_run_deadline_fields(),
                 }
             )
     finally:
@@ -723,6 +751,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         "job_spec_json": job_spec,
         "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
         "code_prefix": code_prefix,
+        **_run_deadline_fields(),
     }
 
     try:
@@ -774,6 +803,7 @@ def test_train_body_rejects_unsafe_code_prefix(monkeypatch):
                 "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
                 "env": {"HF_TOKEN": "tok"},
                 "code_prefix": "../code/flash",
+                **_run_deadline_fields(),
             }
         )
 

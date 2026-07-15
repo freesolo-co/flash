@@ -20,6 +20,7 @@ from flash.schema.fields import (
     _coerce_scalar,
     _environment_secrets,
     _require_environment_ref,
+    _section_int,
     _train_float,
     _train_int,
     _train_stops,
@@ -28,14 +29,24 @@ from flash.schema.fields import (
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.spec import (
+    FIXED_SEED,
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    parse_seed,
+)
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-# The ONE public checkpoint/adapter reference grammar: `<run_id>` (a run's trained adapter) or
-# `<run_id>/step-N` (a specific saved checkpoint listed by `flash checkpoints`). The control plane
-# resolves it to the internal storage reference below; users never see or write storage refs.
+# canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
+# revisions additionally lock that checkpoint identity to the exact hugging face commit.
 _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
+_ADAPTER_REVISION_RE = re.compile(
+    rf"^(?P<run_id>{_RUN_ID_RE})@(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\."
+    r"(?P<hf_revision>[0-9a-f]{40})$"
+)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -58,9 +69,31 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
         return None
 
 
+def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
+    """Parse a locked immutable adapter revision into ``(run_id, step|None, hf_revision)``."""
+    match = _ADAPTER_REVISION_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    step = match.group("step")
+    return (
+        match.group("run_id"),
+        int(step) if step is not None else None,
+        match.group("hf_revision"),
+    )
+
+
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
     """Format the canonical short reference: `<run_id>` or `<run_id>/step-N`."""
     return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
+
+
+def format_adapter_revision(run_id: str, step: int | None, hf_revision: str) -> str:
+    """Format and validate a canonical immutable adapter revision."""
+    suffix = f"step-{int(step)}" if step is not None else "final"
+    revision = f"{run_id}@{suffix}.{hf_revision}"
+    if parse_adapter_revision(revision) is None:
+        raise ValueError("invalid immutable adapter revision components")
+    return revision
 
 
 def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
@@ -176,6 +209,13 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+def _job_seed(raw: dict[str, Any]) -> int:
+    try:
+        return parse_seed(raw.get("seed", FIXED_SEED))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     ref_raw = train_raw.get("init_from_adapter")
     if ref_raw is None:
@@ -202,6 +242,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "algorithm",
         "model_policy",
         "thinking",
+        "seed",
         "environment",
         "train",
         "gpu",
@@ -211,7 +252,9 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 TRAIN_KEY_MIN_VERSIONS = {
-    item.name: str(item.metadata["introduced_in"]) for item in dataclass_fields(TrainSpec)
+    item.name: str(item.metadata["introduced_in"])
+    for item in dataclass_fields(TrainSpec)
+    if "introduced_in" in item.metadata
 }
 TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
 
@@ -229,7 +272,6 @@ def validate_train_keys(keys: Collection[str]) -> None:
             f"[train] unknown key(s): {', '.join(unknown)} "
             f"(allowed: {', '.join(sorted(TRAIN_SCHEMA_KEYS))})"
         )
-
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
@@ -298,6 +340,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
+    gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
+    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
+    gpu_options = {}
+    if gpu_max_retries is not None:
+        gpu_options["max_retries"] = gpu_max_retries
+    if gpu_max_wall_seconds is not None:
+        gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
 
     try:
         # Offline sizing/display only; allocator re-resolves at submit time.
@@ -326,9 +375,20 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true",
             file=sys.stderr,
         )
+    init_from_adapter = _init_from_adapter_ref(train_raw)
+    if algorithm == "sft" and init_from_adapter:
+        raise ConfigError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
+    if init_from_adapter and "lora_rank" in train_raw:
+        raise ConfigError(
+            "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
+            "rank metadata is authoritative"
+        )
     lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
     max_lora_rank = serving_lora_rank_cap(info)
-    if max_lora_rank is not None and lora_rank > max_lora_rank:
+    if not init_from_adapter and max_lora_rank is not None and lora_rank > max_lora_rank:
         raise ConfigError(
             f"train.lora_rank={lora_rank} exceeds {model}'s serving max_lora_rank="
             f"{max_lora_rank}; lower train.lora_rank or raise the serving cap "
@@ -338,20 +398,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
-    spec = JobSpec(
-        model=model,
-        algorithm=algorithm,
-        environment=EnvironmentSpec(
-            id=str(env_raw.get("id") or ""),
-            params=dict(env_raw.get("params") or {}),
-            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
-            secrets=environment_secrets,
-        ),
-        train=TrainSpec(
+    try:
+        train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=_init_from_adapter_ref(train_raw),
+            init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
@@ -365,18 +417,31 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
-            # OPD-only terminal-EOS reinforcement weight; 0 disables. None -> recipe default (0.5).
-            opd_eos_loss_coef=_train_float(train_raw, "opd_eos_loss_coef", minimum=0.0),
-            # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
+            # opd-only managed teacher alias, validated against the allow-list; "" -> default glm 5.2.
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
-            # minimum=0: explicit 0 means "no cap" per TrainSpec contract
-            max_steps=_train_int(train_raw, "max_steps", minimum=0),
+            # minimum=0: explicit 0 means "no cap" per trainspec contract
+            max_steps=train_raw.get("max_steps"),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            save_at_steps=train_raw.get("save_at_steps"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+    spec = JobSpec(
+        model=model,
+        algorithm=algorithm,
+        environment=EnvironmentSpec(
+            id=str(env_raw.get("id") or ""),
+            params=dict(env_raw.get("params") or {}),
+            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+            secrets=environment_secrets,
         ),
-        gpu=GpuSpec(type=gpu_type),
+        train=train_spec,
+        gpu=GpuSpec(type=gpu_type, **gpu_options),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
+        seed=_job_seed(raw),
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,

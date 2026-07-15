@@ -231,6 +231,17 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    if spec.train.init_from_adapter:
+        # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
+        # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
+        # (resolved server-side at submit/dry-run), which can be higher — so this estimate may
+        # under-quote. stderr keeps stdout clean for machine-readable callers.
+        print(
+            "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
+            "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
+            "may cost more than this estimate. Run `flash train --dry-run` for a source-rank quote.",
+            file=sys.stderr,
+        )
     estimate = estimate_cost(runconfig_from_spec(spec))
     if render.styled():
         print(render.cost_panel(estimate))
@@ -595,11 +606,7 @@ def cmd_deploy(args) -> int:
         return 1
     base_run_id, _step = parsed
     client = client_from_config()
-    dep = client.deploy(
-        args.run_id,
-        dry_run=args.dry_run,
-        verify=not getattr(args, "no_verify", False),
-    )
+    dep = client.deploy(args.run_id, dry_run=args.dry_run)
     if render.styled():
         print(render.deployed(dep))
     else:
@@ -636,12 +643,6 @@ def cmd_deploy(args) -> int:
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
             file=sys.stderr,
         )
-        if getattr(args, "no_verify", False):
-            skip_note = "server-side smoke verification was skipped for this deployment."
-            print(
-                render.arrow(skip_note) if render.styled() else f"note: {skip_note}",
-                file=sys.stderr,
-            )
     return 1 if dep.get("state") == "failed" else 0
 
 
@@ -703,27 +704,48 @@ def cmd_deployments(args) -> int:
     if render.styled():
         print(render.deployments_table(rows))
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<10}  {'OPENAI BASE URL':<40}  DETAIL")
-    for r in rows:
-        d = r.get("deployment") or {}
-        detail = str(d.get("error") or d.get("detail") or "")
-        openai_base = str(d.get("openai_base_url") or "")
-        print(f"{r['run_id']:<32}  {d.get('state', '?'):<10}  {openai_base:<40}  {detail}")
+    print(
+        f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
+        f"{'VERIFIED AT':<18}  {'OPENAI MODEL':<30}  DETAIL"
+    )
+    for row in rows:
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        step = deployment.get("checkpoint_step")
+        step_text = "final" if step is None else str(step)
+        verified_at = deployment.get("verified_at")
+        verified_text = "-" if verified_at is None else str(verified_at)
+        revision = str(deployment.get("adapter_revision") or "-")
+        state = str(deployment.get("state") or "-")
+        openai_model = str(deployment.get("openai_model") or run_id)
+        detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
+        print(
+            f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
+            f"{verified_text:<18}  {openai_model:<30}  {detail}"
+        )
     return 0
 
 
 def cmd_chat(args) -> int:
-    from flash.schema import parse_checkpoint_ref
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
 
-    parsed = parse_checkpoint_ref(args.run_id)
-    if parsed is None:
+    revision = parse_adapter_revision(args.run_id)
+    parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
+    if revision is None and parsed is None:
         print(
-            f"invalid run/checkpoint reference {args.run_id!r} "
-            "(expected <run_id> or <run_id>/step-N)",
+            f"invalid chat target {args.run_id!r} "
+            "(expected a bare <run_id> or full immutable adapter revision)",
             file=sys.stderr,
         )
         return 1
-    base_run_id, _step = parsed
+    if revision is None and parsed[1] is not None:
+        print(
+            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
+            "run alias; use the full immutable adapter revision returned by `flash deployments`",
+            file=sys.stderr,
+        )
+        return 1
+    chat_target = args.run_id if revision is not None else parsed[0]
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
     system = getattr(args, "system", None)
@@ -735,7 +757,7 @@ def cmd_chat(args) -> int:
     if stream is not None:
         wrote = False
         for chunk in stream(
-            base_run_id,
+            chat_target,
             messages=messages,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -747,7 +769,7 @@ def cmd_chat(args) -> int:
         return 0
 
     resp = client.chat(
-        base_run_id,
+        chat_target,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,

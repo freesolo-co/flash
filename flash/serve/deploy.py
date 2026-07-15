@@ -3,27 +3,29 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
+from urllib.parse import quote
 
 import httpx
 
 from flash._logging import get_logger
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
+from flash.schema import format_adapter_revision
 from flash.serve.urls import openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
-
-# Read-back verification: after POST /adapters, poll the serving registry until the adapter is
-# visible at the requested checkpoint, so "ready" is a registry-backed claim rather than an
-# assumption (see _verify_adapter_registered).
-READBACK_ATTEMPTS = 5
 READBACK_DELAY_SECONDS = 2.0
+REVISION_READY_BUDGET_SECONDS = 5 * 60.0
+ACTIVATION_READBACK_ATTEMPTS = 3
+THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+_RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 
 
 class ServingError(RuntimeError):
@@ -32,6 +34,32 @@ class ServingError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ActivationOutcomeUnknown(ServingError):
+    """Alias activation cannot be resolved to the attempted or previous revision."""
+
+    def __init__(self, run_id: str, attempted_revision: str, *, detail: str | None = None):
+        reason = detail or "authoritative alias readback failed"
+        super().__init__(
+            "alias_activation_unknown: serving may have activated "
+            f"{attempted_revision} for {run_id}, but {reason}; retry deployment reconciliation "
+            "before treating either revision as authoritative"
+        )
+        self.run_id = run_id
+        self.attempted_revision = attempted_revision
+
+
+class RetryableServingUnavailable(ServingError):
+    """a recognized serving cold-start envelope that may be retried within a caller deadline."""
+
+    def __init__(self, code: str, retry_after_seconds: float):
+        super().__init__(
+            f"serving_retryable_unavailable: {code}",
+            status_code=503,
+        )
+        self.code = code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AdapterConfigMissing(ServingError):
@@ -76,10 +104,12 @@ def _serving_request(
     *,
     json: dict | None = None,
     ok_statuses: tuple[int, ...] = (),
+    timeout_s: float | None = None,
 ) -> httpx.Response:
     """Issue a request to the serving backend; translates failures into ServingError."""
-    # follow_redirects: Modal 303-redirects slow requests to an async-result poll URL.
-    kwargs: dict = {"headers": _internal_key_header(), "timeout": 60.0, "follow_redirects": True}
+    # follow_redirects: modal 303-redirects slow requests to an async-result poll url.
+    timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
+    kwargs: dict = {"headers": _internal_key_header(), "timeout": timeout, "follow_redirects": True}
     if json is not None:
         kwargs["json"] = json
     try:
@@ -141,10 +171,43 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     openai_base_url: str
+    adapter_revision: str | None = None
+    checkpoint_step: int | None = None
+    verified_at: float | None = None
     state: str = "ready"
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def adapter_revision_id(run_id: str, checkpoint_step: int | None, hf_revision: str) -> str:
+    return format_adapter_revision(run_id, checkpoint_step, hf_revision)
+
+
+def resolve_hf_revision(hf_repo: str) -> str:
+    """Resolve the full immutable commit SHA for the uploaded adapter repository."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:  # pragma: no cover
+        raise ServingError(
+            "could not resolve adapter revision: huggingface_hub is not installed"
+        ) from exc
+    try:
+        revision = str(
+            HfApi()
+            .repo_info(
+                repo_id=hf_repo,
+                repo_type="dataset",
+                token=os.environ.get("HF_TOKEN"),
+            )
+            .sha
+            or ""
+        ).strip()
+    except Exception as exc:
+        raise ServingError(f"could not resolve adapter revision for {hf_repo}: {exc}") from exc
+    if len(revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in revision):
+        raise ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
+    return revision.lower()
 
 
 def deployment_record(
@@ -153,6 +216,8 @@ def deployment_record(
     adapter_prefix: str,
     *,
     state: str = "ready",
+    checkpoint_step: int | None = None,
+    adapter_revision: str | None = None,
 ) -> Deployment:
     subfolder = f"{adapter_prefix}/adapter"
     base = serving_base_url()
@@ -162,6 +227,8 @@ def deployment_record(
         model=model,
         adapter_hf_prefix=subfolder,
         openai_model=run_id,
+        adapter_revision=adapter_revision,
+        checkpoint_step=checkpoint_step,
         endpoint_name=base,
         openai_base_url=openai_url,
         state=state,
@@ -182,7 +249,7 @@ def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str =
         )
 
 
-def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
+def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revision: str) -> None:
     """Confirm the adapter has tensor weights before registering it with serving."""
     try:
         from huggingface_hub import HfApi
@@ -197,6 +264,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
                 path_in_repo=subfolder.rstrip("/"),
                 repo_type="dataset",
                 recursive=False,
+                revision=hf_revision,
                 token=os.environ.get("HF_TOKEN"),
             )
         )
@@ -234,7 +302,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str) -> None:
     )
 
 
-def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
+def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str) -> int:
     """Read rank metadata and verify the adapter has tensor weights."""
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
@@ -248,6 +316,7 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
             repo_id=hf_repo,
             filename=filename,
             repo_type="dataset",
+            revision=hf_revision,
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
@@ -266,36 +335,8 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str) -> int:
         raise ValueError(
             f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
         )
-    _verify_adapter_artifact_tensors(hf_repo, subfolder)
+    _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
-
-
-def _structured_outputs_body(
-    run_id: str, structured_outputs: str, *, thinking: bool
-) -> dict | None:
-    """The per-adapter structured-outputs serving default for the registration body, or None.
-
-    Returns the parsed canonical StructuredOutputsParams-kwargs dict when the run configured a
-    constraint AND is non-thinking; None otherwise (no default is registered). Non-thinking only:
-    serving sets no reasoning-parser, so a per-adapter grammar would bind from the very first
-    generated token and force a thinking adapter's ``<think>`` phase to open the schema (e.g. ``{``)
-    — strictly worse than serving it unconstrained. Training stays compatible with thinking via a
-    DEFERRED grammar (``reasoning_parser="deepseek_r1"`` holds the constraint until ``</think>``),
-    but serving has no such deferral, so we skip the serve-time default for thinking runs rather
-    than break reasoning. Raises ValueError on a corrupt spec — a wiring bug, since
-    ``[train].structured_outputs`` is already canonicalized at run creation (schema/fields.py), so
-    this cannot fire for a real run; it fails loudly rather than ever silently serving unconstrained."""
-    if not structured_outputs:
-        return None
-    if thinking:
-        logger.info(
-            "adapter %s trained with structured_outputs but thinking=True; not registering a "
-            "serving guided-decoding default — serving has no reasoning-parser deferral, so it "
-            "would bind the grammar from token 0 and suppress the <think> phase",
-            run_id,
-        )
-        return None
-    return parse_structured_outputs(structured_outputs)
 
 
 def deploy_adapter(
@@ -309,90 +350,93 @@ def deploy_adapter(
     thinking: bool = False,
     structured_outputs: str = "",
     org_id: str | None = None,
+    checkpoint_step: int | None = None,
+    expected_adapter_revision: str | None = None,
+    before_activate: Callable[[str, str], None] | None = None,
 ) -> Deployment:
-    """Register the trained adapter with the freesolo serving app.
+    """Register, verify, and atomically activate one immutable adapter revision.
 
-    ``structured_outputs`` is the run's ``[train].structured_outputs`` spec (canonical
-    StructuredOutputsParams-kwargs JSON, or "" for none). When set, it is registered as the
-    adapter's per-adapter guided-decoding DEFAULT so every serve request is constrained by the
-    SAME grammar the adapter trained under — otherwise a structured-outputs run drifts at
-    unconstrained serving (train/serve exposure bias: it over-generates arrays that truncate to
-    invalid JSON and emits keys the training grammar had masked). See ``_structured_outputs_body``.
+    Thinking adapters with structured outputs require serving to advertise deferred constraint
+    support before the immutable revision is registered.
     """
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
-    if not dry_run:
-        validate_serving_lora_rank(
-            model,
-            adapter_artifact_lora_rank(hf_repo, subfolder),
-            rank_source="adapter artifact",
-        )
-    dep = deployment_record(run_id, model, adapter_prefix, state="dry_run" if dry_run else "ready")
+    dep = deployment_record(
+        run_id,
+        model,
+        adapter_prefix,
+        state="dry_run" if dry_run else "queued",
+        checkpoint_step=checkpoint_step,
+    )
     if dry_run:
         return dep
-    base = serving_base_url()
+
+    hf_revision = resolve_hf_revision(hf_repo)
+    validate_serving_lora_rank(
+        model,
+        adapter_artifact_lora_rank(hf_repo, subfolder, hf_revision=hf_revision),
+        rank_source="adapter artifact",
+    )
+    revision = adapter_revision_id(run_id, checkpoint_step, hf_revision)
+    dep.adapter_revision = revision
+    checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
+    so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
+    _require_serving_capabilities(thinking_structured_outputs=thinking and so_default is not None)
+
     body = {
-        "adapter_id": run_id,
+        "adapter_id": revision,
         "repo_id": hf_repo,
         "base_model": model,
         "subfolder": subfolder,
-        # Must be "dataset": trainer uploads to a dataset repo; serving defaults to "model" and 404s.
         "repo_type": "dataset",
+        "checkpoint": checkpoint,
         "status": "ready",
-        # Preserves thinking parity: without this, Qwen3.5 defaults to thinking ON regardless of training.
+        "metadata": {
+            "record_type": "revision",
+            "run_id": run_id,
+            "checkpoint_step": checkpoint_step,
+            "hf_revision": hf_revision,
+        },
         "thinking": bool(thinking),
     }
-    so_default = _structured_outputs_body(run_id, structured_outputs, thinking=thinking)
     if so_default is not None:
         body["structured_outputs"] = so_default
     normalized_org_id = (org_id or "").strip()
     if normalized_org_id:
         body["org_id"] = normalized_org_id
-    previous_record = _registered_adapter(run_id)
+
     try:
-        _serving_request("POST", f"{base}/adapters", json=body)
+        registration = _serving_request("POST", f"{serving_base_url()}/adapters", json=body)
+        if registration.status_code not in {200, 202}:
+            raise ServingError(
+                f"serving returned unexpected adapter registration status {registration.status_code}"
+            )
     except ServingError as exc:
-        # A 4xx means serving rejected the request outright and nothing changed. Anything else
-        # (5xx, timeout, unreachable) is ambiguous: the registry may or may not have switched to
-        # the new checkpoint. Read it back and report the actual state instead of guessing.
         if exc.status_code is not None and exc.status_code < 500:
             raise
-        record = _registered_adapter(run_id)
-        recorded = _record_subfolder(record)
-        if record is not None and recorded == subfolder:
-            logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows the adapter "
-                "registered; continuing",
-                run_id,
-                exc,
-            )
-        elif record is not None and recorded is None and previous_record is None:
-            logger.warning(
-                "POST /adapters for %s failed (%s) but the serving registry shows a new adapter "
-                "record without subfolder details; continuing because no prior deployment was "
-                "registered",
-                run_id,
-                exc,
-            )
-        elif record is not None and recorded is None:
-            raise ServingError(
-                f"{exc} — the serving registry returned adapter {run_id} without a subfolder, "
-                f"so it cannot confirm that requested checkpoint {subfolder!r} replaced the "
-                "previous deployment. Retry `flash deploy` once serving recovers",
-                status_code=exc.status_code,
-            ) from exc
-        elif recorded is not None:
-            raise ServingError(
-                f"{exc} — the serving registry still shows adapter {run_id} at the previously "
-                f"deployed checkpoint ({recorded!r}, requested {subfolder!r}), so the OLD "
-                "checkpoint remains active. Retry `flash deploy` once serving recovers",
-                status_code=exc.status_code,
-            ) from exc
-        else:
-            raise
-    else:
-        _verify_adapter_registered(run_id, subfolder)
-    logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
+        try:
+            record = _registered_adapter(revision)
+        except ServingError as read_exc:
+            raise exc from read_exc
+        if record is None or not _matches_revision_identity(record, body):
+            raise exc
+        logger.warning(
+            "adapter registration response was ambiguous; revision %s exists with matching identity",
+            revision,
+        )
+
+    _wait_revision_ready(revision, subfolder, expected_identity=body)
+    if before_activate is not None:
+        before_activate(revision, checkpoint)
+    activation = _activate_revision(
+        run_id,
+        revision,
+        checkpoint,
+        expected_adapter_revision=expected_adapter_revision,
+    )
+    dep.state = "ready"
+    dep.openai_model = str(activation.get("adapter_id") or run_id)
+    logger.info("activated adapter %s revision %s", run_id, revision)
     return dep
 
 
@@ -403,73 +447,336 @@ def _record_subfolder(record: dict | None) -> str | None:
     return str(value) if value is not None else None
 
 
-def _registered_adapter(run_id: str) -> dict | None:
-    """The adapter's record in the serving registry, or None when absent or unreadable."""
+def _adapter_url(adapter_id: str) -> str:
+    return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
+
+
+def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
+    """Read one authoritative adapter record, including disabled records."""
+    resp = _serving_request(
+        "GET",
+        _adapter_url(adapter_id),
+        ok_statuses=(404,),
+        timeout_s=timeout_s,
+    )
+    if resp.status_code == 404:
+        return None
     try:
-        resp = _serving_request("GET", f"{serving_base_url()}/adapters")
         payload = resp.json()
-    except (ServingError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    for record in payload.get("adapters") or []:
-        if not isinstance(record, dict):
-            continue
-        adapter_id = record.get("adapter_id") or record.get("adapterId")
-        if adapter_id == run_id:
-            return record
-    return None
-
-
-def _verify_adapter_registered(run_id: str, subfolder: str) -> None:
-    """Poll the serving registry until the adapter is visible at the requested checkpoint.
-
-    A 2xx from POST /adapters only proves the registration request was accepted. If the record
-    never lands in the registry, /v1/chat/completions 404s with "Unknown adapter id" even though
-    the deployment record claims ready. Polling here makes "ready" a registry-backed claim.
-    """
-    recorded: str | None = None
-    seen = False
-    for attempt in range(READBACK_ATTEMPTS):
-        if attempt:
-            time.sleep(READBACK_DELAY_SECONDS * attempt)
-        record = _registered_adapter(run_id)
-        if record is None:
-            continue
-        seen = True
-        recorded = _record_subfolder(record)
-        # Older serving builds may omit subfolder from the record; presence then has to count.
-        if recorded is None or recorded == subfolder:
-            return
-    if seen:
+    except ValueError as exc:
         raise ServingError(
-            f"adapter {run_id} is registered at checkpoint {recorded!r} instead of the requested "
-            f"{subfolder!r}; the previously deployed checkpoint is still active — retry "
-            "`flash deploy`"
-        )
-    raise ServingError(
-        f"adapter {run_id} was accepted by serving but never appeared in its registry; chat "
-        "requests would fail with HTTP 404 'Unknown adapter id'. The deployment was not marked "
-        "ready — retry `flash deploy`, and if this persists an operator must check the freesolo "
-        "serving app"
+            f"serving returned invalid status JSON for adapter {adapter_id}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ServingError(f"serving returned invalid status data for adapter {adapter_id}")
+    record = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else payload
+    if not isinstance(record, dict):
+        raise ServingError(f"serving returned no adapter record for {adapter_id}")
+    return record
+
+
+def _matches_revision_identity(record: dict, expected: dict) -> bool:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    expected_metadata = expected["metadata"]
+    scalar_fields = (
+        "adapter_id",
+        "repo_id",
+        "repo_type",
+        "subfolder",
+        "base_model",
+        "checkpoint",
+        "thinking",
+    )
+    if any(record.get(field) != expected.get(field) for field in scalar_fields):
+        return False
+    if (record.get("org_id") or None) != (expected.get("org_id") or None):
+        return False
+    if (record.get("structured_outputs") or None) != (expected.get("structured_outputs") or None):
+        return False
+    return all(
+        metadata.get(field) == expected_metadata.get(field)
+        for field in ("record_type", "run_id", "checkpoint_step", "hf_revision")
     )
 
 
-def undeploy_adapter(run_id: str) -> list[str]:
-    """Deregister the adapter; returns [run_id] on success, [] if already gone (404)."""
-    base = serving_base_url()
-    url = f"{base}/adapters/{run_id}"
-    resp = _serving_request("DELETE", url, ok_statuses=(404,))
-    if resp.status_code == 404:
-        return []
-    if _registered_adapter(run_id) is not None:
-        logger.warning(
-            "adapter %s still appears in the serving registry after DELETE; a stale router may "
-            "keep serving it until its next reload",
-            run_id,
+def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> None:
+    required = {
+        "immutable_adapter_revisions",
+        "alias_compare_and_swap",
+        "revision_provenance",
+    }
+    if thinking_structured_outputs:
+        required.add(THINKING_STRUCTURED_OUTPUTS_CAPABILITY)
+    url = f"{serving_base_url()}/healthz"
+    response = _serving_request("GET", url)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} did not return valid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} returned a non-object payload"
         )
-    logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
-    return [run_id]
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} must return a list field "
+            "named capabilities"
+        )
+    if not all(isinstance(capability, str) for capability in capabilities):
+        raise ServingError(
+            f"serving_contract_unsupported: serving health check at {url} capabilities must be "
+            "strings"
+        )
+    missing = sorted(required - set(capabilities))
+    if missing:
+        raise ServingError(
+            "serving_contract_unsupported: serving is missing required capabilities "
+            + ", ".join(missing)
+        )
+
+
+def _revision_state(record: dict) -> tuple[str, object]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    state = str(metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered")
+    return state, metadata.get("failure")
+
+
+def _wait_revision_ready(
+    revision: str,
+    subfolder: str,
+    *,
+    expected_identity: dict | None = None,
+    budget_s: float = REVISION_READY_BUDGET_SECONDS,
+) -> dict:
+    deadline = time.monotonic() + max(0.0, float(budget_s))
+    last_state = "registered"
+    last_read_error: ServingError | None = None
+    first_read = True
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not first_read:
+            time.sleep(min(READBACK_DELAY_SECONDS, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+        first_read = False
+        try:
+            record = _registered_adapter(revision, timeout_s=remaining)
+        except ServingError as exc:
+            if exc.status_code is not None and exc.status_code < 500:
+                raise
+            last_read_error = exc
+            continue
+        if time.monotonic() >= deadline:
+            break
+        if record is None:
+            continue
+        last_read_error = None
+        if expected_identity is not None and not _matches_revision_identity(
+            record, expected_identity
+        ):
+            raise ServingError(
+                f"adapter revision {revision} resolved to a different immutable identity"
+            )
+        last_state, failure = _revision_state(record)
+        if last_state == "failed" or record.get("status") == "disabled":
+            raise ServingError(
+                f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
+            )
+        if last_state == "ready" and _record_subfolder(record) == subfolder:
+            return record
+    if last_read_error is not None:
+        raise ServingError(
+            f"adapter revision {revision} readiness could not be confirmed after transient "
+            f"serving errors: {last_read_error}"
+        ) from last_read_error
+    raise ServingError(
+        f"adapter revision {revision} remained {last_state!r}; the previous alias remains available"
+    )
+
+
+def _alias_target(record: dict | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    metadata = record.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("alias_of"), str):
+        return metadata["alias_of"]
+    return None
+
+
+def _active_alias_target(record: dict | None) -> str | None:
+    if not isinstance(record, dict) or record.get("status") == "disabled":
+        return None
+    return _alias_target(record)
+
+
+def adapter_alias_target(run_id: str) -> str | None:
+    """Read the authoritative immutable revision targeted by a mutable run alias."""
+    record = _registered_adapter(run_id)
+    if record is None or record.get("status") == "disabled":
+        return None
+    target = _active_alias_target(record)
+    if target is None:
+        raise ServingError(
+            f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
+        )
+    return target
+
+
+def _validate_activation_response(
+    response: object,
+    *,
+    run_id: str,
+    revision: str,
+    checkpoint: str,
+    expected_adapter_revision: str | None,
+) -> dict:
+    if not isinstance(response, dict):
+        raise ServingError("serving returned an invalid alias activation response")
+    if response.get("adapter_id") != run_id or response.get("target_adapter_revision") != revision:
+        raise ServingError("serving returned mismatched committed alias activation provenance")
+    if response.get("previous_adapter_revision") != expected_adapter_revision:
+        raise ServingError("serving returned mismatched previous alias revision")
+    if response.get("checkpoint") != checkpoint:
+        raise ServingError("serving returned mismatched committed alias checkpoint")
+    if not isinstance(response.get("updated_at"), str) or not response["updated_at"].strip():
+        raise ServingError("serving returned committed alias activation without updated_at")
+    return response
+
+
+def _activate_revision(
+    run_id: str,
+    revision: str,
+    checkpoint: str,
+    *,
+    expected_adapter_revision: str | None,
+) -> dict:
+    body = {"expected_adapter_revision": expected_adapter_revision}
+    try:
+        response = _serving_request(
+            "POST",
+            f"{_adapter_url(revision)}/activate",
+            json=body,
+        ).json()
+        return _validate_activation_response(
+            response,
+            run_id=run_id,
+            revision=revision,
+            checkpoint=checkpoint,
+            expected_adapter_revision=expected_adapter_revision,
+        )
+    except (ServingError, ValueError) as exc:
+        alias = None
+        read_error: ServingError | None = None
+        target = None
+        for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
+            if attempt:
+                time.sleep(READBACK_DELAY_SECONDS)
+            try:
+                alias = _registered_adapter(run_id)
+                read_error = None
+            except ServingError as read_exc:
+                read_error = read_exc
+                continue
+            target = _active_alias_target(alias)
+            if target == revision:
+                return {
+                    "adapter_id": run_id,
+                    "target_adapter_revision": revision,
+                    "previous_adapter_revision": expected_adapter_revision,
+                    "checkpoint": checkpoint,
+                    "updated_at": alias.get("updated_at") if alias else None,
+                }
+            if target not in (None, expected_adapter_revision):
+                break
+        if read_error is not None:
+            raise ActivationOutcomeUnknown(run_id, revision) from read_error
+        if expected_adapter_revision is not None and target == expected_adapter_revision:
+            raise ServingError(
+                f"alias activation was not committed; {run_id} still targets {target!r}"
+            ) from exc
+        if target is None:
+            raise ActivationOutcomeUnknown(
+                run_id,
+                revision,
+                detail=(
+                    "alias activation outcome is ambiguous because authoritative readback exposed "
+                    "no target"
+                ),
+            ) from exc
+        raise ActivationOutcomeUnknown(
+            run_id,
+            revision,
+            detail=f"alias activation diverged because authoritative readback targets {target!r}",
+        ) from exc
+
+
+def undeploy_adapter(run_id: str) -> dict:
+    """Disable the run alias and all immutable revisions without engine eviction."""
+    response = _serving_request(
+        "DELETE",
+        _adapter_url(run_id),
+        ok_statuses=(404,),
+    )
+    if response.status_code == 404:
+        return {
+            "run_id": run_id,
+            "disabled_aliases": [],
+            "disabled_revisions": [],
+            "serving_deregistered": False,
+        }
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ServingError("serving returned an invalid undeploy response") from exc
+    if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+        raise ServingError("serving returned a mismatched undeploy response")
+    for field in ("disabled_aliases", "disabled_revisions"):
+        value = payload.setdefault(field, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ServingError(f"serving returned invalid {field} in undeploy response")
+    payload["serving_deregistered"] = bool(
+        payload["disabled_aliases"] or payload["disabled_revisions"]
+    )
+    return payload
+
+
+def _retryable_smoke_unavailable(
+    response: httpx.Response,
+    *,
+    requested_model: str,
+) -> RetryableServingUnavailable | None:
+    if response.status_code != 503:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return None
+    error = payload["error"]
+    code = error.get("code")
+    if (
+        error.get("type") != "adapter_unavailable"
+        or error.get("retryable") is not True
+        or code not in _RETRYABLE_SMOKE_503_CODES
+        or error.get("requested_model") != requested_model
+        or error.get("adapter_revision") != requested_model
+    ):
+        return None
+    raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
+    try:
+        retry_after_seconds = float(raw_delay)
+    except (TypeError, ValueError):
+        retry_after_seconds = READBACK_DELAY_SECONDS
+    if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+        retry_after_seconds = READBACK_DELAY_SECONDS
+    return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
 def chat(
@@ -478,8 +785,15 @@ def chat(
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
+    expected_checkpoint: str | None = None,
+    timeout_s: float | None = None,
+    retry_unavailable: bool = False,
 ) -> dict:
-    """Send an OpenAI-style chat request for the run's adapter to freesolo serving."""
+    """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
+
+    ``timeout_s`` overrides the default 30-minute request timeout. deployment smoke also enables
+    recognized unavailable-envelope classification so its caller can retry within one deadline.
+    """
     base = serving_openai_base_url()
     body = {
         "model": run_id,
@@ -490,10 +804,25 @@ def chat(
     }
     # follow_redirects + max_redirects=100: Modal 303-redirects slow cold-start requests across
     # several poll cycles before the result is ready.
-    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
-        resp = client.post(f"{base}/chat/completions", json=body, headers=_internal_key_header())
+    headers = _internal_key_header()
+    if expected_checkpoint:
+        headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
+    timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
+    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=timeout) as client:
+        resp = client.post(f"{base}/chat/completions", json=body, headers=headers)
+    if retry_unavailable:
+        retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
+        if retryable_error is not None:
+            raise retryable_error
     resp.raise_for_status()
-    return resp.json()
+    payload = resp.json()
+    if expected_checkpoint and isinstance(payload, dict):
+        payload["_freesolo_headers"] = {
+            "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
+            "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
+            "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
+        }
+    return payload
 
 
 def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:

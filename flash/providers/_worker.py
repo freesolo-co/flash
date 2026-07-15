@@ -10,9 +10,15 @@ from flash._channel import CHANNEL
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
-from flash.spec import JobSpec
+from flash.spec import (
+    RESERVED_WORKER_ENV_KEYS,
+    JobSpec,
+    require_matching_seed,
+    validate_worker_env_reserved,
+)
 
 # Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
 logger = get_logger("flash.providers.runpod.train")
@@ -205,7 +211,9 @@ def build_worker_env(
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
-    # GRPO uses a non-expandable alloc conf: expandable_segments crashes the vLLM sleep-mode engine.
+    canonical_seed = require_matching_seed(spec, seed)
+    validate_worker_env_reserved(spec.worker_env)
+    # grpo uses a non-expandable alloc conf: expandable_segments crashes the vllm sleep-mode engine.
     # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
     # SFT and OPD have NO vLLM sleep engine and allocate large HF generate/logit tensors, so both take
     # the anti-fragmentation expandable allocator up front: OPD was previously lumped in with RL here
@@ -221,6 +229,7 @@ def build_worker_env(
         "RUN_ID": spec.run_id,
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
+        "SEED": str(canonical_seed),
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
@@ -233,16 +242,14 @@ def build_worker_env(
     env["HF_REPO"] = spec.train.hf_repo
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
-    for k in ("FLASH_CHALK_SPEC",):  # install-source override; kernel selection is fixed in chalk_kernels
+    for k in (
+        "FLASH_CHALK_SPEC",
+    ):  # install-source override; kernel selection is fixed in chalk_kernels
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # RUN_ID/HF_REPO/FLASH_ARM are control-plane-owned: overriding them would orphan artifacts.
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
-        if ku in _RESERVED_WORKER_ENV:
-            continue
         if ku in _REMOVED_OPTIMIZATION_ENV:
             logger.warning(
                 "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
@@ -251,10 +258,23 @@ def build_worker_env(
             )
             continue
         env[str(k)] = str(v)
-    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+    # runtime secrets and declared env secrets may never clobber a control-plane-owned key: the
+    # canonical seed, run id, hf repo, and arm are set above, and a runtime seed override would break
+    # the authoritative-seed invariant regardless of how environment.secrets was populated.
+    allowed_runtime_secrets = {
+        k
+        for k in (set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
+        if k.upper() not in RESERVED_WORKER_ENV_KEYS
+    }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)
+    # the pinned resume revision is control-plane-owned transport, not a user-declared secret.
+    # lifecycle removes caller input and supplies only the gate-approved sha on a required replacement.
+    env.pop(OPD_RESUME_REVISION_ENV, None)
+    resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
+    if resume_revision:
+        env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
     # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
     # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
     # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed
@@ -267,19 +287,31 @@ def build_worker_env(
 _CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
-def _hf_call(call, label: str):
-    return hf_call(call, label, logger=logger, sleep=time.sleep)
+def _hf_call(call, label: str, *, deadline_at: float | None = None):
+    return hf_call(
+        call,
+        label,
+        logger=logger,
+        sleep=time.sleep,
+        deadline_at=deadline_at,
+    )
 
 
 def _is_hf_not_found(exc: BaseException) -> bool:
     return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
 
 
-def _ensure_private_artifact_repo(api, repo: str) -> None:
+def _ensure_private_artifact_repo(
+    api,
+    repo: str,
+    *,
+    deadline_at: float | None = None,
+) -> None:
     try:
         _hf_call(
             lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
             f"lookup artifact repo {repo}",
+            deadline_at=deadline_at,
         )
     except Exception as exc:
         if not _is_hf_not_found(exc):
@@ -287,15 +319,22 @@ def _ensure_private_artifact_repo(api, repo: str) -> None:
         _hf_call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),
             f"create artifact repo {repo}",
+            deadline_at=deadline_at,
         )
     # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
     _hf_call(
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",
+        deadline_at=deadline_at,
     )
 
 
-def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> str:
+def upload_code(
+    repo: str | None = None,
+    *,
+    code_prefix: str | None = None,
+    deadline_at: float | None = None,
+) -> str:
     """Upload the ``flash`` package to its content-addressed HF artifact prefix."""
     from huggingface_hub import HfApi
 
@@ -309,12 +348,13 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
     token = os.environ.get("HF_TOKEN")
     pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
-    _ensure_private_artifact_repo(api, repo)
+    _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
     code_prefix = code_prefix or flash_code_prefix()
     code_marker = f"{code_prefix}/{_CODE_SNAPSHOT_COMPLETE}"
     if _hf_call(
         lambda: api.file_exists(repo_id=repo, filename=code_marker, repo_type="dataset"),
         f"check flash code snapshot {repo}:{code_marker}",
+        deadline_at=deadline_at,
     ):
         return repo
     _hf_call(
@@ -326,6 +366,7 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
             ignore_patterns=["__pycache__/*", "*.pyc", "*.pyo"],
         ),
         f"upload flash code to {repo}:{code_prefix}",
+        deadline_at=deadline_at,
     )
     _hf_call(
         lambda: api.upload_file(
@@ -335,5 +376,6 @@ def upload_code(repo: str | None = None, *, code_prefix: str | None = None) -> s
             repo_type="dataset",
         ),
         f"mark flash code snapshot complete {repo}:{code_marker}",
+        deadline_at=deadline_at,
     )
     return repo

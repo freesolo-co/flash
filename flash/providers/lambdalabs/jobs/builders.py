@@ -57,9 +57,9 @@ class LambdaJobHandle(InstanceJobHandle):
 
     @staticmethod
     def _coerce_instance_id(raw) -> str:
-        # A Lambda instance_id is an opaque string; the base guard still turns a MISSING one into a
-        # clear "corrupt lambda handle" error rather than a bare KeyError that crashes recovery.
-        return str(raw)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("invalid lambda instance id")
+        return raw
 
     def _extra_to_dict(self) -> dict:
         return {
@@ -70,11 +70,10 @@ class LambdaJobHandle(InstanceJobHandle):
 
     @staticmethod
     def _extra_from_dict(d: dict) -> dict:
-        return {
-            "instance_type": str(d.get("instance_type") or ""),
-            "region": str(d.get("region") or ""),
-            "name": str(d.get("name") or ""),
-        }
+        values = {key: d.get(key) for key in ("instance_type", "region", "name")}
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            raise ValueError("persisted lambda provider identity is incomplete")
+        return values
 
 
 def lambda_image(gpu: str | None = None) -> str:
@@ -85,14 +84,28 @@ def lambda_image(gpu: str | None = None) -> str:
 
 
 def build_payload(
-    spec, seed: int, attempt: int, runtime_secrets: dict | None = None,
+    spec,
+    seed: int,
+    attempt: int,
+    runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
-    mode: str | None = None, models: list | None = None, code_prefix: str | None = None,
+    mode: str | None = None,
+    models: list | None = None,
+    code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> dict:
     """Build the Lambda bootstrap payload (arm='lambda')."""
     return _shared_build_payload(
-        spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets,
-        cache_host_mount=cache_host_mount, mode=mode, models=models, code_prefix=code_prefix,
+        spec,
+        seed,
+        attempt,
+        arm="lambda",
+        runtime_secrets=runtime_secrets,
+        cache_host_mount=cache_host_mount,
+        mode=mode,
+        models=models,
+        code_prefix=code_prefix,
+        deadline_at=deadline_at,
     )
 
 

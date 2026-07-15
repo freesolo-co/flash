@@ -1119,6 +1119,61 @@ def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
         worker._hf_upload(boom, "DONE", required=True, label="DONE")
 
 
+def test_required_upload_starts_no_hf_call_at_deadline(monkeypatch):
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    calls = []
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+
+    with pytest.raises(RetriableInfraError):
+        worker._hf_upload(lambda: calls.append("upload"), "DONE", required=True, label="DONE")
+
+    assert calls == []
+
+
+def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, capsys):
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    calls = []
+    sleeps = []
+    remaining = iter((2.0, 2.0, 0.0))
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: next(remaining))
+    monkeypatch.setattr(worker.time, "sleep", sleeps.append)
+    monkeypatch.setenv("HF_TOKEN", "bearer-secret")
+
+    def boom():
+        calls.append("upload")
+        raise OSError("Authorization: Bearer bearer-secret provider-body-private")
+
+    with pytest.raises(RetriableInfraError):
+        worker._hf_upload(boom, "DONE", required=True, label="DONE")
+
+    assert calls == ["upload"]
+    assert sleeps == [2.0]
+    output = capsys.readouterr().out
+    assert "bearer-secret" not in output
+    assert "provider-body-private" in output
+
+
+def test_optional_upload_without_deadline_preserves_single_attempt(monkeypatch):
+    from flash.engine import worker
+
+    calls = []
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: None)
+
+    def boom():
+        calls.append("upload")
+        raise OSError("offline")
+
+    assert not worker._hf_upload(boom, "debug.json", required=False, label="debug")
+    assert calls == ["upload"]
+
+
 # ---------------------------------------------------------------------------
 # flash #184: tilelang's libcudart_stub.so shadows the real CUDA runtime in
 # vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset`).

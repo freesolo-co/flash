@@ -34,17 +34,30 @@ class OpdVllmOutput:
 
 
 def opd_lora_rank(model, default: int = 32) -> int:
-    """Best-effort PEFT LoRA rank for vLLM's max_lora_rank."""
+    """Best-effort maximum PEFT LoRA rank for vLLM's max_lora_rank."""
     cfgs = getattr(model, "peft_config", None) or {}
     cfg_iter = cfgs.values() if isinstance(cfgs, dict) else (cfgs,)
+    ranks: list[int] = []
     for cfg in cfg_iter:
         rank = getattr(cfg, "r", None)
-        if isinstance(rank, dict):
-            vals = [int(v) for v in rank.values() if isinstance(v, int) and v > 0]
-            if vals:
-                return max(vals)
-        if isinstance(rank, int) and rank > 0:
-            return rank
+        if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+            ranks.append(rank)
+        elif isinstance(rank, dict):
+            # Some PEFT configs express per-module ranks as a dict-valued `r`; take the max.
+            ranks.extend(
+                int(value)
+                for value in rank.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+        pattern = getattr(cfg, "rank_pattern", None)
+        if isinstance(pattern, dict):
+            ranks.extend(
+                int(value)
+                for value in pattern.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+    if ranks:
+        return max(ranks)
     try:
         return max(1, int(default))
     except (TypeError, ValueError):
@@ -240,6 +253,8 @@ class OpdVllmRolloutEngine:
     temperature: float
     top_p: float
     stop_sequences: tuple[str, ...] = ()
+    # the exact model/tokenizer halt set used for generation and termination classification.
+    eos_token_ids: tuple[int, ...] = ()
     # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
     structured_outputs: dict[str, Any] | None = None
     # vLLM EngineArgs.reasoning_parser (e.g. "deepseek_r1") when thinking + a constraint are both on:
@@ -383,13 +398,17 @@ class OpdVllmRolloutEngine:
                     return False
         return False
 
-    def _sampling_params(self, max_tokens: int):
+    def _sampling_params(self, max_tokens: int, *, seed: int | None = None):
         kwargs = {
             "max_tokens": max(1, int(max_tokens)),
             "temperature": float(self.temperature),
             "top_p": float(self.top_p),
             "stop": list(self.stop_sequences) if self.stop_sequences else None,
         }
+        if seed is not None:
+            kwargs["seed"] = int(seed)
+        if self.eos_token_ids:
+            kwargs["stop_token_ids"] = list(self.eos_token_ids)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
         # matching the shared OPD stop-trimming path. Older vLLM builds ignore unsupported kwargs by
         # raising.
@@ -414,10 +433,16 @@ class OpdVllmRolloutEngine:
             return self._SamplingParams(**kwargs)
 
     def generate(
-        self, prompt_ids_batch: list[list[int]], *, max_tokens: int
+        self,
+        prompt_ids_batch: list[list[int]],
+        *,
+        max_tokens: int,
+        request_seeds: list[int] | None = None,
     ) -> list[OpdVllmOutput]:
         if not prompt_ids_batch:
             return []
+        if request_seeds is not None and len(request_seeds) != len(prompt_ids_batch):
+            raise ValueError("opd rollout request seed count must match prompt count")
         if self._lora_request is None:
             raise RuntimeError("opd vLLM rollout used before sync_from_model()")
         limit = max(1, int(self.rollout_batch_size or len(prompt_ids_batch)))
@@ -427,14 +452,20 @@ class OpdVllmRolloutEngine:
                 {"prompt_token_ids": [int(t) for t in ids]}
                 for ids in prompt_ids_batch[start : start + limit]
             ]
+            seeds = request_seeds[start : start + limit] if request_seeds is not None else None
             # vLLM's structured-output processor stamps per-request backend state onto the
             # StructuredOutputsParams instance, so a single shared constrained params corrupts
             # every sequence after the first (same reason multiturn_rollout builds one per
             # request). Hand vLLM a fresh params per prompt when constrained; unconstrained runs
             # have no per-request state and share one cheaply.
             sampling_params = (
-                [self._sampling_params(max_tokens) for _ in prompts]
-                if self._StructuredOutputsParams is not None
+                [
+                    self._sampling_params(
+                        max_tokens, seed=seeds[index] if seeds is not None else None
+                    )
+                    for index in range(len(prompts))
+                ]
+                if self._StructuredOutputsParams is not None or seeds is not None
                 else self._sampling_params(max_tokens)
             )
             outputs = self.llm.generate(

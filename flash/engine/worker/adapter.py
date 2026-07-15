@@ -113,12 +113,11 @@ def _init_adapter_model(model_id: str):
     adir = _download_adapter(prefix)
     if not adir:
         raise RuntimeError(
-            f"train.init_from_adapter={prefix!r} could not be downloaded from the artifact "
-            "store (wrong/missing prefix or no access); refusing to silently start from "
-            "the base model. Fix the adapter prefix / HF credentials, or omit "
-            "init_from_adapter to train a fresh LoRA."
+            "the warm-start source adapter could not be downloaded from the artifact store; "
+            "refusing to silently start from the base model. Verify the source run and access, "
+            "or omit init_from_adapter to train a fresh LoRA."
         )
-    print(f"[init-adapter] continuing LoRA from {prefix}")
+    print("[init-adapter] continuing the prepared source LoRA")
     _attn = optimal_attn_impl()
     attn_kw = {"attn_implementation": _attn} if _attn else {}
 
@@ -132,9 +131,7 @@ def _init_adapter_model(model_id: str):
     if is_vl:
         print("[init-adapter] VL checkpoint: continuing the adapter on the full multimodal base")
     base_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
-    base = base_cls.from_pretrained(
-        model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw
-    )
+    base = base_cls.from_pretrained(model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw)
     # PeftModel.from_pretrained builds the wrapper + a trainable "default" adapter, but it doesn't
     # forward the HF `_checkpoint_conversion_mapping`; re-load "default" with key_mapping so a VL
     # checkpoint's keys remap onto the current module tree (mapping is None/no-op for non-VL).
@@ -175,12 +172,19 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     repo, prefix = resolved
     from huggingface_hub import snapshot_download
 
-    snapshot_download(
-        repo_id=repo,
-        repo_type="dataset",
-        allow_patterns=[f"{prefix}/adapter/*"],
-        local_dir="/tmp/evdl",
-        token=os.environ.get("HF_TOKEN"),
-    )
+    try:
+        snapshot_download(
+            repo_id=repo,
+            repo_type="dataset",
+            allow_patterns=[f"{prefix}/adapter/*"],
+            local_dir="/tmp/evdl",
+            token=os.environ.get("HF_TOKEN"),
+            revision=(_w.JOB_SPEC.train.init_from_adapter_revision if _w.JOB_SPEC else None)
+            or None,
+        )
+    except Exception:
+        raise RuntimeError(
+            "the prepared warm-start source adapter could not be downloaded"
+        ) from None
     adir = os.path.join("/tmp/evdl", prefix, "adapter")
     return adir if os.path.isdir(adir) else None

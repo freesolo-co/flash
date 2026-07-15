@@ -5,12 +5,10 @@ runs from their persisted quote (``RunStatus.cost_usd``), not measured provider 
 
 from __future__ import annotations
 
-import math
-
 from flash.catalog import samples_on_policy
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
-from flash.engine.steps import on_policy_steps
+from flash.engine.steps import on_policy_steps, resolve_update_horizon, sft_update_steps
 
 
 def _sft_epochs(spec) -> int:
@@ -108,25 +106,28 @@ def _sft_realized_batch(spec) -> int:
 
 def _sft_steps_from_examples(spec, examples: int, *, apply_cap: bool) -> int:
     t = spec.train
-    cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
-    n = max(1, math.ceil(examples / _sft_realized_batch(spec)) * _sft_epochs(spec))
-    return min(n, cap) if apply_cap and cap > 0 else n
+    derived = sft_update_steps(
+        epochs=_sft_epochs(spec),
+        example_count=examples,
+        examples_per_update=_sft_realized_batch(spec),
+    )
+    return resolve_update_horizon(derived, t.max_steps) if apply_cap else derived
 
 
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
-    SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by ``max_steps``. GRPO/OPD:
-    ``epochs`` means passes over ``max_examples`` rows when pinned, otherwise the estimate uses one
-    prompt batch per epoch.
+    SFT derives from examples and realized batch. GRPO/OPD derive passes over retained prompts.
+    For every algorithm, positive ``max_steps`` replaces the derived optimizer-update count.
     """
     if spec.algorithm in ("grpo", "opd"):
         examples = _on_policy_example_count(spec)
-        return on_policy_steps(
+        derived = on_policy_steps(
             epochs=_on_policy_epochs(spec),
             prompt_count=examples,
             prompts_per_step=_on_policy_prompts_per_step(spec, examples),
         )
+        return resolve_update_horizon(derived, spec.train.max_steps)
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.
     return _sft_steps_from_examples(spec, _sft_example_count(spec), apply_cap=True)
@@ -162,6 +163,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
+        save_at_steps=t.save_at_steps,
     )
 
 

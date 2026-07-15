@@ -61,6 +61,7 @@ class InstanceProvider(abc.ABC):
         attempt: int,
         runtime_secrets: dict[str, str] | None,
         code_prefix: str | None,
+        deadline_at: float | None,
     ) -> PollResult: ...
 
     @abc.abstractmethod
@@ -72,12 +73,8 @@ class InstanceProvider(abc.ABC):
         *,
         log: Any,
         heartbeat_reader: Any,
-        deadline_s: float,
+        deadline_at: float | None,
     ) -> PollResult: ...
-
-    @abc.abstractmethod
-    def _reattach_deadline(self, spec) -> float:
-        """Launch-relative wall deadline for a reattached poll (per-substrate; the formulas differ)."""
 
     @abc.abstractmethod
     def _teardown_reattached(self, handle: JobHandle, spec) -> None:
@@ -120,8 +117,12 @@ class InstanceProvider(abc.ABC):
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         code_prefix: str | None = None,
+        _deadline_at: float | None = None,
     ) -> PollResult:
-        # ``on_last_gpu`` is unused: the instance providers use a uniform per-GPU wait (kept for interface parity).
+        from flash.spec import require_matching_seed
+
+        seed = require_matching_seed(spec, seed)
+        # ``on_last_gpu`` is unused: the instance providers use a uniform per-gpu wait (kept for interface parity).
         return self._submit_run(
             spec,
             seed,
@@ -130,19 +131,28 @@ class InstanceProvider(abc.ABC):
             attempt=attempt,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            deadline_at=_deadline_at,
         )
 
-    def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+    def poll(
+        self,
+        handle: JobHandle,
+        spec,
+        seed: int,
+        *,
+        log: Any = None,
+        _deadline_at: float | None = None,
+    ) -> PollResult:
         import contextlib
 
         from flash.providers._hf_artifacts import heartbeat_reader_for
+        from flash.spec import require_matching_seed
 
-        reader = heartbeat_reader_for(spec)
+        seed = require_matching_seed(spec, seed)
+        reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
         h = self._handle_cls.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: {self.name} instance={h.instance_id}", file=log, flush=True)
-        # Deadline is launch-relative, not reattach-relative: resetting on recovery would extend the billable window unbounded.
-        deadline = self._reattach_deadline(spec)
         try:
             return self._poll_job(
                 h,
@@ -150,7 +160,7 @@ class InstanceProvider(abc.ABC):
                 seed,
                 log=log,
                 heartbeat_reader=reader,
-                deadline_s=deadline,
+                deadline_at=_deadline_at,
             )
         finally:
             # attach_run has no submit-time teardown; destroy the reattached instance here so a recovered run stops billing.
