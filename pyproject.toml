@@ -24,8 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Heavy deps for running the fine-tuning worker locally (on the GPU worker these are
-# installed by RunPod Flash via WORKER_DEPS in flash/flash/train.py).
+# heavy deps for running the fine-tuning worker locally (on the gpu worker these are
+# installed by runpod flash from the dependency list in flash/providers/_worker.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
@@ -39,11 +39,12 @@ gpu = [
     "freesolo>=0.2.54",
     "huggingface-hub>=0.34",
 ]
-# freesolo-chalk (Freesolo's custom Triton/CUDA kernels) is a worker-side package selected by the
-# submit path, not a control-plane dependency. flash appends DEFAULT_CHALK_SPEC to each worker job's
-# extra_pip and then applies chalk standalone after the trainer builds the live model. It no-ops when
-# unavailable (see flash/engine/chalk_kernels.py), but normal remote runs install the pinned Chalk
-# PR 11 merge SHA unless FLASH_CHALK_SPEC overrides the source.
+# freesolo-chalk (freesolo's custom triton/cuda kernels) is a worker-side package selected by the
+# submit path, not a control-plane dependency. flash appends the chalk package spec from
+# flash/providers/_worker.py to each worker job's extra_pip, then applies chalk standalone after the
+# trainer builds the live model. it no-ops when unavailable (see flash/engine/chalk_kernels.py).
+# production workers pin an exact public pypi freesolo-chalk release; dev-channel workers install
+# freesolo-chalk-dev with that version as a floor. an explicit install-source override supersedes both.
 # Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
 # code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
 # Keeping runpod-flash out of the base install also stops its `flash` console script shadowing

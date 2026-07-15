@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from flash.envs import loader as adapter
+
+
+def test_cache_limits_ignore_ambient_overrides():
+    script = (
+        "from flash.envs import loader; "
+        "assert loader._CACHE_MAX_ENTRIES == 32; "
+        "assert loader._CACHE_MAX_BYTES == 4 * 1024 * 1024 * 1024"
+    )
+    for max_entries, max_bytes in (("1", "2"), ("invalid", "also-invalid")):
+        env = os.environ.copy()
+        env["FLASH_ENV_CACHE_MAX_ENTRIES"] = max_entries
+        env["FLASH_ENV_CACHE_MAX_BYTES"] = max_bytes
+        subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            check=True,
+        )
 
 
 def _make_entry(root: Path, name: str, *, size: int, age_seconds: float) -> Path:

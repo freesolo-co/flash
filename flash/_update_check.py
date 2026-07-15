@@ -9,7 +9,6 @@ import re
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 
 from flash import __version__
@@ -27,7 +26,7 @@ _PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 CACHE_PATH = CONFIG_DIR / "update_check.json"
 
 _CHECK_INTERVAL_S = 24 * 60 * 60
-# join >= fetch timeout so the worker finishes writing before process exit kills it.
+# keep the join budget above the fetch timeout to allow parsing and persistence before exit.
 _FETCH_TIMEOUT_S = 1.5
 _JOIN_TIMEOUT_S = 2.0
 
@@ -96,9 +95,7 @@ def _clean_version(value: object) -> str | None:
 
 
 def _read_cache() -> dict:
-    # Coerce non-dict results (e.g. []) since _check_due runs before main()'s error handling.
-    cache = read_json_or_empty(CACHE_PATH)
-    return cache if isinstance(cache, dict) else {}
+    return read_json_or_empty(CACHE_PATH)
 
 
 def _check_due(now: float) -> bool:
@@ -122,7 +119,7 @@ def _fetch_latest_version(timeout: float = _FETCH_TIMEOUT_S) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+    except (OSError, ValueError) as exc:
         logger.debug("update check: PyPI lookup failed: %s", exc)
         return None
     info = payload.get("info") if isinstance(payload, dict) else None
@@ -152,23 +149,16 @@ def _refresh_cache() -> None:
         logger.debug("update check: refresh failed: %s", exc)
 
 
-def _supports_color() -> bool:
-    return not os.environ.get("NO_COLOR")
-
-
-def _red(text: str) -> str:
-    return f"\033[31m{text}\033[0m" if _supports_color() else text
-
-
 def _build_notice() -> str | None:
     """Build the upgrade notice from the cached PyPI version, or ``None`` if up to date."""
     latest = _clean_version(_read_cache().get("pypi_version"))
     if not latest or _is_prerelease(latest) or not _is_newer(latest, __version__):
         return None
-    return _red(
+    notice = (
         f"A new release of {PACKAGE_NAME} is available: {__version__} -> {latest}\n"
         f"Update with `{UPGRADE_COMMAND}`."
     )
+    return f"\033[31m{notice}\033[0m" if not os.environ.get("NO_COLOR") else notice
 
 
 def maybe_start_update_check() -> threading.Thread | None:

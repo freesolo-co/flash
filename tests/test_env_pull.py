@@ -196,7 +196,7 @@ def test_safe_extract_archive_bounds_total_members_scanned(monkeypatch, tmp_path
     entries = {f"unrelated/f{i}.txt": b"x" for i in range(20)}
 
     with pytest.raises(RuntimeError, match="too many entries to scan"):
-        adapter._safe_extract_archive(_tarball(entries), tmp_path, subdir="wanted")
+        adapter._safe_extract_archive(_tarball(entries), tmp_path)
 
 
 def test_safe_extract_archive_rejects_top_level_file(tmp_path):

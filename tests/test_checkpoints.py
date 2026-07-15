@@ -16,8 +16,8 @@ import pytest
 
 from flash.runner.checkpoints import (
     CheckpointListingError,
+    adapter_artifact_exists,
     checkpoint_adapter_prefix,
-    final_adapter_exists,
     list_checkpoints,
 )
 from flash.spec import JobSpec
@@ -473,7 +473,7 @@ def test_list_checkpoints_swallows_hf_error(monkeypatch):
     assert list_checkpoints(_spec()) == []  # best-effort: never raises into a run/route
 
 
-def test_final_adapter_exists_requires_config_and_weights(monkeypatch):
+def test_final_adapter_artifact_exists_requires_config_and_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -483,10 +483,10 @@ def test_final_adapter_exists_requires_config_and_weights(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is True
+    assert adapter_artifact_exists(_spec(), step=None) is True
 
 
-def test_final_adapter_exists_accepts_legacy_bin_weights(monkeypatch):
+def test_final_adapter_artifact_exists_accepts_legacy_bin_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -496,10 +496,10 @@ def test_final_adapter_exists_accepts_legacy_bin_weights(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is True
+    assert adapter_artifact_exists(_spec(), step=None) is True
 
 
-def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
+def test_final_adapter_artifact_exists_rejects_incomplete_or_nested_files(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -509,10 +509,10 @@ def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is False
+    assert adapter_artifact_exists(_spec(), step=None) is False
 
 
-def test_final_adapter_exists_raises_final_adapter_listing_error(monkeypatch):
+def test_final_adapter_artifact_exists_raises_listing_error(monkeypatch):
     import huggingface_hub
 
     class _Boom:
@@ -524,12 +524,11 @@ def test_final_adapter_exists_raises_final_adapter_listing_error(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _Boom())
 
-    with pytest.raises(CheckpointListingError) as exc_info:
-        final_adapter_exists(_spec())
-
-    message = str(exc_info.value)
-    assert "could not verify final adapter for flash-ckpt-1: hf down" in message
-    assert "deployable checkpoints" not in message
+    with pytest.raises(
+        CheckpointListingError,
+        match="could not verify adapter artifacts for flash-ckpt-1: hf down",
+    ):
+        adapter_artifact_exists(_spec(), step=None)
 
 
 # --------------------------------------------------------------------------------------------

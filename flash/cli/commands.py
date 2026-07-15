@@ -35,16 +35,6 @@ from flash.schema import (
 
 from . import render
 from ._tty import TtyStatusLine
-from .env_setup import (  # noqa: F401
-    _REASONING_OPTIONS,
-    _STARTER_DATASET_JSONL,
-    _STARTER_DATASET_MULTITURN_JSONL,
-    _STARTER_ENV_MULTITURN_PY,
-    _STARTER_ENV_PY,
-    _TURN_OPTIONS,
-    _setup_interactive,
-    cmd_env_setup,
-)
 
 logger = get_logger("flash.cli")
 
@@ -514,7 +504,7 @@ def cmd_runs(args) -> int:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        where = render._run_gpu(spec, r.get("remote") or {})
+        where = render.gpu_label(spec, r.get("remote") or {})
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
             f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
@@ -753,26 +743,15 @@ def cmd_chat(args) -> int:
         messages.insert(0, {"role": "system", "content": system})
     if render.styled():
         print(render.chat_label())
-    stream = getattr(client, "chat_stream", None)
-    if stream is not None:
-        wrote = False
-        for chunk in stream(
-            chat_target,
-            messages=messages,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-        ):
-            print(chunk, end="", flush=True)
-            wrote = True
-        if wrote:
-            print()
-        return 0
-
-    resp = client.chat(
+    wrote = False
+    for chunk in client.chat_stream(
         chat_target,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
-    )
-    print(resp["choices"][0]["message"]["content"])
+    ):
+        print(chunk, end="", flush=True)
+        wrote = True
+    if wrote:
+        print()
     return 0

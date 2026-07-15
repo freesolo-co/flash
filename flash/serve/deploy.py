@@ -13,6 +13,7 @@ from urllib.parse import quote
 import httpx
 
 from flash._logging import get_logger
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import rank_from_adapter_config
 from flash.schema import format_adapter_revision
@@ -72,7 +73,7 @@ class AdapterTensorMissing(ServingError):
 
 def _is_adapter_tensor_filename(filename: str) -> bool:
     name = filename.rsplit("/", 1)[-1]
-    if name in {"adapter_model.safetensors", "adapter_model.bin"}:
+    if name in ADAPTER_WEIGHT_FILES:
         return True
     return name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
 
@@ -440,13 +441,6 @@ def deploy_adapter(
     return dep
 
 
-def _record_subfolder(record: dict | None) -> str | None:
-    if not isinstance(record, dict):
-        return None
-    value = record.get("subfolder")
-    return str(value) if value is not None else None
-
-
 def _adapter_url(adapter_id: str) -> str:
     return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
 
@@ -538,12 +532,6 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
         )
 
 
-def _revision_state(record: dict) -> tuple[str, object]:
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    state = str(metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered")
-    return state, metadata.get("failure")
-
-
 def _wait_revision_ready(
     revision: str,
     subfolder: str,
@@ -583,13 +571,20 @@ def _wait_revision_ready(
             raise ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"
             )
-        last_state, failure = _revision_state(record)
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        last_state = str(
+            metadata.get("lifecycle_state") or record.get("lifecycle_state") or "registered"
+        )
+        failure = metadata.get("failure")
         if last_state == "failed" or record.get("status") == "disabled":
             raise ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
             )
-        if last_state == "ready" and _record_subfolder(record) == subfolder:
-            return record
+        if last_state == "ready":
+            value = record.get("subfolder")
+            record_subfolder = str(value) if value is not None else None
+            if record_subfolder == subfolder:
+                return record
     if last_read_error is not None:
         raise ServingError(
             f"adapter revision {revision} readiness could not be confirmed after transient "
@@ -600,19 +595,13 @@ def _wait_revision_ready(
     )
 
 
-def _alias_target(record: dict | None) -> str | None:
-    if not isinstance(record, dict):
+def _active_alias_target(record: dict | None) -> str | None:
+    if not isinstance(record, dict) or record.get("status") == "disabled":
         return None
     metadata = record.get("metadata")
     if isinstance(metadata, dict) and isinstance(metadata.get("alias_of"), str):
         return metadata["alias_of"]
     return None
-
-
-def _active_alias_target(record: dict | None) -> str | None:
-    if not isinstance(record, dict) or record.get("status") == "disabled":
-        return None
-    return _alias_target(record)
 
 
 def adapter_alias_target(run_id: str) -> str | None:

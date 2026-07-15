@@ -20,7 +20,8 @@ from flash.spec import (
     validate_worker_env_reserved,
 )
 
-# Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
+# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
+# after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
 logger = get_logger("flash.providers.runpod.train")
 
 
@@ -52,7 +53,7 @@ WORKER_DEPS = [
     # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
     # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
-    # tilelang version-pinned in lockstep with Dockerfile.worker + perf.py runtime reinstall.
+    # tilelang version-pinned with the worker image and flash/engine/worker/perf/__init__.py runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
     # causal_conv1d NOT pip-listed: CUDA extension compiled in Dockerfile.worker with TORCH_CUDA_ARCH_LIST.
@@ -61,19 +62,10 @@ WORKER_DEPS = [
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
-WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
 # back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
-
-
-def _append_tag_suffix(image: str, suffix: str) -> str:
-    slash = image.rfind("/")
-    colon = image.rfind(":")
-    if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
-    return f"{image}-{suffix}"
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
@@ -83,33 +75,16 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
         return override
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
-        template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
-        if template:
-            return template.format(
-                base_image=WORKER_IMAGE,
-                gpu=info.name,
-                gpu_short=info.short,
-                sm=info.sm,
-                sm_num=info.sm.removeprefix("sm"),
-            )
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
-            return _append_tag_suffix(WORKER_IMAGE, info.sm)
+            return f"{WORKER_IMAGE}-{info.sm}"
     return WORKER_IMAGE if allow_default else None
 
 
 def resolve_worker_deps() -> list[str]:
     """Return the pinned worker dependency list."""
     return list(WORKER_DEPS)
-
-
-def _effective_worker_env(spec=None) -> dict[str, str]:
-    """os.environ overlaid with spec.worker_env — mirrors what build_worker_env sends the worker."""
-    eff: dict[str, str] = dict(os.environ)
-    for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        eff[str(k)] = str(v)
-    return eff
 
 
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
@@ -136,16 +111,16 @@ LATEST_CHALK_MAIN_SHA = "e89b52145778102418f00e2b99d27968577ca43a"
 
 def chalk_extra_pip(spec=None) -> list[str]:
     """Return chalk pip spec(s) for the worker's extra_pip; resolved against the effective worker env."""
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
+    worker_env: dict[str, str] = dict(os.environ)
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        worker_env[str(k)] = str(v)
+    spec_str = worker_env.get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
-
-
-_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 # Optimization toggles dropped in PR #175 (deterministic behavior). Filtered from [worker_env]
@@ -187,15 +162,6 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     JIT caches are never redirected — sharing compiled artifacts across tenants is unsafe.
     """
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
-
-
-def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Strip mount-rooted cache vars if the volume isn't actually mounted (mutates+returns)."""
-    if os.path.isdir(mount):
-        return env
-    for k in [k for k, v in env.items() if str(v).startswith(mount)]:
-        env.pop(k, None)
-    return env
 
 
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
@@ -263,7 +229,7 @@ def build_worker_env(
     # the authoritative-seed invariant regardless of how environment.secrets was populated.
     allowed_runtime_secrets = {
         k
-        for k in (set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
+        for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
         if k.upper() not in RESERVED_WORKER_ENV_KEYS
     }
     for k, v in (runtime_secrets or {}).items():
@@ -297,10 +263,6 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
     )
 
 
-def _is_hf_not_found(exc: BaseException) -> bool:
-    return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
-
-
 def _ensure_private_artifact_repo(
     api,
     repo: str,
@@ -314,7 +276,7 @@ def _ensure_private_artifact_repo(
             deadline_at=deadline_at,
         )
     except Exception as exc:
-        if not _is_hf_not_found(exc):
+        if hf_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
             raise
         _hf_call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),

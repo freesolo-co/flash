@@ -10,11 +10,7 @@ WORKER_FAILURE_LINE = "managed worker failed; inspect worker artifacts"
 def main() -> int:
     try:
         from flash.engine import worker
-    except BaseException:
-        print(WORKER_FAILURE_LINE, file=sys.stderr, flush=True)
-        return 1
 
-    try:
         worker.main()
     except BaseException:
         print(WORKER_FAILURE_LINE, file=sys.stderr, flush=True)

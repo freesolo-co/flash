@@ -328,7 +328,7 @@ def _heartbeat_matches_attempt(hb: dict, launch_ts: float | None, current_attemp
         return False
     now = time.time()
     timestamp = float(ts)
-    return bool(
+    return (
         math.isfinite(launch)
         and launch > 0
         and math.isfinite(timestamp)
@@ -343,7 +343,7 @@ def worker_flagged_retriable(
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
-    return bool(
+    return (
         isinstance(hb, dict)
         and hb.get("retriable") is True
         and _heartbeat_matches_attempt(hb, launch_ts, current_attempt)
