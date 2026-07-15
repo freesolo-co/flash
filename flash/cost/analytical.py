@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import math
 
-from flash.providers import available_providers
 from flash.providers.allocator import required_vram_gb, vram_headroom
-from flash.providers.base import providers_for
 
 from .facts import (
     active_params_b,
@@ -249,44 +247,26 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
-    quote_provider = config.provider
-    if config.exact_type and quote_provider == "auto":
-        eligible = tuple(
-            name for name in available_providers() if name in providers_for(config.exact_type)
-        )
-        if not eligible:
-            raise ValueError(
-                f"no configured provider can provision exact_type {config.exact_type!r}"
-            )
-        rates: dict[str, float] = {}
-        for name in eligible:
-            if name == "vast":
-                from flash.providers.vast.pricing import live_offer_rates
+    if config.exact_type and config.provider == "auto":
+        from flash.providers.allocator import allocate
 
-                live = live_offer_rates(
-                    max_wall_seconds=market_wall_s,
-                    min_vram_gb=need,
-                    exact_type=config.exact_type,
-                )
-                if gpu not in live:
-                    continue
-                rates[name] = live[gpu]
-            else:
-                rates[name] = gpu_hourly_usd(
-                    gpu,
-                    provider=name,
-                    max_wall_seconds=market_wall_s,
-                    min_vram_gb=need,
-                    exact_type=config.exact_type,
-                )
-        if not rates:
-            raise ValueError(
-                f"no configured provider has live capacity for exact_type {config.exact_type!r}"
-            )
-        quote_provider = min(rates, key=rates.__getitem__)
-        hourly = rates[quote_provider]
+        allocation = allocate(
+            config.model_id,
+            config.method,
+            train=config.train_knobs(),
+            thinking=config.thinking,
+            max_wall_seconds=market_wall_s,
+            provider="",
+            exact_type=config.exact_type,
+            model_revision=config.model_revision,
+        )
+        gpu = allocation.gpu
+        quote_provider = allocation.provider
+        hourly = allocation.hourly_usd
+        need = allocation.min_vram_gb
     else:
+        gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
+        quote_provider = config.provider
         # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
         # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
         # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.

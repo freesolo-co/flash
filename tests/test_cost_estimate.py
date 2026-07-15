@@ -126,29 +126,55 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     assert exact.gpu_hourly_usd > unconstrained.gpu_hourly_usd
 
 
-def test_estimate_exact_h100_selects_cheapest_eligible_provider_and_rate(monkeypatch):
-    import flash.cost.analytical as analytical
+def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+    from flash.providers.lambdalabs import api as lambda_api
 
-    rates = {"runpod": 3.29, "lambda": 2.49, "vast": 2.79}
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
     monkeypatch.setattr(
-        analytical,
-        "available_providers",
-        lambda: ("runpod", "lambda", "vast"),
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("runpod", "H100", 3.29, 80)],
     )
-    monkeypatch.setattr(
-        analytical,
-        "gpu_hourly_usd",
-        lambda gpu, provider=None, **kwargs: rates[provider],
-    )
+    advertised: list[str] = []
 
-    estimate = estimate_cost(
-        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
-    )
+    def advertised_price(instance_type, **kwargs):
+        advertised.append(instance_type)
+        return 2.49
 
-    assert (estimate.provider, estimate.gpu, estimate.gpu_hourly_usd) == (
-        "lambda",
+    monkeypatch.setattr(lambda_api, "instance_type_price_usd_hr", advertised_price)
+    monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *args, **kwargs: [])
+
+    config = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
+    allocation = allocator.allocate(
+        config.model_id,
+        config.method,
+        train=config.train_knobs(),
+        thinking=config.thinking,
+        max_wall_seconds=24 * 3600,
+        provider="",
+        exact_type=config.exact_type,
+        model_revision=config.model_revision,
+    )
+    estimate = estimate_cost(config)
+
+    assert "gpu_1x_h100_pcie" in advertised
+    assert (allocation.provider, allocation.gpu, allocation.hourly_usd) == (
+        "runpod",
         "H100",
-        rates["lambda"],
+        3.29,
+    )
+    assert (
+        estimate.provider,
+        estimate.gpu,
+        estimate.gpu_hourly_usd,
+        estimate.required_vram_gb,
+    ) == (
+        allocation.provider,
+        allocation.gpu,
+        allocation.hourly_usd,
+        allocation.min_vram_gb,
     )
 
 
@@ -345,7 +371,7 @@ def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
 def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
     from types import SimpleNamespace
 
-    import flash.cost.analytical as analytical
+    from flash.providers import allocator
     from flash.providers.vast import jobs as vast
 
     seen: list[str] = []
@@ -356,7 +382,7 @@ def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    monkeypatch.setattr(analytical, "available_providers", lambda: ("vast",))
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("vast",))
 
     explicit = estimate_cost(
         RunConfig(
@@ -375,14 +401,15 @@ def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
 
 
 def test_estimate_auto_exact_vast_requires_constrained_live_capacity(monkeypatch):
-    import flash.cost.analytical as analytical
+    from flash.providers import allocator
+    from flash.providers.base import CapacityLookupError
     from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast, "usable_offers", lambda *args, **kwargs: [])
-    monkeypatch.setattr(analytical, "available_providers", lambda: ("vast",))
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("vast",))
 
-    with pytest.raises(ValueError, match="live capacity"):
+    with pytest.raises(CapacityLookupError, match="currently has no capacity"):
         estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
 
 
