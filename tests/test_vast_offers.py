@@ -154,6 +154,23 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
     assert captured["limit"] == 512  # explicit override honored
 
 
+def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, **kwargs):
+        captured.update(min_vram_mb=min_vram_mb, **kwargs)
+        return []
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    vast.usable_offers(24, disk_gb=60, exact_type="H100")
+
+    assert captured["min_vram_mb"] == int(80 * 1024 * vast._SEARCH_VRAM_SLACK)
+    assert captured["gpu_names"] == ("H100 SXM", "H100 PCIE")
+
+
 def test_usable_offers_threads_duration_floor(monkeypatch):
     # when a wall cap is supplied, usable_offers does not extend it with provisioning grace.
     # a zero wall keeps the duration filter disabled.

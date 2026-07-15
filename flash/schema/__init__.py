@@ -256,6 +256,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "run_id",
     }
 )
+_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec))
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
     for item in dataclass_fields(TrainSpec)
@@ -280,17 +281,17 @@ def validate_train_keys(keys: Collection[str]) -> None:
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
-    # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
-    unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, …) "
+                " - GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, ...) "
                 "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
+        noun = "section(s)" if any(isinstance(raw[key], dict) for key in unknown) else "key(s)"
         raise ConfigError(
-            f"unknown config section(s): {', '.join(unknown)} "
+            f"unknown config {noun}: {', '.join(unknown)} "
             f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
         )
     try:
@@ -349,6 +350,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
+    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS)
+    if unknown_gpu:
+        raise ConfigError(
+            f"[gpu] unknown key(s): {', '.join(unknown_gpu)} "
+            f"(allowed: {', '.join(sorted(_GPU_KEYS))})"
+        )
     gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
     gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
     gpu_options = {}
@@ -402,7 +409,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                     f"gpu.exact_type {exact_type!r} has {get_gpu_info(exact_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"
                 )
-    except UnsupportedGpuError as exc:
+    except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=exact_type or gpu_type)

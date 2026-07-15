@@ -93,7 +93,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
-# model_revision = "main"   # optional exact hugging face branch, tag, or commit for the student
+# model_revision = "main"   # optional ref resolved to an immutable hugging face commit before submit
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
@@ -114,8 +114,8 @@ lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
-GPU and HF artifacts are **managed by default** — `gpu.type` retains its historical
-non-pinning behavior and `train.hf_repo` remains platform-managed. For controlled
+GPU and HF artifacts are **managed by default**: `gpu.type` is a non-pinning managed
+hint and `train.hf_repo` remains platform-managed. For controlled
 experiments, `[gpu] provider` restricts allocation to one provider and `[gpu] exact_type`
 pins one active validated GPU class; otherwise the allocator picks the cheapest fitting
 class. Run artifacts are stored in a private environment-scoped repo with content-addressed

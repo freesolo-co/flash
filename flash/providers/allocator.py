@@ -28,6 +28,7 @@ def required_vram_gb(
     *,
     train=None,
     thinking: bool = False,
+    model_revision: str = "",
 ) -> int:
     """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
     from flash.engine.vram import model_required_vram_gb
@@ -38,6 +39,7 @@ def required_vram_gb(
         train=train,
         thinking=thinking,
         headroom=vram_headroom(),
+        model_revision=model_revision,
     )
 
 
@@ -51,9 +53,16 @@ def allocate(
     max_wall_seconds: float = 0.0,
     provider: str = "",
     exact_type: str = "",
+    model_revision: str = "",
 ) -> Allocation:
     """Pick the cheapest fitting (provider, GPU class) able to run the job."""
-    need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
+    need = required_vram_gb(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        model_revision=model_revision,
+    )
     provider = (provider or "").strip().lower()
     if provider and provider not in PROVIDER_NAMES:
         raise UnsupportedGpuError(
@@ -85,7 +94,11 @@ def allocate(
             )
         available = tuple(name for name in available if name in exact_providers)
 
-    constraints = AllocationConstraints(disk_gb=disk_gb, max_wall_seconds=max_wall_seconds)
+    constraints = AllocationConstraints(
+        disk_gb=disk_gb,
+        max_wall_seconds=max_wall_seconds,
+        exact_type=exact,
+    )
     candidates: list[Candidate] = []
     lookup_failed = False
     # RunPod prices off a static table (no live lookup), so it never blips; Lambda/Vast query live
@@ -113,6 +126,12 @@ def allocate(
                 f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"
             )
         if exact:
+            dynamic_capacity_providers = {"lambda", "vast"}
+            if available and set(available).issubset(dynamic_capacity_providers):
+                raise CapacityLookupError(
+                    f"exact GPU {exact!r} is structurally supported but currently has no capacity on "
+                    f"{', '.join(available)}"
+                )
             raise UnsupportedGpuError(
                 f"exact GPU {exact!r} has no allocatable capacity on the requested active provider set "
                 f"({', '.join(available) or '(none)'})"

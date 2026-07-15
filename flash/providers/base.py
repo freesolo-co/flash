@@ -205,8 +205,11 @@ def _alias_keys(name: str) -> set[str]:
 
 _ALIASES: dict[str, str] = {}
 for _info in _GPU_INFO_ALL.values():
-    for _k in _alias_keys(_info.name):
-        _ALIASES[_k] = _info.name
+    for _provider_name in (_info.name, _info.vast_name, *_info.vast_aliases):
+        if not _provider_name:
+            continue
+        for _k in _alias_keys(_provider_name):
+            _ALIASES[_k] = _info.name
 # Full marketing names (nvidia-smi / RunPod API) and historical aliases not covered by generic rules.
 _ALIASES.update(
     {
@@ -215,6 +218,7 @@ _ALIASES.update(
         "nvidia a100 80gb pcie": "A100 PCIe",
         "a100 80gb pcie": "A100 PCIe",
         "a100-80g-pcie": "A100 PCIe",
+        "nvidia a100-sxm4-40gb": "A100 SXM 40GB",
         "nvidia a100-sxm4-80gb": "A100 SXM",
         "a100-sxm4-80gb": "A100 SXM",
         "a100": "A100 PCIe",
@@ -353,6 +357,7 @@ def provisional_gpu(
     *,
     train=None,
     thinking: bool = False,
+    model_revision: str = "",
 ) -> str:
     """Cheapest validated GPU for this model: parse-time provisional used by the schema for sizing/display."""
     from flash.engine.vram import model_required_vram_gb
@@ -364,6 +369,7 @@ def provisional_gpu(
         train=train,
         thinking=thinking,
         headroom=vram_headroom(),
+        model_revision=model_revision,
     )
     try:
         return cheapest_gpu(min_vram)
@@ -440,6 +446,7 @@ class AllocationConstraints:
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
+    exact_type: str = ""
 
 
 @runtime_checkable

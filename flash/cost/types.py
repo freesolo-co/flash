@@ -42,6 +42,7 @@ class RunConfig:
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
     exact_type: str = ""
+    model_revision: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -62,6 +63,9 @@ class RunConfig:
             if prov != "auto" and prov not in providers_for(exact):
                 raise ValueError(f"provider {prov!r} cannot provision exact_type {exact!r}")
         object.__setattr__(self, "exact_type", exact)
+        if not isinstance(self.model_revision, str):
+            raise TypeError("model_revision must be a string")
+        object.__setattr__(self, "model_revision", self.model_revision.strip())
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the

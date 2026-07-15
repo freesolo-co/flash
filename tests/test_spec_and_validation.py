@@ -424,15 +424,18 @@ def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
         assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
 
     authored_raw = _raw(**{"gpu.max_retries": 7.0, "gpu.max_wall_seconds": 1234.0})
-    authored_raw["gpu"].update(
-        {"type": "not-a-real-gpu", "disk_gb": 999, "future_gpu_field": "ignored"}
-    )
+    authored_raw["gpu"].update({"type": "not-a-real-gpu", "disk_gb": 999})
     authored = spec_from_dict(authored_raw)
     assert authored.gpu.max_retries == 7
     assert authored.gpu.max_wall_seconds == 1234
     assert authored.gpu.type == spec_from_dict(_raw()).gpu.type
     assert authored.gpu.disk_gb == defaults.disk_gb
     assert spec_from_dict(_raw(**{"gpu.max_retries": 0})).gpu.max_retries == 0
+
+    unknown = _raw()
+    unknown["gpu"]["future_gpu_field"] = "rejected"
+    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key\(s\): future_gpu_field"):
+        spec_from_dict(unknown)
 
 
 @pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds"])
@@ -659,11 +662,21 @@ def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> No
         )
 
 
-def test_gpu_type_remains_historical_non_pinning_input() -> None:
+def test_gpu_type_is_non_pinning_managed_input() -> None:
     baseline = spec_from_dict(_raw())
     authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
     assert authored.gpu.type == baseline.gpu.type
     assert authored.gpu.exact_type == ""
+
+
+def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
+    assert JobSpec.from_dict({"gpu": {"type": " h100 "}}).gpu.type == "H100"
+    with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
+        JobSpec.from_dict({"gpu": {"type": 1}})
+    with pytest.raises(ValueError, match=r"gpu\.type: unsupported gpu 'H10O'"):
+        JobSpec.from_dict({"gpu": {"type": "H10O"}})
+    with pytest.raises(ValueError, match="active validated GPU class"):
+        JobSpec.from_dict({"gpu": {"type": "RTX A6000"}})
 
 
 def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
@@ -682,62 +695,27 @@ def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
             JobSpec.from_dict({"model_revision": value})
 
 
-def test_gpu_and_job_specs_preserve_old_positional_constructors() -> None:
-    from flash.spec import EnvironmentSpec, WandbSpec
+def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
+        spec_from_dict(_raw(model_revison="main"))
 
-    gpu = GpuSpec("H100", 120, 900, 2, "cache-volume", 200)
-    assert (
-        gpu.type,
-        gpu.disk_gb,
-        gpu.max_wall_seconds,
-        gpu.max_retries,
-        gpu.network_volume,
-        gpu.network_volume_gb,
-        gpu.provider,
-        gpu.exact_type,
-    ) == ("H100", 120, 900, 2, "cache-volume", 200, "", "")
+    for gpu in (False, "H100", ["H100"]):
+        with pytest.raises(TypeError, match="gpu must be an object"):
+            JobSpec.from_dict({"gpu": gpu})
+    with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): exact_typ"):
+        JobSpec.from_dict({"gpu": {"exact_typ": "H100"}})
+    with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
+        JobSpec.from_dict({"gpu": {"provider": 1}})
+    with pytest.raises(TypeError, match=r"gpu\.exact_type must be a string"):
+        JobSpec.from_dict({"gpu": {"exact_type": 1}})
+    with pytest.raises(ValueError, match="cannot provision"):
+        JobSpec.from_dict({"gpu": {"provider": "lambda", "exact_type": "RTX 4090"}})
 
-    environment = EnvironmentSpec(id="owner/environment")
-    train = TrainSpec(epochs=1)
-    wandb = WandbSpec(project="project", run_name="run")
-    spec = JobSpec(
-        "Qwen/Qwen3.5-0.8B",
-        "grpo",
-        environment,
-        train,
-        gpu,
-        "positional-run",
-        9,
-        {"SAFE_KEY": "value"},
-        "catalog",
-        True,
-        wandb,
-    )
-    assert (
-        spec.algorithm,
-        spec.environment,
-        spec.train,
-        spec.gpu,
-        spec.run_id,
-        spec.seed,
-        spec.worker_env,
-        spec.model_policy,
-        spec.thinking,
-        spec.wandb,
-        spec.model_revision,
-    ) == (
-        "grpo",
-        environment,
-        train,
-        gpu,
-        "positional-run",
-        9,
-        {"SAFE_KEY": "value"},
-        "catalog",
-        True,
-        wandb,
-        "",
-    )
+    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "exact_type": "h100"}})
+    assert restored.gpu.provider == "lambda"
+    assert restored.gpu.exact_type == "H100"
+    assert JobSpec.from_dict({}).gpu.provider == ""
+    assert JobSpec.from_dict({}).gpu.exact_type == ""
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:

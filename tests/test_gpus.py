@@ -12,6 +12,7 @@ def test_canonical_gpu_aliases():
         assert canonical_gpu(alias) == "RTX 5090"
     for alias in ("RTX 4090", "rtx4090", "4090", "RTX_4090"):
         assert canonical_gpu(alias) == "RTX 4090"
+    assert canonical_gpu("NVIDIA A100-SXM4-40GB") == "A100 SXM 40GB"
 
 
 def test_unknown_gpu_rejected():

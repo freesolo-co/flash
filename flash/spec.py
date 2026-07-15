@@ -65,6 +65,22 @@ def _volume_gb(value: Any, default: int = 100) -> int:
     return gb if gb > 0 else default
 
 
+def _validated_gpu_type(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+
+    from flash.providers.base import GPU_INFO, UnsupportedGpuError, canonical_gpu
+
+    try:
+        canonical = canonical_gpu(value)
+    except UnsupportedGpuError as exc:
+        raise ValueError(f"{field_name}: {exc}") from exc
+    info = GPU_INFO.get(canonical)
+    if info is None or not info.validated:
+        raise ValueError(f"{field_name} {canonical!r} must name an active validated GPU class")
+    return canonical
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse optional int; rejects bools (bool is int subclass — int(True)==1 is a footgun)."""
     if value is None:
@@ -292,6 +308,12 @@ class JobSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
+        if not isinstance(data, dict):
+            raise TypeError("job spec must be an object")
+        allowed_top_level = {item.name for item in fields(cls)}
+        unknown_top_level = sorted(set(data) - allowed_top_level)
+        if unknown_top_level:
+            raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
         env = data.get("environment") or {}
         # Reject stale payloads carrying a local `path`; worker only runs published env ids.
         if isinstance(env, dict) and env.get("path"):
@@ -307,7 +329,37 @@ class JobSpec:
         unknown_train = sorted(set(train) - {item.name for item in fields(TrainSpec)})
         if unknown_train:
             raise ValueError(f"train has unknown key(s): {', '.join(unknown_train)}")
-        gpu = data.get("gpu") or {}
+        gpu = data.get("gpu")
+        if gpu is None:
+            gpu = {}
+        if not isinstance(gpu, dict):
+            raise TypeError("gpu must be an object")
+        unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
+        if unknown_gpu:
+            raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
+        gpu_type = _validated_gpu_type(gpu.get("type", DEFAULT_GPU), field_name="gpu.type")
+        provider = gpu.get("provider", "")
+        if not isinstance(provider, str):
+            raise TypeError("gpu.provider must be a string")
+        provider = provider.strip().lower()
+        exact_type_raw = gpu.get("exact_type", "")
+        if not isinstance(exact_type_raw, str):
+            raise TypeError("gpu.exact_type must be a string")
+        exact_type = (
+            _validated_gpu_type(exact_type_raw, field_name="gpu.exact_type")
+            if exact_type_raw.strip()
+            else ""
+        )
+        if provider or exact_type:
+            from flash.providers import PROVIDER_NAMES
+            from flash.providers.base import providers_for
+
+            if provider and provider not in PROVIDER_NAMES:
+                raise ValueError(f"unknown gpu.provider {provider!r}")
+            if exact_type and provider and provider not in providers_for(exact_type):
+                raise ValueError(
+                    f"gpu.provider {provider!r} cannot provision gpu.exact_type {exact_type!r}"
+                )
         return cls(
             model=data.get("model", cls.model),
             model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
@@ -344,9 +396,9 @@ class JobSpec:
                 structured_outputs=str(train.get("structured_outputs") or ""),
             ),
             gpu=GpuSpec(
-                type=gpu.get("type", DEFAULT_GPU),
-                provider=str(gpu.get("provider") or ""),
-                exact_type=str(gpu.get("exact_type") or ""),
+                type=gpu_type,
+                provider=provider,
+                exact_type=exact_type,
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),

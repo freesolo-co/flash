@@ -69,7 +69,10 @@ def run_rl():
             )
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -741,6 +744,7 @@ def run_rl():
         "rl_finalizing", progress=lambda: _steps_run, progress_step=True, keepalive=True
     ):
         adapter_dir = f"{out_dir}/adapter"
+        _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         # Warm-start CONTINUES the one SFT adapter in place, so the saved adapter already carries

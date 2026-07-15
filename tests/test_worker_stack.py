@@ -698,6 +698,10 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", fake_peft)
 
     worker = _import_worker(monkeypatch)
+    worker.JOB_SPEC = types.SimpleNamespace(
+        train=types.SimpleNamespace(lora_rank=32, lora_alpha=64),
+        model_revision="a" * 40,
+    )
 
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()
@@ -705,6 +709,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is False
+        assert captured.get("revision") == "a" * 40
 
 
 def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
@@ -784,6 +789,18 @@ def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypat
 
     assert probes == [("org/model", "refs/pr/123")]
     assert loads[0][1]["revision"] == "refs/pr/123"
+
+
+def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    with pytest.raises(ValueError, match="probe revision must match"):
+        adapter_mod.prepare_fresh_lora_base(
+            "org/model",
+            "org/model",
+            {"revision": "a" * 40},
+            model_revision="b" * 40,
+        )
 
 
 def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
@@ -1320,6 +1337,46 @@ def test_tilelang_pin_is_consistent_and_pinned():
     assert pm.group(1) == pin, (
         f"perf/__init__.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
+
+
+def test_exact_gpu_validation_accepts_alias_and_rejects_neighbor_classes(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+    from flash.engine.worker.perf import RetriableInfraError
+
+    verify_gpu = lifecycle.verify_gpu
+
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (9, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=80 * 10**9),
+        get_device_name=lambda _index: "NVIDIA H100 PCIE",
+    )
+    torch = SimpleNamespace(cuda=cuda)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+    verify_gpu("H100", exact_type="h100")
+
+    for observed in ("NVIDIA H200", "NVIDIA B200"):
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index, name=observed: name)
+        with pytest.raises(RetriableInfraError, match=r"requested='H100'.*observed="):
+            verify_gpu("H100", exact_type="H100")
+
+
+def test_exact_gpu_validation_accepts_pytorch_a100_sxm4_40gb_name(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (8, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=40 * 10**9),
+        get_device_name=lambda _index: "NVIDIA A100-SXM4-40GB",
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+
+    lifecycle.verify_gpu("A100 SXM 40GB", exact_type="A100 SXM 40GB")
 
 
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):

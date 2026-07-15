@@ -827,6 +827,28 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         raise ValueError("persisted effective preparation has no pinned source revision")
 
 
+def _resolve_model_revision(spec: JobSpec) -> JobSpec:
+    authored = spec.model_revision
+    if not authored:
+        return spec
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
+            spec.model,
+            revision=authored,
+        )
+        resolved = str(getattr(info, "sha", "") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
+            raise ValueError("resolved revision is not an immutable commit")
+    except Exception as exc:
+        raise ValueError(
+            f"could not resolve model_revision for model {spec.model!r}; "
+            "verify that the revision exists and the operator token can access it"
+        ) from exc
+    return replace(spec, model_revision=resolved)
+
+
 @dataclass(frozen=True)
 class PreparedJob:
     public_spec: JobSpec
@@ -843,6 +865,7 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
     if spec.gpu.provider or spec.gpu.exact_type:
@@ -865,6 +888,7 @@ def prepare_job(
         spec.algorithm,
         policy=spec.model_policy,
         gpu=spec.gpu.exact_type or spec.gpu.type,
+        model_revision=spec.model_revision,
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})

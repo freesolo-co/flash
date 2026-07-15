@@ -307,8 +307,12 @@ def _student_model(model_id, model_init_kwargs, device):
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
+    loader_revision = str(model_init_kwargs.get("revision") or "").strip()
+    if loader_revision and model_revision and loader_revision != model_revision:
+        raise ValueError("OPD architecture probe revision must match from_pretrained revision")
+    effective_revision = model_revision or loader_revision
     model_cls = AutoModelForCausalLM
-    if _w.is_vl_checkpoint(model_id, revision=model_revision):
+    if _w.is_vl_checkpoint(model_id, revision=effective_revision):
         # VL checkpoints are trained/served on the full multimodal tree, including visual linears, so
         # a fresh LoRA must target that same tree (parity with the warm-start / serving module set).
         from transformers import AutoModelForImageTextToText
@@ -396,7 +400,10 @@ def run_opd():
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
 
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -1764,6 +1771,10 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
 
 def _save_adapter(model, tok, adapter_dir: str) -> None:
     """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
+    spec = getattr(_w, "JOB_SPEC", None)
+    if spec is None:
+        raise RuntimeError("OPD adapter save requires a JobSpec")
+    _w.stamp_adapter_provenance(model, spec.model, spec.model_revision)
     model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
 

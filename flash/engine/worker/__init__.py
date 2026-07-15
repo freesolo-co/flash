@@ -25,6 +25,7 @@ from flash.engine.worker.adapter import (
     make_lora,
     prepare_fresh_lora_base,
     require_vllm_for_rollout_func,
+    stamp_adapter_provenance,
 )
 from flash.engine.worker.decoding import (
     graded_text,
@@ -518,6 +519,7 @@ __all__ = [
     "run_sft",
     "seed_training_rngs",
     "setup_perf_backends",
+    "stamp_adapter_provenance",
     "strip_think",
     "think_token_count",
     "thinking_text",

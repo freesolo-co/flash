@@ -1145,6 +1145,21 @@ def test_non_object_spec_fields_get_targeted_400(api):
         assert "runtime_secrets must be a JSON object" in r.json()["detail"], (bad_secrets, r.text)
 
 
+def test_create_run_rejects_top_level_and_gpu_typos_as_400(api):
+    key = _login()
+    for spec, expected in (
+        ({**SPEC, "model_revison": "main"}, "model_revison"),
+        ({**SPEC, "gpu": {"exact_typ": "H100"}}, "exact_typ"),
+    ):
+        response = api.post(
+            "/v1/runs",
+            json={"spec": spec, "dry_run": True},
+            headers=_bearer(key),
+        )
+        assert response.status_code == 400, response.text
+        assert expected in response.json()["detail"]
+
+
 def test_deploy_dry_run(api):
     key = _login()
     run_id = api.post(
@@ -1156,6 +1171,27 @@ def test_deploy_dry_run(api):
     assert "mode" not in dep.json()
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
+
+
+def test_deploy_rejects_revision_pinned_base_model(api):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "a" * 40
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "does not support revision-pinned base models" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
@@ -2479,7 +2515,7 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     assert "smoke generation returned no content" in deployment["last_deploy_error"]
 
 
-def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
+def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -2489,7 +2525,7 @@ def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
     ).json()["run_id"]
     status = runner.get_status(run_id)
     status.state = "done"
-    status.spec["gpu"]["type"] = "Quantum TPU"
+    status.spec["gpu"]["type"] = "H200"
     status.effective_preparation = None
     runner._save_status(status)
     seen: dict = {}

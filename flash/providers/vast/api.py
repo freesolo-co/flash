@@ -86,6 +86,7 @@ def search_offers(
     min_reliability: float = 0.95,
     min_duration_seconds: float = 0,
     limit: int = 64,
+    gpu_names: tuple[str, ...] = (),
     deadline_at: float | None = None,
 ) -> list[dict]:
     """Rentable single-GPU offers from verified datacenter hosts, cheapest first.
@@ -106,6 +107,8 @@ def search_offers(
         "order": [["dph_total", "asc"]],
         "limit": int(limit),
     }
+    if gpu_names:
+        q["gpu_name"] = {"in": list(dict.fromkeys(gpu_names))}
     if min_disk_gb:
         q["disk_space"] = {"gte": float(min_disk_gb)}
     if min_duration_seconds > 0:

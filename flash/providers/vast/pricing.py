@@ -32,7 +32,10 @@ def _static_rates() -> dict[str, float]:
 
 
 def live_candidate_rates(
-    min_vram_gb: int, disk_gb: float = 0.0, max_wall_seconds: float = 0.0
+    min_vram_gb: int,
+    disk_gb: float = 0.0,
+    max_wall_seconds: float = 0.0,
+    exact_type: str = "",
 ) -> dict[str, float]:
     """Friendly-name -> cheapest LIVE verified-datacenter $/hr per managed class that currently has a
     rentable offer at/above ``min_vram_gb``, using the SAME effective disk floor
@@ -45,7 +48,10 @@ def live_candidate_rates(
 
     rates: dict[str, float] = {}
     for offer in usable_offers(
-        min_vram_gb, max(float(disk_gb or 0.0), MIN_DISK_GB), max_wall_seconds=max_wall_seconds
+        min_vram_gb,
+        max(float(disk_gb or 0.0), MIN_DISK_GB),
+        max_wall_seconds=max_wall_seconds,
+        exact_type=exact_type,
     ):
         rates.setdefault(offer.gpu, offer.dph_total)  # price-sorted, first seen per class is cheapest
     return rates

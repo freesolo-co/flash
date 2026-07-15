@@ -601,7 +601,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
         ("alpha", 128),
         ("algorithm", "opd"),
         ("environment", "other/environment"),
-        ("gpu", "H200 SXM"),
+        ("gpu", "H200"),
         ("hf_repo", "private-owner/other-child"),
         ("source", "private-owner/private-source:rl/other-source"),
     ],

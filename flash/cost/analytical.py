@@ -177,6 +177,7 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         config.method,
         train=config.train_knobs(),
         thinking=config.thinking,
+        model_revision=config.model_revision,
     )
     if config.exact_type:
         if gpu_vram_gb(config.exact_type) < need:

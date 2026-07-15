@@ -388,6 +388,9 @@ def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_m
 
 
 def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, monkeypatch):
+    from dataclasses import replace
+
+    import flash.catalog as catalog
     import flash.envs.loader as env_loader
     from flash.providers import allocator
     from flash.providers.base import PollResult
@@ -402,12 +405,24 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         resolved_refs.append(parsed.canonical())
         return resolved_sha
 
+    resolved_model_sha = "b" * 40
+    monkeypatch.setattr(
+        orch,
+        "_resolve_model_revision",
+        lambda spec: replace(spec, model_revision=resolved_model_sha),
+    )
+    monkeypatch.setattr(
+        orch,
+        "resolve_model",
+        lambda model, *args, **kwargs: catalog.MODELS[model],
+    )
+
     def fake_runpod_submit(run_spec, seed, **kwargs):
         persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
-        assert persisted["model_revision"] == "refs/pr/123"
+        assert persisted["model_revision"] == resolved_model_sha
         submitted.append(
             {
                 "resolved_sha": run_spec.environment.resolved_sha,
@@ -419,6 +434,10 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
 
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
+    monkeypatch.setattr(
+        "flash.cost.spec.estimate_for_spec",
+        lambda _spec: type("Estimate", (), {"total_usd": 1.0})(),
+    )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
@@ -430,7 +449,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     public = JobSpec.from_dict(
         {
             **_spec().to_internal_dict(),
-            "model_revision": "refs/pr/123",
+            "model_revision": resolved_model_sha,
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
         }
     )
@@ -444,12 +463,12 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
             "resolved_sha": resolved_sha,
             "gpu_type": "RTX 5090",
             "network_volume": "flash-weights",
-            "model_revision": "refs/pr/123",
+            "model_revision": resolved_model_sha,
         }
     ]
     stored = orch.get_status(public.run_id)
     assert stored.spec["environment"]["resolved_sha"] == ""
-    assert stored.spec["model_revision"] == "refs/pr/123"
+    assert stored.spec["model_revision"] == resolved_model_sha
     worker = stored.effective_preparation["worker_spec"]
     assert worker["environment"]["resolved_sha"] == resolved_sha
     assert worker["gpu"]["type"] == "RTX 5090"
@@ -570,7 +589,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     from flash.providers.runpod import jobs as rp_jobs
 
     candidates = (
-        Candidate("runpod", "L4", 0.39, 24),
+        Candidate("runpod", "RTX 4090", 0.39, 24),
         Candidate("runpod", "H100", 0.49, 48),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -596,7 +615,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, spec.seed, log)
     assert metrics["train_tokens"] == 4096
-    assert submitted_gpus == ["L4", "H100"]
+    assert submitted_gpus == ["RTX 4090", "H100"]
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
@@ -610,7 +629,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     from flash.providers.runpod import jobs as rp_jobs
 
     candidates = (
-        Candidate("runpod", "L4", 0.39, 24),
+        Candidate("runpod", "RTX 4090", 0.39, 24),
         Candidate("runpod", "H100", 0.49, 48),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -657,8 +676,8 @@ def _oom_candidates():
     from flash.providers.base import Candidate
 
     return (
-        Candidate("runpod", "A100", 1.0, 80),
-        Candidate("runpod", "Pro6000", 2.0, 96),
+        Candidate("runpod", "A100 PCIe", 1.0, 80),
+        Candidate("runpod", "RTX Pro 6000", 2.0, 96),
         Candidate("runpod", "B200", 3.0, 180),
     )
 
@@ -704,7 +723,7 @@ def test_oom_escalates_exactly_once_at_max_retries_1(orch, monkeypatch):
         ["oom", "oom"],
         max_retries=1,
     )
-    assert submitted == ["A100", "Pro6000"]
+    assert submitted == ["A100 PCIe", "RTX Pro 6000"]
 
 
 def test_oom_after_infra_failure_still_escalates(orch, monkeypatch):
@@ -714,7 +733,7 @@ def test_oom_after_infra_failure_still_escalates(orch, monkeypatch):
         ["no_capacity", "oom", "oom"],
         max_retries=1,
     )
-    assert submitted == ["A100", "Pro6000", "B200"]
+    assert submitted == ["A100 PCIe", "RTX Pro 6000", "B200"]
 
 
 def test_infra_failure_after_oom_uses_infra_budget(orch, monkeypatch):
@@ -724,7 +743,7 @@ def test_infra_failure_after_oom_uses_infra_budget(orch, monkeypatch):
         ["oom", "no_capacity", "oom"],
         max_retries=1,
     )
-    assert submitted == ["A100", "Pro6000", "B200"]
+    assert submitted == ["A100 PCIe", "RTX Pro 6000", "B200"]
     assert on_last_gpu == [False, False, True]
 
 
@@ -735,7 +754,7 @@ def test_oom_never_escalates_at_max_retries_0(orch, monkeypatch):
         ["oom"],
         max_retries=0,
     )
-    assert submitted == ["A100"]
+    assert submitted == ["A100 PCIe"]
 
 
 def test_select_candidate_escapes_failed_provider_then_walks_classes():
@@ -746,7 +765,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
 
     cands = (
         Candidate("runpod", "H100", 0.49, 48),
-        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),
+        Candidate("runpod", "RTX Pro 6000", 0.50, 96),
         Candidate("lambda", "H100", 0.50, 48),
     )
     # Attempt 0 (nothing failed): cheapest overall.
@@ -760,7 +779,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
         {"runpod", "lambda"},
         {("runpod", "H100"), ("lambda", "H100")},
     )
-    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
+    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX Pro 6000")
 
 
 def test_select_candidate_single_provider_walks_classes():
@@ -768,8 +787,8 @@ def test_select_candidate_single_provider_walks_classes():
     from flash.providers.base import Candidate
     from flash.runner.lifecycle import _select_candidate
 
-    cands = (Candidate("runpod", "L4", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
-    assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "H100"
+    cands = (Candidate("runpod", "RTX 4090", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "RTX 4090")}).gpu == "H100"
 
 
 def test_select_candidate_single_fitting_gpu_never_breaks():
@@ -800,7 +819,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
 
     candidates = (
         Candidate("runpod", "H100", 0.49, 48),  # cheapest -> attempt 0
-        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # next RunPod class (the WRONG retry target)
+        Candidate("runpod", "RTX Pro 6000", 0.50, 96),  # next runpod class, the wrong retry target
         Candidate("lambda", "H100", 0.50, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -894,7 +913,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
             "runpod", "H100", 0.49, 48
         ),  # cheapest -> cache attempt, then cache-less same class
         Candidate(
-            "runpod", "RTX 6000 Ada", 0.50, 48
+            "runpod", "RTX Pro 6000", 0.50, 96
         ),  # the GPU-walk target the real retry must reach
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -914,7 +933,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
             on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         # Cache attempt AND its cache-less same-class fallback both starve; only the walk to the OTHER
         # class (the genuine retry that must survive the cache drop) succeeds.
-        if run_spec.gpu.type == "RTX 6000 Ada":
+        if run_spec.gpu.type == "RTX Pro 6000":
             return PollResult(True, metrics={"train_tokens": 4096})
         return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
 
@@ -927,7 +946,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     assert seen == [
         ("H100", WEIGHT_CACHE_VOLUME_NAME),
         ("H100", None),
-        ("RTX 6000 Ada", None),
+        ("RTX Pro 6000", None),
     ]
 
 

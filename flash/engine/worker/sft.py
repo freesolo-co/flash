@@ -88,7 +88,7 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
     info = MODELS.get(model_id)
     c_hidden = int(getattr(info, "hidden_size", 0) or 0) if info else 0
     c_layers = int(getattr(info, "num_layers", 0) or 0) if info else 0
-    if c_hidden and c_layers:
+    if c_hidden and c_layers and not revision:
         return c_hidden, c_layers
     try:
         from transformers import AutoConfig
@@ -99,14 +99,16 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
             **_w.model_revision_kwargs(revision),
         )
         tc = getattr(cfg, "text_config", None) or cfg
-        hidden = c_hidden or int(
-            getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0
-        )
-        layers = c_layers or int(
+        layers = int(
             getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
         )
-        return hidden, layers
+        hidden = int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
+        if revision and ((c_hidden and hidden != c_hidden) or (c_layers and layers != c_layers)):
+            raise ValueError("revision architecture does not match catalog geometry")
+        return hidden or c_hidden, layers or c_layers
     except Exception as e:
+        if revision:
+            raise RuntimeError("could not validate revision-specific model architecture") from e
         print(f"[sft] arch-dims probe failed ({e}); GC decision stays conservative (keep GC on)")
         return c_hidden, c_layers
 
@@ -163,7 +165,10 @@ def run_sft():
     env = _w.require_active_env()
     t_start = time.time()
     _w.heartbeat("sft_start", gpu=gpu_diagnostics())
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
@@ -660,6 +665,7 @@ def run_sft():
         "sft_finalizing", progress=lambda: _final_step, progress_step=True, keepalive=True
     ):
         adapter_dir = f"{out_dir}/adapter"
+        _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)

@@ -252,7 +252,7 @@ class OpdVllmRolloutEngine:
     max_model_len: int
     temperature: float
     top_p: float
-    model_revision: str = ""
+    model_revision: str = field(default="", kw_only=True)
     stop_sequences: tuple[str, ...] = ()
     # the exact model/tokenizer halt set used for generation and termination classification.
     eos_token_ids: tuple[int, ...] = ()

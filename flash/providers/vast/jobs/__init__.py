@@ -111,6 +111,7 @@ def usable_offers(
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     limit: int = 256,
     max_wall_seconds: float = 0,
+    exact_type: str = "",
     deadline_at: float | None = None,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
@@ -126,12 +127,23 @@ def usable_offers(
     min_duration = (
         max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
     )
+    exact_info = GPU_INFO.get(exact_type) if exact_type else None
+    if exact_type and exact_info is None:
+        raise ValueError(f"unknown exact Vast GPU class {exact_type!r}")
+    gpu_names = (
+        (exact_info.vast_name, *exact_info.vast_aliases)
+        if exact_info is not None and exact_info.vast_name
+        else ()
+    )
+    search_vram_gb = max(min_vram_gb, exact_info.vram_gb if exact_info is not None else 0)
+    search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
     rows = vast_api.search_offers(
-        int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
+        int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
         min_duration_seconds=min_duration,
         limit=int(limit),
+        **search_kwargs,
         **deadline_kwargs(vast_api.search_offers, deadline_at),
     )
     out: list[VastOffer] = []
@@ -149,6 +161,7 @@ def usable_offers(
             or r.get("verification") != "verified"
             # Exact class gate: the server-side gpu_ram filter only carries slack, so re-check nominal VRAM.
             or info.vram_gb < min_vram_gb
+            or (exact_type and gpu != exact_type)
             or float(r.get("reliability2") or 0) < RELIABILITY_FLOOR
             or float(r.get("disk_space") or 0) < float(disk_gb)
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
@@ -379,6 +392,7 @@ def deploy_and_submit(
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                            exact_type=next(iter(allowed)) if len(allowed) == 1 else "",
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
@@ -607,6 +621,7 @@ def submit_run_vast(
             info.vram_gb,
             _effective_disk_gb(spec),
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+            exact_type=spec.gpu.type,
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type
