@@ -407,6 +407,7 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
             clock=iter([10.0, 10.25]).__next__,
         ).generate([{"role": "user", "content": "x"}])
 
+    assert caught.value.retriable is False
     assert caught.value.attempts == 1
     assert caught.value.latency_seconds == pytest.approx(0.25)
     valid_usage = match != "arithmetic"
@@ -430,7 +431,11 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
     "usage",
     [
         None,
-        {"prompt_tokens": 7, "completion_tokens": "6", "total_tokens": 13},
+        {
+            "prompt_tokens": 7,
+            "completion_tokens": "private usage detail",
+            "total_tokens": 13,
+        },
     ],
 )
 def test_forward_teacher_counts_usage_unavailable_http_200_as_ambiguous(usage):
@@ -439,13 +444,18 @@ def test_forward_teacher_counts_usage_unavailable_http_200_as_ambiguous(usage):
             "key",
             seed=123,
             opener=lambda *_args, **_kwargs: _Response(_payload(usage=usage)),
-        ).generate([{"role": "user", "content": "x"}])
+            clock=iter([10.0, 10.25]).__next__,
+        ).generate([{"role": "user", "content": "private prompt"}])
 
+    assert caught.value.retriable is False
     assert caught.value.attempts == 1
+    assert caught.value.latency_seconds == pytest.approx(0.25)
     assert caught.value.ambiguous_paid_requests == 1
     assert caught.value.provider_generations == 0
     assert caught.value.prompt_tokens == 0
     assert caught.value.completion_tokens == 0
+    assert "private usage detail" not in str(caught.value)
+    assert "private prompt" not in str(caught.value)
 
 
 def test_forward_teacher_retries_insufficient_system_resources_once():
@@ -467,6 +477,70 @@ def test_forward_teacher_retries_insufficient_system_resources_once():
     assert result.ambiguous_paid_requests == 0
     assert result.provider_generations == 2
     assert (result.prompt_tokens, result.completion_tokens, result.total_tokens) == (14, 12, 26)
+
+
+def test_forward_teacher_retry_accumulates_unavailable_usage_once():
+    calls = []
+    transient = _payload(
+        choices=[_choice(finish_reason="insufficient_system_resource")],
+        usage=None,
+        private_marker="private provider detail",
+    )
+
+    def opener(*_args, **_kwargs):
+        calls.append(1)
+        return _Response(transient if len(calls) == 1 else _payload())
+
+    result = ForwardTeacherClient(
+        "key",
+        seed=123,
+        opener=opener,
+        sleep=lambda _delay: None,
+    ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert calls == [1, 1]
+    assert result.attempts == 2
+    assert result.ambiguous_paid_requests == 1
+    assert result.provider_generations == 1
+    assert (result.prompt_tokens, result.completion_tokens, result.total_tokens) == (7, 6, 13)
+    assert "private provider detail" not in repr(result)
+    assert "private prompt" not in repr(result)
+
+
+def test_forward_teacher_exhausted_retry_counts_each_unavailable_usage_once():
+    calls = []
+    transient = _payload(
+        choices=[_choice(finish_reason="insufficient_system_resource")],
+        usage=None,
+        private_marker="private provider detail",
+    )
+
+    def opener(*_args, **_kwargs):
+        calls.append(1)
+        return _Response(transient)
+
+    with pytest.raises(
+        ForwardTeacherTransientError,
+        match="insufficient system resources",
+    ) as caught:
+        ForwardTeacherClient(
+            "key",
+            seed=123,
+            opener=opener,
+            sleep=lambda _delay: None,
+            clock=iter([10.0, 10.25, 20.0, 20.5]).__next__,
+        ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert calls == [1, 1]
+    assert caught.value.retriable is True
+    assert caught.value.attempts == 2
+    assert caught.value.latency_seconds == pytest.approx(10.5)
+    assert caught.value.ambiguous_paid_requests == 2
+    assert caught.value.provider_generations == 0
+    assert caught.value.prompt_tokens == 0
+    assert caught.value.completion_tokens == 0
+    assert "private provider detail" not in str(caught.value)
+    assert "private prompt" not in str(caught.value)
 
 
 def test_forward_teacher_exhausts_insufficient_system_resources_as_transient():
