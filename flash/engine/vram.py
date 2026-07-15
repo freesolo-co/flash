@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -535,6 +536,82 @@ def sft_grad_checkpoint_can_disable(
     return peak + float(margin_gb) <= float(card_vram_gb)
 
 
+def _config_geometry(config: dict) -> tuple[int, int, int]:
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    return (
+        int(text.get("vocab_size") or config.get("vocab_size") or 0),
+        int(text.get("hidden_size") or config.get("hidden_size") or 0),
+        int(text.get("num_hidden_layers") or config.get("num_hidden_layers") or 0),
+    )
+
+
+def fetch_hf_model_geometry(
+    model_id: str, revision: str = "", *, strict: bool = False
+) -> tuple[float | None, int, int, int]:
+    """Return revision-aware params and config geometry from Hugging Face."""
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        token = os.environ.get("HF_TOKEN")
+        info_kwargs = {"revision": revision} if revision else {}
+        info = HfApi(token=token).model_info(
+            model_id,
+            expand=["safetensors"],
+            **info_kwargs,
+        )
+        total = getattr(getattr(info, "safetensors", None), "total", None)
+        params_b = float(total) / 1e9 if total else None
+        download_kwargs = {"revision": revision} if revision else {}
+        config_path = hf_hub_download(
+            repo_id=model_id,
+            filename="config.json",
+            token=token,
+            **download_kwargs,
+        )
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not isinstance(config, dict):
+            raise ValueError("model config is not an object")
+        vocab, hidden, layers = _config_geometry(config)
+        return params_b, vocab, hidden, layers
+    except Exception as exc:
+        if strict:
+            raise ValueError(
+                f"could not resolve revision-specific sizing metadata for model {model_id!r}"
+            ) from exc
+        return None, 0, 0, 0
+
+
+def _validated_revision_geometry(model_id: str, revision: str, info):
+    params_b, vocab, hidden, layers = fetch_hf_model_geometry(model_id, revision, strict=True)
+    # Revision-aware sizing is authoritative and must fail closed. When the pinned commit exposes no
+    # parameter-count metadata (no safetensors.total), we cannot derive its size; silently reusing the
+    # catalog default-revision count would size the exact-GPU preflight on weights the worker never loads,
+    # the precise mis-provisioning this pin exists to prevent.
+    if params_b is None:
+        raise ValueError(
+            f"model_revision for {model_id!r} exposes no parameter-count metadata "
+            f"(no safetensors.total); cannot size the pinned revision"
+        )
+    mismatches: list[str] = []
+    if info.params_b > 0:
+        delta = abs(params_b - info.params_b) / info.params_b
+        if delta > 0.05:
+            mismatches.append("parameter count")
+    if vocab and info.vocab_size and vocab != info.vocab_size:
+        mismatches.append("vocabulary size")
+    if hidden and info.hidden_size and hidden != info.hidden_size:
+        mismatches.append("hidden size")
+    if layers and info.num_layers and layers != info.num_layers:
+        mismatches.append("layer count")
+    if mismatches:
+        raise ValueError(
+            f"model_revision for {model_id!r} has geometry incompatible with the catalog: "
+            f"{', '.join(mismatches)}"
+        )
+    return params_b, vocab or info.vocab_size
+
+
 def model_required_vram_gb(
     model_id: str,
     algorithm: str,
@@ -542,6 +619,7 @@ def model_required_vram_gb(
     train=None,
     thinking: bool = False,
     headroom: float = 1.1,
+    model_revision: str = "",
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run (allocator and provisional_gpu sizing)."""
 
@@ -661,7 +739,9 @@ def model_required_vram_gb(
     # routes to consumer cards and OOMs on the first backward.
     sft_fused_ce = None if is_grpo else False
     if info is not None:
-        params_b = info.params_b  # curated, authoritative (required field) — no string parsing
+        params_b = info.params_b
+        if model_revision:
+            params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
         quant = getattr(info, "quant", "bf16") or "bf16"
         use_vllm = True
         active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
@@ -739,7 +819,11 @@ def model_required_vram_gb(
                 ),
             )
         return need
-    params_b = fetch_hf_params_b(model_id)
+    params_b = (
+        fetch_hf_params_b(model_id, revision=model_revision, strict=True)
+        if model_revision
+        else fetch_hf_params_b(model_id)
+    )
     if params_b is None:
         return 24
     # Size the uncataloged (model_policy="allow") fallback with the ACTUAL algorithm, not a hardcoded
@@ -759,21 +843,31 @@ def model_required_vram_gb(
     return need
 
 
-def fetch_hf_params_b(model_id: str) -> float | None:
-    """Total params (billions) from HF safetensors metadata; None on network/metadata failure."""
+def fetch_hf_params_b(
+    model_id: str, revision: str = "", *, strict: bool = False
+) -> float | None:
+    """Total params in billions from revision-aware HF safetensors metadata."""
     try:
         from huggingface_hub import HfApi
 
-        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(model_id, expand=["safetensors"])
+        kwargs = {"revision": revision} if revision else {}
+        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
+            model_id, expand=["safetensors"], **kwargs
+        )
         total = getattr(getattr(info, "safetensors", None), "total", None)
         if total:
             return float(total) / 1e9
-    except Exception:
-        pass
+        if strict:
+            raise ValueError("safetensors parameter metadata is unavailable")
+    except Exception as exc:
+        if strict:
+            raise ValueError(
+                f"could not resolve revision-specific parameter metadata for model {model_id!r}"
+            ) from exc
     return None
 
 
-def resolve_params_b(model_id: str) -> float | None:
+def resolve_params_b(model_id: str, revision: str = "") -> float | None:
     """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
     the curated catalog ``params_b`` (the required numeric field), else the real HF safetensors
     param count for an open-policy (uncataloged) model. Best-effort: returns None only
@@ -784,8 +878,13 @@ def resolve_params_b(model_id: str) -> float | None:
     from flash.catalog import MODELS
 
     info = MODELS.get(model_id)
+    if revision:
+        if info is not None:
+            params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
+            return params_b
+        return fetch_hf_params_b(model_id, revision=revision, strict=True)
     if info is not None and info.params_b > 0:
-        return info.params_b  # curated, authoritative (required field) — no string parsing
+        return info.params_b
     return fetch_hf_params_b(model_id)
 
 
@@ -795,11 +894,18 @@ def check_fit(
     gpu: str,
     quant: str = "bf16",
     params_b: float | None = None,
+    model_revision: str = "",
 ) -> VramEstimate:
     """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises."""
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
     if params_b is None:
-        params_b = fetch_hf_params_b(model_id)
+        if model_revision:
+            try:
+                params_b = fetch_hf_params_b(model_id, revision=model_revision, strict=True)
+            except Exception:
+                params_b = None
+        else:
+            params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
     est = estimate_vram_gb(params_b, algorithm, quant)

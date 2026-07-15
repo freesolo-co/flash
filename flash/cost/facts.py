@@ -32,7 +32,11 @@ def gpu_tflops(name: str) -> float:
 
 
 def gpu_hourly_usd(
-    name: str, provider: str | None = None, max_wall_seconds: float = 0.0, min_vram_gb: int = 0
+    name: str,
+    provider: str | None = None,
+    max_wall_seconds: float = 0.0,
+    min_vram_gb: int = 0,
+    exact_type: str = "",
 ) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
@@ -59,7 +63,12 @@ def gpu_hourly_usd(
         # provider="vast" quote through the Vast pricing module (live + static fallback).
         from flash.providers.vast.pricing import hourly_rate
 
-        return hourly_rate(name, max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
+        return hourly_rate(
+            name,
+            max_wall_seconds=max_wall_seconds,
+            min_vram_gb=min_vram_gb,
+            exact_type=exact_type,
+        )
     return info.hourly_usd
 
 
