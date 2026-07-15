@@ -41,6 +41,11 @@ from flash.engine.worker.perf import (
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
 
 
+def grpo_under_ran(steps_run: int, steps: int) -> bool:
+    """return true when grpo completes fewer optimizer updates than requested."""
+    return int(steps_run) < int(steps)
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -709,7 +714,7 @@ def run_rl():
         )
     # only a genuine under-run fails: a resume already at/past target does zero new steps yet holds a
     # fully-trained policy (_steps_run >= steps, _resumed_complete above), matching opd (opt_steps < steps).
-    if _steps_run < steps:
+    if grpo_under_ran(_steps_run, steps):
         raise RuntimeError(f"grpo completed {_steps_run}/{steps} requested optimizer updates")
     # adapter save + required upload can take minutes on a 35B; keep the heartbeat fresh through the
     # whole finalize. keepalive=True:

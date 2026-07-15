@@ -109,7 +109,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(
         spec,
-        0,
+        spec.seed,
         io.StringIO(),
         runtime_secrets={"WANDB_API_KEY": "user-wb"},
     )
@@ -147,7 +147,7 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
 
     with pytest.raises(orch._RunCancelled):
-        orch._submit_seed_supervised(spec, 0, io.StringIO())
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     status = orch.get_status(spec.run_id)
     assert status.state == "cancelled"
@@ -207,7 +207,7 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypa
 
     def submit():
         try:
-            orch._submit_seed_supervised(spec, 0, io.StringIO())
+            orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
         except Exception as exc:
             submit_errors.append(exc)
 
@@ -290,7 +290,7 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
 
     def submit(name):
         try:
-            results[name] = orch._submit_seed_supervised(spec, 0, io.StringIO())
+            results[name] = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
         except Exception as exc:
             results[name] = exc
 
@@ -353,11 +353,11 @@ def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_m
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
 
     if failure_mode == "provider_without_callback":
-        metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+        metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
         assert metrics["train_tokens"] == 4096
     else:
         with pytest.raises(RuntimeError, match="failed after retries"):
-            orch._submit_seed_supervised(spec, 0, io.StringIO())
+            orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     lock = _deploy_lock(spec.run_id)
     assert lock.acquire(blocking=False)
@@ -566,7 +566,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, 0, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["L4", "H100"]
     assert cancelled == [("ep1", "j1")]
@@ -613,7 +613,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
-        orch._submit_seed_supervised(spec, 0, log)
+        orch._submit_seed_supervised(spec, spec.seed, log)
 
     assert submitted_attempts == [0]
     assert deleted_endpoints
@@ -665,7 +665,7 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     spec = _spec(max_retries=max_retries)
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError):
-        orch._submit_seed_supervised(spec, 0, io.StringIO())
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
     return submitted, on_last_gpu
 
 
@@ -803,7 +803,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, 0, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
     assert metrics["train_tokens"] == 4096
     assert rp_gpus == ["H100"]  # RunPod tried exactly once...
     assert lam_gpus == ["H100"]  # ...then the retry escaped cross-provider to Lambda
@@ -849,7 +849,7 @@ def test_auto_cache_run_gets_free_cacheless_fallback_at_zero_retries(orch, monke
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
     assert metrics["train_tokens"] == 4096
     assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
 
@@ -898,7 +898,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
     assert metrics["train_tokens"] == 4096
     # cache attempt -> cache-less SAME class (free fallback) -> GPU-walk to the OTHER class (real retry).
     assert seen == [
@@ -955,7 +955,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
-    metrics = orch._submit_seed_supervised(spec, 0, log)
+    metrics = orch._submit_seed_supervised(spec, spec.seed, log)
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["A10"]  # broken Lambda instance tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
@@ -1004,7 +1004,7 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec()
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["H100"]  # sick region tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
@@ -1027,7 +1027,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="bad reward fn"):
-        orch._submit_seed_supervised(spec, 0, io.StringIO())
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
     assert calls == [0]
 
 

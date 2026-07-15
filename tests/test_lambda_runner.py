@@ -164,8 +164,7 @@ def test_image_per_sm_selects_arch_tag(monkeypatch):
     from flash.providers.lambdalabs.jobs import builders
     from flash.providers.runpod.train import WORKER_IMAGE
 
-    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_TEMPLATE"):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
 
     # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE

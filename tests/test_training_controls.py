@@ -509,6 +509,14 @@ def test_sft_under_ran_only_fails_a_genuine_under_run():
     assert not sft_under_ran(9, 10, 0)
 
 
+def test_grpo_under_ran_only_fails_a_genuine_under_run():
+    from flash.engine.worker.rl import grpo_under_ran
+
+    assert grpo_under_ran(9, 10)
+    assert not grpo_under_ran(10, 10)
+    assert not grpo_under_ran(12, 10)
+
+
 @pytest.mark.parametrize("bad", [[], False, "", 0])
 def test_from_dict_rejects_falsy_non_object_train(bad):
     # strict schema: an explicit non-object train must raise, not silently become an empty table.
@@ -519,6 +527,16 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
 def test_from_dict_defaults_omitted_or_null_train_to_empty():
     assert JobSpec.from_dict({}).seed == FIXED_SEED
     assert JobSpec.from_dict({"train": None}).train.max_steps is None
+
+
+def test_from_dict_rejects_removed_legacy_train_seeds():
+    with pytest.raises(ValueError, match=r"train has unknown key\(s\): seeds"):
+        JobSpec.from_dict({"train": {"seeds": [1, 2]}})
+
+
+def test_from_dict_rejects_misspelled_train_key():
+    with pytest.raises(ValueError, match=r"train has unknown key\(s\): max_step"):
+        JobSpec.from_dict({"train": {"max_step": 10}})
 
 
 def test_runtime_secret_cannot_override_control_plane_seed():
