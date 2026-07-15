@@ -252,7 +252,9 @@ def test_humanize_age_buckets(monkeypatch) -> None:
 
 def test_deployments_table_truncates_long_detail(styled_plain) -> None:
     long_err = "E" * 100
-    out = render.deployments_table([{"run_id": "r1", "deployment": {"state": "failed", "error": long_err}}])
+    out = render.deployments_table(
+        [{"run_id": "r1", "deployment": {"state": "failed", "error": long_err}}]
+    )
     assert ("E" * 61 + "...") in out  # 61 chars + ellipsis
     assert long_err not in out  # the full 100-char string was truncated away
     assert "failed" in out

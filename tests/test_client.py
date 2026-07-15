@@ -64,7 +64,10 @@ def stub():
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
-            if self.path == "/v1/runs/r1/chat":
+            if (
+                self.path in {"/v1/runs/r1/chat", "/v1/runs/run-a/chat"}
+                and seen["body"].get("stream") is True
+            ):
                 body = "héllo".encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -272,6 +275,39 @@ def test_chat_sends_user_supplied_system_prompt(stub):
     }
 
 
+def test_chat_full_immutable_revision_is_forwarded_unchanged(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = "run-a@step-40." + "a" * 40
+
+    client.chat(revision, [{"role": "user", "content": "hi"}])
+
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"]["adapter_revision"] == revision
+
+
+def test_chat_rejects_checkpoint_shorthand_without_request(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="full immutable adapter revision"):
+        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+
+    assert seen == {}
+
+
+@pytest.mark.parametrize("step", ["00", "01"])
+def test_chat_rejects_zero_padded_immutable_revision(stub, step):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = f"run-a@step-{step}." + "a" * 40
+
+    with pytest.raises(ClientError, match="invalid run id"):
+        client.chat(revision, [{"role": "user", "content": "hi"}])
+
+    assert seen == {}
+
+
 def test_chat_stream_sends_stream_request_and_yields_text(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
@@ -287,6 +323,41 @@ def test_chat_stream_sends_stream_request_and_yields_text(stub):
         "max_tokens": 7,
         "stream": True,
     }
+
+
+def test_chat_stream_full_immutable_revision_is_forwarded_unchanged(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    revision = "run-a@step-40." + "a" * 40
+
+    chunks = list(
+        client.chat_stream(
+            revision,
+            [{"role": "user", "content": "hi"}],
+            temperature=0.2,
+            max_tokens=7,
+        )
+    )
+
+    assert "".join(chunks) == "héllo"
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "max_tokens": 7,
+        "stream": True,
+        "adapter_revision": revision,
+    }
+
+
+def test_chat_stream_rejects_checkpoint_shorthand_without_request(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="full immutable adapter revision"):
+        list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
+
+    assert seen == {}
 
 
 def test_chat_stream_accepts_json_fallback(stub):
@@ -449,6 +520,60 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("run_state", ["cancelled", "done", "failed", "dry_run"])
+def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return {
+                "run_id": "r1",
+                "state": run_state,
+                "deployment": {
+                    "state": "revocation_failed",
+                    "retryable": True,
+                    "error": "backend unavailable",
+                },
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(
+        ClientError,
+        match="backend revocation is unconfirmed: backend unavailable; retry cancellation",
+    ):
+        client.cancel_run("r1")
+
+
+def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch):
+    client = ApiClient("http://flash.example", "fslo-user-test")
+    polls = iter(
+        [
+            {
+                "run_id": "r1",
+                "state": "running",
+                "deployment": {"state": "revocation_failed", "retryable": True},
+            },
+            {"run_id": "r1", "state": "cancelled", "deployment": {"state": "undeployed"}},
+        ]
+    )
+
+    def request(method, path, body=None, timeout=None, progress=None):
+        if method == "POST":
+            raise RequestTimeoutError("cancel timed out")
+        if method == "GET" and path == "/v1/runs/r1":
+            return next(polls)
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(client, "_request", request)
+    monkeypatch.setattr("flash.client.http.time.sleep", lambda _seconds: None)
+
+    assert client.cancel_run("r1")["state"] == "cancelled"
+
+
 def test_deploy_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     for bad in ("flash-run/step-", "flash-run/checkpoints/step-4", "flash-run/step-4/adapter"):
@@ -463,7 +588,8 @@ def test_deploy_checkpoint_ref_posts_step(stub):
     assert seen["path"] == "/v1/runs/flash-run/deploy"
     assert seen["body"]["step"] == 40
     assert seen["body"]["dry_run"] is False
-    assert seen["body"]["verify"] is True
+    # smoke verification is mandatory server-side; the client sends no opt-out knob
+    assert "verify" not in seen["body"]
 
 
 def test_deploy_final_ref_omits_step(stub):
@@ -471,7 +597,7 @@ def test_deploy_final_ref_omits_step(stub):
     client = ApiClient(url, "fslo-user-test")
     client.deploy("flash-run")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
-    assert seen["body"] == {"dry_run": False, "verify": True}
+    assert seen["body"] == {"dry_run": False}
 
 
 def test_export_sends_repository_token_and_checkpoint_ref(stub):

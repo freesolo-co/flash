@@ -472,22 +472,31 @@ def runs_table(runs: list[dict]) -> str:
 
 def deployments_table(rows: list[dict]) -> str:
     body = []
-    for r in rows:
-        dep = r.get("deployment") or {}
-        state = str(dep.get("state") or "?")
+    for row in rows:
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        state = str(deployment.get("state") or "?")
         color = _GREEN if state in {"ready", "deployed"} else _RED if state == "failed" else _AMBER
-        detail = str(dep.get("error") or dep.get("detail") or "")
+        step = deployment.get("checkpoint_step")
+        verified_at = deployment.get("verified_at")
+        detail = str(deployment.get("error") or deployment.get("detail") or "")
         if len(detail) > 64:
             detail = detail[:61] + "..."
         body.append(
             [
-                (r["run_id"], _ACCENT2),
+                (run_id, _ACCENT2),
+                ("final" if step is None else str(step), _TEAL),
+                (str(deployment.get("adapter_revision") or "-"), _ACCENT2),
                 (state, color),
-                (str(dep.get("openai_base_url") or ""), _GREEN),
+                ("-" if verified_at is None else str(verified_at), _GRAY),
+                (str(deployment.get("openai_model") or run_id), _GREEN),
                 (detail, _GRAY),
             ]
         )
-    table = _table(["RUN ID", "STATE", "OPENAI BASE URL", "DETAIL"], body)
+    table = _table(
+        ["RUN ID", "STEP", "REVISION", "STATE", "VERIFIED AT", "OPENAI MODEL", "DETAIL"],
+        body,
+    )
     return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
@@ -648,19 +657,16 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash undeploy`: confirm the run's serving deployment was torn down. The server clears the
-    deployment record idempotently (an already-absent serving adapter that 404s still counts as a
-    teardown), and the response can't distinguish that from a true no-op, so we always confirm;
-    when the serving backend actually deregistered endpoints we name them."""
+    """`flash undeploy`: report the run-scoped aliases and immutable revisions disabled."""
     rid = _paint(result.get("run_id", ""), _ACCENT2)
-    deleted = result.get("deleted_endpoints") or []
+    aliases = result.get("disabled_aliases") or []
+    revisions = result.get("disabled_revisions") or []
+    affected = [*aliases, *revisions]
     line = ok(f"torn down {rid}")
-    if deleted:
-        line += "\n" + _dim(f"  deregistered {', '.join(deleted)}")
+    if affected:
+        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")
     else:
-        line += "\n" + _dim(
-            "  serving had no registered adapter to deregister (already gone or never registered)"
-        )
+        line += "\n" + _dim("  serving records were already disabled or absent")
     return _safe(line)
 
 

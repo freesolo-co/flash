@@ -2,31 +2,64 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import threading
 import weakref
 
 
 class _RunLock:
-    """Weak-referenceable mutex; threading.Lock() doesn't support weakref so we wrap it."""
+    """Weak-referenceable mutex shared by threads and control-plane processes."""
 
-    __slots__ = ("__weakref__", "_lock")
+    __slots__ = ("__weakref__", "_fd", "_lock", "_run_id")
 
-    def __init__(self) -> None:
+    def __init__(self, run_id: str) -> None:
+        self._run_id = run_id
         self._lock = threading.Lock()
+        self._fd: int | None = None
 
     def __enter__(self) -> _RunLock:
-        self._lock.acquire()
+        self.acquire()
         return self
 
     def __exit__(self, *exc: object) -> None:
-        self._lock.release()
+        self.release()
 
     def acquire(self, blocking: bool = True) -> bool:
-        """Acquire the underlying mutex; non-blocking mode reports whether it was free."""
-        return self._lock.acquire(blocking)
+        """Acquire the thread mutex and the run's process-wide file lock."""
+        if not self._lock.acquire(blocking):
+            return False
+        fd: int | None = None
+        try:
+            from flash.runner import RUNS_DIR, runs_file_path
+
+            os.makedirs(RUNS_DIR, exist_ok=True)
+            fd = os.open(runs_file_path(self._run_id, ".deploy.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(fd, operation)
+        except BlockingIOError:
+            if fd is not None:
+                os.close(fd)
+            self._lock.release()
+            return False
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            self._lock.release()
+            raise
+        self._fd = fd
+        return True
 
     def release(self) -> None:
-        self._lock.release()
+        fd = self._fd
+        if fd is None:
+            raise RuntimeError("deploy lock is not held")
+        self._fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+            self._lock.release()
 
 
 # Serializes deploy, undeploy, and export per run id.
@@ -38,6 +71,6 @@ def _deploy_lock(run_id: str) -> _RunLock:
     with _DEPLOY_LOCKS_GUARD:
         lk = _DEPLOY_LOCKS.get(run_id)
         if lk is None:
-            lk = _RunLock()
+            lk = _RunLock(run_id)
             _DEPLOY_LOCKS[run_id] = lk
         return lk
