@@ -534,6 +534,42 @@ class _FakeProc:
         self.killed = True
 
 
+class _RaisingWaitProc:
+    def __init__(self, error):
+        self.args = ["worker"]
+        self.stdout = iter(())
+        self.returncode = None
+        self.error = error
+
+    def wait(self, timeout=None):
+        raise self.error
+
+    def kill(self):
+        pytest.fail("non-timeout wait errors must not kill the worker")
+
+
+class _ReapTrackedUploader:
+    def __init__(self):
+        self.alive = True
+        self.close_called = False
+
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.alive = False
+
+    def kill(self):
+        self.alive = False
+
+    def close(self):
+        assert self.alive is False
+        self.close_called = True
+
+
 def _disable_periodic_console_upload(monkeypatch):
     monkeypatch.setattr(
         b,
@@ -581,6 +617,103 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
         body = f.read()
     assert "hello" in body
     assert "world" in body
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [SystemExit(17), KeyboardInterrupt("interrupted")],
+    ids=["system-exit", "keyboard-interrupt"],
+)
+def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, wait_error):
+    uploader = _ReapTrackedUploader()
+    stop_upload = threading.Event()
+    monkeypatch.setattr(
+        b,
+        "_start_console_uploader",
+        lambda *_args: (uploader, stop_upload),
+    )
+    monkeypatch.setattr(
+        b.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: _RaisingWaitProc(wait_error),
+    )
+
+    with pytest.raises(type(wait_error)) as raised:
+        b.run_mode({}, {}, "sft", deadline_ts=b.time.time() + 100)
+
+    assert raised.value is wait_error
+    assert stop_upload.is_set()
+    assert uploader.is_alive() is False
+    assert uploader.close_called is True
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
+    ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
+)
+def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(
+    monkeypatch, wait_error
+):
+    uploader = _ReapTrackedUploader()
+    stop_upload = threading.Event()
+    marker_states = []
+    created_at = b.time.time()
+    payload = {
+        "phase": "sft",
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 100.0,
+        "deadline_at": created_at + 100.0,
+    }
+
+    class _Timer:
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(
+        b,
+        "arm_deadline_watchdog",
+        lambda *_args: (_Timer(), threading.Event()),
+    )
+    monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
+    monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
+    monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
+    monkeypatch.setattr(
+        b.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: _RaisingWaitProc(wait_error),
+    )
+    monkeypatch.setattr(
+        b,
+        "_start_console_uploader",
+        lambda *_args: (uploader, stop_upload),
+    )
+    monkeypatch.setattr(
+        b,
+        "_upload_console_tail_bounded",
+        lambda *_args: pytest.fail("final upload must not run after a wait error"),
+    )
+    monkeypatch.setattr(
+        b,
+        "write_attempt_marker",
+        lambda _payload, ok, error="", retriable=False: marker_states.append(
+            (ok, error, retriable, uploader.is_alive(), uploader.close_called)
+        ),
+    )
+
+    assert b.main() == 1
+
+    assert stop_upload.is_set()
+    assert uploader.is_alive() is False
+    assert uploader.close_called is True
+    assert len(marker_states) == 1
+    ok, error, retriable, uploader_alive, uploader_closed = marker_states[0]
+    assert ok is False
+    assert type(wait_error).__name__ in error
+    assert retriable is False
+    assert uploader_alive is False
+    assert uploader_closed is True
 
 
 def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatch):

@@ -585,39 +585,43 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         t.start()
         uploader, stop_upload = _start_console_uploader(payload, console, mode)
         try:
-            remaining = worker_deadline_at - _finite_positive_number(time.time(), "current clock")
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
-            proc.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            proc.kill()
-            remaining = max(
+            try:
+                remaining = worker_deadline_at - _finite_positive_number(
+                    time.time(), "current clock"
+                )
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                remaining = max(
+                    0.0,
+                    worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
+                )
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=remaining)
+
+            drain_timeout = max(
                 0.0,
                 worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
             )
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=remaining)
-
-        drain_timeout = max(
-            0.0,
-            worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
-        )
-        pump_finished = pump_done.wait(drain_timeout)
-        if pump_finished:
-            t.join()
-        else:
-            timed_out = True
-            with pump_write_lock:
-                pump_writes_enabled = False
-        uploader_clean = _stop_upload_process(
-            uploader,
-            stop_upload,
-            upload_deadline_at,
-            reaping_deadline_at,
-        )
-        if not uploader_clean:
-            print("console uploader exceeded its shutdown allowance; terminated", flush=True)
+            pump_finished = pump_done.wait(drain_timeout)
+            if pump_finished:
+                t.join()
+            else:
+                timed_out = True
+                with pump_write_lock:
+                    pump_writes_enabled = False
+        finally:
+            uploader_clean = _stop_upload_process(
+                uploader,
+                stop_upload,
+                upload_deadline_at,
+                reaping_deadline_at,
+            )
+            if not uploader_clean:
+                print("console uploader exceeded its shutdown allowance; terminated", flush=True)
     try:
         extra = ""
         if timed_out:
