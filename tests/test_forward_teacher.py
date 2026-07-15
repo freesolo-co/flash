@@ -233,6 +233,45 @@ def test_forward_teacher_retry_wait_stops_at_run_deadline(monkeypatch):
     assert "private" not in str(caught.value)
 
 
+def test_forward_teacher_deadline_during_pacing_reports_elapsed_latency(monkeypatch):
+    from flash.engine.worker import forward_teacher as forward_teacher_mod
+
+    now = [100.0]
+    opener_calls = []
+    sleeps = []
+    monkeypatch.setattr(forward_teacher_mod.time, "time", lambda: now[0])
+
+    def opener(_request, timeout):
+        opener_calls.append(timeout)
+        return _Response(_payload())
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    client = ForwardTeacherClient(
+        "key",
+        seed=123,
+        opener=opener,
+        sleep=sleep,
+        clock=lambda: now[0],
+    )
+    client.generate([{"role": "user", "content": "first"}])
+    opener_calls.clear()
+    now[0] += 0.5
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.5")
+
+    with pytest.raises(ForwardTeacherTransientError, match="run wall deadline") as caught:
+        client.generate([{"role": "user", "content": "private prompt"}])
+
+    assert opener_calls == []
+    assert sleeps == [1.0]
+    assert caught.value.attempts == 0
+    assert caught.value.latency_seconds == pytest.approx(1.0)
+    assert caught.value.ambiguous_paid_requests == 0
+    assert "private prompt" not in str(caught.value)
+
+
 @pytest.mark.parametrize("content", ["  visible answer", "visible answer  ", "visible answer\n"])
 def test_forward_teacher_preserves_visible_content_boundary_whitespace(content):
     result = ForwardTeacherClient(

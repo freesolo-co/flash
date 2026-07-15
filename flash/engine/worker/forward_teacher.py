@@ -527,9 +527,9 @@ class ForwardTeacherClient:
         for attempt in (1, 2):
             remaining = remaining_or_fail(attempt - 1)
             attempt_started = self._pace_attempt(max_delay=remaining)
-            remaining = remaining_or_fail(attempt - 1)
             if started is None:
                 started = attempt_started
+            remaining = remaining_or_fail(attempt - 1)
             request_timeout = self._timeout if remaining is None else min(self._timeout, remaining)
             request = urllib.request.Request(
                 FORWARD_TEACHER_URL, data=body, headers=headers, method="POST"
