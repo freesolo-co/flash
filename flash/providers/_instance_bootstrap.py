@@ -26,10 +26,12 @@ _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
+_CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_MARKER_GRACE_S = 0.25
+_TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 _SECRET_RE = re.compile(
     r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -276,22 +278,147 @@ def _console_upload_loop(
             print(f"console upload warn: {_safe_detail(exc)}", flush=True)
 
 
-def _stop_upload_process(process, stop_upload, timeout_s: float) -> bool:
-    """Stop and reap an uploader process; return whether it exited without termination."""
-    stop_upload.set()
-    process.join(max(0.0, timeout_s))
-    clean = not process.is_alive()
-    if not clean:
-        process.terminate()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        process.kill()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        print("console uploader could not be reaped after kill", flush=True)
-    else:
-        process.close()
+def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
+    reaping_deadline_at = deadline_at - _TERMINAL_BOOKKEEPING_RESERVE_S
+    upload_deadline_at = reaping_deadline_at - _CONSOLE_UPLOAD_REAP_RESERVE_S
+    return upload_deadline_at, reaping_deadline_at
+
+
+def _worker_execution_deadline(upload_deadline_at: float) -> float:
+    return (
+        upload_deadline_at
+        - _CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+    )
+
+
+def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) -> None:
+    remaining = max(
+        0.0,
+        deadline_at - _finite_positive_number(time.time(), "current clock"),
+    )
+    process.join(min(max_wait_s, remaining))
+
+
+def _defer_upload_cleanup_error(deferred_error, operation, *args, **kwargs):
+    try:
+        return deferred_error, operation(*args, **kwargs), True
+    except BaseException as exc:
+        return exc if deferred_error is None else deferred_error, None, False
+
+
+def _cleanup_upload_process(
+    process,
+    initial_deadline_at: float,
+    initial_wait_s: float,
+    reaping_deadline_at: float,
+    warning: str,
+    stop_upload=None,
+) -> bool:
+    """reap an uploader before propagating the first cleanup interruption."""
+    deferred_error = None
+    if stop_upload is not None:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            stop_upload.set,
+        )
+    deferred_error, _, _ = _defer_upload_cleanup_error(
+        deferred_error,
+        _join_upload_process_before,
+        process,
+        initial_deadline_at,
+        initial_wait_s,
+    )
+    deferred_error, alive, checked = _defer_upload_cleanup_error(
+        deferred_error,
+        process.is_alive,
+    )
+    clean = checked and alive is False
+    dead = clean
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.terminate,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
+            process,
+            reaping_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.kill,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
+            process,
+            reaping_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            process.kill,
+        )
+        deferred_error, _, _ = _defer_upload_cleanup_error(
+            deferred_error,
+            _join_upload_process_before,
+            process,
+            reaping_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
+        deferred_error, alive, checked = _defer_upload_cleanup_error(
+            deferred_error,
+            process.is_alive,
+        )
+        dead = checked and alive is False
+
+    if not dead:
+        _defer_upload_cleanup_error(deferred_error, print, warning, flush=True)
+        os._exit(124)
+        raise AssertionError("unreachable")
+
+    deferred_error, _, _ = _defer_upload_cleanup_error(
+        deferred_error,
+        process.close,
+    )
+    if deferred_error is not None:
+        raise deferred_error
     return clean
+
+
+def _stop_upload_process(
+    process,
+    stop_upload,
+    upload_deadline_at: float,
+    reaping_deadline_at: float,
+) -> bool:
+    """stop and reap an uploader before terminal-marker bookkeeping."""
+    return _cleanup_upload_process(
+        process,
+        upload_deadline_at,
+        _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
+        reaping_deadline_at,
+        "console uploader remained alive after kill; exiting before terminal bookkeeping",
+        stop_upload,
+    )
 
 
 def _start_console_uploader(payload: dict, console: str, mode: str):
@@ -311,10 +438,11 @@ def _upload_console_tail_bounded(
     console: str,
     mode: str,
     extra: str,
-    timeout_s: float,
+    upload_deadline_at: float,
+    reaping_deadline_at: float,
 ) -> bool:
-    """Upload the final console snapshot without letting HF delay terminal bookkeeping."""
-    if timeout_s <= 0:
+    """upload the final console snapshot before terminal-marker bookkeeping."""
+    if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
         return False
     context = multiprocessing.get_context("spawn")
     process = context.Process(
@@ -323,19 +451,13 @@ def _upload_console_tail_bounded(
         daemon=True,
     )
     process.start()
-    process.join(timeout_s)
-    clean = not process.is_alive()
-    if not clean:
-        process.terminate()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        process.kill()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        print("final console uploader could not be reaped after kill", flush=True)
-    else:
-        process.close()
-    return clean
+    return _cleanup_upload_process(
+        process,
+        upload_deadline_at,
+        _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
+        reaping_deadline_at,
+        "final console uploader remained alive after kill; exiting before terminal bookkeeping",
+    )
 
 
 def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
@@ -496,16 +618,22 @@ def fetch_code(payload: dict) -> None:
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
+    upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
+    worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
     timed_out = False
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
-        if deadline_ts - _finite_positive_number(time.time(), "current clock") <= 0:
+        if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
             raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker_entrypoint"],
             cwd=code_dir,
-            env={**env, "RUN_MODE": mode},
+            env={
+                **env,
+                "RUN_MODE": mode,
+                "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at),
+            },
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -531,59 +659,58 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         t.start()
         uploader, stop_upload = _start_console_uploader(payload, console, mode)
         try:
-            remaining = deadline_ts - _finite_positive_number(time.time(), "current clock")
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
-            proc.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=1.0)
+            try:
+                remaining = worker_deadline_at - _finite_positive_number(
+                    time.time(), "current clock"
+                )
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                remaining = max(
+                    0.0,
+                    worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
+                )
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=remaining)
 
-        drain_timeout = (
-            1.0
-            if timed_out
-            else max(
+            drain_timeout = max(
                 0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
+                worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
             )
-        )
-        pump_finished = pump_done.wait(drain_timeout)
-        if pump_finished:
-            t.join()
-        else:
-            timed_out = True
-            with pump_write_lock:
-                pump_writes_enabled = False
-        uploader_stop_timeout = min(
-            _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
-            max(
-                0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
-            ),
-        )
-        if not _stop_upload_process(uploader, stop_upload, uploader_stop_timeout):
-            print("console uploader exceeded its shutdown allowance; terminated", flush=True)
+            pump_finished = pump_done.wait(drain_timeout)
+            if pump_finished:
+                t.join()
+            else:
+                timed_out = True
+                with pump_write_lock:
+                    pump_writes_enabled = False
+        finally:
+            uploader_clean = _stop_upload_process(
+                uploader,
+                stop_upload,
+                upload_deadline_at,
+                reaping_deadline_at,
+            )
+            if not uploader_clean:
+                print("console uploader exceeded its shutdown allowance; terminated", flush=True)
     try:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-        final_upload_timeout = min(
-            _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
-            max(
-                0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
-            ),
-        )
-        if not _upload_console_tail_bounded(
+        if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
+            print("final console upload skipped; uploader reaping reserve reached", flush=True)
+        elif not _upload_console_tail_bounded(
             payload,
             console,
             mode,
             extra,
-            final_upload_timeout,
+            upload_deadline_at,
+            reaping_deadline_at,
         ):
-            print("final console upload skipped or exceeded its allowance", flush=True)
+            print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
         print(f"console upload warn: {_safe_detail(exc)}", flush=True)
     if timed_out:
@@ -770,7 +897,6 @@ def main() -> int:
         except Exception:
             raise RetriableBootstrapError("failed to fetch run code from HF") from None
         env = build_worker_env(payload)
-        env["FLASH_RUN_DEADLINE_AT"] = str(deadline)
         phase = payload["phase"]
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
             with contextlib.suppress(FileNotFoundError):

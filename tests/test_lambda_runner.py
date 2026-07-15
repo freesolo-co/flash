@@ -1913,6 +1913,22 @@ def test_runner_preserves_success_when_teardown_is_unconfirmed(monkeypatch, capl
     assert "persisted handle remains available" in caplog.text
 
 
+@pytest.mark.parametrize("control_exc", [KeyboardInterrupt, SystemExit])
+def test_runner_propagates_process_control_from_teardown(monkeypatch, control_exc):
+    from flash.providers.base import PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+
+    jobs, _, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instance_confirmed",
+        lambda _instance_id: (_ for _ in ()).throw(control_exc()),
+    )
+
+    with pytest.raises(control_exc):
+        _submit(jobs, _spec(), seed=0)
+
+
 def test_runner_terminates_on_failure_and_exception(monkeypatch):
     from flash.providers.base import PollResult
 
