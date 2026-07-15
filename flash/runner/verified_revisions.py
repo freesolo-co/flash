@@ -108,6 +108,7 @@ def commit_verified_adapter_revision(
     expected_generation: int,
     commit: Callable[[], None],
     retain_only_revision: bool = False,
+    advance_generation: bool = False,
 ) -> bool:
     """Persist verified membership before committing its ready status."""
     parsed = parse_adapter_revision(revision)
@@ -123,11 +124,12 @@ def commit_verified_adapter_revision(
         generation, revisions = _read_unlocked(path, run_id)
         if generation != expected_generation:
             return False
+        retained_generation = generation + 1 if advance_generation else generation
         retained_revisions = [revision] if retain_only_revision else list(revisions)
         if not retain_only_revision and revision not in retained_revisions:
             retained_revisions.append(revision)
-        if retained_revisions != revisions:
-            _write_unlocked(runs_dir, path, generation, retained_revisions)
+        if retained_generation != generation or retained_revisions != revisions:
+            _write_unlocked(runs_dir, path, retained_generation, retained_revisions)
         commit()
         return True
 

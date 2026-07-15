@@ -257,6 +257,8 @@ def cancel_run(run_id: str) -> RunStatus:
             _gc_run_endpoints(cleanup_spec)
 
     deploy_lock = _deploy_lock(run_id)
+    contended_prelock_deployment: dict | None = None
+    contended_preserved_checkpoint: dict | None = None
     lock_acquired = deploy_lock.acquire(blocking=False)
     try:
         if not lock_acquired:
@@ -281,12 +283,22 @@ def cancel_run(run_id: str) -> RunStatus:
                 and not unknown_prelock_outcome
             ):
                 try:
-                    mark_checkpoint_deployed(
+                    fenced_status = mark_checkpoint_deployed(
                         run_id,
                         preserved_prelock_checkpoint,
                         verification_generation=verified_adapter_revision_generation(run_id),
                         owner_deployment=prelock_deployment,
+                        retain_only_revision=True,
+                        advance_generation=True,
                     )
+                    if (
+                        fenced_status.deployment == preserved_prelock_checkpoint
+                        and _is_preservable_checkpoint_deployment(
+                            run_id, fenced_status.deployment
+                        )
+                    ):
+                        contended_prelock_deployment = prelock_deployment
+                        contended_preserved_checkpoint = preserved_prelock_checkpoint
                 except Exception as exc:
                     raise DeploymentStatePersistenceError(
                         run_id, str(exc), backend_outcome="not_attempted"
@@ -308,10 +320,11 @@ def cancel_run(run_id: str) -> RunStatus:
         entered_deployed = entered_deployed or status.state == "deployed"
         _, active_deployment = _deployment_state_and_requires_revocation(status.deployment)
         live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED
-        if (
-            status.state != "dry_run"
-            and isinstance(status.deployment, dict)
-            and status.deployment.get("activation_outcome_unknown")
+        unknown_activation = isinstance(status.deployment, dict) and status.deployment.get(
+            "activation_outcome_unknown"
+        )
+        if status.state != "dry_run" and (
+            unknown_activation or contended_preserved_checkpoint is not None
         ):
             try:
                 from flash.serve.deploy import adapter_alias_target
@@ -319,15 +332,26 @@ def cancel_run(run_id: str) -> RunStatus:
                 live_alias_target = adapter_alias_target(run_id)
             except Exception:
                 live_alias_target = None
-        preserved_checkpoint = (
-            None
-            if status.state == "dry_run"
-            else _preservable_checkpoint_deployment(
+        if status.state == "dry_run":
+            preserved_checkpoint = None
+        elif contended_preserved_checkpoint is not None:
+            preserved_checkpoint = _verified_checkpoint_deployment_for_revision(
+                run_id,
+                live_alias_target,
+                contended_prelock_deployment,
+                contended_preserved_checkpoint,
+                allow_smoke_verified_attempt=(
+                    isinstance(contended_prelock_deployment, dict)
+                    and contended_prelock_deployment.get("adapter_revision")
+                    == live_alias_target
+                ),
+            )
+        else:
+            preserved_checkpoint = _preservable_checkpoint_deployment(
                 run_id,
                 status.deployment,
                 live_alias_target=live_alias_target,
             )
-        )
         if preserved_checkpoint is not None and status.deployment != preserved_checkpoint:
             intended_revision = preserved_checkpoint.get("adapter_revision")
             owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
@@ -635,6 +659,7 @@ def _commit_verified_deployment(
     verification_generation: int | None,
     commit: Callable[[], None],
     retain_only_revision: bool = False,
+    advance_generation: bool = False,
 ) -> bool:
     if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES:
         raise ValueError("immutable deployment commit requires ready or deployed state")
@@ -654,6 +679,7 @@ def _commit_verified_deployment(
         expected_generation=verification_generation,
         commit=commit,
         retain_only_revision=retain_only_revision,
+        advance_generation=advance_generation,
     )
 
 
@@ -707,6 +733,7 @@ def mark_checkpoint_deployed(
     verification_generation: int | None = None,
     owner_deployment: dict | None = None,
     retain_only_revision: bool = False,
+    advance_generation: bool = False,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -739,6 +766,7 @@ def mark_checkpoint_deployed(
             verification_generation=verification_generation,
             commit=_commit,
             retain_only_revision=retain_only_revision,
+            advance_generation=advance_generation,
         ):
             return get_status(run_id)
         return status

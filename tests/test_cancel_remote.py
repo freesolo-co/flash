@@ -1016,6 +1016,9 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
             lock_events.append("waiting")
             fenced = orch.get_status(run_id)
             assert fenced.deployment == previous
+            assert orch.verified_adapter_revision_generation(run_id) == (
+                attempted["verification_generation"] + 1
+            )
             stale = orch.mark_deployed(
                 run_id,
                 stale_commit,
@@ -1031,8 +1034,14 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
             self.held = False
             lock_events.append("released")
 
+    alias_reads = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "adapter_alias_target",
+        lambda target: alias_reads.append(target) or previous["adapter_revision"],
+    )
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -1041,10 +1050,80 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
 
     out = orch.cancel_run(run_id)
 
+    assert alias_reads == [run_id]
     assert lock_events == ["contended", "waiting", "released"]
     assert out.state == "cancelled"
     assert out.deployment == previous
     assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
+    tmp_path, monkeypatch
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-contended-alias-race"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    status = orch.get_status(run_id)
+    status.state = "deployed"
+    attempted = {
+        "state": "smoke_testing",
+        "requested_at": 456.0,
+        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "previous_deployment": previous,
+        "verification_generation": orch.verified_adapter_revision_generation(run_id),
+    }
+    status.deployment = attempted
+    orch._save_status(status)
+    stale_commit = {**attempted, "state": "ready"}
+    alias_target = [previous["adapter_revision"]]
+
+    class ContendedLock:
+        held = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                return False
+            fenced = orch.get_status(run_id)
+            assert fenced.deployment == previous
+            assert orch.verified_adapter_revision_generation(run_id) == (
+                attempted["verification_generation"] + 1
+            )
+            alias_target[0] = attempted["adapter_revision"]
+            stale = orch.mark_deployed(
+                run_id,
+                stale_commit,
+                expect_state="deployed",
+                verification_generation=attempted["verification_generation"],
+            )
+            assert stale.deployment == previous
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held is True
+            self.held = False
+
+    undeploys = []
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _target: alias_target[0])
+
+    def undeploy(target):
+        undeploys.append(target)
+        assert orch.get_status(run_id).deployment["state"] == "revocation_failed"
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+
+    out = orch.cancel_run(run_id)
+
+    assert undeploys == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_path, monkeypatch):
