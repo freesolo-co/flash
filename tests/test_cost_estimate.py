@@ -201,12 +201,32 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, max_examples=8),
-        gpu=GpuSpec(provider="runpod", exact_type="H100"),
+        gpu=GpuSpec(provider="runpod", exact_type="H100", disk_gb=200),
     )
 
     config = runconfig_from_spec(spec)
     assert config.provider == "runpod"
     assert config.exact_type == "H100"
+    # the run's disk floor threads through so an exact-auto quote allocates the same disk as launch
+    assert config.disk_gb == 200.0
+
+
+def test_estimate_exact_auto_threads_disk_floor_into_allocation(monkeypatch):
+    # The exact-auto quote must allocate at the run's real disk floor (parity with the launch allocate
+    # call) so the persisted quote reflects the disk the run is actually provisioned with, not 0.
+    from types import SimpleNamespace
+
+    import flash.providers.allocator as allocator_mod
+
+    seen: dict = {}
+
+    def fake_allocate(model_id, method, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80)
+
+    monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
+    estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100", disk_gb=200.0))
+    assert seen["disk_gb"] == 200.0
 
 
 def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):

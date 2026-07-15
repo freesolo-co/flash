@@ -167,6 +167,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         provider=g.provider or "auto",
         exact_type=g.exact_type,
         model_revision=spec.model_revision,
+        disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

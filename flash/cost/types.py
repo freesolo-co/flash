@@ -43,6 +43,9 @@ class RunConfig:
     save_at_steps: tuple[int, ...] = ()
     exact_type: str = ""
     model_revision: str = ""
+    # Spec gpu.disk_gb, carried so an exact-auto quote allocates at the run's real disk floor (parity
+    # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
+    disk_gb: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))

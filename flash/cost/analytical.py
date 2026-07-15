@@ -256,6 +256,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             train=config.train_knobs(),
             thinking=config.thinking,
             max_wall_seconds=market_wall_s,
+            disk_gb=config.disk_gb,
             provider="",
             exact_type=config.exact_type,
             model_revision=config.model_revision,
