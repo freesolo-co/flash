@@ -1119,6 +1119,30 @@ def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
         worker._hf_upload(boom, "DONE", required=True, label="DONE")
 
 
+def test_opd_training_started_preserves_retriable_upload_error(monkeypatch):
+    import contextlib
+    import os
+
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    attempt = 987654321
+    path = f"/tmp/opd_training_started_attempt{attempt}.json"
+    monkeypatch.setattr(worker, "ATTEMPT", attempt)
+    monkeypatch.setattr(worker, "RUN_ID", "opd-marker-retry")
+
+    def fail_upload(*_args, **_kwargs):
+        raise RetriableInfraError("required marker upload failed")
+
+    monkeypatch.setattr(worker, "hf_upload_file", fail_upload)
+    try:
+        with pytest.raises(RetriableInfraError, match="required marker upload failed"):
+            worker.persist_opd_training_started()
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+
+
 def test_required_upload_starts_no_hf_call_at_deadline(monkeypatch):
     from flash.engine import worker
     from flash.engine.worker.perf import RetriableInfraError

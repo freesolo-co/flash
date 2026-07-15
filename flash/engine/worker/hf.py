@@ -53,6 +53,8 @@ def persist_opd_training_started() -> None:
         os.fsync(f.fileno())
     try:
         _w.hf_upload_file(path, name, required=True)
+    except RetriableInfraError:
+        raise
     except Exception:
         raise RuntimeError("opd optimizer-start marker persistence failed") from None
 
