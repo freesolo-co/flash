@@ -528,32 +528,50 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
             break
 
 
-def upload_resume_checkpoint(step: int, ckpt_dir: str, *, before_upload=None) -> bool:
-    """Synchronously stream one full-state resume checkpoint and prune older steps."""
+def upload_resume_checkpoint(
+    step: int, ckpt_dir: str, *, before_upload=None, after_upload=None
+) -> bool:
+    """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _w.HF_REPO:
         return True
 
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
+    before_completed = before_upload is None
+    resume_completed = False
+    after_completed = after_upload is None
     with liveness_heartbeat(
         "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
     ):
-        if before_upload is not None:
-            before_upload()
         for attempt in range(_CKPT_UPLOAD_RETRIES):
+            failure_stage = "resume"
             try:
-                _require_hf_deadline_allowance()
-                _w.hf_api().upload_folder(
-                    folder_path=ckpt_dir,
-                    path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                    repo_id=_w.HF_REPO,
-                    repo_type="dataset",
-                )
-                # prune only after the atomic folder commit lands, so the prior complete save survives
-                # every failed replacement upload.
-                _prune_stale_resume_checkpoints(step)
+                if not before_completed:
+                    failure_stage = "before"
+                    before_upload()
+                    before_completed = True
+                if not resume_completed:
+                    failure_stage = "resume"
+                    _require_hf_deadline_allowance()
+                    _w.hf_api().upload_folder(
+                        folder_path=ckpt_dir,
+                        path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                        repo_id=_w.HF_REPO,
+                        repo_type="dataset",
+                    )
+                    # prune only after the atomic folder commit lands, so the prior complete save survives
+                    # every failed replacement upload.
+                    _prune_stale_resume_checkpoints(step)
+                    resume_completed = True
+                if not after_completed:
+                    failure_stage = "after"
+                    after_upload()
+                    after_completed = True
+                failure_stage = "heartbeat"
                 _w.heartbeat("checkpoint_uploaded", step=step)
                 return True
+            except RequiredSaveError:
+                raise
             except Exception as e:
                 if attempt + 1 < _CKPT_UPLOAD_RETRIES:
                     print(
@@ -572,6 +590,8 @@ def upload_resume_checkpoint(step: int, ckpt_dir: str, *, before_upload=None) ->
                     )
                     with contextlib.suppress(Exception):
                         _w.heartbeat("checkpoint_upload_failed", step=step)
+                    if failure_stage in {"before", "after"}:
+                        raise
     return False
 
 

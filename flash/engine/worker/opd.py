@@ -22,6 +22,7 @@ module is CPU/offline-safe.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -48,6 +49,7 @@ from flash.engine.structured_outputs import (
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import RequiredSaveError
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
     _rollout_terminated,
@@ -80,6 +82,7 @@ from flash.engine.worker.rng import (
     backend_seed,
     capture_training_rng_state,
     restore_training_rng_state,
+    rollout_request_seed,
     seed_training_rngs,
 )
 from flash.engine.worker.teacher import TeacherError
@@ -92,8 +95,8 @@ OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
 # schema version of the opd_state.json accounting blob inside a full-state resume checkpoint. bumped
 # only if that blob's shape changes; a worker refuses to resume a checkpoint written under a different
-# version (fail closed to a retry rather than misread state).
-OPD_RESUME_STATE_VERSION = 1
+# version (fail closed rather than misread state).
+OPD_RESUME_STATE_VERSION = 2
 _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "generated_tokens": "nonneg_int",
     "teacher_input_tokens": "nonneg_int",
@@ -108,12 +111,47 @@ _OPD_RESUME_ACCOUNTING_SCHEMA = {
     "episodes_seen": "nonneg_int",
     "mt_turn_records": "nonneg_int",
     "granularity_sum": "nonneg_number",
+    "train_wall_seconds": "nonneg_number",
     "loss_curve": "list",
     "coverage_curve": "list",
     "skip_counts": "dict",
     "opd_phase_seconds": "dict",
     "opd_phase_counts": "dict",
 }
+
+
+def _cumulative_train_wall_seconds(baseline: float, started_at: float, now: float) -> float:
+    """return cumulative training-loop wall time across replacement attempts."""
+    elapsed = max(0.0, float(now) - float(started_at))
+    total = float(baseline) + elapsed
+    if not math.isfinite(total) or total < 0:
+        raise RuntimeError("opd cumulative training wall time is invalid")
+    return total
+
+
+def _require_restored_opd_state(state: dict | None) -> dict:
+    """fail terminally when a downloaded checkpoint cannot be restored."""
+    if state is None:
+        raise RuntimeError(
+            "opd resume checkpoint is present but could not be restored; "
+            "refusing to train fresh after possible prior optimizer mutation"
+        )
+    return state
+
+
+def _opd_prompt_pool_fingerprint(examples: list[tuple[object, object, list[int]]]) -> str:
+    """hash the exact ordered filtered prompt pool without exposing prompt content."""
+    digest = hashlib.sha256()
+    for example, messages, prompt_ids in examples:
+        encoded = json.dumps(
+            [example, messages, [int(token) for token in prompt_ids]],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _apply_opd_optimizer_update(
@@ -532,6 +570,7 @@ def run_opd():
             "prompts — failing before the training loop instead of dropping every prompt for "
             "every step and burning the GPU allocation."
         )
+    prompt_pool_fingerprint = _opd_prompt_pool_fingerprint(examples)
     if n_over_budget:
         print(
             f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
@@ -664,18 +703,16 @@ def run_opd():
     )
     resume_state = None
     if resume_ckpt:
-        resume_state = _restore_opd_full_state(
-            resume_ckpt,
-            model=model,
-            optimizer=optimizer,
-            torch=torch,
-            max_opt_steps=steps,
-        )
-        if resume_state is None:
-            raise RetriableInfraError(
-                "opd resume checkpoint is present but could not be restored; "
-                "refusing to train fresh after possible prior optimizer mutation"
+        resume_state = _require_restored_opd_state(
+            _restore_opd_full_state(
+                resume_ckpt,
+                model=model,
+                optimizer=optimizer,
+                torch=torch,
+                max_opt_steps=steps,
+                prompt_pool_fingerprint=prompt_pool_fingerprint,
             )
+        )
         # on-policy sampling must use the restored adapter, so re-sync vllm from the loaded weights.
         vllm_rollout.sync_from_model(model)
         print(
@@ -715,6 +752,7 @@ def run_opd():
     # opd's liveness thread emitted only liveness=True pings that share the opd_step upload-throttle
     # slot and could suppress the main thread's per-sample progress uploads (codex[bot]).
     samples_seen = int(_resumed("samples_seen", 0))
+    rollout_seed_ordinal = int(_resumed("rollout_seed_ordinal", 0))
     # No-signal accounting: distinguish a run that trained nothing because the TEACHER was down
     # (transient) from one where scoring succeeded but never aligned — the former is retriable infra.
     teacher_ok = int(_resumed("teacher_ok", 0))
@@ -725,6 +763,29 @@ def run_opd():
     skip_counts: Counter[str] = Counter(_resumed("skip_counts", {}))
     no_signal_resamples = int(_resumed("no_signal_resamples", 0))
     no_signal_skipped_steps = int(_resumed("no_signal_skipped_steps", 0))
+
+    def _generate_with_rollout_seeds(prompt_ids_batch, *, max_tokens):
+        nonlocal rollout_seed_ordinal
+        request_seeds = [
+            rollout_request_seed(_w.SEED, rollout_seed_ordinal + offset)
+            for offset in range(len(prompt_ids_batch))
+        ]
+        generations = _generate_many_vllm(
+            vllm_rollout,
+            tok,
+            prompt_ids_batch,
+            knobs,
+            generation_eos_ids,
+            max_tokens=max_tokens,
+            request_seeds=request_seeds,
+        )
+        if len(generations) != len(prompt_ids_batch):
+            raise RuntimeError(
+                f"opd vLLM returned {len(generations)} generations for "
+                f"{len(prompt_ids_batch)} requests"
+            )
+        rollout_seed_ordinal += len(generations)
+        return generations
 
     # OPD rollouts always use the colocated vLLM engine. The HF model remains the authoritative
     # training target for the GKD loss forward/backward; vLLM only samples the current LoRA.
@@ -758,14 +819,7 @@ def run_opd():
 
         def generate_fn(prefix_ids, max_new):
             """One turn's generation through the colocated vLLM engine."""
-            return _generate_many_vllm(
-                vllm_rollout,
-                tok,
-                [prefix_ids],
-                knobs,
-                generation_eos_ids,
-                max_tokens=max(1, int(max_new)),
-            )[0]
+            return _generate_with_rollout_seeds([prefix_ids], max_tokens=max(1, int(max_new)))[0]
 
     def _account(r):
         """Consume one sample's SampleResult: tally teacher health / truncations, advance the step
@@ -807,6 +861,7 @@ def run_opd():
         _opd_progress(opt_steps, nseq)
 
     t_train = time.time()
+    train_wall_baseline = float(_resumed("train_wall_seconds", 0.0))
     opd_phase_seconds: Counter[str] = Counter(_resumed("opd_phase_seconds", {}))
     opd_phase_counts: Counter[str] = Counter(_resumed("opd_phase_counts", {}))
     # Drive the loop by optimizer UPDATES, not raw iterations. A no-signal iteration (empty
@@ -995,13 +1050,8 @@ def run_opd():
                             keepalive=True,
                         ):
                             rollout_started = time.perf_counter()
-                            gens = _generate_many_vllm(
-                                vllm_rollout,
-                                tok,
-                                chunk_prompts,
-                                knobs,
-                                generation_eos_ids,
-                                max_tokens=knobs.max_completion,
+                            gens = _generate_with_rollout_seeds(
+                                chunk_prompts, max_tokens=knobs.max_completion
                             )
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
@@ -1106,47 +1156,74 @@ def run_opd():
             if save_step_due(opt_steps, knobs.save_at_steps, knobs.save_every):
                 _save_adapter(model, tok, adapter_dir)
                 is_required_save = opt_steps in knobs.save_at_steps
-                _publish_opd_deployable(
-                    adapter_dir,
-                    opt_steps,
-                    as_default=False,
-                    best_effort=not is_required_save,
-                    save_required=is_required_save,
-                )
-                # stream the custom loop's full semantic state through the same latest-only upload
-                # transaction used by sft and grpo trainer checkpoints.
-                _save_opd_resume_checkpoint(
-                    model=model,
-                    tok=tok,
-                    optimizer=optimizer,
-                    torch=torch,
-                    out_dir=out_dir,
-                    opt_steps=opt_steps,
-                    step=step,
-                    accounting={
-                        "loss_curve": list(loss_curve),
-                        "coverage_curve": list(coverage_curve),
-                        "generated_tokens": int(generated_tokens),
-                        "teacher_input_tokens": int(teacher_input_tokens),
-                        "truncated_rollouts": int(truncated_rollouts),
-                        "granularity_sum": float(granularity_sum),
-                        "granularity_n": int(granularity_n),
-                        "samples_seen": int(samples_seen),
-                        "teacher_ok": int(teacher_ok),
-                        "teacher_transient": int(teacher_transient),
-                        "teacher_error": int(teacher_error),
-                        "skip_counts": dict(skip_counts),
-                        "no_signal_resamples": int(no_signal_resamples),
-                        "no_signal_skipped_steps": int(no_signal_skipped_steps),
-                        "episodes_seen": int(episodes_seen),
-                        "mt_turn_records": int(mt_turn_records),
-                        "opd_phase_seconds": dict(opd_phase_seconds),
-                        "opd_phase_counts": dict(opd_phase_counts),
-                    },
-                    required=is_required_save,
-                )
+                checkpoint_accounting = {
+                    "loss_curve": list(loss_curve),
+                    "coverage_curve": list(coverage_curve),
+                    "generated_tokens": int(generated_tokens),
+                    "teacher_input_tokens": int(teacher_input_tokens),
+                    "truncated_rollouts": int(truncated_rollouts),
+                    "granularity_sum": float(granularity_sum),
+                    "granularity_n": int(granularity_n),
+                    "samples_seen": int(samples_seen),
+                    "teacher_ok": int(teacher_ok),
+                    "teacher_transient": int(teacher_transient),
+                    "teacher_error": int(teacher_error),
+                    "skip_counts": dict(skip_counts),
+                    "no_signal_resamples": int(no_signal_resamples),
+                    "no_signal_skipped_steps": int(no_signal_skipped_steps),
+                    "episodes_seen": int(episodes_seen),
+                    "mt_turn_records": int(mt_turn_records),
+                    "opd_phase_seconds": dict(opd_phase_seconds),
+                    "opd_phase_counts": dict(opd_phase_counts),
+                    "train_wall_seconds": _cumulative_train_wall_seconds(
+                        train_wall_baseline, t_train, time.time()
+                    ),
+                }
 
-    train_wall = time.time() - t_train
+                def _publish_step_deployable(
+                    _opt_steps=opt_steps, _required=is_required_save
+                ) -> None:
+                    _publish_opd_deployable(
+                        adapter_dir,
+                        _opt_steps,
+                        as_default=False,
+                        best_effort=not _required,
+                        save_required=_required,
+                    )
+
+                # required boundaries upload recoverable full state first. the shared transaction then
+                # retries transient deployable failures without repeating either successful artifact.
+                if is_required_save:
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=True,
+                        after_upload=_publish_step_deployable,
+                    )
+                else:
+                    _publish_step_deployable()
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                    )
+
+    train_wall = _cumulative_train_wall_seconds(train_wall_baseline, t_train, time.time())
     if not loss_curve:
         # use attempt-local failures for retry classification, not the cumulative reporting counter.
         if teacher_ok == 0 and (teacher_transient - teacher_transient_baseline) > 0:
@@ -1184,17 +1261,15 @@ def run_opd():
             raise RetriableInfraError(
                 f"{diag} — retrying rather than publishing an under-trained adapter billed as full steps."
             )
-        # No transient teacher failures: the shortfall is DETERMINISTIC (over-budget prompts /
-        # non-terminated or empty rollouts / zero teacher-to-student alignment). no optimizer step ever
-        # landed (loss_curve is empty), so there is no resume checkpoint to continue from, and a retry
-        # restarts from step 0 with the same seed/model/data and reproduces the identical skips, burning
-        # gpu on an unfixable run and masking the real config/model problem. fail permanently with the
-        # skip diagnostics so the user fixes the env/model instead (codex[bot]).
+        # no transient teacher failures: the shortfall is deterministic (over-budget prompts,
+        # non-terminated or empty rollouts, or zero teacher-to-student alignment). some updates may have
+        # landed, but retrying the same seed, model, data, and restored cursor reproduces the insufficient
+        # successful-update rate. fail permanently with the skip diagnostics so the user fixes the setup.
         raise RuntimeError(
-            f"{diag} — the shortfall is deterministic (no transient teacher failures), so a retry would "
-            "repeat it (no optimizer step landed, so there is nothing to resume from). Fix the setup: "
-            "shorten prompts, enable stop_sequences or a warm-start so rollouts terminate, or verify the "
-            "teacher tokenizer aligns to the student."
+            f"{diag}; the shortfall is deterministic (no transient teacher failures), so resuming the "
+            "same seed, model, data, and rollout position would repeat the insufficient successful-update "
+            "rate. Fix the setup: shorten prompts, enable stop_sequences or a warm-start so rollouts "
+            "terminate, or verify the teacher tokenizer aligns to the student."
         )
 
     _save_adapter(model, tok, adapter_dir)
@@ -1488,10 +1563,13 @@ def _generate_many_vllm(
     eos_ids,
     *,
     max_tokens: int,
+    request_seeds: list[int] | None = None,
 ) -> list[_GenResult]:
     return [
         _gen_from_vllm_output(out, tok, knobs, eos_ids)
-        for out in rollout.generate(prompt_ids_batch, max_tokens=max_tokens)
+        for out in rollout.generate(
+            prompt_ids_batch, max_tokens=max_tokens, request_seeds=request_seeds
+        )
     ]
 
 
@@ -1904,7 +1982,10 @@ def _save_opd_resume_checkpoint(
     opt_steps: int,
     step: int,
     accounting: dict,
+    rollout_seed_ordinal: int,
+    prompt_pool_fingerprint: str,
     required: bool = False,
+    after_upload=None,
 ) -> None:
     """Persist and upload one latest-only OPD full-state resume checkpoint."""
     import shutil
@@ -1924,6 +2005,8 @@ def _save_opd_resume_checkpoint(
                 "seed": int(_w.SEED),
                 "opt_steps": int(opt_steps),
                 "step": int(step),
+                "rollout_seed_ordinal": int(rollout_seed_ordinal),
+                "prompt_pool_fingerprint": str(prompt_pool_fingerprint),
             }
         )
         state_path = os.path.join(local_dir, "opd_state.json")
@@ -1940,7 +2023,12 @@ def _save_opd_resume_checkpoint(
         return
 
     try:
-        uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir)
+        if after_upload is None:
+            uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir)
+        else:
+            uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir, after_upload=after_upload)
+    except (RequiredSaveError, RetriableInfraError):
+        raise
     except Exception as e:
         if required:
             raise RetriableInfraError(
@@ -1962,7 +2050,13 @@ def _save_opd_resume_checkpoint(
 
 
 def _restore_opd_full_state(
-    ckpt_dir: str, *, model, optimizer, torch, max_opt_steps: int | None = None
+    ckpt_dir: str,
+    *,
+    model,
+    optimizer,
+    torch,
+    prompt_pool_fingerprint: str,
+    max_opt_steps: int | None = None,
 ) -> dict | None:
     """Restore adapter + adam moments + rng + accounting from a resume checkpoint dir, in place.
 
@@ -1989,6 +2083,17 @@ def _restore_opd_full_state(
     if state.get("contract_version") != OPD_RESUME_STATE_VERSION:
         return None
     if state.get("seed") != int(_w.SEED):
+        return None
+    rollout_seed_ordinal = _nonneg_int_or_none(state.get("rollout_seed_ordinal"))
+    if rollout_seed_ordinal is None:
+        return None
+    saved_prompt_pool_fingerprint = state.get("prompt_pool_fingerprint")
+    if (
+        not isinstance(saved_prompt_pool_fingerprint, str)
+        or len(saved_prompt_pool_fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in saved_prompt_pool_fingerprint)
+        or saved_prompt_pool_fingerprint != prompt_pool_fingerprint
+    ):
         return None
     # validate the serialized boundary before touching the adapter or optimizer so corrupt state fails
     # closed instead of resuming with mismatched weights, moments, data position, or accounting.
@@ -2077,7 +2182,12 @@ def _restore_opd_full_state(
         rng = torch.load(
             os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu", weights_only=False
         )
+    except MemoryError:
+        raise
     except Exception as e:
+        cuda_oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if isinstance(cuda_oom_type, type) and isinstance(e, cuda_oom_type):
+            raise
         print(f"[opd] resume checkpoint at {ckpt_dir} failed to load: {e}")
         return None
     # rng is part of the semantic continuation contract. a downloaded replacement checkpoint whose
@@ -2109,13 +2219,7 @@ def _publish_opd_deployable(
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         if publish_checkpoint:
             if save_required:
-                _w.publish_deployable_checkpoint(
-                    adapter_dir,
-                    step,
-                    retries=3,
-                    backoff_s=5.0,
-                    required=True,
-                )
+                _w.publish_deployable_checkpoint(adapter_dir, step, required=True)
             else:
                 _w.publish_deployable_checkpoint(adapter_dir, step)
     except Exception as e:

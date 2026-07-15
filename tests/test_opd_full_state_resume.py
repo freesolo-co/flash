@@ -20,6 +20,7 @@ import pytest
 from flash.engine.worker import opd
 from flash.opd_retry_contract import opd_resume_checkpoint_complete
 
+_PROMPT_POOL_FINGERPRINT = "a" * 64
 _COMPLETE = (
     "adapter_config.json",
     "adapter_model.safetensors",
@@ -85,7 +86,13 @@ class _FakeOptimizer:
         self._order.append("optimizer")
 
 
+class _FakeCudaOutOfMemoryError(RuntimeError):
+    pass
+
+
 class _FakeCuda:
+    OutOfMemoryError = _FakeCudaOutOfMemoryError
+
     def __init__(self, available=False):
         self._available = available
 
@@ -166,6 +173,7 @@ def _accounting(opt_steps):
         "truncated_rollouts": 1,
         "granularity_sum": 2.5,
         "granularity_n": 4,
+        "train_wall_seconds": 12.5,
         "samples_seen": 9,
         "teacher_ok": 8,
         "teacher_transient": 1,
@@ -217,6 +225,46 @@ def test_nonneg_int_or_none(value, expected):
     assert opd._nonneg_int_or_none(value) == expected
 
 
+def test_rollout_request_seeds_continue_identically_after_resume():
+    run_seed = 20260715
+    generation_count = 19
+    resume_boundary = 7
+    uninterrupted = [
+        opd.rollout_request_seed(run_seed, ordinal) for ordinal in range(generation_count)
+    ]
+    resumed = [
+        opd.rollout_request_seed(run_seed, ordinal)
+        for ordinal in range(resume_boundary, generation_count)
+    ]
+
+    assert resumed == uninterrupted[resume_boundary:]
+    assert all(0 <= seed < 2**63 for seed in uninterrupted)
+    assert len(set(uninterrupted)) == generation_count
+
+
+def test_cumulative_train_wall_and_throughput_match_uninterrupted_run():
+    generated_tokens = 600
+    uninterrupted_wall = opd._cumulative_train_wall_seconds(0.0, 10.0, 25.0)
+    resumed_wall = opd._cumulative_train_wall_seconds(9.0, 100.0, 106.0)
+
+    assert resumed_wall == uninterrupted_wall == 15.0
+    assert generated_tokens / resumed_wall == generated_tokens / uninterrupted_wall == 40.0
+
+
+def test_prompt_pool_fingerprint_is_stable_and_order_sensitive():
+    examples = [
+        ({"id": 1}, [{"role": "user", "content": "private-a"}], [1, 2]),
+        ({"id": 2}, [{"role": "user", "content": "private-b"}], [3, 4]),
+    ]
+
+    fingerprint = opd._opd_prompt_pool_fingerprint(examples)
+
+    assert fingerprint == opd._opd_prompt_pool_fingerprint(examples)
+    assert fingerprint != opd._opd_prompt_pool_fingerprint(list(reversed(examples)))
+    assert len(fingerprint) == 64
+    assert "private" not in fingerprint
+
+
 # --- save --------------------------------------------------------------------------------------
 
 
@@ -241,6 +289,8 @@ def test_save_writes_complete_checkpoint_and_uploads(monkeypatch, tmp_path):
         opt_steps=3,
         step=7,
         accounting=acct,
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
     local_dir = os.path.join(str(tmp_path), "resume_ckpt")
@@ -253,6 +303,8 @@ def test_save_writes_complete_checkpoint_and_uploads(monkeypatch, tmp_path):
     assert state["seed"] == 42
     assert state["opt_steps"] == 3
     assert state["step"] == 7
+    assert state["rollout_seed_ordinal"] == 17
+    assert state["prompt_pool_fingerprint"] == _PROMPT_POOL_FINGERPRINT
     # every accounting key round-trips verbatim alongside the version/seed/step envelope.
     for key, value in acct.items():
         assert state[key] == value
@@ -277,6 +329,8 @@ def test_save_is_best_effort_on_upload_failure(monkeypatch, tmp_path):
         opt_steps=2,
         step=2,
         accounting=_accounting(2),
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
 
@@ -296,6 +350,8 @@ def test_periodic_save_is_best_effort_when_upload_returns_false(monkeypatch, tmp
         opt_steps=2,
         step=2,
         accounting=_accounting(2),
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
 
@@ -316,6 +372,8 @@ def test_required_save_raises_when_upload_returns_false(monkeypatch, tmp_path):
             opt_steps=2,
             step=2,
             accounting=_accounting(2),
+            rollout_seed_ordinal=17,
+            prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
             required=True,
         )
 
@@ -348,6 +406,8 @@ def test_required_save_raises_when_local_construction_fails(monkeypatch, tmp_pat
             opt_steps=2,
             step=2,
             accounting=_accounting(2),
+            rollout_seed_ordinal=17,
+            prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
             required=True,
         )
 
@@ -372,8 +432,75 @@ def test_save_reuses_local_dir_across_calls(monkeypatch, tmp_path):
         opt_steps=1,
         step=1,
         accounting=_accounting(1),
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
     assert "stale-shard.bin" not in os.listdir(local_dir)
+
+
+def test_required_opd_save_uploads_full_state_before_deployable(monkeypatch, tmp_path):
+    events = []
+
+    def upload(step, checkpoint_dir, *, after_upload=None):
+        assert step == 2
+        assert opd_resume_checkpoint_complete(os.listdir(checkpoint_dir))
+        events.append("resume")
+        after_upload()
+        return True
+
+    monkeypatch.setattr(opd, "_w", types.SimpleNamespace(SEED=42, upload_resume_checkpoint=upload))
+
+    opd._save_opd_resume_checkpoint(
+        model=_FakeModel(),
+        tok=_FakeTok(),
+        optimizer=_FakeOptimizer([]),
+        torch=_FakeTorch(),
+        out_dir=str(tmp_path),
+        opt_steps=2,
+        step=2,
+        accounting=_accounting(2),
+        rollout_seed_ordinal=5,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
+        required=True,
+        after_upload=lambda: events.append("deployable"),
+    )
+
+    assert events == ["resume", "deployable"]
+
+
+def test_required_opd_save_propagates_permanent_deployable_failure_after_resume(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    def upload(_step, _checkpoint_dir, *, after_upload=None):
+        events.append("resume")
+        after_upload()
+        return True
+
+    def fail_deployable():
+        events.append("deployable")
+        raise opd.RequiredSaveError("required adapter is invalid")
+
+    monkeypatch.setattr(opd, "_w", types.SimpleNamespace(SEED=42, upload_resume_checkpoint=upload))
+
+    with pytest.raises(opd.RequiredSaveError, match="required adapter is invalid"):
+        opd._save_opd_resume_checkpoint(
+            model=_FakeModel(),
+            tok=_FakeTok(),
+            optimizer=_FakeOptimizer([]),
+            torch=_FakeTorch(),
+            out_dir=str(tmp_path),
+            opt_steps=2,
+            step=2,
+            accounting=_accounting(2),
+            rollout_seed_ordinal=5,
+            prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
+            required=True,
+            after_upload=fail_deployable,
+        )
+
+    assert events == ["resume", "deployable"]
 
 
 # --- restore round trip ------------------------------------------------------------------------
@@ -399,6 +526,8 @@ def test_save_then_restore_round_trips_state_in_place(monkeypatch, tmp_path):
         opt_steps=3,
         step=7,
         accounting=acct,
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
     saved_dir = tmp_path / "resume_ckpt"
     ckpt_dir = tmp_path / "checkpoint-3"
@@ -414,12 +543,18 @@ def test_save_then_restore_round_trips_state_in_place(monkeypatch, tmp_path):
     assert random.getstate() != saved_rng
 
     restored = opd._restore_opd_full_state(
-        ckpt_dir, model=model, optimizer=optimizer, torch=torch
+        ckpt_dir,
+        model=model,
+        optimizer=optimizer,
+        torch=torch,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
     assert restored is not None
     assert restored["opt_steps"] == 3
     assert restored["step"] == 7
+    assert restored["rollout_seed_ordinal"] == 17
+    assert restored["prompt_pool_fingerprint"] == _PROMPT_POOL_FINGERPRINT
     for key, value in acct.items():
         assert restored[key] == value
 
@@ -456,6 +591,8 @@ def _valid_state(**overrides):
         "seed": 42,
         "opt_steps": 3,
         "step": 7,
+        "rollout_seed_ordinal": 17,
+        "prompt_pool_fingerprint": _PROMPT_POOL_FINGERPRINT,
         **_accounting(3),
     }
     state.update(overrides)
@@ -474,6 +611,7 @@ def _restore_expecting_none(monkeypatch, ckpt_dir, *, torch=None, max_opt_steps=
         model=_FakeModel(),
         optimizer=optimizer,
         torch=torch,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
         max_opt_steps=max_opt_steps,
     )
     return result, order, optimizer, torch
@@ -498,7 +636,7 @@ def test_restore_rejects_incomplete_dir(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"contract_version": 2},
+        {"contract_version": 1},
         {"seed": 99},
         {"opt_steps": -1},
         {"opt_steps": True},
@@ -513,6 +651,47 @@ def test_restore_rejects_bad_state(monkeypatch, tmp_path, overrides):
     result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
     assert result is None
     _assert_restore_untouched(order, optimizer, torch)
+
+
+@pytest.mark.parametrize("value", [None, -1, True, 1.5, "7"])
+def test_restore_rejects_missing_or_invalid_rollout_seed_ordinal(monkeypatch, tmp_path, value):
+    state = _valid_state()
+    if value is None:
+        state.pop("rollout_seed_ordinal")
+    else:
+        state["rollout_seed_ordinal"] = value
+    ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=state)
+
+    result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
+
+    assert result is None
+    _assert_restore_untouched(order, optimizer, torch)
+
+
+@pytest.mark.parametrize("value", [None, -0.1, float("nan"), float("inf"), True])
+def test_restore_rejects_missing_or_invalid_train_wall(monkeypatch, tmp_path, value):
+    state = _valid_state()
+    if value is None:
+        state.pop("train_wall_seconds")
+    else:
+        state["train_wall_seconds"] = value
+    ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=state)
+
+    result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
+
+    assert result is None
+    _assert_restore_untouched(order, optimizer, torch)
+
+
+def test_restore_rejects_missing_or_mismatched_prompt_pool_fingerprint(monkeypatch, tmp_path):
+    for state in (
+        {key: value for key, value in _valid_state().items() if key != "prompt_pool_fingerprint"},
+        _valid_state(prompt_pool_fingerprint="b" * 64),
+    ):
+        ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=state)
+        result, order, optimizer, torch = _restore_expecting_none(monkeypatch, ckpt)
+        assert result is None
+        _assert_restore_untouched(order, optimizer, torch)
 
 
 @pytest.mark.parametrize(
@@ -667,7 +846,11 @@ def test_restore_returns_none_when_adapter_load_fails(monkeypatch, tmp_path):
     _install_fake_peft(monkeypatch, order, set_raises=RuntimeError("adapter shape mismatch"))
     optimizer = _FakeOptimizer(order)
     result = opd._restore_opd_full_state(
-        ckpt, model=_FakeModel(), optimizer=optimizer, torch=_FakeTorch()
+        ckpt,
+        model=_FakeModel(),
+        optimizer=optimizer,
+        torch=_FakeTorch(),
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
     assert result is None
     # adapter load raised before the optimizer state was touched.
@@ -694,7 +877,11 @@ def test_restore_rejects_incompatible_adapter_keys(
     optimizer = _FakeOptimizer(order)
 
     result = opd._restore_opd_full_state(
-        ckpt, model=_FakeModel(), optimizer=optimizer, torch=torch
+        ckpt,
+        model=_FakeModel(),
+        optimizer=optimizer,
+        torch=torch,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
     assert result is None
@@ -726,7 +913,11 @@ def test_restore_allows_missing_base_model_keys(monkeypatch, tmp_path):
     optimizer = _FakeOptimizer(order)
 
     result = opd._restore_opd_full_state(
-        ckpt, model=_FakeModel(), optimizer=optimizer, torch=torch
+        ckpt,
+        model=_FakeModel(),
+        optimizer=optimizer,
+        torch=torch,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
 
     assert result is not None
@@ -752,6 +943,62 @@ def test_restore_rejects_malformed_rng_blob(monkeypatch, tmp_path, rng_state):
     torch._payload["optimizer.pt"] = {"state": {}, "param_groups": []}
     torch._payload["rng_state.pth"] = rng_state
     result = opd._restore_opd_full_state(
-        ckpt, model=_FakeModel(), optimizer=_FakeOptimizer(order), torch=torch
+        ckpt,
+        model=_FakeModel(),
+        optimizer=_FakeOptimizer(order),
+        torch=torch,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
     )
     assert result is None
+
+
+def test_downloaded_invalid_checkpoint_is_terminal_and_never_starts_fresh():
+    started = []
+
+    def restore_then_start():
+        state = opd._require_restored_opd_state(None)
+        started.append(state)
+
+    with pytest.raises(RuntimeError, match="could not be restored") as exc_info:
+        restore_then_start()
+
+    assert not isinstance(exc_info.value, opd.RetriableInfraError)
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_oom"),
+    [(_FakeCudaOutOfMemoryError("cuda oom"), True), (MemoryError("host oom"), False)],
+)
+def test_restore_memory_failures_propagate_without_retriable_reclassification(
+    monkeypatch, tmp_path, error, expected_oom
+):
+    import flash.engine.worker as worker
+
+    ckpt = _write_state_dir(tmp_path / "checkpoint-3", state=_valid_state())
+    monkeypatch.setattr(opd, "_w", types.SimpleNamespace(SEED=42))
+    order = []
+    _install_fake_peft(monkeypatch, order)
+
+    class _RaisingTorch(_FakeTorch):
+        def load(self, path, map_location=None, weights_only=None):
+            raise error
+
+    with pytest.raises(type(error)) as exc_info:
+        opd._restore_opd_full_state(
+            ckpt,
+            model=_FakeModel(),
+            optimizer=_FakeOptimizer(order),
+            torch=_RaisingTorch(),
+            prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
+        )
+
+    monkeypatch.setattr(
+        worker,
+        "is_cuda_oom",
+        lambda exc: isinstance(exc, _FakeCudaOutOfMemoryError),
+    )
+    assert worker._worker_failure_flags(exc_info.value) == {
+        "retriable": False,
+        "oom": expected_oom,
+    }

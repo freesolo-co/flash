@@ -223,7 +223,8 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, sample_result=None, output
             self.model = model
             self.sync_count += 1
 
-        def generate(self, prompt_ids_batch, *, max_tokens):
+        def generate(self, prompt_ids_batch, *, max_tokens, request_seeds=None):
+            self.request_seeds = list(request_seeds or [])
             out = []
             for _prompt_ids in prompt_ids_batch:
                 if queued:
@@ -1426,7 +1427,16 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
     events: list[tuple[str, int, int]] = []
     first_score_started = threading.Event()
 
-    def _generate_many_vllm(_rollout, _tok, prompt_ids_batch, _knobs, _eos_ids, *, max_tokens):
+    def _generate_many_vllm(
+        _rollout,
+        _tok,
+        prompt_ids_batch,
+        _knobs,
+        _eos_ids,
+        *,
+        max_tokens,
+        request_seeds=None,
+    ):
         call_idx = sum(1 for e in events if e[0] == "generate")
         if call_idx == 1:
             first_score_started.wait(timeout=1.0)
@@ -1831,10 +1841,9 @@ def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_determini
     """Regression (codex[bot], opd.py:467 + shortfall guard): the loop is driven by optimizer UPDATES,
     not raw iterations -- a no-signal iteration skips optimizer.step(), so `for step in range(steps)`
     could exit with opt_steps < steps and publish an under-trained adapter as the default while billing
-    the full `steps` quote. When the shortfall is DETERMINISTIC (updates land, then every sample skips
-    with NO transient teacher failure), the run must fail PERMANENTLY, not RetriableInfraError: opd has
-    no resume, so a retry restarts from step 0 and reproduces the identical skips, burning GPU on an
-    unfixable run (codex[bot])."""
+    the full `steps` quote. when the shortfall is deterministic (updates land, then every sample skips
+    with no transient teacher failure), the run must fail permanently, not RetriableInfraError: resuming
+    the same cursor reproduces the insufficient successful-update rate and burns gpu on an unfixable run."""
     from flash.engine.worker.perf import RetriableInfraError
 
     torch = pytest.importorskip("torch")
@@ -1857,8 +1866,10 @@ def test_opd_loop_drives_by_optimizer_updates_and_fails_permanently_on_determini
     opd_mod = _opd_harness(monkeypatch, sample_result=_one_update_then_skip, epochs=3, group=1)
     with pytest.raises(RuntimeError, match="deterministic") as ei:
         opd_mod.run_opd()
-    assert not isinstance(ei.value, RetriableInfraError)  # permanent, NOT the retriable path
-    # The loop is BOUNDED: it did not spin forever waiting for updates that never come.
+    assert not isinstance(ei.value, RetriableInfraError)  # permanent, not the retriable path
+    assert "no optimizer step landed" not in str(ei.value)
+    assert "insufficient successful-update rate" in str(ei.value)
+    # the loop is bounded: it did not spin forever waiting for updates that never come.
     assert state["n"] <= 3 * 3 + 10
 
 

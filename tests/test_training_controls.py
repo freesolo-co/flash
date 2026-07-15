@@ -229,6 +229,82 @@ def test_required_save_fails_when_trainer_checkpoint_is_missing(monkeypatch, tmp
         )
 
 
+def test_transient_required_deployable_failure_retries_before_full_state(monkeypatch, tmp_path):
+    fake_transformers = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    fake_transformers.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    checkpoint = tmp_path / "checkpoint-4"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    calls = {"deployable": 0, "resume": 0}
+
+    def publish_once_then_succeed(*_args, **_kwargs):
+        calls["deployable"] += 1
+        if calls["deployable"] == 1:
+            raise ConnectionError("hf deployable upload unavailable")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_hf, "publish_deployable_checkpoint", publish_once_then_succeed)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    worker.make_checkpoint_upload_callback((4,)).on_save(
+        SimpleNamespace(output_dir=str(tmp_path)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert calls == {"deployable": 2, "resume": 1}
+
+
+def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    calls = {"resume": 0, "deployable": 0}
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    def publish_once_then_succeed():
+        calls["deployable"] += 1
+        if calls["deployable"] == 1:
+            raise ConnectionError("hf deployable upload unavailable")
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    assert worker_hf.upload_resume_checkpoint(
+        4, str(tmp_path), after_upload=publish_once_then_succeed
+    )
+    assert calls == {"resume": 1, "deployable": 2}
+
+
 def test_permanent_required_save_failure_is_not_retried(monkeypatch, tmp_path):
     fake_transformers = types.ModuleType("transformers")
 

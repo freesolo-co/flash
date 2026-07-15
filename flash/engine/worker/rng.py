@@ -11,6 +11,17 @@ def backend_seed(seed: int) -> int:
     return int(seed) % (2**32)
 
 
+def rollout_request_seed(run_seed: int, ordinal: int) -> int:
+    """derive a stable nonnegative 63-bit seed for one ordered rollout request."""
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        raise ValueError("rollout seed ordinal must be a nonnegative integer")
+    mask = (1 << 64) - 1
+    value = (int(run_seed) + 0x9E3779B97F4A7C15 * (ordinal + 1)) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return (value ^ (value >> 31)) & ((1 << 63) - 1)
+
+
 def seed_training_rngs(seed: int) -> None:
     """Seed Python, NumPy, torch CPU, and available CUDA generators."""
     seed = int(seed)
@@ -62,6 +73,11 @@ def restore_training_rng_state(torch, state: object) -> bool:
             import numpy as np
 
             np.random.set_state(state["numpy"])
-    except Exception:
+    except MemoryError:
+        raise
+    except Exception as exc:
+        cuda_oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if isinstance(cuda_oom_type, type) and isinstance(exc, cuda_oom_type):
+            raise
         return False
     return True
