@@ -149,7 +149,7 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
 
 
 def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch):
-    """Copilot MsGxp/MsGxy: the heredoc terminators must start on their own line (a bootstrap
+    """the heredoc terminators must start on their own line (a bootstrap
     source without a trailing newline would otherwise swallow the rest of the script), and the
     python-interpreter resolution must fall back past python3 to python with a clear diagnostic."""
     from flash.providers.vast.jobs import builders
@@ -163,14 +163,14 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
     assert "no python interpreter" in script
-    # Copilot Msbs6: an empty PYBIN must EXIT (after a log-retrieval hold), not fall through to the
+    # an empty PYBIN must EXIT (after a log-retrieval hold), not fall through to the
     # doomed `"$PYBIN"` bootstrap + self-destroy invocations.
     assert 'if [ -z "$PYBIN" ]; then' in script
     assert "exit 1" in script
 
 
 def test_onstart_spills_large_spec_to_hf(monkeypatch):
-    """Codex MsMPw: a large inline job spec is spilled to HF (parity with Lambda's build_user_data)
+    """a large inline job spec is spilled to HF (parity with Lambda's build_user_data)
     so it never inflates the base64 onstart past Vast's exec-arg / onstart length limit and fails the
     rent before a handle is persisted. A small spec rides inline unchanged."""
     import huggingface_hub

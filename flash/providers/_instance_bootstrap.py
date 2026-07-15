@@ -161,7 +161,7 @@ def _code_dir(payload: dict) -> str:
     raw = payload.get("code_prefix")
     if not isinstance(raw, str) or not raw.strip():
         return os.path.join(CODE_ROOT, "code")
-    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)) or ".")
+    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)))
 
 
 def _hf_status_code(exc: BaseException) -> int | None:
@@ -841,7 +841,6 @@ def main() -> int:
     ok = False
     error = ""
     retriable = False
-    deadline = None
     deadline_watchdog = None
     try:
         try:

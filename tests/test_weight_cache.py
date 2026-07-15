@@ -1765,8 +1765,8 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
 
 
 def test_build_payload_carries_mount_marker_for_nfs_cache():
-    """A cache-attached preload payload (even NFS) carries cache_mount_marker so the in-container check
-    can require the sentinel regardless of substrate."""
+    """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
+    can require the NFS mount sentinel."""
     from flash.providers import _instance
 
     spec = _preload_spec()

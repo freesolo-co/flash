@@ -139,7 +139,7 @@ class InstanceJobHandle:
         )
 
 
-# Fixed container path the per-region cache is bind-mounted at (host mount differs per provider).
+# fixed container path for Lambda's per-region NFS cache bind mount.
 CACHE_CONTAINER_MOUNT = "/weight-cache"
 CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
 # Sentinel on a successfully-mounted cache so the preload check can tell a real mount from an empty bind.
@@ -147,8 +147,8 @@ CACHE_MOUNT_MARKER = ".flash-cache-mounted"
 
 
 def _cache_nfs_mount_check(payload: dict) -> str:
-    """Cloud-init preamble (NFS providers, e.g. Lambda): the platform auto-mounts the weight-cache
-    filesystem on the host at ``cache_host_mount`` — but ONLY if Lambda actually attached + readied it."""
+    """cloud-init preamble for Lambda: the platform auto-mounts the weight-cache filesystem on the
+    host at ``cache_host_mount`` only when the cache is attached and ready."""
     if not payload.get("cache_host_mount"):
         return ""
     mount = payload["cache_host_mount"]
@@ -266,13 +266,11 @@ try:
         time.sleep(delay)
     if requested >= remaining:
         raise SystemExit(124)
-except SystemExit:
-    raise
 except Exception:
     raise SystemExit(125)
 """
 
-# host helper: best-effort upload of the boot log to hf (no provider console api). attempt-scoped path.
+# host helper: best-effort Lambda boot-log upload to hf. attempt-scoped path.
 _HOSTLOG_PY = """\
 import json, math, time
 try:
@@ -407,7 +405,7 @@ def build_user_data(payload: dict, *, image: str) -> str:
 set -x
 mkdir -p /opt/flash
 # Consolidate ALL boot output (this script + the container) into one host log the uploader ships
-# to HF — neither substrate has a console API, so this is the only window into a pre-worker failure.
+# to HF since Lambda has no provider console API, so this is the only window into a pre-worker failure.
 exec >>/opt/flash/host_boot.log 2>&1
 cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}FLASH_PAYLOAD_EOF
