@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from flash.catalog import MODELS
-
 SERVING_MARKUP = 1.20
 
 
@@ -74,21 +72,3 @@ def serving_price(model_id: str) -> ServingPrice:
         return SERVING_PRICES[model_id]
     except KeyError as exc:
         raise ValueError(f"unknown serving model {model_id!r}") from exc
-
-
-def serving_price_rows() -> list[dict[str, float | str]]:
-    rows: list[dict[str, float | str]] = []
-    for model_id in sorted(MODELS):
-        price = serving_price(model_id)
-        rows.append(
-            {
-                "model_id": model_id,
-                "typical_input_usd_per_mtok": price.typical_input_usd_per_mtok,
-                "typical_output_usd_per_mtok": price.typical_output_usd_per_mtok,
-                "typical_cached_input_usd_per_mtok": price.typical_cached_input_usd_per_mtok,
-                "billed_input_usd_per_mtok": price.billed_input_usd_per_mtok,
-                "billed_output_usd_per_mtok": price.billed_output_usd_per_mtok,
-                "billed_cached_input_usd_per_mtok": price.billed_cached_input_usd_per_mtok,
-            }
-        )
-    return rows
