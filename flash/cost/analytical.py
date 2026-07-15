@@ -56,7 +56,15 @@ WORKER_BOOT_S = 120.0  # container pull + start
 DEPS_INSTALL_S = 90.0  # pip/uv resolve + install
 MODEL_LOAD_BASE_S = 235.0  # fixed checkpoint deserialize + GPU placement + framework/CUDA init
 VLLM_INIT_S = 120.0
-DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer), on top of the base load
+DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download (hf_transfer), on top of the base load
+
+# synchronous required saves serialize the lora state and publish it. sft/grpo make two hf commits
+# per save (deployable adapter plus resume checkpoint); opd publishes a single deployable adapter.
+# price a per-commit floor plus a conservative model-size/rank serialize term. this changes wall/cost
+# only, never optimizer steps.
+REQUIRED_SAVE_COMMIT_FLOOR_S = 7.5
+REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 = 1.5
+_REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -88,6 +96,19 @@ def _opd_step_shape(n: RunConfig) -> tuple[int, int]:
     not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
     completions = n.batch_size * n.group_size
     return completions, completions * n.seq_len
+
+
+def required_save_overhead_seconds(config: RunConfig) -> float:
+    """Conservative synchronous required-save wall time for exact save_at_steps (sft/grpo/opd)."""
+    commits = _REQUIRED_SAVE_COMMITS.get(config.method, 0)
+    if not commits or not config.save_at_steps:
+        return 0.0
+    n = config.normalized()
+    serialize_s = (
+        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 * total_params_b(n.model_id) * (n.lora_rank / 32.0)
+    )
+    per_save = commits * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_s
+    return len(n.save_at_steps) * per_save
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
@@ -188,6 +209,12 @@ def _notes(
         )
     elif n.train_tokens is not None:
         notes.append(f"SFT priced on {n.train_tokens:,} actual train tokens")
+    required_save_s = required_save_overhead_seconds(n)
+    if required_save_s:
+        notes.append(
+            f"{len(n.save_at_steps)} synchronous required save(s) add "
+            f"~{_fmt_duration(required_save_s)}"
+        )
     notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
         notes.append(
@@ -222,10 +249,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
-    raw_train = config.steps * sps
+    required_save_s = required_save_overhead_seconds(config)
+    raw_train = config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
-        raw_train = sft_seconds_for_tokens(config, gpu, config.train_tokens)
-        sps = raw_train / config.steps
+        raw_train = sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+    sps = raw_train / config.steps
 
     # The cap is on total elapsed wall; setup is reported but not billed, so only training
     # contributes to total_usd.

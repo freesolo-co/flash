@@ -10,11 +10,11 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
-    configure_trainer_checkpoint_schedule,
-    final_checkpoint_due,
+    configure_trainer_save_schedule,
+    final_save_due,
     resolve_update_horizon,
     sft_update_steps,
-    validate_checkpoint_horizon,
+    validate_save_steps,
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -120,6 +120,34 @@ def select_sft_examples(train, max_examples, seed):
     rng = random.Random(seed)
     rng.shuffle(train)
     return train
+
+
+def sft_completed_train_tokens(
+    tokens_per_epoch: int,
+    epochs: int,
+    derived_steps: int,
+    completed_steps: int,
+) -> int:
+    """Estimate tokens processed from completed updates while preserving epoch accounting at parity."""
+    epoch_tokens = max(0, int(tokens_per_epoch)) * max(0, int(epochs))
+    completed = max(0, int(completed_steps))
+    derived = max(1, int(derived_steps))
+    if completed == derived:
+        return epoch_tokens
+    if completed == 0 or epoch_tokens == 0:
+        return 0
+    return max(1, round(epoch_tokens * completed / derived))
+
+
+def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
+    """True when a max_steps-authoritative run completed fewer updates than requested.
+
+    with max_steps authoritative, trl's max_steps override lands a fresh run exactly on the horizon,
+    and a resume from a checkpoint past a lowered horizon does zero new steps yet holds a fully-trained
+    adapter (final_step >= horizon). fail loudly only on a genuine under-run, mirroring grpo
+    (steps_run < steps) and opd (opt_steps < steps).
+    """
+    return int(max_steps) > 0 and int(final_step) < int(update_horizon)
 
 
 def run_sft():
@@ -279,7 +307,7 @@ def run_sft():
     )
 
     max_steps = int(_t.max_steps or 0) if _t else 0
-    checkpoint_landmarks = tuple(getattr(_t, "checkpoint_landmarks", ()) or ())
+    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -318,7 +346,7 @@ def run_sft():
         cfg_kwargs["use_liger_kernel"] = False
     if max_steps > 0:
         cfg_kwargs["max_steps"] = max_steps
-    configure_trainer_checkpoint_schedule(cfg_kwargs, checkpoint_landmarks)
+    configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
     # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
     # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
     _pure_attn = model_is_pure_attention(model_id)
@@ -479,7 +507,7 @@ def run_sft():
         packed_block_count=_bfd_block_count if cfg_kwargs.get("packing") else None,
     )
     update_horizon = resolve_update_horizon(derived_steps, max_steps)
-    validate_checkpoint_horizon(checkpoint_landmarks, update_horizon)
+    validate_save_steps(save_at_steps, update_horizon)
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
@@ -560,12 +588,7 @@ def run_sft():
             data_collator=_collator,
             callbacks=[
                 _w.make_sft_heartbeat_callback(),
-                *(
-                    [_w.make_checkpoint_landmark_callback(checkpoint_landmarks)]
-                    if checkpoint_landmarks
-                    else []
-                ),
-                _w.make_checkpoint_upload_callback(checkpoint_landmarks),
+                _w.make_checkpoint_upload_callback(save_at_steps),
             ],
         )
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
@@ -601,7 +624,7 @@ def run_sft():
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
-    if max_steps > 0 and _final_step != update_horizon:
+    if sft_under_ran(_final_step, update_horizon, max_steps):
         raise RuntimeError(
             f"sft completed {_final_step}/{update_horizon} requested optimizer updates"
         )
@@ -618,12 +641,17 @@ def run_sft():
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the historical final step only when exact landmarks are not configured.
-        if final_checkpoint_due(_final_step, checkpoint_landmarks):
+        # preserve the final checkpoint only when exact save steps are not configured.
+        if final_save_due(_final_step, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _final_step)
     _w.heartbeat("sft_trained", train_wall=train_wall, step=_final_step, gpu=gpu_diagnostics())
 
-    train_tokens = _total_tok * epochs
+    train_tokens = sft_completed_train_tokens(
+        _total_tok,
+        epochs,
+        derived_steps,
+        _final_step,
+    )
     _w.write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,

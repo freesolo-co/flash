@@ -65,7 +65,9 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.providers.runpod.jobs import submit_run
+        from flash.spec import require_matching_seed
 
+        seed = require_matching_seed(spec, seed)
         kwargs = {
             "log": log,
             "on_handle": on_handle,
@@ -94,7 +96,9 @@ class RunpodProvider:
             poll_job,
             stall_kwargs,
         )
+        from flash.spec import require_matching_seed
 
+        seed = require_matching_seed(spec, seed)
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
