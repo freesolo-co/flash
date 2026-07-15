@@ -159,6 +159,25 @@ def test_forward_teacher_pins_request_and_returns_visible_usage():
     assert result.ambiguous_paid_requests == 0
 
 
+def test_forward_teacher_accepts_deepseek_reasoning_content():
+    payload = _payload(
+        choices=[
+            _choice(
+                message={
+                    "content": "visible answer",
+                    "reasoning_content": "invented rationale",
+                }
+            )
+        ]
+    )
+
+    result = ForwardTeacherClient(
+        "key", seed=123, opener=lambda *_args, **_kwargs: _Response(payload)
+    ).generate([{"role": "user", "content": "x"}])
+
+    assert result.reasoning == "invented rationale"
+
+
 def test_forward_teacher_caps_request_timeout_at_run_deadline(monkeypatch):
     from flash.engine.worker import forward_teacher as forward_teacher_mod
 
@@ -359,6 +378,49 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
     }
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_forward_teacher_retries_insufficient_system_resources_once():
+    calls = []
+    transient = _payload(
+        choices=[_choice(finish_reason="insufficient_system_resource")]
+    )
+
+    def opener(*_args, **_kwargs):
+        calls.append(1)
+        return _Response(transient if len(calls) == 1 else _payload())
+
+    result = ForwardTeacherClient(
+        "key", seed=123, opener=opener, sleep=lambda _delay: None
+    ).generate([{"role": "user", "content": "x"}])
+
+    assert calls == [1, 1]
+    assert result.attempts == 2
+    assert result.ambiguous_paid_requests == 1
+
+
+def test_forward_teacher_exhausts_insufficient_system_resources_as_transient():
+    calls = []
+    transient = _payload(
+        choices=[_choice(finish_reason="insufficient_system_resource")]
+    )
+
+    def opener(*_args, **_kwargs):
+        calls.append(1)
+        return _Response(transient)
+
+    with pytest.raises(
+        ForwardTeacherTransientError, match="insufficient system resources"
+    ) as caught:
+        ForwardTeacherClient(
+            "key", seed=123, opener=opener, sleep=lambda _delay: None
+        ).generate([{"role": "user", "content": "private prompt"}])
+
+    assert calls == [1, 1]
+    assert caught.value.retriable is True
+    assert caught.value.attempts == 2
+    assert caught.value.ambiguous_paid_requests == 2
+    assert "private" not in str(caught.value)
 
 
 def _http_error(code, retry_after=None):
@@ -656,13 +718,17 @@ def test_forward_teacher_accepts_and_classifies_pinned_semantic_completion_contr
     assert all(record.token not in diagnostic for record in parsed.records)
 
 
-def test_forward_teacher_allows_literal_think_boundaries_in_reasoning_and_content():
+def test_forward_teacher_allows_literal_control_tokens_in_reasoning_and_content():
     tokens = (
         "explain ",
+        FORWARD_TEACHER_TERMINAL,
+        " and ",
         FORWARD_TEACHER_THINK_BOUNDARY,
         " literally",
         FORWARD_TEACHER_THINK_BOUNDARY,
         "answer ",
+        FORWARD_TEACHER_TERMINAL,
+        " and ",
         FORWARD_TEACHER_THINK_BOUNDARY,
         " text",
         FORWARD_TEACHER_TERMINAL,
@@ -679,13 +745,13 @@ def test_forward_teacher_allows_literal_think_boundaries_in_reasoning_and_conten
         choices=[
             _choice(
                 message={
-                    "reasoning": "".join(tokens[:3]),
-                    "content": "".join(tokens[4:7]),
+                    "reasoning": "".join(tokens[:5]),
+                    "content": "".join(tokens[6:11]),
                 },
                 logprobs={"content": records},
             )
         ],
-        usage={"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15},
+        usage={"prompt_tokens": 7, "completion_tokens": 12, "total_tokens": 19},
     )
 
     result = ForwardTeacherClient(
@@ -693,7 +759,8 @@ def test_forward_teacher_allows_literal_think_boundaries_in_reasoning_and_conten
     ).generate([{"role": "user", "content": "x"}])
 
     parsed = result.parsed_completion
-    assert parsed.boundary_record.index == 3
+    assert parsed.boundary_record.index == 5
+    assert parsed.terminal_record.index == 11
     assert parsed.hidden_reasoning_records[1].kind is ForwardTeacherRecordKind.HIDDEN_REASONING
     assert parsed.visible_content_records[1].kind is ForwardTeacherRecordKind.VISIBLE_CONTENT
 
@@ -757,6 +824,30 @@ def test_forward_teacher_transport_is_bounded_and_exception_is_sanitized():
             ],
             {"content": "visible answerwrong terminal", "reasoning": "invented rationale"},
             "terminal count",
+        ),
+        (
+            [
+                *_content_logprobs()[:3],
+                _content_logprobs()[-1],
+                *_content_logprobs()[3:-1],
+                {
+                    **_content_logprobs()[-1],
+                    "token": "wrong final",
+                    "top_logprobs": [{"token": "wrong final", "logprob": -0.01}],
+                },
+            ],
+            {"content": "visible answer", "reasoning": "invented rationale"},
+            "terminal position",
+        ),
+        (
+            [*_content_logprobs()[:-1], _content_logprobs()[-1], _content_logprobs()[-1]],
+            {"content": "visible answer", "reasoning": "invented rationale"},
+            "content reconstruction mismatch",
+        ),
+        (
+            [*_content_logprobs()[:3], _content_logprobs()[-1]],
+            {"content": "x", "reasoning": "invented rationale"},
+            "visible interval is empty",
         ),
         (
             _content_logprobs(),

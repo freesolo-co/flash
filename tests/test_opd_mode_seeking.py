@@ -198,6 +198,37 @@ def test_forward_teacher_local_validation_does_not_count_provider_request():
     assert caught.value.stats.ambiguous_paid_requests == 0
 
 
+def test_forward_teacher_resource_transient_preserves_opd_accounting():
+    from flash.engine.worker.forward_teacher import ForwardTeacherTransientError
+    from flash.engine.worker.opd import (
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
+    )
+
+    class _Client:
+        def generate(self, _messages):
+            raise ForwardTeacherTransientError(
+                "forward_teacher provider reported insufficient system resources",
+                attempts=2,
+                latency_seconds=3.5,
+                ambiguous_paid_requests=2,
+            )
+
+    batch = [(None, [{"role": "user", "content": "x"}], [1])]
+    with pytest.raises(
+        _ForwardTeacherPreparationError, match="insufficient system resources"
+    ) as caught:
+        _prepare_forward_teacher_targets(_Client(), object(), batch, max_length=8)
+
+    assert caught.value.retriable is True
+    assert caught.value.stats.provider_requests == 1
+    assert caught.value.stats.provider_failures == 1
+    assert caught.value.stats.attempts == 2
+    assert caught.value.stats.retries == 1
+    assert caught.value.stats.latency_seconds == pytest.approx(3.5)
+    assert caught.value.stats.ambiguous_paid_requests == 2
+
+
 def test_forward_teacher_target_preparation_reports_partial_success_then_transient_failure(monkeypatch):
     from types import SimpleNamespace
 

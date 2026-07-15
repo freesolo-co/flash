@@ -135,12 +135,12 @@ def _parse_semantic_completion(
     terminal_indices = [
         index for index, record in enumerate(records) if record.token == FORWARD_TEACHER_TERMINAL
     ]
-    if len(terminal_indices) != 1:
+    if not terminal_indices:
         raise ForwardTeacherError(
-            f"forward_teacher semantic completion terminal count is invalid: count={len(terminal_indices)}"
+            "forward_teacher semantic completion terminal count is invalid: count=0"
         )
-    terminal_index = terminal_indices[0]
-    if terminal_index != len(records) - 1:
+    terminal_index = len(records) - 1
+    if records[terminal_index].token != FORWARD_TEACHER_TERMINAL:
         raise ForwardTeacherError("forward_teacher semantic completion terminal position is invalid")
 
     matching_boundaries = [
@@ -270,11 +270,20 @@ class ForwardTeacherClient:
         choice = choices[0]
         if not isinstance(choice, dict) or choice.get("index") != 0:
             raise ForwardTeacherError("forward_teacher response choice index is invalid")
-        if choice.get("finish_reason") != "stop":
+        finish_reason = choice.get("finish_reason")
+        if finish_reason == "insufficient_system_resource":
+            raise ForwardTeacherTransientError(
+                "forward_teacher provider reported insufficient system resources"
+            )
+        if finish_reason != "stop":
             raise ForwardTeacherError("forward_teacher response did not finish naturally")
         message = choice.get("message")
         content = message.get("content") if isinstance(message, dict) else None
-        reasoning = message.get("reasoning") if isinstance(message, dict) else None
+        reasoning = None
+        if isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            if reasoning is None:
+                reasoning = message.get("reasoning")
         if not isinstance(content, str) or not content.strip():
             raise ForwardTeacherError("forward_teacher response visible content is empty")
         if not isinstance(reasoning, str):
@@ -514,6 +523,16 @@ class ForwardTeacherClient:
                         ambiguous_paid_requests,
                     )
                 except ForwardTeacherError as exc:
+                    if exc.retriable:
+                        if attempt == 2:
+                            raise failure(
+                                ForwardTeacherTransientError,
+                                str(exc),
+                                ambiguous_increment=1,
+                            ) from None
+                        ambiguous_paid_requests += 1
+                        retry_sleep(10.0, attempt)
+                        continue
                     raise ForwardTeacherError(
                         str(exc),
                         attempts=attempt,
