@@ -13,23 +13,46 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+KERNEL_FINGERPRINT_SCRIPT = ROOT / "docker" / "kernel_fingerprint.py"
+AUTO_REBAKE_ARCH_COMMAND = "arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)"
 
 
 def _load_kf():
-    spec = importlib.util.spec_from_file_location(
-        "kernel_fingerprint", ROOT / "docker" / "kernel_fingerprint.py"
-    )
+    spec = importlib.util.spec_from_file_location("kernel_fingerprint", KERNEL_FINGERPRINT_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 kf = _load_kf()
+
+
+def _workflow_block(lines: list[str], *headers: str) -> list[str]:
+    for header in headers:
+        starts = [i for i, line in enumerate(lines) if line.rstrip() == header]
+        if len(starts) != 1:
+            raise ValueError(f"expected exactly one {header!r} block, found {len(starts)}")
+        start = starts[0]
+        indent = len(header) - len(header.lstrip())
+        end = next(
+            (
+                i
+                for i, line in enumerate(lines[start + 1 :], start + 1)
+                if line.strip()
+                and not line.lstrip().startswith("#")
+                and len(line) - len(line.lstrip()) <= indent
+            ),
+            len(lines),
+        )
+        lines = lines[start + 1 : end]
+    return lines
 
 
 def test_fingerprints_are_deterministic():
@@ -88,7 +111,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
 
 
 def test_bake_kernel_cache_uses_chalk_default_source_of_truth():
-    from flash.providers.runpod.train.deps import LATEST_CHALK_MAIN_SHA
+    from flash.providers._worker import LATEST_CHALK_MAIN_SHA
 
     bake_src = (ROOT / "docker" / "bake_kernel_cache.py").read_text()
     assert "DEFAULT_CHALK_SPEC" in bake_src
@@ -118,17 +141,101 @@ def test_fa3_default_is_in_lockstep():
     )
 
 
-def test_bake_sms_default_mirrors_baked_per_sm_arches():
-    """The auto-rebake gate iterates BAKED_PER_SM_ARCHES; the bake workflow's default `sms` must
-    mirror it (today a comment-only claim). Keep them in lockstep."""
-    from flash.providers.runpod.train.deps import BAKED_PER_SM_ARCHES
+def test_parse_baked_per_sm_arches_contract():
+    annotated = 'BAKED_PER_SM_ARCHES: frozenset[str] = frozenset({"sm90", "sm80"})\n'
+    assert kf.parse_baked_per_sm_arches(annotated) == ["sm90", "sm80"]
 
-    yml = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text()
-    default = re.search(r'sms[\s\S]*?default:\s*"([^"]+)"', yml).group(1)
-    sms = {s.strip() for s in default.split(",") if s.strip()}
-    assert sms == set(BAKED_PER_SM_ARCHES), (
-        f"bake default sms {sorted(sms)} must mirror BAKED_PER_SM_ARCHES {sorted(BAKED_PER_SM_ARCHES)}"
+    malformed = [
+        "OTHER = frozenset({'sm80'})\n",
+        "BAKED_PER_SM_ARCHES: frozenset[str]\n",
+        "BAKED_PER_SM_ARCHES = frozenset({'sm80', 90})\n",
+        "BAKED_PER_SM_ARCHES = {'sm80'}\n",
+        "BAKED_PER_SM_ARCHES = set({'sm80'})\n",
+        "BAKED_PER_SM_ARCHES = frozenset({})\n",
+        "OTHER = BAKED_PER_SM_ARCHES = frozenset({'sm80'})\n",
+        "BAKED_PER_SM_ARCHES = frozenset({'sm80', 'sm80'})\n",
+        "BAKED_PER_SM_ARCHES = frozenset({'sm80'})\nBAKED_PER_SM_ARCHES = frozenset({'sm90'})\n",
+    ]
+    for source in malformed:
+        with pytest.raises(ValueError, match="kernel_fingerprint"):
+            kf.parse_baked_per_sm_arches(source)
+
+    for arch in ("", " sm80", "sm80 ", "sm*", "gpu90", "sm90x"):
+        source = f"BAKED_PER_SM_ARCHES = frozenset({{{arch!r}}})\n"
+        with pytest.raises(ValueError, match="expected sm followed by digits"):
+            kf.parse_baked_per_sm_arches(source)
+
+
+def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
+    worker_dir = tmp_path / "flash" / "providers"
+    worker_dir.mkdir(parents=True)
+    (worker_dir / "_worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(KERNEL_FINGERPRINT_SCRIPT),
+            "--root",
+            str(tmp_path),
+            "--print-baked-arches",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
     )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "sm90 sm80\n"
+
+
+def test_baked_arch_workflows_match_canonical_source():
+    from flash.providers._worker import BAKED_PER_SM_ARCHES
+
+    worker_source = (ROOT / "flash" / "providers" / "_worker.py").read_text()
+    source_arches = kf.parse_baked_per_sm_arches(worker_source)
+    canonical_arches = set(BAKED_PER_SM_ARCHES)
+
+    bake_lines = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text().splitlines()
+    sms_block = _workflow_block(
+        bake_lines, "on:", "  workflow_dispatch:", "    inputs:", "      sms:"
+    )
+    (default,) = [
+        match.group(1)
+        for line in sms_block
+        if (match := re.fullmatch(r'\s*default:\s*"([^"]+)"\s*', line))
+    ]
+    default_arches = {arch.strip() for arch in default.split(",") if arch.strip()}
+
+    include_block = _workflow_block(
+        bake_lines, "jobs:", "  bake:", "    strategy:", "      matrix:", "        include:"
+    )
+    matrix_arch_list = [
+        match.group(1)
+        for line in include_block
+        if (match := re.fullmatch(r"\s*sm:\s*(sm[0-9]+),?\s*", line))
+    ]
+    matrix_arches = set(matrix_arch_list)
+
+    assert len(source_arches) == len(canonical_arches)
+    assert set(source_arches) == canonical_arches == default_arches
+    assert len(matrix_arch_list) == len(matrix_arches)
+    assert canonical_arches <= matrix_arches
+    assert matrix_arches - canonical_arches == {"sm100"}
+
+    auto_lines = (ROOT / ".github" / "workflows" / "auto-rebake.yml").read_text().splitlines()
+    run_block = _workflow_block(
+        auto_lines,
+        "jobs:",
+        "  gate:",
+        "    steps:",
+        "      - name: Classify arches",
+        "        run: |",
+    )
+
+    def active_assignments(lines: list[str]) -> list[str]:
+        return [line.strip() for line in lines if re.fullmatch(r"\s*arches=.*", line)]
+
+    assert active_assignments(run_block) == [AUTO_REBAKE_ARCH_COMMAND]
+    assert active_assignments([f"# {AUTO_REBAKE_ARCH_COMMAND}"]) == []
+    assert active_assignments([AUTO_REBAKE_ARCH_COMMAND] * 2) != [AUTO_REBAKE_ARCH_COMMAND]
 
 
 def test_parsing_fails_loud_on_a_broken_stack():

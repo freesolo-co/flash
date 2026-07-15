@@ -133,7 +133,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # every completion in a step is scored in ONE parallel wave — the teacher wall is a single
         # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
         # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
-        teacher_s = teacher_lat if completions else 0.0
+        teacher_s = teacher_lat
         return gen_s + teacher_s + update_s
 
     if not n.is_grpo:
@@ -320,10 +320,8 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        # GPU (platform-billed) time only. OPD's teacher tokens are billed by Fireworks to the
-        # platform-managed teacher key — never through this GPU charge — so folding teacher_api_usd
-        # into the charged total would bill it a second time. Keep it itemized as a diagnostic
-        # instead (codex[bot]).
+        # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
+        # only as a diagnostic and is not passed through to the customer.
         total_usd=train / 3600.0 * hourly,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),

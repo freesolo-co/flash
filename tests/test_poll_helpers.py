@@ -65,16 +65,11 @@ def test_heartbeat_progress_no_ts_is_not_fresh():
 
 
 def test_heartbeat_progress_rejects_other_attempt_even_when_ts_is_fresh():
-    # The seed heartbeat path is shared across attempts: a prior attempt's worker still shutting down
-    # can upload a heartbeat with ts > this attempt's launch. By ts alone it looks fresh, but it
-    # belongs to a DIFFERENT attempt, so it must NOT satisfy this attempt's first-liveness. The worker
-    # stamps attempt as a STRING (env var), the poller passes an int -> compare coerced to int.
+    # a prior attempt can upload a post-launch heartbeat, but an exact canonical attempt mismatch must
+    # prevent it from satisfying current liveness.
     now = time.time()
     launch = now - 100
-    # worker-stamped string attempt "0"; we are polling attempt=1 -> not fresh despite a post-launch ts
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch, current_attempt=1)
-    assert fresh is False
-    # int attempts mismatch likewise
+    # canonical integer attempts mismatch
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 0), launch, current_attempt=1)
     assert fresh is False
 

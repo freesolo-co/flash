@@ -58,6 +58,8 @@ LABEL_REVISION = "org.opencontainers.image.revision"
 # pip specs in Dockerfile.worker's main stack whose kernels land in the mega-cache. everything else
 # in that block is a base-layer dep (fp_base). fla is matched separately (it carries the git sha).
 _CACHE_PKGS = {"tilelang", "apache-tvm-ffi"}
+_BAKED_ARCHES_NAME = "BAKED_PER_SM_ARCHES"
+_BAKED_ARCH_PATTERN = re.compile(r"sm[0-9]+")
 
 
 def _search(pattern: str, text: str, what: str, *, flags: int = 0) -> str:
@@ -108,6 +110,62 @@ def _python_string_constant(text: str, name: str, what: str) -> str:
     if name not in values:
         raise ValueError(f"kernel_fingerprint: could not parse {what}")
     return values[name]
+
+
+def parse_baked_per_sm_arches(text: str, *, source: str = "_worker.py") -> list[str]:
+    """Parse the canonical baked-architecture frozenset without importing flash."""
+    tree = ast.parse(text, filename=source)
+    assignments = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == _BAKED_ARCHES_NAME for t in node.targets)
+        )
+        or (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == _BAKED_ARCHES_NAME
+        )
+    ]
+    context = f"kernel_fingerprint: {_BAKED_ARCHES_NAME} in {source}"
+    if len(assignments) != 1:
+        raise ValueError(
+            f"{context}: expected exactly one top-level assignment, found {len(assignments)}"
+        )
+
+    assignment = assignments[0]
+    if isinstance(assignment, ast.Assign) and (
+        len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name)
+    ):
+        raise ValueError(f"{context} must use one named target")
+    value = assignment.value
+    if value is None:
+        raise ValueError(f"{context} must have a value")
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "frozenset"
+        and len(value.args) == 1
+        and not value.keywords
+        and isinstance(value.args[0], ast.Set)
+    ):
+        raise ValueError(f"{context} must be frozenset({{...}}) of string literals")
+
+    arches: list[str] = []
+    for element in value.args[0].elts:
+        if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+            raise ValueError(f"{context} must contain strings")
+        if _BAKED_ARCH_PATTERN.fullmatch(element.value) is None:
+            raise ValueError(
+                f"{context} has invalid architecture {element.value!r}; expected sm followed by digits"
+            )
+        arches.append(element.value)
+    if not arches:
+        raise ValueError(f"{context} must not be empty")
+    if len(arches) != len(set(arches)):
+        raise ValueError(f"{context} must not contain duplicates")
+    return arches
 
 
 def _pip_stack_specs(dockerfile: str) -> list[str]:
@@ -257,6 +315,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--print-label-keys", action="store_true", help="print the OCI label keys + exit"
     )
+    ap.add_argument(
+        "--print-baked-arches",
+        action="store_true",
+        help="print BAKED_PER_SM_ARCHES from _worker.py + exit",
+    )
     args = ap.parse_args(argv)
 
     if args.print_label_keys:
@@ -265,8 +328,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"revision={LABEL_REVISION}")
         return 0
 
+    root = Path(args.root)
+    if args.print_baked_arches:
+        worker_source = root / "flash" / "providers" / "_worker.py"
+        try:
+            arches = parse_baked_per_sm_arches(
+                worker_source.read_text(encoding="utf-8"), source=str(worker_source)
+            )
+        except (OSError, SyntaxError, ValueError) as exc:
+            ap.error(str(exc))
+        print(" ".join(arches))
+        return 0
+
     fp_cache, fp_base, cache_inputs, base_inputs = fingerprints(
-        Path(args.root), fa2_spec=args.fa2_spec, fa3_spec=args.fa3_spec
+        root, fa2_spec=args.fa2_spec, fa3_spec=args.fa3_spec
     )
     if args.explain:
         print(

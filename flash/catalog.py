@@ -78,7 +78,7 @@ class ModelInfo:
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
     grpo_min_vram_gb: int = 0
-    # 0 => SFT sizes from param-based estimate; set only when a model must not down-route to the cheapest card.
+    # 0 => non-grpo sizing uses the param-based estimate; set when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
     # vLLM sleep mode (offload the colocate rollout engine between GRPO steps) is NON-FUNCTIONAL for
     # this model: the wake/reload HANGS the rollout (a ~70 GB weight reallocation can't be placed in
@@ -124,9 +124,9 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        serving = data.get("serving")
+        serving = data["serving"]
         if serving is None:
-            data.pop("serving", None)
+            del data["serving"]
         else:
             for key in (
                 "serve_model_id",
@@ -162,7 +162,7 @@ MODELS: dict[str, ModelInfo] = {
         params="1.2B dense (Llama arch)",
         params_b=1.2,
         vocab_size=130_560,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -181,7 +181,7 @@ MODELS: dict[str, ModelInfo] = {
         params="0.9B (text-only fine-tune)",
         params_b=0.9,
         vocab_size=248_320,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -200,7 +200,7 @@ MODELS: dict[str, ModelInfo] = {
         params="2.3B (text-only fine-tune)",
         params_b=2.3,
         vocab_size=248_320,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
         serving=ServingCapacity(
@@ -218,7 +218,7 @@ MODELS: dict[str, ModelInfo] = {
         params="4.7B (text-only fine-tune)",
         params_b=4.7,
         vocab_size=248_320,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
         serving=ServingCapacity(
@@ -240,7 +240,7 @@ MODELS: dict[str, ModelInfo] = {
         params="9.7B (text-only fine-tune)",
         params_b=9.7,
         vocab_size=248_320,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=48,
         # NOT QLoRA: peft bnb merge during GRPO rollout diverges trainer precision -> TRL ratio collapses to 0.
         grpo_min_vram_gb=80,
@@ -272,7 +272,7 @@ MODELS: dict[str, ModelInfo] = {
         num_layers=40,
         hidden_size=2048,
         vocab_size=248_320,
-        algos=("sft", "grpo", "opd"),
+        algos=ALGORITHMS,
         min_vram_gb=141,
         # Floor to 100 GB so SFT lands on H200, not the thin-margin consumer Blackwell or 80 GB H100.
         sft_min_vram_gb=100,
@@ -328,19 +328,20 @@ def get_model(model_id: str) -> ModelInfo:
         ) from exc
 
 
-def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
-    """Return the model's serving LoRA rank cap, or None when Flash has no local cap.
-
-    Serving capacity is model-specific: small serving models currently allow rank 64, while larger
-    serving paths currently allow rank 32. Unknown/open-policy models intentionally return None instead
-    of inheriting a global fallback.
-    """
+def _model_info_for_serving(model: str | ModelInfo | None) -> ModelInfo | None:
     if isinstance(model, ModelInfo):
-        info = model
-    elif isinstance(model, str) and model.strip():
-        info = MODELS.get(model.strip())
-    else:
-        info = None
+        return model
+    if isinstance(model, str) and model.strip():
+        return MODELS.get(model.strip())
+    return None
+
+
+def serving_lora_rank_cap(model: str | ModelInfo | None) -> int | None:
+    """Return the model-specific serving LoRA rank cap.
+
+    Unknown and open-policy models return None.
+    """
+    info = _model_info_for_serving(model)
     if info is None or info.serving is None:
         return None
     return int(info.serving.max_lora_rank)
@@ -355,12 +356,7 @@ def serving_context_cap(model: str | ModelInfo | None) -> int | None:
     ``flash.lora_rank.preflight_train_context_within_serving``). Resolution mirrors
     ``serving_lora_rank_cap``: unknown/open-policy models return None rather than a global fallback.
     """
-    if isinstance(model, ModelInfo):
-        info = model
-    elif isinstance(model, str) and model.strip():
-        info = MODELS.get(model.strip())
-    else:
-        info = None
+    info = _model_info_for_serving(model)
     if info is None or info.serving is None:
         return None
     return int(info.serving.max_model_len)
@@ -406,10 +402,11 @@ def _resolve_open_model(
     """Synthesize a ModelInfo for the open-model "allow" policy via a coarse HF VRAM-fit estimate."""
     from flash.engine.vram import check_fit
 
+    resolved_gpu = gpu or DEFAULT_GPU
     est = check_fit(
         model_id,
         algo,
-        gpu or DEFAULT_GPU,
+        resolved_gpu,
         model_revision=model_revision,
     )
     if est.verdict == "too_big":
@@ -419,19 +416,20 @@ def _resolve_open_model(
         )
     if est.verdict in ("tight", "unknown"):
         print(f"warning: open-model policy: {est.describe()}")
-    params = f"{est.params_b:.1f}B" if est.params_b else "unknown size"
-    min_disk = int(est.params_b * 2) + 64 if est.params_b else 0
+    params_b = est.params_b or 0.0
+    params = f"{params_b:.1f}B" if params_b else "unknown size"
+    min_disk = int(params_b * 2) + 64 if params_b else 0
     return ModelInfo(
         id=model_id,
         display_name=model_id,
         params=params,
         # Carry the estimated/HF param count straight through (0.0 when size is unknown) so downstream
         # sizing reads ``params_b`` directly — no re-parsing the display string.
-        params_b=est.params_b or 0.0,
+        params_b=params_b,
         algos=ALGORITHMS,
         min_vram_gb=math.ceil(est.est_gb) if est.est_gb else 24,
         min_disk_gb=min_disk,
-        recommended_gpu=gpu or DEFAULT_GPU,
+        recommended_gpu=resolved_gpu,
         thinking="unknown",
         notes="unlisted model accepted via the open-model policy (not curated/validated)",
     )

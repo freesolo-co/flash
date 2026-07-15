@@ -6,6 +6,9 @@ can't be confirmed. These tests pin those invariants and the fixed 7-day policy.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import types
 from datetime import UTC, datetime
 
@@ -115,6 +118,20 @@ def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is False
     monkeypatch.setenv("HF_TOKEN", "tok")
     assert rc.repo_cleanup_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["1", "64", "0", "-1", "not-a-number"])
+def test_scan_workers_ignores_environment(value):
+    env = os.environ.copy()
+    env["FLASH_GC_SCAN_WORKERS"] = value
+    result = subprocess.run(
+        [sys.executable, "-c", "from flash.server.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "8"
 
 
 def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):

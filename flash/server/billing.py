@@ -60,7 +60,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
-    except (urllib.error.URLError, OSError) as exc:
+    except OSError as exc:
         raise BillingError(503, f"billing service unavailable: {exc}") from exc
     try:
         return json.loads(raw or b"{}")

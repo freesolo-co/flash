@@ -1235,9 +1235,9 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
 
 
 def test_poll_job_malformed_step_does_not_crash(monkeypatch):
-    # A heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
-    # no local handler — a ValueError would abort poll_job). The step is coerced like `attempt`, so an
-    # unparseable step is treated as 0 (keep setup grace, don't tighten).
+    # a heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
+    # no local handler — a ValueError would abort poll_job). the step is validated strictly through the
+    # same bounded integer helper; an invalid step stays setup-classified and must not raise.
     import itertools
 
     from flash.providers.runpod import api as runpod_api
@@ -2070,7 +2070,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
 
         def fail_listing(spec, *, step, revision=None):
             raise checkpoints.CheckpointListingError(
-                "could not verify deployable checkpoints for source-run: 503"
+                "could not verify adapter artifacts for source-run: 503"
             )
 
         monkeypatch.setattr(checkpoints, "adapter_artifact_exists", fail_listing)
@@ -2082,7 +2082,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             }
         )
 
-        with pytest.raises(ValueError, match="could not verify deployable checkpoints"):
+        with pytest.raises(ValueError, match="could not verify adapter artifacts"):
             orch.submit_job(
                 spec,
                 dry_run=True,

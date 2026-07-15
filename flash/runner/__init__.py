@@ -274,7 +274,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
 
 
 def _verified_opd_next_attempt(run_id: str) -> int:
-    """Compatibility wrapper returning only the verified next attempt."""
+    """Return just the verified next attempt, discarding the resume revision."""
     return _verified_opd_retry_state(run_id)[0]
 
 
