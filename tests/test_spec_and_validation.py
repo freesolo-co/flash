@@ -115,6 +115,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
+    assert TRAIN_KEY_MIN_VERSIONS["checkpoint_landmarks"] == "0.2.57"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -126,6 +127,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "max_completion_tokens",
             "teacher_model",
             "structured_outputs",
+            "checkpoint_landmarks",
         }
     } == {"0.2.0"}
 
@@ -172,9 +174,10 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. opd has no auxiliary eos loss or user-facing eos-loss key, so current TRAIN_SCHEMA_KEYS
-    # equals the latest historical shape minus that one key.
-    assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS
+    # did. current adds checkpoint_landmarks and removes the legacy opd eos key.
+    assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
+        "checkpoint_landmarks"
+    }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
     for key in ("structured_outputs", "teacher_model"):
