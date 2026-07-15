@@ -339,6 +339,40 @@ def test_save_is_best_effort_on_upload_failure(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        opd.RetriableInfraError("checkpoint upload retry"),
+        opd.RequiredSaveError("checkpoint upload rejected"),
+    ],
+)
+def test_nonrequired_save_suppresses_upload_contract_errors(
+    monkeypatch, tmp_path, failure
+):
+    def _fail_upload(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        opd,
+        "_w",
+        types.SimpleNamespace(SEED=42, upload_resume_checkpoint=_fail_upload),
+    )
+
+    opd._save_opd_resume_checkpoint(
+        model=_FakeModel(),
+        tok=_FakeTok(),
+        optimizer=_FakeOptimizer([]),
+        torch=_FakeTorch(),
+        out_dir=str(tmp_path),
+        opt_steps=2,
+        step=2,
+        accounting=_accounting(2),
+        rollout_seed_ordinal=17,
+        prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
+        required=False,
+    )
+
+
 def test_periodic_save_is_best_effort_when_upload_returns_false(monkeypatch, tmp_path):
     monkeypatch.setattr(
         opd,
@@ -381,6 +415,36 @@ def test_required_save_raises_when_upload_returns_false(monkeypatch, tmp_path):
             prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
             required=True,
         )
+
+
+def test_required_save_propagates_retriable_upload_error(monkeypatch, tmp_path):
+    failure = opd.RetriableInfraError("checkpoint upload retry")
+
+    def _fail_upload(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        opd,
+        "_w",
+        types.SimpleNamespace(SEED=42, upload_resume_checkpoint=_fail_upload),
+    )
+
+    with pytest.raises(opd.RetriableInfraError) as caught:
+        opd._save_opd_resume_checkpoint(
+            model=_FakeModel(),
+            tok=_FakeTok(),
+            optimizer=_FakeOptimizer([]),
+            torch=_FakeTorch(),
+            out_dir=str(tmp_path),
+            opt_steps=2,
+            step=2,
+            accounting=_accounting(2),
+            rollout_seed_ordinal=17,
+            prompt_pool_fingerprint=_PROMPT_POOL_FINGERPRINT,
+            required=True,
+        )
+
+    assert caught.value is failure
 
 
 def test_required_save_raises_when_local_construction_fails(monkeypatch, tmp_path):

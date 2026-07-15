@@ -877,6 +877,7 @@ def run_opd():
     # deterministic shuffle rebuilt identically every worker start), so restoring this int restores the
     # exact data position -- the dataset itself is never persisted. max_iters stays absolute.
     step = int(_resumed("step", 0))
+    final_adapter_staged = False
     max_iters = 3 * steps + 10
     max_no_signal_attempts = 3
     teacher_batch_size = _opd_teacher_batch_size(knobs.prompts_per_step * knobs.group_size)
@@ -1139,12 +1140,20 @@ def run_opd():
                     f"[opd] step {it + 1}/{steps} loss={avg_loss:.4f} "
                     f"coverage={avg_cov:.0%} seqs={nseq}"
                 )
-            # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
-            # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
-            # warm-start/deploy from step-N would use fewer updates than its name implies.
-            if save_step_due(opt_steps, knobs.save_at_steps, knobs.save_every):
-                _save_adapter(model, tok, adapter_dir)
+            # checkpoint on optimizer-step count, not the loop index: a `step-n` artifact must
+            # contain n real updates. the final optimizer state is always a required recovery boundary,
+            # even when the configured deployable schedule does not select that step.
+            checkpoint_due = save_step_due(
+                opt_steps, knobs.save_at_steps, knobs.save_every
+            )
+            is_final_step = opt_steps == steps
+            if checkpoint_due or is_final_step:
                 is_required_save = opt_steps in knobs.save_at_steps
+                publish_periodic = checkpoint_due and not is_required_save and not is_final_step
+                if is_required_save or publish_periodic:
+                    _save_adapter(model, tok, adapter_dir)
+                    if is_final_step:
+                        final_adapter_staged = True
                 checkpoint_accounting = {
                     "loss_curve": list(loss_curve),
                     "coverage_curve": list(coverage_curve),
@@ -1180,8 +1189,10 @@ def run_opd():
                         save_required=_required,
                     )
 
-                # every due full-state checkpoint must be durable before the next vllm sync. required
-                # boundaries then publish their companion in the same retrying transaction.
+                # exact boundaries keep full state and their required companion in one transaction.
+                # nonfinal periodic publications stay ordered before sync but are fully best-effort.
+                # final periodic or otherwise unscheduled steps publish only full state here; finalization
+                # stages and publishes the deployable once after recovery state is known durable.
                 if is_required_save:
                     _save_opd_resume_checkpoint(
                         model=model,
@@ -1197,6 +1208,20 @@ def run_opd():
                         required=True,
                         after_upload=_publish_step_deployable,
                     )
+                elif is_final_step:
+                    _save_opd_resume_checkpoint(
+                        model=model,
+                        tok=tok,
+                        optimizer=optimizer,
+                        torch=torch,
+                        out_dir=out_dir,
+                        opt_steps=opt_steps,
+                        step=step,
+                        accounting=checkpoint_accounting,
+                        rollout_seed_ordinal=rollout_seed_ordinal,
+                        prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=True,
+                    )
                 else:
                     _publish_step_deployable()
                     _save_opd_resume_checkpoint(
@@ -1210,7 +1235,7 @@ def run_opd():
                         accounting=checkpoint_accounting,
                         rollout_seed_ordinal=rollout_seed_ordinal,
                         prompt_pool_fingerprint=prompt_pool_fingerprint,
-                        required=True,
+                        required=False,
                     )
             # on-policy means the next rollout must sample from the just-updated student lora. a due
             # optimizer-boundary checkpoint must already be durable before this fallible sync. skip the
@@ -1273,7 +1298,8 @@ def run_opd():
             "terminate, or verify the teacher tokenizer aligns to the student."
         )
 
-    _save_adapter(model, tok, adapter_dir)
+    if not final_adapter_staged:
+        _save_adapter(model, tok, adapter_dir)
     # keep the served default while suppressing unrequested final checkpoints.
     _publish_opd_deployable(
         adapter_dir,
@@ -2013,8 +2039,13 @@ def _save_opd_resume_checkpoint(
             uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir)
         else:
             uploaded = _w.upload_resume_checkpoint(opt_steps, local_dir, after_upload=after_upload)
-    except (RequiredSaveError, RetriableInfraError):
-        raise
+    except (RequiredSaveError, RetriableInfraError) as e:
+        if required:
+            raise
+        print(
+            f"[opd] resume checkpoint upload failed at opt_steps={opt_steps}; training continues: {e}"
+        )
+        return
     except Exception as e:
         if required:
             raise RetriableInfraError(
