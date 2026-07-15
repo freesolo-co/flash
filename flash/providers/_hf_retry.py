@@ -9,6 +9,9 @@ from email.utils import parsedate_to_datetime
 from logging import Logger
 from typing import TypeVar
 
+from flash.diagnostics import sanitize_diagnostic
+from flash.providers._deadline import remaining_seconds, require_deadline_at
+
 T = TypeVar("T")
 
 HF_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -25,7 +28,9 @@ def hf_status_code(exc: BaseException) -> int | None:
         return None
 
 
-def hf_retry_after(exc: BaseException, *, max_seconds: float = HF_RETRY_AFTER_MAX_S) -> float | None:
+def hf_retry_after(
+    exc: BaseException, *, max_seconds: float = HF_RETRY_AFTER_MAX_S
+) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -49,6 +54,12 @@ def hf_retry_after(exc: BaseException, *, max_seconds: float = HF_RETRY_AFTER_MA
     return min(max_seconds, max(0.0, seconds))
 
 
+def _call_before_deadline(call: Callable[[], T], label: str, deadline: float) -> T:
+    if remaining_seconds(deadline) <= 0:
+        raise TimeoutError(f"{label} exceeded the run wall deadline")
+    return call()
+
+
 def hf_call(
     call: Callable[[], T],
     label: str,
@@ -57,20 +68,30 @@ def hf_call(
     sleep: Callable[[float], object] = time.sleep,
     retry_delays: tuple[float, ...] = HF_RETRY_DELAYS_S,
     transient_status_codes: frozenset[int] = HF_TRANSIENT_STATUS_CODES,
+    deadline_at: float | None = None,
 ) -> T:
+    deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     for attempt in range(len(retry_delays) + 1):
         try:
-            return call()
+            return call() if deadline is None else _call_before_deadline(call, label, deadline)
         except Exception as exc:
             if hf_status_code(exc) not in transient_status_codes or attempt >= len(retry_delays):
                 raise
             retry_after = hf_retry_after(exc)
             delay = retry_after if retry_after is not None else retry_delays[attempt]
+            if deadline is not None:
+                remaining = remaining_seconds(deadline)
+                if remaining <= 0:
+                    raise
+                delay = min(delay, remaining)
             logger.warning(
                 "%s transient Hugging Face error; retrying in %.0fs: %s",
                 label,
                 delay,
-                exc,
+                sanitize_diagnostic(exc, limit=500),
             )
-            sleep(delay)
+            if delay > 0:
+                sleep(delay)
+            if deadline is not None and remaining_seconds(deadline) <= 0:
+                raise
     raise AssertionError("unreachable")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import tempfile
 
@@ -494,7 +495,7 @@ def test_run_job_background_swallows_exception(monkeypatch):
     assert calls["n"] == 1
 
 
-def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
+def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch, caplog):
     """If _run_job crashes BEFORE _run_job_inner persisted a terminal state (e.g. an import/resolve
     error), the daemon wrapper must still record a terminal `failed` (via terminal-sticky _update) so
     the run doesn't hang non-terminal forever."""
@@ -510,17 +511,23 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
         os.makedirs(runner.RUNS_DIR, exist_ok=True)
         # a non-terminal (queued) run, as submit_job persists before dispatching the daemon thread
         runner._save_status(RunStatus(run_id="bg-fail", state="queued", spec={}))
+        raw_message = "crashed before persisting terminal state"
 
         def boom(spec):
-            raise RuntimeError("crashed before persisting terminal state")
+            raise RuntimeError(raw_message)
 
         monkeypatch.setattr(runner, "_run_job", boom)
+        caplog.set_level(logging.WARNING, logger=runner.__name__)
         spec = type("S", (), {"run_id": "bg-fail"})()
         runner._run_job_background(spec)  # must not raise
 
         status = runner.get_status("bg-fail")
         assert status.state == "failed"
-        assert "crashed before persisting" in (status.error or "")
+        safe_detail = "RuntimeError: background run failed"
+        assert status.error == safe_detail
+        assert raw_message not in (status.error or "")
+        assert f"background run bg-fail ended in error: {safe_detail}" in caplog.messages
+        assert raw_message not in caplog.text
 
 
 def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):

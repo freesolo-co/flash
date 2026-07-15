@@ -118,14 +118,16 @@ def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
     assert len(calls) == 3
 
 
-def test_request_4xx_raises_immediately_with_body(monkeypatch):
+def test_request_4xx_raises_immediately_without_provider_body(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(400, b'{"msg": "no such ask"}')])
-    with pytest.raises(vast_api.VastApiError, match="no such ask"):
+    with pytest.raises(vast_api.VastApiError) as exc_info:
         vast_api.request_with_retries("/asks/123/", method="PUT", body={})
     assert len(calls) == 1  # no retry on 4xx
+    assert "HTTP 400" in str(exc_info.value)
+    assert "no such ask" not in str(exc_info.value)
 
 
 def test_create_instance_success_and_rejection(monkeypatch):
@@ -133,7 +135,11 @@ def test_create_instance_success_and_rejection(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(
-        monkeypatch, [{"success": True, "new_contract": 777}, {"success": False, "error": "taken"}]
+        monkeypatch,
+        [
+            {"success": True, "new_contract": 777},
+            {"success": False, "error": "provider body secret"},
+        ],
     )
     kwargs = {
         "image": "img",
@@ -151,6 +157,7 @@ def test_create_instance_success_and_rejection(monkeypatch):
     with pytest.raises(vast_api.VastApiError, match="rejected") as exc_info:
         vast_api.create_instance(123, **kwargs)
     assert vast_api.create_error_is_ambiguous(exc_info.value) is False
+    assert "provider body secret" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("status", [404, 410])
@@ -162,7 +169,13 @@ def test_create_instance_non_2xx_explicit_false_is_rejected(monkeypatch, status)
         monkeypatch,
         [_http_error(status, b'{"success": false, "error": "offer unavailable"}')],
     )
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastCreateRejected) as exc_info:
         vast_api.create_instance(123, **kwargs)
@@ -181,7 +194,13 @@ def test_create_instance_non_2xx_uncertain_response_is_ambiguous(monkeypatch, st
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [_http_error(status, body)])
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastApiError) as exc_info:
         vast_api.create_instance(123, **kwargs)
@@ -199,7 +218,13 @@ def test_create_instance_non_2xx_contradictory_response_is_ambiguous(monkeypatch
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     body = _json.dumps({"success": False, "new_contract": contract}).encode()
     _capture_urlopen(monkeypatch, [_http_error(410, body)])
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
         vast_api.create_instance(123, **kwargs)
@@ -218,7 +243,13 @@ def test_create_instance_non_2xx_long_false_body_is_still_rejected(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     body = _json.dumps({"success": False, "error": "x" * 800}).encode()
     _capture_urlopen(monkeypatch, [_http_error(410, body)])
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastCreateRejected) as exc_info:
         vast_api.create_instance(123, **kwargs)
@@ -231,7 +262,13 @@ def test_create_instance_missing_key_is_not_sent(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastCreateNotSent) as exc_info:
         vast_api.create_instance(123, **kwargs)
@@ -257,11 +294,64 @@ def test_create_instance_malformed_response_is_ambiguous(monkeypatch, body):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [body])
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
         vast_api.create_instance(123, **kwargs)
     assert vast_api.create_error_is_ambiguous(exc_info.value) is True
+    assert "provider body secret" not in str(exc_info.value)
+
+
+def test_create_instance_diagnostics_never_render_opaque_response_body(monkeypatch):
+    import traceback
+
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    private = "opaque-private-sentinel-7f3c"
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
+
+    for response, expected in (
+        ({"success": False, "error": private}, vast_api.VastCreateRejected),
+        ({"success": None, "error": private}, vast_api.VastAmbiguousCreate),
+    ):
+        _capture_urlopen(monkeypatch, [response])
+        with pytest.raises(expected) as exc_info:
+            vast_api.create_instance(123, **kwargs)
+        detail = str(exc_info.value)
+        assert private not in detail
+        assert "create_instance(123)" in detail
+
+    private_http = urllib.error.HTTPError(
+        "https://console.vast.ai/api/v0/asks/123/",
+        409,
+        private,
+        None,
+        io.BytesIO(json.dumps({"error": private}).encode()),
+    )
+    _capture_urlopen(monkeypatch, [private_http])
+    with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
+        vast_api.create_instance(123, **kwargs)
+    detail = str(exc_info.value)
+    formatted = "".join(
+        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
+    )
+    assert private not in detail
+    assert private not in formatted
+    assert "HTTP 409" in detail
+    assert "/v0/asks/123/" in detail
 
 
 def test_create_instance_is_not_retried(monkeypatch):
@@ -299,7 +389,13 @@ def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast_api.time, "sleep", lambda s: None)
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
 
     class _NonJsonResp:  # 200 with a non-JSON body -> json.loads raises JSONDecodeError
         def read(self):
@@ -352,12 +448,18 @@ def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    kwargs = {"image": "img", "disk_gb": 60, "env": {}, "onstart": "#!/bin/bash", "label": "flash-x"}
+    kwargs = {
+        "image": "img",
+        "disk_gb": 60,
+        "env": {},
+        "onstart": "#!/bin/bash",
+        "label": "flash-x",
+    }
     # "²" is a unicode digit str.isdigit() accepts but int() rejects — the parser must stay
     # total and non-throwing so it flows to ambiguous instead of escaping as a valueerror.
     for bad in ("not-a-number", {"id": 1}, [7], "²", True, -3, 0):
         _capture_urlopen(monkeypatch, [{"success": True, "new_contract": bad}])
-        with pytest.raises(vast_api.VastAmbiguousCreate, match="no instance id") as ei:
+        with pytest.raises(vast_api.VastAmbiguousCreate, match="no usable instance id") as ei:
             vast_api.create_instance(123, **kwargs)
         assert vast_api.create_error_is_ambiguous(ei.value) is True
 
@@ -377,9 +479,14 @@ def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    _capture_urlopen(monkeypatch, [_http_error(400, b'{"error":"bad request for instance 4040"}')])
-    with pytest.raises(vast_api.VastApiError):
+    private_body = "bad request for instance 4040"
+    _capture_urlopen(
+        monkeypatch,
+        [_http_error(400, json.dumps({"error": private_body}).encode())],
+    )
+    with pytest.raises(vast_api.VastApiError) as exc_info:
         vast_api.get_instance(4040)
+    assert private_body not in str(exc_info.value)
 
 
 def test_get_instance_raises_on_success_false_envelope(monkeypatch):
@@ -390,9 +497,17 @@ def test_get_instance_raises_on_success_false_envelope(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    _capture_urlopen(monkeypatch, [{"success": False, "msg": "no such instance"}])
-    with pytest.raises(vast_api.VastApiError):
+    private_key = "opaque_provider_key_sentinel"
+    private_value = "opaque-provider-response-sentinel"
+    _capture_urlopen(monkeypatch, [{"success": False, private_key: private_value}])
+    with pytest.raises(vast_api.VastApiError) as exc_info:
         vast_api.get_instance(4040)
+    detail = str(exc_info.value)
+    assert private_key not in detail
+    assert private_value not in detail
+    assert "get_instance(4040)" in detail
+    assert "classification=error_envelope" in detail
+    assert "returned_type=dict" in detail
 
 
 def test_get_instance_returns_dict_and_gone_signal(monkeypatch):
@@ -422,7 +537,9 @@ def test_create_error_is_ambiguous_classification():
 
     assert vast_api.create_error_is_ambiguous(vast_api.VastCreateRejected("success:false")) is False
     assert vast_api.create_error_is_ambiguous(vast_api.VastCreateNotSent("no api key")) is False
-    assert vast_api.create_error_is_ambiguous(vast_api.VastAmbiguousCreate("no instance id")) is True
+    assert (
+        vast_api.create_error_is_ambiguous(vast_api.VastAmbiguousCreate("no instance id")) is True
+    )
     assert vast_api.create_error_is_ambiguous(err(msg="untyped rejection")) is True
     assert (
         vast_api.create_error_is_ambiguous(
@@ -431,7 +548,9 @@ def test_create_error_is_ambiguous_classification():
         is True
     )
     assert vast_api.create_error_is_ambiguous(err(TimeoutError("read timed out"))) is True
-    assert vast_api.create_error_is_ambiguous(json.JSONDecodeError("Expecting value", "x", 0)) is True
+    assert (
+        vast_api.create_error_is_ambiguous(json.JSONDecodeError("Expecting value", "x", 0)) is True
+    )
 
 
 def test_destroy_instance_never_raises(monkeypatch):

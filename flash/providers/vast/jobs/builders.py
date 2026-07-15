@@ -74,9 +74,9 @@ class VastJobHandle(InstanceJobHandle):
 
     @staticmethod
     def _coerce_instance_id(raw) -> int:
-        # A Vast instance_id is numeric; the base guard turns a missing/non-numeric one into a clear
-        # "corrupt vast handle" error rather than a bare KeyError/ValueError that crashes recovery.
-        return int(raw)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise ValueError("invalid vast instance id")
+        return raw
 
     def _extra_to_dict(self) -> dict:
         return {
@@ -87,11 +87,21 @@ class VastJobHandle(InstanceJobHandle):
 
     @staticmethod
     def _extra_from_dict(d: dict) -> dict:
-        return {
-            "offer_id": int(d.get("offer_id") or 0),
-            "machine_id": int(d.get("machine_id") or 0),
-            "label": str(d.get("label") or ""),
-        }
+        offer_id = d.get("offer_id")
+        machine_id = d.get("machine_id")
+        label = d.get("label")
+        if (
+            isinstance(offer_id, bool)
+            or not isinstance(offer_id, int)
+            or offer_id <= 0
+            or isinstance(machine_id, bool)
+            or not isinstance(machine_id, int)
+            or machine_id <= 0
+            or not isinstance(label, str)
+            or not label
+        ):
+            raise ValueError("persisted vast provider identity is incomplete")
+        return {"offer_id": offer_id, "machine_id": machine_id, "label": label}
 
 
 def vast_image(gpu: str | None = None) -> str:
@@ -111,6 +121,7 @@ def build_payload(
     attempt: int,
     runtime_secrets: dict | None = None,
     code_prefix: str | None = None,
+    deadline_at: float | None = None,
 ) -> dict:
     """The Vast bootstrap payload (shared builder, arm='vast').
 
@@ -124,6 +135,7 @@ def build_payload(
         arm="vast",
         runtime_secrets=runtime_secrets,
         code_prefix=code_prefix,
+        deadline_at=deadline_at,
     )
 
 
