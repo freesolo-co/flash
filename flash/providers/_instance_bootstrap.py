@@ -559,7 +559,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker_entrypoint"],
             cwd=code_dir,
-            env={**env, "RUN_MODE": mode},
+            env={
+                **env,
+                "RUN_MODE": mode,
+                "FLASH_RUN_DEADLINE_AT": str(worker_deadline_at),
+            },
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -823,7 +827,6 @@ def main() -> int:
         except Exception:
             raise RetriableBootstrapError("failed to fetch run code from HF") from None
         env = build_worker_env(payload)
-        env["FLASH_RUN_DEADLINE_AT"] = str(deadline)
         phase = payload["phase"]
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
             with contextlib.suppress(FileNotFoundError):
