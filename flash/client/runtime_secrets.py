@@ -5,13 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# The global runtime-secret allow-list: keys collected/gated/injected for EVERY run regardless of
-# algorithm. Only WANDB_API_KEY belongs here (optional experiment logging, useful to all arms). The
-# opd teacher key (FIREWORKS_API_KEY) is NOT global: opd auto-declares it as a required environment
-# secret in spec_from_dict, and each gate unions the spec's declared secrets on top of this set
-# (client collection below; server create gate server/_deps.py; worker-env injection
-# providers/_worker.py). Keeping it out of the default means SFT/GRPO workers never
-# receive the teacher key they don't need.
+# only secrets useful to every algorithm belong here. algorithm-specific secrets must be declared
+# by the job spec; client collection, server validation, and worker injection add those declarations.
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
 
