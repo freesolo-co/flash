@@ -2143,7 +2143,14 @@ def _prepare_forward_teacher_targets_impl(
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
                         provider_requests=1 if attempts > 0 else 0,
+                        provider_generations=_nonnegative_int(
+                            getattr(exc, "provider_generations", 0)
+                        ),
                         provider_failures=1 if attempts > 0 else 0,
+                        prompt_tokens=_nonnegative_int(getattr(exc, "prompt_tokens", 0)),
+                        completion_tokens=_nonnegative_int(
+                            getattr(exc, "completion_tokens", 0)
+                        ),
                         attempts=attempts,
                         latency_seconds=_nonnegative_float(getattr(exc, "latency_seconds", 0.0)),
                         ambiguous_paid_requests=_nonnegative_int(
@@ -2171,7 +2178,9 @@ def _prepare_forward_teacher_targets_impl(
             try:
                 successful_stats = _ForwardTeacherBatchStats(
                     provider_requests=1,
-                    provider_generations=1,
+                    provider_generations=max(
+                        1, _nonnegative_int(getattr(result, "provider_generations", 1))
+                    ),
                     prompt_tokens=_nonnegative_int(result.prompt_tokens),
                     completion_tokens=_nonnegative_int(result.completion_tokens),
                     attempts=max(1, _nonnegative_int(result.attempts)),
@@ -2186,9 +2195,20 @@ def _prepare_forward_teacher_targets_impl(
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
                         provider_requests=1,
-                        provider_generations=1,
-                        attempts=1,
-                        ambiguous_paid_requests=1,
+                        provider_generations=max(
+                            1, _nonnegative_int(getattr(result, "provider_generations", 1))
+                        ),
+                        prompt_tokens=_nonnegative_int(getattr(result, "prompt_tokens", 0)),
+                        completion_tokens=_nonnegative_int(
+                            getattr(result, "completion_tokens", 0)
+                        ),
+                        attempts=max(1, _nonnegative_int(getattr(result, "attempts", 1))),
+                        latency_seconds=_nonnegative_float(
+                            getattr(result, "latency_seconds", 0.0)
+                        ),
+                        ambiguous_paid_requests=_nonnegative_int(
+                            getattr(result, "ambiguous_paid_requests", 0)
+                        ),
                     )
                 )
                 raise _ForwardTeacherPreparationError(

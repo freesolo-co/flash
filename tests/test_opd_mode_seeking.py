@@ -286,6 +286,40 @@ def test_forward_teacher_local_validation_does_not_count_provider_request():
     assert caught.value.stats.ambiguous_paid_requests == 0
 
 
+def test_forward_teacher_deterministic_validation_failure_preserves_paid_accounting():
+    from flash.engine.worker.forward_teacher import ForwardTeacherError
+    from flash.engine.worker.opd import (
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
+    )
+
+    class _Client:
+        def generate(self, _messages):
+            raise ForwardTeacherError(
+                "forward_teacher response top logprobs are malformed",
+                attempts=1,
+                latency_seconds=0.25,
+                ambiguous_paid_requests=0,
+                provider_generations=1,
+                prompt_tokens=7,
+                completion_tokens=6,
+            )
+
+    batch = [(None, [{"role": "user", "content": "x"}], [1])]
+    with pytest.raises(_ForwardTeacherPreparationError, match="top logprobs") as caught:
+        _prepare_forward_teacher_targets(_Client(), object(), batch, max_length=8)
+
+    stats = caught.value.stats
+    assert caught.value.retriable is False
+    assert stats.provider_requests == 1
+    assert stats.provider_generations == 1
+    assert stats.provider_failures == 1
+    assert stats.prompt_tokens == 7
+    assert stats.completion_tokens == 6
+    assert stats.attempts == 1
+    assert stats.ambiguous_paid_requests == 0
+
+
 def test_forward_teacher_resource_transient_preserves_opd_accounting():
     from flash.engine.worker.forward_teacher import ForwardTeacherTransientError
     from flash.engine.worker.opd import (
@@ -299,7 +333,10 @@ def test_forward_teacher_resource_transient_preserves_opd_accounting():
                 "forward_teacher provider reported insufficient system resources",
                 attempts=2,
                 latency_seconds=3.5,
-                ambiguous_paid_requests=2,
+                ambiguous_paid_requests=0,
+                provider_generations=2,
+                prompt_tokens=14,
+                completion_tokens=12,
             )
 
     batch = [(None, [{"role": "user", "content": "x"}], [1])]
@@ -310,11 +347,14 @@ def test_forward_teacher_resource_transient_preserves_opd_accounting():
 
     assert caught.value.retriable is True
     assert caught.value.stats.provider_requests == 1
+    assert caught.value.stats.provider_generations == 2
     assert caught.value.stats.provider_failures == 1
+    assert caught.value.stats.prompt_tokens == 14
+    assert caught.value.stats.completion_tokens == 12
     assert caught.value.stats.attempts == 2
     assert caught.value.stats.retries == 1
     assert caught.value.stats.latency_seconds == pytest.approx(3.5)
-    assert caught.value.stats.ambiguous_paid_requests == 2
+    assert caught.value.stats.ambiguous_paid_requests == 0
 
 
 def test_forward_teacher_target_preparation_reports_partial_success_then_transient_failure(monkeypatch):
@@ -1001,7 +1041,7 @@ def test_projection_rejects_invalid_record_kind_with_sanitized_error():
     assert private not in str(caught.value)
 
 
-def test_projection_defensive_collision_bypasses_provider_validation_and_is_order_invariant():
+def test_projection_aggregates_duplicate_raw_support_order_invariantly():
     tokenizer = _ProjectionTokenizer(
         {"P": [1], "Pa": [1, 2], "Pb": [1, 3]},
         {(1,): "P", (1, 2): "Pa", (1, 3): "Pb", (2,): "a", (3,): "b"},
@@ -1012,14 +1052,68 @@ def test_projection_defensive_collision_bypasses_provider_validation_and_is_orde
     projected_second = project_visible_records(tokenizer, prefix_text="P", visible_records=[second])
 
     row = projected_first.rows[0]
+    expected_raw_entropy = -sum(
+        probability * math.log(probability) for probability in (1 / 3, 1 / 2, 1 / 6)
+    )
     assert row.collision_count == 1
+    assert row.reported_top_k_mass == pytest.approx(0.6)
+    assert row.provider_top_k_entropy_nats == pytest.approx(expected_raw_entropy)
     assert row.retained_projected_mass == pytest.approx(0.6)
-    by_id = dict(zip(row.token_ids, row.probabilities, strict=True))
-    assert by_id == pytest.approx({2: 5 / 6, 3: 1 / 6})
+    assert row.rejected_reported_mass == pytest.approx(0.0)
+    assert row.token_ids == projected_second.rows[0].token_ids == (2, 3)
+    assert row.probabilities == pytest.approx((5 / 6, 1 / 6))
+    assert row.probabilities == pytest.approx(projected_second.rows[0].probabilities)
     logits = torch.tensor([[[0.1, -0.2, 0.7, -0.4]]], dtype=torch.float64)
     first_loss = sparse_projected_conditional_cross_entropy(logits, [projected_first])
     second_loss = sparse_projected_conditional_cross_entropy(logits, [projected_second])
     torch.testing.assert_close(first_loss, second_loss, rtol=0, atol=1e-15)
+
+
+def test_projection_counts_duplicate_and_distinct_string_token_id_collisions():
+    tokenizer = _ProjectionTokenizer(
+        {"P": [1], "Pa": [1, 2], "Pá": [1, 2]},
+        {(1,): "P", (1, 2): "Pa", (2,): "a"},
+    )
+    target = project_visible_records(
+        tokenizer,
+        prefix_text="P",
+        visible_records=[_visible_record(0, "a", (("a", 0.4), ("a", 0.2), ("á", 0.3)))],
+    )
+
+    row = target.rows[0]
+    assert row.token_ids == (2,)
+    assert row.probabilities == (1.0,)
+    assert row.support_size == 1
+    assert row.collision_count == 2
+    assert row.reported_top_k_mass == pytest.approx(0.9)
+    assert row.retained_projected_mass == pytest.approx(0.9)
+    assert row.rejected_reported_mass == pytest.approx(0.0)
+    assert row.provider_top_k_entropy_nats == pytest.approx(
+        -sum(probability * math.log(probability) for probability in (4 / 9, 2 / 9, 3 / 9))
+    )
+
+
+def test_projection_preserves_duplicate_mass_when_another_entry_is_dropped():
+    tokenizer = _ProjectionTokenizer(
+        {"P": [1], "Pa": [1, 2], "Pxy": [1, 3, 4]},
+        {(1,): "P", (1, 2): "Pa", (2,): "a"},
+    )
+    target = project_visible_records(
+        tokenizer,
+        prefix_text="P",
+        visible_records=[_visible_record(0, "a", (("a", 0.2), ("a", 0.3), ("xy", 0.1)))],
+    )
+
+    row = target.rows[0]
+    assert row.token_ids == (2,)
+    assert row.probabilities == (1.0,)
+    assert row.collision_count == 1
+    assert row.drop_counts.multi_token == 1
+    assert row.reported_top_k_mass == pytest.approx(0.6)
+    assert row.retained_projected_mass == pytest.approx(0.5)
+    assert row.rejected_reported_mass == pytest.approx(0.1)
+    assert row.unreported_mass == pytest.approx(0.4)
+    assert row.total_dropped_mass == pytest.approx(0.5)
 
 
 def test_projection_accepts_float_noise_above_one_but_rejects_material_mass_and_sanitizes():

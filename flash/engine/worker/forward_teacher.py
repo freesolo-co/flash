@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from threading import Lock
 
@@ -29,12 +29,18 @@ class ForwardTeacherError(RuntimeError):
         attempts: int = 0,
         latency_seconds: float = 0.0,
         ambiguous_paid_requests: int = 0,
+        provider_generations: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
     ) -> None:
         super().__init__(reason)
         self.attempts = max(0, int(attempts))
         latency = float(latency_seconds)
         self.latency_seconds = latency if math.isfinite(latency) and latency >= 0 else 0.0
         self.ambiguous_paid_requests = max(0, int(ambiguous_paid_requests))
+        self.provider_generations = max(0, int(provider_generations))
+        self.prompt_tokens = max(0, int(prompt_tokens))
+        self.completion_tokens = max(0, int(completion_tokens))
 
 
 class ForwardTeacherTransientError(ForwardTeacherError):
@@ -121,6 +127,7 @@ class ForwardTeacherResult:
     latency_seconds: float
     attempts: int
     ambiguous_paid_requests: int = 0
+    provider_generations: int = 1
 
 
 def _parse_semantic_completion(
@@ -254,6 +261,22 @@ class ForwardTeacherClient:
         return min(60.0, max(1.0, delay))
 
     @staticmethod
+    def _validated_usage(payload: object) -> tuple[int, int, int]:
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            raise ForwardTeacherError("forward_teacher response usage is malformed")
+        values = []
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ForwardTeacherError("forward_teacher response usage is malformed")
+            values.append(value)
+        prompt_tokens, completion_tokens, total_tokens = values
+        if completion_tokens <= 0 or prompt_tokens + completion_tokens != total_tokens:
+            raise ForwardTeacherError("forward_teacher response usage arithmetic is invalid")
+        return prompt_tokens, completion_tokens, total_tokens
+
+    @staticmethod
     def _validate(
         payload: object,
         attempts: int,
@@ -312,7 +335,6 @@ class ForwardTeacherClient:
             ):
                 raise ForwardTeacherError("forward_teacher response content logprobs are malformed")
             validated_top = []
-            seen_candidate_tokens: set[str] = set()
             for candidate in top_logprobs:
                 if not isinstance(candidate, dict):
                     raise ForwardTeacherError("forward_teacher response top logprobs are malformed")
@@ -326,11 +348,6 @@ class ForwardTeacherClient:
                     or float(candidate_logprob) > 0
                 ):
                     raise ForwardTeacherError("forward_teacher response top logprobs are malformed")
-                if candidate_token in seen_candidate_tokens:
-                    raise ForwardTeacherError(
-                        "forward_teacher response top logprobs contain duplicate token strings"
-                    )
-                seen_candidate_tokens.add(candidate_token)
                 validated_top.append(
                     ForwardTeacherTopLogprob(
                         token=candidate_token,
@@ -340,13 +357,16 @@ class ForwardTeacherClient:
             realized_candidates = [
                 candidate for candidate in validated_top if candidate.token == token
             ]
-            if len(realized_candidates) != 1:
+            if not realized_candidates:
                 raise ForwardTeacherError("forward_teacher response realized token top-logprob count is invalid")
-            if not math.isclose(
-                realized_candidates[0].logprob,
-                float(logprob),
-                rel_tol=0.0,
-                abs_tol=FORWARD_TEACHER_REALIZED_LOGPROB_ABS_TOLERANCE,
+            if not any(
+                math.isclose(
+                    candidate.logprob,
+                    float(logprob),
+                    rel_tol=0.0,
+                    abs_tol=FORWARD_TEACHER_REALIZED_LOGPROB_ABS_TOLERANCE,
+                )
+                for candidate in realized_candidates
             ):
                 raise ForwardTeacherError("forward_teacher response realized token logprob does not match")
             validated_records.append(
@@ -356,18 +376,9 @@ class ForwardTeacherClient:
                     top_logprobs=tuple(validated_top),
                 )
             )
-        usage = payload.get("usage")
-        if not isinstance(usage, dict):
-            raise ForwardTeacherError("forward_teacher response usage is malformed")
-        values = []
-        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            value = usage.get(name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ForwardTeacherError("forward_teacher response usage is malformed")
-            values.append(value)
-        prompt_tokens, completion_tokens, total_tokens = values
-        if completion_tokens <= 0 or prompt_tokens + completion_tokens != total_tokens:
-            raise ForwardTeacherError("forward_teacher response usage arithmetic is invalid")
+        prompt_tokens, completion_tokens, total_tokens = ForwardTeacherClient._validated_usage(
+            payload
+        )
         # the pinned route counts the full completion, including separately surfaced
         # reasoning, with one logprob record per completion token in 211/211 probes.
         if len(validated_records) != completion_tokens:
@@ -393,7 +404,7 @@ class ForwardTeacherClient:
         )
 
     def generate(self, messages: object) -> ForwardTeacherResult:
-        sanitized: tuple[type[ForwardTeacherError], str, int, float, int] | None = None
+        sanitized: tuple[type[ForwardTeacherError], str, int, float, int, int, int, int] | None = None
         try:
             return self._generate(messages)
         except ForwardTeacherError as exc:
@@ -404,13 +415,28 @@ class ForwardTeacherClient:
                 exc.attempts,
                 exc.latency_seconds,
                 exc.ambiguous_paid_requests,
+                exc.provider_generations,
+                exc.prompt_tokens,
+                exc.completion_tokens,
             )
-        error_type, reason, attempts, latency_seconds, ambiguous_paid_requests = sanitized
+        (
+            error_type,
+            reason,
+            attempts,
+            latency_seconds,
+            ambiguous_paid_requests,
+            provider_generations,
+            prompt_tokens,
+            completion_tokens,
+        ) = sanitized
         raise error_type(
             reason,
             attempts=attempts,
             latency_seconds=latency_seconds,
             ambiguous_paid_requests=ambiguous_paid_requests,
+            provider_generations=provider_generations,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         ) from None
 
     def _generate(self, messages: object) -> ForwardTeacherResult:
@@ -447,6 +473,9 @@ class ForwardTeacherClient:
         }
         started = None
         ambiguous_paid_requests = 0
+        provider_generations = 0
+        prompt_tokens = 0
+        completion_tokens = 0
 
         def deadline_failure(attempts: int) -> ForwardTeacherTransientError:
             latency = self._clock() - started if started is not None else 0.0
@@ -455,6 +484,9 @@ class ForwardTeacherClient:
                 attempts=attempts,
                 latency_seconds=latency,
                 ambiguous_paid_requests=ambiguous_paid_requests,
+                provider_generations=provider_generations,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
 
         def remaining_or_fail(attempts: int) -> float | None:
@@ -470,6 +502,28 @@ class ForwardTeacherClient:
             if delay > 0:
                 self._sleep(delay)
 
+        def failure(
+            error_type,
+            reason: str,
+            *,
+            attempts: int,
+            ambiguous_increment: int,
+            latency_seconds: float | None = None,
+        ):
+            return error_type(
+                reason,
+                attempts=attempts,
+                latency_seconds=(
+                    self._clock() - started if latency_seconds is None else latency_seconds
+                ),
+                ambiguous_paid_requests=(
+                    ambiguous_paid_requests + max(0, int(ambiguous_increment))
+                ),
+                provider_generations=provider_generations,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+
         for attempt in (1, 2):
             remaining = remaining_or_fail(attempt - 1)
             attempt_started = self._pace_attempt(max_delay=remaining)
@@ -481,24 +535,6 @@ class ForwardTeacherClient:
                 FORWARD_TEACHER_URL, data=body, headers=headers, method="POST"
             )
 
-            def failure(
-                error_type,
-                reason: str,
-                *,
-                ambiguous_increment: int,
-                _attempt=attempt,
-                _started=started,
-                _ambiguous_paid_requests=ambiguous_paid_requests,
-            ):
-                return error_type(
-                    reason,
-                    attempts=_attempt,
-                    latency_seconds=self._clock() - _started,
-                    ambiguous_paid_requests=(
-                        _ambiguous_paid_requests + max(0, int(ambiguous_increment))
-                    ),
-                )
-
             try:
                 with self._opener(request, timeout=request_timeout) as response:
                     raw = response.read()
@@ -509,57 +545,81 @@ class ForwardTeacherClient:
                         raise failure(
                             ForwardTeacherTransientError,
                             "forward_teacher response decoding failure",
-                            ambiguous_increment=1,
+                            attempts=attempt,
+                            ambiguous_increment=0,
                         ) from None
-                    ambiguous_paid_requests += 1
                     retry_sleep(10.0, attempt)
                     continue
                 latency = self._clock() - started
                 try:
-                    return self._validate(
+                    result = self._validate(
                         payload,
                         attempt,
                         latency,
                         ambiguous_paid_requests,
                     )
                 except ForwardTeacherError as exc:
+                    try:
+                        usage = self._validated_usage(payload)
+                    except ForwardTeacherError:
+                        usage = None
+                    if usage is not None:
+                        provider_generations += 1
+                        prompt_tokens += usage[0]
+                        completion_tokens += usage[1]
                     if exc.retriable:
                         if attempt == 2:
                             raise failure(
                                 ForwardTeacherTransientError,
                                 str(exc),
-                                ambiguous_increment=1,
+                                attempts=attempt,
+                                ambiguous_increment=0,
+                                latency_seconds=latency,
                             ) from None
-                        ambiguous_paid_requests += 1
                         retry_sleep(10.0, attempt)
                         continue
-                    raise ForwardTeacherError(
+                    raise failure(
+                        ForwardTeacherError,
                         str(exc),
                         attempts=attempt,
+                        ambiguous_increment=0,
                         latency_seconds=latency,
-                        ambiguous_paid_requests=ambiguous_paid_requests + 1,
                     ) from None
+                return replace(
+                    result,
+                    prompt_tokens=prompt_tokens + result.prompt_tokens,
+                    completion_tokens=completion_tokens + result.completion_tokens,
+                    total_tokens=(
+                        prompt_tokens
+                        + completion_tokens
+                        + result.prompt_tokens
+                        + result.completion_tokens
+                    ),
+                    provider_generations=provider_generations + 1,
+                )
             except urllib.error.HTTPError as exc:
                 retryable = exc.code in (408, 409, 425, 429) or 500 <= exc.code <= 599
                 if not retryable:
                     raise failure(
                         ForwardTeacherError,
                         f"forward_teacher HTTP {exc.code}",
+                        attempts=attempt,
                         ambiguous_increment=0,
                     ) from None
                 if attempt == 2:
                     raise failure(
                         ForwardTeacherTransientError,
                         f"forward_teacher HTTP {exc.code}",
-                        ambiguous_increment=1,
+                        attempts=attempt,
+                        ambiguous_increment=0,
                     ) from None
-                ambiguous_paid_requests += 1
                 retry_sleep(self._retry_after(exc.headers), attempt)
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
                 if attempt == 2:
                     raise failure(
                         ForwardTeacherTransientError,
                         "forward_teacher transport failure",
+                        attempts=attempt,
                         ambiguous_increment=1,
                     ) from None
                 ambiguous_paid_requests += 1
@@ -568,11 +628,15 @@ class ForwardTeacherClient:
                 raise failure(
                     ForwardTeacherError,
                     "forward_teacher response is malformed",
-                    ambiguous_increment=1,
+                    attempts=attempt,
+                    ambiguous_increment=0,
                 ) from None
         raise ForwardTeacherTransientError(
             "forward_teacher request attempts exhausted",
             attempts=2,
             latency_seconds=(self._clock() - started) if started is not None else 0.0,
-            ambiguous_paid_requests=max(1, ambiguous_paid_requests),
+            ambiguous_paid_requests=ambiguous_paid_requests,
+            provider_generations=provider_generations,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )

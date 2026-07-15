@@ -168,7 +168,7 @@ def _candidate_projection(
         round_trip_ids = _encode(tokenizer, decoded_full)
     except SoftTargetProjectionError:
         return _CandidateProjection(None, "round_trip_mismatch")
-    if decoded_full != extended_text or round_trip_ids != extended_ids:
+    if round_trip_ids != extended_ids:
         return _CandidateProjection(None, "round_trip_mismatch")
     return _CandidateProjection(token_id, None)
 
@@ -187,12 +187,14 @@ def _increment_drop(counts: ProjectionDropCounts, category: str) -> ProjectionDr
     return ProjectionDropCounts(**values)
 
 
-def _stable_logaddexp(left: float, right: float) -> float:
-    high = max(left, right)
-    low = min(left, right)
+def _stable_logsumexp(values: Sequence[float]) -> float:
+    ordered = tuple(sorted(float(value) for value in values))
+    if not ordered:
+        raise ValueError("logsumexp support must not be empty")
+    high = ordered[-1]
     if high == -math.inf:
         return high
-    return high + math.log1p(math.exp(low - high))
+    return high + math.log(math.fsum(math.exp(value - high) for value in ordered))
 
 
 def _reported_mass(record: ForwardTeacherSemanticRecord) -> float:
@@ -319,7 +321,7 @@ def project_visible_records(
             current_ids = extended_ids
             continue
 
-        log_mass_by_token: dict[int, float] = {}
+        logprobs_by_token: dict[int, list[float]] = {}
         collision_count = 0
         drops = ProjectionDropCounts()
         for candidate in record.top_logprobs:
@@ -340,16 +342,15 @@ def project_visible_records(
             token_id = projected.token_id
             if token_id is None:
                 raise AssertionError("accepted soft-target candidate has no token id")
-            if token_id in log_mass_by_token:
+            if token_id in logprobs_by_token:
                 collision_count += 1
-                log_mass_by_token[token_id] = _stable_logaddexp(
-                    log_mass_by_token[token_id], candidate.logprob
-                )
-            else:
-                log_mass_by_token[token_id] = candidate.logprob
+            logprobs_by_token.setdefault(token_id, []).append(float(candidate.logprob))
 
-        token_ids = tuple(log_mass_by_token)
-        masses = tuple(math.exp(log_mass_by_token[token_id]) for token_id in token_ids)
+        token_ids = tuple(sorted(logprobs_by_token))
+        log_masses = tuple(
+            _stable_logsumexp(logprobs_by_token[token_id]) for token_id in token_ids
+        )
+        masses = tuple(math.exp(log_mass) for log_mass in log_masses)
         raw_retained_mass = math.fsum(masses)
         retained_mass = min(reported_mass, raw_retained_mass)
         rejected_mass = max(0.0, reported_mass - retained_mass)

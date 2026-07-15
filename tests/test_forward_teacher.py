@@ -370,11 +370,18 @@ def test_forward_teacher_rejects_alias_length_empty_and_malformed_contract(paylo
 
     assert caught.value.attempts == 1
     assert caught.value.latency_seconds == pytest.approx(0.25)
-    assert caught.value.ambiguous_paid_requests == 1
+    assert caught.value.ambiguous_paid_requests == 0
+    valid_usage = match != "arithmetic"
+    assert caught.value.provider_generations == int(valid_usage)
+    assert caught.value.prompt_tokens == (7 if valid_usage else 0)
+    assert caught.value.completion_tokens == (6 if valid_usage else 0)
     assert set(vars(caught.value)) == {
         "attempts",
         "latency_seconds",
         "ambiguous_paid_requests",
+        "provider_generations",
+        "prompt_tokens",
+        "completion_tokens",
     }
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
@@ -396,7 +403,9 @@ def test_forward_teacher_retries_insufficient_system_resources_once():
 
     assert calls == [1, 1]
     assert result.attempts == 2
-    assert result.ambiguous_paid_requests == 1
+    assert result.ambiguous_paid_requests == 0
+    assert result.provider_generations == 2
+    assert (result.prompt_tokens, result.completion_tokens, result.total_tokens) == (14, 12, 26)
 
 
 def test_forward_teacher_exhausts_insufficient_system_resources_as_transient():
@@ -419,7 +428,10 @@ def test_forward_teacher_exhausts_insufficient_system_resources_as_transient():
     assert calls == [1, 1]
     assert caught.value.retriable is True
     assert caught.value.attempts == 2
-    assert caught.value.ambiguous_paid_requests == 2
+    assert caught.value.ambiguous_paid_requests == 0
+    assert caught.value.provider_generations == 2
+    assert caught.value.prompt_tokens == 14
+    assert caught.value.completion_tokens == 12
     assert "private" not in str(caught.value)
 
 
@@ -466,10 +478,10 @@ def test_forward_teacher_retries_transient_http_errors_once(code):
     )
     assert calls == [code, code]
     assert result.attempts == 2
-    assert result.ambiguous_paid_requests == 1
+    assert result.ambiguous_paid_requests == 0
 
 
-def test_forward_teacher_preserves_retry_ambiguity_before_permanent_http_failure():
+def test_forward_teacher_keeps_definitive_http_retries_unambiguous():
     calls = []
 
     def opener(*_a, **_k):
@@ -491,7 +503,7 @@ def test_forward_teacher_preserves_retry_ambiguity_before_permanent_http_failure
     assert caught.value.retriable is False
     assert caught.value.attempts == 2
     assert caught.value.latency_seconds == pytest.approx(2.5)
-    assert caught.value.ambiguous_paid_requests == 1
+    assert caught.value.ambiguous_paid_requests == 0
     assert "private prompt" not in str(caught.value)
 
 
@@ -568,7 +580,7 @@ def test_forward_teacher_exhausted_transient_http_error_is_typed_and_bounded(cod
     assert caught.value.retriable is True
     assert caught.value.attempts == 2
     assert caught.value.latency_seconds == pytest.approx(2.75)
-    assert caught.value.ambiguous_paid_requests == 2
+    assert caught.value.ambiguous_paid_requests == 0
     assert calls == [code, code]
 
 
@@ -596,7 +608,7 @@ def test_forward_teacher_retries_http_200_decode_failures_with_start_pacing(firs
     assert sleeps == [10.0]
     assert result.attempts == 2
     assert result.latency_seconds == pytest.approx(10.0)
-    assert result.ambiguous_paid_requests == 1
+    assert result.ambiguous_paid_requests == 0
 
 
 @pytest.mark.parametrize("body", [b"not-json", b'"\xff"'])
@@ -615,7 +627,7 @@ def test_forward_teacher_exhausted_http_200_decode_failure_is_sanitized_and_tran
     assert calls == [1, 1]
     assert caught.value.attempts == 2
     assert caught.value.latency_seconds >= 0
-    assert caught.value.ambiguous_paid_requests == 2
+    assert caught.value.ambiguous_paid_requests == 0
     assert "private prompt" not in str(caught.value)
     assert body.decode("utf-8", errors="ignore") not in str(caught.value)
 
@@ -904,7 +916,7 @@ def test_forward_teacher_semantic_parser_rejects_positive_and_nonfinite_logprobs
         candidates[0] = {**candidates[0], "logprob": value}
         records[record_index] = {**records[record_index], "top_logprobs": candidates}
 
-    with pytest.raises(ForwardTeacherError, match=match):
+    with pytest.raises(ForwardTeacherError, match=match) as caught:
         ForwardTeacherClient(
             "key",
             seed=123,
@@ -912,6 +924,11 @@ def test_forward_teacher_semantic_parser_rejects_positive_and_nonfinite_logprobs
                 _payload(choices=[_choice(logprobs={"content": records})])
             ),
         ).generate([{"role": "user", "content": "x"}])
+
+    assert caught.value.provider_generations == 1
+    assert caught.value.prompt_tokens == 7
+    assert caught.value.completion_tokens == 6
+    assert caught.value.ambiguous_paid_requests == 0
 
 
 @pytest.mark.parametrize(
@@ -970,24 +987,31 @@ def test_forward_teacher_accepts_realized_logprob_within_json_float_tolerance():
     assert result.parsed_completion.visible_content_records[0].token == "visible"
 
 
-def test_forward_teacher_rejects_duplicate_exact_teacher_tokens_and_oversized_top_k():
+def test_forward_teacher_accepts_duplicate_decoded_support_strings():
     duplicate_records = _content_logprobs()
     duplicate_records[3] = {
         **duplicate_records[3],
         "top_logprobs": [
-            {"token": "same", "logprob": -0.7},
-            {"token": "same", "logprob": -0.8},
+            {"token": "visible", "logprob": -0.1},
+            {"token": "visible", "logprob": -0.8},
+            {"token": "shown", "logprob": -2.4},
         ],
     }
-    with pytest.raises(ForwardTeacherError, match="duplicate token strings"):
-        ForwardTeacherClient(
-            "key",
-            seed=123,
-            opener=lambda *_a, **_k: _Response(
-                _payload(choices=[_choice(logprobs={"content": duplicate_records})])
-            ),
-        ).generate([{"role": "user", "content": "x"}])
 
+    result = ForwardTeacherClient(
+        "key",
+        seed=123,
+        opener=lambda *_a, **_k: _Response(
+            _payload(choices=[_choice(logprobs={"content": duplicate_records})])
+        ),
+    ).generate([{"role": "user", "content": "x"}])
+
+    support = result.parsed_completion.visible_content_records[0].top_logprobs
+    assert tuple(candidate.token for candidate in support) == ("visible", "visible", "shown")
+    assert tuple(candidate.logprob for candidate in support) == pytest.approx((-0.1, -0.8, -2.4))
+
+
+def test_forward_teacher_rejects_oversized_top_k():
     oversized_records = _content_logprobs()
     oversized_records[3] = {
         **oversized_records[3],
