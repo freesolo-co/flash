@@ -384,6 +384,57 @@ def _prefetch_error_is_retriable(exc: BaseException) -> bool:
     return False
 
 
+def _is_commit_sha(value: str) -> bool:
+    """True when value is a full 40-hex-char git commit id (an immutable HF revision)."""
+    return len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def resolve_cached_model_commit(model_id: str, revision: str = "") -> str:
+    """Best-effort, offline lookup of the immutable base-model commit already in the HF cache.
+
+    Returns the 40-hex commit that (model_id, revision) resolved to when training loaded the
+    weights, or "" when it cannot be determined. Lets a run record its provable base-weight
+    identity even when a mutable ref (branch/tag) was pinned. Never raises, never hits the network.
+    """
+    from huggingface_hub import snapshot_download
+
+    tried: set[str | None] = set()
+    for cache_dir in (None, _shared_weight_cache_dir()):
+        if cache_dir in tried:
+            continue
+        tried.add(cache_dir)
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=model_id,
+                revision=revision or None,
+                local_files_only=True,
+                cache_dir=cache_dir,
+            )
+        except Exception:
+            continue
+        commit = os.path.basename(os.path.normpath(snapshot_dir))
+        if _is_commit_sha(commit):
+            return commit
+    return ""
+
+
+def write_base_model_provenance(adapter_dir: str, model_id: str, model_revision: str = "") -> None:
+    """Record the resolved immutable base-model commit next to the saved adapter.
+
+    Writes base_model_provenance.json into adapter_dir so the base weights a run trained on are
+    provable from the uploaded adapter, even when a mutable ref was pinned. Best-effort on the
+    resolved commit (null when the cache cannot be read); the record itself always lands.
+    """
+    payload = {
+        "model_id": model_id,
+        "requested_revision": model_revision or None,
+        "resolved_commit": resolve_cached_model_commit(model_id, model_revision) or None,
+    }
+    os.makedirs(adapter_dir, exist_ok=True)
+    with open(os.path.join(adapter_dir, "base_model_provenance.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
 def prefetch_model(model_id: str, revision: str = "") -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
