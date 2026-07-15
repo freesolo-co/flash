@@ -8,11 +8,11 @@ from flash.engine.worker.perf.liger import _liger_default_for_model
 _LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS
 
 
-def _memory_mode(model_id: str, max_length: int = 0) -> bool:
+def _memory_mode(model_id: str, max_length: int = 0, *, revision: str = "") -> bool:
     """True for large models or long contexts; False for small+short (optimize for speed)."""
     if max_length and max_length >= _LONG_CONTEXT_TOKENS:
         return True
-    return _liger_default_for_model(model_id)
+    return _liger_default_for_model(model_id, revision=revision)
 
 
 def grad_checkpointing_on(
@@ -28,9 +28,10 @@ def grad_checkpointing_on(
     fused_ce: bool = False,
     per_device_bs: int = 0,
     lora_rank: int = 32,
+    revision: str = "",
 ) -> bool:
     """Gradient-checkpointing default, with an SFT-only opt-out when GC-off fits."""
-    base = _memory_mode(model_id, max_length)
+    base = _memory_mode(model_id, max_length, revision=revision)
     if not allow_disable:
         return base
     if not base:
@@ -125,6 +126,7 @@ def grpo_sleep_mode(
     thinking: bool = False,
     card_vram_gb: float = 0.0,
     fp8_kv: bool = False,
+    revision: str = "",
 ) -> bool:
     """Whether colocated-vLLM GRPO should offload the rollout engine between steps."""
     from flash.catalog import MODELS
@@ -133,7 +135,7 @@ def grpo_sleep_mode(
     _info = MODELS.get(model_id)
     _sleep_broken = bool(_info is not None and getattr(_info, "sleep_unsupported", False))
     seq_len = grpo_rollout_seq_len(max_length, max_tokens, thinking)
-    if not _memory_mode(model_id, seq_len) and not _sleep_broken:
+    if not _memory_mode(model_id, seq_len, revision=revision) and not _sleep_broken:
         return False
     _fits = None
     if card_vram_gb and card_vram_gb > 0:

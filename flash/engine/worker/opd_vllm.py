@@ -252,6 +252,7 @@ class OpdVllmRolloutEngine:
     max_model_len: int
     temperature: float
     top_p: float
+    model_revision: str = field(default="", kw_only=True)
     stop_sequences: tuple[str, ...] = ()
     # the exact model/tokenizer halt set used for generation and termination classification.
     eos_token_ids: tuple[int, ...] = ()
@@ -303,6 +304,8 @@ class OpdVllmRolloutEngine:
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
         }
+        if self.model_revision:
+            kwargs["revision"] = self.model_revision
         if self.reasoning_parser:
             # Gate the structured-outputs grammar on </think>: with a constraint AND thinking on, vLLM
             # otherwise binds the schema from token 0 and forbids the <think> reasoning phase. Only set

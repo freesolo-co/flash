@@ -127,6 +127,160 @@ def test_nothing_fits_names_constraint(monkeypatch):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
 
 
+def test_allocate_provider_constraint_never_falls_through(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("runpod", "RTX 4090", 0.50, 24)],
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("lambda", "A10", 1.29, 24)],
+    )
+
+    allocation = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        provider="lambda",
+    )
+
+    assert allocation.provider == "lambda"
+    assert allocation.gpu == "A10"
+    assert {candidate.provider for candidate in allocation.candidates} == {"lambda"}
+
+
+def test_allocate_rejects_unconfigured_provider(monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    with pytest.raises(UnsupportedGpuError, match="not configured"):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
+
+
+def test_allocate_exact_type_never_widens_or_escalates(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: [
+            Candidate("runpod", "RTX 4090", 0.50, 24),
+            Candidate("runpod", "H100", 3.29, 80),
+        ],
+    )
+    monkeypatch.setattr(
+        get_provider("lambda"),
+        "live_candidates",
+        lambda need, constraints: [Candidate("lambda", "H100", 2.49, 80)],
+    )
+
+    allocation = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        exact_type="h100",
+    )
+
+    assert allocation.gpu == "H100"
+    assert {candidate.gpu for candidate in allocation.candidates} == {"H100"}
+
+
+def test_allocate_exact_type_enforces_vram_and_provider_support(monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
+    with pytest.raises(UnsupportedGpuError, match="requires at least"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-9B",
+            "grpo",
+            exact_type="RTX 4090",
+        )
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    with pytest.raises(UnsupportedGpuError, match="cannot provision"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            provider="lambda",
+            exact_type="RTX 4090",
+        )
+
+
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provider):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import CapacityLookupError
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: (provider,))
+    monkeypatch.setattr(get_provider(provider), "live_candidates", lambda need, constraints: [])
+
+    with pytest.raises(CapacityLookupError, match="currently has no capacity"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            provider=provider,
+            exact_type="H100",
+        )
+
+
+def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import UnsupportedGpuError
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(get_provider("runpod"), "live_candidates", lambda need, constraints: [])
+
+    with pytest.raises(UnsupportedGpuError, match="no allocatable capacity"):
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            provider="runpod",
+            exact_type="H100",
+        )
+
+
+def test_allocate_exact_type_ignores_ineligible_provider_blip(monkeypatch):
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+
+    calls: list[str] = []
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
+    monkeypatch.setattr(
+        get_provider("runpod"),
+        "live_candidates",
+        lambda need, constraints: calls.append("runpod") or [],
+    )
+
+    def lambda_blip(need, constraints):
+        calls.append("lambda")
+        raise CapacityLookupError("lambda live capacity lookup failed")
+
+    monkeypatch.setattr(get_provider("lambda"), "live_candidates", lambda_blip)
+
+    with pytest.raises(UnsupportedGpuError) as exc_info:
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            exact_type="H200",
+        )
+
+    assert not isinstance(exc_info.value, CapacityLookupError)
+    assert calls == ["runpod"]
+
+
 def _raise_capacity_blip(*a, **k):
     from flash.providers.base import CapacityLookupError
 

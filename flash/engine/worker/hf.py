@@ -45,6 +45,22 @@ def hf_api():
     return HfApi(token=os.environ.get("HF_TOKEN"))
 
 
+def model_revision_kwargs(revision: str = "") -> dict[str, str]:
+    """return the hf revision keyword only for a nonempty pinned revision."""
+    return {"revision": revision} if revision else {}
+
+
+def load_tokenizer(model_id: str, revision: str = ""):
+    """load the student tokenizer under the run's optional model revision."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        **model_revision_kwargs(revision),
+    )
+
+
 def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}"
 
@@ -327,7 +343,48 @@ def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
         return None
 
 
-def prefetch_model(model_id: str) -> float:
+def _prefetch_error_is_retriable(exc: BaseException) -> bool:
+    import httpx
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import Timeout as RequestsTimeout
+
+    if isinstance(exc, (RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError)):
+        return False
+    if isinstance(exc, LocalEntryNotFoundError):
+        return True
+    if isinstance(exc, EntryNotFoundError):
+        return False
+    if isinstance(
+        exc,
+        (
+            RequestsConnectionError,
+            RequestsTimeout,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    ):
+        return True
+    if isinstance(exc, HfHubHTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        if status in {401, 403, 404}:
+            return False
+        return status is None or status == 429 or (
+            isinstance(status, int) and 500 <= status <= 599
+        )
+    return False
+
+
+def prefetch_model(model_id: str, revision: str = "") -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
     When the shared weight-cache volume is attached, downloads onto the mount and symlinks into
@@ -343,17 +400,32 @@ def prefetch_model(model_id: str) -> float:
     with liveness_heartbeat(
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
-        try:
+        def _download() -> None:
             _require_hf_deadline_allowance()
             snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,
                 ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+                **model_revision_kwargs(revision),
             )
             if shared_hub:
                 _link_base_model_into_ephemeral_cache(model_id, shared_hub)
-        except Exception as e:
-            print("prefetch_model warn:", e)
+
+        if revision:
+            try:
+                _download()
+            except Exception as e:
+                if _prefetch_error_is_retriable(e):
+                    detail = sanitize_diagnostic(e, limit=500)
+                    raise RetriableInfraError(
+                        f"pinned model prefetch failed: {detail}"
+                    ) from e
+                raise
+        else:
+            try:
+                _download()
+            except Exception as e:
+                print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
     _w.heartbeat(
         "model_prefetched",

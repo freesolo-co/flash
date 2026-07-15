@@ -24,12 +24,14 @@ def make_lora(model_id: str | None = None):
     targets = "all-linear"
     rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
     alpha = _w.JOB_SPEC.train.lora_alpha if _w.JOB_SPEC else RECIPE.lora.alpha
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     kwargs = {
         "r": rank,
         "lora_alpha": alpha,
         "lora_dropout": RECIPE.lora.dropout,
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
+        "revision": model_revision or None,
     }
     # PiSSA removed: it mutates the base, so its adapter corrupts serve + warm-start on the unmodified base.
     kwargs["init_lora_weights"] = True
@@ -41,6 +43,24 @@ def make_lora(model_id: str | None = None):
     return LoraConfig(**kwargs)
 
 
+def stamp_adapter_provenance(model, model_id: str, model_revision: str = "") -> None:
+    """Validate and stamp the saved default adapter's immutable base identity."""
+    configs = getattr(model, "peft_config", None) or {}
+    config = configs.get("default") if isinstance(configs, dict) else None
+    if config is None:
+        raise RuntimeError("trained model has no default PEFT adapter config")
+    current_base = str(getattr(config, "base_model_name_or_path", "") or "").strip()
+    if current_base and current_base != model_id:
+        raise RuntimeError(
+            f"adapter base model {current_base!r} does not match validated target {model_id!r}"
+        )
+    current_revision = str(getattr(config, "revision", "") or "").strip()
+    if current_revision and current_revision != model_revision:
+        raise RuntimeError("adapter base revision does not match the validated target commit")
+    config.base_model_name_or_path = model_id
+    config.revision = model_revision or None
+
+
 def prepare_fresh_lora_base(
     model_source: str,
     model_id: str,
@@ -48,6 +68,7 @@ def prepare_fresh_lora_base(
     *,
     force: bool = False,
     phase: str = "train",
+    model_revision: str = "",
 ):
     """Prepare the correct base object/path for fresh-LoRA training.
 
@@ -60,7 +81,15 @@ def prepare_fresh_lora_base(
     the checkpoint is VL, so a transient config-probe failure cannot send the fresh stage back to a
     language-only loader.
     """
-    if not (force or is_vl_checkpoint(model_id)):
+    loader_revision = str(model_init_kwargs.get("revision") or "").strip()
+    if loader_revision and model_revision and loader_revision != model_revision:
+        raise ValueError(
+            "fresh adapter architecture probe revision must match from_pretrained revision"
+        )
+    effective_revision = model_revision or loader_revision
+    if effective_revision and not loader_revision:
+        model_init_kwargs = {**model_init_kwargs, "revision": effective_revision}
+    if not (force or is_vl_checkpoint(model_id, revision=effective_revision)):
         return model_source
     from transformers import AutoModelForImageTextToText
 
@@ -108,6 +137,7 @@ def _init_adapter_model(model_id: str):
     returned ``LoraConfig`` — VL fresh runs load the full multimodal base via ``prepare_fresh_lora_base``.
     """
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
     adir = _download_adapter(prefix)
@@ -127,11 +157,19 @@ def _init_adapter_model(model_id: str):
     # Only the base class differs: VL checkpoints load the full multimodal model (so the adapter's
     # language_model.* keys line up with the module tree AND the trainer arch matches the VL vLLM
     # rollout engine); non-VL uses the lighter causal-LM loader.
-    is_vl = adapter_is_vl_warmstart(adir, model_id)
+    is_vl = adapter_is_vl_warmstart(adir, model_id, revision=model_revision)
     if is_vl:
         print("[init-adapter] VL checkpoint: continuing the adapter on the full multimodal base")
     base_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
-    base = base_cls.from_pretrained(model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw)
+    from flash.engine.worker.hf import model_revision_kwargs
+
+    base = base_cls.from_pretrained(
+        model_id,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        **attn_kw,
+        **model_revision_kwargs(model_revision),
+    )
     # PeftModel.from_pretrained builds the wrapper + a trainable "default" adapter, but it doesn't
     # forward the HF `_checkpoint_conversion_mapping`; re-load "default" with key_mapping so a VL
     # checkpoint's keys remap onto the current module tree (mapping is None/no-op for non-VL).

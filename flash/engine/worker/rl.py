@@ -48,7 +48,6 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
 
 def run_rl():
     from datasets import Dataset
-    from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
     seed_training_rngs(_w.SEED)
@@ -70,10 +69,18 @@ def run_rl():
             )
         except Exception as exc:
             print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    download_seconds = (
+        _w.prefetch_model(model_id, revision=model_revision)
+        if model_revision
+        else _w.prefetch_model(model_id)
+    )
     rl = RECIPE.rl
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
     gcfg = _w.grpo_overrides()
@@ -95,13 +102,15 @@ def run_rl():
     # vLLM colocate LLM overrides actually applied (recorded in train_meta for observability — the
     # console is only uploaded on failure, so a SUCCESSFUL run otherwise can't confirm fp8 KV engaged).
     print("[rl] rollout backend: colocated vLLM")
+    if model_revision:
+        _w.patch_trl_colocate_llm_kwargs(revision=model_revision)
     from flash.catalog import MODELS as _CATALOG
 
     _info = _CATALOG.get(model_id)
     # tokenizer + dataset download + per-prompt budget tokenization of the whole dataset can run
     # for minutes with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("rl_data_loading"):
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = _w.load_tokenizer(model_id, revision=model_revision)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -360,7 +369,11 @@ def run_rl():
         "report_to": _w.wandb_report_to(),
         "run_name": _w.wandb_run_name(),
         "seed": backend_seed(_w.SEED),
-        "gradient_checkpointing": grad_checkpointing_on(model_id, vllm_max_len),
+        "gradient_checkpointing": grad_checkpointing_on(
+            model_id,
+            vllm_max_len,
+            revision=model_revision,
+        ),
         # MoE needs REENTRANT recompute: its router re-dispatches tokens on the backward recompute,
         # so non-reentrant's metadata-equality assert fires on the first backward and kills the run
         # (Qwen3.6-35B-A3B). Dense models keep the faster non-reentrant path. See grpo_use_reentrant.
@@ -504,7 +517,10 @@ def run_rl():
     if init_peft is not None:
         _attn = optimal_attn_impl()
         # Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
-        grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+        grpo_kwargs["model_init_kwargs"] = {
+            "dtype": "bfloat16",
+            **_w.model_revision_kwargs(model_revision),
+        }
         if _attn:
             grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
     else:
@@ -631,6 +647,7 @@ def run_rl():
                 model_id,
                 model_init_kwargs,
                 phase="rl",
+                model_revision=model_revision,
             )
             if not isinstance(trainer_model, str):
                 cfg.model_init_kwargs = None
@@ -727,6 +744,7 @@ def run_rl():
         "rl_finalizing", progress=lambda: _steps_run, progress_step=True, keepalive=True
     ):
         adapter_dir = f"{out_dir}/adapter"
+        _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         # Warm-start CONTINUES the one SFT adapter in place, so the saved adapter already carries
