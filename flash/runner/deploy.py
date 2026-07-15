@@ -122,7 +122,10 @@ def _is_preservable_checkpoint_deployment(run_id: str, deployment: object) -> bo
 
 
 def _verified_checkpoint_deployment_for_revision(
-    run_id: str, revision: object, *candidates: object
+    run_id: str,
+    revision: object,
+    *candidates: object,
+    allow_smoke_verified_attempt: bool = False,
 ) -> dict | None:
     if not isinstance(revision, str):
         return None
@@ -136,13 +139,14 @@ def _verified_checkpoint_deployment_for_revision(
         revision_run_id, revision_step, hf_revision
     ):
         return None
-    from flash.runner.verified_revisions import read_verified_adapter_revisions
+    if not allow_smoke_verified_attempt:
+        from flash.runner.verified_revisions import read_verified_adapter_revisions
 
-    try:
-        if revision not in read_verified_adapter_revisions(run_id):
+        try:
+            if revision not in read_verified_adapter_revisions(run_id):
+                return None
+        except Exception:
             return None
-    except Exception:
-        return None
 
     candidate = next(
         (
@@ -181,6 +185,9 @@ def _preservable_checkpoint_deployment(
             live_alias_target,
             deployment,
             deployment.get("previous_deployment"),
+            allow_smoke_verified_attempt=(
+                deployment.get("adapter_revision") == live_alias_target
+            ),
         )
     if _is_preservable_checkpoint_deployment(run_id, deployment):
         return dict(deployment)
@@ -254,14 +261,36 @@ def cancel_run(run_id: str) -> RunStatus:
         if not lock_acquired:
             prelock_status = get_status(run_id)
             _, prelock_active = _deployment_state_and_requires_revocation(prelock_status.deployment)
-            unknown_prelock_outcome = isinstance(
-                prelock_status.deployment, dict
-            ) and prelock_status.deployment.get("activation_outcome_unknown")
-            preserve_prelock_checkpoint = (
-                prelock_status.state != "dry_run"
-                and _should_preserve_checkpoint_deployment(run_id, prelock_status.deployment)
+            prelock_deployment = (
+                dict(prelock_status.deployment)
+                if isinstance(prelock_status.deployment, dict)
+                else None
             )
-            if prelock_active and not preserve_prelock_checkpoint and not unknown_prelock_outcome:
+            unknown_prelock_outcome = bool(
+                prelock_deployment and prelock_deployment.get("activation_outcome_unknown")
+            )
+            preserved_prelock_checkpoint = (
+                None
+                if prelock_status.state == "dry_run"
+                else _preservable_checkpoint_deployment(run_id, prelock_deployment)
+            )
+            if (
+                prelock_active
+                and preserved_prelock_checkpoint is not None
+                and not unknown_prelock_outcome
+            ):
+                try:
+                    mark_checkpoint_deployed(
+                        run_id,
+                        preserved_prelock_checkpoint,
+                        verification_generation=verified_adapter_revision_generation(run_id),
+                        owner_deployment=prelock_deployment,
+                    )
+                except Exception as exc:
+                    raise DeploymentStatePersistenceError(
+                        run_id, str(exc), backend_outcome="not_attempted"
+                    ) from exc
+            elif prelock_active and not unknown_prelock_outcome:
                 try:
                     mark_deployment_revocation_failed(
                         run_id,

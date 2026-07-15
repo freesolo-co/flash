@@ -984,6 +984,69 @@ def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
     assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
 
 
+def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+    import flash.server._locks as locks
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-contended-fence"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    status = orch.get_status(run_id)
+    status.state = "deployed"
+    attempted = {
+        "state": "smoke_testing",
+        "requested_at": 456.0,
+        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "previous_deployment": previous,
+        "verification_generation": orch.verified_adapter_revision_generation(run_id),
+    }
+    status.deployment = attempted
+    orch._save_status(status)
+    stale_commit = {**attempted, "state": "ready"}
+    lock_events = []
+
+    class ContendedLock:
+        held = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if not blocking:
+                lock_events.append("contended")
+                return False
+            lock_events.append("waiting")
+            fenced = orch.get_status(run_id)
+            assert fenced.deployment == previous
+            stale = orch.mark_deployed(
+                run_id,
+                stale_commit,
+                expect_state="deployed",
+                verification_generation=attempted["verification_generation"],
+            )
+            assert stale.deployment == previous
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held is True
+            self.held = False
+            lock_events.append("released")
+
+    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("the verified predecessor must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert lock_events == ["contended", "waiting", "released"]
+    assert out.state == "cancelled"
+    assert out.deployment == previous
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
 def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.serve.deploy as deploy
@@ -1201,7 +1264,7 @@ def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_
 
 
 @pytest.mark.parametrize("live_verified", [False, True])
-def test_cancel_unknown_outcome_uses_verified_live_alias_instead_of_stale_previous(
+def test_cancel_unknown_outcome_commits_attempted_live_checkpoint(
     tmp_path, monkeypatch, live_verified
 ):
     import flash.runner as orch
@@ -1221,33 +1284,64 @@ def test_cancel_unknown_outcome_uses_verified_live_alias_instead_of_stale_previo
     status.deployment = {
         "state": "reconciling",
         "requested_at": 789.0,
+        "adapter_revision": live_revision,
+        "checkpoint_step": 20,
         "activation_outcome_unknown": True,
         "previous_deployment": stale_previous,
     }
     orch._save_status(status)
-    undeploys = []
     monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _target: pytest.fail("the attempted live checkpoint must remain serving"),
+    )
 
     out = orch.cancel_run(run_id)
 
     assert out.state == "cancelled"
-    assert out.deployment != stale_previous
-    if live_verified:
-        assert undeploys == []
-        assert out.deployment == {
-            "state": "ready",
-            "adapter_revision": live_revision,
-            "checkpoint_step": 20,
-        }
-        assert orch.read_verified_adapter_revisions(run_id) == frozenset(
-            {stale_previous["adapter_revision"], live_revision}
-        )
-    else:
-        assert undeploys == [run_id]
-        assert out.deployment["state"] == "undeployed"
-        assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+    assert out.deployment == {
+        "state": "ready",
+        "requested_at": 789.0,
+        "adapter_revision": live_revision,
+        "checkpoint_step": 20,
+    }
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset(
+        {stale_previous["adapter_revision"], live_revision}
+    )
+
+
+def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-live-divergent"
+    previous = _ready_checkpoint(orch, run_id, 10)
+    attempted_revision = _checkpoint_revision(run_id, 20, "b")
+    divergent_revision = _checkpoint_revision(run_id, 30, "c")
+    status = orch.get_status(run_id)
+    status.deployment = {
+        "state": "reconciling",
+        "requested_at": 789.0,
+        "adapter_revision": attempted_revision,
+        "checkpoint_step": 20,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    orch._save_status(status)
+    undeploys = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: divergent_revision)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    out = orch.cancel_run(run_id)
+
+    assert undeploys == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 @pytest.mark.parametrize("alias_result", ["missing", "disabled", "error"])
