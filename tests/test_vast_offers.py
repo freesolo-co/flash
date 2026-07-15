@@ -187,7 +187,10 @@ def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
 
     assert captured["min_vram_mb"] == int(40 * 1024 * vast._SEARCH_VRAM_SLACK)
     assert captured["max_vram_mb"] == 40 * 1024
-    assert captured["gpu_names"] == ("A100 SXM4", "A100 PCIE")
+    # Exact A100 SXM 40GB drops the "A100 PCIE" capacity alias: a PCIe board canonicalizes to the distinct
+    # "A100 PCIe" class, so seeding it would rent a board the box's device attestation (verify_gpu) then
+    # rejects. The alias is still honored for NON-exact capacity capture via vast_gpu_for_offer (above).
+    assert captured["gpu_names"] == ("A100 SXM4",)
 
     captured.clear()
     vast.usable_offers(24, disk_gb=60)

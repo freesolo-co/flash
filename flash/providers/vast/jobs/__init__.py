@@ -56,6 +56,8 @@ from flash.providers.base import (
     GPU_INFO,
     PollResult,
     UnreconciledCreateError,
+    UnsupportedGpuError,
+    canonical_gpu,
     min_cuda_modern,
     vast_gpu_for_offer,
 )
@@ -105,6 +107,26 @@ def _effective_disk_gb(spec) -> float:
     return max(float(spec.gpu.disk_gb), MIN_DISK_GB)
 
 
+def _exact_search_aliases(info) -> tuple[str, ...]:
+    """Vast alias spellings safe to seed an EXACT-class offer search with.
+
+    An exact pin is attested on the box against the live device name (``verify_gpu`` -> ``canonical_gpu``).
+    Keep only alias spellings that canonicalize back to THIS class, so the search never pulls a board that
+    attestation would then reject: "A100 PCIE" (kept as fungible A100 SXM 40GB capacity for NON-exact runs
+    by ``vast_gpu_for_offer``) names a PCIe board that canonicalizes to the distinct "A100 PCIe" class, so
+    it would be rented then fail an exact A100-SXM-40GB attestation; H100's "H100 PCIE" canonicalizes to
+    "H100" and stays fungible. Ambiguous/unknown spellings (``canonical_gpu`` raises) are dropped.
+    """
+    kept: list[str] = []
+    for alias in info.vast_aliases:
+        try:
+            if canonical_gpu(alias) == info.name:
+                kept.append(alias)
+        except UnsupportedGpuError:
+            pass
+    return tuple(kept)
+
+
 def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
@@ -130,8 +152,11 @@ def usable_offers(
     exact_info = GPU_INFO.get(exact_type) if exact_type else None
     if exact_type and exact_info is None:
         raise ValueError(f"unknown exact Vast GPU class {exact_type!r}")
+    # Seed an exact search only with spellings that will attest as this class on the box (the ambiguous
+    # vast_name itself is always kept and disambiguated by the max_vram_mb ceiling below); a cross-
+    # architecture capacity alias would rent a board that live-device attestation then rejects.
     gpu_names = (
-        (exact_info.vast_name, *exact_info.vast_aliases)
+        (exact_info.vast_name, *_exact_search_aliases(exact_info))
         if exact_info is not None and exact_info.vast_name
         else ()
     )
