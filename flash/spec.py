@@ -79,6 +79,33 @@ def _opt_float(value: Any) -> float | None:
     return float(value)
 
 
+def _seed(value: Any) -> int:
+    """Parse one bounded nonnegative per-run seed without coercing floats or bools."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("seed must be an integer")
+    if value < 0 or value > 2**63 - 1:
+        raise ValueError("seed must be between 0 and 9223372036854775807")
+    return value
+
+
+def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
+    """Parse a strictly increasing list or tuple of positive integers."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be a list of integers")
+    out: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise TypeError(f"{name} entries must be integers")
+        if item <= 0:
+            raise ValueError(f"{name} entries must be positive")
+        out.append(item)
+    if out != sorted(set(out)):
+        raise ValueError(f"{name} must be strictly increasing with no duplicates")
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class EnvironmentSpec:
     id: str = ""
@@ -93,9 +120,7 @@ class EnvironmentSpec:
     resolved_sha: str = ""
 
 
-# The single RNG seed every training job uses. Flash trains exactly one adapter per run (no
-# multi-seed); the value is fixed so runs are reproducible and the artifact path carries no seed
-# segment. It still reaches the worker via the ``SEED`` env (data shuffling / init in sft.py/rl.py).
+# default for old payloads and callers that do not select a per-run seed.
 FIXED_SEED = 42
 
 
@@ -118,6 +143,7 @@ class TrainSpec:
     max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     save_every: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_steps: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    checkpoint_landmarks: tuple[int, ...] = field(default=(), metadata={"introduced_in": "0.2.57"})
     max_examples: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     group_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -135,6 +161,19 @@ class TrainSpec:
     # Canonical JSON of vLLM StructuredOutputsParams kwargs ("" = unconstrained). Normalized once
     # at parse time (schema/fields.py) so worker/hub/API hops carry one stable string form.
     structured_outputs: str = field(default="", metadata={"introduced_in": "0.2.56"})
+
+    def __post_init__(self) -> None:
+        landmarks = parse_positive_int_tuple(
+            self.checkpoint_landmarks, name="train.checkpoint_landmarks"
+        )
+        object.__setattr__(self, "checkpoint_landmarks", landmarks)
+        max_steps = int(self.max_steps or 0)
+        if landmarks and max_steps <= 0:
+            raise ValueError("train.checkpoint_landmarks requires positive train.max_steps")
+        if landmarks and landmarks[-1] > max_steps:
+            raise ValueError(
+                "train.checkpoint_landmarks cannot contain a step beyond train.max_steps"
+            )
 
 
 @dataclass(frozen=True)
@@ -163,12 +202,16 @@ class JobSpec:
     train: TrainSpec = field(default_factory=TrainSpec)
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
+    seed: int = FIXED_SEED
     # Per-run env overrides forwarded to the GPU worker; never put secrets here.
     worker_env: dict[str, str] = field(default_factory=dict)
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
+
+    def __post_init__(self) -> None:
+        _seed(self.seed)
 
     @property
     def phase(self) -> str:
@@ -223,6 +266,9 @@ class JobSpec:
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=_opt_int(train.get("max_steps")),
+                checkpoint_landmarks=parse_positive_int_tuple(
+                    train.get("checkpoint_landmarks"), name="train.checkpoint_landmarks"
+                ),
                 max_examples=_opt_int(train.get("max_examples")),
                 group_size=_opt_int(train.get("group_size")),
                 temperature=_opt_float(train.get("temperature")),
@@ -246,6 +292,7 @@ class JobSpec:
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
             ),
             run_id=data.get("run_id", "local"),
+            seed=_seed(data.get("seed", FIXED_SEED)),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=coerce_bool(data.get("thinking", False)),
