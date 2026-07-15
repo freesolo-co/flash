@@ -277,9 +277,13 @@ def test_forward_teacher_local_validation_does_not_count_provider_request():
     )
     batch = [(None, [{"role": "user", "content": ["not a string"]}], [1])]
 
-    with pytest.raises(_ForwardTeacherPreparationError, match="messages are invalid") as caught:
+    with pytest.raises(
+        _ForwardTeacherPreparationError,
+        match="no accepted projected targets",
+    ) as caught:
         _prepare_forward_teacher_targets(client, object(), batch, max_length=8)
 
+    assert caught.value.stats.dropped_provider_error_targets == 1
     assert caught.value.stats.provider_requests == 0
     assert caught.value.stats.provider_failures == 0
     assert caught.value.stats.attempts == 0
@@ -306,11 +310,15 @@ def test_forward_teacher_deterministic_validation_failure_preserves_paid_account
             )
 
     batch = [(None, [{"role": "user", "content": "x"}], [1])]
-    with pytest.raises(_ForwardTeacherPreparationError, match="top logprobs") as caught:
+    with pytest.raises(
+        _ForwardTeacherPreparationError,
+        match="no accepted projected targets",
+    ) as caught:
         _prepare_forward_teacher_targets(_Client(), object(), batch, max_length=8)
 
     stats = caught.value.stats
     assert caught.value.retriable is False
+    assert stats.dropped_provider_error_targets == 1
     assert stats.provider_requests == 1
     assert stats.provider_generations == 1
     assert stats.provider_failures == 1
@@ -389,10 +397,13 @@ def test_forward_teacher_target_preparation_reports_partial_success_then_transie
             )
 
     target = _loss_target(_loss_row(0, (2,), (1.0,)))
-    monkeypatch.setattr(
-        "flash.engine.worker.opd._build_projected_target",
-        lambda *_args, **_kwargs: target,
-    )
+
+    def _build(_tok, messages, *_args, **_kwargs):
+        if messages[0]["content"] == "a":
+            raise RuntimeError("soft-target realized prefix retokenization")
+        return target
+
+    monkeypatch.setattr("flash.engine.worker.opd._build_projected_target", _build)
     batch = [(None, [{"role": "user", "content": value}], [1]) for value in ("a", "b", "c")]
 
     with pytest.raises(_ForwardTeacherPreparationError, match="transport failure") as caught:
@@ -402,8 +413,9 @@ def test_forward_teacher_target_preparation_reports_partial_success_then_transie
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert caught.value.retriable is True
-    assert stats.logical_accepted_targets == 2
-    assert stats.supervised_positions == 2
+    assert stats.logical_accepted_targets == 1
+    assert stats.dropped_projection_error_targets == 1
+    assert stats.supervised_positions == 1
     assert stats.provider_requests == 3
     assert stats.provider_generations == 2
     assert stats.provider_failures == 1
@@ -446,7 +458,10 @@ def test_forward_teacher_target_preparation_accounts_provider_before_local_targe
         ),
     )
 
-    with pytest.raises(_ForwardTeacherPreparationError, match="boundary mismatch") as caught:
+    with pytest.raises(
+        _ForwardTeacherPreparationError,
+        match="no accepted projected targets",
+    ) as caught:
         _prepare_forward_teacher_targets(
             _Client(),
             object(),
@@ -457,6 +472,7 @@ def test_forward_teacher_target_preparation_accounts_provider_before_local_targe
     stats = caught.value.stats
     assert caught.value.retriable is False
     assert stats.logical_accepted_targets == 0
+    assert stats.dropped_projection_error_targets == 1
     assert stats.supervised_positions == 0
     assert stats.provider_requests == 1
     assert stats.provider_generations == 1
@@ -468,6 +484,140 @@ def test_forward_teacher_target_preparation_accounts_provider_before_local_targe
     assert stats.latency_seconds == pytest.approx(0.75)
     assert private not in str(caught.value)
     assert private not in repr(caught.value.runtime_telemetry)
+
+
+def test_forward_teacher_projection_drop_keeps_scheduled_denominator_and_valid_gradient(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.opd as opd
+
+    valid = _loss_target(_loss_row(0, (1,), (1.0,), provider_entropy=0.8))
+    private = "private realized forward response"
+
+    class _Client:
+        def generate(self, _messages):
+            return SimpleNamespace(
+                content=private,
+                parsed_completion=SimpleNamespace(visible_content_records=()),
+                prompt_tokens=5,
+                completion_tokens=3,
+                attempts=1,
+                latency_seconds=0.2,
+            )
+
+    def _build(_tok, messages, *_args, **_kwargs):
+        if messages[0]["content"] == "drop":
+            raise RuntimeError("soft-target realized prefix retokenization")
+        return valid
+
+    monkeypatch.setattr(opd, "_build_projected_target", _build)
+    batch = [
+        (None, [{"role": "user", "content": "drop"}], [1]),
+        (None, [{"role": "user", "content": "keep"}], [1]),
+    ]
+
+    targets, stats = opd._prepare_forward_teacher_targets(
+        _Client(), object(), batch, max_length=8
+    )
+
+    assert len(targets) == 2
+    assert targets[0].rows == ()
+    assert targets[1] is valid
+    assert stats.logical_accepted_targets == 1
+    assert stats.dropped_projection_error_targets == 1
+    assert stats.supervised_positions == 1
+    assert stats.provider_requests == 2
+    assert stats.provider_generations == 2
+    assert private not in repr(stats.runtime_telemetry())
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(use_cache=True)
+            self.values = torch.nn.Parameter(torch.zeros(1, 1, 3, dtype=torch.float64))
+
+        def forward(self, input_ids, **_kwargs):
+            return SimpleNamespace(logits=self.values.expand(input_ids.shape[0], -1, -1))
+
+    mixed_model = _Model()
+    mixed_loss, mixed_rows = opd._backward_projected_targets(
+        mixed_model,
+        targets,
+        torch.device("cpu"),
+        SimpleNamespace(pad_token_id=0),
+        coef=1.0,
+        microbatch_size=2,
+    )
+    single_model = _Model()
+    single_loss, single_rows = opd._backward_projected_targets(
+        single_model,
+        [valid],
+        torch.device("cpu"),
+        SimpleNamespace(pad_token_id=0),
+        coef=1.0,
+        microbatch_size=1,
+    )
+
+    assert mixed_rows == single_rows == 1
+    assert mixed_loss == pytest.approx(single_loss / 2)
+    torch.testing.assert_close(mixed_model.values.grad, single_model.values.grad / 2)
+
+
+def test_forward_teacher_non_retriable_drop_keeps_other_prompt_and_accounting(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.opd as opd
+    from flash.engine.worker.forward_teacher import ForwardTeacherError
+
+    valid = _loss_target(_loss_row(0, (1,), (1.0,), provider_entropy=0.8))
+    calls = 0
+
+    class _Client:
+        def generate(self, _messages):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ForwardTeacherError(
+                    "forward_teacher realized token is absent from top logprobs",
+                    attempts=1,
+                    latency_seconds=0.3,
+                    provider_generations=1,
+                    prompt_tokens=7,
+                    completion_tokens=4,
+                )
+            return SimpleNamespace(
+                content="valid",
+                parsed_completion=SimpleNamespace(visible_content_records=()),
+                prompt_tokens=5,
+                completion_tokens=2,
+                attempts=1,
+                latency_seconds=0.2,
+            )
+
+    monkeypatch.setattr(opd, "_build_projected_target", lambda *_a, **_k: valid)
+    targets, stats = opd._prepare_forward_teacher_targets(
+        _Client(),
+        object(),
+        [
+            (None, [{"role": "user", "content": "drop"}], [1]),
+            (None, [{"role": "user", "content": "keep"}], [1]),
+        ],
+        max_length=8,
+    )
+
+    assert len(targets) == 2
+    assert targets[0].rows == ()
+    assert targets[1] is valid
+    assert stats.logical_accepted_targets == 1
+    assert stats.dropped_provider_error_targets == 1
+    assert stats.supervised_positions == 1
+    assert stats.provider_requests == 2
+    assert stats.provider_generations == 2
+    assert stats.provider_failures == 1
+    assert stats.prompt_tokens == 12
+    assert stats.completion_tokens == 6
+    assert stats.attempts == 2
+    assert stats.latency_seconds == pytest.approx(0.5)
 
 
 class _ProjectionTokenizer:
@@ -659,10 +809,13 @@ def test_projected_target_telemetry_and_backward_count_only_entropy_active_rows(
     torch.testing.assert_close(model.values.grad[0, :2], torch.zeros(2, 4, dtype=torch.float64))
 
 
-def test_projected_target_preparation_accepts_all_unprojectable_visible_target_with_telemetry():
+def test_projected_target_preparation_rejects_all_unprojectable_visible_target_with_telemetry():
     from types import SimpleNamespace
 
-    from flash.engine.worker.opd import _prepare_forward_teacher_targets
+    from flash.engine.worker.opd import (
+        _ForwardTeacherPreparationError,
+        _prepare_forward_teacher_targets,
+    )
 
     class _Tok(_ProjectionTokenizer):
         pad_token_id = 0
@@ -690,19 +843,19 @@ def test_projected_target_preparation_accepts_all_unprojectable_visible_target_w
             )
 
     messages = [{"role": "user", "content": "private prompt"}]
-    targets, stats = _prepare_forward_teacher_targets(
-        _Client(),
-        tokenizer,
-        [(None, messages, [1])],
-        max_length=8,
-    )
+    with pytest.raises(
+        _ForwardTeacherPreparationError,
+        match="no entropy-active projected rows",
+    ) as caught:
+        _prepare_forward_teacher_targets(
+            _Client(),
+            tokenizer,
+            [(None, messages, [1])],
+            max_length=8,
+        )
 
-    assert len(targets) == 1
-    target = targets[0]
-    assert target.eligible_row_count == 0
-    assert target.visible_position_count == 1
-    assert target.rows == ()
-    assert target.drop_counts.multi_token == 1
+    stats = caught.value.stats
+    assert caught.value.retriable is False
     assert stats.logical_accepted_targets == 1
     assert stats.supervised_positions == 0
     assert stats.visible_provider_positions == 1

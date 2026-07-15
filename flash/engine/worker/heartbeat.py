@@ -81,6 +81,8 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 _FORWARD_TEACHER_RUNTIME_TELEMETRY_FIELDS = frozenset(
     {
         "forward_teacher_logical_accepted_targets",
+        "forward_teacher_dropped_provider_error_targets",
+        "forward_teacher_dropped_projection_error_targets",
         "forward_teacher_supervised_positions",
         "forward_teacher_visible_provider_positions",
         "forward_teacher_eligible_projected_rows",

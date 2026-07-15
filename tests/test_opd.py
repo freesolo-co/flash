@@ -1534,6 +1534,8 @@ def test_hybrid_runtime_settings_require_coef_and_reject_reverse_only_injection(
 def _forward_teacher_runtime_telemetry(**overrides):
     telemetry = {
         "forward_teacher_logical_accepted_targets": 0,
+        "forward_teacher_dropped_provider_error_targets": 0,
+        "forward_teacher_dropped_projection_error_targets": 0,
         "forward_teacher_supervised_positions": 0,
         "forward_teacher_visible_provider_positions": 0,
         "forward_teacher_eligible_projected_rows": 0,
@@ -1676,7 +1678,7 @@ def test_hybrid_opd_merges_prior_step_accounting_before_later_transient_failure(
     assert "private target" not in repr(caught.value.runtime_telemetry)
 
 
-def test_hybrid_opd_keeps_permanent_forward_teacher_failure_non_retriable(monkeypatch):
+def test_hybrid_opd_drops_permanent_forward_teacher_failure_then_rejects_empty_batch(monkeypatch):
     from flash.engine.worker.forward_teacher import ForwardTeacherError
     from flash.engine.worker.opd import _ForwardTeacherPreparationError
     from flash.engine.worker.perf import RetriableInfraError
@@ -1698,10 +1700,16 @@ def test_hybrid_opd_keeps_permanent_forward_teacher_failure_non_retriable(monkey
         ),
     )
 
-    with pytest.raises(_ForwardTeacherPreparationError, match="forward_teacher HTTP 400") as caught:
+    with pytest.raises(
+        _ForwardTeacherPreparationError,
+        match="no accepted projected targets",
+    ) as caught:
         opd_mod.run_opd()
     assert not isinstance(caught.value, RetriableInfraError)
     assert caught.value.retriable is False
+    assert caught.value.runtime_telemetry[
+        "forward_teacher_dropped_provider_error_targets"
+    ] == 1
     assert caught.value.runtime_telemetry["forward_teacher_provider_requests"] == 1
     assert caught.value.runtime_telemetry["forward_teacher_provider_failures"] == 1
     assert caught.value.runtime_telemetry["forward_teacher_attempts"] == 1
@@ -1836,23 +1844,19 @@ def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypa
     assert opd_mod.OpdVllmRolloutEngine.instances[0].sync_count == 1
 
 
-def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update(monkeypatch):
+def test_projected_soft_all_inactive_forward_target_aborts_before_reverse_update(monkeypatch):
     torch = pytest.importorskip("torch")
-    from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
     from flash.engine.worker.opd_soft_targets import ProjectedTarget, ProjectionDropCounts
 
-    def _one_update(*, model, **_kwargs):
-        return SampleResult(
-            loss=model.w.float().sum() * 1e-6,
-            teacher_status="ok",
-            coverage=1.0,
-            gen_tokens=1,
-            teacher_tokens=1,
-        )
+    reverse_calls = []
+
+    def _unexpected_reverse(**_kwargs):
+        reverse_calls.append(True)
+        pytest.fail("reverse rollout must not run without an active forward target")
 
     opd_mod = _opd_harness(
         monkeypatch,
-        sample_result=_one_update,
+        sample_result=_unexpected_reverse,
         teacher_model="accounts/fireworks/models/deepseek-v4-pro",
     )
     _patch_hybrid_forward_teacher(monkeypatch)
@@ -1864,51 +1868,25 @@ def test_projected_soft_all_empty_forward_target_preserves_atomic_reverse_update
         eligible_row_count=0,
         drop_counts=ProjectionDropCounts(multi_token=1),
     )
+    monkeypatch.setattr(opd_mod, "_build_projected_target", lambda *_a, **_k: empty)
+    optimizer_steps = []
     monkeypatch.setattr(
-        opd_mod,
-        "_prepare_forward_teacher_targets",
-        lambda *_args, **_kwargs: (
-            [empty],
-            _ForwardTeacherBatchStats(
-                logical_accepted_targets=1,
-                supervised_positions=0,
-                visible_provider_positions=1,
-                eligible_projected_rows=0,
-                projected_drop_multi_token=1,
-                dropped_mass_sum=1.0,
-                provider_requests=1,
-                provider_generations=1,
-                attempts=1,
-            ),
-        ),
+        torch.optim.AdamW,
+        "step",
+        lambda *_args, **_kwargs: optimizer_steps.append(True),
     )
-    events = []
-    clip_gradient_sums = []
-    real_clip = torch.nn.utils.clip_grad_norm_
-    real_step = torch.optim.AdamW.step
 
-    def _clip(parameters, max_norm, *args, **kwargs):
-        params = list(parameters)
-        clip_gradient_sums.append(
-            sum(float(param.grad.abs().sum()) for param in params if param.grad is not None)
-        )
-        events.append("clip")
-        return real_clip(params, max_norm, *args, **kwargs)
+    with pytest.raises(
+        opd_mod._ForwardTeacherPreparationError,
+        match="no entropy-active projected rows",
+    ) as caught:
+        opd_mod.run_opd()
 
-    def _step(optimizer, *args, **kwargs):
-        events.append("step")
-        return real_step(optimizer, *args, **kwargs)
-
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _clip)
-    monkeypatch.setattr(torch.optim.AdamW, "step", _step)
-    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
-    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
-
-    opd_mod.run_opd()
-
-    assert events == ["clip", "step"]
-    assert len(clip_gradient_sums) == 1
-    assert clip_gradient_sums[0] > 0
+    assert reverse_calls == []
+    assert optimizer_steps == []
+    assert caught.value.retriable is False
+    assert caught.value.runtime_telemetry["forward_teacher_logical_accepted_targets"] == 1
+    assert caught.value.runtime_telemetry["forward_teacher_supervised_positions"] == 0
 
 
 def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeypatch):
@@ -1989,12 +1967,15 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
 
     with pytest.raises(
         opd_mod._ForwardTeacherPreparationError,
-        match="projected target rollout prompt mismatch",
-    ):
+        match="no accepted projected targets",
+    ) as caught:
         opd_mod.run_opd()
 
     assert [kind for kind, _value in forward_teacher_calls] == ["init", "generate"]
     assert optimizer_steps == []
+    assert caught.value.runtime_telemetry[
+        "forward_teacher_dropped_projection_error_targets"
+    ] == 1
 
 
 def test_projected_soft_uses_qwen_generation_prefix_for_visible_targets():
@@ -4738,6 +4719,77 @@ def test_backward_projected_targets_retains_empty_target_in_outer_mean():
     assert eligible_rows == mixed_rows == 1
     assert mixed_loss == pytest.approx(eligible_loss / 2)
     torch.testing.assert_close(mixed_model.w.grad, eligible_grad / 2, rtol=0, atol=0)
+
+
+def test_backward_projected_targets_retains_entropy_inactive_targets_in_sequence_mean():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd import _backward_projected_targets
+    from flash.engine.worker.opd_soft_targets import (
+        ProjectedPosition,
+        ProjectedTarget,
+        ProjectionDropCounts,
+    )
+
+    def _target(provider_entropy):
+        row = ProjectedPosition(
+            provider_record_index=0,
+            logits_index=0,
+            token_ids=(1, 2),
+            probabilities=(0.4, 0.6),
+            reported_top_k_mass=1.0,
+            retained_projected_mass=1.0,
+            rejected_reported_mass=0.0,
+            unreported_mass=0.0,
+            total_dropped_mass=0.0,
+            support_size=2,
+            collision_count=0,
+            conditional_entropy_nats=0.0,
+            drop_counts=ProjectionDropCounts(),
+            provider_top_k_entropy_nats=provider_entropy,
+        )
+        return ProjectedTarget(
+            input_ids=(1,),
+            positions=(row,),
+            rows=(row,),
+            visible_position_count=1,
+            eligible_row_count=1,
+            drop_counts=ProjectionDropCounts(),
+        )
+
+    active = _target(0.6)
+    inactive = _target(0.4)
+    tok = SimpleNamespace(pad_token_id=0)
+    reference_model = _TinyLM(torch, T=2, V=4)
+    reference_loss, reference_rows = _backward_projected_targets(
+        reference_model,
+        [active],
+        "cpu",
+        tok,
+        coef=0.03,
+        microbatch_size=1,
+        entropy_tau=0.5,
+    )
+    reference_grad = reference_model.w.grad.detach().clone()
+
+    mixed_model = _TinyLM(torch, T=2, V=4)
+    mixed_loss, mixed_rows = _backward_projected_targets(
+        mixed_model,
+        [inactive, active, inactive],
+        "cpu",
+        tok,
+        coef=0.03,
+        microbatch_size=2,
+        entropy_tau=0.5,
+    )
+
+    assert reference_rows == mixed_rows == 1
+    assert mixed_loss == pytest.approx(reference_loss / 3)
+    torch.testing.assert_close(
+        mixed_model.w.grad,
+        reference_grad / 3,
+        rtol=1e-6,
+        atol=1e-9,
+    )
 
 
 def test_backward_projected_targets_microbatches_preserve_loss_and_gradients():

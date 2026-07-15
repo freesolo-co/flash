@@ -61,6 +61,7 @@ from flash.engine.worker.opd_gkd import (
 )
 from flash.engine.worker.opd_soft_targets import (
     ProjectedTarget,
+    ProjectionDropCounts,
     SoftTargetProjectionError,
     project_visible_records,
     projected_row_is_active,
@@ -1843,6 +1844,8 @@ def _nonnegative_float(value: object, *, default: float = 0.0) -> float:
 @dataclass(frozen=True)
 class _ForwardTeacherBatchStats:
     logical_accepted_targets: int = 0
+    dropped_provider_error_targets: int = 0
+    dropped_projection_error_targets: int = 0
     supervised_positions: int = 0
     visible_provider_positions: int = 0
     eligible_projected_rows: int = 0
@@ -1880,6 +1883,12 @@ class _ForwardTeacherBatchStats:
         return _ForwardTeacherBatchStats(
             logical_accepted_targets=(
                 self.logical_accepted_targets + other.logical_accepted_targets
+            ),
+            dropped_provider_error_targets=(
+                self.dropped_provider_error_targets + other.dropped_provider_error_targets
+            ),
+            dropped_projection_error_targets=(
+                self.dropped_projection_error_targets + other.dropped_projection_error_targets
             ),
             supervised_positions=self.supervised_positions + other.supervised_positions,
             visible_provider_positions=(
@@ -1929,6 +1938,12 @@ class _ForwardTeacherBatchStats:
     def runtime_telemetry(self) -> dict[str, int | float]:
         return {
             "forward_teacher_logical_accepted_targets": self.logical_accepted_targets,
+            "forward_teacher_dropped_provider_error_targets": (
+                self.dropped_provider_error_targets
+            ),
+            "forward_teacher_dropped_projection_error_targets": (
+                self.dropped_projection_error_targets
+            ),
             "forward_teacher_supervised_positions": self.supervised_positions,
             "forward_teacher_visible_provider_positions": self.visible_provider_positions,
             "forward_teacher_eligible_projected_rows": self.eligible_projected_rows,
@@ -2085,6 +2100,20 @@ def _build_projected_target(
     return target
 
 
+def _empty_projected_target(prompt_ids) -> ProjectedTarget:
+    input_ids = tuple(int(token_id) for token_id in prompt_ids)
+    if not input_ids:
+        raise RuntimeError("opd hybrid dropped target prompt is empty")
+    return ProjectedTarget(
+        input_ids=input_ids,
+        positions=(),
+        rows=(),
+        visible_position_count=0,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(),
+    )
+
+
 def _prepare_forward_teacher_targets(
     client,
     tok,
@@ -2121,7 +2150,9 @@ def _prepare_forward_teacher_targets_impl(
     from flash.engine.worker.forward_teacher import ForwardTeacherError
 
     targets: list[ProjectedTarget] = []
-    cached: dict[tuple[str, tuple[int, ...]], ProjectedTarget] = {}
+    cached: dict[
+        tuple[str, tuple[int, ...]], tuple[ProjectedTarget | None, str | None]
+    ] = {}
     stats = _ForwardTeacherBatchStats()
     for _example, messages, prompt_ids in batch:
         try:
@@ -2158,9 +2189,16 @@ def _prepare_forward_teacher_targets_impl(
                         ),
                     )
                 )
-                raise _ForwardTeacherPreparationError(
-                    str(exc), stats=stats, retriable=bool(getattr(exc, "retriable", False))
-                ) from None
+                if bool(getattr(exc, "retriable", False)):
+                    raise _ForwardTeacherPreparationError(
+                        str(exc), stats=stats, retriable=True
+                    ) from None
+                cached[key] = (None, "provider_error")
+                targets.append(_empty_projected_target(prompt_ids))
+                stats = stats.merged(
+                    _ForwardTeacherBatchStats(dropped_provider_error_targets=1)
+                )
+                continue
             except Exception:
                 stats = stats.merged(
                     _ForwardTeacherBatchStats(
@@ -2218,7 +2256,7 @@ def _prepare_forward_teacher_targets_impl(
                 ) from None
             stats = stats.merged(successful_stats)
             try:
-                cached[key] = _build_projected_target(
+                target = _build_projected_target(
                     tok,
                     messages,
                     prompt_ids,
@@ -2226,15 +2264,34 @@ def _prepare_forward_teacher_targets_impl(
                     visible_records,
                     max_length=max_length,
                 )
-            except RuntimeError as exc:
-                raise _ForwardTeacherPreparationError(str(exc), stats=stats, retriable=False) from None
+            except RuntimeError:
+                cached[key] = (None, "projection_error")
+                targets.append(_empty_projected_target(prompt_ids))
+                stats = stats.merged(
+                    _ForwardTeacherBatchStats(dropped_projection_error_targets=1)
+                )
+                continue
             except Exception:
                 raise _ForwardTeacherPreparationError(
                     "opd hybrid local target preparation failed",
                     stats=stats,
                     retriable=False,
                 ) from None
-        target = cached[key]
+            cached[key] = (target, None)
+        target, drop_reason = cached[key]
+        if target is None:
+            targets.append(_empty_projected_target(prompt_ids))
+            if drop_reason == "provider_error":
+                stats = stats.merged(
+                    _ForwardTeacherBatchStats(dropped_provider_error_targets=1)
+                )
+            elif drop_reason == "projection_error":
+                stats = stats.merged(
+                    _ForwardTeacherBatchStats(dropped_projection_error_targets=1)
+                )
+            else:
+                raise AssertionError("dropped forward target is missing a reason")
+            continue
         targets.append(target)
         rows = target.rows
         drops = target.drop_counts
@@ -2263,6 +2320,18 @@ def _prepare_forward_teacher_targets_impl(
     if not targets:
         raise _ForwardTeacherPreparationError(
             "opd hybrid target batch is empty", stats=stats, retriable=False
+        ) from None
+    if stats.logical_accepted_targets <= 0:
+        raise _ForwardTeacherPreparationError(
+            "opd hybrid target batch has no accepted projected targets",
+            stats=stats,
+            retriable=False,
+        ) from None
+    if stats.supervised_positions <= 0:
+        raise _ForwardTeacherPreparationError(
+            "opd hybrid target batch has no entropy-active projected rows",
+            stats=stats,
+            retriable=False,
         ) from None
     return targets, stats
 
