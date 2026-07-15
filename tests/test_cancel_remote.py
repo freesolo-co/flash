@@ -1057,25 +1057,33 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
     assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
 
 
+@pytest.mark.parametrize("attempted_step", [None, 80])
 def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, attempted_step
 ):
     import flash.runner as orch
     import flash.serve.deploy as deploy
     import flash.server._locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-contended-alias-race"
+    run_id = f"flash-checkpoint-contended-alias-race-{attempted_step}"
     previous = _ready_checkpoint(orch, run_id, 40)
     status = orch.get_status(run_id)
     status.state = "deployed"
+    attempted_revision = (
+        f"{run_id}@final." + "b" * 40
+        if attempted_step is None
+        else _checkpoint_revision(run_id, attempted_step, "b")
+    )
     attempted = {
         "state": "smoke_testing",
         "requested_at": 456.0,
-        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "adapter_revision": attempted_revision,
         "previous_deployment": previous,
         "verification_generation": orch.verified_adapter_revision_generation(run_id),
     }
+    if attempted_step is not None:
+        attempted["checkpoint_step"] = attempted_step
     status.deployment = attempted
     orch._save_status(status)
     stale_commit = {**attempted, "state": "ready"}
@@ -1093,12 +1101,20 @@ def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
                 attempted["verification_generation"] + 1
             )
             alias_target[0] = attempted["adapter_revision"]
-            stale = orch.mark_deployed(
-                run_id,
-                stale_commit,
-                expect_state="deployed",
-                verification_generation=attempted["verification_generation"],
-            )
+            if attempted_step is None:
+                stale = orch.mark_deployed(
+                    run_id,
+                    stale_commit,
+                    expect_state="deployed",
+                    verification_generation=attempted["verification_generation"],
+                )
+            else:
+                stale = orch.mark_checkpoint_deployed(
+                    run_id,
+                    stale_commit,
+                    verification_generation=attempted["verification_generation"],
+                    owner_deployment=attempted,
+                )
             assert stale.deployment == previous
             self.held = True
             return True

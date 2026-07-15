@@ -340,11 +340,6 @@ def cancel_run(run_id: str) -> RunStatus:
                 live_alias_target,
                 contended_prelock_deployment,
                 contended_preserved_checkpoint,
-                allow_smoke_verified_attempt=(
-                    isinstance(contended_prelock_deployment, dict)
-                    and contended_prelock_deployment.get("adapter_revision")
-                    == live_alias_target
-                ),
             )
         else:
             preserved_checkpoint = _preservable_checkpoint_deployment(
