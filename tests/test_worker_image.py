@@ -1,9 +1,9 @@
-from flash.providers.base import get_gpu_info
-from flash.providers.runpod.train.deps import (
+from flash.providers._worker import (
     BAKED_PER_SM_ARCHES,
     WORKER_IMAGE,
     worker_image_for_gpu,
 )
+from flash.providers.base import get_gpu_info
 
 
 def _clear_image_env(monkeypatch):

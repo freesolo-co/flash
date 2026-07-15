@@ -10,7 +10,7 @@ from pathlib import Path
 # opd teacher key (FIREWORKS_API_KEY) is NOT global: opd auto-declares it as a required environment
 # secret in spec_from_dict, and each gate unions the spec's declared secrets on top of this set
 # (client collection below; server create gate server/_deps.py; worker-env injection
-# providers/runpod/train/deps.py). Keeping it out of the default means SFT/GRPO workers never
+# providers/_worker.py). Keeping it out of the default means SFT/GRPO workers never
 # receive the teacher key they don't need.
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 

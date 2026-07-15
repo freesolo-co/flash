@@ -1,7 +1,7 @@
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is referenced by name in flash/providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be
+# This image is referenced by name in flash/providers/_worker.py:WORKER_IMAGE. It MUST be
 # published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
@@ -12,7 +12,7 @@
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
 # CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
-# flash/providers/runpod/train/deps.py:WORKER_DEPS.
+# flash/providers/_worker.py:WORKER_DEPS.
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -78,7 +78,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds — keep this SHA in lockstep with flash/providers/runpod/train/deps.py:WORKER_DEPS.
+# reproducible image builds — keep this SHA in lockstep with flash/providers/_worker.py:WORKER_DEPS.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
@@ -144,13 +144,13 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
          pip uninstall -y causal-conv1d 2>/dev/null || true; }
 
-# Weight cache (this PR, RUNTIME not baked): when the shared weight-cache network volume is attached
-# (flash runner._assign_weight_cache_volume), the control plane points HF_HOME at the persistent mount
-# per-run (providers/.../deps.weight_cache_env), so the MODEL DOWNLOAD is reused across runs landing in
-# the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT caches
-# below are deliberately NOT shared (the volume is multi-tenant; a poisoned compiled artifact could
-# affect another tenant). The redirect can't be a static image ENV: the volume mounts at a fixed path
-# only at runtime and only when attached, so a baked ENV would break cache-less (no-volume) cold runs.
+# weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
+# flash/providers/_worker.py:weight_cache_env redirects only base-model prefetching through
+# FLASH_WEIGHT_CACHE_DIR to the persistent volume for reuse across runs. HF_HOME remains ephemeral,
+# so environment and reward downloads are not shared. executable kernel-jit caches are deliberately
+# not shared because the volume is multi-tenant; a poisoned compiled artifact could affect another
+# tenant. the redirect cannot be a static image environment variable: the volume mounts at a fixed
+# path only at runtime and only when attached, so a baked redirect would break cache-less cold runs.
 #
 # Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (fla/chalk),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed

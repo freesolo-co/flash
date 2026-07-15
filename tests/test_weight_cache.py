@@ -278,10 +278,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# deps.weight_cache_env / build_worker_env redirect
+# worker weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers.runpod.train.deps import weight_cache_env
+    from flash.providers._worker import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -299,13 +299,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers.runpod.train.deps import weight_cache_env
+    from flash.providers._worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
@@ -314,7 +314,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m"), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -323,7 +323,7 @@ def test_build_worker_env_no_cache_without_volume():
 
 
 def test_build_worker_env_per_run_override_wins():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     spec = _vol_spec()
     spec = JobSpec.from_dict(
@@ -334,22 +334,22 @@ def test_build_worker_env_per_run_override_wins():
 
 
 def test_drop_unmounted_cache_env_strips_when_unmounted(monkeypatch):
-    import flash.providers.runpod.train.deps as deps
+    import flash.providers._worker as worker
 
-    # volume NOT mounted -> the /runpod-volume cache var is stripped (cold fallback), others kept.
-    monkeypatch.setattr(deps.os.path, "isdir", lambda p: False)
+    # volume not mounted -> the /runpod-volume cache var is stripped (cold fallback), others kept.
+    monkeypatch.setattr(worker.os.path, "isdir", lambda p: False)
     env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "OTHER": "x"}
-    out = deps.drop_unmounted_cache_env(env)
+    out = worker.drop_unmounted_cache_env(env)
     assert "FLASH_WEIGHT_CACHE_DIR" not in out
     assert out["OTHER"] == "x"
 
 
 def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
-    import flash.providers.runpod.train.deps as deps
+    import flash.providers._worker as worker
 
-    monkeypatch.setattr(deps.os.path, "isdir", lambda p: True)
+    monkeypatch.setattr(worker.os.path, "isdir", lambda p: True)
     env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
-    assert deps.drop_unmounted_cache_env(env) == {
+    assert worker.drop_unmounted_cache_env(env) == {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"
     }
 
@@ -478,7 +478,7 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 # instance-provider integration (Lambda reuses RunPod's build_worker_env)
 # ---------------------------------------------------------------------------
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
-    from flash.providers.runpod.train.deps import strip_runpod_volume_env
+    from flash.providers._worker import strip_runpod_volume_env
 
     env = {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
@@ -496,7 +496,7 @@ def test_instance_payload_strips_runpod_volume_redirect():
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
     from flash.providers import _instance
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(

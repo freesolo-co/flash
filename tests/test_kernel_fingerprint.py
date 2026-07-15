@@ -111,7 +111,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
 
 
 def test_bake_kernel_cache_uses_chalk_default_source_of_truth():
-    from flash.providers.runpod.train.deps import LATEST_CHALK_MAIN_SHA
+    from flash.providers._worker import LATEST_CHALK_MAIN_SHA
 
     bake_src = (ROOT / "docker" / "bake_kernel_cache.py").read_text()
     assert "DEFAULT_CHALK_SPEC" in bake_src
