@@ -979,6 +979,19 @@ def test_opd_train_meta_reports_truncated_rollouts_without_special_diagnostics(m
     assert "final_empty_rate_ema" not in notes
     assert "final_truncation_rate_ema" not in notes
     assert not any(key.startswith("forward_teacher_") for key in notes)
+    hybrid_objective_fields = {
+        "reverse_loss",
+        "forward_loss",
+        "total_loss",
+        "supervised_positions",
+        "reverse_loss_curve",
+        "forward_loss_curve",
+        "total_loss_curve",
+    }
+    assert hybrid_objective_fields.isdisjoint(notes)
+    steps = [fields for stage, fields in beats if stage == "opd_step" and "loss" in fields]
+    assert len(steps) == 1
+    assert hybrid_objective_fields.isdisjoint(steps[0])
     trained = [fields for stage, fields in beats if stage == "opd_trained"]
     assert len(trained) == 1
     assert not any(key.startswith("forward_teacher_") for key in trained[0])

@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from flash.engine.worker.forward_teacher import (
     FORWARD_TEACHER_TERMINAL,
@@ -1256,6 +1257,48 @@ def test_sparse_projected_ce_validates_python_probabilities_and_computes_half_lo
     loss.backward()
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sparse_projected_ce_mixed_active_inactive_and_empty_targets_use_fp32_graph_zeros(
+    dtype,
+):
+    logits = torch.tensor(
+        [
+            [[0.2, -0.1, 0.7], [0.3, 0.8, -0.2]],
+            [[9.0, -9.0, 3.0], [2.0, -2.0, 1.0]],
+        ],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    active = _loss_row(0, (1, 2), (0.4, 0.6), provider_entropy=0.6)
+    inactive = _loss_row(1, (0, 1), (0.5, 0.5), provider_entropy=0.5)
+    empty = ProjectedTarget(
+        input_ids=(1,),
+        positions=(),
+        rows=(),
+        visible_position_count=0,
+        eligible_row_count=0,
+        drop_counts=ProjectionDropCounts(),
+    )
+    active_only = sparse_projected_conditional_cross_entropy(
+        logits[:1, :1],
+        [_loss_target(active)],
+    )
+
+    mixed = sparse_projected_conditional_cross_entropy(
+        logits,
+        [_loss_target(active, inactive), empty],
+        entropy_tau=0.5,
+    )
+
+    assert mixed.dtype == torch.float32
+    torch.testing.assert_close(mixed, active_only / 4, rtol=0, atol=1e-6)
+    mixed.backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    torch.testing.assert_close(logits.grad[0, 1], torch.zeros_like(logits.grad[0, 1]))
+    torch.testing.assert_close(logits.grad[1], torch.zeros_like(logits.grad[1]))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

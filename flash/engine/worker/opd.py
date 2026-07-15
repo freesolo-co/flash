@@ -1228,9 +1228,18 @@ def _run_opd(forward_teacher_accounting):
             total_loss = avg_loss + forward_loss if forward_loss is not None else avg_loss
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
-            if forward_loss is not None:
-                forward_loss_curve.append(forward_loss)
-            total_loss_curve.append(total_loss)
+            hybrid_step_telemetry = {}
+            if hybrid.enabled:
+                if forward_loss is not None:
+                    forward_loss_curve.append(forward_loss)
+                total_loss_curve.append(total_loss)
+                hybrid_step_telemetry = {
+                    "reverse_loss": avg_loss,
+                    "forward_loss": forward_loss,
+                    "total_loss": total_loss,
+                    "supervised_positions": supervised_position_count,
+                    **forward_teacher_accounting.totals.runtime_telemetry(),
+                }
             _w.heartbeat(
                 "opd_step",
                 # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
@@ -1242,11 +1251,7 @@ def _run_opd(forward_teacher_accounting):
                 step=opt_steps,
                 loss=avg_loss,
                 coverage=avg_cov,
-                reverse_loss=avg_loss,
-                forward_loss=forward_loss,
-                total_loss=total_loss,
-                supervised_positions=supervised_position_count,
-                **(forward_teacher_accounting.totals.runtime_telemetry() if hybrid.enabled else {}),
+                **hybrid_step_telemetry,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
             )
@@ -1258,12 +1263,13 @@ def _run_opd(forward_teacher_accounting):
                     metrics = {
                         "opd/loss": avg_loss,
                         "opd/coverage": avg_cov,
-                        "opd/reverse_loss": avg_loss,
-                        "opd/total_loss": total_loss,
                     }
-                    if forward_loss is not None:
-                        metrics["opd/forward_loss"] = forward_loss
-                        metrics["opd/supervised_positions"] = supervised_position_count
+                    if hybrid.enabled:
+                        metrics["opd/reverse_loss"] = avg_loss
+                        metrics["opd/total_loss"] = total_loss
+                        if forward_loss is not None:
+                            metrics["opd/forward_loss"] = forward_loss
+                            metrics["opd/supervised_positions"] = supervised_position_count
                     wandb.log(metrics, step=opt_steps)
             if it % 10 == 0:
                 print(
@@ -1342,6 +1348,7 @@ def _run_opd(forward_teacher_accounting):
         hybrid_enabled=hybrid.enabled,
     )
     forward_teacher_notes = {}
+    hybrid_loss_notes = {}
     if hybrid.enabled:
         forward_teacher_notes = {
             **forward_teacher_accounting.totals.runtime_telemetry(),
@@ -1351,6 +1358,11 @@ def _run_opd(forward_teacher_accounting):
             "forward_teacher_generations": (
                 forward_teacher_accounting.totals.provider_generations
             ),
+        }
+        hybrid_loss_notes = {
+            "reverse_loss_curve": loss_curve,
+            "forward_loss_curve": forward_loss_curve,
+            "total_loss_curve": total_loss_curve,
         }
 
     _w.write_train_meta(
@@ -1377,9 +1389,7 @@ def _run_opd(forward_teacher_accounting):
             "chalk_kernels": _chalk_active or None,
             "thinking": _w.THINKING,
             "loss_curve": loss_curve,
-            "reverse_loss_curve": loss_curve,
-            "forward_loss_curve": forward_loss_curve,
-            "total_loss_curve": total_loss_curve,
+            **hybrid_loss_notes,
             **forward_teacher_notes,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or

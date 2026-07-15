@@ -468,6 +468,10 @@ def sparse_projected_conditional_cross_entropy(
         raise ValueError("soft-target batch size must match logits")
     low_precision = logits.dtype in (torch.float16, torch.bfloat16)
     computation_dtype = torch.float32 if low_precision else logits.dtype
+
+    def graph_zero(values):
+        return values.reshape(-1)[:1].to(dtype=computation_dtype).sum() * 0.0
+
     target_losses = []
     for batch_index, target in enumerate(targets):
         row_losses = []
@@ -477,9 +481,7 @@ def sparse_projected_conditional_cross_entropy(
             if row.logits_index < 0 or row.logits_index >= logits.shape[1]:
                 raise ValueError("soft-target logits position is out of range")
             if not projected_row_is_active(row, entropy_tau):
-                row_losses.append(
-                    logits[batch_index, row.logits_index].reshape(-1)[:1].sum() * 0.0
-                )
+                row_losses.append(graph_zero(logits[batch_index, row.logits_index]))
                 continue
             probabilities_tuple = _validated_probabilities(row)
             ids = torch.tensor(row.token_ids, dtype=torch.long, device=logits.device)
@@ -496,14 +498,10 @@ def sparse_projected_conditional_cross_entropy(
             log_probabilities = row_logits.log_softmax(dim=-1)
             row_losses.append(-(probabilities * log_probabilities.index_select(0, ids)).sum())
         target_loss = (
-            torch.stack(row_losses).mean()
-            if row_losses
-            else logits[batch_index].reshape(-1)[:1].sum() * 0.0
+            torch.stack(row_losses).mean() if row_losses else graph_zero(logits[batch_index])
         )
         target_losses.append(target_loss)
-    loss = (
-        torch.stack(target_losses).mean() if target_losses else logits.reshape(-1)[:1].sum() * 0.0
-    )
+    loss = torch.stack(target_losses).mean() if target_losses else graph_zero(logits)
     if not bool(torch.isfinite(loss)):
         raise ValueError("soft-target loss is non-finite")
     return loss
