@@ -2198,6 +2198,7 @@ def _save_adapter(model, tok, adapter_dir: str) -> None:
     _w.stamp_adapter_provenance(model, spec.model, spec.model_revision)
     model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
+    _w.write_base_model_provenance(adapter_dir, spec.model, spec.model_revision)
 
 
 def _publish_opd_deployable(
