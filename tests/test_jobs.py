@@ -2068,7 +2068,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
 
         def fail_listing(spec, *, step, revision=None):
             raise checkpoints.CheckpointListingError(
-                "could not verify deployable checkpoints for source-run: 503"
+                "could not verify adapter artifacts for source-run: 503"
             )
 
         monkeypatch.setattr(checkpoints, "adapter_artifact_exists", fail_listing)
@@ -2080,7 +2080,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             }
         )
 
-        with pytest.raises(ValueError, match="could not verify deployable checkpoints"):
+        with pytest.raises(ValueError, match="could not verify adapter artifacts"):
             orch.submit_job(
                 spec,
                 dry_run=True,

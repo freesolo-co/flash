@@ -526,7 +526,7 @@ def test_final_adapter_artifact_exists_raises_listing_error(monkeypatch):
 
     with pytest.raises(
         CheckpointListingError,
-        match="could not verify deployable checkpoints for flash-ckpt-1: hf down",
+        match="could not verify adapter artifacts for flash-ckpt-1: hf down",
     ):
         adapter_artifact_exists(_spec(), step=None)
 

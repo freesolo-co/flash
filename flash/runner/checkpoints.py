@@ -60,7 +60,7 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
     except Exception as exc:
         if strict:
             raise CheckpointListingError(
-                f"could not verify deployable checkpoints for {spec.run_id}: {exc}"
+                f"could not verify adapter artifacts for {spec.run_id}: {exc}"
             ) from exc
         print(f"[ckpt] list warn for {spec.run_id}: {exc}")
         return []
