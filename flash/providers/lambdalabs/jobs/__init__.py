@@ -471,6 +471,21 @@ def poll_lambda_job(
     )
 
 
+def _teardown_polled_instance(handle: LambdaJobHandle, run_id: str) -> None:
+    """Attempt teardown without replacing the already-determined worker outcome."""
+    try:
+        lambda_api.terminate_instance_confirmed(handle.instance_id)
+    except BaseException as exc:
+        logger.error(
+            "lambda teardown unconfirmed for instance %s after poll; the persisted handle remains "
+            "available for terminal cleanup and orphan sweeps: %s",
+            handle.instance_id,
+            sanitize_diagnostic(exc, limit=500),
+        )
+        with contextlib.suppress(BaseException):
+            terminate_run_instances(run_id)
+
+
 def submit_run_lambda(
     spec,
     seed: int,
@@ -517,7 +532,7 @@ def submit_run_lambda(
             **deadline_kwargs(poll_lambda_job, absolute_deadline),
         )
     finally:
-        lambda_api.terminate_instance_confirmed(handle.instance_id)
+        _teardown_polled_instance(handle, spec.run_id)
 
 
 def terminate_run_instances(run_id: str) -> list[str]:

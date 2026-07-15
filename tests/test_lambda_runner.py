@@ -1885,6 +1885,34 @@ def test_runner_terminates_on_success(monkeypatch):
     assert handles[0]["instance_id"] == "i-9999"
 
 
+def test_runner_preserves_success_when_teardown_is_unconfirmed(monkeypatch, caplog):
+    from flash.providers.base import PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+
+    jobs, _, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
+    cleanup_runs = []
+
+    def unconfirmed(_instance_id):
+        raise lambda_api.LambdaApiError("instance remains")
+
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", unconfirmed)
+    monkeypatch.setattr(
+        jobs,
+        "terminate_run_instances",
+        lambda run_id: cleanup_runs.append(run_id) or [],
+    )
+    handles = []
+    caplog.set_level("ERROR")
+
+    res = _submit(jobs, _spec(), seed=0, on_handle=handles.append)
+
+    assert res.ok
+    assert res.metrics == {"a": 1}
+    assert handles[0]["instance_id"] == "i-9999"
+    assert cleanup_runs == [_spec().run_id]
+    assert "persisted handle remains available" in caplog.text
+
+
 def test_runner_terminates_on_failure_and_exception(monkeypatch):
     from flash.providers.base import PollResult
 
