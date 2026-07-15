@@ -452,12 +452,6 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
     return done
 
 
-def provision_all() -> list[str]:
-    """Eagerly create instance-provider cache storage in every region (GPU-free). RunPod volumes are
-    created automatically by endpoint deploy, so only Lambda is provisioned here."""
-    return provision_lambda_filesystems()
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
@@ -479,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
     ap.add_argument(
         "--provision", action="store_true",
-        help="CREATE the Lambda cache storage in every region (pure API, no GPU) and "
+        help="CREATE the Lambda weight-cache filesystem in every region (pure API, no GPU) and "
              "exit; RunPod volumes are auto-created by the eager deploy/warm. Run before --teardown's "
              "inverse to set up all storage up front.",
     )
@@ -537,9 +531,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print("would provision Lambda filesystems in every region")
             return 0
-        provisioned = provision_all()
-        print(f"provisioned {len(provisioned)} instance-provider cache store(s): "
-              f"{', '.join(provisioned) or '(none — no Lambda key, or no regions)'}")
+        provisioned = provision_lambda_filesystems()
+        print(f"provisioned {len(provisioned)} Lambda filesystem(s): "
+              f"{', '.join(provisioned) or '(none: no Lambda key or no regions)'}")
         return 0
     if args.warm_instances:
         if args.dry_run:

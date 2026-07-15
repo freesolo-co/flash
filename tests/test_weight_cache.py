@@ -1275,7 +1275,7 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Eager PROVISION — create the instance-provider cache storage in every region/env (no GPU)
+# eager provision: create lambda weight-cache filesystems in every region without a gpu
 # ---------------------------------------------------------------------------
 def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
@@ -1328,12 +1328,13 @@ def test_provision_lambda_no_key_is_noop(monkeypatch):
     assert preload.provision_lambda_filesystems() == []
 
 
-def test_provision_cli_creates_instance_storage(monkeypatch):
-    """`preload --provision` creates Lambda storage (GPU-free) and exits 0."""
+def test_provision_cli_creates_lambda_filesystems(monkeypatch, capsys):
+    """`preload --provision` creates Lambda filesystems (GPU-free) and exits 0."""
     from flash.providers.runpod import preload
 
     monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: ["lambda:us-east-1"])
     assert preload.main(["--provision"]) == 0
+    assert capsys.readouterr().out == "provisioned 1 Lambda filesystem(s): lambda:us-east-1\n"
 
 
 def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
