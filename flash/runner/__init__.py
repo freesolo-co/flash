@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -13,7 +14,13 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - linux production fails closed below
+    fcntl = None
+
 from flash.catalog import ModelInfo, resolve_model
+from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
@@ -22,7 +29,20 @@ RESULTS_DIR = os.path.join(_STATE_DIR, "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 # `done` IS deployable, so excluded; cancelled/failed/dry_run must never flip to `deployed`.
 _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
+# serialize local writers before taking each run's interprocess lock.
 _STATUS_LOCK = threading.Lock()
+_RUN_DEADLINE_AT_KEY = "run_deadline_at"
+_NEXT_ATTEMPT_KEY = "next_attempt"
+_CLEANUP_REMOTES_KEY = "cleanup_remotes"
+_PRIVATE_STATUS_KEYS = frozenset(
+    {
+        _RUN_DEADLINE_AT_KEY,
+        _NEXT_ATTEMPT_KEY,
+        _CLEANUP_REMOTES_KEY,
+    }
+)
+_PRIVATE_VALUE_UNSET = object()
+MIN_PROVIDER_WALL_SECONDS = 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -65,12 +85,7 @@ def _gpu_rate(gpu_type: str) -> float:
 
 
 def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
-    """The customer charge for a run: the flash.cost estimate (training-only steps x sec/step x $/hr).
-
-    This is the price the run was QUOTED at submit. ``steps=None`` prices the spec's planned steps
-    (a completed run is charged exactly its quote); pass the actual steps that ran to re-price a
-    CANCELLED run at how far it got. Returns ``fallback`` if the spec can't be priced (so a charge is
-    never blocked by a pricing failure)."""
+    """Return the estimated customer charge, prorated by completed steps when requested."""
     try:
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import estimate_for_spec, runconfig_from_spec
@@ -79,17 +94,11 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
             return float(estimate_for_spec(spec).total_usd)
         n = max(0, int(steps))
         if n == 0:
-            return 0.0  # cancelled before any training step -> nothing to charge
-        from dataclasses import replace
-
+            return 0.0
         cfg = runconfig_from_spec(spec)
         planned = int(cfg.steps or 0)
         if planned > 0:
             n = min(n, planned)
-        # SFT is priced from train_tokens (not steps), so lowering steps ALONE wouldn't prorate a
-        # cancel -- estimate_cost would still charge the full-run token estimate. Scale the token
-        # count to the fraction of steps that ran so a mid-training SFT cancel is charged its share,
-        # mirroring GRPO's steps-based proration.
         if not cfg.is_grpo and cfg.train_tokens and planned > 0:
             scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
             cfg = replace(cfg, steps=n, train_tokens=scaled_tokens)
@@ -140,6 +149,102 @@ def actual_steps_run(status: RunStatus) -> int:
     return 0
 
 
+def _require_valid_deadline(value: object) -> float:
+    """Return a finite positive unix deadline or fail closed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
+    deadline = float(value)
+    if not math.isfinite(deadline) or deadline <= 0:
+        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
+    return deadline
+
+
+def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
+    status = _runstatus_from_json(raw)
+    spec = JobSpec.from_dict(status.spec)
+    created_at = _require_valid_deadline(status.created_at)
+    max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
+    return status, _require_valid_deadline(created_at + max_wall_seconds)
+
+
+def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
+    deadline = _require_valid_deadline(stored)
+    if not math.isclose(deadline, canonical, rel_tol=0.0, abs_tol=1e-6):
+        raise RuntimeError(
+            "persisted run wall deadline does not match canonical submission deadline; "
+            "no further provisioning is allowed"
+        )
+    return deadline
+
+
+def _load_run_deadline_at(run_id: str) -> float:
+    """Return the persisted canonical submission-to-terminal deadline."""
+    raw = _load_status_json(run_id)
+    _status, canonical = _canonical_run_deadline(raw)
+    if _RUN_DEADLINE_AT_KEY not in raw:
+        raise RuntimeError(
+            "persisted run wall deadline is missing; no further provisioning is allowed"
+        )
+    return _checked_stored_run_deadline(raw[_RUN_DEADLINE_AT_KEY], canonical)
+
+
+def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> float:
+    """Return non-negative wall allowance remaining on the run-global deadline."""
+    current = time.time() if now is None else now
+    if (
+        isinstance(current, bool)
+        or not isinstance(current, (int, float))
+        or not math.isfinite(current)
+        or current <= 0
+    ):
+        raise ValueError("current clock is invalid")
+    return max(0.0, _load_run_deadline_at(run_id) - float(current))
+
+
+def _spec_with_remaining_wall(
+    spec: JobSpec,
+    *,
+    require_provider_minimum: bool,
+    now: float | None = None,
+) -> JobSpec:
+    """Copy a spec with only the run-global wall allowance still available."""
+    remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
+    if remaining <= 0:
+        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
+    if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
+        raise RuntimeError(
+            "run wall deadline has less than the 60-second minimum provider allowance remaining; "
+            "no further provisioning is allowed"
+        )
+    allowance = max(1, int(remaining))
+    return replace(spec, gpu=replace(spec.gpu, max_wall_seconds=allowance))
+
+
+def _infer_next_attempt(raw: dict) -> int:
+    if _NEXT_ATTEMPT_KEY not in raw:
+        raise RuntimeError("stored next attempt identity is missing")
+    stored = raw[_NEXT_ATTEMPT_KEY]
+    if _attempt_int(stored) is None:
+        raise RuntimeError("stored next attempt identity is invalid")
+    return stored
+
+
+def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
+    """Durably consume one run-global attempt identity before provider creation."""
+    minimum = _attempt_int(minimum_attempt)
+    if minimum is None:
+        raise RuntimeError("minimum attempt identity is invalid")
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        attempt = max(_infer_next_attempt(raw), minimum)
+        if attempt >= _MAX_ATTEMPT_ID:
+            raise RuntimeError("run attempt identity is exhausted")
+        _save_status_unlocked(status, _next_attempt=attempt + 1)
+        return attempt
+
+
+
 @dataclass
 class RunStatus:
     run_id: str
@@ -178,30 +283,91 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
+    effective_preparation: dict | None = None
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
         from flash.serve.urls import public_deployment
 
         data = _status_storage_dict(self)
+        data["spec"] = _public_status_spec(data.get("spec"))
+        # internal warm-start preparation (storage locators, digests) never leaves the server
+        data.pop("effective_preparation", None)
         if isinstance(self.deployment, dict):
             data["deployment"] = public_deployment(self.deployment)
         return data
+
+
+def _public_status_spec(raw):
+    """Canonicalize valid specs and safely redact malformed legacy shapes."""
+    if not isinstance(raw, dict):
+        return raw
+    try:
+        data = JobSpec.from_dict(raw).to_dict()
+    except Exception:
+        data = dict(raw)
+        train = data.get("train")
+        if isinstance(train, dict):
+            train = dict(train)
+            train.pop("init_from_adapter_revision", None)
+            init_ref = train.get("init_from_adapter")
+            if init_ref is not None and (not isinstance(init_ref, str) or init_ref.strip()):
+                train.pop("lora_rank", None)
+            data["train"] = train
+    _redact_internal_adapter_ref(data)
+    return data
+
+
+def _redact_internal_adapter_ref(data: dict) -> None:
+    """Never surface an internal storage locator in the public spec.
+
+    A worker/effective or legacy record can persist ``train.init_from_adapter`` as the internal
+    storage ref ``<hf_repo>:<phase>/<run_id>[/checkpoints/step-N]``, which embeds the private HF
+    repo. Rewrite it back to the user-facing checkpoint ref (``<run_id>[/step-N]``); a public ref
+    (``parse_adapter_storage_ref`` returns ``None``) is left untouched.
+    """
+    train = data.get("train")
+    if not isinstance(train, dict):
+        return
+    ref = train.get("init_from_adapter")
+    if not isinstance(ref, str) or not ref.strip():
+        return
+    from flash.schema import format_checkpoint_ref, parse_adapter_storage_ref
+
+    resolved = parse_adapter_storage_ref(ref)
+    if resolved is None:
+        return  # already a user-facing ref, not an internal storage locator
+    _repo, prefix = resolved
+    match = re.fullmatch(
+        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:/checkpoints/step-(?P<step>\d+))?",
+        prefix,
+    )
+    if match is None:
+        # Parseable storage ref with an unexpected prefix shape; drop rather than leak the repo.
+        train.pop("init_from_adapter", None)
+        return
+    step = match.group("step")
+    train["init_from_adapter"] = format_checkpoint_ref(
+        match.group("run"), int(step) if step is not None else None
+    )
 
 
 def _status_storage_dict(status: RunStatus) -> dict:
     """Serialize status for persistence without filtering internal deployment state."""
     data = asdict(status)
     data["adapter_ref"] = (
-        _adapter_ref_from_status_spec(status.spec)
-        if status.state in {"done", "deployed"}
-        else None
+        _adapter_ref_from_status_spec(status.spec) if status.state in {"done", "deployed"} else None
     )
     return data
 
 
 class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
+
+
+class _TerminalHandleRace(_RunCancelled):
+    """A provider handle was created after the run became terminal."""
 
 
 def new_run_id() -> str:
@@ -227,9 +393,27 @@ def runs_file_path(run_id: str, suffix: str) -> str:
     return path
 
 
+@contextlib.contextmanager
+def _status_guard(run_id: str):
+    """Serialize one run's status mutations across threads and Linux processes."""
+    if fcntl is None:
+        raise RuntimeError("interprocess run-status locking is unavailable")
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    lock_path = runs_file_path(run_id, ".lock")
+    with _STATUS_LOCK:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     """Spec dict with gpu.disk_gb raised to the model's catalog min_disk_gb."""
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     need = int(getattr(info, "min_disk_gb", 0) or 0)
     if need > int(d["gpu"].get("disk_gb") or 0):
         d["gpu"] = {**d["gpu"], "disk_gb": need}
@@ -289,7 +473,7 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     if not spec.run_id or spec.run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
     repo = managed_hf_repo_for_environment(spec.environment.id)
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
     return JobSpec.from_dict(d)
 
@@ -323,7 +507,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         return spec
     if not sha:
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     d["environment"] = {**d["environment"], "resolved_sha": sha}
     return JobSpec.from_dict(d)
 
@@ -357,7 +541,7 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     attach = is_catalog and (info is None or _fits_weight_cache(info))
     if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
         return spec
-    d = spec.to_dict()
+    d = spec.to_internal_dict()
     if attach:
         d["gpu"] = {
             **d["gpu"],
@@ -386,11 +570,14 @@ def _run_job_background(
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
             _run_job(spec)
-    except Exception as e:
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: background run failed"
         with contextlib.suppress(Exception):
             if get_status(spec.run_id).state not in TERMINAL_STATES:
-                _update(spec.run_id, "failed", error=str(e))
-        logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
+                _update(spec.run_id, "failed", error=detail)
+        logging.getLogger(__name__).warning(
+            "background run %s ended in error: %s", spec.run_id, detail
+        )
 
 
 def _context_org_id(context: dict | None) -> str:
@@ -414,17 +601,33 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
         return False
 
 
-def _resolve_init_from_adapter(
-    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
-) -> JobSpec:
-    """Resolve the public `<run_id>[/step-N]` warm-start ref into the internal storage reference.
+def _require_supported_adapter_continuation(spec: JobSpec) -> None:
+    if spec.algorithm == "sft" and spec.train.init_from_adapter:
+        raise ValueError(
+            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
+            "SFT adapter continuation is not supported"
+        )
 
-    The control plane owns run metadata, so the short ref is resolved HERE (never on the worker):
-    the source run's hf_repo + phase key the artifact location the worker downloads from.
-    """
+
+def _prepare_init_from_adapter(
+    spec: JobSpec,
+    *,
+    owner_org_id: str = "",
+    owner_key_id: int | None = None,
+    token: str | None = None,
+) -> tuple[JobSpec, JobSpec, dict | None]:
+    """Preserve the public request while applying source metadata only to the worker spec."""
+    _require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
-        return spec
+        return spec, spec, None
+    from flash.lora_rank import (
+        adapter_artifact_identity,
+        load_hf_adapter_config,
+        preflight_init_adapter_lora_rank,
+        resolve_hf_dataset_revision,
+    )
+    from flash.runner.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
@@ -441,52 +644,74 @@ def _resolve_init_from_adapter(
     owner_org_id = owner_org_id.strip()
     if owner_org_id:
         src_org_id = _status_org_id(src_status)
-        if src_org_id:
-            owner_ok = src_org_id == owner_org_id
-        else:
-            owner_ok = _source_owned_by_key(src_run_id, owner_key_id)
+        owner_ok = (
+            src_org_id == owner_org_id
+            if src_org_id
+            else _source_owned_by_key(src_run_id, owner_key_id)
+        )
         if not owner_ok:
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
     src_spec = JobSpec.from_dict(src_status.spec)
+    if src_spec.model != spec.model:
+        raise ValueError(
+            f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
+            f"{spec.model!r}"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
         )
-    if step is not None:
-        from flash.runner.checkpoints import CheckpointListingError, checkpoint_step_exists
-
-        try:
-            exists = checkpoint_step_exists(src_spec, step)
-        except CheckpointListingError as exc:
-            raise ValueError(str(exc)) from exc
-        if not exists:
-            raise ValueError(
-                f"train.init_from_adapter references {src_run_id}/step-{step}, but that "
-                "deployable checkpoint was not found"
-            )
-    else:
-        if src_status.state not in {"done", "deployed"}:
-            raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but that run is "
-                f"{src_status.state!r}; use a completed source run or a concrete "
-                f"{src_run_id}/step-N checkpoint"
-            )
-        from flash.runner.checkpoints import CheckpointListingError, final_adapter_exists
-
-        try:
-            exists = final_adapter_exists(src_spec)
-        except CheckpointListingError as exc:
-            raise ValueError(str(exc)) from exc
-        if not exists:
-            raise ValueError(
-                f"train.init_from_adapter references run {src_run_id!r}, but its final "
-                "adapter was not found; use a concrete checkpoint ref like "
-                f"{src_run_id}/step-N if one exists"
-            )
+    if step is None and src_status.state not in {"done", "deployed"}:
+        raise ValueError(
+            f"train.init_from_adapter references run {src_run_id!r}, but that run is "
+            f"{src_status.state!r}; use a completed source run or a concrete "
+            f"{src_run_id}/step-N checkpoint"
+        )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
-    return replace(spec, train=replace(spec.train, init_from_adapter=storage))
+    revision = resolve_hf_dataset_revision(src_spec.train.hf_repo, token)
+    try:
+        exists = adapter_artifact_exists(src_spec, step=step, revision=revision)
+    except CheckpointListingError as exc:
+        raise ValueError(str(exc)) from exc
+    if not exists:
+        target = f"{src_run_id}/step-{step}" if step is not None else src_run_id
+        raise ValueError(
+            f"train.init_from_adapter references {target!r}, but its complete adapter artifact "
+            "was not found"
+        )
+    worker_spec = replace(
+        spec,
+        train=replace(
+            spec.train,
+            init_from_adapter=storage,
+            init_from_adapter_revision=revision,
+        ),
+    )
+    config = load_hf_adapter_config(storage, token, revision)
+    metadata = preflight_init_adapter_lora_rank(
+        worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
+    )
+    assert metadata is not None
+    identity = adapter_artifact_identity(storage, config, token, revision).to_dict()
+    public_spec = spec
+    worker_spec = replace(
+        worker_spec,
+        train=replace(worker_spec.train, lora_rank=metadata.rank, lora_alpha=metadata.alpha),
+    )
+    return public_spec, worker_spec, identity
+
+
+def _resolve_init_from_adapter(
+    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
+) -> JobSpec:
+    return _prepare_init_from_adapter(
+        spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+        token=os.environ.get("HF_TOKEN"),
+    )[1]
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
@@ -519,6 +744,150 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
         )
 
 
+def _preparation_digest(
+    public_spec: JobSpec, worker_spec: JobSpec, adapter_identity: dict | None
+) -> str:
+    payload = {
+        "version": 1,
+        "public_spec": public_spec.to_dict(),
+        "worker_spec": worker_spec.to_internal_dict(),
+        "adapter_identity": adapter_identity,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None:
+    public = public_spec.to_internal_dict()
+    effective = worker_spec.to_internal_dict()
+    public_train = dict(public["train"])
+    effective_train = dict(effective["train"])
+    public_ref = public_train.get("init_from_adapter") or ""
+    internal_ref = effective_train.get("init_from_adapter") or ""
+    for train_field in (
+        "init_from_adapter",
+        "init_from_adapter_revision",
+        "lora_rank",
+        "lora_alpha",
+    ):
+        effective_train[train_field] = public_train.get(train_field)
+    effective["train"] = effective_train
+    public_environment = dict(public["environment"])
+    effective_environment = dict(effective["environment"])
+    public_sha = public_environment.get("resolved_sha")
+    effective_sha = effective_environment.get("resolved_sha")
+    if not public_sha and isinstance(effective_sha, str):
+        from flash.envs.loader import _is_commit_sha
+
+        if _is_commit_sha(effective_sha):
+            effective_environment["resolved_sha"] = ""
+    effective["environment"] = effective_environment
+    public_gpu = dict(public["gpu"])
+    effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
+    if (
+        public_gpu.get("network_volume") == WEIGHT_CACHE_VOLUME_NAME
+        and effective_gpu.get("network_volume") is None
+    ):
+        effective_gpu["network_volume"] = WEIGHT_CACHE_VOLUME_NAME
+    effective["gpu"] = effective_gpu
+    if effective != public:
+        raise ValueError("persisted effective preparation does not match the public run")
+    if not public_ref:
+        if internal_ref or worker_spec.train.init_from_adapter_revision:
+            raise ValueError("persisted effective preparation has an unexpected source adapter")
+        return
+    from flash.schema import parse_adapter_storage_ref, parse_checkpoint_ref
+
+    public_target = parse_checkpoint_ref(public_ref)
+    resolved = parse_adapter_storage_ref(internal_ref)
+    if public_target is None or resolved is None:
+        raise ValueError("persisted effective preparation has an invalid source adapter")
+    _repo, prefix = resolved
+    match = re.fullmatch(
+        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:/checkpoints/step-(?P<step>\d+))?",
+        prefix,
+    )
+    if match is None:
+        raise ValueError("persisted effective preparation has an invalid source adapter")
+    source_run, source_step = public_target
+    internal_step = int(match.group("step")) if match.group("step") is not None else None
+    if match.group("run") != source_run or internal_step != source_step:
+        raise ValueError("persisted effective preparation source does not match the public run")
+    if not worker_spec.train.init_from_adapter_revision:
+        raise ValueError("persisted effective preparation has no pinned source revision")
+
+
+@dataclass(frozen=True)
+class PreparedJob:
+    public_spec: JobSpec
+    worker_spec: JobSpec
+    estimated_cost_usd: float
+    adapter_identity: dict | None = None
+
+
+def prepare_job(
+    spec: JobSpec,
+    *,
+    billing_context: dict | None = None,
+    platform_context: dict | None = None,
+    owner_key_id: int | None = None,
+) -> PreparedJob:
+    """Prepare all read-only submission inputs before persistence or allocation."""
+    _require_priced_sft_examples(spec)
+    _require_supported_adapter_continuation(spec)
+    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
+    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    spec = _assign_managed_hf_repo(spec)
+    spec = _assign_weight_cache_volume(spec, info)
+    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
+    public_spec, worker_spec, adapter_identity = _prepare_init_from_adapter(
+        spec,
+        owner_org_id=owner_org_id,
+        owner_key_id=owner_key_id,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    from flash.cost.spec import estimate_for_spec
+    from flash.lora_rank import preflight_train_context_within_serving
+
+    preflight_train_context_within_serving(worker_spec)
+    estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    return PreparedJob(
+        public_spec=public_spec,
+        worker_spec=worker_spec,
+        estimated_cost_usd=estimated_cost_usd,
+        adapter_identity=adapter_identity,
+    )
+
+
+def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
+    """Persist the selected worker spec before provider provisioning starts."""
+    status = get_status(worker_spec.run_id)
+    if status.state in TERMINAL_STATES:
+        return False
+    snapshot = status.effective_preparation
+    public_spec = JobSpec.from_dict(status.spec)
+    if public_spec.train.init_from_adapter:
+        if not isinstance(snapshot, dict):
+            raise ValueError("persisted effective preparation is malformed")
+        effective_spec_from_status(status)
+        adapter_identity = snapshot.get("adapter_identity")
+    else:
+        adapter_identity = None
+    _validate_effective_spec(public_spec, worker_spec)
+    effective_preparation = {
+        "worker_spec": worker_spec.to_internal_dict(),
+        "adapter_identity": adapter_identity,
+        "preparation_digest": _preparation_digest(public_spec, worker_spec, adapter_identity),
+    }
+    return _update(
+        worker_spec.run_id,
+        status.state,
+        effective_preparation=effective_preparation,
+    )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -527,43 +896,20 @@ def submit_job(
     billing_context: dict | None = None,
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
+    prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
-    """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
-    that fits the run; dry-run runs the same config validation and preflights and records a
-    state=dry_run preview without allocating a GPU, provisioning, or billing."""
-    _require_priced_sft_examples(spec)
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
-    # "local" is the JobSpec placeholder; treat it as unset so programmatic callers get unique ids.
-    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
-    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
-    spec = _assign_managed_hf_repo(spec)
-    spec = _assign_weight_cache_volume(spec, info)
-    from flash.providers import INSTANCE_PROVIDERS, available_providers
-
-    public_spec = spec
-    # The cost quote and the config preflights run in BOTH dry-run and real submit, so `--dry-run` is
-    # a faithful preview of what the control plane would accept or reject. A spec a real submit would
-    # reject — a warm-start whose train.lora_rank disagrees with the continued source adapter's rank
-    # (the run trains and serves at the source rank, so cost/allocator/GRPO-sleep sizing must agree
-    # with it), or a training context longer than the model's serving window — must fail `--dry-run`
-    # too, not sail through and be rejected only at live submit. These are all CPU-only (an analytical
-    # cost model, catalog lookups, and one small adapter_config.json read for a warm-start); GPU
-    # allocation, provisioning, billing, and the warm-start GC marker stay real-submit-only below.
-    from flash.cost.spec import estimate_for_spec
-    from flash.lora_rank import (
-        preflight_init_adapter_lora_rank,
-        preflight_train_context_within_serving,
-    )
-
-    estimated_cost_usd = float(estimate_for_spec(public_spec).total_usd)
-    owner_org_id = _context_org_id(billing_context) or _context_org_id(platform_context)
-    worker_spec = _resolve_init_from_adapter(
-        public_spec,
-        owner_org_id=owner_org_id,
+    """Submit a prepared job, allocating resources only outside dry-run mode."""
+    prepared = prepared_job or prepare_job(
+        spec,
+        billing_context=billing_context,
+        platform_context=platform_context,
         owner_key_id=owner_key_id,
     )
-    preflight_init_adapter_lora_rank(worker_spec, token=os.environ.get("HF_TOKEN"))
-    preflight_train_context_within_serving(worker_spec)
+    public_spec = prepared.public_spec
+    worker_spec = prepared.worker_spec
+    estimated_cost_usd = prepared.estimated_cost_usd
+    from flash.providers import INSTANCE_PROVIDERS, available_providers
+
     if not dry_run:
         # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
         # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
@@ -579,12 +925,23 @@ def submit_job(
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
         platform_context=platform_context,
+        effective_preparation={
+            "worker_spec": worker_spec.to_internal_dict(),
+            "adapter_identity": prepared.adapter_identity,
+            "preparation_digest": _preparation_digest(
+                public_spec, worker_spec, prepared.adapter_identity
+            ),
+        },
         # Snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
-    _save_status(status)
+    _save_status(
+        status,
+        _run_deadline_at=status.created_at + float(public_spec.gpu.max_wall_seconds),
+        _next_attempt=0,
+    )
     _report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
@@ -621,12 +978,89 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
 
 
-def get_status(run_id: str) -> RunStatus:
+def _load_status_json(run_id: str) -> dict:
     path = runs_file_path(run_id, ".json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
-        return _runstatus_from_json(json.load(f))
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid stored run status for {run_id}")
+    return value
+
+
+def get_status(run_id: str) -> RunStatus:
+    return _runstatus_from_json(_load_status_json(run_id))
+
+
+def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    public_spec = JobSpec.from_dict(status.spec)
+    snapshot = status.effective_preparation
+    if not isinstance(snapshot, dict):
+        if public_spec.train.init_from_adapter:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original preparation snapshot is unavailable"
+            )
+        return public_spec
+    raw_worker = snapshot.get("worker_spec")
+    if not isinstance(raw_worker, dict):
+        raise ValueError("persisted effective preparation is malformed")
+    worker_spec = JobSpec.from_dict(raw_worker)
+    _validate_effective_spec(public_spec, worker_spec)
+    expected = snapshot.get("adapter_identity")
+    stored_digest = snapshot.get("preparation_digest")
+    if public_spec.train.init_from_adapter:
+        if not isinstance(expected, dict) or not expected.get("digest"):
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
+                "because its original artifact identity is unavailable"
+            )
+        if not isinstance(stored_digest, str) or stored_digest != _preparation_digest(
+            public_spec, worker_spec, expected
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
+    if verify_source and public_spec.train.init_from_adapter:
+        try:
+            from flash.lora_rank import (
+                adapter_artifact_identity,
+                inspect_adapter_config,
+                load_hf_adapter_config,
+            )
+
+            revision = worker_spec.train.init_from_adapter_revision
+            config = load_hf_adapter_config(
+                worker_spec.train.init_from_adapter,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            )
+            metadata = inspect_adapter_config(
+                config,
+                source="pinned warm-start adapter",
+                target_model=worker_spec.model,
+            )
+            if (
+                metadata.rank != worker_spec.train.lora_rank
+                or metadata.alpha != worker_spec.train.lora_alpha
+            ):
+                raise ValueError("prepared adapter topology changed")
+            current = adapter_artifact_identity(
+                worker_spec.train.init_from_adapter,
+                config,
+                os.environ.get("HF_TOKEN"),
+                revision,
+            ).to_dict()
+        except Exception as exc:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} could not be revalidated"
+            ) from exc
+        if current != expected:
+            raise ValueError(
+                f"warm-start source {public_spec.train.init_from_adapter!r} changed after submission; "
+                "recovery was refused"
+            )
+    return worker_spec
 
 
 def list_runs() -> list[RunStatus]:
@@ -684,7 +1118,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         return
     hb = _sanitize_status_value(heartbeat)
     gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -692,7 +1126,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -702,6 +1136,9 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
     wall time; setup/cold-start is reported separately and is not included here."""
+    from flash.engine.accounting import sanitize_worker_metrics
+
+    metrics = sanitize_worker_metrics(metrics)
     dest = artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.
@@ -728,6 +1165,184 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
+def _remote_resource_identity(remote: object) -> tuple | None:
+    """Return the exact strict provider resource identity used for compare-and-clear."""
+    if not isinstance(remote, dict):
+        return None
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            handle = RunpodJobHandle.from_dict(remote)
+            return provider, handle.attempt, handle.endpoint_id, handle.job_id, handle.key_fingerprint
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            handle = LambdaJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.instance_type,
+                handle.region,
+                handle.name,
+            )
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            handle = VastJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.offer_id,
+                handle.machine_id,
+                handle.label,
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
+    """Clear only the nonterminal remote that still names the destroyed resource."""
+    expected_identity = _remote_resource_identity(expected_remote)
+    if expected_identity is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if _remote_resource_identity(status.remote) != expected_identity:
+            return False
+        status.remote = None
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
+def _canonical_cleanup_remote(remote: object) -> dict | None:
+    """Return the complete strict teardown handle for one exact resource."""
+    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
+        return None
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            return RunpodJobHandle.from_dict(remote).to_dict()
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            return LambdaJobHandle.from_dict(remote).to_dict()
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            return VastJobHandle.from_dict(remote).to_dict()
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cleanup_remote_key(remote: object) -> tuple | None:
+    record = _canonical_cleanup_remote(remote)
+    if record is None:
+        return None
+    return _remote_resource_identity(record), record["attempt"]
+
+
+def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
+    value = raw.get(_CLEANUP_REMOTES_KEY, [])
+    if not isinstance(value, list):
+        raise RuntimeError("stored cleanup remotes are invalid")
+    records = []
+    seen = set()
+    for item in value:
+        record = _canonical_cleanup_remote(item)
+        key = _cleanup_remote_key(record)
+        if record is None or key is None:
+            raise RuntimeError("stored cleanup remote is invalid")
+        if key not in seen:
+            records.append(record)
+            seen.add(key)
+    return records
+
+
+def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
+    with _status_guard(run_id):
+        return _cleanup_remotes_from_raw(_load_status_json(run_id))
+
+
+def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
+    expected_key = _cleanup_remote_key(expected_remote)
+    if expected_key is None:
+        return False
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        records = _cleanup_remotes_from_raw(raw)
+        remaining = [record for record in records if _cleanup_remote_key(record) != expected_key]
+        if len(remaining) == len(records):
+            return False
+        _save_status_unlocked(
+            _runstatus_from_json(raw),
+            _cleanup_remotes=remaining or None,
+        )
+    return True
+
+
+def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
+    """Teardown every tracked resource independently, removing only confirmed exact records."""
+    records = _snapshot_cleanup_remotes(run_id)
+    attempted = set()
+    if not records:
+        return attempted
+    from flash.providers.base import JobHandle
+    from flash.runner.lifecycle import _strict_teardown_handle
+
+    for record in records:
+        identity = _remote_resource_identity(record)
+        if identity is None:
+            continue
+        attempted.add(identity)
+        try:
+            _strict_teardown_handle(JobHandle.from_dict(record))
+        except Exception:
+            continue
+        with contextlib.suppress(Exception):
+            _compare_and_remove_cleanup_remote(run_id, record)
+    return attempted
+
+
+def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
+    """Persist cleanup identity without changing a terminal lifecycle state."""
+    record = _canonical_cleanup_remote(remote)
+    key = _cleanup_remote_key(record)
+    if record is None or key is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        records = _cleanup_remotes_from_raw(raw)
+        if all(_cleanup_remote_key(existing) != key for existing in records):
+            records.append(record)
+        current_identity = _remote_resource_identity(status.remote)
+        identity = _remote_resource_identity(record)
+        if current_identity is None or current_identity == identity:
+            status.remote = dict(remote)
+        status.updated_at = time.time()
+        _save_status_unlocked(status, _cleanup_remotes=records)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -737,7 +1352,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     must check this return so a run concurrently flipped terminal does not get resumed.
     """
     report_status: RunStatus | None = None
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
@@ -746,11 +1361,11 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         status.state = state
         status.updated_at = time.time()
         if state in TERMINAL_STATES and status.finished_at is None:
-            # Legacy run already terminal: backfill from prior updated_at, not now.
+            # legacy run already terminal: backfill from prior updated_at, not now.
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
-        _save_status(status)
+        _save_status_unlocked(status)
         report_status = status
     if report_status is not None:
         _report_status(report_status)
@@ -759,7 +1374,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -767,7 +1382,7 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -781,7 +1396,7 @@ def record_billing_state(run_id: str, **fields) -> None:
     bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -803,7 +1418,7 @@ def record_billing_state(run_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(status, key, value)
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -814,27 +1429,81 @@ def _report_status(status: RunStatus) -> None:
         record_training_run(status=status)
 
 
-def _save_status(status: RunStatus) -> None:
+def _save_status(
+    status: RunStatus,
+    *,
+    _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
+    _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+) -> None:
+    with _status_guard(status.run_id):
+        if not os.path.exists(runs_file_path(status.run_id, ".json")):
+            if _run_deadline_at is _PRIVATE_VALUE_UNSET:
+                spec = JobSpec.from_dict(status.spec)
+                _run_deadline_at = _require_valid_deadline(
+                    _require_valid_deadline(status.created_at)
+                    + _require_valid_deadline(spec.gpu.max_wall_seconds)
+                )
+            if _next_attempt is _PRIVATE_VALUE_UNSET:
+                _next_attempt = 0
+        _save_status_unlocked(
+            status,
+            _run_deadline_at=_run_deadline_at,
+            _next_attempt=_next_attempt,
+            _cleanup_remotes=_cleanup_remotes,
+        )
+
+
+def _save_status_unlocked(
+    status: RunStatus,
+    *,
+    _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
+    _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
-    # Write-then-rename so concurrent readers never see a half-written file.
+    # write-then-rename so concurrent readers never see a half-written file.
     path = runs_file_path(status.run_id, ".json")
+    existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
+    private_values = {
+        _RUN_DEADLINE_AT_KEY: _run_deadline_at,
+        _NEXT_ATTEMPT_KEY: _next_attempt,
+        _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+    }
+    data = _status_storage_dict(status)
+    for key in _PRIVATE_STATUS_KEYS:
+        value = private_values[key]
+        if value is _PRIVATE_VALUE_UNSET:
+            value = existing.get(key, _PRIVATE_VALUE_UNSET)
+        if value is not _PRIVATE_VALUE_UNSET and value is not None:
+            data[key] = value
     fd, tmp = tempfile.mkstemp(dir=RUNS_DIR, prefix=f"{status.run_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(_status_storage_dict(status), f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(RUNS_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
 
 
 from flash.runner.deploy import (  # noqa: E402,F401
+    DeploymentRevocationError,
+    DeploymentStatePersistenceError,
     attach_run,
     cancel_run,
     mark_checkpoint_deployed,
     mark_deployed,
     mark_deployment_failed,
     mark_deployment_pending,
+    mark_deployment_revocation_failed,
     mark_deployment_undeployed,
     mark_undeployed,
 )
@@ -845,4 +1514,10 @@ from flash.runner.lifecycle import (  # noqa: E402,F401
     _run_training,
     _spec_with_gpu,
     _submit_seed_supervised,
+)
+from flash.runner.verified_revisions import (  # noqa: E402,F401
+    add_verified_adapter_revision,
+    clear_verified_adapter_revisions,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
 )

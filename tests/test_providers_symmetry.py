@@ -17,6 +17,8 @@ import importlib
 
 import pytest
 
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
 # The universal per-provider surface: concerns every substrate must implement itself (no shared
 # default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
 PROVIDER_MODULES = ("api", "auth", "pricing", "jobs", "preflight")
@@ -276,7 +278,8 @@ def test_jobhandle_roundtrip_tags_provider():
     back = JobHandle.from_dict(d)
     assert back.provider == "runpod"
     assert back.data == {"endpoint_id": "ep", "job_id": "j"}
-    assert JobHandle.from_dict({"endpoint_id": "ep", "job_id": "j"}).provider == "runpod"
+    with pytest.raises(ValueError, match="provider identity is missing or invalid"):
+        JobHandle.from_dict({"endpoint_id": "ep", "job_id": "j"})
 
 
 def test_provider_cancel_destroy_dispatch(monkeypatch):
@@ -285,10 +288,54 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     from flash.providers.runpod import api as rp_api
 
     cancelled, deleted = [], []
-    monkeypatch.setattr(rp_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
-    monkeypatch.setattr(rp_api, "delete_endpoint", lambda e: deleted.append(e) or True)
-    handle = JobHandle("runpod", {"endpoint_id": "ep", "job_id": "j"})
+    monkeypatch.setattr(
+        rp_api,
+        "cancel_job",
+        lambda e, j, **_kw: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(
+        rp_api,
+        "delete_endpoint_for_fingerprint",
+        lambda e, _fingerprint: deleted.append(e) or True,
+    )
+    handle = JobHandle(
+        "runpod",
+        {
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "attempt": 0,
+            "started_ts": 1.0,
+        },
+    )
     get_provider("runpod").cancel(handle)
     get_provider("runpod").destroy(handle)
     assert cancelled == [("ep", "j")]
     assert deleted == ["ep"]
+
+
+def test_runpod_destroy_rejects_unconfirmed_delete(monkeypatch):
+    from flash.providers import get_provider
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import api as rp_api
+
+    monkeypatch.setattr(
+        rp_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: False,
+    )
+    handle = JobHandle(
+        "runpod",
+        {
+            "endpoint_id": "ep-unconfirmed",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "j",
+            "attempt": 0,
+            "started_ts": 1.0,
+        },
+    )
+
+    with pytest.raises(rp_api.RunpodApiError, match="unconfirmed"):
+        get_provider("runpod").destroy(handle)

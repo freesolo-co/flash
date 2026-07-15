@@ -18,12 +18,15 @@ def test_is_cuda_oom_is_structured(monkeypatch):
     assert lc.is_cuda_oom(ValueError("bad config")) is False
     # vLLM can reject startup before torch records an allocator OOM; those deterministic memory
     # preflight messages must still trigger the larger-GPU walk.
-    assert lc.is_cuda_oom(
-        RuntimeError(
-            "Free memory on device cuda:0 (2.42/31.36 GiB) on startup is less than "
-            "desired GPU memory utilization (0.37421194528246804, 11.73 GiB)"
+    assert (
+        lc.is_cuda_oom(
+            RuntimeError(
+                "Free memory on device cuda:0 (2.42/31.36 GiB) on startup is less than "
+                "desired GPU memory utilization (0.37421194528246804, 11.73 GiB)"
+            )
         )
-    ) is True
+        is True
+    )
     assert lc.is_cuda_oom(RuntimeError("No available memory for the cache blocks")) is True
     # torch's allocator counter advancing is the structured "error code"
     monkeypatch.setattr(lc, "cuda_oom_count", lambda: 2)
@@ -54,7 +57,9 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
     from flash.runner.lifecycle import _oom_escalated
 
     cands = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
-    assert [c.gpu for c in _oom_escalated(cands, 0)] == [c.gpu for c in cands]  # no OOM -> unchanged
+    assert [c.gpu for c in _oom_escalated(cands, 0)] == [
+        c.gpu for c in cands
+    ]  # no OOM -> unchanged
     assert {c.gpu for c in _oom_escalated(cands, 80)} == {"Pro6000", "B200"}  # >80 only
     assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
 
@@ -67,35 +72,102 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
 
     def reader(force=False):
         reads["n"] += 1
-        return {"oom": True, "attempt": "0", "retriable": False, "stage": "rl_train"}
+        return {"oom": True, "attempt": 0, "retriable": False, "stage": "rl_train"}
 
-    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0)
+    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0, launch_ts=1.0)
     assert (retriable, oom) == (False, True)
-    assert reads["n"] == 1  # surfacing + both flags share ONE forced read
-    assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say)[1:] == (True, False)
-    assert surfaced_worker_flags(lambda force=False: {"retriable": True}, None, say, 0)[1:] == (True, False)
+    assert reads["n"] == 1
     assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "ts": 9_000.0}, None, say, 0, launch_ts=10_000.0
-    )[1:] == (False, False)
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "ts": 10_500.0}, None, say, 0, launch_ts=10_000.0
+        lambda force=False: {"retriable": True, "attempt": 0, "ts": 10_500.0},
+        None,
+        say,
+        0,
+        launch_ts=10_000.0,
     )[1:] == (True, False)
+    assert surfaced_worker_flags(
+        lambda force=False: {"retriable": True, "attempt": 1, "ts": 10_500.0},
+        None,
+        say,
+        0,
+        launch_ts=10_000.0,
+    )[1:] == (False, False)
     assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
-    stale = lambda force=False: {"oom": True, "attempt": "0", "retriable": False}  # noqa: E731
-    assert surfaced_worker_flags(stale, None, say, 0)[1:] == (False, True)
-    assert surfaced_worker_flags(stale, None, say, 1)[1:] == (False, False)
 
 
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
     from flash.providers._poll import heartbeat_oom_for_attempt
 
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, 0) is True
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, 1) is False
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "1"}, 1) is True
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 0) is True
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 1) is False
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, 1) is True
     assert heartbeat_oom_for_attempt({"oom": True}, 1) is False
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": "0"}, None) is False
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, None) is False
     assert heartbeat_oom_for_attempt(None, 0) is False
     assert heartbeat_oom_for_attempt({"retriable": True}, 0) is False
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_attempt", "current_attempt"),
+    [(0, 0), (7, 7)],
+)
+def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
+    heartbeat_attempt, current_attempt
+):
+    from flash.providers._poll import heartbeat_oom_for_attempt
+
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": heartbeat_attempt}, current_attempt)
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [
+        True,
+        False,
+        1.0,
+        -1,
+        "0",
+        "7",
+        "007",
+        "-1",
+        "+1",
+        " 1",
+        "1 ",
+        "",
+        chr(0x661),
+        chr(0xFF11),
+        object(),
+    ],
+)
+def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
+    from flash.providers._poll import heartbeat_oom_for_attempt
+
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": malformed_attempt}, 1) is False
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [
+        True,
+        False,
+        1.0,
+        -1,
+        "0",
+        "7",
+        "007",
+        "-1",
+        "+1",
+        " 1",
+        "1 ",
+        "",
+        chr(0x661),
+        chr(0xFF11),
+        object(),
+    ],
+)
+def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
+    from flash.providers._poll import heartbeat_oom_for_attempt
+
+    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
 
 
 def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
@@ -103,13 +175,17 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     from flash.providers.runpod import jobs
 
     monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(runpod_api, "job_status", lambda _eid, _jid: {"status": "FAILED", "error": "x"})
-    handle = jobs.JobHandle("ep", "name", "job")
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
+    )
+    handle = jobs.JobHandle("ep", "name", "rpk-0123456789ab", "job", 2, 1.0)
 
     res = jobs.poll_job(
         handle,
         interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": "2"},
+        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
         current_attempt=2,
     )
     assert res.failure == "oom"
@@ -117,7 +193,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     res = jobs.poll_job(
         handle,
         interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": "1"},
+        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},
         current_attempt=2,
     )
     assert res.failure == "job_failed"
