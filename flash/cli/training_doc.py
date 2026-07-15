@@ -93,6 +93,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
+# model_revision = "main"   # optional ref resolved to an immutable hugging face commit before submit
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
@@ -113,9 +114,11 @@ lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
-GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
-`train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
-and run artifacts are stored in a private environment-scoped repo with content-addressed
+GPU and HF artifacts are **managed by default**: `gpu.type` is a non-pinning managed
+hint and `train.hf_repo` remains platform-managed. For controlled
+experiments, `[gpu] provider` restricts allocation to one provider and `[gpu] exact_type`
+pins one active validated GPU class; otherwise the allocator picks the cheapest fitting
+class. Run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
 `SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
 extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).

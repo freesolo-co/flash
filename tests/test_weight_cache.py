@@ -20,6 +20,8 @@ import os
 import tempfile
 import types
 
+import pytest
+
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
@@ -58,14 +60,11 @@ def test_default_spec_has_no_volume():
     assert JobSpec(model="m").gpu.network_volume is None
 
 
-def test_legacy_datacenter_key_tolerated():
-    # A stale spec from the reverted single-DC pin may still carry gpu.datacenter; it must be
-    # ignored (the DC set is deploy-time policy now), not raise.
-    spec = JobSpec.from_dict(
-        {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
-    )
-    assert spec.gpu.network_volume == "v"
-    assert not hasattr(spec.gpu, "datacenter")
+def test_stale_datacenter_key_rejected():
+    with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): datacenter"):
+        JobSpec.from_dict(
+            {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
+        )
 
 
 def test_network_volume_gb_tolerant_of_bad_values():
@@ -831,7 +830,7 @@ def _supervised_walk(monkeypatch, failures):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
         assert orch.get_status("wc-walk").state == "done"

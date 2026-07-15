@@ -260,12 +260,18 @@ def _fail_blocked_recovery(spec, reason: str) -> None:
 
 
 def _start_resubmit(spec) -> bool:
-    from flash.runner import _run_job_background
+    from flash.runner import _run_job_background, _verified_opd_next_attempt
 
     reason = _recovery_block_reason(spec)
     if reason is not None:
         _fail_blocked_recovery(spec, reason)
         return False
+    if spec.algorithm == "opd":
+        try:
+            _verified_opd_next_attempt(spec.run_id)
+        except Exception as exc:
+            _fail_blocked_recovery(spec, str(exc))
+            return False
     with contextlib.suppress(Exception):
         _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
     threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()

@@ -1940,8 +1940,10 @@ def test_submit_rejects_policy_word_gpu():
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs.jobs import submit_run_lambda
 
+    spec = _spec()
+    object.__setattr__(spec.gpu, "type", "cheapest")
     with pytest.raises(lambda_api.LambdaApiError, match="concrete gpu class"):
-        submit_run_lambda(_spec(gpu_type="cheapest"), seed=0)
+        submit_run_lambda(spec, seed=0)
 
 
 # ---------------------------------------------------------------------------

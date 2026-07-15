@@ -98,7 +98,9 @@ def _sft_realized_batch(spec) -> int:
     # micro-batch cap) hinges on the >=3B threshold, so an uncataloged >=3B model must not be priced
     # as <3B (which would flip fused off, change the realized batch via the cap, and misprice the
     # step count). Best-effort: no network -> None -> the prior <3B (cap-on) behavior.
-    sft_fused = sft_logits_fused(resolve_params_b(spec.model), sft_seq)
+    sft_fused = sft_logits_fused(
+        resolve_params_b(spec.model, revision=spec.model_revision), sft_seq
+    )
     return sft_realized_batch(
         requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
     )
@@ -130,9 +132,11 @@ def spec_steps(spec) -> int:
 
 
 def runconfig_from_spec(spec) -> RunConfig:
-    """Map a parsed ``JobSpec`` to a cost ``RunConfig``. A run trains exactly one adapter, so the
-    estimate covers a single job. The estimate doesn't pin a GPU -- it does its own cheapest-fit
-    (provider="auto")."""
+    """Map a parsed ``JobSpec`` to a cost ``RunConfig`` for one adapter-training job.
+
+    unconstrained runs retain cheapest-fit pricing; authored provider/exact-type constraints are
+    preserved so the quote matches the allocatable hardware contract.
+    """
     t, g = spec.train, spec.gpu
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
@@ -156,7 +160,10 @@ def runconfig_from_spec(spec) -> RunConfig:
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
         teacher_model=teacher_model,
-        provider="auto",
+        provider=g.provider or "auto",
+        exact_type=g.exact_type,
+        model_revision=spec.model_revision,
+        disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

@@ -177,6 +177,30 @@ def test_scan_repo_classifies_paths():
     assert unknown == {"telemetry"}
 
 
+def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
+    from flash.opd_retry_contract import opd_optimizer_start_marker_path
+
+    repo = _managed("opd-retry")
+    marker_path = opd_optimizer_start_marker_path("flash-1-a", 0)
+    api = FakeApi(
+        {
+            repo: [
+                _adapter("opd/flash-1-a/adapter/w.safetensors", OLD),
+                _adapter(marker_path, OLD, size=123),
+            ]
+        }
+    )
+
+    prefixes, _ref_recent_ts, unknown = rc._scan_repo(api, repo)
+    assert set(prefixes) == {"opd/flash-1-a"}
+    assert unknown == {"_opd_retry"}
+
+    _wire(monkeypatch)
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 1
+    assert api.deleted == [(repo, "opd/flash-1-a")]
+    assert all(marker_path != deleted_path for _repo, deleted_path in api.deleted)
+
+
 # ---- the global serving set (deployed_prefixes) -----------------------------------------------
 
 

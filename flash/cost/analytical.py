@@ -175,7 +175,15 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         config.method,
         train=config.train_knobs(),
         thinking=config.thinking,
+        model_revision=config.model_revision,
     )
+    if config.exact_type:
+        if gpu_vram_gb(config.exact_type) < need:
+            raise ValueError(
+                f"exact_type {config.exact_type!r} has {gpu_vram_gb(config.exact_type)} GB VRAM, "
+                f"but this run requires at least {need} GB"
+            )
+        return config.exact_type, need
     gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
 
@@ -239,13 +247,37 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
-    # Quote the SAME VRAM-floored Vast market pick_gpu selected under (min_vram_gb=need): without the
-    # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
-    # crowd a high-VRAM selection off the limited page -> it silently falls back to the static rate.
-    hourly = gpu_hourly_usd(
-        gpu, provider=config.provider, max_wall_seconds=market_wall_s, min_vram_gb=need
-    )
+    if config.exact_type and config.provider == "auto":
+        from flash.providers.allocator import allocate
+
+        allocation = allocate(
+            config.model_id,
+            config.method,
+            train=config.train_knobs(),
+            thinking=config.thinking,
+            max_wall_seconds=market_wall_s,
+            disk_gb=config.disk_gb,
+            provider="",
+            exact_type=config.exact_type,
+            model_revision=config.model_revision,
+        )
+        gpu = allocation.gpu
+        quote_provider = allocation.provider
+        hourly = allocation.hourly_usd
+        need = allocation.min_vram_gb
+    else:
+        gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
+        quote_provider = config.provider
+        # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
+        # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
+        # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.
+        hourly = gpu_hourly_usd(
+            gpu,
+            provider=quote_provider,
+            max_wall_seconds=market_wall_s,
+            min_vram_gb=need,
+            exact_type=config.exact_type,
+        )
 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
@@ -279,7 +311,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         method=config.method,
         steps=config.steps,
         gpu=gpu,
-        provider=config.provider,
+        provider=quote_provider,
         gpu_vram_gb=gpu_vram_gb(gpu),
         required_vram_gb=need,
         gpu_hourly_usd=hourly,
