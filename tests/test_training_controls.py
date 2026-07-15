@@ -230,6 +230,47 @@ def test_permanent_landmark_failure_is_not_retried(monkeypatch, tmp_path):
     assert calls == 1
 
 
+def test_resume_upload_failure_preserves_published_landmark(monkeypatch, tmp_path):
+    fake_transformers = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    fake_transformers.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    checkpoint = tmp_path / "checkpoint-4"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    calls = {"deployable": 0, "resume": 0}
+
+    class ResumeFailingApi:
+        def upload_folder(self, **kwargs):
+            if kwargs["path_in_repo"].endswith("/checkpoints/step-4/adapter"):
+                calls["deployable"] += 1
+                return
+            calls["resume"] += 1
+            raise RuntimeError("resume upload unavailable")
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: ResumeFailingApi())
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+    callback = worker.make_checkpoint_upload_callback((4,))
+
+    callback.on_save(
+        SimpleNamespace(output_dir=str(tmp_path)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert calls == {"deployable": 1, "resume": 3}
+
+
 def test_resumed_trainer_credits_landmarks_at_or_before_restored_step(monkeypatch, tmp_path):
     fake_transformers = types.ModuleType("transformers")
 

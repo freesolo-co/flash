@@ -470,6 +470,7 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
     from flash.engine.worker.heartbeat import liveness_heartbeat
 
     required_steps = frozenset(int(step) for step in checkpoint_landmarks)
+    deployable_steps: set[int] = set()
 
     def _publish_deployable(ckpt_dir: str, step: int) -> None:
         """Publish a step's deployable adapter directly from the trainer checkpoint.
@@ -479,12 +480,15 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
         the catalog base and serves as-is (no merge, no SFT rank-stack recombine).
         """
         publish_deployable_checkpoint(ckpt_dir, step, required=step in required_steps)
+        if step in required_steps:
+            deployable_steps.add(step)
 
     def _upload_once(step: int, ckpt_dir: str) -> None:
-        # Deployable per-step adapter FIRST: it's small, kept-forever, and the only
+        # deployable per-step adapter first: it's small, kept-forever, and the only
         # artifact that makes a cancelled/preempted run deployable from this step, so
         # it must land before the larger resume checkpoint (best-effort, latest-only).
-        _publish_deployable(ckpt_dir, step)
+        if step not in deployable_steps:
+            _publish_deployable(ckpt_dir, step)
         _require_hf_deadline_allowance()
         _w.hf_api().upload_folder(
             folder_path=ckpt_dir,
@@ -541,7 +545,9 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
     class _CheckpointUpload(TrainerCallback):
         def on_train_begin(self, args, state, control, **kwargs):
             resumed_step = int(getattr(state, "global_step", 0) or 0)
-            uploaded_steps.update(step for step in required_steps if step <= resumed_step)
+            resumed_landmarks = {step for step in required_steps if step <= resumed_step}
+            deployable_steps.update(resumed_landmarks)
+            uploaded_steps.update(resumed_landmarks)
             return control
 
         def on_save(self, args, state, control, **kwargs):
@@ -566,13 +572,14 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
                     )
                 return
             if not _upload_with_retries(step, ckpt_dir):
-                if step in required_steps:
+                if step in required_steps and step not in deployable_steps:
                     raise RetriableInfraError(
                         f"checkpoint landmark step {step} was not durably published"
                     )
                 print(
-                    f"[ckpt] step {step} not durable on HF after retries; training continues and "
-                    "on_train_end will re-flush the latest checkpoint."
+                    f"[ckpt] step {step} resume checkpoint not durable on HF after retries; "
+                    "the deployable landmark is preserved and on_train_end will re-flush the latest "
+                    "checkpoint."
                 )
 
         def on_train_end(self, args, state, control, **kwargs):
@@ -592,12 +599,15 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
                     and step not in uploaded_steps
                     and not _upload_with_retries(step, ckpt_dir)
                 ):
-                    if step in required_steps:
+                    if step in required_steps and step not in deployable_steps:
                         raise RetriableInfraError(
                             f"checkpoint landmark step {step} was not durably published"
                         )
-                    print(f"[ckpt] final checkpoint step {step} not durable on HF after retries.")
-            missing_required = sorted(required_steps - uploaded_steps)
+                    print(
+                        f"[ckpt] final resume checkpoint step {step} not durable on HF after retries; "
+                        "the deployable landmark is preserved."
+                    )
+            missing_required = sorted(required_steps - deployable_steps)
             if missing_required:
                 raise RuntimeError(
                     f"checkpoint landmarks were not durably published: {missing_required}"
