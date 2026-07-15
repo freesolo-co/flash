@@ -1,11 +1,10 @@
 name: flash worker image
 
-# Builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
-# pushes it to GHCR, so Vast/RunPod cold-start skips the per-host dep install (the dominant
-# cold-start cost). Training and serving both default to the pinned WORKER_IMAGE constant
-# (flash/providers/runpod/train.py) — bump that to the new tag. FLASH_WORKER_IMAGE is an
-# operator env override honored by BOTH training (providers/runpod/{jobs,train}.py) and serving
-# (flash/serve/deploy.py).
+# builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
+# pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
+# install (the dominant cold-start cost). training providers select the pinned image and operator
+# override through flash/providers/_worker.py. serving has no consumer for this training-worker
+# image or override.
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
 # rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
@@ -95,9 +94,9 @@ jobs:
           context: .
           file: Dockerfile.worker
           push: true
-          # Pin the freesolo-co namespace: both RunPod and Vast pull the hardcoded
-          # WORKER_IMAGE = ghcr.io/freesolo-co/flash-worker:cu128 (flash/providers/runpod/train.py),
-          # so a fork run must not push to its own owner namespace and leave the real image stale.
+          # pin the freesolo-co namespace: runpod, vast, and lambda training paths pull the image
+          # declared in flash/providers/_worker.py, so a fork run must not push to its own owner
+          # namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ github.event.inputs.tag || 'cu128' }}
           provenance: false
           # Stamp the kernel-cache fingerprints + the source commit so auto-rebake.yml can read what
