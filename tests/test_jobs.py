@@ -1235,9 +1235,9 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
 
 
 def test_poll_job_malformed_step_does_not_crash(monkeypatch):
-    # A heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
-    # no local handler — a ValueError would abort poll_job). The step is coerced like `attempt`, so an
-    # unparseable step is treated as 0 (keep setup grace, don't tighten).
+    # a heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
+    # no local handler — a ValueError would abort poll_job). the step is validated strictly through the
+    # same bounded integer helper; an invalid step stays setup-classified and must not raise.
     import itertools
 
     from flash.providers.runpod import api as runpod_api

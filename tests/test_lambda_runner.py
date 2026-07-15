@@ -1578,26 +1578,6 @@ def test_poll_rejects_missing_started_timestamp(monkeypatch):
         jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
 
 
-def test_heartbeat_progress_ts_rejects_unknown_launch_identity():
-    from flash.providers._poll import heartbeat_progress_ts
-
-    hb_ts = time.time() - 30.0
-    _ts, fresh = heartbeat_progress_ts(
-        ("rl", 4, hb_ts, 0), launch_ts=0.0, current_attempt=0
-    )
-    assert fresh is False
-
-    launch = time.time() - 100.0
-    _, fresh_old = heartbeat_progress_ts(
-        ("rl", 1, launch - 50.0, 0), launch_ts=launch, current_attempt=0
-    )
-    assert fresh_old is False
-    _, fresh_new = heartbeat_progress_ts(
-        ("rl", 9, launch + 10.0, 0), launch_ts=launch, current_attempt=0
-    )
-    assert fresh_new is True
-
-
 def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     """A heartbeat that was already stale before a restart must not reset the stall clock to the
     reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago

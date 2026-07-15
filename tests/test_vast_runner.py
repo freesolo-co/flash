@@ -928,7 +928,7 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     ],
 )
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
-    # Codex/Cursor: a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
+    # a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
     # raise JSONDecodeError/UnicodeDecodeError, or IncompleteRead/http.client.HTTPException on a truncated
     # body read (NOT a VastApiError — the _http wrapper only catches the OSError-family transients). The
     # poll loop must treat all of those as a TRANSIENT poll error (count + keep polling, give up only once
@@ -954,7 +954,7 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
 
 
 def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
-    # Codex 3519040492: when Vast's detail API lags in 'loading'/'unknown' and never flips to
+    # when Vast's detail API lags in 'loading'/'unknown' and never flips to
     # 'running', a worker that HAS booted still uploads fresh heartbeats to HF. Those prove it
     # started, so they disarm the load timeout — else a healthy, heartbeating box is torn down at
     # LOAD_TIMEOUT_S (15m) on a stale status feed (deadline_s + the finally destroy stay the spend
@@ -987,9 +987,9 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
-    # Cursor 3519197324: the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh
-    # heartbeat arriving on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. If the guard is
-    # ordered BEFORE the read (the incomplete 91daa363 fix), seen_fresh_hb is still False on that tick
+    # the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh heartbeat arriving
+    # on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. if the guard is ordered BEFORE the
+    # read, seen_fresh_hb is still False on that tick
     # -> a healthy, heartbeating box is torn down as 'stalled'. The heartbeat is ABSENT until the
     # crossing tick (unlike the sibling test, whose heartbeat is present from iteration 1 and so can't
     # expose the ordering race).
@@ -1022,7 +1022,7 @@ def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
-    """Codex/Cursor: when the Vast status endpoint keeps raising and the poll-error budget is spent, the
+    """when the Vast status endpoint keeps raising and the poll-error budget is spent, the
     poller does a BOUNDED terminal DONE/marker read (same as the deadline / dead-host paths) BEFORE
     returning poll_error. A worker that COMPLETED during a prolonged outage — DONE on HF, a separate
     endpoint, but lagged on the first read — is finished rather than abandoned to a duplicate retry that
