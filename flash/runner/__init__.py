@@ -662,6 +662,12 @@ def _prepare_init_from_adapter(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
+    if src_spec.model_revision != spec.model_revision:
+        raise ValueError(
+            "train.init_from_adapter source model_revision "
+            f"{src_spec.model_revision!r} does not match target model_revision "
+            f"{spec.model_revision!r}"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
@@ -839,7 +845,27 @@ def prepare_job(
     """Prepare all read-only submission inputs before persistence or allocation."""
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    if spec.gpu.provider or spec.gpu.exact_type:
+        from flash.providers import PROVIDER_NAMES, available_providers
+        from flash.providers.base import providers_for
+
+        configured = available_providers()
+        provider = spec.gpu.provider.strip().lower()
+        if provider:
+            if provider not in PROVIDER_NAMES:
+                raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
+            if provider not in configured:
+                raise ValueError(f"requested gpu.provider {provider!r} is not configured")
+        elif not any(name in configured for name in providers_for(spec.gpu.exact_type)):
+            raise ValueError(
+                f"no configured provider can provision gpu.exact_type {spec.gpu.exact_type!r}"
+            )
+    info = resolve_model(
+        spec.model,
+        spec.algorithm,
+        policy=spec.model_policy,
+        gpu=spec.gpu.exact_type or spec.gpu.type,
+    )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)

@@ -134,9 +134,11 @@ def spec_steps(spec) -> int:
 
 
 def runconfig_from_spec(spec) -> RunConfig:
-    """Map a parsed ``JobSpec`` to a cost ``RunConfig``. A run trains exactly one adapter, so the
-    estimate covers a single job. The estimate doesn't pin a GPU -- it does its own cheapest-fit
-    (provider="auto")."""
+    """Map a parsed ``JobSpec`` to a cost ``RunConfig`` for one adapter-training job.
+
+    unconstrained runs retain cheapest-fit pricing; authored provider/exact-type constraints are
+    preserved so the quote matches the allocatable hardware contract.
+    """
     t, g = spec.train, spec.gpu
     # Both grpo and opd sample on-policy student completions, so both carry the rollout
     # dimensions (completion length + group size) into the cost model.
@@ -160,7 +162,8 @@ def runconfig_from_spec(spec) -> RunConfig:
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
         teacher_model=teacher_model,
-        provider="auto",
+        provider=g.provider or "auto",
+        exact_type=g.exact_type,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

@@ -299,6 +299,8 @@ def _student_model(model_id, model_init_kwargs, device):
     a new adapter here, loading the full multimodal model for VL so all-linear LoRA sees every target.
     """
     init_model, init_peft = _w._init_adapter_model(model_id)
+    job_spec = getattr(_w, "JOB_SPEC", None)
+    model_revision = getattr(job_spec, "model_revision", "") if job_spec else ""
     if init_peft is None:
         # init_model is already a trainable PeftModel continuing the prior (e.g. SFT) adapter.
         return init_model.to(device), model_id
@@ -306,7 +308,7 @@ def _student_model(model_id, model_init_kwargs, device):
     from transformers import AutoModelForCausalLM
 
     model_cls = AutoModelForCausalLM
-    if _w.is_vl_checkpoint(model_id):
+    if _w.is_vl_checkpoint(model_id, revision=model_revision):
         # VL checkpoints are trained/served on the full multimodal tree, including visual linears, so
         # a fresh LoRA must target that same tree (parity with the warm-start / serving module set).
         from transformers import AutoModelForImageTextToText
@@ -315,9 +317,18 @@ def _student_model(model_id, model_init_kwargs, device):
 
     # init_model is the base id (fresh run). VL runs load the full multimodal model so all-linear LoRA
     # sees every target; non-VL runs keep the lighter causal-LM loader.
-    base = model_cls.from_pretrained(init_model, trust_remote_code=True, **model_init_kwargs).to(
-        device
-    )
+    from flash.engine.worker.hf import model_revision_kwargs
+
+    base = model_cls.from_pretrained(
+        init_model,
+        trust_remote_code=True,
+        **model_init_kwargs,
+        **{
+            key: value
+            for key, value in model_revision_kwargs(model_revision).items()
+            if key not in model_init_kwargs
+        },
+    ).to(device)
     return get_peft_model(base, init_peft), str(init_model)
 
 
@@ -346,8 +357,8 @@ def _format_skip_counts(counts: Counter[str]) -> str:
 
 def run_opd():
     import torch
-    from transformers import AutoTokenizer
 
+    from flash.engine.worker.hf import load_tokenizer, model_revision_kwargs
     from flash.engine.worker.teacher import TeacherClient
 
     seed_training_rngs(_w.SEED)
@@ -388,10 +399,11 @@ def run_opd():
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     # Tokenizer only (a few small files) up front -- the prompt-budget filter below needs it. The FULL
     # base-weight prefetch (tens of GB) is deferred until AFTER the filter confirms a non-empty pool, so
     # a dataset whose every prompt is over-budget fails fast without paying for the download (codex[bot]).
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tok = load_tokenizer(model_id, revision=model_revision)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     # Thinking-mode student prompts open a reasoning block (e.g. Qwen's <think>) after the generation
@@ -401,7 +413,10 @@ def run_opd():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _attn = optimal_attn_impl()
-    model_init_kwargs = {"dtype": torch.bfloat16}
+    model_init_kwargs = {
+        "dtype": torch.bfloat16,
+        **model_revision_kwargs(model_revision),
+    }
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
     # --- Build the on-policy prompt pool BEFORE loading the student ------------------------------
@@ -508,7 +523,11 @@ def run_opd():
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
     # setup so an all-over-budget dataset fails before this download). Still inside the setup phase
     # (opt_steps==0 -> wide poller grace), same as when it ran earlier.
-    download_seconds = _w.prefetch_model(model_id)
+    download_seconds = (
+        _w.prefetch_model(model_id, revision=model_revision)
+        if model_revision
+        else _w.prefetch_model(model_id)
+    )
 
     # reseed before stochastic student and adapter construction.
     seed_training_rngs(_w.SEED)
@@ -528,7 +547,7 @@ def run_opd():
             print(f"[opd] chalk kernels active: {', '.join(_chalk_active)}")
         # Engine length gates whether gradient checkpointing is needed for the loss forward.
         seq_cap = knobs.max_length or (RECIPE.opd.max_prompt_len + knobs.max_completion)
-        if grad_checkpointing_on(model_id, seq_cap):
+        if grad_checkpointing_on(model_id, seq_cap, revision=model_revision):
             # GDN/MoE models MUST use reentrant recompute (parity with sft.py / rl.py). The default
             # non-reentrant path asserts recomputed-activation metadata equality and dies on the FIRST
             # backward for GatedDeltaNet (the fused chunk-scan + chalk Triton kernels save shape-/data-
@@ -578,6 +597,7 @@ def run_opd():
     with liveness_heartbeat("opd_vllm_initializing"):
         vllm_rollout = OpdVllmRolloutEngine(
             model_source=rollout_model_source,
+            model_revision=model_revision,
             max_model_len=seq_cap,
             temperature=knobs.temperature,
             top_p=knobs.top_p,

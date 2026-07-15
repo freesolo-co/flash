@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from flash.catalog import normalize_algorithm, samples_on_policy
 from flash.engine.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
+from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 from flash.spec import parse_positive_int_tuple
 
 
@@ -40,6 +41,7 @@ class RunConfig:
     # from this token count instead of the padded batch_size * seq_len slot estimate.
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
+    exact_type: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -51,6 +53,15 @@ class RunConfig:
                 f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
             )
         object.__setattr__(self, "provider", prov)
+        exact = ""
+        if self.exact_type:
+            exact = canonical_gpu(self.exact_type)
+            info = GPU_INFO.get(exact)
+            if info is None or not info.validated:
+                raise ValueError(f"exact_type {exact!r} must name an active validated GPU class")
+            if prov != "auto" and prov not in providers_for(exact):
+                raise ValueError(f"provider {prov!r} cannot provision exact_type {exact!r}")
+        object.__setattr__(self, "exact_type", exact)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the

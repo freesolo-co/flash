@@ -48,6 +48,7 @@ def prepare_fresh_lora_base(
     *,
     force: bool = False,
     phase: str = "train",
+    model_revision: str = "",
 ):
     """Prepare the correct base object/path for fresh-LoRA training.
 
@@ -60,7 +61,7 @@ def prepare_fresh_lora_base(
     the checkpoint is VL, so a transient config-probe failure cannot send the fresh stage back to a
     language-only loader.
     """
-    if not (force or is_vl_checkpoint(model_id)):
+    if not (force or is_vl_checkpoint(model_id, revision=model_revision)):
         return model_source
     from transformers import AutoModelForImageTextToText
 
@@ -108,6 +109,7 @@ def _init_adapter_model(model_id: str):
     returned ``LoraConfig`` — VL fresh runs load the full multimodal base via ``prepare_fresh_lora_base``.
     """
     prefix = _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else ""
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
     adir = _download_adapter(prefix)
@@ -127,11 +129,19 @@ def _init_adapter_model(model_id: str):
     # Only the base class differs: VL checkpoints load the full multimodal model (so the adapter's
     # language_model.* keys line up with the module tree AND the trainer arch matches the VL vLLM
     # rollout engine); non-VL uses the lighter causal-LM loader.
-    is_vl = adapter_is_vl_warmstart(adir, model_id)
+    is_vl = adapter_is_vl_warmstart(adir, model_id, revision=model_revision)
     if is_vl:
         print("[init-adapter] VL checkpoint: continuing the adapter on the full multimodal base")
     base_cls = AutoModelForImageTextToText if is_vl else AutoModelForCausalLM
-    base = base_cls.from_pretrained(model_id, dtype="bfloat16", trust_remote_code=True, **attn_kw)
+    from flash.engine.worker.hf import model_revision_kwargs
+
+    base = base_cls.from_pretrained(
+        model_id,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        **attn_kw,
+        **model_revision_kwargs(model_revision),
+    )
     # PeftModel.from_pretrained builds the wrapper + a trainable "default" adapter, but it doesn't
     # forward the HF `_checkpoint_conversion_mapping`; re-load "default" with key_mapping so a VL
     # checkpoint's keys remap onto the current module tree (mapping is None/no-op for non-VL).

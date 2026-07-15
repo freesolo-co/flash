@@ -40,6 +40,22 @@ def hf_api():
     return HfApi(token=os.environ.get("HF_TOKEN"))
 
 
+def model_revision_kwargs(revision: str = "") -> dict[str, str]:
+    """return the hf revision keyword only for a nonempty pinned revision."""
+    return {"revision": revision} if revision else {}
+
+
+def load_tokenizer(model_id: str, revision: str = ""):
+    """load the student tokenizer under the run's optional model revision."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        **model_revision_kwargs(revision),
+    )
+
+
 def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}"
 
@@ -262,7 +278,7 @@ def _hf_cache_bytes(model_id: str, cache_dir: str | None = None) -> int | None:
         return None
 
 
-def prefetch_model(model_id: str) -> float:
+def prefetch_model(model_id: str, revision: str = "") -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
     When the shared weight-cache volume is attached, downloads onto the mount and symlinks into
@@ -284,6 +300,7 @@ def prefetch_model(model_id: str) -> float:
                 repo_id=model_id,
                 cache_dir=shared_hub,
                 ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+                **model_revision_kwargs(revision),
             )
             if shared_hub:
                 _link_base_model_into_ephemeral_cache(model_id, shared_hub)

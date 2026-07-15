@@ -292,14 +292,14 @@ def _submit_seed_supervised(
     last_detail = None
     # Sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-DC pool.
     drop_weight_cache = False
-    # One free cache-less fallback when the shared cache's DC-set restriction may have caused no_capacity.
-    # A non-shared per-org volume earns no bonus — that's the user's own choice.
+    # one cache-less fallback is available only when the user enabled retries; max_retries=0 is
+    # exactly one provider submission. a non-shared per-org volume earns no bonus.
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    cache_fallback_attempts = 1 if started_with_shared_cache else 0
+    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
@@ -383,6 +383,8 @@ def _submit_seed_supervised(
                 disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
                 # the remaining run-global wall cap, so retries cannot reset the duration budget.
                 max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                provider=getattr(attempt_spec.gpu, "provider", ""),
+                exact_type=getattr(attempt_spec.gpu, "exact_type", ""),
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError

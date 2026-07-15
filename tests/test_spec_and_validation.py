@@ -610,16 +610,134 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     from flash.client.specs import spec_payload
 
     spec = spec_from_dict(
-        _raw(**{"gpu.max_retries": 0, "gpu.max_wall_seconds": 60}), run_id="gpu-rt"
+        _raw(
+            **{
+                "gpu.max_retries": 0,
+                "gpu.max_wall_seconds": 60,
+                "gpu.provider": " RunPod ",
+                "gpu.exact_type": "rtx-4090",
+            }
+        ),
+        run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     assert payload["gpu"]["max_retries"] == 0
     assert payload["gpu"]["max_wall_seconds"] == 60
+    assert payload["gpu"]["provider"] == "runpod"
+    assert payload["gpu"]["exact_type"] == "RTX 4090"
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.max_retries == 0
     assert reparsed.gpu.max_wall_seconds == 60
+    assert reparsed.gpu.provider == "runpod"
+    assert reparsed.gpu.exact_type == "RTX 4090"
     assert reparsed.gpu.type == spec.gpu.type
+
+
+def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
+    with pytest.raises(ConfigError, match=r"gpu\.provider"):
+        spec_from_dict(_raw(**{"gpu.provider": "aws"}))
+    with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
+        spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
+    with pytest.raises(ConfigError, match="validated"):
+        spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
+    with pytest.raises(ConfigError, match="requires at least"):
+        spec_from_dict(
+            _raw(
+                model="Qwen/Qwen3.5-9B",
+                **{"gpu.exact_type": "RTX 4090"},
+            )
+        )
+    with pytest.raises(ConfigError, match="cannot provision"):
+        spec_from_dict(
+            _raw(
+                **{
+                    "gpu.provider": "lambda",
+                    "gpu.exact_type": "RTX 4090",
+                }
+            )
+        )
+
+
+def test_gpu_type_remains_historical_non_pinning_input() -> None:
+    baseline = spec_from_dict(_raw())
+    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    assert authored.gpu.type == baseline.gpu.type
+    assert authored.gpu.exact_type == ""
+
+
+def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(_raw(model_revision="  refs/pr/123  "), run_id="revision-rt")
+    assert spec.model_revision == "refs/pr/123"
+    assert spec_payload(spec)["model_revision"] == "refs/pr/123"
+    assert JobSpec.from_json(spec.to_json()).model_revision == "refs/pr/123"
+    assert spec_from_dict(_raw(model_revision="   ")).model_revision == ""
+
+    for value in (None, 123, False, ["main"], {"revision": "main"}):
+        with pytest.raises(ConfigError, match="model_revision must be a string"):
+            spec_from_dict(_raw(model_revision=value))
+        with pytest.raises(TypeError, match="model_revision must be a string"):
+            JobSpec.from_dict({"model_revision": value})
+
+
+def test_gpu_and_job_specs_preserve_old_positional_constructors() -> None:
+    from flash.spec import EnvironmentSpec, WandbSpec
+
+    gpu = GpuSpec("H100", 120, 900, 2, "cache-volume", 200)
+    assert (
+        gpu.type,
+        gpu.disk_gb,
+        gpu.max_wall_seconds,
+        gpu.max_retries,
+        gpu.network_volume,
+        gpu.network_volume_gb,
+        gpu.provider,
+        gpu.exact_type,
+    ) == ("H100", 120, 900, 2, "cache-volume", 200, "", "")
+
+    environment = EnvironmentSpec(id="owner/environment")
+    train = TrainSpec(epochs=1)
+    wandb = WandbSpec(project="project", run_name="run")
+    spec = JobSpec(
+        "Qwen/Qwen3.5-0.8B",
+        "grpo",
+        environment,
+        train,
+        gpu,
+        "positional-run",
+        9,
+        {"SAFE_KEY": "value"},
+        "catalog",
+        True,
+        wandb,
+    )
+    assert (
+        spec.algorithm,
+        spec.environment,
+        spec.train,
+        spec.gpu,
+        spec.run_id,
+        spec.seed,
+        spec.worker_env,
+        spec.model_policy,
+        spec.thinking,
+        spec.wandb,
+        spec.model_revision,
+    ) == (
+        "grpo",
+        environment,
+        train,
+        gpu,
+        "positional-run",
+        9,
+        {"SAFE_KEY": "value"},
+        "catalog",
+        True,
+        wandb,
+        "",
+    )
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:

@@ -16,12 +16,18 @@ from __future__ import annotations
 _VL_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_6")
 
 
-def is_vl_checkpoint(model_id: str) -> bool:
+def is_vl_checkpoint(model_id: str, revision: str = "") -> bool:
     """True for natively-multimodal checkpoints (Qwen3.5/3.6) — routes VL warm-start handling."""
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **model_revision_kwargs(revision),
+        )
         model_type = getattr(cfg, "model_type", "") or ""
     except Exception as e:
         print("is_vl_checkpoint: config probe failed:", e)
@@ -265,7 +271,7 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
     return None
 
 
-def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
+def adapter_is_vl_warmstart(adir: str, model_id: str, revision: str = "") -> bool:
     """Whether a warm-start adapter must be continued on the FULL multimodal base (VL loader).
 
     Robust to a transient ``is_vl_checkpoint`` config-probe failure (it calls
@@ -288,6 +294,8 @@ def adapter_is_vl_warmstart(adir: str, model_id: str) -> bool:
             f"[init-adapter] adapter VL-key probe failed for adir={adir!r} model={model_id!r}; "
             f"deferring to the config probe: {e}"
         )
+    if revision:
+        return is_vl_checkpoint(model_id, revision=revision)
     return is_vl_checkpoint(model_id)
 
 

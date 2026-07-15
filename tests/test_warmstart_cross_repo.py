@@ -215,6 +215,35 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     }
 
 
+def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
+    import flash.runner as R
+    from flash.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": "source-revision",
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = R.RunStatus(run_id="source-run", state="done", spec=source.to_dict())
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": "target-revision",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    with pytest.raises(ValueError, match=r"source model_revision.*does not match target"):
+        R._prepare_init_from_adapter(child, token="token")
+
+
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import types
 

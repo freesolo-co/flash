@@ -74,6 +74,37 @@ def test_provider_is_normalized_and_validated():
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="aws")
 
 
+def test_runconfig_preserves_old_positional_constructor():
+    config = RunConfig(
+        "Qwen/Qwen3.5-0.8B",
+        "sft",
+        10,
+        2048,
+        None,
+        4,
+        None,
+        8,
+        False,
+        None,
+        "",
+        3600,
+        "runpod",
+        "owner/environment",
+        16_000,
+        (2, 5),
+    )
+
+    assert config.seq_len == 2048
+    assert config.batch_size == 4
+    assert config.lora_rank == 8
+    assert config.max_wall_seconds == 3600
+    assert config.provider == "runpod"
+    assert config.environment == "owner/environment"
+    assert config.train_tokens == 16_000
+    assert config.save_at_steps == (2, 5)
+    assert config.exact_type == ""
+
+
 def test_estimate_reports_the_runs_provider():
     # Provider is reported as configured: the default is "auto", and an explicit substrate is
     # passed through unchanged.
@@ -82,6 +113,74 @@ def test_estimate_reports_the_runs_provider():
         estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider
         == "runpod"
     )
+
+
+def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
+    unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10))
+    exact = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
+    )
+
+    assert unconstrained.gpu == "RTX 4090"
+    assert exact.gpu == "H100"
+    assert exact.gpu_hourly_usd > unconstrained.gpu_hourly_usd
+
+
+def test_estimate_exact_h100_selects_cheapest_eligible_provider_and_rate(monkeypatch):
+    import flash.cost.analytical as analytical
+
+    rates = {"runpod": 3.29, "lambda": 2.49, "vast": 2.79}
+    monkeypatch.setattr(
+        analytical,
+        "available_providers",
+        lambda: ("runpod", "lambda", "vast"),
+    )
+    monkeypatch.setattr(
+        analytical,
+        "gpu_hourly_usd",
+        lambda gpu, provider=None, **kwargs: rates[provider],
+    )
+
+    estimate = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
+    )
+
+    assert (estimate.provider, estimate.gpu, estimate.gpu_hourly_usd) == (
+        "lambda",
+        "H100",
+        rates["lambda"],
+    )
+
+
+def test_estimate_exact_gpu_enforces_provider_support_and_vram():
+    with pytest.raises(ValueError, match="cannot provision"):
+        RunConfig(
+            "Qwen/Qwen3.5-0.8B",
+            "grpo",
+            10,
+            provider="lambda",
+            exact_type="RTX 4090",
+        )
+    with pytest.raises(ValueError, match="requires at least"):
+        estimate_cost(
+            RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, exact_type="RTX 4090")
+        )
+
+
+def test_runconfig_from_spec_preserves_gpu_constraints():
+    from flash.cost.spec import runconfig_from_spec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, max_examples=8),
+        gpu=GpuSpec(provider="runpod", exact_type="H100"),
+    )
+
+    config = runconfig_from_spec(spec)
+    assert config.provider == "runpod"
+    assert config.exact_type == "H100"
 
 
 def test_estimate_cost_vast_market_duration_mirrors_launch(monkeypatch):

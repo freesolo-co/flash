@@ -2552,7 +2552,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
-def test_shared_cache_zero_retry_budget_gets_free_cacheless_fallback(monkeypatch, failure):
+def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failure):
     from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2580,10 +2580,7 @@ def test_shared_cache_zero_retry_budget_gets_free_cacheless_fallback(monkeypatch
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
 
-        assert submissions == [
-            (0, orch.WEIGHT_CACHE_VOLUME_NAME, False),
-            (1, None, True),
-        ]
+        assert submissions == [(0, orch.WEIGHT_CACHE_VOLUME_NAME, True)]
 
 
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):

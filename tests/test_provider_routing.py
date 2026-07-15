@@ -81,13 +81,34 @@ def _seed_status(orch, spec):
     return st
 
 
+def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persistence(
+    orch, monkeypatch
+):
+    import flash.providers as providers
+
+    persisted = []
+    spec = _spec(exact_type="H200")
+    monkeypatch.setattr(providers, "available_providers", lambda: ("lambda", "vast"))
+    monkeypatch.setattr(orch, "_save_status", lambda *args, **kwargs: persisted.append(args))
+
+    with pytest.raises(ValueError, match="no configured provider can provision"):
+        orch.submit_job(spec, dry_run=True)
+
+    assert persisted == []
+
+
 def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
 
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     captured = {}
+
+    def fake_allocate(*args, **kwargs):
+        captured["allocate_kwargs"] = kwargs
+        return _alloc()
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
 
     def fake_runpod_submit(
         run_spec,
@@ -105,7 +126,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec()
+    spec = _spec(provider="runpod", exact_type="RTX 4090")
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(
         spec,
@@ -116,6 +137,8 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     assert metrics["train_tokens"] == 4096
     assert captured["gpu_type"] == "RTX 4090"
     assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
+    assert captured["allocate_kwargs"]["provider"] == "runpod"
+    assert captured["allocate_kwargs"]["exact_type"] == "RTX 4090"
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
     assert remote["allocated_gpu"] == "RTX 4090"
@@ -384,11 +407,13 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
+        assert persisted["model_revision"] == "refs/pr/123"
         submitted.append(
             {
                 "resolved_sha": run_spec.environment.resolved_sha,
                 "gpu_type": run_spec.gpu.type,
                 "network_volume": run_spec.gpu.network_volume,
+                "model_revision": run_spec.model_revision,
             }
         )
         return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
@@ -405,6 +430,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     public = JobSpec.from_dict(
         {
             **_spec().to_internal_dict(),
+            "model_revision": "refs/pr/123",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
         }
     )
@@ -418,10 +444,12 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
             "resolved_sha": resolved_sha,
             "gpu_type": "RTX 5090",
             "network_volume": "flash-weights",
+            "model_revision": "refs/pr/123",
         }
     ]
     stored = orch.get_status(public.run_id)
     assert stored.spec["environment"]["resolved_sha"] == ""
+    assert stored.spec["model_revision"] == "refs/pr/123"
     worker = stored.effective_preparation["worker_spec"]
     assert worker["environment"]["resolved_sha"] == resolved_sha
     assert worker["gpu"]["type"] == "RTX 5090"
@@ -811,8 +839,9 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_auto_cache_run_gets_free_cacheless_fallback_at_zero_retries(orch, monkeypatch):
-    """max_retries=0 still permits one free cacheless fallback for a shared-cache run."""
+@pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
+def test_shared_cache_zero_retries_submits_exactly_once(orch, monkeypatch, failure):
+    """max_retries=0 is one provider submission even with the managed shared cache."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -838,20 +867,14 @@ def test_auto_cache_run_gets_free_cacheless_fallback_at_zero_retries(orch, monke
         volumes_seen.append(vol)
         if on_handle:
             on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
-        # fallback attempt -> success.
-        if vol == WEIGHT_CACHE_VOLUME_NAME:
-            return PollResult(
-                False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)"
-            )
-        return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure=failure, detail="cache-constrained failure")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
     spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
-    assert metrics["train_tokens"] == 4096
-    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME]
 
 
 def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):

@@ -139,6 +139,13 @@ def require_matching_seed(spec: JobSpec, seed: Any) -> int:
     return canonical
 
 
+def _model_revision(value: Any) -> str:
+    """parse an optional exact model-repository revision."""
+    if not isinstance(value, str):
+        raise TypeError("model_revision must be a string")
+    return value.strip()
+
+
 def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
     """Parse a strictly increasing list or tuple of positive integers."""
     if value is None:
@@ -231,6 +238,8 @@ class GpuSpec:
     # PLATFORM-MANAGED: runner assigns weight-cache volume; None = cold download.
     network_volume: str | None = None
     network_volume_gb: int = 100
+    provider: str = ""
+    exact_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -254,9 +263,11 @@ class JobSpec:
     model_policy: str = "catalog"
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
+    model_revision: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
+        object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
         validate_worker_env_reserved(self.worker_env)
 
     @property
@@ -299,6 +310,7 @@ class JobSpec:
         gpu = data.get("gpu") or {}
         return cls(
             model=data.get("model", cls.model),
+            model_revision=_model_revision(data.get("model_revision", cls.model_revision)),
             algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
@@ -333,6 +345,8 @@ class JobSpec:
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
+                provider=str(gpu.get("provider") or ""),
+                exact_type=str(gpu.get("exact_type") or ""),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
