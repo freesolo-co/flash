@@ -467,6 +467,54 @@ spirals when told to be brief on a problem it finds hard), which is exactly the 
 runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
 failures. This assumes the teacher is still strong at the task (vet it first, above).
 
+### Small students collapse under reverse-KL — watch entropy, cut steps, lower rank
+
+Reverse-KL is **mode-seeking**: it sharpens the student's next-token distribution toward the
+teacher's dominant mode. A large student has the capacity to match the teacher without losing
+entropy; a **small student (<=~2-4B) progressively over-sharpens** as training proceeds — its
+per-token entropy collapses, and once the distribution is peaked enough, **greedy (temperature=0)
+decoding falls into a repetition loop** that repeats a phrase to the length cap and never emits your
+answer. The loss looks healthy the whole run (reverse-KL is being minimized *by* the collapse), so it
+is invisible in the loss curve and only surfaces at serving — where **temperature=0 is the default**,
+so it hits real callers, not just a sampled eval. The collapse is worse the smaller the student, the
+higher the LoRA rank, the more steps you train, and the stronger/sharper the teacher. Four levers,
+each attacking the same over-sharpening:
+
+- **Train fewer steps (highest leverage).** The student typically peaks early — often around
+  ~20 optimizer steps — and every step after is pure over-sharpening that *lowers* accuracy while
+  *raising* the loop rate. Cut `max_examples` (or `epochs`) so the run stops before the collapse, and
+  deploy an early **checkpoint** (`flash checkpoints <run>`, `flash deploy <run>/step-N`) rather than
+  the final adapter. Observed on a 4B: 42% acc / 44% loop at full length -> **74% / 0% at step 20** —
+  more accurate *and* clean, from a checkpoint of the same run.
+- **Lower the rank for small students.** A rank-32 adapter is a large relative perturbation to a
+  small model. Dropping `lora_rank` to 16 (or 8) gives less capacity to over-sharpen and often clears
+  the loop outright (a 4B sft->opd went 42%/44% at rank 32 -> 76%/2% at rank 16).
+- **Match the teacher to the student.** A *stronger* teacher is not universally better — the harder
+  it is for the student to match, the harder the collapse. On a 2B, a closer/weaker teacher can beat a
+  frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
+  enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
+  over-sharpening only compounds over many steps.
+- **Diagnose it in-band.** Watch the per-step **mean completion entropy** in the run's telemetry — a
+  steady decline toward zero is the collapse happening. Confirm at serving by evaluating at
+  **temperature=0** and flagging `finish_reason=length` completions that never emit your answer token,
+  and compare an early checkpoint against the final one to watch the loop emerge over steps.
+
+### Distilling from base with no format anchor
+
+`opd` straight from a base model (no SFT warm-start) faithfully distils the teacher's *reasoning* but
+the student never learns your **answer format** — it terminates (`finish_reason=stop`) without ever
+emitting the boxed/tagged answer, so completions score unparseable even when the reasoning is fine.
+On-policy distillation reinforces the student's *own* tokens, so if the base never produces the
+format there is nothing to reinforce (and a downstream GRPO pass can't rescue it — with no
+correctly-formatted rollout to reward, RL has no signal to climb). Two fixes:
+
+- **Warm-start from an SFT adapter** (`[train] init_from_adapter`) — the SFT installs the output
+  format first, then OPD refines the content. This is the reliable default for structured-answer tasks.
+- **Constrain the rollouts with `[train] structured_outputs`** (guided decoding) to a schema whose
+  **answer field comes first** — the model learns to commit a parseable answer *before* any reasoning
+  that might run long, so the answer survives even if the reasoning still loops. This separates the
+  *format* problem (fixed here) from the *loop* problem (fixed by the levers above).
+
 ---
 
 ## GRPO knobs that matter
