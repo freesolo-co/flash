@@ -49,7 +49,7 @@ from flash.engine.structured_outputs import (
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.hf import RequiredSaveError
+from flash.engine.worker.hf import RequiredSaveError, _deployable_adapter_on_hf
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
     _rollout_terminated,
@@ -87,37 +87,16 @@ from flash.engine.worker.rng import (
 )
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
-from flash.opd_retry_contract import opd_resume_checkpoint_complete
+from flash.opd_retry_contract import (
+    OPD_RESUME_STATE_VERSION,
+    opd_resume_checkpoint_complete,
+    validate_opd_resume_state_metadata,
+)
 
 OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE = 16
 OPD_ROLLOUT_PIPELINE_MAX_CHUNKS = 8
 OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
-# schema version of the opd_state.json accounting blob inside a full-state resume checkpoint. bumped
-# only if that blob's shape changes; a worker refuses to resume a checkpoint written under a different
-# version (fail closed rather than misread state).
-OPD_RESUME_STATE_VERSION = 2
-_OPD_RESUME_ACCOUNTING_SCHEMA = {
-    "generated_tokens": "nonneg_int",
-    "teacher_input_tokens": "nonneg_int",
-    "truncated_rollouts": "nonneg_int",
-    "granularity_n": "nonneg_int",
-    "samples_seen": "nonneg_int",
-    "teacher_ok": "nonneg_int",
-    "teacher_transient": "nonneg_int",
-    "teacher_error": "nonneg_int",
-    "no_signal_resamples": "nonneg_int",
-    "no_signal_skipped_steps": "nonneg_int",
-    "episodes_seen": "nonneg_int",
-    "mt_turn_records": "nonneg_int",
-    "granularity_sum": "nonneg_number",
-    "train_wall_seconds": "nonneg_number",
-    "loss_curve": "list",
-    "coverage_curve": "list",
-    "skip_counts": "dict",
-    "opd_phase_seconds": "dict",
-    "opd_phase_counts": "dict",
-}
 
 
 def _cumulative_train_wall_seconds(baseline: float, started_at: float, now: float) -> float:
@@ -137,6 +116,20 @@ def _require_restored_opd_state(state: dict | None) -> dict:
             "refusing to train fresh after possible prior optimizer mutation"
         )
     return state
+
+
+def _reconcile_required_opd_deployable(
+    checkpoint_dir: str, opt_steps: int, save_at_steps: tuple[int, ...]
+) -> None:
+    """Publish a missed required companion directly from the restored checkpoint."""
+    if opt_steps not in save_at_steps or _deployable_adapter_on_hf(opt_steps):
+        return
+    _publish_opd_deployable(
+        checkpoint_dir,
+        opt_steps,
+        as_default=False,
+        save_required=True,
+    )
 
 
 def _opd_prompt_pool_fingerprint(examples: list[tuple[object, object, list[int]]]) -> str:
@@ -679,7 +672,6 @@ def run_opd():
             seed=backend_seed(_w.SEED),
             **vllm_kwargs,
         )
-        vllm_rollout.sync_from_model(model)
     vllm_init_seconds = time.time() - t_vllm_init
     print(f"[opd] vLLM rollout initialized in {vllm_init_seconds:.1f}s")
 
@@ -713,12 +705,20 @@ def run_opd():
                 prompt_pool_fingerprint=prompt_pool_fingerprint,
             )
         )
-        # on-policy sampling must use the restored adapter, so re-sync vllm from the loaded weights.
-        vllm_rollout.sync_from_model(model)
+        _reconcile_required_opd_deployable(
+            resume_ckpt,
+            int(resume_state["opt_steps"]),
+            knobs.save_at_steps,
+        )
         print(
             f"[opd] resumed from {resume_ckpt}: opt_steps={resume_state['opt_steps']} "
             f"step={resume_state['step']}"
         )
+
+    # synchronize exactly once before the first rollout. resumed runs reconcile the restored required
+    # checkpoint companion first, so an initial sync failure cannot strand a missing deployable.
+    with liveness_heartbeat("opd_vllm_initializing"):
+        vllm_rollout.sync_from_model(model)
 
     def _resumed(key, default):
         """Restored accumulator value, or the fresh-start default when not resuming."""
@@ -1110,17 +1110,6 @@ def run_opd():
             )
             opd_phase_seconds["optimizer_step"] += time.perf_counter() - optimizer_started
             opd_phase_counts["optimizer_steps"] += 1
-            # On-policy means the next rollout must sample from the just-updated student LoRA.
-            # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
-            # post-final vLLM sync that can fail after all optimizer updates have already landed.
-            if opt_steps < steps:
-                with liveness_heartbeat(
-                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
-                ):
-                    sync_started = time.perf_counter()
-                    vllm_rollout.sync_from_model(model)
-                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
-                    opd_phase_counts["vllm_syncs"] += 1
             avg_loss = step_loss / nseq
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
@@ -1191,8 +1180,8 @@ def run_opd():
                         save_required=_required,
                     )
 
-                # required boundaries upload recoverable full state first. the shared transaction then
-                # retries transient deployable failures without repeating either successful artifact.
+                # every due full-state checkpoint must be durable before the next vllm sync. required
+                # boundaries then publish their companion in the same retrying transaction.
                 if is_required_save:
                     _save_opd_resume_checkpoint(
                         model=model,
@@ -1221,7 +1210,19 @@ def run_opd():
                         accounting=checkpoint_accounting,
                         rollout_seed_ordinal=rollout_seed_ordinal,
                         prompt_pool_fingerprint=prompt_pool_fingerprint,
+                        required=True,
                     )
+            # on-policy means the next rollout must sample from the just-updated student lora. a due
+            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip the
+            # final sync because no rollout remains and the final adapter is saved from the hf model.
+            if opt_steps < steps:
+                with liveness_heartbeat(
+                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
+                ):
+                    sync_started = time.perf_counter()
+                    vllm_rollout.sync_from_model(model)
+                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
+                    opd_phase_counts["vllm_syncs"] += 1
 
     train_wall = _cumulative_train_wall_seconds(train_wall_baseline, t_train, time.time())
     if not loss_curve:
@@ -1944,21 +1945,6 @@ def _resolve_no_loss_sample(gen, score) -> SampleResult:
     raise RuntimeError("opd scored samples must be resolved through _resolve_samples_batched")
 
 
-def _nonneg_int_or_none(value) -> int | None:
-    """Return ``value`` as an int when it is a non-negative integer (bool rejected), else None."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return int(value)
-
-
-def _is_finite_number(value: object, *, nonnegative: bool = False) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, int):
-        return not nonnegative or value >= 0
-    return math.isfinite(value) and (not nonnegative or value >= 0)
-
-
 def _is_lora_adapter_key(key: object) -> bool:
     if not isinstance(key, str):
         return False
@@ -2078,31 +2064,6 @@ def _restore_opd_full_state(
             state = json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(state, dict):
-        return None
-    if state.get("contract_version") != OPD_RESUME_STATE_VERSION:
-        return None
-    if state.get("seed") != int(_w.SEED):
-        return None
-    rollout_seed_ordinal = _nonneg_int_or_none(state.get("rollout_seed_ordinal"))
-    if rollout_seed_ordinal is None:
-        return None
-    saved_prompt_pool_fingerprint = state.get("prompt_pool_fingerprint")
-    if (
-        not isinstance(saved_prompt_pool_fingerprint, str)
-        or len(saved_prompt_pool_fingerprint) != 64
-        or any(char not in "0123456789abcdef" for char in saved_prompt_pool_fingerprint)
-        or saved_prompt_pool_fingerprint != prompt_pool_fingerprint
-    ):
-        return None
-    # validate the serialized boundary before touching the adapter or optimizer so corrupt state fails
-    # closed instead of resuming with mismatched weights, moments, data position, or accounting.
-    opt_steps = _nonneg_int_or_none(state.get("opt_steps"))
-    step = _nonneg_int_or_none(state.get("step"))
-    if opt_steps is None or opt_steps == 0 or step is None:
-        return None
-    if max_opt_steps is not None and opt_steps > max_opt_steps:
-        return None
     _base = os.path.basename(ckpt_dir.rstrip("/"))
     if not _base.startswith("checkpoint-"):
         return None
@@ -2110,48 +2071,21 @@ def _restore_opd_full_state(
     if not _suffix.isdigit():
         return None
     _dir_step = int(_suffix)
-    if _dir_step <= 0 or _suffix != str(_dir_step) or _dir_step != opt_steps:
+    if _dir_step <= 0 or _suffix != str(_dir_step):
         return None
-    if step < opt_steps:
+    # validate every dependency-free json invariant before touching adapter or optimizer state.
+    try:
+        state = validate_opd_resume_state_metadata(
+            state,
+            expected_seed=int(_w.SEED),
+            checkpoint_step=_dir_step,
+        )
+    except ValueError:
         return None
-    for field, field_type in _OPD_RESUME_ACCOUNTING_SCHEMA.items():
-        value = state.get(field)
-        if field_type == "nonneg_int":
-            if _nonneg_int_or_none(value) is None:
-                return None
-        elif field_type == "nonneg_number":
-            if not _is_finite_number(value, nonnegative=True):
-                return None
-        elif field_type == "list":
-            if not isinstance(value, list):
-                return None
-        elif field_type == "dict" and not isinstance(value, dict):
-            return None
-    loss_curve = state["loss_curve"]
-    coverage_curve = state["coverage_curve"]
-    if len(loss_curve) != opt_steps or not all(_is_finite_number(value) for value in loss_curve):
+    if state["prompt_pool_fingerprint"] != prompt_pool_fingerprint:
         return None
-    if len(coverage_curve) != opt_steps or not all(
-        _is_finite_number(value) for value in coverage_curve
-    ):
-        return None
-    skip_counts = state["skip_counts"]
-    if any(
-        not isinstance(key, str) or _nonneg_int_or_none(value) is None
-        for key, value in skip_counts.items()
-    ):
-        return None
-    opd_phase_seconds = state["opd_phase_seconds"]
-    if any(
-        not isinstance(key, str) or not _is_finite_number(value, nonnegative=True)
-        for key, value in opd_phase_seconds.items()
-    ):
-        return None
-    opd_phase_counts = state["opd_phase_counts"]
-    if any(
-        not isinstance(key, str) or _nonneg_int_or_none(value) is None
-        for key, value in opd_phase_counts.items()
-    ):
+    opt_steps = state["opt_steps"]
+    if max_opt_steps is not None and opt_steps > max_opt_steps:
         return None
     try:
         from peft import load_peft_weights, set_peft_model_state_dict

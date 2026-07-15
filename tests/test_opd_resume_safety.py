@@ -9,14 +9,48 @@ import pytest
 
 from flash.opd_retry_contract import (
     OPD_RESUME_REVISION_ENV,
+    OPD_RESUME_STATE_VERSION,
     OPD_RETRY_CONTRACT_STATUS_KEY,
     OPD_RETRY_CONTRACT_VERSION,
     canonical_opd_optimizer_start_json,
     decode_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
+    validate_opd_resume_state_metadata,
 )
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+
+
+def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
+    state = {
+        "contract_version": OPD_RESUME_STATE_VERSION,
+        "seed": seed,
+        "opt_steps": step,
+        "step": step,
+        "rollout_seed_ordinal": step,
+        "prompt_pool_fingerprint": "a" * 64,
+        "loss_curve": [0.5] * step,
+        "coverage_curve": [1.0] * step,
+        "generated_tokens": step,
+        "teacher_input_tokens": step,
+        "truncated_rollouts": 0,
+        "granularity_sum": 0.0,
+        "granularity_n": 0,
+        "samples_seen": step,
+        "teacher_ok": step,
+        "teacher_transient": 0,
+        "teacher_error": 0,
+        "skip_counts": {},
+        "no_signal_resamples": 0,
+        "no_signal_skipped_steps": 0,
+        "episodes_seen": 0,
+        "mt_turn_records": 0,
+        "opd_phase_seconds": {},
+        "opd_phase_counts": {},
+        "train_wall_seconds": 0.0,
+    }
+    state.update(overrides)
+    return state
 
 
 def _remote(*, attempt: int = 0) -> dict:
@@ -762,7 +796,11 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
                     run_id=spec.run_id, attempt=0, seed=42
                 )
                 for path in _ckpt_files("opd", spec.run_id, 20, _COMPLETE_CKPT):
-                    private_hf.files[path] = b"checkpoint"
+                    private_hf.files[path] = (
+                        json.dumps(_valid_resume_state(20)).encode()
+                        if path.endswith("/opd_state.json")
+                        else b"checkpoint"
+                    )
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
 
@@ -974,15 +1012,17 @@ def _ckpt_files(phase, run_id, step, names):
     return [f"{phase}/{run_id}/checkpoint/checkpoint-{step}/{name}" for name in names]
 
 
-def _install_marker_gate(monkeypatch, tmp_path, *, checkpoint_files):
-    """Install an hf fake with one validated attempt-1 marker present, plus a checkpoint listing.
-
-    ``checkpoint_files`` is the list of repo paths ``list_repo_files`` returns, or an Exception instance
-    to raise from it (a listing outage). Records the revision passed to ``list_repo_files`` so callers can
-    assert read-after-write consistency (same pinned sha as the marker snapshot).
-    """
+def _install_marker_gate(
+    monkeypatch,
+    tmp_path,
+    *,
+    checkpoint_files,
+    checkpoint_state=None,
+    state_download_error=None,
+):
+    """Install one validated marker plus pinned checkpoint listing and metadata reads."""
     present_path = opd_optimizer_start_marker_path("run-1", 1)
-    seen = {"list_revision": None}
+    seen = {"list_revision": None, "downloads": []}
 
     class Api:
         def repo_info(self, **_kwargs):
@@ -997,9 +1037,19 @@ def _install_marker_gate(monkeypatch, tmp_path, *, checkpoint_files):
                 raise checkpoint_files
             return list(checkpoint_files)
 
-    def download(**_kwargs):
-        path = tmp_path / "marker.json"
-        path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
+    def download(**kwargs):
+        seen["downloads"].append(kwargs)
+        if kwargs["filename"] == present_path:
+            path = tmp_path / "marker.json"
+            path.write_bytes(
+                canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42)
+            )
+            return str(path)
+        if state_download_error is not None:
+            raise state_download_error
+        path = tmp_path / "opd_state.json"
+        state = _valid_resume_state(40) if checkpoint_state is None else checkpoint_state
+        path.write_text(state if isinstance(state, str) else json.dumps(state))
         return str(path)
 
     _install_hf_reader(monkeypatch, Api(), download)
@@ -1019,14 +1069,75 @@ def _run_gate():
     )
 
 
-def test_gate_allows_replacement_when_marker_paired_with_complete_checkpoint(monkeypatch, tmp_path):
+def test_gate_allows_replacement_when_marker_paired_with_valid_metadata(monkeypatch, tmp_path):
     seen = _install_marker_gate(
         monkeypatch, tmp_path, checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
     )
-    # mutation is proven, but a complete resume checkpoint lets the replacement worker continue.
     assert _run_gate() == "pinned-sha"
-    # the checkpoint listing was pinned to the same revision the marker evidence was read at.
     assert seen["list_revision"] == "pinned-sha"
+    metadata_download = seen["downloads"][-1]
+    assert metadata_download["revision"] == "pinned-sha"
+    assert metadata_download["filename"] == (
+        "opd/run-1/checkpoint/checkpoint-40/opd_state.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "checkpoint_state",
+    [
+        _valid_resume_state(40, contract_version=1),
+        _valid_resume_state(40, opt_steps=39),
+        _valid_resume_state(40, seed=99),
+    ],
+    ids=["schema-v1", "checkpoint-step-mismatch", "seed-mismatch"],
+)
+def test_gate_blocks_invalid_checkpoint_metadata(monkeypatch, tmp_path, checkpoint_state):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT),
+        checkpoint_state=checkpoint_state,
+    )
+
+    with pytest.raises(RuntimeError, match="metadata is unverifiable"):
+        _run_gate()
+
+
+def test_gate_blocks_malformed_checkpoint_metadata_json(monkeypatch, tmp_path):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT),
+        checkpoint_state="{not json",
+    )
+
+    with pytest.raises(RuntimeError, match="metadata is unverifiable"):
+        _run_gate()
+
+
+def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tmp_path):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT),
+        state_download_error=TimeoutError("pinned download failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="metadata is unverifiable"):
+        _run_gate()
+
+
+def test_shared_resume_metadata_validator_returns_a_copy():
+    state = _valid_resume_state(3)
+
+    validated = validate_opd_resume_state_metadata(
+        state,
+        expected_seed=42,
+        checkpoint_step=3,
+    )
+
+    assert validated == state
+    assert validated is not state
 
 
 def test_gate_validates_every_present_marker(monkeypatch, tmp_path):

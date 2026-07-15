@@ -18,7 +18,10 @@ from pathlib import Path
 import pytest
 
 from flash.engine.worker import opd
-from flash.opd_retry_contract import opd_resume_checkpoint_complete
+from flash.opd_retry_contract import (
+    opd_resume_checkpoint_complete,
+    validate_opd_resume_state_metadata,
+)
 
 _PROMPT_POOL_FINGERPRINT = "a" * 64
 _COMPLETE = (
@@ -217,12 +220,14 @@ def test_missing_adapter_weight_is_incomplete():
     )
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [(5, 5), (0, 0), (-1, None), (True, None), (False, None), ("3", None), (3.0, None), (None, None)],
-)
-def test_nonneg_int_or_none(value, expected):
-    assert opd._nonneg_int_or_none(value) == expected
+@pytest.mark.parametrize("value", [-1, True, False, "3", 3.0, None])
+def test_shared_metadata_validator_rejects_noninteger_opt_steps(value):
+    with pytest.raises(ValueError, match="opt_steps"):
+        validate_opd_resume_state_metadata(
+            _valid_state(opt_steps=value),
+            expected_seed=42,
+            checkpoint_step=3,
+        )
 
 
 def test_rollout_request_seeds_continue_identically_after_resume():
@@ -501,6 +506,94 @@ def test_required_opd_save_propagates_permanent_deployable_failure_after_resume(
         )
 
     assert events == ["resume", "deployable"]
+
+
+# --- required deployable reconciliation --------------------------------------------------------
+
+
+def test_resume_republishes_missing_required_deployable_from_checkpoint(monkeypatch, tmp_path):
+    checkpoint_dir = str(tmp_path / "checkpoint-3")
+    events = []
+    monkeypatch.setattr(
+        opd,
+        "_deployable_adapter_on_hf",
+        lambda step: events.append(("lookup", step)) or False,
+    )
+    monkeypatch.setattr(
+        opd,
+        "_publish_opd_deployable",
+        lambda path, step, **kwargs: events.append(("publish", path, step, kwargs)),
+    )
+
+    opd._reconcile_required_opd_deployable(checkpoint_dir, 3, (3, 8))
+
+    assert events == [
+        ("lookup", 3),
+        (
+            "publish",
+            checkpoint_dir,
+            3,
+            {"as_default": False, "save_required": True},
+        ),
+    ]
+
+
+def test_resume_skips_present_required_deployable(monkeypatch):
+    published = []
+    monkeypatch.setattr(opd, "_deployable_adapter_on_hf", lambda _step: True)
+    monkeypatch.setattr(
+        opd,
+        "_publish_opd_deployable",
+        lambda *args, **kwargs: published.append((args, kwargs)),
+    )
+
+    opd._reconcile_required_opd_deployable("/tmp/checkpoint-3", 3, (3,))
+
+    assert published == []
+
+
+def test_resume_required_deployable_lookup_failure_is_retriable(monkeypatch):
+    failure = opd.RetriableInfraError("hf lookup failed")
+    monkeypatch.setattr(
+        opd,
+        "_deployable_adapter_on_hf",
+        lambda _step: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(opd.RetriableInfraError) as caught:
+        opd._reconcile_required_opd_deployable("/tmp/checkpoint-3", 3, (3,))
+
+    assert caught.value is failure
+
+
+def test_resume_required_deployable_upload_failure_is_retriable(monkeypatch):
+    failure = opd.RetriableInfraError("hf upload failed")
+    monkeypatch.setattr(opd, "_deployable_adapter_on_hf", lambda _step: False)
+    monkeypatch.setattr(
+        opd,
+        "_publish_opd_deployable",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(opd.RetriableInfraError) as caught:
+        opd._reconcile_required_opd_deployable("/tmp/checkpoint-3", 3, (3,))
+
+    assert caught.value is failure
+
+
+def test_resume_nonrequired_step_does_not_publish_or_lookup(monkeypatch):
+    monkeypatch.setattr(
+        opd,
+        "_deployable_adapter_on_hf",
+        lambda _step: (_ for _ in ()).throw(AssertionError("must not query hf")),
+    )
+    monkeypatch.setattr(
+        opd,
+        "_publish_opd_deployable",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not publish")),
+    )
+
+    opd._reconcile_required_opd_deployable("/tmp/checkpoint-2", 2, (3, 8))
 
 
 # --- restore round trip ------------------------------------------------------------------------

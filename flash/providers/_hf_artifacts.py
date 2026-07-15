@@ -22,33 +22,27 @@ from flash.opd_retry_contract import (
     opd_optimizer_start_marker_path,
     opd_resume_checkpoint_complete,
     require_opd_retry_contract_version,
+    validate_opd_resume_state_metadata,
 )
 from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._poll import _attempt_int
 
 
-def _opd_resume_checkpoint_present(
+def _opd_resume_checkpoint_step(
     api, *, hf_repo: str, phase: str, run_id: str, revision: str
-) -> bool:
-    """True iff a COMPLETE full-state opd resume checkpoint exists at the pinned revision.
-
-    Lists files at the SAME repo SHA the marker evidence was pinned to (read-after-write consistency:
-    never unblock on a checkpoint that raced in after the snapshot), then checks the highest
-    ``checkpoint-N`` dir under ``{phase}/{run_id}/checkpoint/`` for the complete required file set. Fails
-    CLOSED (returns False) on any listing error, missing dir, or partial upload, so an uncertain
-    checkpoint never unblocks a replacement.
-    """
+) -> int | None:
+    """Return the newest filename-complete OPD checkpoint step at the pinned revision."""
     base = f"{phase}/{run_id}/checkpoint/"
     try:
         files = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
     except Exception:
-        return False
+        return None
     by_step: dict[int, set[str]] = {}
     for path in files:
         if not isinstance(path, str) or not path.startswith(base):
             continue
         seg, sep, tail = path[len(base) :].partition("/")
-        # only files directly inside a checkpoint-n dir (the required state files are written flat).
+        # only files directly inside a checkpoint-n dir count toward filename completeness.
         if not sep or not tail or "/" in tail or not seg.startswith("checkpoint-"):
             continue
         suffix = seg[len("checkpoint-") :]
@@ -59,8 +53,9 @@ def _opd_resume_checkpoint_present(
             continue
         by_step.setdefault(step, set()).add(tail)
     if not by_step:
-        return False
-    return opd_resume_checkpoint_complete(by_step[max(by_step)])
+        return None
+    step = max(by_step)
+    return step if opd_resume_checkpoint_complete(by_step[step]) else None
 
 
 def verify_opd_replacement_safe(
@@ -153,17 +148,43 @@ def verify_opd_replacement_safe(
     if not mutated:
         return None
     # a validated optimizer-start marker proves some attempt crossed the first optimizer.step(). allow
-    # replacement only when a complete full-state resume checkpoint exists at the same pinned revision
-    # (the replacement worker resumes from it); otherwise fail closed. the presence check itself fails
-    # closed on any uncertainty, so an unreadable/partial checkpoint keeps the run blocked.
-    if _opd_resume_checkpoint_present(
+    # replacement only when the newest canonical checkpoint is filename-complete and its lightweight
+    # metadata validates at the same pinned revision. tensor, optimizer, rng, tokenizer, and model checks
+    # remain worker-side.
+    checkpoint_step = _opd_resume_checkpoint_step(
         api, hf_repo=hf_repo, phase=phase, run_id=run_id, revision=revision
-    ):
-        return revision
-    raise RuntimeError(
-        "opd optimizer state may have mutated and no complete resume checkpoint is available; "
-        "replacement is blocked"
     )
+    if checkpoint_step is None:
+        raise RuntimeError(
+            "opd optimizer state may have mutated and no complete resume checkpoint is available; "
+            "replacement is blocked"
+        )
+    state_path = (
+        f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
+    )
+    try:
+        from huggingface_hub import hf_hub_download
+
+        local_path = hf_hub_download(
+            repo_id=hf_repo,
+            repo_type="dataset",
+            filename=state_path,
+            revision=revision,
+            token=token,
+            force_download=True,
+        )
+        with open(local_path, encoding="utf-8") as file:
+            state = json.load(file)
+        validate_opd_resume_state_metadata(
+            state,
+            expected_seed=seed,
+            checkpoint_step=checkpoint_step,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "opd resume checkpoint metadata is unverifiable; replacement is blocked"
+        ) from exc
+    return revision
 
 
 def make_hf_text_reader(

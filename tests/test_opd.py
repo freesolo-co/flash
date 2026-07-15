@@ -801,6 +801,8 @@ def _opd_harness(
     structured_outputs="",
     metas=None,
     outputs=None,
+    save_every=0,
+    save_at_steps=(),
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -871,7 +873,8 @@ def _opd_harness(
             prompts_per_step=1,
             group_size=group,
             kl_coef=1.0,
-            save_every=0,
+            save_every=save_every,
+            save_at_steps=tuple(save_at_steps),
             max_length=0,
             stop_sequences=stop_sequences,
             structured_outputs=structured_outputs,
@@ -1292,6 +1295,333 @@ def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
     assert all(c[3].get("keepalive") is True for c in generate_calls)
     assert callable(generate_calls[0][2])
     assert generate_calls[0][2]() == {"step": 0}
+
+
+def test_opd_reconciles_required_resume_companion_before_restored_sync_and_generation(
+    monkeypatch,
+):
+    pytest.importorskip("torch")
+    events = []
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=2,
+        group=1,
+        save_at_steps=(1,),
+    )
+    opd_mod._w.OPD_RESUME_REVISION = "pinned-sha"
+    opd_mod._w.hf_resume_checkpoint = lambda **_kwargs: "/tmp/checkpoint-1"
+    monkeypatch.setattr(
+        opd_mod,
+        "_restore_opd_full_state",
+        lambda *args, **kwargs: {
+            "opt_steps": 1,
+            "step": 1,
+            "loss_curve": [0.1],
+            "coverage_curve": [1.0],
+            "rollout_seed_ordinal": 1,
+        },
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_reconcile_required_opd_deployable",
+        lambda path, step, required: events.append(("reconcile", path, step, required)),
+    )
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    original_generate = engine_type.generate
+
+    def _sync(self, model):
+        events.append("sync")
+        return original_sync(self, model)
+
+    def _generate(self, *args, **kwargs):
+        events.append("generate")
+        return original_generate(self, *args, **kwargs)
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(engine_type, "generate", _generate)
+
+    opd_mod.run_opd()
+
+    assert events == [
+        ("reconcile", "/tmp/checkpoint-1", 1, (1,)),
+        "sync",
+        "generate",
+    ]
+
+
+def test_opd_initial_sync_failure_happens_after_required_resume_reconciliation(monkeypatch):
+    pytest.importorskip("torch")
+    events = []
+    opd_mod = _opd_harness(monkeypatch, sample_result=_skip, save_at_steps=(1,))
+    opd_mod._w.OPD_RESUME_REVISION = "pinned-sha"
+    opd_mod._w.hf_resume_checkpoint = lambda **_kwargs: "/tmp/checkpoint-1"
+    monkeypatch.setattr(
+        opd_mod,
+        "_restore_opd_full_state",
+        lambda *args, **kwargs: {
+            "opt_steps": 1,
+            "step": 1,
+            "loss_curve": [0.1],
+            "coverage_curve": [1.0],
+            "rollout_seed_ordinal": 1,
+        },
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_reconcile_required_opd_deployable",
+        lambda path, step, required: events.append(("reconcile", path, step, required)),
+    )
+    engine_type = opd_mod.OpdVllmRolloutEngine
+
+    def _fail_sync(self, model):
+        events.append("sync")
+        raise RuntimeError("initial sync failed")
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _fail_sync)
+    monkeypatch.setattr(
+        engine_type,
+        "generate",
+        lambda *args, **kwargs: events.append("generate"),
+    )
+
+    with pytest.raises(RuntimeError, match="initial sync failed"):
+        opd_mod.run_opd()
+
+    assert events == [
+        ("reconcile", "/tmp/checkpoint-1", 1, (1,)),
+        "sync",
+    ]
+
+
+def test_opd_due_checkpoint_is_complete_before_nonfinal_sync(monkeypatch):
+    pytest.importorskip("torch")
+    events = []
+    checkpoints = []
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=0.75,
+            gen_tokens=2,
+            teacher_tokens=3,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=2,
+        group=1,
+        save_at_steps=(1,),
+    )
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    original_generate = engine_type.generate
+
+    def _sync(self, model):
+        events.append("sync")
+        return original_sync(self, model)
+
+    def _generate(self, *args, **kwargs):
+        events.append("generate")
+        return original_generate(self, *args, **kwargs)
+
+    def _save_checkpoint(**kwargs):
+        events.append("checkpoint")
+        checkpoints.append(kwargs)
+        if kwargs.get("after_upload") is not None:
+            kwargs["after_upload"]()
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(engine_type, "generate", _generate)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: events.append("save_adapter"))
+    monkeypatch.setattr(opd_mod, "_save_opd_resume_checkpoint", _save_checkpoint)
+    monkeypatch.setattr(
+        opd_mod,
+        "_publish_opd_deployable",
+        lambda _path, step, **_kwargs: events.append(f"deployable:{step}"),
+    )
+
+    opd_mod.run_opd()
+
+    first_generate = events.index("generate")
+    checkpoint = events.index("checkpoint")
+    companion = events.index("deployable:1")
+    post_update_sync = events.index("sync", first_generate + 1)
+    second_generate = events.index("generate", first_generate + 1)
+    assert checkpoint < companion < post_update_sync < second_generate
+    saved = checkpoints[0]
+    assert saved["opt_steps"] == 1
+    assert saved["step"] == 1
+    assert saved["rollout_seed_ordinal"] == 1
+    assert len(saved["accounting"]["loss_curve"]) == 1
+    assert saved["accounting"]["coverage_curve"] == [0.75]
+    assert saved["accounting"]["samples_seen"] == 1
+    assert saved["accounting"]["generated_tokens"] == 2
+    assert saved["accounting"]["teacher_input_tokens"] == 3
+    assert saved["accounting"]["teacher_ok"] == 1
+    assert saved["accounting"]["opd_phase_counts"]["optimizer_steps"] == 1
+    assert saved["accounting"]["opd_phase_counts"].get("vllm_syncs", 0) == 0
+
+
+def test_opd_sync_failure_after_due_step_preserves_checkpoint_and_blocks_next_rollout(monkeypatch):
+    pytest.importorskip("torch")
+    events = []
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=2,
+        group=1,
+        save_at_steps=(1,),
+    )
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    original_generate = engine_type.generate
+
+    def _sync(self, model):
+        events.append("sync")
+        if events.count("sync") == 2:
+            raise RuntimeError("sync failed")
+        return original_sync(self, model)
+
+    def _generate(self, *args, **kwargs):
+        events.append("generate")
+        return original_generate(self, *args, **kwargs)
+
+    def _save_checkpoint(**kwargs):
+        events.append("checkpoint")
+        if kwargs.get("after_upload") is not None:
+            kwargs["after_upload"]()
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(engine_type, "generate", _generate)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(opd_mod, "_save_opd_resume_checkpoint", _save_checkpoint)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        opd_mod.run_opd()
+
+    assert events == ["sync", "generate", "checkpoint", "sync"]
+
+
+def test_opd_periodic_checkpoint_failure_blocks_sync_and_next_rollout(monkeypatch):
+    pytest.importorskip("torch")
+    events = []
+    save_calls = []
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_one_update,
+        epochs=2,
+        group=1,
+        save_every=1,
+    )
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    original_generate = engine_type.generate
+
+    def _sync(self, model):
+        events.append("sync")
+        return original_sync(self, model)
+
+    def _generate(self, *args, **kwargs):
+        events.append("generate")
+        return original_generate(self, *args, **kwargs)
+
+    def _fail_checkpoint(**kwargs):
+        save_calls.append(kwargs)
+        events.append("checkpoint")
+        raise opd_mod.RetriableInfraError("checkpoint upload failed")
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(engine_type, "generate", _generate)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(opd_mod, "_save_opd_resume_checkpoint", _fail_checkpoint)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+
+    with pytest.raises(opd_mod.RetriableInfraError, match="checkpoint upload failed"):
+        opd_mod.run_opd()
+
+    assert events == ["sync", "generate", "checkpoint"]
+    assert save_calls[0]["required"] is True
+
+
+def test_opd_nondue_step_syncs_before_next_rollout(monkeypatch):
+    pytest.importorskip("torch")
+    events = []
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=2, group=1)
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    original_generate = engine_type.generate
+
+    def _sync(self, model):
+        events.append("sync")
+        return original_sync(self, model)
+
+    def _generate(self, *args, **kwargs):
+        events.append("generate")
+        return original_generate(self, *args, **kwargs)
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(engine_type, "generate", _generate)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+
+    opd_mod.run_opd()
+
+    assert events == ["sync", "generate", "sync", "generate"]
 
 
 def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
