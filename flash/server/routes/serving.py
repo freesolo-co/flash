@@ -6,6 +6,7 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import multiprocessing
@@ -1009,6 +1010,18 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ServingError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # best-effort product-analytics report: exports never otherwise touch the
+    # platform backend (the copy is hf-to-hf inside flash).
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_model_exported
+
+        record_model_exported(
+            status=status,
+            key=key,
+            repository=repository,
+            url=url,
+            step=checkpoint_step if is_checkpoint else None,
+        )
     result = {
         "run_id": run_id,
         "adapter_id": run_id,

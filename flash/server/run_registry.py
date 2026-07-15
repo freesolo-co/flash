@@ -12,6 +12,7 @@ from ._internal_client import org_id_of, post_internal_json
 _LOG = logging.getLogger("flash.server.runs")
 _RUN_PATH = "/api/flash/runs/internal"
 _CHECKPOINT_PATH = "/api/flash/runs/checkpoints/internal"
+_EVENT_PATH = "/api/flash/events/internal"
 
 
 def _iso_from_epoch(value: float | int | None) -> str | None:
@@ -94,6 +95,40 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "metadata": {"source": "flash.control_plane"},
     }
     return _post(_RUN_PATH, body)
+
+
+def record_model_exported(
+    *,
+    status: Any,
+    key: dict[str, Any] | None = None,
+    repository: str,
+    url: str,
+    step: int | None = None,
+) -> bool:
+    """Report an adapter export as a platform product-analytics event.
+
+    An export is an hf-to-hf copy that never otherwise touches the platform
+    backend, so it is reported explicitly through the (allowlisted) internal
+    product-event endpoint. Best-effort like every other internal reporter.
+    """
+    context = {**_context_from_status(status), **(key or {})}
+    org_id = org_id_of(context)
+    if not org_id:
+        return False
+    spec = _spec_from_status(status)
+    body = {
+        "orgId": org_id,
+        "userId": context.get("user_id"),
+        "event": "flash_model_exported",
+        "properties": {
+            "run_id": status.run_id,
+            "repository": repository,
+            "url": url,
+            "step": step,
+            "model": spec.get("model") if isinstance(spec.get("model"), str) else None,
+        },
+    }
+    return _post(_EVENT_PATH, body)
 
 
 def record_training_checkpoint(
