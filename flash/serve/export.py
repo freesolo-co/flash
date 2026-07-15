@@ -31,7 +31,9 @@ def _clean_base_model(base_model: str) -> str:
     return base_model.strip()
 
 
-def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bool:
+def _rewrite_adapter_config_base_model(
+    adapter_dir: Path, base_model: str, base_model_revision: str = ""
+) -> bool:
     path = adapter_dir / "adapter_config.json"
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -40,8 +42,19 @@ def _rewrite_adapter_config_base_model(adapter_dir: Path, base_model: str) -> bo
     if not isinstance(config, dict):
         return False
 
-    changed = config.get("base_model_name_or_path") != base_model
+    existing_base = str(config.get("base_model_name_or_path") or "").strip()
+    if existing_base and existing_base != base_model and not _TEMP_MERGED_BASE_MODEL_RE.fullmatch(
+        existing_base
+    ):
+        raise ValueError(
+            f"adapter base_model_name_or_path {existing_base!r} does not match run model {base_model!r}"
+        )
+    existing_revision = str(config.get("revision") or "").strip()
+    if existing_revision and existing_revision != base_model_revision:
+        raise ValueError("adapter revision does not match the run's validated base-model commit")
+    changed = existing_base != base_model or existing_revision != base_model_revision
     config["base_model_name_or_path"] = base_model
+    config["revision"] = base_model_revision or None
     if "base_model" in config and config.get("base_model") != base_model:
         config["base_model"] = base_model
         changed = True
@@ -63,9 +76,13 @@ def _rewrite_readme_temp_base_model(adapter_dir: Path, base_model: str) -> bool:
     return True
 
 
-def _repair_export_metadata(adapter_dir: Path, base_model: str) -> None:
+def _repair_export_metadata(
+    adapter_dir: Path, base_model: str, base_model_revision: str = ""
+) -> None:
     changed = 0
-    changed += int(_rewrite_adapter_config_base_model(adapter_dir, base_model))
+    changed += int(
+        _rewrite_adapter_config_base_model(adapter_dir, base_model, base_model_revision)
+    )
     changed += int(_rewrite_readme_temp_base_model(adapter_dir, base_model))
     if changed:
         logger.info("repaired exported adapter metadata base_model=%s", base_model)
@@ -90,6 +107,7 @@ def export_adapter(
     dest_repo: str,
     dest_token: str,
     base_model: str,
+    base_model_revision: str = "",
     source_token: str | None = None,
     private: bool = True,
 ) -> str:
@@ -128,7 +146,7 @@ def export_adapter(
                 f"no loadable LoRA adapter at {source_repo}:{source_subfolder} "
                 "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
-        _repair_export_metadata(adapter_dir, base_model)
+        _repair_export_metadata(adapter_dir, base_model, base_model_revision)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.

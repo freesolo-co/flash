@@ -142,7 +142,7 @@ def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
 
     calls = _install_student_loader_fakes(monkeypatch, vl_raises=True)
     fake_w = SimpleNamespace(
-        is_vl_checkpoint=lambda model_id: False,
+        is_vl_checkpoint=lambda model_id, revision="": False,
         _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
@@ -162,13 +162,33 @@ def test_opd_fresh_lora_keeps_causal_loader(monkeypatch):
     assert not any(kind == "vl" for kind, *_ in calls)
 
 
+def test_opd_fresh_student_forwards_model_revision(monkeypatch):
+    from flash.engine.worker import opd as opd_mod
+
+    calls = _install_student_loader_fakes(monkeypatch, vl_raises=True)
+    fake_w = SimpleNamespace(
+        JOB_SPEC=SimpleNamespace(model_revision="refs/pr/123"),
+        is_vl_checkpoint=lambda model_id, revision="": False,
+        _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+
+    opd_mod._student_model("org/model", {"dtype": "bf16"}, "cuda")
+
+    assert calls[0] == (
+        "causal",
+        ("org/model",),
+        {"trust_remote_code": True, "dtype": "bf16", "revision": "refs/pr/123"},
+    )
+
+
 def test_opd_fresh_vl_lora_uses_multimodal_loader(monkeypatch):
     """Fresh OPD on a VL checkpoint should still train LoRA on the full multimodal tree."""
     from flash.engine.worker import opd as opd_mod
 
     calls = _install_student_loader_fakes(monkeypatch, causal_raises=True)
     fake_w = SimpleNamespace(
-        is_vl_checkpoint=lambda model_id: True,
+        is_vl_checkpoint=lambda model_id, revision="": True,
         _init_adapter_model=lambda model_id: (model_id, "fresh-lora-config"),
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)

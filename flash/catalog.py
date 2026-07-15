@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 ALGORITHMS = ("sft", "grpo", "opd")
@@ -377,21 +377,41 @@ def resolve_model(
     algorithm: str,
     policy: str = "catalog",
     gpu: str | None = None,
+    model_revision: str = "",
 ) -> ModelInfo:
     """Resolve a model under the configured policy; "allow" accepts any HF model."""
     algo = normalize_algorithm(algorithm)
     if model_id in MODELS:
-        return validate_model_for_algorithm(model_id, algo)
+        info = validate_model_for_algorithm(model_id, algo)
+        if model_revision:
+            from flash.engine.vram import _validated_revision_geometry
+
+            params_b, vocab_size = _validated_revision_geometry(model_id, model_revision, info)
+            info = replace(
+                info,
+                params_b=params_b,
+                params=f"{params_b:.1f}B",
+                vocab_size=vocab_size,
+                min_disk_gb=max(info.min_disk_gb, int(params_b * 2) + 64),
+            )
+        return info
     if policy != "allow":
         return get_model(model_id)
-    return _resolve_open_model(model_id, algo, gpu)
+    return _resolve_open_model(model_id, algo, gpu, model_revision=model_revision)
 
 
-def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
+def _resolve_open_model(
+    model_id: str, algo: str, gpu: str | None, *, model_revision: str = ""
+) -> ModelInfo:
     """Synthesize a ModelInfo for the open-model "allow" policy via a coarse HF VRAM-fit estimate."""
     from flash.engine.vram import check_fit
 
-    est = check_fit(model_id, algo, gpu or DEFAULT_GPU)
+    est = check_fit(
+        model_id,
+        algo,
+        gpu or DEFAULT_GPU,
+        model_revision=model_revision,
+    )
     if est.verdict == "too_big":
         raise ValueError(
             f"{model_id} does not fit the requested GPU: {est.describe()}. "

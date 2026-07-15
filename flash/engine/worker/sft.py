@@ -74,7 +74,7 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
 
 
-def _model_arch_dims(model_id: str) -> tuple[int, int]:
+def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
     """``(hidden_size, num_hidden_layers)`` used to size the GC-off activation estimate.
 
     Prefer the CURATED catalog geometry (deterministic, no network/parse risk) for known models — a
@@ -88,21 +88,34 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
     info = MODELS.get(model_id)
     c_hidden = int(getattr(info, "hidden_size", 0) or 0) if info else 0
     c_layers = int(getattr(info, "num_layers", 0) or 0) if info else 0
-    if c_hidden and c_layers:
+    if c_hidden and c_layers and not revision:
         return c_hidden, c_layers
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        tc = getattr(cfg, "text_config", None) or cfg
-        hidden = c_hidden or int(
-            getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **_w.model_revision_kwargs(revision),
         )
-        layers = c_layers or int(
+        tc = getattr(cfg, "text_config", None) or cfg
+        layers = int(
             getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
         )
-        return hidden, layers
+        hidden = int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
+        # Only a NONZERO probe dim that disagrees with the catalog is a real revision mismatch. A (0, 0)
+        # probe means "couldn't parse" (the 35B-A3B multimodal-nested config does exactly this), not
+        # "differs" -- treat it like the unpinned path and fall back to catalog dims below, otherwise a
+        # revision pin would spuriously fail such models after the GPU is already rented.
+        if revision and (
+            (c_hidden and hidden and hidden != c_hidden)
+            or (c_layers and layers and layers != c_layers)
+        ):
+            raise ValueError("revision architecture does not match catalog geometry")
+        return hidden or c_hidden, layers or c_layers
     except Exception as e:
+        if revision:
+            raise RuntimeError("could not validate revision-specific model architecture") from e
         print(f"[sft] arch-dims probe failed ({e}); GC decision stays conservative (keep GC on)")
         return c_hidden, c_layers
 
@@ -152,7 +165,6 @@ def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
 
 def run_sft():
     from datasets import Dataset
-    from transformers import AutoTokenizer
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
@@ -160,10 +172,18 @@ def run_sft():
     env = _w.require_active_env()
     t_start = time.time()
     _w.heartbeat("sft_start", gpu=gpu_diagnostics())
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    download_seconds = (
+        _w.prefetch_model(model_id, revision=model_revision)
+        if model_revision
+        else _w.prefetch_model(model_id)
+    )
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
 
@@ -174,7 +194,7 @@ def run_sft():
     # tokenizer + dataset download + O(N) chat-template render can run for minutes on a big
     # dataset with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("sft_data_loading"):
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = _w.load_tokenizer(model_id, revision=model_revision)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -289,7 +309,7 @@ def run_sft():
             _gc_cap = _torch_gc.cuda.get_device_capability(0)
     except Exception:
         _gc_card_gb, _gc_cap = 0.0, None
-    _gc_hidden, _gc_layers = _model_arch_dims(model_id)
+    _gc_hidden, _gc_layers = _model_arch_dims(model_id, revision=model_revision)
     _gc_active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0) or None
     _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
     _grad_ckpt = grad_checkpointing_on(
@@ -304,6 +324,7 @@ def run_sft():
         fused_ce=_sft_fused,
         per_device_bs=per_device_bs,
         lora_rank=_gc_lora_rank,
+        revision=model_revision,
     )
 
     max_steps = int(_t.max_steps or 0) if _t else 0
@@ -349,8 +370,8 @@ def run_sft():
     configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
     # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
     # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
-    _pure_attn = model_is_pure_attention(model_id)
-    _gdn = model_is_gdn_hybrid(model_id)
+    _pure_attn = model_is_pure_attention(model_id, revision=model_revision)
+    _gdn = model_is_gdn_hybrid(model_id, revision=model_revision)
     _bfd_block_count: int | None = None
     _fa_ok = _flash_attn_available()
     if _fa_ok and _pure_attn:
@@ -368,7 +389,7 @@ def run_sft():
         print(
             f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below."
         )
-    if _memory_mode(model_id, sft_max_len):
+    if _memory_mode(model_id, sft_max_len, revision=model_revision):
         print("[sft] chalk standalone fused kernels scheduled after trainer build")
     _attn = optimal_attn_impl()
     # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
@@ -446,7 +467,10 @@ def run_sft():
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
     elif (
-        not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok
+        not cfg_kwargs.get("packing")
+        and _gdn
+        and gdn_packing_available(model_id, revision=model_revision)
+        and _mask_pack_ok
     ):
         # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
         # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
@@ -493,7 +517,11 @@ def run_sft():
         )
     # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
     # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
-    model_init_kwargs = {"dtype": "bfloat16", "device_map": None}
+    model_init_kwargs = {
+        "dtype": "bfloat16",
+        "device_map": None,
+        **_w.model_revision_kwargs(model_revision),
+    }
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = model_init_kwargs
@@ -576,7 +604,13 @@ def run_sft():
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
         seed_training_rngs(_w.SEED)
-        sft_model = _w.prepare_fresh_lora_base(model_id, model_id, model_init_kwargs, phase="sft")
+        sft_model = _w.prepare_fresh_lora_base(
+            model_id,
+            model_id,
+            model_init_kwargs,
+            phase="sft",
+            model_revision=model_revision,
+        )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
         trainer = _SFT(
@@ -638,6 +672,7 @@ def run_sft():
         "sft_finalizing", progress=lambda: _final_step, progress_step=True, keepalive=True
     ):
         adapter_dir = f"{out_dir}/adapter"
+        _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
