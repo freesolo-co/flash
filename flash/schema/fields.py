@@ -8,7 +8,7 @@ from typing import Any
 
 from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec
+from flash.spec import WandbSpec, parse_positive_int_tuple
 
 
 def _section_int(
@@ -32,6 +32,14 @@ def _section_int(
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400)."""
     return _section_int(train_raw, "train", key, minimum=minimum)
+
+
+def _train_positive_int_tuple(train_raw: dict, key: str) -> tuple[int, ...]:
+    """Validate an optional strictly increasing list of positive integer steps."""
+    try:
+        return parse_positive_int_tuple(train_raw.get(key), name=f"train.{key}")
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _train_float(
