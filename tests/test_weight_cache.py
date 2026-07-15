@@ -337,27 +337,6 @@ def test_build_worker_env_per_run_override_wins():
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
 
 
-def test_drop_unmounted_cache_env_strips_when_unmounted(monkeypatch):
-    import flash.providers._worker as worker
-
-    # volume not mounted -> the /runpod-volume cache var is stripped (cold fallback), others kept.
-    monkeypatch.setattr(worker.os.path, "isdir", lambda p: False)
-    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "OTHER": "x"}
-    out = worker.drop_unmounted_cache_env(env)
-    assert "FLASH_WEIGHT_CACHE_DIR" not in out
-    assert out["OTHER"] == "x"
-
-
-def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
-    import flash.providers._worker as worker
-
-    monkeypatch.setattr(worker.os.path, "isdir", lambda p: True)
-    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
-    assert worker.drop_unmounted_cache_env(env) == {
-        "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"
-    }
-
-
 # ---------------------------------------------------------------------------
 # worker engine.worker.hf.prefetch_model — base-model-scoped caching (issue #252)
 # The shared mount holds ONLY the trusted public base model; the run's env/reward HF downloads use the

@@ -86,14 +86,6 @@ def resolve_worker_deps() -> list[str]:
     return list(WORKER_DEPS)
 
 
-def _effective_worker_env(spec=None) -> dict[str, str]:
-    """os.environ overlaid with spec.worker_env — mirrors what build_worker_env sends the worker."""
-    eff: dict[str, str] = dict(os.environ)
-    for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        eff[str(k)] = str(v)
-    return eff
-
-
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
 # Pin the exact PUBLIC version so worker + kernel-cache-bake pods install with NO GitHub auth — the
 # chalk repo is INTERNAL, so a git+https default made installs fail wherever GITHUB_TOKEN is absent
@@ -118,16 +110,16 @@ LATEST_CHALK_MAIN_SHA = "e89b52145778102418f00e2b99d27968577ca43a"
 
 def chalk_extra_pip(spec=None) -> list[str]:
     """Return chalk pip spec(s) for the worker's extra_pip; resolved against the effective worker env."""
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
+    worker_env: dict[str, str] = dict(os.environ)
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        worker_env[str(k)] = str(v)
+    spec_str = worker_env.get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
-
-
-_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 # Optimization toggles dropped in PR #175 (deterministic behavior). Filtered from [worker_env]
@@ -169,15 +161,6 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     JIT caches are never redirected — sharing compiled artifacts across tenants is unsafe.
     """
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
-
-
-def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Strip mount-rooted cache vars if the volume isn't actually mounted (mutates+returns)."""
-    if os.path.isdir(mount):
-        return env
-    for k in [k for k, v in env.items() if str(v).startswith(mount)]:
-        env.pop(k, None)
-    return env
 
 
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
@@ -245,7 +228,7 @@ def build_worker_env(
     # the authoritative-seed invariant regardless of how environment.secrets was populated.
     allowed_runtime_secrets = {
         k
-        for k in (set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
+        for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
         if k.upper() not in RESERVED_WORKER_ENV_KEYS
     }
     for k, v in (runtime_secrets or {}).items():
@@ -273,10 +256,6 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
     )
 
 
-def _is_hf_not_found(exc: BaseException) -> bool:
-    return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
-
-
 def _ensure_private_artifact_repo(
     api,
     repo: str,
@@ -290,7 +269,7 @@ def _ensure_private_artifact_repo(
             deadline_at=deadline_at,
         )
     except Exception as exc:
-        if not _is_hf_not_found(exc):
+        if hf_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
             raise
         _hf_call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),

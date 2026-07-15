@@ -28,9 +28,7 @@ def hf_status_code(exc: BaseException) -> int | None:
         return None
 
 
-def hf_retry_after(
-    exc: BaseException, *, max_seconds: float = HF_RETRY_AFTER_MAX_S
-) -> float | None:
+def hf_retry_after(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -51,7 +49,7 @@ def hf_retry_after(
             seconds = (retry_at - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(max_seconds, max(0.0, seconds))
+    return min(HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
 def hf_call(
