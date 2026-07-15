@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import multiprocessing
 import os
 import re
 import signal
@@ -22,6 +23,9 @@ from email.utils import parsedate_to_datetime
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
+_CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
+_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
 _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
@@ -244,6 +248,96 @@ def hf_upload(
         print(f"hf upload warn ({repo_subpath}): {_safe_detail(exc)}", flush=True)
 
 
+def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
+    """Upload one console snapshot from an isolated process."""
+    tail_path = console + ".tail"
+    with open(console, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 64_000))
+        tail = f.read().decode("utf-8", "replace")
+    if extra:
+        tail += extra
+    with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(_safe_detail(tail, 64_000))
+    hf_upload(payload, tail_path, f"console_{mode}.txt")
+
+
+def _console_upload_loop(
+    payload: dict,
+    console: str,
+    mode: str,
+    interval_s: float,
+    stop_upload,
+) -> None:
+    while not stop_upload.wait(interval_s):
+        try:
+            _upload_console_snapshot(payload, console, mode)
+        except Exception as exc:
+            print(f"console upload warn: {_safe_detail(exc)}", flush=True)
+
+
+def _stop_upload_process(process, stop_upload, timeout_s: float) -> bool:
+    """Stop and reap an uploader process; return whether it exited without termination."""
+    stop_upload.set()
+    process.join(max(0.0, timeout_s))
+    clean = not process.is_alive()
+    if not clean:
+        process.terminate()
+        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+    if process.is_alive():
+        process.kill()
+        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+    if process.is_alive():
+        print("console uploader could not be reaped after kill", flush=True)
+    else:
+        process.close()
+    return clean
+
+
+def _start_console_uploader(payload: dict, console: str, mode: str):
+    context = multiprocessing.get_context("spawn")
+    stop_upload = context.Event()
+    process = context.Process(
+        target=_console_upload_loop,
+        args=(payload, console, mode, _CONSOLE_UPLOAD_INTERVAL_S, stop_upload),
+        daemon=True,
+    )
+    process.start()
+    return process, stop_upload
+
+
+def _upload_console_tail_bounded(
+    payload: dict,
+    console: str,
+    mode: str,
+    extra: str,
+    timeout_s: float,
+) -> bool:
+    """Upload the final console snapshot without letting HF delay terminal bookkeeping."""
+    if timeout_s <= 0:
+        return False
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_upload_console_snapshot,
+        args=(payload, console, mode, extra),
+        daemon=True,
+    )
+    process.start()
+    process.join(timeout_s)
+    clean = not process.is_alive()
+    if not clean:
+        process.terminate()
+        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+    if process.is_alive():
+        process.kill()
+        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+    if process.is_alive():
+        print("final console uploader could not be reaped after kill", flush=True)
+    else:
+        process.close()
+    return clean
+
+
 def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
     """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's HF dataset repo. Raises on API error."""
     from huggingface_hub import HfApi
@@ -403,29 +497,6 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     timed_out = False
-    upload_interval = _CONSOLE_UPLOAD_INTERVAL_S
-
-    def upload_console_tail(extra: str = "") -> None:
-        tail_path = console + ".tail"
-        # Keep the newest bytes only; the tail's end is never truncated.
-        with open(console, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - 64_000))
-            tail = f.read().decode("utf-8", "replace")
-        if extra:
-            tail += extra
-        with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write(_safe_detail(tail, 64_000))
-        hf_upload(payload, tail_path, f"console_{mode}.txt")
-
-    stop_upload = threading.Event()
-
-    def upload_loop() -> None:
-        while not stop_upload.wait(upload_interval):
-            try:
-                upload_console_tail()
-            except Exception as exc:
-                print(f"console upload warn: {_safe_detail(exc)}", flush=True)
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
@@ -458,8 +529,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
 
         t = threading.Thread(target=pump, daemon=True)
         t.start()
-        uploader = threading.Thread(target=upload_loop, daemon=True)
-        uploader.start()
+        uploader, stop_upload = _start_console_uploader(payload, console, mode)
         try:
             remaining = deadline_ts - _finite_positive_number(time.time(), "current clock")
             if remaining <= 0:
@@ -486,13 +556,34 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             timed_out = True
             with pump_write_lock:
                 pump_writes_enabled = False
-        stop_upload.set()
-        uploader.join()
+        uploader_stop_timeout = min(
+            _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
+            max(
+                0.0,
+                deadline_ts - _finite_positive_number(time.time(), "current clock"),
+            ),
+        )
+        if not _stop_upload_process(uploader, stop_upload, uploader_stop_timeout):
+            print("console uploader exceeded its shutdown allowance; terminated", flush=True)
     try:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-        upload_console_tail(extra)
+        final_upload_timeout = min(
+            _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
+            max(
+                0.0,
+                deadline_ts - _finite_positive_number(time.time(), "current clock"),
+            ),
+        )
+        if not _upload_console_tail_bounded(
+            payload,
+            console,
+            mode,
+            extra,
+            final_upload_timeout,
+        ):
+            print("final console upload skipped or exceeded its allowance", flush=True)
     except Exception as exc:
         print(f"console upload warn: {_safe_detail(exc)}", flush=True)
     if timed_out:

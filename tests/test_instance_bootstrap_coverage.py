@@ -464,6 +464,17 @@ def test_fetch_code_raises_when_no_files_under_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # run_mode: subprocess tee (success + wall-clock timeout)
 # ---------------------------------------------------------------------------
+class _StoppedUploader:
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return False
+
+    def close(self):
+        return None
+
+
 class _FakeProc:
     def __init__(self, lines, rc=0, timeout_once=False):
         self.stdout = iter(lines)
@@ -482,9 +493,25 @@ class _FakeProc:
         self.killed = True
 
 
+def _disable_periodic_console_upload(monkeypatch):
+    monkeypatch.setattr(
+        b,
+        "_start_console_uploader",
+        lambda *_args: (_StoppedUploader(), threading.Event()),
+    )
+
+
+def _run_final_console_upload_inline(payload, console, mode, extra, timeout_s):
+    assert timeout_s > 0
+    b._upload_console_snapshot(payload, console, mode, extra)
+    return True
+
+
 def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     uploads: list[tuple] = []
     popen_calls = []
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", _run_final_console_upload_inline)
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
     proc = _FakeProc(["hello\n", "world\n"], rc=0)
 
@@ -552,6 +579,8 @@ class _TrackedConsole:
 
 def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
     console = "/tmp/console_sft.txt"
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", _run_final_console_upload_inline)
     final_write_attempt = threading.Event()
     late_writes = []
     uploads = []
@@ -581,54 +610,59 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
     assert "final-after-delay" in uploads[-1][1]
 
 
-def test_run_mode_waits_for_periodic_uploader_before_final_upload(monkeypatch):
-    periodic_started = threading.Event()
-    release_periodic = threading.Event()
+def test_run_mode_terminates_hung_uploader_before_final_upload(monkeypatch):
     events = []
 
-    class _WaitForUploaderProc(_FakeProc):
-        def wait(self, timeout=None):
-            assert periodic_started.wait(1.0)
-            return self.returncode
+    class _HungUploader:
+        def __init__(self):
+            self.alive = True
 
-    def upload(_payload, _path, _subpath):
-        if threading.current_thread() is runner:
-            events.append("final")
-            return
-        events.append("periodic-start")
-        periodic_started.set()
-        assert release_periodic.wait(2.0)
-        events.append("periodic-finish")
+        def join(self, timeout=None):
+            events.append(("join", timeout))
 
-    monkeypatch.setattr(b, "_CONSOLE_UPLOAD_INTERVAL_S", 0.001)
-    monkeypatch.setattr(b, "hf_upload", upload)
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            events.append(("terminate", None))
+            self.alive = False
+
+        def kill(self):
+            events.append(("kill", None))
+            self.alive = False
+
+        def close(self):
+            events.append(("close", None))
+
+    stop_upload = threading.Event()
+    monkeypatch.setattr(
+        b,
+        "_start_console_uploader",
+        lambda *_args: (_HungUploader(), stop_upload),
+    )
+    monkeypatch.setattr(
+        b,
+        "_upload_console_tail_bounded",
+        lambda *_args: events.append(("final", None)) or True,
+    )
     monkeypatch.setattr(
         b.subprocess,
         "Popen",
-        lambda *args, **kwargs: _WaitForUploaderProc(["hello\n"], rc=0),
+        lambda *args, **kwargs: _FakeProc(["hello\n"], rc=0),
     )
     payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
-    result = []
 
-    runner = threading.Thread(
-        target=lambda: result.append(
-            b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 100)
-        )
-    )
-    runner.start()
-    assert periodic_started.wait(1.0)
-    assert runner.is_alive()
-    assert events == ["periodic-start"]
+    assert b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 100) == 0
 
-    release_periodic.set()
-    runner.join(2.0)
-
-    assert not runner.is_alive()
-    assert result == [0]
-    assert events == ["periodic-start", "periodic-finish", "final"]
+    assert stop_upload.is_set()
+    assert ("terminate", None) in events
+    assert ("kill", None) not in events
+    assert events[-1] == ("final", None)
 
 
 def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
