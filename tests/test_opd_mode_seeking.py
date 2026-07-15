@@ -210,6 +210,58 @@ def test_hybrid_eligibility_is_narrow_and_reports_sanitized_reason():
         assert unactivated.reason == reason
 
 
+def test_forward_teacher_prepare_wrapper_sanitizes_expected_error(monkeypatch):
+    from flash.engine.worker import opd
+
+    stats = opd._ForwardTeacherBatchStats(provider_requests=1, attempts=2)
+    private_cause = RuntimeError("private provider response")
+    expected = opd._ForwardTeacherPreparationError(
+        "opd hybrid target preparation failed",
+        stats=stats,
+        retriable=True,
+    )
+
+    def _raise_expected(*_args, **_kwargs):
+        raise expected from private_cause
+
+    monkeypatch.setattr(opd, "_prepare_forward_teacher_targets_impl", _raise_expected)
+
+    with pytest.raises(
+        opd._ForwardTeacherPreparationError,
+        match="opd hybrid target preparation failed",
+    ) as caught:
+        opd._prepare_forward_teacher_targets(object(), object(), [], max_length=8)
+
+    assert caught.value is not expected
+    assert caught.value.stats is stats
+    assert caught.value.retriable is True
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "private provider response" not in str(caught.value)
+    assert "private provider response" not in repr(caught.value.runtime_telemetry)
+
+
+def test_forward_teacher_prepare_wrapper_preserves_unexpected_exception(monkeypatch):
+    from flash.engine.worker import opd
+
+    class _UnexpectedPreparationError(RuntimeError):
+        pass
+
+    unexpected = _UnexpectedPreparationError("privacy-safe internal diagnostic")
+
+    def _raise_unexpected(*_args, **_kwargs):
+        raise unexpected
+
+    monkeypatch.setattr(opd, "_prepare_forward_teacher_targets_impl", _raise_unexpected)
+
+    with pytest.raises(_UnexpectedPreparationError) as caught:
+        opd._prepare_forward_teacher_targets(object(), object(), [], max_length=8)
+
+    assert caught.value is unexpected
+    assert caught.value.args == ("privacy-safe internal diagnostic",)
+    assert caught.traceback[-1].name == "_raise_unexpected"
+
+
 def test_forward_teacher_local_validation_does_not_count_provider_request():
     from flash.engine.worker.forward_teacher import ForwardTeacherClient
     from flash.engine.worker.opd import (

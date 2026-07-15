@@ -2083,7 +2083,6 @@ def _prepare_forward_teacher_targets(
     max_length: int,
     entropy_tau: float | None = None,
 ):
-    sanitized: tuple[str, _ForwardTeacherBatchStats, bool] | None = None
     try:
         return _prepare_forward_teacher_targets_impl(
             client,
@@ -2093,8 +2092,9 @@ def _prepare_forward_teacher_targets(
             entropy_tau=entropy_tau,
         )
     except _ForwardTeacherPreparationError as exc:
-        sanitized = (str(exc), exc.stats, exc.retriable)
-    reason, stats, retriable = sanitized
+        reason = str(exc)
+        stats = exc.stats
+        retriable = exc.retriable
     raise _ForwardTeacherPreparationError(reason, stats=stats, retriable=retriable) from None
 
 
