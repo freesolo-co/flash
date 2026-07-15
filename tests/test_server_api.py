@@ -5153,3 +5153,117 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert bad.status_code == 404, bad.text
     assert "step 99" in bad.json()["detail"]
+
+
+# --- export: product-analytics report ------------------------------------------------------
+
+
+def test_export_reports_product_analytics_event(api, monkeypatch):
+    """A successful export fires the platform product-event reporter (best-effort) with the
+    destination repo, url, and step; the report failing must never fail the export itself."""
+    import flash.server.app as app_mod
+    import flash.server.run_registry as run_registry
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
+    )
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return True
+
+    monkeypatch.setattr(run_registry, "record_model_exported", capture)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["repository"] == "me/adapters"
+    assert seen["url"] == "https://huggingface.co/me/adapters"
+    assert seen["step"] is None
+    assert seen["status"].run_id == run_id
+
+
+def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
+    import flash.server.app as app_mod
+    import flash.server.run_registry as run_registry
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
+    )
+
+    def boom(**_kwargs):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(run_registry, "record_model_exported", boom)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_record_model_exported_posts_allowlisted_event(monkeypatch):
+    """The reporter posts the flash_model_exported event with org/user attribution and the
+    export detail; no org in context disables the report entirely."""
+    import flash.server.run_registry as run_registry
+
+    posted: dict = {}
+    monkeypatch.setattr(
+        run_registry,
+        "_post",
+        lambda path, body: posted.update({"path": path, "body": body}) or True,
+    )
+
+    class _Status:
+        def __init__(self):
+            self.run_id = "run-9"
+            self.platform_context = {"org_id": "org-A", "user_id": "user-1"}
+            self.billing_context = None
+            self.spec = {"model": "Qwen/Qwen3.5-0.8B"}
+
+    ok = run_registry.record_model_exported(
+        status=_Status(),
+        repository="me/adapters",
+        url="https://huggingface.co/me/adapters",
+        step=120,
+    )
+    assert ok is True
+    assert posted["path"] == "/api/flash/events/internal"
+    assert posted["body"]["orgId"] == "org-A"
+    assert posted["body"]["userId"] == "user-1"
+    assert posted["body"]["event"] == "flash_model_exported"
+    props = posted["body"]["properties"]
+    assert props == {
+        "run_id": "run-9",
+        "repository": "me/adapters",
+        "url": "https://huggingface.co/me/adapters",
+        "step": 120,
+        "model": "Qwen/Qwen3.5-0.8B",
+    }
+
+    class _NoOrg:
+        def __init__(self):
+            self.run_id = "run-9"
+            self.platform_context = None
+            self.billing_context = None
+            self.spec = {}
+
+    posted.clear()
+    assert (
+        run_registry.record_model_exported(
+            status=_NoOrg(), repository="x/y", url="https://x", step=None
+        )
+        is False
+    )
+    assert posted == {}
