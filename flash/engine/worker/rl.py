@@ -747,6 +747,7 @@ def run_rl():
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
+        _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
         # Warm-start CONTINUES the one SFT adapter in place, so the saved adapter already carries
         # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs
         # likewise deploy their single adapter directly).

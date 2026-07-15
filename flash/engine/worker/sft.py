@@ -675,6 +675,7 @@ def run_sft():
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
+        _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured.
         if final_save_due(_final_step, save_at_steps):
