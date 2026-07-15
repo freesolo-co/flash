@@ -72,12 +72,26 @@ def test_grpo_epochs_need_max_examples_for_cost():
     assert _spec_steps(spec) == 2
 
 
+def test_grpo_positive_max_steps_is_authoritative():
+    assert _spec_steps(_spec(**{"train.max_steps": 73})) == 73
+    assert _spec_steps(_spec(**{"train.max_steps": 0})) == 50
+
+
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"
     raw["train"].update({"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1})
     spec = spec_from_dict(raw)
     assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
+
+
+def test_opd_positive_max_steps_is_authoritative():
+    raw = copy.deepcopy(GRPO_RAW)
+    raw["algorithm"] = "opd"
+    raw["train"].update(
+        {"epochs": 2, "max_examples": 17, "batch_size": 8, "group_size": 1, "max_steps": 31}
+    )
+    assert _spec_steps(spec_from_dict(raw)) == 31
 
 
 def test_opd_runconfig_carries_selected_teacher_and_prices_it():
@@ -155,7 +169,7 @@ def _worker_sft_steps(*, examples, requested_batch, epochs, max_steps=0):
     grad_accum = max(1, -(-requested_batch // per_device))
     realized = per_device * grad_accum
     n = max(1, -(-examples // realized) * epochs)
-    return min(n, max_steps) if max_steps > 0 else n
+    return max_steps if max_steps > 0 else n
 
 
 def test_sft_steps_default_epochs_mirror_the_worker():
@@ -206,9 +220,11 @@ def test_runconfig_preserves_positional_seq_len_compatibility():
     assert cfg.train_tokens is None
 
 
-def test_sft_max_steps_caps_the_derived_count():
-    spec = _sft_spec(max_examples=10_000, batch_size=16, epochs=2, max_steps=5)
-    assert _spec_steps(spec) == 5
+def test_sft_positive_max_steps_is_authoritative():
+    below_derived = _sft_spec(max_examples=10_000, batch_size=16, epochs=2, max_steps=5)
+    above_derived = _sft_spec(max_examples=16, batch_size=16, epochs=1, max_steps=9)
+    assert _spec_steps(below_derived) == 5
+    assert _spec_steps(above_derived) == 9
 
 
 def test_sft_steps_honor_big_vocab_per_device_cap():
@@ -228,7 +244,10 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
             "hf_repo": "owner/runs",
-            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_context_tokens": 1024,
+            "max_examples": 320,
+            "batch_size": 6,
+            "epochs": 2,
+            "max_context_tokens": 1024,
         },
         "gpu": {"type": "RTX 4090"},
     }

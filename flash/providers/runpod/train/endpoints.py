@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import threading
 import time
 from typing import Any
 
+from flash.diagnostics import sanitize_diagnostic
 from flash.providers.base import canonical_gpu, gpu_short
 from flash.providers.runpod.gpus import flash_gpu
 from flash.providers.runpod.train.deps import (
@@ -195,7 +197,9 @@ def _train_body(input_data: dict) -> dict:
     """
     import contextlib
     import json
+    import math
     import os
+    import re
     import subprocess
     import sys
     import tempfile
@@ -205,6 +209,25 @@ def _train_body(input_data: dict) -> dict:
     from email.utils import parsedate_to_datetime
 
     from huggingface_hub import snapshot_download
+
+    def _safe_detail(value, secrets=None, limit=1000):
+        text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        values = {**os.environ, **(secrets or {})}
+        for key, secret in values.items():
+            upper = str(key).upper()
+            if secret and (
+                upper in {"AUTHORIZATION", "HF_TOKEN"}
+                or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
+            ):
+                text = text.replace(str(secret), "<redacted>")
+        text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+        text = re.sub(
+            r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
+            r"(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)",
+            lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+            text,
+        )
+        return text[:limit]
 
     if input_data.get("mode") == "preload":
         overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
@@ -254,7 +277,7 @@ def _train_body(input_data: dict) -> dict:
                 )
                 done.append(repo_id)
             except Exception as exc:
-                failed[repo_id] = str(exc)[:300]
+                failed[repo_id] = _safe_detail(exc, overrides, 300)
         return {
             "preloaded": done,
             "already_cached": already,
@@ -262,249 +285,298 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
-    overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+    raw_deadline = input_data.get("deadline_at")
+    if isinstance(raw_deadline, bool) or not isinstance(raw_deadline, (int, float)):
+        raise RuntimeError("run wall deadline is invalid")
+    deadline_at = float(raw_deadline)
+    if not math.isfinite(deadline_at) or deadline_at <= 0:
+        raise RuntimeError("run wall deadline is invalid")
 
-    def _extra_pip_env() -> tuple[dict[str, str], str | None]:
-        env = dict(os.environ)
-        env.update(overrides)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        askpass = None
-        if env.get("GITHUB_TOKEN"):
-            fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(
-                    "#!/bin/sh\n"
-                    'case "$1" in\n'
-                    '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                    '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
-                    "esac\n"
-                )
-            os.chmod(askpass, 0o700)
-            env["GIT_ASKPASS"] = askpass
-        return env, askpass
+    def _require_deadline_allowance() -> float:
+        now = time.time()
+        if not math.isfinite(now) or now <= 0:
+            raise RuntimeError("run wall deadline clock is invalid")
+        remaining_seconds = deadline_at - now
+        if remaining_seconds <= 0:
+            raise TimeoutError("run wall deadline exceeded")
+        return remaining_seconds
 
-    extra_pip = input_data.get("extra_pip") or []
-    if extra_pip:
-        extra_env, askpass = _extra_pip_env()
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", *extra_pip],
-                check=True,
-                env=extra_env,
-            )
-        finally:
-            if askpass:
-                with contextlib.suppress(OSError):
-                    os.remove(askpass)
+    try:
+        remaining = _require_deadline_allowance()
+    except TimeoutError:
+        raise RuntimeError("run wall deadline exceeded before bootstrap") from None
 
-    def _code_prefix() -> str:
-        raw = input_data.get("code_prefix")
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("missing code_prefix")
-        prefix = raw.strip().strip("/")
-        parts = prefix.split("/")
-        digest = parts[1] if len(parts) == 3 else ""
-        if (
-            len(parts) != 3
-            or parts[0] != "code"
-            or parts[2] != "flash"
-            or len(digest) != 32
-            or any(c not in "0123456789abcdef" for c in digest)
-        ):
-            raise ValueError(f"invalid code_prefix: {prefix!r}")
-        return prefix
+    def _deadline_exit() -> None:
+        print("run wall deadline exceeded; terminating worker", flush=True)
+        os._exit(124)
 
-    def _hf_status_code(exc: BaseException) -> int | None:
-        response = getattr(exc, "response", None)
-        code = getattr(response, "status_code", None)
-        try:
-            return int(code)
-        except (TypeError, ValueError):
-            return None
+    deadline_timer = threading.Timer(remaining, _deadline_exit)
+    deadline_timer.daemon = True
+    deadline_timer.start()
 
-    def _hf_retry_after(exc: BaseException) -> float | None:
-        response = getattr(exc, "response", None)
-        headers = getattr(response, "headers", None) or {}
-        value = headers.get("retry-after") if hasattr(headers, "get") else None
-        if not value and hasattr(headers, "items"):
-            for key, candidate in headers.items():
-                if str(key).lower() == "retry-after":
-                    value = candidate
-                    break
-        if not value:
-            return None
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
+    try:
+        overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
+
+        def _extra_pip_env() -> tuple[dict[str, str], str | None]:
+            env = dict(os.environ)
+            env.update(overrides)
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            askpass = None
+            if env.get("GITHUB_TOKEN"):
+                fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#!/bin/sh\n"
+                        'case "$1" in\n'
+                        '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                        '*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                        "esac\n"
+                    )
+                os.chmod(askpass, 0o700)
+                env["GIT_ASKPASS"] = askpass
+            return env, askpass
+
+        extra_pip = input_data.get("extra_pip") or []
+        if extra_pip:
+            extra_env, askpass = _extra_pip_env()
             try:
-                retry_at = parsedate_to_datetime(str(value))
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=UTC)
-                seconds = (retry_at - datetime.now(UTC)).total_seconds()
+                _require_deadline_allowance()
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", *extra_pip],
+                    check=True,
+                    env=extra_env,
+                )
+            finally:
+                if askpass:
+                    with contextlib.suppress(OSError):
+                        os.remove(askpass)
+
+        def _code_prefix() -> str:
+            raw = input_data.get("code_prefix")
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("missing code_prefix")
+            prefix = raw.strip().strip("/")
+            parts = prefix.split("/")
+            digest = parts[1] if len(parts) == 3 else ""
+            if (
+                len(parts) != 3
+                or parts[0] != "code"
+                or parts[2] != "flash"
+                or len(digest) != 32
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise ValueError(f"invalid code_prefix: {prefix!r}")
+            return prefix
+
+        def _hf_status_code(exc: BaseException) -> int | None:
+            response = getattr(exc, "response", None)
+            code = getattr(response, "status_code", None)
+            try:
+                return int(code)
             except (TypeError, ValueError):
                 return None
-        return min(60.0, max(0.0, seconds))
 
-    def _hf_call(call, label: str):
-        retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
-        transient_status_codes = {429, 500, 502, 503, 504}
-        for attempt in range(len(retry_delays) + 1):
+        def _hf_retry_after(exc: BaseException) -> float | None:
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None) or {}
+            value = headers.get("retry-after") if hasattr(headers, "get") else None
+            if not value and hasattr(headers, "items"):
+                for key, candidate in headers.items():
+                    if str(key).lower() == "retry-after":
+                        value = candidate
+                        break
+            if not value:
+                return None
             try:
-                return call()
-            except Exception as exc:
-                if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
-                    retry_delays
-                ):
-                    raise
-                retry_after = _hf_retry_after(exc)
-                delay = retry_after if retry_after is not None else retry_delays[attempt]
-                print(
-                    f"{label} transient Hugging Face error; retrying in {delay:.0f}s: {exc}",
-                    flush=True,
+                seconds = float(value)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(str(value))
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=UTC)
+                    seconds = (retry_at - datetime.now(UTC)).total_seconds()
+                except (TypeError, ValueError):
+                    return None
+            return min(60.0, max(0.0, seconds))
+
+        def _hf_call(call, label: str):
+            retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
+            transient_status_codes = {429, 500, 502, 503, 504}
+            for attempt in range(len(retry_delays) + 1):
+                _require_deadline_allowance()
+                try:
+                    return call()
+                except Exception as exc:
+                    if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                        retry_delays
+                    ):
+                        raise
+                    retry_after = _hf_retry_after(exc)
+                    delay = retry_after if retry_after is not None else retry_delays[attempt]
+                    try:
+                        delay = min(delay, _require_deadline_allowance())
+                    except TimeoutError:
+                        raise exc from None
+                    print(
+                        f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                        f"{_safe_detail(exc, overrides, 500)}",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    try:
+                        _require_deadline_allowance()
+                    except TimeoutError:
+                        raise exc from None
+            raise AssertionError("unreachable")
+
+        def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
+            from huggingface_hub import HfApi, hf_hub_download
+
+            api = HfApi(token=token)
+            files = [
+                entry.path
+                for entry in _hf_call(
+                    lambda: list(
+                        api.list_repo_tree(
+                            repo_id=repo_id,
+                            repo_type="dataset",
+                            path_in_repo=prefix,
+                            recursive=True,
+                            token=token,
+                        )
+                    ),
+                    f"list flash code under {repo_id}:{prefix}",
                 )
-                time.sleep(delay)
-        raise AssertionError("unreachable")
-
-    def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
-        from huggingface_hub import HfApi, hf_hub_download
-
-        api = HfApi(token=token)
-        files = [
-            entry.path
-            for entry in _hf_call(
-                lambda: list(
-                    api.list_repo_tree(
+                if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
+            ]
+            if not files:
+                raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
+            for filename in files:
+                _hf_call(
+                    lambda filename=filename: hf_hub_download(
                         repo_id=repo_id,
                         repo_type="dataset",
-                        path_in_repo=prefix,
-                        recursive=True,
+                        filename=filename,
+                        local_dir="/runcode",
                         token=token,
-                    )
-                ),
-                f"list flash code under {repo_id}:{prefix}",
-            )
-            if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-        ]
-        if not files:
-            raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
-        for filename in files:
-            _hf_call(
-                lambda filename=filename: hf_hub_download(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    filename=filename,
-                    local_dir="/runcode",
-                    token=token,
-                ),
-                f"download flash code file {repo_id}:{filename}",
-            )
+                    ),
+                    f"download flash code file {repo_id}:{filename}",
+                )
 
-    code_prefix = _code_prefix()
-    _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
-    code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        code_prefix = _code_prefix()
+        _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
+        code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
 
-    env = dict(os.environ)
-    env.update(overrides)
-    # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
-    if not os.path.isdir("/runpod-volume"):
-        for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
-            env.pop(_k, None)
-    # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
-    spec_path = "/tmp/job_spec.json"
-    with open(spec_path, "w") as sf:
-        sf.write(input_data["job_spec_json"])
-    env["FLASH_JOB_SPEC_PATH"] = spec_path
-    env.pop("FLASH_JOB_SPEC_JSON", None)
-    env["PHASE"] = input_data["phase"]
-    env["SEED"] = str(input_data["seed"])
-    env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-
-    def _upload_console(mode: str) -> None:
-        """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-        console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-        from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-        without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-        ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-        crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
-        console = f"/tmp/console_{mode}.txt"
-        if not os.path.exists(console):
-            return
-        try:
-            from huggingface_hub import HfApi
-
-            spec = json.loads(input_data["job_spec_json"])
-            phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
-            prefix = f"{phase_ns}/{spec['run_id']}"
-            # Keep the newest bytes only; the uploaded tail's end is never truncated.
-            tail_bytes = 64_000
-            with open(console, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - tail_bytes))
-                tail = f.read().decode("utf-8", "replace")
-            with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
-                f.write(tail)
-            HfApi(token=env.get("HF_TOKEN")).upload_file(
-                path_or_fileobj=console + ".tail",
-                path_in_repo=f"{prefix}/console_{mode}.txt",
-                repo_id=input_data["hf_repo"],
-                repo_type="dataset",
-            )
-        except Exception as up_err:
-            print("console upload warn:", up_err)
-
-    def run_mode(mode: str, check: bool) -> int:
-        """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
-        console = f"/tmp/console_{mode}.txt"
-        interval = 3600.0
-        stop_upload = threading.Event()
-
-        def _upload_loop() -> None:
-            while not stop_upload.wait(interval):
-                _upload_console(mode)  # best-effort; swallows its own errors
-
-        with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "flash.engine.worker"],
-                cwd=code_dir,
-                env={**env, "RUN_MODE": mode},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            uploader = threading.Thread(target=_upload_loop, daemon=True)
-            uploader.start()
-            try:
-                for line in proc.stdout:
-                    print(line, end="")
-                    cf.write(line)
-                proc.wait()
-            finally:
-                stop_upload.set()
-                uploader.join(timeout=10)
-        _upload_console(mode)
-        if proc.returncode != 0 and check:
-            raise RuntimeError(
-                f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                f"and error_{mode}_attempt*.txt in the HF dataset repo"
-            )
-        return proc.returncode
-
-    # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
-    for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(stale)
-    # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
-    run_mode(input_data["phase"], check=False)
-    if not os.path.exists("/tmp/metrics.json"):
-        phase = input_data["phase"]
-        _upload_console(phase)
-        raise RuntimeError(
-            f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-            f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-            f"dataset repo for the full traceback"
+        env = dict(os.environ)
+        env.update(overrides)
+        # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
+        if not os.path.isdir("/runpod-volume"):
+            for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
+                env.pop(_k, None)
+        # Pass spec via file to avoid ~128 KiB per-env-string exec limit.
+        spec_path = "/tmp/job_spec.json"
+        with open(spec_path, "w") as sf:
+            sf.write(input_data["job_spec_json"])
+        env["FLASH_JOB_SPEC_PATH"] = spec_path
+        env.pop("FLASH_JOB_SPEC_JSON", None)
+        env["PHASE"] = input_data["phase"]
+        env["SEED"] = str(input_data["seed"])
+        env["PYTHONPATH"] = code_dir + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
-    with open("/tmp/metrics.json") as f:
-        return json.load(f)
+
+        def _upload_console(mode: str) -> None:
+            """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
+            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
+            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
+            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
+            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
+            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+            console = f"/tmp/console_{mode}.txt"
+            if not os.path.exists(console):
+                return
+            try:
+                from huggingface_hub import HfApi
+
+                _require_deadline_allowance()
+                spec = json.loads(input_data["job_spec_json"])
+                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
+                prefix = f"{phase_ns}/{spec['run_id']}"
+                # Keep the newest bytes only; the uploaded tail's end is never truncated.
+                tail_bytes = 64_000
+                with open(console, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - tail_bytes))
+                    tail = f.read().decode("utf-8", "replace")
+                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                    f.write(_safe_detail(tail, env, 64_000))
+                _require_deadline_allowance()
+                HfApi(token=env.get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=console + ".tail",
+                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    repo_id=input_data["hf_repo"],
+                    repo_type="dataset",
+                )
+            except Exception as e:
+                print("console upload warn:", _safe_detail(e, env))
+
+        def run_mode(mode: str, check: bool) -> int:
+            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            console = f"/tmp/console_{mode}.txt"
+            interval = 3600.0
+            stop_upload = threading.Event()
+
+            def _upload_loop() -> None:
+                while not stop_upload.wait(interval):
+                    _upload_console(mode)  # best-effort; swallows its own errors
+
+            with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
+                _require_deadline_allowance()
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+                    cwd=code_dir,
+                    env={**env, "RUN_MODE": mode},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader.start()
+                try:
+                    for line in proc.stdout:
+                        print(line, end="")
+                        cf.write(line)
+                    proc.wait()
+                finally:
+                    stop_upload.set()
+                    uploader.join(timeout=10)
+            _upload_console(mode)
+            if proc.returncode != 0 and check:
+                raise RuntimeError(
+                    f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
+                    f"and error_{mode}_attempt*.txt in the HF dataset repo"
+                )
+            return proc.returncode
+
+        # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
+        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stale)
+        # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
+        run_mode(input_data["phase"], check=False)
+        if not os.path.exists("/tmp/metrics.json"):
+            phase = input_data["phase"]
+            _upload_console(phase)
+            raise RuntimeError(
+                f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
+                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
+                f"dataset repo for the full traceback"
+            )
+        with open("/tmp/metrics.json") as f:
+            return json.load(f)
+    finally:
+        deadline_timer.cancel()
 
 
 def isolate_flash_state(scope: str | None = None) -> None:
@@ -684,16 +756,20 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
                     continue
 
 
+def _endpoint_name_matches_run(name: str, target: str) -> bool:
+    canonical = str(name or "").removeprefix("live-")
+    return canonical == target or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
+
+
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
-    """Return resource ids whose name contains ``target`` (live resources are prefixed with ``live-``)."""
+    """Return exact base and canonical retry endpoint resource ids for one run."""
     if not target:
         return []
-    out = []
-    for uid, res in (resources or {}).items():
-        name = str(getattr(res, "name", "") or "")
-        if target in name:
-            out.append(uid)
-    return out
+    return [
+        uid
+        for uid, resource in (resources or {}).items()
+        if _endpoint_name_matches_run(getattr(resource, "name", ""), target)
+    ]
 
 
 def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
@@ -710,14 +786,18 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             isolate_flash_state(_run_suffix(run_id))
             from runpod_flash.core.resources.resource_manager import ResourceManager
         except Exception as exc:
-            return [{"success": False, "name": target, "message": f"flash unavailable: {exc}"}]
+            detail = sanitize_diagnostic(exc, limit=1000)
+            return [{"success": False, "name": target, "message": f"flash unavailable: {detail}"}]
 
         try:
             rm = ResourceManager()
             resources = rm.list_all_resources()
             uids = _select_endpoint_resources(resources, target)
         except Exception as exc:
-            return [{"success": False, "name": target, "message": f"resource lookup failed: {exc}"}]
+            detail = sanitize_diagnostic(exc, limit=1000)
+            return [
+                {"success": False, "name": target, "message": f"resource lookup failed: {detail}"}
+            ]
 
         async def _undeploy_all() -> list:
             out = []
@@ -729,7 +809,13 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                         await rm.undeploy_resource(uid, resource_name=name, force_remove=True)
                     )
                 except Exception as exc:
-                    out.append({"success": False, "name": name, "message": str(exc)})
+                    out.append(
+                        {
+                            "success": False,
+                            "name": name,
+                            "message": sanitize_diagnostic(exc, limit=1000),
+                        }
+                    )
             return out
 
         try:
@@ -757,30 +843,60 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                     raise TimeoutError("undeploy timed out after 30s")
                 results = _out[0]
         except Exception as exc:
-            results = [{"success": False, "name": target, "message": str(exc)}]
-
-    # Registry-less fallback: per-process state means a fresh container can't see the endpoint.
-    # Delete by reconstructed name via REST so the worker doesn't stay live.
-    rest_confirmed_absent = False
-    if not uids:
-        try:
-            from flash.providers.runpod import api as runpod_api
-
-            matches = [
-                e for e in runpod_api.find_endpoints_by_name(target) if e.get("name") == target
+            results = [
+                {
+                    "success": False,
+                    "name": target,
+                    "message": sanitize_diagnostic(exc, limit=1000),
+                }
             ]
-            for ep in matches:
-                if runpod_api.delete_endpoint(ep["id"]):
-                    results.append(
-                        {"success": True, "name": target, "message": "deleted via REST API"}
-                    )
-            rest_confirmed_absent = not matches
-        except Exception as exc:
-            # Can't prove endpoint is gone — do NOT treat as absent; slot stays held.
-            logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
-    # Release only when the endpoint is provably gone; do NOT release on failure (may still be live).
-    if any(r.get("success") for r in results) or (not uids and rest_confirmed_absent):
+    # registry-less cleanup must inspect every configured account and exact retry suffix.
+    rest_confirmed_clear = False
+    try:
+        from flash.providers.runpod import api as runpod_api
+
+        by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
+        rest_confirmed_clear = not failed_fingerprints
+        for fingerprint, endpoints in by_fingerprint.items():
+            for endpoint in endpoints:
+                if not _endpoint_name_matches_run(endpoint.get("name", ""), target):
+                    continue
+                endpoint_id = endpoint.get("id")
+                if not endpoint_id or not runpod_api.delete_endpoint_for_fingerprint(
+                    endpoint_id, fingerprint
+                ):
+                    rest_confirmed_clear = False
+                    results.append(
+                        {
+                            "success": False,
+                            "name": endpoint.get("name") or target,
+                            "message": "REST endpoint deletion was unconfirmed",
+                        }
+                    )
+                    continue
+                results.append(
+                    {
+                        "success": True,
+                        "name": endpoint.get("name") or target,
+                        "message": "deleted via REST API",
+                    }
+                )
+        if failed_fingerprints:
+            results.append(
+                {
+                    "success": False,
+                    "name": target,
+                    "message": (
+                        f"could not enumerate {len(failed_fingerprints)} configured RunPod account(s)"
+                    ),
+                }
+            )
+    except Exception as exc:
+        logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
+
+    # release only when every configured account authoritatively confirms cleanup.
+    if rest_confirmed_clear:
         _release_endpoint_slot(target)
 
     with contextlib.suppress(Exception):

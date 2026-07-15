@@ -103,8 +103,10 @@ def record_training_checkpoint(
     artifact_path: str,
 ) -> bool:
     try:
+        from flash.engine.accounting import sanitize_worker_metrics
         from flash.runner import adapter_ref, get_status
 
+        metrics = sanitize_worker_metrics(metrics)
         status = get_status(spec.run_id)
         ref = adapter_ref(spec)
     except Exception:

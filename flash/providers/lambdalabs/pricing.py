@@ -26,7 +26,7 @@ def _static_rate(name: str) -> float:
     return _STATIC_RATES.get(name) or get_gpu_info(name).hourly_usd
 
 
-def hourly_rate(gpu_name: str) -> float:
+def hourly_rate(gpu_name: str, *, deadline_at: float | None = None) -> float:
     """$/hr for one friendly GPU name on Lambda (live ``/instance-types`` if available, else static)."""
     from flash.providers.base import canonical_gpu, get_gpu_info
 
@@ -36,7 +36,7 @@ def hourly_rate(gpu_name: str) -> float:
         try:
             from flash.providers.lambdalabs.api import instance_type_price_usd_hr
 
-            live = instance_type_price_usd_hr(info.lambda_name)
+            live = instance_type_price_usd_hr(info.lambda_name, deadline_at=deadline_at)
             if live:
                 return live
         except Exception as exc:

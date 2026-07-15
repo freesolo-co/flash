@@ -366,16 +366,19 @@ def test_sweep_charges_run_with_stale_unparseable_spec(monkeypatch, tmp_path):
     # are no longer supported) -- the exact "stale persisted spec" finding (3) is about.
     stale_spec = {**SPEC, "environment": {"path": "./local/environment.py"}}
     spec = _spec()
+    created_at = 1_000_000.0
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
             state="done",
             spec=stale_spec,
+            created_at=created_at,
             cost_usd=1.23,
-            remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
             billing_context={"org_id": "org-A"},
             billing_state="pending",
-        )
+        ),
+        _run_deadline_at=created_at + float(spec.gpu.max_wall_seconds),
+        _next_attempt=0,
     )
 
     # belt-and-suspenders: prove this spec really would have aborted the old reparse path

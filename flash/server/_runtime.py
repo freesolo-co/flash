@@ -64,7 +64,9 @@ async def _repo_cleanup_loop() -> None:
     ``repo_cleanup_enabled`` (needs an operator ``HF_TOKEN``)."""
     from flash.server.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
-    interval = 24.0 * 3600.0  # daily sweep (fixed); the 7-day age makes the exact cadence non-critical
+    interval = (
+        24.0 * 3600.0
+    )  # daily sweep (fixed); the 7-day age makes the exact cadence non-critical
     # Sweep IMMEDIATELY on startup, THEN sleep between subsequent sweeps (sleep is at the END of the
     # loop). Sleeping first would let a control plane restarted — or crash-looping — more often than
     # the interval never reclaim anything. The startup sweep is still off the critical path — this is a
@@ -84,7 +86,9 @@ async def _repo_cleanup_loop() -> None:
         except CleanupAborted as exc:
             # Live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a serving/
             # registry blip; not an error. Retry next cycle.
-            _log.warning("repo GC sweep skipped (live set unconfirmed); retrying next cycle: %s", exc)
+            _log.warning(
+                "repo GC sweep skipped (live set unconfirmed); retrying next cycle: %s", exc
+            )
         except Exception:
             _log.debug("repo GC sweep failed; retrying next cycle", exc_info=True)
         # Sleep AFTER the sweep, so the first sweep runs at startup rather than a full interval later.
@@ -224,7 +228,9 @@ def _confirm_run_clear(spec) -> bool:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
         try:
-            has_capability = getattr(get_provider(name), "run_instances_remaining", None) is not None
+            has_capability = (
+                getattr(get_provider(name), "run_instances_remaining", None) is not None
+            )
         except Exception:
             # Can't even resolve a RECORDED instance provider -> assume it could own a phantom -> fail
             # closed rather than declare clear.
@@ -234,12 +240,36 @@ def _confirm_run_clear(spec) -> bool:
     return clear
 
 
-def _start_resubmit(spec) -> None:
+def _recovery_block_reason(spec) -> str | None:
+    from flash.runner import _spec_with_remaining_wall
+
+    try:
+        _spec_with_remaining_wall(spec, require_provider_minimum=True)
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def _fail_blocked_recovery(spec, reason: str) -> None:
+    from flash.runner import _update
+
+    with contextlib.suppress(Exception):
+        _update(spec.run_id, "failed", remote=None, error=reason)
+    with contextlib.suppress(Exception):
+        _append_run_log(spec.run_id, reason)
+
+
+def _start_resubmit(spec) -> bool:
     from flash.runner import _run_job_background
 
+    reason = _recovery_block_reason(spec)
+    if reason is not None:
+        _fail_blocked_recovery(spec, reason)
+        return False
     with contextlib.suppress(Exception):
         _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
     threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    return True
 
 
 def _deferred_resubmit_loop(spec) -> None:
@@ -284,9 +314,7 @@ def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) 
         )
     except Exception:
         return default
-    pat = re.compile(
-        rf"^{re.escape(prefix)}/{kind}_{re.escape(phase)}(?:_attempt(\d+))?\.txt$"
-    )
+    pat = re.compile(rf"^{re.escape(prefix)}/{kind}_{re.escape(phase)}(?:_attempt(\d+))?\.txt$")
     best: int | None = None
     best_name: str | None = None
     for f in files:
@@ -353,12 +381,12 @@ def recover_runs() -> None:
     re-attach to ``running`` jobs, and resubmit ``queued``/``provisioning`` runs that never reached
     a worker."""
     from flash.runner import (
+        _drain_cleanup_remotes,
         _gc_run_endpoints,
         _mark_warmstart_source,
-        _resolve_init_from_adapter,
-        _status_org_id,
         _update,
         attach_run,
+        effective_spec_from_status,
         get_status,
     )
 
@@ -379,6 +407,8 @@ def recover_runs() -> None:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
+        with contextlib.suppress(Exception):
+            _drain_cleanup_remotes(status.run_id)
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
@@ -421,19 +451,13 @@ def recover_runs() -> None:
 
                         terminate_endpoint(gpu_type, status.run_id)
                 continue
+            # reap run-scoped resources from the parseable public spec before touching the private
+            # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             try:
-                owner_key_id = None
-                with contextlib.suppress(Exception):
-                    owner_key_id = db.run_owner(status.run_id)
-                spec = _resolve_init_from_adapter(
-                    spec,
-                    owner_org_id=_status_org_id(status),
-                    owner_key_id=owner_key_id,
-                )
-                # Refresh the warm-start marker so a child recovered across restarts keeps its aged
-                # source protected from the artifact GC past the age window (best-effort).
+                spec = effective_spec_from_status(status, verify_source=True)
+                # refresh the warm-start marker so recovery keeps an aged source protected.
                 _mark_warmstart_source(spec, spec.run_id)
             except Exception as exc:
                 _log.warning(
@@ -456,6 +480,10 @@ def recover_runs() -> None:
             prov.sweep_orphans(active_labels=active, known_labels=known)
 
     for spec, prior_state in resubmit:
+        reason = _recovery_block_reason(spec)
+        if reason is not None:
+            _fail_blocked_recovery(spec, reason)
+            continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
 from collections.abc import Callable
 from typing import Any
+
+from flash.providers._deadline import remaining_seconds
 
 # Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
 PRELOAD_REAP_GRACE_S = 1800.0
@@ -77,13 +80,20 @@ class PollErrorTracker:
     def reset(self) -> None:
         self._count = 0
 
-    def record(self, exc: Exception) -> bool:
-        """Register a poll error; returns True to give up, False to continue after backoff sleep."""
+    def record(self, exc: Exception, *, deadline_at: float | None = None) -> bool:
+        """Register a poll error and back off no later than the absolute deadline."""
         self._count += 1
-        self._say(f"poll error ({self._count}): {exc}")
+        self._say(f"poll error ({self._count}): {type(exc).__name__}")
         if self._count >= self._max_errors:
             return True
-        time.sleep(min(60, self._interval_s * self._count))
+        delay = min(60, self._interval_s * self._count)
+        if deadline_at is not None:
+            remaining = remaining_seconds(deadline_at)
+            if remaining <= 0:
+                return True
+            delay = min(delay, remaining)
+        if delay > 0:
+            time.sleep(delay)
         return False
 
 
@@ -314,18 +324,22 @@ def surface_heartbeat(
     return key, stage
 
 
+_MAX_ATTEMPT_ID = (1 << 63) - 1
+
+
 def _attempt_int(value: Any) -> int | None:
-    """Coerce attempt number to int, or None when empty/unparseable."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    """Validate a bounded nonnegative integer attempt identity."""
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
+    return value if 0 <= value <= _MAX_ATTEMPT_ID else None
 
 
 def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
     if not isinstance(hb, dict) or not hb.get("oom"):
         return False
-    return current_attempt is not None and _attempt_int(hb.get("attempt")) == current_attempt
+    hb_attempt = _attempt_int(hb.get("attempt"))
+    expected_attempt = _attempt_int(current_attempt)
+    return expected_attempt is not None and hb_attempt == expected_attempt
 
 
 def heartbeat_progress_ts(
@@ -334,23 +348,22 @@ def heartbeat_progress_ts(
     """Return (ts, fresh): ts is the heartbeat's own timestamp clamped to [launch, now]; fresh is
     False for a prior-attempt leftover (retries reuse the same seed heartbeat path).
 
-    Use the heartbeat's own ts, not poll time — a stale-before-reattach heartbeat must not buy a fresh
-    stall window. launch_ts=0.0 means unknown; attempt mismatches are still rejected."""
+    Use the heartbeat's own ts, not poll time, so stale pre-reattach state buys no fresh window."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
         ts = float(ts)
     except (TypeError, ValueError):
         return now, False
-    lo = (
-        float(launch_ts) if launch_ts else 0.0
-    )  # unknown launch -> floor 0.0 (all heartbeats fresh)
-    fresh = ts >= lo
-    # Worker stamps attempt as a str env var, poller passes int; coerce both before comparing.
+    try:
+        lo = float(launch_ts)
+    except (TypeError, ValueError):
+        return now, False
+    if not math.isfinite(lo) or lo <= 0 or not math.isfinite(ts):
+        return now, False
     hb_attempt = (
         _attempt_int(hb_key[3]) if (isinstance(hb_key, tuple) and len(hb_key) >= 4) else None
     )
     cur_attempt = _attempt_int(current_attempt)
-    if fresh and cur_attempt is not None and hb_attempt != cur_attempt:
-        fresh = False
+    fresh = ts >= lo and cur_attempt is not None and hb_attempt == cur_attempt
     return min(now, max(lo, ts)), fresh

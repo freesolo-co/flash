@@ -54,7 +54,9 @@ def test_vast_a100_pcie_offer_resolves_by_vram():
     from flash.providers.base import vast_gpu_for_offer
 
     assert vast_gpu_for_offer("A100 PCIE", 80 * 1024) == "A100 PCIe"  # 80 GB -> 80 GB class
-    assert vast_gpu_for_offer("A100 PCIE", 40 * 1024) == "A100 SXM 40GB"  # 40 GB -> 40 GB class (was dropped)
+    assert (
+        vast_gpu_for_offer("A100 PCIE", 40 * 1024) == "A100 SXM 40GB"
+    )  # 40 GB -> 40 GB class (was dropped)
 
 
 def test_usable_offers_filters_and_order(monkeypatch):
@@ -64,7 +66,13 @@ def test_usable_offers_filters_and_order(monkeypatch):
     captured = {}
 
     def fake_search(
-        min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, min_duration_seconds=0, limit=64, extra_q=None
+        min_vram_mb,
+        *,
+        min_disk_gb=0,
+        min_reliability=0.95,
+        min_duration_seconds=0,
+        limit=64,
+        extra_q=None,
     ):
         captured["min_vram_mb"] = min_vram_mb
         captured["min_disk_gb"] = min_disk_gb
@@ -126,7 +134,13 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
     captured = {}
 
     def fake_search(
-        min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, min_duration_seconds=0, limit=64, extra_q=None
+        min_vram_mb,
+        *,
+        min_disk_gb=0,
+        min_reliability=0.95,
+        min_duration_seconds=0,
+        limit=64,
+        extra_q=None,
     ):
         captured["limit"] = limit
         captured["min_duration_seconds"] = min_duration_seconds
@@ -141,9 +155,8 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
 
 
 def test_usable_offers_threads_duration_floor(monkeypatch):
-    # Codex Msvb0: when a wall cap is supplied, usable_offers requires offers available for at least
-    # max_wall + PROVISION_GRACE_S (the SAME deadline the poller enforces), so the search never returns
-    # an offer that would expire mid-run. 0 wall = no duration floor.
+    # when a wall cap is supplied, usable_offers does not extend it with provisioning grace.
+    # a zero wall keeps the duration filter disabled.
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -155,11 +168,10 @@ def test_usable_offers_threads_duration_floor(monkeypatch):
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
     vast.usable_offers(24, disk_gb=60, max_wall_seconds=7200.0)
-    assert captured["min_duration_seconds"] == 7200.0 + vast.PROVISION_GRACE_S
-    # Cursor MtO8P: a sub-60s wall is floored at 60 (matching the poller's max(60, max_wall)+grace
-    # deadline) so the duration floor never undershoots what poll_vast_job actually enforces.
+    assert captured["min_duration_seconds"] == 7200.0
+    # a sub-60s wall is floored at the minimum provider creation allowance.
     vast.usable_offers(24, disk_gb=60, max_wall_seconds=30.0)
-    assert captured["min_duration_seconds"] == 60.0 + vast.PROVISION_GRACE_S
+    assert captured["min_duration_seconds"] == 60.0
     vast.usable_offers(24, disk_gb=60)  # no wall cap -> filter stays off
     assert captured["min_duration_seconds"] == 0
 
@@ -242,7 +254,9 @@ def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate from other tests
+    monkeypatch.setattr(
+        pricing, "_rates_cache", {"ts": 0.0, "data": None}
+    )  # isolate from other tests
     pricing.live_rates()  # first call -> one fetch
     pricing.live_rates()  # within TTL -> served from cache, no new fetch
     assert calls["n"] == 1

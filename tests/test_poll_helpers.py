@@ -2,20 +2,36 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
-from flash.providers._poll import heartbeat_progress_ts
+import pytest
+
+from flash.providers._poll import _attempt_int, heartbeat_progress_ts
+
+
+def test_attempt_int_rejects_oversized_ascii_decimal():
+    if not hasattr(sys, "set_int_max_str_digits"):
+        assert _attempt_int("9" * 5000) is None
+        return
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(0)
+        assert int("9" * 5000) > 0
+        assert _attempt_int("9" * 5000) is None
+    finally:
+        sys.set_int_max_str_digits(previous)
 
 
 def test_heartbeat_progress_credits_post_launch_ts_and_is_fresh():
     now = time.time()
     launch = now - 1000
     # a real heartbeat from this instance, 100s ago -> credited as-is (own ts) and fresh
-    ts, fresh = heartbeat_progress_ts(("rl", 5, now - 100), launch)
+    ts, fresh = heartbeat_progress_ts(("rl", 5, now - 100, 0), launch, current_attempt=0)
     assert fresh is True
     assert abs(ts - (now - 100)) < 2
     # future ts (worker clock ahead of the control plane) -> clamped down to now, still fresh
-    ts, fresh = heartbeat_progress_ts(("rl", 5, now + 5000), launch)
+    ts, fresh = heartbeat_progress_ts(("rl", 5, now + 5000, 0), launch, current_attempt=0)
     assert fresh is True
     assert abs(ts - now) < 2
 
@@ -24,23 +40,19 @@ def test_heartbeat_progress_pre_launch_leftover_is_not_fresh():
     now = time.time()
     launch = now - 1000
     # ts predates this instance's launch -> leftover from a prior attempt on the same seed path
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, launch - 1), launch)
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, launch - 1, 0), launch, current_attempt=0)
     assert fresh is False
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 5000), launch)
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 5000, 0), launch, current_attempt=0)
     assert fresh is False
 
 
-def test_heartbeat_progress_unknown_launch_counts_every_heartbeat_fresh():
-    # Regression: started_ts is coerced to 0.0 when unknown -> we cannot date the heartbeat vs
-    # launch, so a normal (slightly-past) heartbeat must still be FRESH. Otherwise a healthy
-    # recovered worker with an unknown launch is stalled after SETUP_GRACE despite heartbeats.
+def test_heartbeat_progress_rejects_unknown_launch_identity():
     now = time.time()
-    ts, fresh = heartbeat_progress_ts(("rl", 5, now - 30), 0.0)
-    assert fresh is True
-    assert abs(ts - (now - 30)) < 2
-    # None launch is treated the same as 0.0 (unknown)
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 30), None)
-    assert fresh is True
+    for launch in (0.0, None):
+        _ts, fresh = heartbeat_progress_ts(
+            ("rl", 5, now - 30, 0), launch, current_attempt=0
+        )
+        assert fresh is False
 
 
 def test_heartbeat_progress_no_ts_is_not_fresh():
@@ -67,25 +79,65 @@ def test_heartbeat_progress_rejects_other_attempt_even_when_ts_is_fresh():
     assert fresh is False
 
 
-def test_heartbeat_progress_same_attempt_string_vs_int_is_fresh():
-    # Regression (Cursor HIGH): the worker stamps ``attempt`` as a string ("0") while the poller
-    # passes an int (0). A naive `!=` would reject EVERY live heartbeat ("0" != 0) and spuriously
-    # stall healthy workers. Coercing both to int makes the SAME attempt match across types.
+def test_heartbeat_progress_rejects_string_attempt_identity():
     now = time.time()
     launch = now - 100
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch, current_attempt=0)
-    assert fresh is True
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "2"), launch, current_attempt=2)
-    assert fresh is True
+    for heartbeat_attempt, current_attempt in (("0", 0), ("2", 2)):
+        _ts, fresh = heartbeat_progress_ts(
+            ("rl", 5, now - 10, heartbeat_attempt),
+            launch,
+            current_attempt=current_attempt,
+        )
+        assert fresh is False
 
 
 def test_heartbeat_progress_rejects_unstamped_when_attempt_known():
     now = time.time()
     launch = now - 100
     for attempt_field in ("", None):
-        _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, attempt_field), launch, current_attempt=1)
+        _ts, fresh = heartbeat_progress_ts(
+            ("rl", 5, now - 10, attempt_field), launch, current_attempt=1
+        )
         assert fresh is False
     _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10), launch, current_attempt=1)
     assert fresh is False
-    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, "0"), launch)
+    _ts, fresh = heartbeat_progress_ts(("rl", 5, now - 10, 0), launch)
+    assert fresh is False
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_attempt", "current_attempt"),
+    [(0, 0), (7, 7)],
+)
+def test_heartbeat_progress_accepts_only_canonical_attempt_identities(
+    heartbeat_attempt, current_attempt
+):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, heartbeat_attempt), now - 10, current_attempt=current_attempt
+    )
     assert fresh is True
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [True, False, 1.0, -1, "-1", "+1", " 1", "1 ", "", chr(0x661), chr(0xFF11), object()],
+)
+def test_heartbeat_progress_rejects_malformed_heartbeat_attempt(malformed_attempt):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, malformed_attempt), now - 10, current_attempt=1
+    )
+    assert fresh is False
+
+
+@pytest.mark.parametrize(
+    "malformed_attempt",
+    [True, False, 1.0, -1, "-1", "+1", " 1", "1 ", "", chr(0x661), chr(0xFF11), object()],
+)
+def test_heartbeat_progress_rejects_malformed_current_attempt(malformed_attempt):
+    now = time.time()
+    _ts, fresh = heartbeat_progress_ts(
+        ("rl", 5, now - 1, 1), now - 10, current_attempt=malformed_attempt
+    )
+    assert fresh is False

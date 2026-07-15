@@ -27,11 +27,16 @@ import os
 import threading
 
 from flash import __version__
-from flash.runner import get_status, submit_job
+from flash.runner import get_status, prepare_job, submit_job
 from flash.runner.checkpoints import list_checkpoints
+from flash.serve.deploy import (
+    adapter_alias_target,
+    deploy_adapter,
+    deployment_record,
+    undeploy_adapter,
+)
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
-from flash.serve.deploy import deploy_adapter, deployment_record, undeploy_adapter
 from flash.serve.export import export_adapter
 
 from . import db
@@ -64,12 +69,14 @@ __all__ = [
     "_reconcile_cost_loop",
     "_repo_cleanup_loop",
     "_worker_artifacts",
+    "adapter_alias_target",
     "create_app",
     "deploy_adapter",
     "deployment_record",
     "export_adapter",
     "get_status",
     "list_checkpoints",
+    "prepare_job",
     "recover_runs",
     "run_server",
     "serve_chat",
@@ -257,9 +264,7 @@ def _sweep_orphan_instances_once() -> int:
     torn = 0
     for prov in configured_providers():
         try:
-            deleted = prov.sweep_orphans(
-                active_labels=_active_run_ids, known_labels=_known_run_ids
-            )
+            deleted = prov.sweep_orphans(active_labels=_active_run_ids, known_labels=_known_run_ids)
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
             # (the loop docstring promises failures are logged + retried next cycle), so a
@@ -344,9 +349,7 @@ def create_app():
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
         # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
         # so it can't leak revenue. Same internal-key gate as the charge itself.
-        charge_task = (
-            asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
-        )
+        charge_task = asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
         # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
         # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
         # Only when this plane manages RunPod (its API key is configured).
@@ -369,9 +372,7 @@ def create_app():
         # repos); fails closed on any live-set uncertainty. See flash.server.repo_cleanup.
         from flash.server.repo_cleanup import repo_cleanup_enabled
 
-        cleanup_task = (
-            asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        )
+        cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
         try:
             yield
         finally:
