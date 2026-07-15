@@ -419,7 +419,11 @@ def deploy_and_submit(
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
-                            exact_type=next(iter(allowed)) if len(allowed) == 1 else "",
+                            # Mirror the initial submit search: narrow to exact aliases ONLY on the user's
+                            # hard pin. Inferring exact_type from ``allowed`` forced an exact refresh for a
+                            # non-exact run (its offers are pre-filtered to one canonical class), dropping the
+                            # fungible cross-architecture capacity the first broad search had matched.
+                            exact_type=spec.gpu.exact_type,
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
