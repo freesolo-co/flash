@@ -17,8 +17,92 @@ import math
 import os
 import time
 
+from flash.opd_retry_contract import (
+    decode_opd_optimizer_start_json,
+    opd_optimizer_start_marker_path,
+    require_opd_retry_contract_version,
+)
 from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._poll import _attempt_int
+
+
+def verify_opd_retry_markers_absent(
+    *,
+    hf_repo: str,
+    run_id: str,
+    seed: int,
+    next_attempt: int,
+    contract_version: int,
+) -> None:
+    """Return only when every reserved OPD attempt is proven mutation-marker-free."""
+    try:
+        version = require_opd_retry_contract_version(contract_version)
+        attempt_count = _attempt_int(next_attempt)
+        if attempt_count is None:
+            raise ValueError("next attempt identity is invalid")
+        paths = [opd_optimizer_start_marker_path(run_id, attempt) for attempt in range(attempt_count)]
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence contract is invalid; replacement is blocked") from exc
+    if not paths:
+        return
+    if not isinstance(hf_repo, str) or not hf_repo.strip():
+        raise RuntimeError("opd artifact repository is missing; replacement is blocked")
+    token = os.environ.get("HF_TOKEN")
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        revision = str(api.repo_info(repo_id=hf_repo, repo_type="dataset").sha or "").strip()
+        if not revision:
+            raise ValueError("repository revision is missing")
+        infos = api.get_paths_info(
+            repo_id=hf_repo,
+            paths=paths,
+            repo_type="dataset",
+            revision=revision,
+        )
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence could not be listed; replacement is blocked") from exc
+    expected_paths = set(paths)
+    present: dict[str, object] = {}
+    try:
+        for info in infos:
+            path = str(getattr(info, "path", ""))
+            if path not in expected_paths or path in present:
+                raise ValueError("HF returned ambiguous optimizer-start marker evidence")
+            present[path] = info
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence listing is malformed; replacement is blocked") from exc
+    if not present:
+        return
+    for attempt, path in enumerate(paths):
+        if path not in present:
+            continue
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local_path = hf_hub_download(
+                repo_id=hf_repo,
+                repo_type="dataset",
+                filename=path,
+                revision=revision,
+                token=token,
+                force_download=True,
+            )
+            with open(local_path, "rb") as file:
+                raw = file.read()
+            decode_opd_optimizer_start_json(
+                raw,
+                run_id=run_id,
+                attempt=attempt,
+                seed=seed,
+                version=version,
+            )
+        except Exception as exc:
+            raise RuntimeError("opd retry evidence is unverifiable; replacement is blocked") from exc
+        raise RuntimeError(
+            f"opd attempt {attempt} may have mutated optimizer state; replacement is blocked"
+        )
 
 
 def make_hf_text_reader(

@@ -206,6 +206,7 @@ def _submit_seed_supervised(
         _spec_with_remaining_wall,
         _TerminalHandleRace,
         _update,
+        _verified_opd_next_attempt,
         flash_code_prefix,
         get_status,
     )
@@ -354,9 +355,13 @@ def _submit_seed_supervised(
         except RuntimeError:
             _gc_seen_endpoints()
             raise
+        expected_next_attempt = (
+            _verified_opd_next_attempt(spec.run_id) if spec.algorithm == "opd" else None
+        )
         attempt = _reserve_attempt(
             spec.run_id,
             minimum_attempt=attempt_start if local_attempt == 0 else 0,
+            expected_next_attempt=expected_next_attempt,
         )
         current_attempt["value"] = attempt
         res = None

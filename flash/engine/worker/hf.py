@@ -16,6 +16,10 @@ from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.diagnostics import sanitize_diagnostic
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
+from flash.opd_retry_contract import (
+    canonical_opd_optimizer_start_json,
+    opd_optimizer_start_marker_path,
+)
 
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 
@@ -38,6 +42,36 @@ def hf_api():
 
 def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}"
+
+
+def publish_opd_optimizer_start_marker() -> None:
+    """Synchronously publish the first-update mutation marker before optimizer.step()."""
+    if not isinstance(_w.HF_REPO, str) or not _w.HF_REPO.strip():
+        raise RuntimeError("opd optimizer-start marker requires a private HF repository")
+    marker_path = opd_optimizer_start_marker_path(_w.RUN_ID, _w.ATTEMPT)
+    local_path = f"/tmp/opd-optimizer-start-attempt-{_w.ATTEMPT}.json"
+    payload = canonical_opd_optimizer_start_json(
+        run_id=_w.RUN_ID,
+        attempt=_w.ATTEMPT,
+        seed=_w.SEED,
+    )
+    with open(local_path, "wb") as file:
+        file.write(payload)
+        file.flush()
+        os.fsync(file.fileno())
+    try:
+        _require_hf_deadline_allowance()
+        _w.hf_api().upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=marker_path,
+            repo_id=_w.HF_REPO,
+            repo_type="dataset",
+        )
+    except Exception as error:
+        detail = sanitize_diagnostic(error, limit=500)
+        raise RetriableInfraError(
+            f"required upload of OPD optimizer-start marker failed: {detail}"
+        ) from error
 
 
 def _require_hf_deadline_allowance() -> float | None:

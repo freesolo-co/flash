@@ -78,6 +78,7 @@ from flash.engine.worker.hf import (
     make_checkpoint_upload_callback,
     prefetch_model,
     publish_deployable_checkpoint,
+    publish_opd_optimizer_start_marker,
     upload_debug_jsonl,
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -492,6 +493,7 @@ __all__ = [
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
+    "publish_opd_optimizer_start_marker",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",

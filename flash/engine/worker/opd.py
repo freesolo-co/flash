@@ -77,6 +77,25 @@ OPD_TEACHER_BATCH_SIZE = 8
 OPD_LOSS_MICROBATCH_SIZE = 4
 
 
+def _apply_opd_optimizer_update(
+    *, model, optimizer, torch, opt_steps: int, nseq: int, accum_target: int
+) -> int:
+    """Apply one OPD update with the mutation marker immediately before optimizer mutation."""
+    if nseq <= 0 or accum_target <= 0:
+        raise ValueError("opd optimizer update requires positive sequence counts")
+    if nseq != accum_target:
+        scale = accum_target / nseq
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+    if opt_steps == 0:
+        _w.publish_opd_optimizer_start_marker()
+    optimizer.step()
+    return opt_steps + 1
+
+
 def _opd_rollout_pipeline_target_chunk_size(total_prompts: int) -> int:
     total = max(1, int(total_prompts))
     return max(1, min(total, OPD_ROLLOUT_PIPELINE_TARGET_CHUNK_SIZE))
@@ -938,20 +957,19 @@ def run_opd():
                 break
             if nseq == 0:
                 continue
-            # Each seq's grad was scaled by 1/accum_target; if some seqs were skipped (teacher call
-            # failed / empty completion), rescale to a true 1/nseq mean so a partial step isn't a
-            # silently smaller update.
-            if nseq != accum_target:
-                scale = accum_target / nseq
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+            # each seq's grad was scaled by 1/accum_target; the mutation boundary rescales a partial
+            # step, clips, publishes the first-update marker, mutates the optimizer, then increments.
             optimizer_started = time.perf_counter()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            optimizer.step()
+            opt_steps = _apply_opd_optimizer_update(
+                model=model,
+                optimizer=optimizer,
+                torch=torch,
+                opt_steps=opt_steps,
+                nseq=nseq,
+                accum_target=accum_target,
+            )
             opd_phase_seconds["optimizer_step"] += time.perf_counter() - optimizer_started
             opd_phase_counts["optimizer_steps"] += 1
-            opt_steps += 1
             # On-policy means the next rollout must sample from the just-updated student LoRA.
             # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
             # post-final vLLM sync that can fail after all optimizer updates have already landed.
