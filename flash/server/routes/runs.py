@@ -9,7 +9,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from flash.runner import cancel_run, new_run_id, runs_file_path
+from flash.runner import (
+    DeploymentRevocationError,
+    DeploymentStatePersistenceError,
+    cancel_run,
+    new_run_id,
+    runs_file_path,
+)
 from flash.schema import train_schema_metadata
 from flash.server import app as _app
 from flash.server import db
@@ -267,7 +273,29 @@ def run_worker_output(run_id: str, key: Annotated[dict, Depends(require_key)]):
 @router.post("/v1/runs/{run_id}/cancel")
 def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
     owned_run(run_id, key)
-    return cancel_run(run_id).to_dict()
+    try:
+        return cancel_run(run_id).to_dict()
+    except DeploymentRevocationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "deployment_revocation_failed",
+                "run_id": run_id,
+                "retryable": True,
+                "message": str(exc),
+            },
+        ) from exc
+    except DeploymentStatePersistenceError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "deployment_state_persistence_failed",
+                "run_id": run_id,
+                "retryable": True,
+                "backend_outcome": exc.backend_outcome,
+                "message": str(exc),
+            },
+        ) from exc
 
 
 @router.get("/v1/runs/{run_id}/checkpoints")
