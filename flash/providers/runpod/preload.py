@@ -329,7 +329,7 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
         try:
             lambda_jobs.launch_and_submit(
                 spec,
-                seed=0,
+                seed=spec.seed,
                 instances=[candidate],
                 attempt=0,
                 mode="preload",

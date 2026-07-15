@@ -26,7 +26,11 @@ _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
-    return JobSpec(model="m", gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu))
+    return JobSpec(
+        model="m",
+        gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu),
+        seed=0,
+    )
 
 
 def _ndc() -> int:
@@ -316,7 +320,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 def test_build_worker_env_no_cache_without_volume():
     from flash.providers._worker import build_worker_env
 
-    env = build_worker_env(JobSpec(model="m"), 0)
+    env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
     assert "FLASH_WEIGHT_CACHE_DIR" not in env
     assert "HF_HOME" not in env
@@ -1577,9 +1581,10 @@ def _preload_spec():
 def test_instance_build_payload_preload_mode():
     from flash.providers import _instance
 
+    spec = _preload_spec()
     p = _instance.build_payload(
-        _preload_spec(),
-        0,
+        spec,
+        spec.seed,
         0,
         arm="lambda",
         deadline_at=10_000_000_000.0,
@@ -1599,8 +1604,14 @@ def test_instance_build_payload_preload_mode():
 def test_instance_build_payload_no_mode_by_default():
     from flash.providers import _instance
 
+    spec = _preload_spec()
     p = _instance.build_payload(
-        _preload_spec(), 0, 0, arm="lambda", deadline_at=10_000_000_000.0, cache_host_mount="/lambda/nfs/flash-weights"
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
     )
     assert "mode" not in p  # ordinary train payload
     assert "models" not in p
@@ -1622,7 +1633,12 @@ def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
         }
     )
     p = _instance.build_payload(
-        spec, 0, 0, arm="lambda", deadline_at=10_000_000_000.0, cache_host_mount="/lambda/nfs/flash-weights"
+        spec,
+        spec.seed,
+        0,
+        arm="lambda",
+        deadline_at=10_000_000_000.0,
+        cache_host_mount="/lambda/nfs/flash-weights",
     )
     # the user's HF_HOME survives, and the platform cache redirect is NOT installed on top of it.
     assert p["env"]["HF_HOME"] == "/custom/hf"
@@ -1857,9 +1873,10 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
     can require the sentinel regardless of substrate."""
     from flash.providers import _instance
 
+    spec = _preload_spec()
     p = _instance.build_payload(
-        _preload_spec(),
-        0,
+        spec,
+        spec.seed,
         0,
         arm="lambda",
         deadline_at=10_000_000_000.0,
@@ -1915,9 +1932,10 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     )
     from tests.test_lambda_runner import _inst  # reuse the runner's instance candidate
 
+    spec = _preload_spec()
     jobs.launch_and_submit(
-        _preload_spec(),
-        seed=0,
+        spec,
+        seed=spec.seed,
         instances=[_inst()],
         attempt=0,
         mode="preload",
@@ -1957,6 +1975,10 @@ def _wire_warm(monkeypatch, marker):
     )
 
     def fake_launch(spec, seed, instances, attempt=0, mode=None, models=None, **k):
+        # the preload launch must thread the spec's authoritative seed: the real
+        # build_payload/build_worker_env path calls require_matching_seed, so a stale seed=0
+        # against the default spec.seed would crash every real preload launch.
+        assert seed == spec.seed, (seed, spec.seed)
         launched.append((instances[0].region, mode, tuple(models or [])))
 
     monkeypatch.setattr(lj, "launch_and_submit", fake_launch)

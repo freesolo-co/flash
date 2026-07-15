@@ -9,11 +9,11 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
-    configure_trainer_checkpoint_schedule,
-    final_checkpoint_due,
+    configure_trainer_save_schedule,
+    final_save_due,
     on_policy_steps,
     resolve_update_horizon,
-    validate_checkpoint_horizon,
+    validate_save_steps,
 )
 from flash.engine.structured_outputs import (
     describe_structured_outputs,
@@ -39,6 +39,11 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+
+
+def grpo_under_ran(steps_run: int, steps: int) -> bool:
+    """return true when grpo completes fewer optimizer updates than requested."""
+    return int(steps_run) < int(steps)
 
 
 def run_rl():
@@ -316,8 +321,8 @@ def run_rl():
     )
     configured_max_steps = getattr(_t, "max_steps", None) if _t else None
     steps = resolve_update_horizon(derived_steps, configured_max_steps)
-    checkpoint_landmarks = tuple(getattr(_t, "checkpoint_landmarks", ()) or ())
-    validate_checkpoint_horizon(checkpoint_landmarks, steps)
+    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
+    validate_save_steps(save_at_steps, steps)
     print(
         f"[rl] epochs={epochs} over {len(prompts)} retained prompt(s) at "
         f"{batching['unique_prompts_per_step']} unique_prompts/step -> "
@@ -374,7 +379,7 @@ def run_rl():
         # 8-bit paged AdamW: colocated GRPO is memory-tight, so int8 state paged to host RAM.
         "optim": fused_optim_name(),
     }
-    configure_trainer_checkpoint_schedule(grpo_kwargs, checkpoint_landmarks)
+    configure_trainer_save_schedule(grpo_kwargs, save_at_steps)
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
     # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
@@ -638,12 +643,7 @@ def run_rl():
             processing_class=tok,
             callbacks=[
                 hb_cb,
-                *(
-                    [_w.make_checkpoint_landmark_callback(checkpoint_landmarks)]
-                    if checkpoint_landmarks
-                    else []
-                ),
-                _w.make_checkpoint_upload_callback(checkpoint_landmarks),
+                _w.make_checkpoint_upload_callback(save_at_steps),
             ],
             **extra_trainer_kwargs,
         )
@@ -712,7 +712,9 @@ def run_rl():
             f"[resume] no new reward in this worker but resumed checkpoint already reached "
             f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
-    if _steps_run != steps:
+    # only a genuine under-run fails: a resume already at/past target does zero new steps yet holds a
+    # fully-trained policy (_steps_run >= steps, _resumed_complete above), matching opd (opt_steps < steps).
+    if grpo_under_ran(_steps_run, steps):
         raise RuntimeError(f"grpo completed {_steps_run}/{steps} requested optimizer updates")
     # adapter save + required upload can take minutes on a 35B; keep the heartbeat fresh through the
     # whole finalize. keepalive=True:
@@ -731,8 +733,8 @@ def run_rl():
         # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs
         # likewise deploy their single adapter directly).
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the historical final step only when exact landmarks are not configured.
-        if final_checkpoint_due(_steps_run, checkpoint_landmarks):
+        # preserve the final checkpoint only when exact save steps are not configured.
+        if final_save_due(_steps_run, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
     _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
 

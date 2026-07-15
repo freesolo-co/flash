@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from flash.catalog import normalize_algorithm, samples_on_policy
 from flash.engine.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
+from flash.spec import parse_positive_int_tuple
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,10 @@ class RunConfig:
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
-    # SFT only: actual training tokens across all epochs. When present, SFT dollars are priced
+    # sft only: actual training tokens across all epochs. when present, sft dollars are priced
     # from this token count instead of the padded batch_size * seq_len slot estimate.
     train_tokens: int | None = None
+    save_at_steps: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -60,6 +62,10 @@ class RunConfig:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
         if self.train_tokens is not None and self.train_tokens < 1:
             raise ValueError(f"train_tokens must be >= 1, got {self.train_tokens}")
+        save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="save_at_steps")
+        if save_at_steps and save_at_steps[-1] > self.steps:
+            raise ValueError("save_at_steps cannot exceed steps")
+        object.__setattr__(self, "save_at_steps", save_at_steps)
 
     @property
     def is_grpo(self) -> bool:

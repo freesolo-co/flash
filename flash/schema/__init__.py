@@ -23,14 +23,20 @@ from flash.schema.fields import (
     _section_int,
     _train_float,
     _train_int,
-    _train_positive_int_tuple,
     _train_stops,
     _train_structured_outputs,
     _train_teacher,
     _wandb_spec,
     _worker_env,
 )
-from flash.spec import FIXED_SEED, EnvironmentSpec, GpuSpec, JobSpec, TrainSpec, parse_seed
+from flash.spec import (
+    FIXED_SEED,
+    EnvironmentSpec,
+    GpuSpec,
+    JobSpec,
+    TrainSpec,
+    parse_seed,
+)
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -383,18 +389,39 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             "after real-GPU validation"
         )
 
-    max_steps = _train_int(train_raw, "max_steps", minimum=0)
-    checkpoint_landmarks = _train_positive_int_tuple(train_raw, "checkpoint_landmarks")
-    if checkpoint_landmarks:
-        if not max_steps:
-            raise ConfigError("train.checkpoint_landmarks requires positive train.max_steps")
-        if checkpoint_landmarks[-1] > max_steps:
-            raise ConfigError(
-                "train.checkpoint_landmarks cannot contain a step beyond train.max_steps"
-            )
-
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
+
+    try:
+        train_spec = TrainSpec(
+            epochs=_train_int(train_raw, "epochs", minimum=1),
+            lora_rank=lora_rank,
+            lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
+            init_from_adapter=init_from_adapter,
+            hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
+            learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
+            batch_size=_train_int(train_raw, "batch_size", minimum=1),
+            max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
+            save_every=_train_int(train_raw, "save_every", minimum=1),
+            group_size=_train_int(train_raw, "group_size", minimum=1),
+            temperature=_train_float(train_raw, "temperature", minimum=0.0),
+            max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
+            kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
+            advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
+            thinking_length_penalty_coef=_train_float(
+                train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
+            ),
+            # opd-only managed teacher alias, validated against the allow-list; "" -> default glm 5.2.
+            teacher_model=_train_teacher(train_raw),
+            stop_sequences=_train_stops(train_raw),
+            structured_outputs=_train_structured_outputs(train_raw),
+            # minimum=0: explicit 0 means "no cap" per trainspec contract
+            max_steps=train_raw.get("max_steps"),
+            max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            save_at_steps=train_raw.get("save_at_steps"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
     spec = JobSpec(
         model=model,
@@ -405,33 +432,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             pip=tuple(str(p) for p in env_raw.get("pip") or ()),
             secrets=environment_secrets,
         ),
-        train=TrainSpec(
-            epochs=_train_int(train_raw, "epochs", minimum=1),
-            lora_rank=lora_rank,
-            lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
-            init_from_adapter=init_from_adapter,
-            hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
-            learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
-            batch_size=_train_int(train_raw, "batch_size", minimum=1),
-            max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
-            save_every=_train_int(train_raw, "save_every", minimum=1),
-            checkpoint_landmarks=checkpoint_landmarks,
-            group_size=_train_int(train_raw, "group_size", minimum=1),
-            temperature=_train_float(train_raw, "temperature", minimum=0.0),
-            max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
-            kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
-            thinking_length_penalty_coef=_train_float(
-                train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
-            ),
-            # OPD-only managed teacher alias, validated against the allow-list; "" -> default GLM 5.2.
-            teacher_model=_train_teacher(train_raw),
-            stop_sequences=_train_stops(train_raw),
-            structured_outputs=_train_structured_outputs(train_raw),
-            # minimum=0: explicit 0 means "no cap" per TrainSpec contract
-            max_steps=max_steps,
-            max_examples=_train_int(train_raw, "max_examples", minimum=0),
-        ),
+        train=train_spec,
         gpu=GpuSpec(type=gpu_type, **gpu_options),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         seed=_job_seed(raw),
