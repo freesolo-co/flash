@@ -168,7 +168,7 @@ def _candidate_projection(
         round_trip_ids = _encode(tokenizer, decoded_full)
     except SoftTargetProjectionError:
         return _CandidateProjection(None, "round_trip_mismatch")
-    if round_trip_ids != extended_ids:
+    if decoded_full != extended_text or round_trip_ids != extended_ids:
         return _CandidateProjection(None, "round_trip_mismatch")
     return _CandidateProjection(token_id, None)
 
@@ -300,6 +300,8 @@ def project_visible_records(
             raise SoftTargetProjectionError("soft-target realized extension is empty")
         if any(token_id < 0 or token_id >= tokenizer_size for token_id in added):
             raise SoftTargetProjectionError("soft-target realized token id is invalid")
+        if any(token_id in special_ids for token_id in added):
+            raise SoftTargetProjectionError("soft-target realized token is special")
         if (
             _decode(tokenizer, extended_ids) != extended_text
             or _encode(tokenizer, extended_text) != extended_ids

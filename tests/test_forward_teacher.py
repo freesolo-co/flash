@@ -608,7 +608,7 @@ def test_forward_teacher_retries_http_200_decode_failures_with_start_pacing(firs
     assert sleeps == [10.0]
     assert result.attempts == 2
     assert result.latency_seconds == pytest.approx(10.0)
-    assert result.ambiguous_paid_requests == 0
+    assert result.ambiguous_paid_requests == 1
 
 
 @pytest.mark.parametrize("body", [b"not-json", b'"\xff"'])
@@ -627,7 +627,7 @@ def test_forward_teacher_exhausted_http_200_decode_failure_is_sanitized_and_tran
     assert calls == [1, 1]
     assert caught.value.attempts == 2
     assert caught.value.latency_seconds >= 0
-    assert caught.value.ambiguous_paid_requests == 0
+    assert caught.value.ambiguous_paid_requests == 2
     assert "private prompt" not in str(caught.value)
     assert body.decode("utf-8", errors="ignore") not in str(caught.value)
 

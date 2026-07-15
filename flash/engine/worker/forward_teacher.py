@@ -541,6 +541,7 @@ class ForwardTeacherClient:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
+                    ambiguous_paid_requests += 1
                     if attempt == 2:
                         raise failure(
                             ForwardTeacherTransientError,

@@ -870,6 +870,37 @@ def test_projection_accepts_contextual_metaspace_decode_without_isolated_surface
     assert target.rows[0].probabilities == (1.0,)
 
 
+def test_projection_rejects_candidate_whose_decoded_surface_is_normalized():
+    decomposed = "é"
+    normalized = "é"
+    tokenizer = _ProjectionTokenizer(
+        {
+            "P": [1],
+            "Pa": [1, 2],
+            "P" + decomposed: [1, 8],
+            "P" + normalized: [1, 8],
+        },
+        {
+            (1,): "P",
+            (1, 2): "Pa",
+            (1, 8): "P" + normalized,
+        },
+    )
+
+    target = project_visible_records(
+        tokenizer,
+        prefix_text="P",
+        visible_records=[_visible_record(0, "a", (("a", 0.6), (decomposed, 0.2)))],
+    )
+
+    row = target.rows[0]
+    assert row.token_ids == (2,)
+    assert row.probabilities == (1.0,)
+    assert row.retained_projected_mass == pytest.approx(0.6)
+    assert row.rejected_reported_mass == pytest.approx(0.2)
+    assert row.drop_counts.round_trip_mismatch == 1
+
+
 def test_validated_forward_teacher_semantic_records_compose_with_projection():
     from flash.engine.recipe import FORWARD_TEACHER_MODEL_ID
     from flash.engine.worker.forward_teacher import ForwardTeacherClient
@@ -1181,6 +1212,30 @@ def test_realized_zero_token_and_prefix_retokenization_reject_target_without_tex
             prefix_text="P",
             visible_records=[_visible_record(0, private, ((private, 1.0),))],
         )
+    assert private not in str(caught.value)
+
+
+def test_realized_special_token_extension_rejects_target_without_text_leakage():
+    private = "private visible special literal"
+    tokenizer = _ProjectionTokenizer(
+        {
+            "P": [1],
+            "P" + private: [1, 9],
+        },
+        {
+            (1,): "P",
+            (1, 9): "P" + private,
+        },
+        special_ids=(9,),
+    )
+
+    with pytest.raises(SoftTargetProjectionError, match="realized token is special") as caught:
+        project_visible_records(
+            tokenizer,
+            prefix_text="P",
+            visible_records=[_visible_record(0, private, ((private, 1.0),))],
+        )
+
     assert private not in str(caught.value)
 
 
