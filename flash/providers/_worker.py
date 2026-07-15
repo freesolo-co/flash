@@ -14,7 +14,8 @@ from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec
 
-# Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
+# Pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
+# after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
 logger = get_logger("flash.providers.runpod.train")
 
 
@@ -61,14 +62,6 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
 
 
-def _append_tag_suffix(image: str, suffix: str) -> str:
-    slash = image.rfind("/")
-    colon = image.rfind(":")
-    if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
-    return f"{image}-{suffix}"
-
-
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
     """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base), respecting the FLASH_WORKER_IMAGE override."""
     override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
@@ -79,7 +72,7 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
-            return _append_tag_suffix(WORKER_IMAGE, info.sm)
+            return f"{WORKER_IMAGE}-{info.sm}"
     return WORKER_IMAGE if allow_default else None
 
 
