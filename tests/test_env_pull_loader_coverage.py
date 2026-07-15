@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import io
 import tarfile
+from pathlib import Path
 
 import pytest
 
 from flash.envs import loader, pull
+from flash.envs.archive import extract_validated_archive_members
+from flash.envs.archive_policy import LimitedArchiveReader
 
 
 def _package_tarball(entries: dict[str, bytes]) -> bytes:
@@ -27,6 +30,41 @@ def _package_tarball(entries: dict[str, bytes]) -> bytes:
 
 
 _ENV_ONLY = {"environment.py": b"# env\n", "datasets/train.jsonl": b'{"a":1}\n'}
+
+
+def test_extract_validated_archive_members_public_boundary(tmp_path: Path) -> None:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        for name, data in {
+            "keep.txt": b"ok",
+            "filtered.txt": b"too large for the content limit",
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    archive.seek(0)
+    reader = LimitedArchiveReader(
+        archive,
+        1 << 20,
+        lambda: RuntimeError("unexpected archive limit"),
+    )
+    observed: list[list[str]] = []
+    root = tmp_path.resolve()
+
+    extract_validated_archive_members(
+        reader,
+        extract_base=tmp_path,
+        guard_root=root,
+        content_byte_limit=2,
+        extracted_member_limit=1,
+        scanned_member_limit=2,
+        member_filter=lambda segments: segments == ["keep.txt"],
+        segment_observer=observed.append,
+    )
+
+    assert observed == [["keep.txt"], ["filtered.txt"]]
+    assert (tmp_path / "keep.txt").read_bytes() == b"ok"
+    assert not (tmp_path / "filtered.txt").exists()
 
 
 # --- flash.envs.pull ------------------------------------------------------------------

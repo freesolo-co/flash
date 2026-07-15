@@ -15,24 +15,22 @@ import json
 import os
 import re
 import shutil
-import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from flash.envs.archive import extract_validated_archive_members
 from flash.envs.archive_policy import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
-    TAR_METADATA_TYPES,
     LimitedArchiveReader,
     archive_stream_limit,
-    tar_member_segments,
 )
 
 _DEFAULT_GITHUB_REF = "main"
@@ -568,67 +566,6 @@ def _safe_extract_archive(
         return _safe_extract_archive_file(spill, dest, subdir)
 
 
-def _extract_validated_archive_members(
-    reader: LimitedArchiveReader,
-    *,
-    extract_base: Path,
-    guard_root: Path,
-    member_filter: Callable[[list[str]], bool] | None = None,
-    on_segments: Callable[[list[str]], None] | None = None,
-) -> None:
-    """Stream a tar archive from ``reader`` and extract its members into ``extract_base``.
-
-    Enforces the archive-bomb / path-traversal guards shared by the GitHub-repo and the
-    flat-package extractors: a scan-count cap, per-member path normalization plus a
-    traversal guard against ``guard_root``, a member-count cap, and an uncompressed-byte
-    cap. ``on_segments`` observes each surviving member's path segments (after the
-    empty-path skip, before filtering); ``member_filter`` drops members whose segments it
-    rejects, before they count toward the member/byte caps.
-    """
-    total = 0
-    extracted = 0
-    scanned = 0
-    with tarfile.open(fileobj=reader, mode="r|") as tar:
-        for member in tar:
-            scanned += 1
-            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
-                )
-            if member.type in TAR_METADATA_TYPES:
-                continue
-            raw = tar_member_segments(
-                member.name,
-                unsafe_error=lambda name: RuntimeError(
-                    f"unsafe path in environment archive: {name!r}"
-                ),
-            )
-            if not raw:
-                continue
-            if on_segments is not None:
-                on_segments(raw)
-            if member_filter is not None and not member_filter(raw):
-                continue
-            normalized_name = "/".join(raw)
-            target = (extract_base / normalized_name).resolve()
-            if target != guard_root and guard_root not in target.parents:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
-                continue
-            extracted += 1
-            if extracted > _MAX_ARCHIVE_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
-                )
-            total += max(0, member.size)
-            if total > _MAX_ARCHIVE_BYTES:
-                raise RuntimeError(
-                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-                )
-            member.name = normalized_name
-            tar.extract(member, extract_base)
-
-
 def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
     """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
     root = dest.resolve()
@@ -641,12 +578,15 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
             f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
         ),
     )
-    _extract_validated_archive_members(
+    extract_validated_archive_members(
         reader,
         extract_base=dest,
         guard_root=root,
-        member_filter=lambda raw: not (want and raw[1 : 1 + len(want)] != want),
-        on_segments=lambda raw: top_dirs.add(raw[0]),
+        content_byte_limit=_MAX_ARCHIVE_BYTES,
+        extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
+        scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,
+        member_filter=lambda segments: not (want and segments[1 : 1 + len(want)] != want),
+        segment_observer=lambda segments: top_dirs.add(segments[0]),
     )
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")

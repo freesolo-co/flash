@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 from flash.envs import loader
+from flash.envs.archive import extract_validated_archive_members
 from flash.envs.archive_policy import (
     LimitedArchiveReader,
     archive_stream_limit,
@@ -168,7 +169,14 @@ def _extract_environment_package_archive(package: bytes | bytearray, dest: Path)
             f"environment archive is too large uncompressed (limit {loader._MAX_ARCHIVE_BYTES} bytes)"
         ),
     )
-    loader._extract_validated_archive_members(reader, extract_base=root, guard_root=root)
+    extract_validated_archive_members(
+        reader,
+        extract_base=root,
+        guard_root=root,
+        content_byte_limit=loader._MAX_ARCHIVE_BYTES,
+        extracted_member_limit=loader._MAX_ARCHIVE_MEMBERS,
+        scanned_member_limit=loader._MAX_ARCHIVE_SCAN_MEMBERS,
+    )
     return root
 
 
