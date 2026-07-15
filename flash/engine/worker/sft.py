@@ -103,7 +103,14 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
             getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
         )
         hidden = int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
-        if revision and ((c_hidden and hidden != c_hidden) or (c_layers and layers != c_layers)):
+        # Only a NONZERO probe dim that disagrees with the catalog is a real revision mismatch. A (0, 0)
+        # probe means "couldn't parse" (the 35B-A3B multimodal-nested config does exactly this), not
+        # "differs" -- treat it like the unpinned path and fall back to catalog dims below, otherwise a
+        # revision pin would spuriously fail such models after the GPU is already rented.
+        if revision and (
+            (c_hidden and hidden and hidden != c_hidden)
+            or (c_layers and layers and layers != c_layers)
+        ):
             raise ValueError("revision architecture does not match catalog geometry")
         return hidden or c_hidden, layers or c_layers
     except Exception as e:

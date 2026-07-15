@@ -130,6 +130,43 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
     assert all(kwargs == expected for _model_id, kwargs in calls)
 
 
+def _fake_arch_probe(monkeypatch, *, hidden, layers):
+    """Stub AutoConfig so ``_model_arch_dims`` sees a probe that yields ``(hidden, layers)``."""
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            return SimpleNamespace(
+                model_type="qwen3_6", hidden_size=hidden, num_hidden_layers=layers
+            )
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = _AutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+
+def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
+    # regression: the 35B-A3B multimodal-nested config makes the AutoConfig probe return (0, 0). A
+    # revision pin must treat that as "unparseable" and fall back to the curated catalog geometry
+    # (exactly like an unpinned run), NOT as a mismatch -- otherwise revision-pinned SFT on that model
+    # raises after the GPU is already rented.
+    from flash.engine.worker import sft
+
+    _fake_arch_probe(monkeypatch, hidden=0, layers=0)
+    # Qwen/Qwen3.6-35B-A3B is the sole catalog entry carrying (hidden, layers) == (2048, 40).
+    assert sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123") == (2048, 40)
+
+
+def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
+    # a NONZERO probe dim that genuinely disagrees with the catalog is a real revision mismatch and must
+    # still fail closed, so a revision pin can never silently size VRAM with the wrong geometry.
+    from flash.engine.worker import sft
+
+    _fake_arch_probe(monkeypatch, hidden=9999, layers=99)
+    with pytest.raises(RuntimeError, match="revision-specific model architecture"):
+        sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123")
+
+
 def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     calls = []
 
