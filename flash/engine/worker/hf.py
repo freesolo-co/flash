@@ -50,9 +50,8 @@ def _require_hf_deadline_allowance() -> float | None:
 def _sleep_with_hf_deadline(delay: float) -> bool:
     remaining = _require_hf_deadline_allowance()
     sleep_for = delay if remaining is None else min(delay, remaining)
-    if sleep_for <= 0:
-        return False
-    time.sleep(sleep_for)
+    if sleep_for > 0:
+        time.sleep(sleep_for)
     remaining = _w._remaining_worker_wall_seconds()
     return remaining is None or remaining > 0
 
