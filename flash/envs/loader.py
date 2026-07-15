@@ -39,8 +39,8 @@ _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 # bound the on-disk env cache so it cannot grow without limit (one subdir per env
 # content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
-_CACHE_MAX_ENTRIES = int(os.environ.get("FLASH_ENV_CACHE_MAX_ENTRIES", "32"))
-_CACHE_MAX_BYTES = int(os.environ.get("FLASH_ENV_CACHE_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
+_CACHE_MAX_ENTRIES = 32
+_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 # never evict an entry used within this window; a concurrent run may be loading it.
 _CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
