@@ -2148,6 +2148,31 @@ def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
         _submit(vast,spec, seed=0)
 
 
+def test_submit_gates_exact_search_on_user_pin_not_allocated_class(monkeypatch):
+    # regression: the submit-time exact-alias narrowing must key on the user's hard pin
+    # (gpu.exact_type), not the allocated gpu.type. passing gpu.type unconditionally dropped
+    # fungible cross-architecture capacity (e.g. a 40GB "A100 PCIE" board usable as A100 SXM 40GB)
+    # for non-exact runs, whose verify_gpu is soft and would have accepted those boards.
+    from flash.providers.vast import jobs as vast
+
+    seen: dict[str, str] = {}
+
+    def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
+        seen["exact_type"] = exact_type
+        return [_offer(gpu="H100")]
+
+    vast, _ = _wire_submit(monkeypatch)
+    monkeypatch.setattr(vast, "usable_offers", capture)
+
+    # non-exact run: keep the broad fungible search so cross-arch capacity still counts
+    _submit(vast, _spec(gpu_type="H100"), seed=0)
+    assert seen["exact_type"] == ""
+
+    # exact-pinned run (type == exact_type): attestation-safe narrowing on the pinned class
+    _submit(vast, _spec(gpu_type="H100", exact_type="H100"), seed=0)
+    assert seen["exact_type"] == "H100"
+
+
 def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
     """Codex MtbAK: ``destroy_instance`` returning False (success:false / breakdown) means the box is
     STILL billing. ``VastProvider.destroy`` must SURFACE that (raise) instead of returning normally —

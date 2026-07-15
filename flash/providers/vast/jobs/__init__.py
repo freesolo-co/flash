@@ -648,7 +648,10 @@ def submit_run_vast(
             info.vram_gb,
             _effective_disk_gb(spec),
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
-            exact_type=spec.gpu.type,
+            # Narrow to attestation-safe exact aliases ONLY when the user hard-pinned the class.
+            # A non-exact run (exact_type == "") keeps the broad fungible search so cross-architecture
+            # capacity (e.g. 40GB "A100 PCIE" as A100 SXM 40GB) still counts, matching soft verify_gpu.
+            exact_type=spec.gpu.exact_type,
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type
