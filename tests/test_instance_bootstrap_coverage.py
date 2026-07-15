@@ -534,6 +534,40 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     assert "world" in body
 
 
+def test_run_mode_reserves_terminal_bookkeeping_time_from_final_console_upload(monkeypatch):
+    deadline = 200.0
+    reserve = b._TERMINAL_MARKER_GRACE_S
+    upload_budget = 0.05
+    clock = {"now": 100.0}
+    upload_allowances = []
+    _disable_periodic_console_upload(monkeypatch)
+
+    class _NearDeadlineProc(_FakeProc):
+        def wait(self, timeout=None):
+            clock["now"] = deadline - reserve - upload_budget
+            return self.returncode
+
+    def consume_upload_allowance(_payload, _console, _mode, _extra, timeout_s):
+        upload_allowances.append(timeout_s)
+        clock["now"] += timeout_s
+        return True
+
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", consume_upload_allowance)
+    monkeypatch.setattr(
+        b.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _NearDeadlineProc(["done\n"], rc=0),
+    )
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+
+    assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
+
+    assert upload_allowances == [pytest.approx(upload_budget)]
+    assert deadline - clock["now"] == pytest.approx(reserve)
+    assert reserve == b._TERMINAL_BOOKKEEPING_RESERVE_S
+
+
 class _DelayedOutput:
     def __init__(self):
         self._index = 0

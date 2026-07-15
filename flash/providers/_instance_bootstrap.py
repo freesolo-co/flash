@@ -30,6 +30,7 @@ _HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_MARKER_GRACE_S = 0.25
+_TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 _SECRET_RE = re.compile(
     r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -569,21 +570,23 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-        final_upload_timeout = min(
-            _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
-            max(
-                0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
-            ),
+        final_upload_allowance = max(
+            0.0,
+            deadline_ts
+            - _finite_positive_number(time.time(), "current clock")
+            - _TERMINAL_BOOKKEEPING_RESERVE_S,
         )
-        if not _upload_console_tail_bounded(
+        final_upload_timeout = min(_CONSOLE_UPLOAD_FINAL_TIMEOUT_S, final_upload_allowance)
+        if final_upload_timeout <= 0:
+            print("final console upload skipped; terminal bookkeeping reserve reached", flush=True)
+        elif not _upload_console_tail_bounded(
             payload,
             console,
             mode,
             extra,
             final_upload_timeout,
         ):
-            print("final console upload skipped or exceeded its allowance", flush=True)
+            print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
         print(f"console upload warn: {_safe_detail(exc)}", flush=True)
     if timed_out:
