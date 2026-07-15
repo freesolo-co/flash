@@ -60,6 +60,7 @@ def test_final_successful_opd_heartbeat_retains_cumulative_forward_teacher_telem
         opt_steps=9,
         train_wall=123.0,
         forward_teacher_accounting=_Accounting(),
+        hybrid_enabled=True,
     )
 
     assert captured == {
@@ -68,6 +69,40 @@ def test_final_successful_opd_heartbeat_retains_cumulative_forward_teacher_telem
         "train_wall": 123.0,
         "gpu": {"gpu": "ok"},
         **telemetry,
+    }
+
+
+def test_reverse_only_opd_heartbeat_omits_forward_teacher_telemetry(monkeypatch):
+    from flash.engine.worker import opd
+
+    captured = {}
+
+    class _Totals:
+        def runtime_telemetry(self):
+            return {"forward_teacher_provider_requests": 0}
+
+    class _Accounting:
+        totals = _Totals()
+
+    monkeypatch.setattr(opd, "gpu_diagnostics", lambda: {"gpu": "ok"})
+    monkeypatch.setattr(
+        opd._w,
+        "heartbeat",
+        lambda stage, **fields: captured.update(stage=stage, **fields),
+    )
+
+    opd._emit_opd_trained_heartbeat(
+        opt_steps=9,
+        train_wall=123.0,
+        forward_teacher_accounting=_Accounting(),
+        hybrid_enabled=False,
+    )
+
+    assert captured == {
+        "stage": "opd_trained",
+        "step": 9,
+        "train_wall": 123.0,
+        "gpu": {"gpu": "ok"},
     }
 
 

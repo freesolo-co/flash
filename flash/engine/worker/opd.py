@@ -162,6 +162,18 @@ class HybridEligibility:
     reason: str
 
 
+def _worker_world_size() -> int:
+    raw = os.environ.get("WORLD_SIZE")
+    if raw is None:
+        raw = os.environ.get("LOCAL_WORLD_SIZE")
+    if raw is None:
+        return 1
+    normalized = raw.strip()
+    if not normalized.isdecimal() or int(normalized) < 1:
+        raise RuntimeError("opd worker world size is invalid")
+    return int(normalized)
+
+
 def _resolve_hybrid_eligibility(
     *, multi_turn: bool, knobs, thinking: bool, gpu_count: int = 1, activated: bool = False
 ):
@@ -463,14 +475,24 @@ def run_opd():
         raise
 
 
-def _emit_opd_trained_heartbeat(*, opt_steps: int, train_wall: float, forward_teacher_accounting) -> None:
+def _forward_teacher_runtime_fields(forward_teacher_accounting, *, enabled: bool) -> dict:
+    if not enabled:
+        return {}
+    return forward_teacher_accounting.totals.runtime_telemetry()
+
+
+def _emit_opd_trained_heartbeat(
+    *, opt_steps: int, train_wall: float, forward_teacher_accounting, hybrid_enabled: bool
+) -> None:
     """Emit the final successful heartbeat with cumulative ForwardTeacher accounting intact."""
     _w.heartbeat(
         "opd_trained",
         step=opt_steps,
         train_wall=train_wall,
         gpu=gpu_diagnostics(),
-        **forward_teacher_accounting.totals.runtime_telemetry(),
+        **_forward_teacher_runtime_fields(
+            forward_teacher_accounting, enabled=hybrid_enabled
+        ),
     )
 
 
@@ -503,7 +525,7 @@ def _run_opd(forward_teacher_accounting):
         multi_turn=multi_turn,
         knobs=knobs,
         thinking=bool(_w.THINKING),
-        gpu_count=1,
+        gpu_count=_worker_world_size(),
         activated=hybrid_activated,
     )
     if hybrid_activated and not hybrid.enabled:
@@ -1317,7 +1339,19 @@ def _run_opd(forward_teacher_accounting):
         opt_steps=opt_steps,
         train_wall=train_wall,
         forward_teacher_accounting=forward_teacher_accounting,
+        hybrid_enabled=hybrid.enabled,
     )
+    forward_teacher_notes = {}
+    if hybrid.enabled:
+        forward_teacher_notes = {
+            **forward_teacher_accounting.totals.runtime_telemetry(),
+            "forward_teacher_accepted_targets": (
+                forward_teacher_accounting.totals.logical_accepted_targets
+            ),
+            "forward_teacher_generations": (
+                forward_teacher_accounting.totals.provider_generations
+            ),
+        }
 
     _w.write_train_meta(
         phase="opd",
@@ -1346,10 +1380,7 @@ def _run_opd(forward_teacher_accounting):
             "reverse_loss_curve": loss_curve,
             "forward_loss_curve": forward_loss_curve,
             "total_loss_curve": total_loss_curve,
-            **forward_teacher_accounting.totals.runtime_telemetry(),
-            # compatibility aliases for existing train metadata consumers.
-            "forward_teacher_accepted_targets": forward_teacher_accounting.totals.logical_accepted_targets,
-            "forward_teacher_generations": forward_teacher_accounting.totals.provider_generations,
+            **forward_teacher_notes,
             "mean_coverage": (sum(coverage_curve) / len(coverage_curve)) if coverage_curve else 0.0,
             # rollouts that hit the generation length cap without eos/stop are not teacher-scored or
             # distilled.
@@ -2027,14 +2058,14 @@ def _build_projected_target(
     max_length: int,
 ) -> ProjectedTarget:
     boundary = _derive_assistant_content_boundary(tok, prompt_messages, visible_content)
-    if tuple(_encode_no_special(tok, boundary.content_prefix)) != tuple(prompt_ids):
+    if tuple(_encode_no_special(tok, boundary.prompt_text)) != tuple(prompt_ids):
         raise RuntimeError("opd hybrid projected target rollout prompt mismatch")
     if "".join(record.token for record in visible_records) != visible_content:
         raise RuntimeError("opd hybrid projected visible records do not reconstruct content")
     try:
         target = project_visible_records(
             tok,
-            prefix_text=boundary.content_prefix,
+            prefix_text=boundary.prompt_text,
             visible_records=visible_records,
         )
     except SoftTargetProjectionError as exc:

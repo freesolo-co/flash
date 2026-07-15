@@ -963,7 +963,13 @@ def test_opd_train_meta_reports_truncated_rollouts_without_special_diagnostics(m
         )
 
     metas = []
-    opd_mod = _opd_harness(monkeypatch, sample_result=_trained_sample, metas=metas)
+    beats = []
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_trained_sample,
+        metas=metas,
+        beats=beats,
+    )
 
     opd_mod.run_opd()
 
@@ -972,6 +978,10 @@ def test_opd_train_meta_reports_truncated_rollouts_without_special_diagnostics(m
     assert "mean_eos_logprob" not in notes
     assert "final_empty_rate_ema" not in notes
     assert "final_truncation_rate_ema" not in notes
+    assert not any(key.startswith("forward_teacher_") for key in notes)
+    trained = [fields for stage, fields in beats if stage == "opd_trained"]
+    assert len(trained) == 1
+    assert not any(key.startswith("forward_teacher_") for key in trained[0])
 
 
 def test_opd_truncated_rollouts_bypass_teacher_and_gkd(monkeypatch, capsys):
@@ -1393,6 +1403,7 @@ def test_hybrid_opd_requires_managed_forward_teacher_key_before_gpu_wait(monkeyp
         ("thinking", "thinking"),
         ("structured_outputs", "structured_outputs"),
         ("explicit_stop_sequences", "explicit_stop_sequences"),
+        ("multi_gpu", "multi_gpu"),
     ],
 )
 def test_activated_hybrid_runtime_mismatch_fails_closed_before_gpu_setup(
@@ -1409,6 +1420,8 @@ def test_activated_hybrid_runtime_mismatch_fails_closed_before_gpu_setup(
         opd_mod._w.require_active_env().multi_turn = True
     elif mismatch == "thinking":
         opd_mod._w.THINKING = True
+    elif mismatch == "multi_gpu":
+        monkeypatch.setenv("WORLD_SIZE", "2")
     else:
         knobs = opd_mod._resolve_opd_knobs()
         override = (
@@ -1684,50 +1697,6 @@ def test_hybrid_opd_keeps_permanent_forward_teacher_failure_non_retriable(monkey
     assert caught.value.runtime_telemetry["forward_teacher_ambiguous_paid_requests"] == 0
 
 
-def test_hybrid_opd_activation_is_independent_of_ambient_world_size(monkeypatch):
-    beats = []
-    meta = {}
-
-    def _one_update(*, model, **_kwargs):
-        from flash.engine.worker.opd import SampleResult
-
-        return SampleResult(
-            loss=model.w.float().sum() * 1e-6,
-            teacher_status="ok",
-            coverage=1.0,
-            gen_tokens=1,
-            teacher_tokens=1,
-        )
-
-    opd_mod = _opd_harness(
-        monkeypatch,
-        sample_result=_one_update,
-        beats=beats,
-        meta=meta,
-        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
-    )
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    _patch_hybrid_forward_teacher(monkeypatch)
-    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
-    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
-
-    opd_mod.run_opd()
-
-    private_fields = {
-        "hybrid_enabled",
-        "hybrid_reason",
-        "hybrid_objective_mode",
-        "hybrid_forward_objective_coef",
-    }
-    assert private_fields.isdisjoint(meta["notes"])
-    assert len(meta["notes"]["forward_loss_curve"]) == 1
-    assert all(private_fields.isdisjoint(fields) for _stage, fields in beats)
-    post_update = [
-        fields for stage, fields in beats if stage == "opd_step" and fields.get("step") == 1
-    ]
-    assert post_update[-1]["forward_loss"] is not None
-
-
 def test_projected_soft_opd_reuses_targets_and_combines_one_atomic_step(monkeypatch):
     torch = pytest.importorskip("torch")
     from flash.engine.worker.opd import SampleResult, _ForwardTeacherBatchStats
@@ -1948,6 +1917,9 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
         eos_token_id = 7
         all_special_ids = (7,)
 
+        def __init__(self):
+            self.rollout_tokenizations = 0
+
         def apply_chat_template(self, messages, *, add_generation_prompt=False, **_kwargs):
             if add_generation_prompt:
                 return "ROLLOUT"
@@ -1955,7 +1927,8 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
 
         def __call__(self, text, add_special_tokens=False):
             if text == "ROLLOUT":
-                ids = [1, 2]
+                self.rollout_tokenizations += 1
+                ids = [1, 2] if self.rollout_tokenizations == 1 else [1, 9]
             elif text == "COMPLETED":
                 ids = [1, 6]
             elif text.startswith("COMPLETED") and text.endswith("END"):
@@ -2009,6 +1982,53 @@ def test_projected_soft_rejects_completed_prefix_mismatch_before_rollout(monkeyp
 
     assert [kind for kind, _value in forward_teacher_calls] == ["init", "generate"]
     assert optimizer_steps == []
+
+
+def test_projected_soft_uses_qwen_generation_prefix_for_visible_targets():
+    from flash.engine.worker import opd as opd_mod
+
+    prompt_text = "PROMPT<THINK></THINK>"
+
+    class _QwenStyleTok:
+        all_special_ids = ()
+
+        def __len__(self):
+            return 16
+
+        def apply_chat_template(self, messages, *, add_generation_prompt=False, **_kwargs):
+            if add_generation_prompt:
+                return prompt_text
+            return "PROMPT" + str(messages[-1].get("content", "")) + "END"
+
+        def __call__(self, text, add_special_tokens=False):
+            encodings = {
+                prompt_text: [1, 2],
+                prompt_text + "tar": [1, 2, 3],
+                prompt_text + "target": [1, 2, 3, 4],
+            }
+            return SimpleNamespace(input_ids=encodings[text])
+
+        def decode(self, ids, skip_special_tokens=False):
+            decodings = {
+                (1, 2): prompt_text,
+                (1, 2, 3): prompt_text + "tar",
+                (1, 2, 3, 4): prompt_text + "target",
+            }
+            return decodings[tuple(int(value) for value in ids)]
+
+    result = _hybrid_forward_teacher_result(content="target")
+    target = opd_mod._build_projected_target(
+        _QwenStyleTok(),
+        [{"role": "user", "content": "question"}],
+        [1, 2],
+        result.content,
+        result.parsed_completion.visible_content_records,
+        max_length=32,
+    )
+
+    assert target.input_ids == (1, 2, 3)
+    assert target.visible_position_count == 2
+    assert target.eligible_row_count == 2
 
 
 def test_projected_soft_failure_is_atomic_before_optimizer_step(monkeypatch):
