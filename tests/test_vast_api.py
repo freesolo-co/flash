@@ -497,9 +497,17 @@ def test_get_instance_raises_on_success_false_envelope(monkeypatch):
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    _capture_urlopen(monkeypatch, [{"success": False, "msg": "no such instance"}])
-    with pytest.raises(vast_api.VastApiError):
+    private_key = "opaque_provider_key_sentinel"
+    private_value = "opaque-provider-response-sentinel"
+    _capture_urlopen(monkeypatch, [{"success": False, private_key: private_value}])
+    with pytest.raises(vast_api.VastApiError) as exc_info:
         vast_api.get_instance(4040)
+    detail = str(exc_info.value)
+    assert private_key not in detail
+    assert private_value not in detail
+    assert "get_instance(4040)" in detail
+    assert "classification=error_envelope" in detail
+    assert "returned_type=dict" in detail
 
 
 def test_get_instance_returns_dict_and_gone_signal(monkeypatch):

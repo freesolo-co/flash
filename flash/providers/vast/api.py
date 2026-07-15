@@ -319,7 +319,8 @@ def get_instance(
         # the poller counts it as a bounded, retryable poll_error instead of a false healthy read.
         if out.get("success") is False:
             raise VastApiError(
-                f"vast instance-detail error envelope for {int(instance_id)}: {repr(out)[:1000]}"
+                f"vast get_instance({int(instance_id)}) malformed response: "
+                f"classification=error_envelope returned_type={type(out).__name__}"
             )
         return out
     return None
