@@ -858,7 +858,6 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
     assert "HF_HOME" not in payload["env"]
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
-    assert "cache_block_device" not in payload  # NFS: no format/mount preamble
 
 
 def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):

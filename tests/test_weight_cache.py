@@ -1696,98 +1696,15 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     assert real_downloads == []  # no network re-download for a cache hit
 
 
-def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeypatch):
-    """A block-volume preload with the mount dir present but NO sentinel must refuse.
-
-    Regression: a failed/absent volume attach lets Docker bind an EMPTY host dir, so isdir(mount)
-    passes; without requiring the on-device sentinel the worker would warm EPHEMERAL disk and report
-    success. The cloud-init preamble writes .flash-cache-mounted only onto a real mount.
-    """
-    import sys
-
-    from flash.providers import _instance_bootstrap as b
-
-    def _boom(**k):
-        raise AssertionError("must not download when the block volume isn't really mounted")
-
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = _boom
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    cache_dir_env = str(
-        tmp_path / "hf-cache" / "hub"
-    )  # grandparent (the mount) exists but has no sentinel
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
-            "models": ["a/b"],
-            "cache_block_device": True,
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == []
-    assert "not mounted" in r["error"]
-
-
-def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, monkeypatch):
-    """With the on-device sentinel present, a block-volume preload proceeds to download."""
-    import sys
-
-    from flash.providers import _instance_bootstrap as b
-
-    calls = []
-
-    def _snap(**k):
-        if k.get("local_files_only"):
-            raise FileNotFoundError("not cached")  # force the real download
-        calls.append(k)
-
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = _snap
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    mount = tmp_path
-    (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
-    cache_dir_env = str(mount / "hf-cache" / "hub")
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
-            "models": ["a/b"],
-            "cache_block_device": True,
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == ["a/b"]
-    assert not r["failed"]
-
-
-def test_block_device_preamble_writes_mount_sentinel():
-    """The block-device preamble drops the sentinel only on a SUCCESSFUL mount."""
-    from flash.providers import _instance
-
-    pre = _instance._cache_block_device_setup(
-        {"cache_block_device": True, "cache_host_mount": "/mnt/cache", "cache_size_gb": 100}
-    )
-    # sentinel is written inside the mount-success branch (after `mount ... &&`), not unconditionally
-    assert "touch '/mnt/cache/.flash-cache-mounted'" in pre
-    assert _instance.CACHE_MOUNT_MARKER == ".flash-cache-mounted"
-
-
 def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
     auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
     from flash.providers import _instance
 
-    pre = _instance._cache_nfs_mount_check(
-        {"cache_host_mount": "/lambda/nfs/flash-weights"}  # NFS: no cache_block_device
-    )
+    pre = _instance._cache_nfs_mount_check({"cache_host_mount": "/lambda/nfs/flash-weights"})
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
     assert "touch '/lambda/nfs/flash-weights/.flash-cache-mounted'" in pre
-    # No-op for block-volume (handled by the block preamble) and for cold runs.
-    assert (
-        _instance._cache_nfs_mount_check(
-            {"cache_host_mount": "/mnt/cache", "cache_block_device": True}
-        )
-        == ""
-    )
+    # no-op for cold runs.
     assert _instance._cache_nfs_mount_check({}) == ""
 
 
@@ -1813,7 +1730,7 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
             "models": ["a/b"],
             "cache_mount_marker": ".flash-cache-mounted",
         }
-    )  # NFS: no cache_block_device
+    )
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
     assert "NFS" in r["error"]
@@ -1864,7 +1781,6 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
         models=["a/b"],
     )
     assert p["cache_mount_marker"] == _instance.CACHE_MOUNT_MARKER
-    assert "cache_block_device" not in p  # NFS, not a block volume
 
 
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):

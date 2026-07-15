@@ -794,13 +794,12 @@ def run_preload(payload: dict) -> dict:
     if payload.get("cache_mount_marker"):
         marker = os.path.join(mount, payload["cache_mount_marker"])
         if not os.path.exists(marker):
-            kind = "block volume" if payload.get("cache_block_device") else "NFS filesystem"
             return {
                 "preloaded": [],
                 "already_cached": [],
                 "failed": {},
                 "error": (
-                    f"weight-cache {kind} not mounted (no sentinel at {marker}); "
+                    f"weight-cache NFS filesystem not mounted (no sentinel at {marker}); "
                     "refusing to warm ephemeral disk"
                 ),
             }
