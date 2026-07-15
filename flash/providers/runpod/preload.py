@@ -19,13 +19,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._logging import get_logger
+from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     build_function_input,
     decode_output,
     deploy_train_endpoint,
-    make_hf_text_reader,
     weight_cache_datacenters,
     weight_cache_volume_name,
 )

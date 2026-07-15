@@ -26,7 +26,6 @@ from flash.providers._deadline import (
 from flash.providers._hf_artifacts import (
     make_hf_failure_detail_reader,
     make_hf_heartbeat_reader,
-    make_hf_text_reader,
     worker_flagged_retriable,
 )
 from flash.providers._poll import (
@@ -66,7 +65,6 @@ __all__ = [
     "deploy_train_endpoint",
     "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
-    "make_hf_text_reader",
     "poll_job",
     "submit_run",
     "weight_cache_datacenters",
@@ -897,10 +895,9 @@ def submit_run(
     )
 
 
-# make_hf_text_reader / make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-
-# provenance predicate worker_flagged_retriable are provider-neutral and now live in
-# flash.providers._hf_artifacts; re-exported at the top of this module for back-compat (preload +
-# tests still reference runpod.jobs.<name>).
+# make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-provenance predicate
+# worker_flagged_retriable are provider-neutral and live in flash.providers._hf_artifacts; they are
+# re-exported here so the runpod package and tests reference them as runpod.jobs.<name>.
 
 
 def surfaced_worker_flags(
