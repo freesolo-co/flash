@@ -283,9 +283,8 @@ def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
     return deleted
 
 
-_PRELOAD_INSTANCE_GPU = os.environ.get("FLASH_PRELOAD_INSTANCE_GPU") or "A10"
-_PRELOAD_GPU_BY_PROVIDER = {"lambda": "A10"}
-_PRELOAD_STATUS_REPO = os.environ.get("FLASH_PRELOAD_STATUS_REPO") or "Freesolo-Co/flash-weight-preload"
+_LAMBDA_PRELOAD_GPU = "A10"
+_PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
 def _ensure_status_repo(token: str | None) -> None:
@@ -398,7 +397,7 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         jobs_mod = mods.get(provider)
         if jobs_mod is None:
             continue
-        provider_gpu = gpu or _PRELOAD_GPU_BY_PROVIDER.get(provider, _PRELOAD_INSTANCE_GPU)
+        provider_gpu = gpu or _LAMBDA_PRELOAD_GPU
         seen_regions: set = set()
         try:
             candidates = jobs_mod.usable_instances(provider_gpu)
@@ -466,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--gpu", default=None,
         help="GPU class for the preload worker. Defaults are per-mode (RunPod warm -> "
-             f"{_PRELOAD_GPU!r}; --warm-instances -> {_PRELOAD_INSTANCE_GPU!r}); pass this to override "
+             f"{_PRELOAD_GPU!r}; --warm-instances -> {_LAMBDA_PRELOAD_GPU!r}); pass this to override "
              "either. Defaulting to None (not a sentinel string) lets you explicitly pick even the "
              "per-mode default GPU without it being mistaken for 'no override'.",
     )
