@@ -49,6 +49,22 @@ def test_resolve_cached_model_commit_empty_when_basename_not_a_commit(monkeypatc
     assert hf.resolve_cached_model_commit("org/m", "") == ""
 
 
+def test_resolve_cached_model_commit_falls_back_to_shared_cache(monkeypatch):
+    # ephemeral (default) cache misses; the shared weight mount resolves the commit.
+    commit = "d" * 40
+    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: "/shared-hub")
+
+    def fake_snapshot_download(*, repo_id, revision, local_files_only, cache_dir):
+        if cache_dir is None:
+            raise FileNotFoundError("not in ephemeral cache")
+        assert cache_dir == "/shared-hub"
+        return f"/shared-hub/models--org--m/snapshots/{commit}"
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    assert hf.resolve_cached_model_commit("org/m", "main") == commit
+
+
 def test_write_base_model_provenance_records_resolved_commit(monkeypatch, tmp_path):
     commit = "c" * 40
     monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
