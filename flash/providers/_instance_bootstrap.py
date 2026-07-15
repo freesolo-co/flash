@@ -277,22 +277,51 @@ def _console_upload_loop(
             print(f"console upload warn: {_safe_detail(exc)}", flush=True)
 
 
-def _stop_upload_process(process, stop_upload, timeout_s: float) -> bool:
-    """Stop and reap an uploader process; return whether it exited without termination."""
-    stop_upload.set()
-    process.join(max(0.0, timeout_s))
-    clean = not process.is_alive()
-    if not clean:
+def _join_upload_process_before(process, cleanup_deadline_at: float, max_wait_s: float) -> None:
+    remaining = max(
+        0.0,
+        cleanup_deadline_at - _finite_positive_number(time.time(), "current clock"),
+    )
+    process.join(min(max_wait_s, remaining))
+
+
+def _reap_upload_process(process, cleanup_deadline_at: float, warning: str) -> bool:
+    if process.is_alive():
         process.terminate()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+        _join_upload_process_before(
+            process,
+            cleanup_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
     if process.is_alive():
         process.kill()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
+        _join_upload_process_before(
+            process,
+            cleanup_deadline_at,
+            _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S,
+        )
     if process.is_alive():
-        print("console uploader could not be reaped after kill", flush=True)
-    else:
-        process.close()
-    return clean
+        print(warning, flush=True)
+        return False
+    process.close()
+    return True
+
+
+def _stop_upload_process(process, stop_upload, cleanup_deadline_at: float) -> tuple[bool, bool]:
+    """stop and reap an uploader before terminal-marker bookkeeping."""
+    stop_upload.set()
+    _join_upload_process_before(
+        process,
+        cleanup_deadline_at,
+        _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
+    )
+    clean = not process.is_alive()
+    reaped = _reap_upload_process(
+        process,
+        cleanup_deadline_at,
+        "console uploader could not be reaped before terminal bookkeeping",
+    )
+    return clean, reaped
 
 
 def _start_console_uploader(payload: dict, console: str, mode: str):
@@ -312,10 +341,10 @@ def _upload_console_tail_bounded(
     console: str,
     mode: str,
     extra: str,
-    timeout_s: float,
+    cleanup_deadline_at: float,
 ) -> bool:
-    """Upload the final console snapshot without letting HF delay terminal bookkeeping."""
-    if timeout_s <= 0:
+    """upload the final console snapshot before terminal-marker bookkeeping."""
+    if cleanup_deadline_at <= _finite_positive_number(time.time(), "current clock"):
         return False
     context = multiprocessing.get_context("spawn")
     process = context.Process(
@@ -324,18 +353,17 @@ def _upload_console_tail_bounded(
         daemon=True,
     )
     process.start()
-    process.join(timeout_s)
+    _join_upload_process_before(
+        process,
+        cleanup_deadline_at,
+        _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
+    )
     clean = not process.is_alive()
-    if not clean:
-        process.terminate()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        process.kill()
-        process.join(_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S)
-    if process.is_alive():
-        print("final console uploader could not be reaped after kill", flush=True)
-    else:
-        process.close()
+    _reap_upload_process(
+        process,
+        cleanup_deadline_at,
+        "final console uploader could not be reaped before terminal bookkeeping",
+    )
     return clean
 
 
@@ -497,7 +525,9 @@ def fetch_code(payload: dict) -> None:
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
+    cleanup_deadline_at = deadline_ts - _TERMINAL_BOOKKEEPING_RESERVE_S
     timed_out = False
+    periodic_uploader_reaped = True
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
@@ -557,34 +587,27 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             timed_out = True
             with pump_write_lock:
                 pump_writes_enabled = False
-        uploader_stop_timeout = min(
-            _CONSOLE_UPLOAD_STOP_TIMEOUT_S,
-            max(
-                0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
-            ),
+        uploader_clean, periodic_uploader_reaped = _stop_upload_process(
+            uploader,
+            stop_upload,
+            cleanup_deadline_at,
         )
-        if not _stop_upload_process(uploader, stop_upload, uploader_stop_timeout):
+        if not uploader_clean:
             print("console uploader exceeded its shutdown allowance; terminated", flush=True)
     try:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-        final_upload_allowance = max(
-            0.0,
-            deadline_ts
-            - _finite_positive_number(time.time(), "current clock")
-            - _TERMINAL_BOOKKEEPING_RESERVE_S,
-        )
-        final_upload_timeout = min(_CONSOLE_UPLOAD_FINAL_TIMEOUT_S, final_upload_allowance)
-        if final_upload_timeout <= 0:
+        if not periodic_uploader_reaped:
+            print("final console upload skipped; periodic uploader is still alive", flush=True)
+        elif cleanup_deadline_at <= _finite_positive_number(time.time(), "current clock"):
             print("final console upload skipped; terminal bookkeeping reserve reached", flush=True)
         elif not _upload_console_tail_bounded(
             payload,
             console,
             mode,
             extra,
-            final_upload_timeout,
+            cleanup_deadline_at,
         ):
             print("final console upload exceeded its allowance", flush=True)
     except Exception as exc:
