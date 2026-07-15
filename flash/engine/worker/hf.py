@@ -13,14 +13,21 @@ import threading
 import time
 
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
+from flash.diagnostics import sanitize_diagnostic
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 
+_MAX_ATTEMPT_ID = (1 << 63) - 1
 
-def error_artifact_name(mode: str, attempt=0) -> str:
+
+def error_artifact_name(mode: str, attempt: int = 0) -> str:
     """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
     attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
-    return f"error_{mode}_attempt{int(attempt or 0)}.txt"
+    if isinstance(attempt, bool) or not isinstance(attempt, int):
+        raise ValueError("attempt must be a nonnegative integer")
+    if attempt < 0 or attempt > _MAX_ATTEMPT_ID:
+        raise ValueError("attempt must be a bounded nonnegative integer")
+    return f"error_{mode}_attempt{attempt}.txt"
 
 
 def hf_api():
@@ -33,6 +40,22 @@ def hf_prefix() -> str:
     return f"{_w.PHASE}/{_w.RUN_ID}"
 
 
+def _require_hf_deadline_allowance() -> float | None:
+    remaining = _w._remaining_worker_wall_seconds()
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError("run wall deadline exceeded")
+    return remaining
+
+
+def _sleep_with_hf_deadline(delay: float) -> bool:
+    remaining = _require_hf_deadline_allowance()
+    sleep_for = delay if remaining is None else min(delay, remaining)
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+    remaining = _w._remaining_worker_wall_seconds()
+    return remaining is None or remaining > 0
+
+
 def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool:
     """HF upload loop: retries + raises on required artifacts; warn-only on optional.
 
@@ -41,19 +64,32 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
     if not _w.HF_REPO:
         return True
     attempts = 3 if required else 1
+    last_err: Exception | None = None
     for attempt in range(attempts):
         try:
+            _require_hf_deadline_allowance()
             do_upload()
             return True
         except Exception as e:
+            last_err = e
+            detail = sanitize_diagnostic(e, limit=500)
             if required and attempt + 1 < attempts:
-                print(f"{label} retry {attempt + 1}/{attempts}: {e}")
-                time.sleep(5 * (attempt + 1))
+                print(f"{label} retry {attempt + 1}/{attempts}: {detail}")
+                try:
+                    if not _sleep_with_hf_deadline(5 * (attempt + 1)):
+                        break
+                except Exception:
+                    break
                 continue
-            if required:
-                raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
-            print(f"{label} warn:", e)
-            return False
+            if not required:
+                print(f"{label} warn: {detail}")
+                return False
+            break
+    if required:
+        detail = sanitize_diagnostic(last_err, limit=500)
+        raise RetriableInfraError(
+            f"required upload of {repo_subpath!r} failed: {detail}"
+        ) from last_err
     return False
 
 
@@ -125,6 +161,7 @@ def hf_resume_checkpoint() -> str | None:
 
         # resume checkpoints carry the full optimizer state (multi-GB); keep the heartbeat fresh.
         with liveness_heartbeat("checkpoint_prefetching"):
+            _require_hf_deadline_allowance()
             snapshot_download(
                 repo_id=_w.HF_REPO,
                 repo_type="dataset",
@@ -238,6 +275,7 @@ def prefetch_model(model_id: str) -> float:
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
         try:
+            _require_hf_deadline_allowance()
             snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,
@@ -297,6 +335,7 @@ def publish_deployable_checkpoint(
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
     for attempt in range(retries):
         try:
+            _require_hf_deadline_allowance()
             _w.hf_api().upload_folder(
                 folder_path=ckpt_dir,
                 path_in_repo=subfolder,
@@ -309,7 +348,11 @@ def publish_deployable_checkpoint(
         except Exception as e:
             print(f"[ckpt] deployable publish warn (step {step}):", e)
             if attempt + 1 < retries:
-                time.sleep(backoff_s * (attempt + 1))
+                try:
+                    if not _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
+                        break
+                except Exception:
+                    break
     return None
 
 
@@ -353,6 +396,7 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     api = _w.hf_api()
     base = f"{hf_prefix()}/checkpoint/"
     try:
+        _require_hf_deadline_allowance()
         files = api.list_repo_files(repo_id=_w.HF_REPO, repo_type="dataset")
     except Exception as e:
         print("ckpt prune warn (list):", e)
@@ -366,8 +410,12 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
         if seg.startswith("checkpoint-") and n.isdigit() and int(n) != keep_step:
             stale.add(f"{base}{seg}")
     for folder in sorted(stale):
-        with contextlib.suppress(Exception):
+        try:
+            _require_hf_deadline_allowance()
             api.delete_folder(path_in_repo=folder, repo_id=_w.HF_REPO, repo_type="dataset")
+        except Exception as e:
+            print(f"ckpt prune warn ({folder}):", e)
+            break
 
 
 def make_checkpoint_upload_callback():
@@ -397,6 +445,7 @@ def make_checkpoint_upload_callback():
         # artifact that makes a cancelled/preempted run deployable from this step, so
         # it must land before the larger resume checkpoint (best-effort, latest-only).
         _publish_deployable(ckpt_dir, step)
+        _require_hf_deadline_allowance()
         _w.hf_api().upload_folder(
             folder_path=ckpt_dir,
             path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
@@ -434,7 +483,13 @@ def make_checkpoint_upload_callback():
                         print(
                             f"[ckpt] step {step} upload retry {attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
                         )
-                        time.sleep(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1))
+                        try:
+                            if not _sleep_with_hf_deadline(
+                                _CKPT_UPLOAD_BACKOFF_S * (attempt + 1)
+                            ):
+                                break
+                        except Exception:
+                            break
                     else:
                         print(
                             f"[ckpt] step {step} upload FAILED after {_CKPT_UPLOAD_RETRIES} attempts: {e}"

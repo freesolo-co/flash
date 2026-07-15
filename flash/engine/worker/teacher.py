@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import os
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,20 @@ class TeacherError(RuntimeError):
     def __init__(self, *args, permanent: bool = False) -> None:
         super().__init__(*args)
         self.permanent = permanent
+
+
+def _remaining_run_wall_seconds() -> float | None:
+    raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
+    if raw_deadline is None:
+        return None
+    try:
+        deadline = float(raw_deadline)
+    except (TypeError, ValueError):
+        raise TeacherError("worker run wall deadline is invalid", permanent=True) from None
+    now = time.time()
+    if not math.isfinite(deadline) or deadline <= 0 or not math.isfinite(now) or now <= 0:
+        raise TeacherError("worker run wall deadline is invalid", permanent=True)
+    return max(0.0, deadline - now)
 
 
 def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int]]:
@@ -188,26 +203,25 @@ class TeacherClient:
         }
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
+            remaining = _remaining_run_wall_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TeacherError("teacher call exceeded the run wall deadline") from None
+            timeout = self.timeout if remaining is None else min(self.timeout, remaining)
             req = urllib.request.Request(self.base_url + path, data=data, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                # Retry transient server/rate-limit errors; fail fast on 4xx client errors. Guard the
-                # error-body preview read: a retryable 429/5xx whose body is truncated or times out
-                # makes e.read() raise IncompleteRead/OSError BEFORE last_err is set, so repeated
-                # retryable errors could end as permanent no-signal instead of a retriable outage.
-                # Classify by e.code regardless (codex[bot]).
-                try:
-                    body_txt = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
-                except (http.client.IncompleteRead, OSError):
-                    body_txt = "<error body unavailable>"
+                # HTTP response bodies may contain arbitrary private provider text. Classify only from
+                # the structural status and request path, which are sufficient for retry policy.
                 retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
+                classification = "retryable" if retryable else "permanent"
                 last_err = TeacherError(
-                    f"teacher HTTP {e.code} on {path}: {body_txt}", permanent=not retryable
+                    f"teacher HTTP {e.code} on {path} ({classification})",
+                    permanent=not retryable,
                 )
                 if not retryable:  # bad key (401/403) / model id (404) / bad request (400)
-                    raise last_err from e
+                    raise last_err from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = TeacherError(f"teacher transport error on {path}: {e}")
             except http.client.IncompleteRead as e:
@@ -228,7 +242,16 @@ class TeacherClient:
                 last_err = TeacherError(
                     f"teacher returned HTTP 200 with unparseable body on {path}: {e}"
                 )
-            time.sleep(min(2.0 * (2**attempt), 20.0))
+            if attempt + 1 >= self.max_retries:
+                break
+            delay = min(2.0 * (2**attempt), 20.0)
+            remaining = _remaining_run_wall_seconds()
+            if remaining is not None:
+                if remaining <= 0:
+                    raise TeacherError("teacher call exceeded the run wall deadline") from None
+                delay = min(delay, remaining)
+            if delay > 0:
+                time.sleep(delay)
         raise last_err or TeacherError(f"teacher call to {path} failed")
 
     # -- echo scoring (gkd) ----------------------------------------------------------------------

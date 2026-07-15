@@ -10,10 +10,13 @@ reachable through the package global rather than a statically-bound copy.
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
+from flash.providers._deadline import deadline_kwargs
+from flash.providers._poll import _attempt_int
 from flash.schema import format_adapter_revision, parse_adapter_revision
 from flash.spec import JobSpec
 
@@ -150,10 +153,18 @@ def _preservable_checkpoint_deployment(
 
 
 def cancel_run(run_id: str) -> RunStatus:
-    """Cancel training, then preserve only a verified immutable checkpoint deployment."""
+    """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner import (
         TERMINAL_STATES,
+        _cleanup_remote_key,
+        _drain_cleanup_remotes,
         _gc_run_endpoints,
+        _preserve_cleanup_remote,
+        _remote_resource_identity,
+        _report_status,
+        _save_status_unlocked,
+        _snapshot_cleanup_remotes,
+        _status_guard,
         _update,
         actual_steps_run,
         charge_usd_for_spec,
@@ -167,7 +178,50 @@ def cancel_run(run_id: str) -> RunStatus:
     )
     from flash.server._locks import _deploy_lock
 
+    def _clear_exact_remote(expected_remote: dict) -> bool:
+        expected_identity = _remote_resource_identity(expected_remote)
+        if expected_identity is None:
+            return False
+        report_status = None
+        with _status_guard(run_id):
+            current = get_status(run_id)
+            if _remote_resource_identity(current.remote) != expected_identity:
+                return False
+            current.remote = None
+            current.updated_at = time.time()
+            _save_status_unlocked(current)
+            report_status = current
+        if report_status is not None:
+            _report_status(report_status)
+        return True
+
+    def _drain_confirmed_cleanup() -> set[tuple]:
+        try:
+            before = _snapshot_cleanup_remotes(run_id)
+            _drain_cleanup_remotes(run_id)
+            remaining_keys = {
+                key
+                for record in _snapshot_cleanup_remotes(run_id)
+                if (key := _cleanup_remote_key(record)) is not None
+            }
+        except Exception:
+            return set()
+        confirmed_identities = set()
+        for record in before:
+            key = _cleanup_remote_key(record)
+            if key is None or key in remaining_keys:
+                continue
+            identity = _remote_resource_identity(record)
+            if identity is not None:
+                confirmed_identities.add(identity)
+            _clear_exact_remote(record)
+        return confirmed_identities
+
     initial_status = get_status(run_id)
+    confirmed_cleanup_identities = set()
+    if initial_status.state == "cancelled":
+        confirmed_cleanup_identities = _drain_confirmed_cleanup()
+        initial_status = get_status(run_id)
     _, initial_active = _deployment_state_and_requires_revocation(initial_status.deployment)
     if initial_status.state in TERMINAL_STATES and not initial_active:
         return initial_status
@@ -185,23 +239,6 @@ def cancel_run(run_id: str) -> RunStatus:
         and initial_status.state not in TERMINAL_STATES
         and not entered_deployed
     )
-
-    # stop the existing training worker before deciding whether serving can remain active.
-    remote = initial_status.remote or {}
-    if remote:
-        try:
-            from flash.providers import get_provider
-            from flash.providers.base import JobHandle
-
-            handle = JobHandle.from_dict(remote)
-            provider = get_provider(handle.provider)
-            provider.cancel(handle)
-            provider.destroy(handle)
-        except Exception:
-            pass
-    if cleanup_spec is not None:
-        with contextlib.suppress(Exception):
-            _gc_run_endpoints(cleanup_spec)
 
     deploy_lock = _deploy_lock(run_id)
     captured_contended_attempt: dict | None = None
@@ -288,6 +325,47 @@ def cancel_run(run_id: str) -> RunStatus:
                                 ) from exc
             deploy_lock.acquire()
             lock_acquired = True
+
+        status = get_status(run_id)
+        entered_deployed = entered_deployed or status.state == "deployed"
+
+        from flash.providers.base import JobHandle
+        from flash.runner.lifecycle import _strict_teardown_handle
+
+        def _teardown_remote(remote: dict) -> bool:
+            try:
+                _strict_teardown_handle(JobHandle.from_dict(remote))
+                return True
+            except Exception:
+                if not _preserve_cleanup_remote(run_id, remote):
+                    raise RuntimeError(
+                        f"run {run_id} teardown was unconfirmed and its exact cleanup target "
+                        "could not be preserved"
+                    ) from None
+                return False
+
+        processed_remote_identities = set()
+        while True:
+            status = get_status(run_id)
+            remote = status.remote or {}
+            identity = _remote_resource_identity(remote)
+            if not remote or identity in processed_remote_identities:
+                break
+            processed_remote_identities.add(identity)
+            if identity in confirmed_cleanup_identities:
+                _clear_exact_remote(remote)
+                continue
+            teardown_confirmed = _teardown_remote(remote)
+            if teardown_confirmed:
+                _clear_exact_remote(remote)
+                continue
+            latest_remote = get_status(run_id).remote or {}
+            if _remote_resource_identity(latest_remote) != identity:
+                continue
+            break
+        if cleanup_spec is not None:
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(cleanup_spec)
 
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
@@ -427,11 +505,22 @@ def cancel_run(run_id: str) -> RunStatus:
         billing_diagnostic: dict = {}
         if bill_cancel:
             if effective_spec is not None:
-                cancel_charge_usd = charge_usd_for_spec(
+                estimated_charge = charge_usd_for_spec(
                     effective_spec,
                     steps=actual_steps_run(get_status(run_id)),
-                    fallback=0.0,
+                    fallback=float("nan"),
                 )
+                if math.isfinite(estimated_charge):
+                    cancel_charge_usd = estimated_charge
+                else:
+                    cancel_charge_usd = 0.0
+                    billing_diagnostic = {
+                        "billing_state": "failed",
+                        "billing_error": (
+                            "cancellation charge was not computed because pricing failed; "
+                            "teardown was still attempted"
+                        ),
+                    }
             else:
                 cancel_charge_usd = 0.0
                 billing_diagnostic = {
@@ -480,10 +569,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner import (
         FIXED_SEED,
         TERMINAL_STATES,
+        _compare_and_clear_remote,
         _gc_run_endpoints,
+        _load_run_deadline_at,
         _persist_metrics,
         _run_training,
         _RunCancelled,
+        _spec_with_remaining_wall,
         _status_estimated_charge,
         _update,
         artifacts_dir,
@@ -510,77 +602,104 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     log = log_stream or sys.stderr
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
+    from flash.runner.lifecycle import _strict_teardown_handle
 
     try:
         worker_spec = effective_spec_from_status(status)
-        remote = dict(status.remote)
+        persisted_remote = dict(status.remote)
+        remote = dict(persisted_remote)
         seed = int(remote.pop("seed", FIXED_SEED))
         code_prefix = remote.pop("code_prefix", None)
+        provider_name = remote.get("provider")
+        if not isinstance(provider_name, str) or not provider_name:
+            raise ValueError("persisted provider identity is missing or invalid")
+        recovered_attempt = _attempt_int(remote.get("attempt"))
+        if recovered_attempt is None:
+            raise ValueError("persisted attempt identity is missing or invalid")
+        next_attempt = recovered_attempt + 1
         # The class the run actually provisioned (a policy retry may have walked past the
         # provisional spec.gpu.type). The in-process success path stamps this into metrics;
         # on recovery the worker output carries no such field, so recover it from the handle
         # to cost the right card.
         allocated_gpu = remote.pop("allocated_gpu", None)
         handle = JobHandle.from_dict(remote)
+        try:
+            poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
+        except RuntimeError as exc:
+            # expiry is terminal: stop the persisted worker before clearing its handle, and retain the
+            # handle when teardown is unconfirmed so later cleanup can still target the paid resource.
+            teardown_confirmed = True
+            try:
+                _strict_teardown_handle(handle)
+            except Exception:
+                teardown_confirmed = False
+            if teardown_confirmed:
+                _compare_and_clear_remote(run_id, persisted_remote)
+            _update(run_id, "failed", error=str(exc))
+            print(f"attach: {run_id} {exc}", file=log)
+            return get_status(run_id)
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
-        res = get_provider(handle.provider).poll(handle, worker_spec, seed, log=log)
+        res = get_provider(handle.provider).poll(
+            handle,
+            poll_spec,
+            seed,
+            log=log,
+            _deadline_at=_load_run_deadline_at(run_id),
+        )
         if get_status(run_id).state == "cancelled":
             return status_for_return()
         if not res.ok:
-            # job ended not-ok, so any replacement must revalidate the pinned source before paid work.
-            worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
-            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume from
-            # the last HF checkpoint (fresh allocation, worker resumes mid-training) instead of
-            # failing; _run_training still terminates a genuinely broken run when it re-fails.
-            print(
-                f"attach: {run_id} ended ({res.failure}); resuming from checkpoint",
-                file=log,
-            )
-            # Before resuming, the in-flight instance MUST be CONFIRMED torn down. Resubmitting while
-            # it may still be alive runs TWO workers against this run's shared HF artifacts
-            # (DONE/metrics/checkpoints) — double bill AND corrupted state. An instance provider's
-            # destroy() raises only on an UNCONFIRMED teardown (Vast: DELETE success:false / network
-            # breakdown — a real 404 is now treated as confirmed-gone). The poll loop's own finally
-            # already best-effort-destroyed the box; re-confirm here. On an unconfirmed result, GC by
-            # label (run-scoped, not orphan-sweep-shielded) and BAIL with the handle intact + the run
-            # left non-terminal, so a later recovery/sweep reconciles instead of racing a live box.
-            from flash.providers import INSTANCE_PROVIDERS
-
-            teardown_confirmed = True
-            if handle.provider in INSTANCE_PROVIDERS:
-                try:
-                    get_provider(handle.provider).destroy(handle)
-                except Exception as exc:
-                    teardown_confirmed = False
-                    print(
-                        f"attach: {run_id} {handle.provider} instance teardown UNCONFIRMED ({exc}); "
-                        "not resuming over a possibly-live box",
-                        file=log,
-                    )
-            # GC the dead endpoint / any label-named instances (a second force-reap attempt when the
-            # teardown above was unconfirmed), then clear the stale handle.
+            print(f"attach: {run_id} ended ({res.failure}); evaluating recovery", file=log)
+            try:
+                _strict_teardown_handle(handle)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    _gc_run_endpoints(worker_spec)
+                print(
+                    f"attach: {run_id} {handle.provider} teardown unconfirmed; "
+                    "not resuming over a possibly-live resource",
+                    file=log,
+                )
+                return status_for_return()
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(worker_spec)
-            if not teardown_confirmed:
-                # Keep ``remote`` so the still-billing box stays reachable for the next recovery/sweep,
-                # and leave the run non-terminal (do not _update) so a future re-attach re-polls it.
+            if not _compare_and_clear_remote(run_id, persisted_remote):
+                print(
+                    f"attach: {run_id} persisted remote changed before clear; not resuming",
+                    file=log,
+                )
                 return status_for_return()
-            # Bail if the run was raced to terminal during the long poll above: _update's CAS
-            # returns False, and resuming would submit paid work for a dead run.
-            if not _update(run_id, "running", remote=None):
+            try:
+                _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
+            except RuntimeError as exc:
+                _update(run_id, "failed", error=str(exc))
+                print(f"attach: {run_id} {exc}", file=log)
+                return status_for_return()
+            worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
+            if not _update(run_id, "running"):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return status_for_return()
+            print(
+                f"attach: {run_id} resubmitting from the latest checkpoint before the "
+                "run-global wall deadline",
+                file=log,
+            )
             if code_prefix is None:
                 from flash.providers._worker import upload_code
                 from flash.runner import flash_code_prefix
 
                 code_prefix = flash_code_prefix()
-                upload_code(worker_spec.train.hf_repo, code_prefix=code_prefix)
+                upload_code(
+                    worker_spec.train.hf_repo,
+                    code_prefix=code_prefix,
+                    **deadline_kwargs(upload_code, _load_run_deadline_at(run_id)),
+                )
             _run_training(
                 worker_spec,
                 log,
                 prior_cost=float(status.cost_usd or 0.0),
                 code_prefix=code_prefix,
+                attempt_start=next_attempt,
             )
             return status_for_return()
         if allocated_gpu and isinstance(res.metrics, dict):
@@ -679,9 +798,9 @@ def mark_deployed(
     *,
     verification_generation: int | None = None,
 ) -> RunStatus:
-    from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
+    from flash.runner import _UNDEPLOYABLE_STATES, _save_status_unlocked, _status_guard, get_status
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         if status.state in _UNDEPLOYABLE_STATES:
             return status
@@ -693,7 +812,7 @@ def mark_deployed(
         def _commit() -> None:
             _promote_final_deployment(status, deployment)
             status.updated_at = time.time()
-            _save_status(status)
+            _save_status_unlocked(status)
 
         if not _commit_verified_deployment(
             run_id,
@@ -720,9 +839,9 @@ def mark_checkpoint_deployed(
     If training has finished by the time serving registration completes, the run behaves like any
     finished deployed run. Otherwise, keep the training state and only attach the deployment record.
     """
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         if status.state == "dry_run":
             return status
@@ -738,7 +857,7 @@ def mark_checkpoint_deployed(
             else:
                 status.deployment = deployment
             status.updated_at = time.time()
-            _save_status(status)
+            _save_status_unlocked(status)
 
         if not _commit_verified_deployment(
             run_id,
@@ -760,9 +879,9 @@ def mark_deployment_pending(
     owner_deployment: dict | None = None,
 ) -> RunStatus:
     """Attach an in-progress deployment record without changing the run lifecycle state."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         if status.state == "dry_run":
             return status
@@ -785,15 +904,15 @@ def mark_deployment_pending(
             return status
         status.deployment = deployment
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
         return status
 
 
 def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
     """Record a failed deployment attempt while preserving the run lifecycle state."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         current = status.deployment or {}
         # don't clobber a newer deployment attempt, explicit undeploy, or pending revocation.
@@ -827,16 +946,16 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
             )
             status.deployment = {**failed, "state": state}
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
         return status
 
 
 def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
     """Revoke local serving authority while retaining retryable backend cleanup state."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
     from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
 
         def _commit() -> None:
@@ -849,7 +968,7 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
                 "updated_at": time.time(),
             }
             status.updated_at = time.time()
-            _save_status(status)
+            _save_status_unlocked(status)
 
         invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status
@@ -857,10 +976,10 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
 
 def mark_undeployed(run_id: str) -> RunStatus:
     """Record an explicit undeploy; live final-adapter deployments return to `done`."""
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
     from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
 
         def _commit() -> None:
@@ -869,7 +988,7 @@ def mark_undeployed(run_id: str) -> RunStatus:
             if status.state == "deployed":
                 status.state = "done"
             status.updated_at = time.time()
-            _save_status(status)
+            _save_status_unlocked(status)
 
         invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status
@@ -878,13 +997,13 @@ def mark_undeployed(run_id: str) -> RunStatus:
 def mark_deployment_undeployed(run_id: str) -> RunStatus:
     """Flip ONLY the deployment field to ``undeployed``, leaving the run's state untouched.
 
-    Used by cancel_run — unlike mark_undeployed, never asserts or changes the run state,
+    Used by cancel_run, unlike mark_undeployed, never asserts or changes the run state,
     so it works even after a racing mark_undeployed has already written terminal `done`.
     """
-    from flash.runner import _STATUS_LOCK, _save_status, get_status
+    from flash.runner import _save_status_unlocked, _status_guard, get_status
     from flash.runner.verified_revisions import invalidate_verified_adapter_revisions
 
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
 
         def _commit() -> None:
@@ -895,7 +1014,7 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
                     deployment.pop(field, None)
                 status.deployment = {**deployment, "state": "undeployed"}
                 status.updated_at = time.time()
-                _save_status(status)
+                _save_status_unlocked(status)
 
         invalidate_verified_adapter_revisions(run_id, commit=_commit)
         return status

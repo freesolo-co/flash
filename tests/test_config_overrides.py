@@ -12,7 +12,7 @@ BASE = (
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     '[train]\nepochs = 1\nmax_examples = 100\nhf_repo = "owner/runs"\n'
-    '[gpu]\ntype = "RTX 5090"\n'
+    '[gpu]\ntype = "RTX 5090"\nmax_retries = 6\nmax_wall_seconds = 7200\n'
 )
 
 
@@ -34,11 +34,14 @@ def test_set_overrides_scalar_and_list():
             overrides=[
                 "train.epochs=3",
                 "gpu.type=RTX 4090",
+                "gpu.max_retries=0",
                 "train.stop_sequences=[STOP1,STOP2]",
             ],
         )
         assert spec.train.epochs == 3
         assert spec.train.stop_sequences == ("STOP1", "STOP2")
+        assert spec.gpu.max_retries == 0
+        assert spec.gpu.max_wall_seconds == 7200
         # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
         # resolves the cheapest fitting VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB
         # A100 PCIe @ $1.39, the cheapest validated class that fits), not the override.
@@ -51,13 +54,17 @@ def test_composed_config_deep_merge():
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
         override = _write(
-            tmp, "prod.toml", '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\n'
+            tmp,
+            "prod.toml",
+            '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\nmax_retries = 9\nmax_wall_seconds = 3600\n',
         )
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert (
             spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
         )  # untouched key preserved
+        assert spec.gpu.max_retries == 9
+        assert spec.gpu.max_wall_seconds == 3600
         # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
         # VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB A100 PCIe @ $1.39), regardless
         # of the composed gpu.type.

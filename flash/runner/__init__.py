@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -13,7 +14,13 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - linux production fails closed below
+    fcntl = None
+
 from flash.catalog import ModelInfo, resolve_model
+from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
 from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
@@ -22,7 +29,20 @@ RESULTS_DIR = os.path.join(_STATE_DIR, "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 # `done` IS deployable, so excluded; cancelled/failed/dry_run must never flip to `deployed`.
 _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
+# serialize local writers before taking each run's interprocess lock.
 _STATUS_LOCK = threading.Lock()
+_RUN_DEADLINE_AT_KEY = "run_deadline_at"
+_NEXT_ATTEMPT_KEY = "next_attempt"
+_CLEANUP_REMOTES_KEY = "cleanup_remotes"
+_PRIVATE_STATUS_KEYS = frozenset(
+    {
+        _RUN_DEADLINE_AT_KEY,
+        _NEXT_ATTEMPT_KEY,
+        _CLEANUP_REMOTES_KEY,
+    }
+)
+_PRIVATE_VALUE_UNSET = object()
+MIN_PROVIDER_WALL_SECONDS = 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -65,12 +85,7 @@ def _gpu_rate(gpu_type: str) -> float:
 
 
 def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0) -> float:
-    """The customer charge for a run: the flash.cost estimate (training-only steps x sec/step x $/hr).
-
-    This is the price the run was QUOTED at submit. ``steps=None`` prices the spec's planned steps
-    (a completed run is charged exactly its quote); pass the actual steps that ran to re-price a
-    CANCELLED run at how far it got. Returns ``fallback`` if the spec can't be priced (so a charge is
-    never blocked by a pricing failure)."""
+    """Return the estimated customer charge, prorated by completed steps when requested."""
     try:
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import estimate_for_spec, runconfig_from_spec
@@ -79,17 +94,11 @@ def charge_usd_for_spec(spec, *, steps: int | None = None, fallback: float = 0.0
             return float(estimate_for_spec(spec).total_usd)
         n = max(0, int(steps))
         if n == 0:
-            return 0.0  # cancelled before any training step -> nothing to charge
-        from dataclasses import replace
-
+            return 0.0
         cfg = runconfig_from_spec(spec)
         planned = int(cfg.steps or 0)
         if planned > 0:
             n = min(n, planned)
-        # SFT is priced from train_tokens (not steps), so lowering steps ALONE wouldn't prorate a
-        # cancel -- estimate_cost would still charge the full-run token estimate. Scale the token
-        # count to the fraction of steps that ran so a mid-training SFT cancel is charged its share,
-        # mirroring GRPO's steps-based proration.
         if not cfg.is_grpo and cfg.train_tokens and planned > 0:
             scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
             cfg = replace(cfg, steps=n, train_tokens=scaled_tokens)
@@ -138,6 +147,102 @@ def actual_steps_run(status: RunStatus) -> int:
     if hb.get("stage") in _TRAINING_STAGES:
         return 1
     return 0
+
+
+def _require_valid_deadline(value: object) -> float:
+    """Return a finite positive unix deadline or fail closed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
+    deadline = float(value)
+    if not math.isfinite(deadline) or deadline <= 0:
+        raise RuntimeError("run wall deadline is invalid; no further provisioning is allowed")
+    return deadline
+
+
+def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
+    status = _runstatus_from_json(raw)
+    spec = JobSpec.from_dict(status.spec)
+    created_at = _require_valid_deadline(status.created_at)
+    max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
+    return status, _require_valid_deadline(created_at + max_wall_seconds)
+
+
+def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
+    deadline = _require_valid_deadline(stored)
+    if not math.isclose(deadline, canonical, rel_tol=0.0, abs_tol=1e-6):
+        raise RuntimeError(
+            "persisted run wall deadline does not match canonical submission deadline; "
+            "no further provisioning is allowed"
+        )
+    return deadline
+
+
+def _load_run_deadline_at(run_id: str) -> float:
+    """Return the persisted canonical submission-to-terminal deadline."""
+    raw = _load_status_json(run_id)
+    _status, canonical = _canonical_run_deadline(raw)
+    if _RUN_DEADLINE_AT_KEY not in raw:
+        raise RuntimeError(
+            "persisted run wall deadline is missing; no further provisioning is allowed"
+        )
+    return _checked_stored_run_deadline(raw[_RUN_DEADLINE_AT_KEY], canonical)
+
+
+def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> float:
+    """Return non-negative wall allowance remaining on the run-global deadline."""
+    current = time.time() if now is None else now
+    if (
+        isinstance(current, bool)
+        or not isinstance(current, (int, float))
+        or not math.isfinite(current)
+        or current <= 0
+    ):
+        raise ValueError("current clock is invalid")
+    return max(0.0, _load_run_deadline_at(run_id) - float(current))
+
+
+def _spec_with_remaining_wall(
+    spec: JobSpec,
+    *,
+    require_provider_minimum: bool,
+    now: float | None = None,
+) -> JobSpec:
+    """Copy a spec with only the run-global wall allowance still available."""
+    remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
+    if remaining <= 0:
+        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
+    if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
+        raise RuntimeError(
+            "run wall deadline has less than the 60-second minimum provider allowance remaining; "
+            "no further provisioning is allowed"
+        )
+    allowance = max(1, int(remaining))
+    return replace(spec, gpu=replace(spec.gpu, max_wall_seconds=allowance))
+
+
+def _infer_next_attempt(raw: dict) -> int:
+    if _NEXT_ATTEMPT_KEY not in raw:
+        raise RuntimeError("stored next attempt identity is missing")
+    stored = raw[_NEXT_ATTEMPT_KEY]
+    if _attempt_int(stored) is None:
+        raise RuntimeError("stored next attempt identity is invalid")
+    return stored
+
+
+def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
+    """Durably consume one run-global attempt identity before provider creation."""
+    minimum = _attempt_int(minimum_attempt)
+    if minimum is None:
+        raise RuntimeError("minimum attempt identity is invalid")
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        attempt = max(_infer_next_attempt(raw), minimum)
+        if attempt >= _MAX_ATTEMPT_ID:
+            raise RuntimeError("run attempt identity is exhausted")
+        _save_status_unlocked(status, _next_attempt=attempt + 1)
+        return attempt
+
 
 
 @dataclass
@@ -261,6 +366,10 @@ class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
 
 
+class _TerminalHandleRace(_RunCancelled):
+    """A provider handle was created after the run became terminal."""
+
+
 def new_run_id() -> str:
     return f"flash-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
@@ -282,6 +391,24 @@ def runs_file_path(run_id: str, suffix: str) -> str:
     if not path.startswith(base + os.sep):
         raise ValueError(f"invalid run_id: {run_id!r}")
     return path
+
+
+@contextlib.contextmanager
+def _status_guard(run_id: str):
+    """Serialize one run's status mutations across threads and Linux processes."""
+    if fcntl is None:
+        raise RuntimeError("interprocess run-status locking is unavailable")
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    lock_path = runs_file_path(run_id, ".lock")
+    with _STATUS_LOCK:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
@@ -443,11 +570,14 @@ def _run_job_background(
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
             _run_job(spec)
-    except Exception as e:
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: background run failed"
         with contextlib.suppress(Exception):
             if get_status(spec.run_id).state not in TERMINAL_STATES:
-                _update(spec.run_id, "failed", error=str(e))
-        logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
+                _update(spec.run_id, "failed", error=detail)
+        logging.getLogger(__name__).warning(
+            "background run %s ended in error: %s", spec.run_id, detail
+        )
 
 
 def _context_org_id(context: dict | None) -> str:
@@ -807,7 +937,11 @@ def submit_job(
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
-    _save_status(status)
+    _save_status(
+        status,
+        _run_deadline_at=status.created_at + float(public_spec.gpu.max_wall_seconds),
+        _next_attempt=0,
+    )
     _report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
@@ -844,12 +978,19 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
 
 
-def get_status(run_id: str) -> RunStatus:
+def _load_status_json(run_id: str) -> dict:
     path = runs_file_path(run_id, ".json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
-        return _runstatus_from_json(json.load(f))
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid stored run status for {run_id}")
+    return value
+
+
+def get_status(run_id: str) -> RunStatus:
+    return _runstatus_from_json(_load_status_json(run_id))
 
 
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
@@ -977,7 +1118,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         return
     hb = _sanitize_status_value(heartbeat)
     gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -985,7 +1126,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -1024,6 +1165,184 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
+def _remote_resource_identity(remote: object) -> tuple | None:
+    """Return the exact strict provider resource identity used for compare-and-clear."""
+    if not isinstance(remote, dict):
+        return None
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            handle = RunpodJobHandle.from_dict(remote)
+            return provider, handle.attempt, handle.endpoint_id, handle.job_id, handle.key_fingerprint
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            handle = LambdaJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.instance_type,
+                handle.region,
+                handle.name,
+            )
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            handle = VastJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.offer_id,
+                handle.machine_id,
+                handle.label,
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
+    """Clear only the nonterminal remote that still names the destroyed resource."""
+    expected_identity = _remote_resource_identity(expected_remote)
+    if expected_identity is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if _remote_resource_identity(status.remote) != expected_identity:
+            return False
+        status.remote = None
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
+def _canonical_cleanup_remote(remote: object) -> dict | None:
+    """Return the complete strict teardown handle for one exact resource."""
+    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
+        return None
+    provider = remote.get("provider")
+    try:
+        if provider == "runpod":
+            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+            return RunpodJobHandle.from_dict(remote).to_dict()
+        if provider == "lambda":
+            from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
+
+            return LambdaJobHandle.from_dict(remote).to_dict()
+        if provider == "vast":
+            from flash.providers.vast.jobs.builders import VastJobHandle
+
+            return VastJobHandle.from_dict(remote).to_dict()
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cleanup_remote_key(remote: object) -> tuple | None:
+    record = _canonical_cleanup_remote(remote)
+    if record is None:
+        return None
+    return _remote_resource_identity(record), record["attempt"]
+
+
+def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
+    value = raw.get(_CLEANUP_REMOTES_KEY, [])
+    if not isinstance(value, list):
+        raise RuntimeError("stored cleanup remotes are invalid")
+    records = []
+    seen = set()
+    for item in value:
+        record = _canonical_cleanup_remote(item)
+        key = _cleanup_remote_key(record)
+        if record is None or key is None:
+            raise RuntimeError("stored cleanup remote is invalid")
+        if key not in seen:
+            records.append(record)
+            seen.add(key)
+    return records
+
+
+def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
+    with _status_guard(run_id):
+        return _cleanup_remotes_from_raw(_load_status_json(run_id))
+
+
+def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
+    expected_key = _cleanup_remote_key(expected_remote)
+    if expected_key is None:
+        return False
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        records = _cleanup_remotes_from_raw(raw)
+        remaining = [record for record in records if _cleanup_remote_key(record) != expected_key]
+        if len(remaining) == len(records):
+            return False
+        _save_status_unlocked(
+            _runstatus_from_json(raw),
+            _cleanup_remotes=remaining or None,
+        )
+    return True
+
+
+def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
+    """Teardown every tracked resource independently, removing only confirmed exact records."""
+    records = _snapshot_cleanup_remotes(run_id)
+    attempted = set()
+    if not records:
+        return attempted
+    from flash.providers.base import JobHandle
+    from flash.runner.lifecycle import _strict_teardown_handle
+
+    for record in records:
+        identity = _remote_resource_identity(record)
+        if identity is None:
+            continue
+        attempted.add(identity)
+        try:
+            _strict_teardown_handle(JobHandle.from_dict(record))
+        except Exception:
+            continue
+        with contextlib.suppress(Exception):
+            _compare_and_remove_cleanup_remote(run_id, record)
+    return attempted
+
+
+def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
+    """Persist cleanup identity without changing a terminal lifecycle state."""
+    record = _canonical_cleanup_remote(remote)
+    key = _cleanup_remote_key(record)
+    if record is None or key is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        records = _cleanup_remotes_from_raw(raw)
+        if all(_cleanup_remote_key(existing) != key for existing in records):
+            records.append(record)
+        current_identity = _remote_resource_identity(status.remote)
+        identity = _remote_resource_identity(record)
+        if current_identity is None or current_identity == identity:
+            status.remote = dict(remote)
+        status.updated_at = time.time()
+        _save_status_unlocked(status, _cleanup_remotes=records)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -1033,7 +1352,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     must check this return so a run concurrently flipped terminal does not get resumed.
     """
     report_status: RunStatus | None = None
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         status = get_status(run_id)
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
@@ -1046,7 +1365,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
             status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
-        _save_status(status)
+        _save_status_unlocked(status)
         report_status = status
     if report_status is not None:
         _report_status(report_status)
@@ -1055,7 +1374,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -1063,7 +1382,7 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -1077,7 +1396,7 @@ def record_billing_state(run_id: str, **fields) -> None:
     bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
-    with _STATUS_LOCK:
+    with _status_guard(run_id):
         try:
             status = get_status(run_id)
         except FileNotFoundError:
@@ -1099,7 +1418,7 @@ def record_billing_state(run_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(status, key, value)
         status.updated_at = time.time()
-        _save_status(status)
+        _save_status_unlocked(status)
     _report_status(status)
 
 
@@ -1110,15 +1429,66 @@ def _report_status(status: RunStatus) -> None:
         record_training_run(status=status)
 
 
-def _save_status(status: RunStatus) -> None:
+def _save_status(
+    status: RunStatus,
+    *,
+    _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
+    _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+) -> None:
+    with _status_guard(status.run_id):
+        if not os.path.exists(runs_file_path(status.run_id, ".json")):
+            if _run_deadline_at is _PRIVATE_VALUE_UNSET:
+                spec = JobSpec.from_dict(status.spec)
+                _run_deadline_at = _require_valid_deadline(
+                    _require_valid_deadline(status.created_at)
+                    + _require_valid_deadline(spec.gpu.max_wall_seconds)
+                )
+            if _next_attempt is _PRIVATE_VALUE_UNSET:
+                _next_attempt = 0
+        _save_status_unlocked(
+            status,
+            _run_deadline_at=_run_deadline_at,
+            _next_attempt=_next_attempt,
+            _cleanup_remotes=_cleanup_remotes,
+        )
+
+
+def _save_status_unlocked(
+    status: RunStatus,
+    *,
+    _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
+    _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
-    # Write-then-rename so concurrent readers never see a half-written file.
+    # write-then-rename so concurrent readers never see a half-written file.
     path = runs_file_path(status.run_id, ".json")
+    existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
+    private_values = {
+        _RUN_DEADLINE_AT_KEY: _run_deadline_at,
+        _NEXT_ATTEMPT_KEY: _next_attempt,
+        _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+    }
+    data = _status_storage_dict(status)
+    for key in _PRIVATE_STATUS_KEYS:
+        value = private_values[key]
+        if value is _PRIVATE_VALUE_UNSET:
+            value = existing.get(key, _PRIVATE_VALUE_UNSET)
+        if value is not _PRIVATE_VALUE_UNSET and value is not None:
+            data[key] = value
     fd, tmp = tempfile.mkstemp(dir=RUNS_DIR, prefix=f"{status.run_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(_status_storage_dict(status), f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(RUNS_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
