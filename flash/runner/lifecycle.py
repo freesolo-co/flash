@@ -479,8 +479,7 @@ def _submit_seed_supervised(
                             False,
                             failure="job_failed",
                             detail=(
-                                "provider create could not be reconciled "
-                                f"({type(exc).__name__})"
+                                f"provider create could not be reconciled ({type(exc).__name__})"
                             ),
                         )
                     else:
@@ -616,7 +615,6 @@ def _run_training(
     recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
     worker identities while each invocation keeps its own bounded retry budget."""
     from flash.runner import (
-        FIXED_SEED,
         TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
@@ -646,7 +644,7 @@ def _run_training(
     )
     metrics = _submit_seed_supervised(
         spec,
-        FIXED_SEED,
+        spec.seed,
         log,
         runtime_secrets=runtime_secrets,
         code_prefix=code_prefix,

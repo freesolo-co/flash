@@ -23,6 +23,7 @@ from flash.schema.fields import (
     _section_int,
     _train_float,
     _train_int,
+    _train_positive_int_tuple,
     _train_stops,
     _train_structured_outputs,
     _train_teacher,
@@ -202,6 +203,15 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+def _job_seed(raw: dict[str, Any]) -> int:
+    value = raw.get("seed", 42)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("seed must be an integer")
+    if value < 0 or value > 2**63 - 1:
+        raise ConfigError("seed must be between 0 and 9223372036854775807")
+    return value
+
+
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     ref_raw = train_raw.get("init_from_adapter")
     if ref_raw is None:
@@ -228,6 +238,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "algorithm",
         "model_policy",
         "thinking",
+        "seed",
         "environment",
         "train",
         "gpu",
@@ -380,6 +391,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             "after real-GPU validation"
         )
 
+    max_steps = _train_int(train_raw, "max_steps", minimum=0)
+    checkpoint_landmarks = _train_positive_int_tuple(train_raw, "checkpoint_landmarks")
+    if max_steps and checkpoint_landmarks and checkpoint_landmarks[-1] > max_steps:
+        raise ConfigError("train.checkpoint_landmarks cannot contain a step beyond train.max_steps")
+
     worker_env = _worker_env(raw.get("worker_env"))
     wandb_spec = _wandb_spec(raw.get("wandb"))
 
@@ -402,6 +418,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
             save_every=_train_int(train_raw, "save_every", minimum=1),
+            checkpoint_landmarks=checkpoint_landmarks,
             group_size=_train_int(train_raw, "group_size", minimum=1),
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
@@ -415,11 +432,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             # minimum=0: explicit 0 means "no cap" per TrainSpec contract
-            max_steps=_train_int(train_raw, "max_steps", minimum=0),
+            max_steps=max_steps,
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
         ),
         gpu=GpuSpec(type=gpu_type, **gpu_options),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
+        seed=_job_seed(raw),
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,

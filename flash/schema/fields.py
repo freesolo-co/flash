@@ -34,6 +34,25 @@ def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     return _section_int(train_raw, "train", key, minimum=minimum)
 
 
+def _train_positive_int_tuple(train_raw: dict, key: str) -> tuple[int, ...]:
+    """Validate an optional strictly increasing list of positive integer steps."""
+    value = train_raw.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"train.{key} must be a list of integers")
+    out: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(f"train.{key} entries must be integers")
+        if item <= 0:
+            raise ConfigError(f"train.{key} entries must be positive")
+        out.append(item)
+    if out != sorted(set(out)):
+        raise ConfigError(f"train.{key} must be strictly increasing with no duplicates")
+    return tuple(out)
+
+
 def _train_float(
     train_raw: dict,
     key: str,
