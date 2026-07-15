@@ -47,11 +47,6 @@ from flash.providers._poll import (
     STALL_AFTER_S,
     make_say,
 )
-
-# Re-exported (unused here) so the cross-provider symmetry guard can assert every rent-a-box jobs module
-# draws the setup-vs-training stall boundary from the ONE canonical helper (the shared poll driver uses
-# it); keeps the rule from drifting between providers.
-from flash.providers._poll import is_training_heartbeat as is_training_heartbeat
 from flash.providers.base import (
     GPU_INFO,
     PollResult,
@@ -476,7 +471,7 @@ def _failure_detail(
     prefix: str,
     phase: str,
     marker: dict | None,
-    instance_id: int | None = None,
+    instance_id: int,
     attempt: int = 0,
 ) -> str:
     """Assemble bounded failure detail from worker artifacts and the Vast console."""
@@ -489,13 +484,12 @@ def _failure_detail(
         parts.append(
             f"--- {err_name} ---\n{sanitize_diagnostic(content[-4096:], limit=4096)}"
         )
-    if instance_id:
-        logs = vast_api.instance_logs(int(instance_id))
-        if logs:
-            parts.append(
-                "--- instance log tail ---\n"
-                f"{sanitize_diagnostic(logs[-4096:], limit=4096)}"
-            )
+    logs = vast_api.instance_logs(int(instance_id))
+    if logs:
+        parts.append(
+            "--- instance log tail ---\n"
+            f"{sanitize_diagnostic(logs[-4096:], limit=4096)}"
+        )
     return "\n".join(parts) or "vast worker terminated without a strict terminal marker"
 
 

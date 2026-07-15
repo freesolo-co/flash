@@ -33,13 +33,15 @@ def _read_config() -> dict:
 def load_credentials_with_source() -> tuple[str, str | None, str | None]:
     """Resolve (api_url, api_key, key_source); key/source are None when logged out."""
     cfg = _read_config()
-    api_url = os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL
+    api_url = (os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL).rstrip(
+        "/"
+    )
     env_key = os.environ.get("FREESOLO_API_KEY")
     if env_key:
-        return api_url.rstrip("/"), env_key, "FREESOLO_API_KEY"
+        return api_url, env_key, "FREESOLO_API_KEY"
     if cfg.get("api_key"):
-        return api_url.rstrip("/"), cfg["api_key"], str(CONFIG_PATH)
-    return api_url.rstrip("/"), None, None
+        return api_url, cfg["api_key"], str(CONFIG_PATH)
+    return api_url, None, None
 
 
 def load_credentials() -> tuple[str, str | None]:

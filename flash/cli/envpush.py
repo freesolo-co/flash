@@ -187,7 +187,6 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"dataset"})
 # ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
 # user-authored README/NOTES) travels with the env into the hub and back out through
 # ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
@@ -292,7 +291,7 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
             continue
         target = dest / child.name
         if child.is_dir():
-            if child.name in _ENV_PUSH_SIDECAR_DIRS:
+            if child.name == "dataset":
                 shutil.copytree(
                     child,
                     target,
@@ -352,11 +351,10 @@ class _UploadProgress(TtyStatusLine):
         )
 
 
-def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | None = None) -> int:
+def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
-    bar = bar or _UploadProgress(name)
     try:
         result = client_from_config().publish_env(
             name=name, package_b64=package_b64, progress=bar.callback

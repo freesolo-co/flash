@@ -28,7 +28,6 @@ _CLIENT = RestClient(
     env_var="LAMBDA_API_KEY",
     error_cls=LambdaApiError,
     base_url=LAMBDA_BASE,
-    missing_key_message="LAMBDA_API_KEY not configured on the control-plane host",
     extra_headers={"User-Agent": _USER_AGENT},
 )
 

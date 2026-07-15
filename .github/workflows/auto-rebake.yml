@@ -105,9 +105,9 @@ jobs:
           FP_BASE: ${{ steps.base.outputs.fp_base }}
           REV: ${{ steps.base.outputs.revision }}
         run: |
-          # arch list is the single source of truth in deps.py (mirrored by the bake matrix; a test
-          # pins that mirror). textual parse -> no flash import / uv sync needed.
-          arches=$(python3 -c "import re,pathlib; t=pathlib.Path('flash/providers/runpod/train/deps.py').read_text(); m=re.search(r'BAKED_PER_SM_ARCHES\s*=\s*frozenset\(\{([^}]+)\}\)', t); print(' '.join(re.findall(r'sm\d+', m.group(1))))")
+          # flash/providers/_worker.py is the single source of truth for the arch list; the bake
+          # matrix mirrors it. read the canonical assignment statically without importing flash.
+          arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
           relayer=(); gpu=()
           summary="| arch | published fp_cache | published fp_base | action |\n|---|---|---|---|\n"
           for sm in $arches; do

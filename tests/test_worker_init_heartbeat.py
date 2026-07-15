@@ -698,7 +698,7 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     assert is_training_heartbeat("sft_step", "not-a-number") is False
     assert is_training_heartbeat("opd_step", None) is False
     # POST-training stages carry NO step but mean training is DONE -> tighten so a hung teardown/DONE
-    # upload falls under the tight window, not the wide setup grace (the MqsTh fix).
+    # upload falls under the tight window, not the wide setup grace.
     assert is_training_heartbeat("rl_trained", None) is True
     assert is_training_heartbeat("sft_trained", None) is True
     assert is_training_heartbeat("rl_train_done", None) is True
