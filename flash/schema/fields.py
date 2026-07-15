@@ -8,23 +8,38 @@ from typing import Any
 
 from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec
+from flash.spec import WandbSpec, parse_positive_int_tuple
+
+
+def _section_int(
+    section_raw: dict, section: str, key: str, *, minimum: int | None = None
+) -> int | None:
+    """validate an optional section-qualified integer knob."""
+    v = section_raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ConfigError(f"{section}.{key} must be an integer")
+    # int(inf) raises overflowerror, so check finiteness before conversion.
+    if not math.isfinite(v) or float(v) != int(v):
+        raise ConfigError(f"{section}.{key} must be a finite integer")
+    v = int(v)
+    if minimum is not None and v < minimum:
+        raise ConfigError(f"{section}.{key} must be >= {minimum}")
+    return v
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400)."""
-    v = train_raw.get(key)
-    if v is None:
-        return None
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise ConfigError(f"train.{key} must be an integer")
-    # int(inf) raises OverflowError (500), not ValueError; check finiteness first.
-    if not math.isfinite(v) or float(v) != int(v):
-        raise ConfigError(f"train.{key} must be a finite integer")
-    v = int(v)
-    if v < minimum:
-        raise ConfigError(f"train.{key} must be >= {minimum}")
-    return v
+    return _section_int(train_raw, "train", key, minimum=minimum)
+
+
+def _train_positive_int_tuple(train_raw: dict, key: str) -> tuple[int, ...]:
+    """Validate an optional strictly increasing list of positive integer steps."""
+    try:
+        return parse_positive_int_tuple(train_raw.get(key), name=f"train.{key}")
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _train_float(
@@ -287,8 +302,7 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
     reserved = sorted(set(secrets) & _RESERVED_ENVIRONMENT_SECRET_KEYS)
     if reserved:
         raise ConfigError(
-            "[environment] secrets must not include platform-managed key(s): "
-            f"{', '.join(reserved)}"
+            f"[environment] secrets must not include platform-managed key(s): {', '.join(reserved)}"
         )
     return secrets
 

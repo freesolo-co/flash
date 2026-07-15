@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import io
+import threading
 
 import pytest
 
 from flash.spec import JobSpec
+
+_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
@@ -37,16 +40,29 @@ def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
     )
 
 
-def _lambda_handle(instance_id="i1"):
-    return {"provider": "lambda", "instance_id": instance_id, "region": "us-east-1", "name": "n"}
+def _lambda_handle(instance_id="i1", attempt=0):
+    return {
+        "provider": "lambda",
+        "instance_id": instance_id,
+        "instance_type": "gpu_1x_a100",
+        "region": "us-east-1",
+        "name": "n",
+        "gpu": "A100",
+        "hourly_usd": 1.0,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
+    }
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j"):
+def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
         "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
+        "attempt": attempt,
+        "started_ts": float(attempt + 1),
     }
 
 
@@ -85,7 +101,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         captured["gpu_type"] = run_spec.gpu.type
         captured["runtime_secrets"] = dict(runtime_secrets or {})
         if on_handle:
-            on_handle(_runpod_handle())
+            on_handle(_runpod_handle(attempt=attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -103,6 +119,410 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
     assert remote["allocated_gpu"] == "RTX 4090"
+
+
+def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    original_spec_with_gpu = orch._spec_with_gpu
+
+    def cancel_after_allocation(run_spec, gpu_type):
+        selected = original_spec_with_gpu(run_spec, gpu_type)
+        assert orch._update(run_spec.run_id, "cancelled")
+        return selected
+
+    provider_calls = []
+
+    def fake_runpod_submit(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(orch, "_spec_with_gpu", cancel_after_allocation)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    with pytest.raises(orch._RunCancelled):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    status = orch.get_status(spec.run_id)
+    assert status.state == "cancelled"
+    assert status.effective_preparation is None
+    assert not orch._persist_effective_worker_spec(spec)
+    assert provider_calls == []
+
+
+def test_cancel_waits_for_durable_provider_handle_then_tears_down(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(run_id="flash-provider-handshake-cancel", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+
+    resource_created = threading.Event()
+    allow_handle = threading.Event()
+    handle_persisted = threading.Event()
+    polling = threading.Event()
+    allow_poll = threading.Event()
+    cancellation_started = threading.Event()
+    cancellation_finished = threading.Event()
+    resource_live = {"value": False}
+    cancelled_handles = []
+    destroyed_handles = []
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        resource_live["value"] = True
+        resource_created.set()
+        assert allow_handle.wait(timeout=5)
+        on_handle(_runpod_handle("ep-handshake", "job-handshake"))
+        persisted_remote = orch.get_status(spec.run_id).remote
+        assert persisted_remote["endpoint_id"] == "ep-handshake"
+        assert persisted_remote["job_id"] == "job-handshake"
+        handle_persisted.set()
+        polling.set()
+        assert allow_poll.wait(timeout=5)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    def cancel_job(endpoint_id, job_id, **_kw):
+        cancelled_handles.append((endpoint_id, job_id))
+
+    def delete_endpoint(endpoint_id, _fingerprint):
+        destroyed_handles.append(endpoint_id)
+        resource_live["value"] = False
+        return True
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+
+    submit_errors = []
+
+    def submit():
+        try:
+            orch._submit_seed_supervised(spec, 0, io.StringIO())
+        except Exception as exc:
+            submit_errors.append(exc)
+
+    cancel_results = []
+
+    def cancel():
+        cancellation_started.set()
+        cancel_results.append(orch.cancel_run(spec.run_id))
+        cancellation_finished.set()
+
+    submit_thread = threading.Thread(target=submit)
+    submit_thread.start()
+    assert resource_created.wait(timeout=5)
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert cancellation_started.wait(timeout=5)
+    cancel_thread.join(timeout=0.1)
+    assert cancel_thread.is_alive()
+    assert not cancellation_finished.is_set()
+    assert orch.get_status(spec.run_id).remote is None
+    assert resource_live["value"]
+
+    allow_handle.set()
+    assert handle_persisted.wait(timeout=5)
+    assert polling.wait(timeout=5)
+    assert cancellation_finished.wait(timeout=5)
+    cancel_thread.join(timeout=5)
+
+    assert not cancel_thread.is_alive()
+    assert submit_thread.is_alive()
+    assert cancel_results[0].state == "cancelled"
+    status = orch.get_status(spec.run_id)
+    assert status.state == "cancelled"
+    assert status.remote is None
+    assert cancelled_handles == [("ep-handshake", "job-handshake")]
+    assert "ep-handshake" in destroyed_handles
+    assert not resource_live["value"]
+
+    allow_poll.set()
+    submit_thread.join(timeout=5)
+    assert not submit_thread.is_alive()
+    assert len(submit_errors) == 1
+    assert isinstance(submit_errors[0], orch._RunCancelled)
+    assert not resource_live["value"]
+
+
+def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    spec = _spec(run_id="flash-concurrent-supervisors", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+
+    def allocate_for_supervisor(*args, **kwargs):
+        gpu = "RTX 4090" if threading.current_thread().name == "supervisor-a" else "RTX 5090"
+        return _alloc(gpu=gpu)
+
+    monkeypatch.setattr(allocator, "allocate", allocate_for_supervisor)
+
+    resource_created = threading.Event()
+    allow_handle = threading.Event()
+    polling = threading.Event()
+    allow_poll = threading.Event()
+    provider_gpus = []
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        provider_gpus.append(run_spec.gpu.type)
+        resource_created.set()
+        assert allow_handle.wait(timeout=5)
+        on_handle(_runpod_handle("ep-first", "job-first"))
+        polling.set()
+        assert allow_poll.wait(timeout=5)
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    results = {}
+
+    def submit(name):
+        try:
+            results[name] = orch._submit_seed_supervised(spec, 0, io.StringIO())
+        except Exception as exc:
+            results[name] = exc
+
+    first = threading.Thread(target=submit, args=("first",), name="supervisor-a")
+    second = threading.Thread(target=submit, args=("second",), name="supervisor-b")
+    first.start()
+    assert resource_created.wait(timeout=5)
+    second.start()
+    second.join(timeout=0.1)
+    assert second.is_alive()
+
+    allow_handle.set()
+    assert polling.wait(timeout=5)
+    second.join(timeout=5)
+    assert not second.is_alive()
+    assert isinstance(results["second"], orch._RunCancelled)
+    assert provider_gpus == ["RTX 4090"]
+
+    status = orch.get_status(spec.run_id)
+    worker_spec = status.effective_preparation["worker_spec"]
+    assert worker_spec["gpu"]["type"] == "RTX 4090"
+    assert status.remote["endpoint_id"] == "ep-first"
+
+    allow_poll.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert results["first"]["train_tokens"] == 4096
+    assert provider_gpus == ["RTX 4090"]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["provider_exception", "provider_without_callback", "callback_persistence_exception"],
+)
+def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_mode):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.server._locks import _deploy_lock
+
+    spec = _spec(run_id=f"flash-lock-release-{failure_mode}", max_retries=0)
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+
+    original_update = orch._update
+
+    def fail_remote_persistence(run_id, state, **updates):
+        if failure_mode == "callback_persistence_exception" and updates.get("remote") is not None:
+            raise RuntimeError("remote persistence failed")
+        return original_update(run_id, state, **updates)
+
+    def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
+        if failure_mode == "provider_exception":
+            raise RuntimeError("provider create failed")
+        if failure_mode == "callback_persistence_exception":
+            on_handle({"provider": "runpod", "job_id": "job-no-persist"})
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(orch, "_update", fail_remote_persistence)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+
+    if failure_mode == "provider_without_callback":
+        metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+        assert metrics["train_tokens"] == 4096
+    else:
+        with pytest.raises(RuntimeError, match="failed after retries"):
+            orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    lock = _deploy_lock(spec.run_id)
+    assert lock.acquire(blocking=False)
+    lock.release()
+
+
+def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, monkeypatch):
+    import flash.envs.loader as env_loader
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import lifecycle
+
+    resolved_sha = "a" * 40
+    resolved_refs = []
+    submitted = []
+
+    def fake_resolve(parsed, *args, **kwargs):
+        resolved_refs.append(parsed.canonical())
+        return resolved_sha
+
+    def fake_runpod_submit(run_spec, seed, **kwargs):
+        persisted = orch.get_status(run_spec.run_id).effective_preparation["worker_spec"]
+        assert persisted["environment"]["resolved_sha"] == resolved_sha
+        assert persisted["gpu"]["type"] == "RTX 5090"
+        assert persisted["gpu"]["network_volume"] == "flash-weights"
+        submitted.append(
+            {
+                "resolved_sha": run_spec.environment.resolved_sha,
+                "gpu_type": run_spec.gpu.type,
+                "network_volume": run_spec.gpu.network_volume,
+            }
+        )
+        return PollResult(True, metrics={"train_tokens": 4096, "wall_seconds": 1})
+
+    monkeypatch.setattr(env_loader, "_resolve_ref_sha", fake_resolve)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 5090"))
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    monkeypatch.setattr("flash.providers._worker.upload_code", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "flash_code_prefix", lambda: "code/test/flash")
+    monkeypatch.setattr(orch, "_persist_metrics", lambda *a, **k: 0.0)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+
+    status = orch.submit_job(public)
+
+    assert status.state == "done"
+    assert resolved_refs == ["github:owner/repo@main:env/environment.py"]
+    assert submitted == [
+        {
+            "resolved_sha": resolved_sha,
+            "gpu_type": "RTX 5090",
+            "network_volume": "flash-weights",
+        }
+    ]
+    stored = orch.get_status(public.run_id)
+    assert stored.spec["environment"]["resolved_sha"] == ""
+    worker = stored.effective_preparation["worker_spec"]
+    assert worker["environment"]["resolved_sha"] == resolved_sha
+    assert worker["gpu"]["type"] == "RTX 5090"
+    assert worker["gpu"]["network_volume"] == "flash-weights"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("id", "other/environment@main", id="id"),
+        pytest.param("params", {"difficulty": "hard"}, id="kwargs"),
+        pytest.param("id", "owner/environment@dev", id="revision"),
+        pytest.param(
+            "params",
+            {"difficulty": "easy", "arbitrary": "value"},
+            id="arbitrary-field",
+        ),
+        pytest.param("pip", ["dep==2"], id="pip"),
+        pytest.param("secrets", ["OTHER_TOKEN"], id="secrets"),
+    ],
+)
+def test_effective_spec_rejects_other_environment_mutations(field, value):
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {
+                "id": "owner/environment@main",
+                "params": {"difficulty": "easy"},
+                "pip": ["dep==1"],
+                "secrets": ["TOKEN"],
+            },
+        }
+    )
+    worker_dict = public.to_internal_dict()
+    worker_dict["environment"][field] = value
+    worker = JobSpec.from_dict(worker_dict)
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
+
+
+@pytest.mark.parametrize(
+    "resolved_sha",
+    [
+        pytest.param("main", id="symbolic-ref"),
+        pytest.param("not-a-commit", id="arbitrary-string"),
+        pytest.param("a" * 39, id="short-hex"),
+        pytest.param("g" * 40, id="non-hex"),
+        pytest.param(123, id="non-string"),
+    ],
+)
+def test_effective_spec_rejects_malformed_worker_resolved_sha(resolved_sha):
+    from dataclasses import replace
+
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        }
+    )
+    worker = replace(
+        public,
+        environment=replace(public.environment, resolved_sha=resolved_sha),
+    )
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
+
+
+@pytest.mark.parametrize(
+    "resolved_sha",
+    [
+        pytest.param("", id="removal"),
+        pytest.param("b" * 40, id="replacement"),
+    ],
+)
+def test_effective_spec_rejects_changing_existing_resolved_env_sha(resolved_sha):
+    from dataclasses import replace
+
+    from flash import runner
+
+    public = JobSpec.from_dict(
+        {
+            **_spec().to_internal_dict(),
+            "environment": {
+                "id": "github:owner/repo@main:env/environment.py",
+                "resolved_sha": "a" * 40,
+            },
+        }
+    )
+    worker = replace(
+        public,
+        environment=replace(public.environment, resolved_sha=resolved_sha),
+    )
+
+    with pytest.raises(ValueError, match="effective preparation"):
+        runner._validate_effective_spec(public, worker)
 
 
 def test_runpod_cost_projection_flows_into_run_status(orch, monkeypatch):
@@ -127,15 +547,19 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     cancelled, deleted, submitted_gpus = [], [], []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda e, j, **_kw: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted.append(e) or True)
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
         if attempt == 0:
-            on_handle(_runpod_handle("ep1", "j1"))
+            on_handle(_runpod_handle("ep1", "j1", attempt))
             return PollResult(False, failure="stalled", detail="no worker progress")
-        on_handle(_runpod_handle("ep2", "j2"))
+        on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
@@ -148,6 +572,57 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "L4", 0.39, 24),
+        Candidate("runpod", "H100", 0.49, 48),
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+
+    submitted_attempts = []
+    deleted_endpoints = []
+    gc_calls = []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: deleted_endpoints.append(endpoint_id) or False,
+    )
+    monkeypatch.setattr(
+        RunpodProvider,
+        "gc",
+        lambda self, cleanup_spec: gc_calls.append(cleanup_spec.run_id),
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
+        submitted_attempts.append(attempt)
+        on_handle(_runpod_handle("ep-unconfirmed", "job-unconfirmed", attempt))
+        return PollResult(False, failure="stalled", detail="no worker progress")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="flash-unconfirmed-runpod-teardown")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
+        orch._submit_seed_supervised(spec, 0, log)
+
+    assert submitted_attempts == [0]
+    assert deleted_endpoints
+    assert set(deleted_endpoints) == {"ep-unconfirmed"}
+    assert gc_calls == [spec.run_id]
+    status = orch.get_status(spec.run_id)
+    assert status.remote["endpoint_id"] == "ep-unconfirmed"
+    assert status.remote["job_id"] == "job-unconfirmed"
+    assert "teardown unconfirmed" in log.getvalue()
 
 
 def _oom_candidates():
@@ -167,8 +642,12 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     from flash.providers.runpod import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=_oom_candidates()))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     submitted = []
     on_last_gpu = []
@@ -177,7 +656,7 @@ def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted.append(run_spec.gpu.type)
         on_last_gpu.append(kwargs.get("on_last_gpu", False))
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         failure = next(failure_iter)
         detail = "CUDA out of memory" if failure == "oom" else "x"
         return PollResult(False, failure=failure, detail=detail)
@@ -297,14 +776,18 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
         Candidate("lambda", "H100", 0.50, 48),  # the right cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     rp_gpus, lam_gpus = [], []
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep1", "j1"))
+        on_handle(_runpod_handle("ep1", "j1", attempt))
         return PollResult(
             False, failure="no_capacity", detail="job stuck IN_QUEUE (no RunPod capacity)"
         )
@@ -312,7 +795,7 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle())
+            on_handle(_lambda_handle(attempt=attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -328,12 +811,8 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     assert "walking past the cheapest class" in log.getvalue()
 
 
-def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatch):
-    """The platform auto-attaches the SHARED weight cache, so its endpoint-pinning DC-set
-    restriction must not cost the user a GPU-walk retry: a no_capacity on the cached spec earns ONE
-    extra, cache-less cross-region attempt even at max_retries=0 (else the auto-cache could fail a
-    run a cache-less launch would have won). Regression for the cache-fallback-vs-retry-budget gap.
-    """
+def test_auto_cache_run_gets_free_cacheless_fallback_at_zero_retries(orch, monkeypatch):
+    """max_retries=0 still permits one free cacheless fallback for a shared-cache run."""
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
@@ -345,8 +824,12 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
         "allocate",
         lambda *a, **k: _alloc(candidates=(Candidate("runpod", "H100", 0.49, 48),)),
     )
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     volumes_seen = []
 
@@ -354,11 +837,13 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
         vol = getattr(run_spec.gpu, "network_volume", None)
         volumes_seen.append(vol)
         if on_handle:
-            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
         # fallback attempt -> success.
         if vol == WEIGHT_CACHE_VOLUME_NAME:
-            return PollResult(False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)")
+            return PollResult(
+                False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -366,7 +851,6 @@ def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatc
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
     assert metrics["train_tokens"] == 4096
-    # Exactly two attempts: the cache-attached one (no_capacity) then the bonus cache-less retry.
     assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
 
 
@@ -383,12 +867,20 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
-        Candidate("runpod", "H100", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
-        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # the GPU-walk target the real retry must reach
+        Candidate(
+            "runpod", "H100", 0.49, 48
+        ),  # cheapest -> cache attempt, then cache-less same class
+        Candidate(
+            "runpod", "RTX 6000 Ada", 0.50, 48
+        ),  # the GPU-walk target the real retry must reach
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     seen = []
 
@@ -396,7 +888,7 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
         vol = getattr(run_spec.gpu, "network_volume", None)
         seen.append((run_spec.gpu.type, vol))
         if on_handle:
-            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         # Cache attempt AND its cache-less same-class fallback both starve; only the walk to the OTHER
         # class (the genuine retry that must survive the cache drop) succeeds.
         if run_spec.gpu.type == "RTX 6000 Ada":
@@ -435,16 +927,18 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     terminated = []
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api,
+        "terminate_instance_confirmed",
+        lambda instance_id: terminated.append(instance_id),
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
 
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle("i-broken"))
+            on_handle(_lambda_handle("i-broken", attempt))
         return PollResult(
             False,
             failure="job_preempted",
@@ -453,7 +947,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep2", "j2"))
+        on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_lam)
@@ -486,15 +980,15 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
         Candidate("runpod", "H100", 0.49, 48),  # the cross-provider escape
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+    monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", lambda instance_id: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
 
     def fake_lam(spec, seed, log=None, on_handle=None, attempt=0, **kw):
         lam_gpus.append(spec.gpu.type)
         if on_handle:
-            on_handle(_lambda_handle())
+            on_handle(_lambda_handle(attempt=attempt))
         return PollResult(
             False,
             failure="stalled",
@@ -503,7 +997,7 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         rp_gpus.append(run_spec.gpu.type)
-        on_handle(_runpod_handle("ep3", "j3"))
+        on_handle(_runpod_handle("ep3", "j3", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_lam)
@@ -537,23 +1031,28 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     assert calls == [0]
 
 
-def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
+def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import train as rp_train
 
     cancelled_jobs, deleted_eps = [], []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled_jobs.append((e, j)))
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted_eps.append(e) or True)
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda e, j, **_kw: cancelled_jobs.append((e, j)) or {"id": j, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted_eps.append(e) or True)
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
     spec = _spec()
     st = _seed_status(orch, spec)
     st.state = "running"
     st.remote = {"endpoint_id": "ep1", "endpoint_name": "n", "job_id": "j1"}
     orch._save_status(st)
-    out = orch.cancel_run(spec.run_id)
-    assert out.state == "cancelled"
-    assert cancelled_jobs == [("ep1", "j1")]
-    assert "ep1" in deleted_eps
+    with pytest.raises(RuntimeError, match="exact cleanup target could not be preserved"):
+        orch.cancel_run(spec.run_id)
+    assert cancelled_jobs == []
+    assert deleted_eps == []
+    assert orch.get_status(spec.run_id).remote == st.remote
 
 
 def test_config_gpu_fields(monkeypatch):

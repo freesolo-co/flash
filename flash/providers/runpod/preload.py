@@ -86,22 +86,36 @@ def _preload_one_dc(
         }
 
     endpoint_id = None
+    key_fingerprint = None
+    deadline_at = time.time() + timeout_s
     try:
-        endpoint_id, _name = deploy_train_endpoint(
+        endpoint_id, _name, key_fingerprint = deploy_train_endpoint(
             gpu,
             execution_timeout_ms=timeout_s * 1000,
             name_suffix=f"preload-{dc_id.lower()}-{uuid.uuid4().hex[:6]}",
             spec=None,
             endpoint_kwargs=_endpoint_kwargs,
+            deadline_at=deadline_at,
         )
         payload = {
             "mode": "preload",
             "models": models,
             "env": {"HF_HOME": _HF_HOME, **({"HF_TOKEN": token} if token else {})},
         }
-        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
+        job_id = runpod_api.submit_job(
+            endpoint_id,
+            build_function_input(payload),
+            key_fingerprint=key_fingerprint,
+            deadline_at=deadline_at,
+        )
         logger.info("preload %s: job %s submitted (%d models)", dc_id, job_id, len(models))
-        result = _poll_until_done(endpoint_id, job_id, timeout_s, poll_interval_s)
+        result = _poll_until_done(
+            endpoint_id,
+            job_id,
+            key_fingerprint,
+            timeout_s,
+            poll_interval_s,
+        )
         if result.get("error"):
             return {"datacenter": dc_id, "status": "error", "error": result["error"], "result": result}
         if result.get("failed"):
@@ -111,17 +125,26 @@ def _preload_one_dc(
         logger.warning("preload %s FAILED: %s", dc_id, exc)
         return {"datacenter": dc_id, "status": "error", "error": str(exc)}
     finally:
-        if endpoint_id:
+        if endpoint_id and key_fingerprint:
             with contextlib.suppress(Exception):
-                runpod_api.delete_endpoint(endpoint_id)
+                runpod_api.delete_endpoint_for_fingerprint(endpoint_id, key_fingerprint)
 
 
 def _poll_until_done(
-    endpoint_id: str, job_id: str, timeout_s: int, poll_interval_s: float
+    endpoint_id: str,
+    job_id: str,
+    key_fingerprint: str,
+    timeout_s: int,
+    poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        st = runpod_api.job_status(endpoint_id, job_id)
+        st = runpod_api.job_status(
+            endpoint_id,
+            job_id,
+            key_fingerprint=key_fingerprint,
+            deadline_at=deadline,
+        )
         status = (st or {}).get("status")
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
@@ -302,14 +325,21 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     # polling to full timeout on a dead box). Completion file is authoritative when present.
     fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/{provider}_attempt0.json",
                                       min_interval_s=max(5.0, poll_interval_s))
+    deadline = time.time() + effective_s
     try:
         try:
-            jobs_mod.launch_and_submit(spec, seed=0, instances=[candidate], attempt=0,
-                                       mode="preload", models=models)
+            jobs_mod.launch_and_submit(
+                spec,
+                seed=0,
+                instances=[candidate],
+                attempt=0,
+                mode="preload",
+                models=models,
+                deadline_at=deadline,
+            )
         except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
             return {"provider": provider, "region": region, "status": "error", "error": f"launch: {exc}"}
         logger.info("warm %s/%s: launched preload (%d models)", provider, region, len(models))
-        deadline = time.time() + effective_s
         text = None
         while time.time() < deadline:
             text = reader(force=True)
@@ -416,7 +446,7 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
         return done
     for region in regions:
         try:
-            lambda_api.ensure_filesystem(target, region)
+            lambda_api.ensure_filesystem(target, region, deadline_at=time.time() + 300.0)
             done.append(f"lambda:{region}")
         except Exception as exc:
             logger.warning("provision: lambda ensure_filesystem(%s, %s) failed: %s", target, region, exc)

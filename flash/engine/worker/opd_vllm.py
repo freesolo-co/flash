@@ -34,17 +34,30 @@ class OpdVllmOutput:
 
 
 def opd_lora_rank(model, default: int = 32) -> int:
-    """Best-effort PEFT LoRA rank for vLLM's max_lora_rank."""
+    """Best-effort maximum PEFT LoRA rank for vLLM's max_lora_rank."""
     cfgs = getattr(model, "peft_config", None) or {}
     cfg_iter = cfgs.values() if isinstance(cfgs, dict) else (cfgs,)
+    ranks: list[int] = []
     for cfg in cfg_iter:
         rank = getattr(cfg, "r", None)
-        if isinstance(rank, dict):
-            vals = [int(v) for v in rank.values() if isinstance(v, int) and v > 0]
-            if vals:
-                return max(vals)
-        if isinstance(rank, int) and rank > 0:
-            return rank
+        if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+            ranks.append(rank)
+        elif isinstance(rank, dict):
+            # Some PEFT configs express per-module ranks as a dict-valued `r`; take the max.
+            ranks.extend(
+                int(value)
+                for value in rank.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+        pattern = getattr(cfg, "rank_pattern", None)
+        if isinstance(pattern, dict):
+            ranks.extend(
+                int(value)
+                for value in pattern.values()
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            )
+    if ranks:
+        return max(ranks)
     try:
         return max(1, int(default))
     except (TypeError, ValueError):
@@ -240,6 +253,8 @@ class OpdVllmRolloutEngine:
     temperature: float
     top_p: float
     stop_sequences: tuple[str, ...] = ()
+    # the exact model/tokenizer halt set used for generation and termination classification.
+    eos_token_ids: tuple[int, ...] = ()
     # StructuredOutputsParams kwargs (parsed [train] structured_outputs); None = unconstrained.
     structured_outputs: dict[str, Any] | None = None
     # vLLM EngineArgs.reasoning_parser (e.g. "deepseek_r1") when thinking + a constraint are both on:
@@ -390,6 +405,8 @@ class OpdVllmRolloutEngine:
             "top_p": float(self.top_p),
             "stop": list(self.stop_sequences) if self.stop_sequences else None,
         }
+        if self.eos_token_ids:
+            kwargs["stop_token_ids"] = list(self.eos_token_ids)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
         # matching the shared OPD stop-trimming path. Older vLLM builds ignore unsupported kwargs by
         # raising.
