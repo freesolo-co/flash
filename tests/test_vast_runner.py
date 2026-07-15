@@ -2153,8 +2153,6 @@ def test_submit_gates_exact_search_on_user_pin_not_allocated_class(monkeypatch):
     # (gpu.exact_type), not the allocated gpu.type. passing gpu.type unconditionally dropped
     # fungible cross-architecture capacity (e.g. a 40GB "A100 PCIE" board usable as A100 SXM 40GB)
     # for non-exact runs, whose verify_gpu is soft and would have accepted those boards.
-    from flash.providers.vast import jobs as vast
-
     seen: dict[str, str] = {}
 
     def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
