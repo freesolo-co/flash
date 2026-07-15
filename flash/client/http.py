@@ -129,6 +129,26 @@ def _validate_chat_messages(messages: list[dict]) -> None:
             raise ClientError(f"chat messages[{index}] must be an object")
 
 
+def _parse_chat_target(target: str) -> tuple[str, str | None]:
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+
+    revision = parse_adapter_revision(target)
+    if revision is not None:
+        return revision[0], target.strip()
+    parsed = parse_checkpoint_ref(target)
+    if parsed is None:
+        raise ClientError(
+            "invalid run id: expected a bare RUN_ID or full immutable adapter revision"
+        )
+    run_id, step = parsed
+    if step is not None:
+        raise ClientError(
+            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
+            "run alias; use the full immutable adapter revision returned by flash deployments"
+        )
+    return run_id, None
+
+
 class ApiClient:
     def __init__(
         self,
@@ -322,10 +342,24 @@ class ApiClient:
         deadline = time.monotonic() + 120.0
         last_state = "unknown"
         while True:
-            with contextlib.suppress(ClientError):
+            try:
                 status = self.get_run(run_id)
+            except ClientError:
+                pass
+            else:
                 last_state = str(status.get("state") or "unknown")
-                if last_state in {"cancelled", "done", "failed", "dry_run"}:
+                deployment = status.get("deployment") or {}
+                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
+                revocation_failed = (
+                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                )
+                if terminal and revocation_failed:
+                    error = deployment.get("error") or "unknown backend teardown error"
+                    raise ClientError(
+                        "cancel request reached the control plane, but backend revocation is "
+                        f"unconfirmed: {error}; retry cancellation"
+                    ) from cause
+                if terminal:
                     return status
             if time.monotonic() >= deadline:
                 raise ClientError(
@@ -342,7 +376,6 @@ class ApiClient:
         self,
         run_id: str,
         dry_run: bool = False,
-        verify: bool = True,
     ) -> dict:
         from flash.schema import parse_checkpoint_ref
 
@@ -353,7 +386,8 @@ class ApiClient:
                 "for a saved checkpoint"
             )
         base_run_id, step = parsed
-        body: dict = {"dry_run": dry_run, "verify": verify}
+        # smoke verification is mandatory server-side; there is no opt-out to forward.
+        body: dict = {"dry_run": dry_run}
         if step is not None:
             body["step"] = step
         return self._request(
@@ -399,19 +433,15 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
     ) -> dict:
-        from flash.schema import parse_checkpoint_ref
-
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
-            raise ClientError(
-                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
-            )
-        base_run_id, _step = parsed
+        base_run_id, adapter_revision = _parse_chat_target(run_id)
         _validate_chat_messages(messages)
+        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        if adapter_revision is not None:
+            body["adapter_revision"] = adapter_revision
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
-            body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
+            body=body,
             timeout=timeout if timeout is not None else 30 * 60,
         )
 
@@ -422,14 +452,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
-        from flash.schema import parse_checkpoint_ref
-
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
-            raise ClientError(
-                "invalid run id: expected RUN_ID or RUN_ID/step-N for a deployed checkpoint"
-            )
-        base_run_id, _step = parsed
+        base_run_id, adapter_revision = _parse_chat_target(run_id)
         _validate_chat_messages(messages)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -443,6 +466,11 @@ class ApiClient:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "stream": True,
+                    **(
+                        {"adapter_revision": adapter_revision}
+                        if adapter_revision is not None
+                        else {}
+                    ),
                 }
             ).encode(),
             headers=headers,
