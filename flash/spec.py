@@ -88,7 +88,7 @@ def _seed(value: Any) -> int:
     return value
 
 
-def _positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
+def parse_positive_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
     """Parse a strictly increasing list or tuple of positive integers."""
     if value is None:
         return ()
@@ -163,16 +163,14 @@ class TrainSpec:
     structured_outputs: str = field(default="", metadata={"introduced_in": "0.2.56"})
 
     def __post_init__(self) -> None:
-        landmarks = _positive_int_tuple(
+        landmarks = parse_positive_int_tuple(
             self.checkpoint_landmarks, name="train.checkpoint_landmarks"
         )
         object.__setattr__(self, "checkpoint_landmarks", landmarks)
-        if (
-            landmarks
-            and self.max_steps is not None
-            and self.max_steps > 0
-            and landmarks[-1] > self.max_steps
-        ):
+        max_steps = int(self.max_steps or 0)
+        if landmarks and max_steps <= 0:
+            raise ValueError("train.checkpoint_landmarks requires positive train.max_steps")
+        if landmarks and landmarks[-1] > max_steps:
             raise ValueError(
                 "train.checkpoint_landmarks cannot contain a step beyond train.max_steps"
             )
@@ -268,7 +266,7 @@ class JobSpec:
                 max_context_tokens=_opt_int(train.get("max_context_tokens")),
                 save_every=_opt_int(train.get("save_every")),
                 max_steps=_opt_int(train.get("max_steps")),
-                checkpoint_landmarks=_positive_int_tuple(
+                checkpoint_landmarks=parse_positive_int_tuple(
                     train.get("checkpoint_landmarks"), name="train.checkpoint_landmarks"
                 ),
                 max_examples=_opt_int(train.get("max_examples")),

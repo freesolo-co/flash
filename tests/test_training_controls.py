@@ -93,7 +93,19 @@ def test_checkpoint_landmarks_reject_steps_beyond_positive_max_steps(tmp_path):
         TrainSpec(max_steps=5, checkpoint_landmarks=(2, 6))
 
     assert TrainSpec(max_steps=5).checkpoint_landmarks == ()
-    assert TrainSpec(max_steps=-1, checkpoint_landmarks=(2,)).checkpoint_landmarks == (2,)
+    with pytest.raises(ValueError, match=r"requires positive train\.max_steps"):
+        TrainSpec(max_steps=-1, checkpoint_landmarks=(2,))
+
+
+def test_checkpoint_landmarks_require_explicit_positive_max_steps(tmp_path):
+    path = tmp_path / "invalid.toml"
+    path.write_text(_BASE_TOML + "checkpoint_landmarks = [2]\n")
+
+    with pytest.raises(ConfigError, match=r"requires positive train\.max_steps"):
+        spec_from_file(str(path))
+
+    with pytest.raises(ValueError, match=r"requires positive train\.max_steps"):
+        TrainSpec(checkpoint_landmarks=(2,))
 
 
 def test_authoritative_update_horizon_and_fallback_behavior():
@@ -181,6 +193,41 @@ def test_required_landmark_fails_when_trainer_checkpoint_is_missing(monkeypatch,
             SimpleNamespace(global_step=4),
             SimpleNamespace(),
         )
+
+
+def test_permanent_landmark_failure_is_not_retried(monkeypatch, tmp_path):
+    fake_transformers = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    fake_transformers.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf as worker_hf
+
+    checkpoint = tmp_path / "checkpoint-4"
+    checkpoint.mkdir()
+    calls = 0
+
+    def fail_permanently(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise worker_hf.CheckpointLandmarkError("missing deployable adapter")
+
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "publish_deployable_checkpoint", fail_permanently)
+    callback = worker.make_checkpoint_upload_callback((4,))
+
+    with pytest.raises(worker_hf.CheckpointLandmarkError, match="missing deployable adapter"):
+        callback.on_save(
+            SimpleNamespace(output_dir=str(tmp_path)),
+            SimpleNamespace(global_step=4),
+            SimpleNamespace(),
+        )
+
+    assert calls == 1
 
 
 def test_resumed_trainer_credits_landmarks_at_or_before_restored_step(monkeypatch, tmp_path):

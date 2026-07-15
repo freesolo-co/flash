@@ -107,7 +107,7 @@ id = "your-org/my-env"      # the id printed by `flash env push`
 epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
-# checkpoint_landmarks = [10, 50, 100]  # exact deployable checkpoints; overrides save_every
+# checkpoint_landmarks = [10, 50, 100]  # requires max_steps; overrides save_every
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
@@ -381,8 +381,9 @@ SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
 optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
 derived count with an exact update horizon for every algorithm. `[train] checkpoint_landmarks`
-requests exact deployable checkpoint steps; when non-empty, it suppresses periodic `save_every`
-checkpoints and the run fails if a requested landmark cannot be saved and published.
+requires a positive `max_steps` so its horizon is authoritative even when SFT packing changes the
+realized batch shape. When non-empty, landmarks suppress periodic `save_every` checkpoints, and the
+run fails if a requested landmark cannot be saved and published.
 
 ---
 

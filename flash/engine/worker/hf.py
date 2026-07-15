@@ -20,6 +20,10 @@ from flash.engine.worker.perf import RetriableInfraError, gpu_diagnostics
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 
 
+class CheckpointLandmarkError(RuntimeError):
+    """permanent checkpoint landmark contract failure."""
+
+
 def error_artifact_name(mode: str, attempt: int = 0) -> str:
     """Per-mode, per-attempt error filename (e.g. error_sft_attempt0.txt). Attempt-scoped so a prior
     attempt's stale traceback can't be mistaken for the current attempt's crash on a retry host-loss."""
@@ -334,11 +338,13 @@ def publish_deployable_checkpoint(
     """
     if not _w.HF_REPO:
         if required:
-            raise RuntimeError(f"checkpoint landmark step {step} has no artifact repository")
+            raise CheckpointLandmarkError(
+                f"checkpoint landmark step {step} has no artifact repository"
+            )
         return None
     if not _has_deployable_adapter(ckpt_dir):
         if required:
-            raise RuntimeError(
+            raise CheckpointLandmarkError(
                 f"checkpoint landmark step {step} has no deployable adapter in {ckpt_dir}"
             )
         return None
@@ -512,6 +518,8 @@ def make_checkpoint_upload_callback(checkpoint_landmarks=()):
                     _upload_once(step, ckpt_dir)
                     uploaded_steps.add(step)
                     return True
+                except CheckpointLandmarkError:
+                    raise
                 except Exception as e:
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
                         print(

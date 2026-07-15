@@ -393,7 +393,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
     max_steps = _train_int(train_raw, "max_steps", minimum=0)
     checkpoint_landmarks = _train_positive_int_tuple(train_raw, "checkpoint_landmarks")
-    if max_steps and checkpoint_landmarks and checkpoint_landmarks[-1] > max_steps:
+    if checkpoint_landmarks and not max_steps:
+        raise ConfigError("train.checkpoint_landmarks requires positive train.max_steps")
+    if checkpoint_landmarks and checkpoint_landmarks[-1] > int(max_steps or 0):
         raise ConfigError("train.checkpoint_landmarks cannot contain a step beyond train.max_steps")
 
     worker_env = _worker_env(raw.get("worker_env"))
