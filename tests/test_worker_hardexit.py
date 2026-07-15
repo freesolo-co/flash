@@ -13,10 +13,16 @@ already persisted to HF inside the handler), bypassing the hanging teardown.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import huggingface_hub
 import pytest
 
 import flash.engine.worker as worker
+from flash.engine.worker_entrypoint import WORKER_FAILURE_LINE
 
 
 class _HardExit(BaseException):
@@ -37,6 +43,68 @@ def _patch_common(monkeypatch, fake_exit):
     # so stub out the Hopper fla fast-path setup and the alloc-conf finalize.
     monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
+
+
+def _run_safe_entrypoint(tmp_path, sitecustomize):
+    (tmp_path / "sitecustomize.py").write_text(sitecustomize)
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
+    return subprocess.run(
+        [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_safe_entrypoint_failure(result, secret):
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert combined.strip() == WORKER_FAILURE_LINE
+    assert secret not in combined
+    assert "Traceback" not in combined
+
+
+def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
+    secret = "managed-private-provider-response"
+    result = _run_safe_entrypoint(
+        tmp_path,
+        "import flash.engine.worker as worker\n"
+        "def fail():\n"
+        f"    raise RuntimeError({secret!r})\n"
+        "worker.main = fail\n",
+    )
+    _assert_safe_entrypoint_failure(result, secret)
+
+
+def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
+    secret = "direct-worker-diagnostic"
+    (tmp_path / "sitecustomize.py").write_text(
+        "import flash.engine.worker as worker\n"
+        "def fail():\n"
+        f"    raise RuntimeError({secret!r})\n"
+        "worker.main = fail\n"
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "flash.engine.worker"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert combined.count("Traceback") == 1
+    assert secret in combined
 
 
 def test_worker_hard_exits_zero_on_success(monkeypatch):
@@ -142,6 +210,46 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
     assert exited["v"] is False, "must not hard-exit when the replay read failed"
     err_hbs = [k for _a, k in hb if k.get("retriable") is True]
     assert err_hbs, "the error heartbeat must be stamped retriable=True so the run reschedules"
+
+
+def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, tmp_path):
+    clock = {"now": 100.0}
+    sleeps = []
+    downloads = []
+
+    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
+    monkeypatch.setattr(worker.os, "_exit", lambda code=0: (_ for _ in ()).throw(_HardExit(code)))
+    monkeypatch.setattr(worker, "HF_REPO", "owner/run-dataset")
+    monkeypatch.setattr(worker, "hf_prefix", lambda: "seed0")
+    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(worker, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "wandb_finish", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+    done_marker = tmp_path / "DONE"
+    done_marker.write_text("")
+
+    def fake_download(*, repo_id, repo_type, filename, token=None):
+        downloads.append(filename)
+        if filename.endswith("/DONE"):
+            return str(done_marker)
+        raise OSError("private provider response")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    with pytest.raises(worker.RetriableInfraError) as exc_info:
+        worker.main()
+
+    assert downloads == ["seed0/DONE", "seed0/metrics.json"]
+    assert sleeps == [1.0]
+    assert "private" not in str(exc_info.value)
 
 
 def test_worker_does_not_hard_exit_on_failure(monkeypatch):

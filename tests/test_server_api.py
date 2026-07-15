@@ -3493,6 +3493,88 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert runner.get_status("nohandle-1").state != "failed"
 
 
+def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
+    import flash.providers as providers_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    run_id = "terminal-cleanup-recovery"
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint-cleanup",
+        "job_id": "job-cleanup",
+        "attempt": 1,
+    }
+    runner._save_status(
+        runner.RunStatus(run_id=run_id, state="cancelled", spec={"run_id": run_id}),
+        _cleanup_remotes=[remote],
+    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
+    drained = []
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set())
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+
+    app_mod.recover_runs()
+
+    assert drained == [run_id]
+
+
+
+def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
+    import flash.providers as providers_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+    from flash.spec import GpuSpec, JobSpec
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+    spec = JobSpec(
+        run_id="blocked-expired",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    created_at = 100.0
+    deadline = created_at + float(spec.gpu.max_wall_seconds)
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=created_at,
+        ),
+        _run_deadline_at=deadline,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner.time, "time", lambda: deadline + 1.0)
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    submitted = []
+    monkeypatch.setattr(
+        runner, "_run_job_background", lambda recovered: submitted.append(recovered.run_id)
+    )
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
+
+    app_mod.recover_runs()
+
+    recovered = runner.get_status(spec.run_id)
+    assert submitted == []
+    assert recovered.state == "failed"
+    assert "deadline exhausted" in recovered.error
+
+
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
     # Codex: a handle-less run's force-reap before resubmit is best-effort — Vast's gc
     # (destroy_run_instances) returns an empty list rather than raising when a DELETE is unconfirmed
@@ -4136,8 +4218,17 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "run_id": "good-2",
     }
     runner._save_status(
-        runner.RunStatus(run_id="bad-1", state="provisioning", spec=bad_spec, remote=None)
+        runner.RunStatus(
+            run_id="bad-1",
+            state="provisioning",
+            spec={**good_spec, "run_id": "bad-1"},
+            remote=None,
+        )
     )
+    bad_raw = runner._load_status_json("bad-1")
+    bad_raw["spec"] = bad_spec
+    with open(runner.runs_file_path("bad-1", ".json"), "w") as file:
+        json.dump(bad_raw, file)
     runner._save_status(
         runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
     )
