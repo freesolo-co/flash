@@ -307,27 +307,27 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     })
 
 
-def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: str,
-                       token: str | None, timeout_s: int, poll_interval_s: float) -> dict:
+def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
+                              timeout_s: int, poll_interval_s: float) -> dict:
     """Launch a download-only preload instance pinned to ``candidate``'s region, poll its status
     marker, then ALWAYS terminate. One region failing never aborts the others."""
     region = getattr(candidate, "region", "?")
     effective_s = max(60, int(timeout_s))
     # Embed reap deadline in the run_id so orphan sweep can free the box if this driver process dies.
     reap_deadline = int(time.time()) + effective_s
-    run_id = preload_instance_run_id(provider, region, reap_deadline, uuid.uuid4().hex[:6])
+    run_id = preload_instance_run_id("lambda", region, reap_deadline, uuid.uuid4().hex[:6])
     spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
     prefix = f"{spec.phase}/{run_id}"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
                                  min_interval_s=max(5.0, poll_interval_s))
     # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
     # polling to full timeout on a dead box). Completion file is authoritative when present.
-    fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/{provider}_attempt0.json",
+    fail_reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/lambda_attempt0.json",
                                       min_interval_s=max(5.0, poll_interval_s))
     deadline = time.time() + effective_s
     try:
         try:
-            jobs_mod.launch_and_submit(
+            lambda_jobs.launch_and_submit(
                 spec,
                 seed=0,
                 instances=[candidate],
@@ -337,8 +337,8 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
                 deadline_at=deadline,
             )
         except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
-            return {"provider": provider, "region": region, "status": "error", "error": f"launch: {exc}"}
-        logger.info("warm %s/%s: launched preload (%d models)", provider, region, len(models))
+            return {"provider": "lambda", "region": region, "status": "error", "error": f"launch: {exc}"}
+        logger.info("warm lambda/%s: launched preload (%d models)", region, len(models))
         text = None
         while time.time() < deadline:
             text = reader(force=True)
@@ -357,7 +357,7 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
                     fail = {}
                 if fail.get("ok") is True:
                     bad = fail.get("error") or fail.get("failed")
-                    return {"provider": provider, "region": region,
+                    return {"provider": "lambda", "region": region,
                             "status": "partial" if bad else "ok", "result": fail}
                 if not fail.get("ok", True):
                     # Completion file is authoritative: a partial run writes it before the fail marker,
@@ -365,50 +365,44 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
                     text = reader(force=True)
                     if text:
                         break
-                    return {"provider": provider, "region": region, "status": "error",
+                    return {"provider": "lambda", "region": region, "status": "error",
                             "error": f"box failed early: {fail.get('error') or 'see boot log'}"}
             time.sleep(max(5.0, poll_interval_s))
         if not text:
-            return {"provider": provider, "region": region, "status": "timeout"}
+            return {"provider": "lambda", "region": region, "status": "timeout"}
         result = json.loads(text)
         bad = result.get("error") or result.get("failed")
-        return {"provider": provider, "region": region,
+        return {"provider": "lambda", "region": region,
                 "status": "partial" if bad else "ok", "result": result}
     except Exception as exc:
-        return {"provider": provider, "region": region, "status": "error", "error": str(exc)}
+        return {"provider": "lambda", "region": region, "status": "error", "error": str(exc)}
     finally:
         with contextlib.suppress(Exception):
-            jobs_mod.terminate_run_instances(run_id)
+            lambda_jobs.terminate_run_instances(run_id)
 
 
 def warm_instances(models: list | None = None, gpu: str | None = None,
-                   providers: list | None = None, timeout_s: int = 1800,
-                   poll_interval_s: float = 20.0, max_workers: int = 4) -> list[dict]:
+                   timeout_s: int = 1800, poll_interval_s: float = 20.0,
+                   max_workers: int = 4) -> list[dict]:
     """Warm Lambda caches: one download-only launch per region with capacity. Returns status per region."""
     models = models or catalog_model_ids()
-    providers = providers or ["lambda"]
     token = os.environ.get("HF_TOKEN")
 
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
-    mods = {"lambda": lambda_jobs}
+    gpu = gpu or _LAMBDA_PRELOAD_GPU
+    try:
+        candidates = lambda_jobs.usable_instances(gpu)
+    except Exception as exc:
+        logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", gpu, exc)
+        candidates = []
+    seen_regions: set = set()
     targets: list = []
-    for provider in providers:
-        jobs_mod = mods.get(provider)
-        if jobs_mod is None:
+    for c in candidates:
+        if c.region in seen_regions:
             continue
-        provider_gpu = gpu or _LAMBDA_PRELOAD_GPU
-        seen_regions: set = set()
-        try:
-            candidates = jobs_mod.usable_instances(provider_gpu)
-        except Exception as exc:
-            logger.warning("warm %s: usable_instances(%s) failed (skipping): %s", provider, provider_gpu, exc)
-            continue
-        for c in candidates:
-            if c.region in seen_regions:
-                continue
-            seen_regions.add(c.region)
-            targets.append((provider, jobs_mod, c, provider_gpu))
+        seen_regions.add(c.region)
+        targets.append(c)
     if not targets:
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
@@ -422,8 +416,8 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
         ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [
-            ex.submit(_warm_one_instance, provider, jobs_mod, c, models, provider_gpu, token, timeout_s, poll_interval_s)
-            for (provider, jobs_mod, c, provider_gpu) in targets
+            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models, gpu, timeout_s, poll_interval_s)
+            for c in targets
         ]
         return [f.result() for f in as_completed(futs)]
 

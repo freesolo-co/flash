@@ -2059,9 +2059,7 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
         lj, "launch_and_submit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity"))
     )
     monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
-    res = preload.warm_instances(
-        models=["a/b"], providers=["lambda"], timeout_s=5, poll_interval_s=0.0
-    )
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
     assert res[0]["status"] == "error"
     assert "no capacity" in res[0]["error"]
     assert len(terminated) == 1  # finally still tears down
@@ -2100,9 +2098,7 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
             time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)
         ),
     )
-    res = preload.warm_instances(
-        models=["a/b"], providers=["lambda"], timeout_s=600, poll_interval_s=0.0
-    )
+    res = preload.warm_instances(models=["a/b"], timeout_s=600, poll_interval_s=0.0)
     assert res[0]["status"] == "error"
     assert "image pull failed" in res[0]["error"]
     assert clock["t"] - start < 5  # bailed immediately, did NOT poll the full 600s
@@ -2140,7 +2136,7 @@ def test_warm_instances_uses_managed_lambda_default_gpu(monkeypatch):
     assert preload._LAMBDA_PRELOAD_GPU == "A10"
 
 
-def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
+def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
@@ -2200,8 +2196,8 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
 
     preload._ensure_status_repo("token")
     spec = preload._preload_instance_spec("A10", "preload-test")
-    result = preload._warm_one_instance(
-        "lambda", jobs_mod, _cand("us-east-1"), ["a/b"], "A10", "token", 5, 0.0
+    result = preload._warm_one_lambda_instance(
+        jobs_mod, _cand("us-east-1"), ["a/b"], "A10", 5, 0.0
     )
 
     assert managed_repo == preload._PRELOAD_STATUS_REPO
@@ -2229,7 +2225,7 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
-    # Lambda (an unfiltered provider) has capacity -> a real launch target exists.
+    # Lambda has capacity -> a real launch target exists.
     monkeypatch.setattr(
         lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")]
     )
