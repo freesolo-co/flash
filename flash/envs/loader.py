@@ -23,7 +23,7 @@ import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
 from flash.envs.archive import extract_validated_archive_members
 from flash.envs.archive_policy import (
@@ -209,10 +209,7 @@ def _resolve_ref_sha(
     if _is_commit_sha(parsed.ref):
         return parsed.ref
     # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _github_headers("application/vnd.github+json")
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
     data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
@@ -243,15 +240,6 @@ def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
         yield chunk
 
 
-def _read_capped(resp: object, max_bytes: int) -> bytes:
-    return b"".join(_iter_capped_chunks(resp, max_bytes))
-
-
-def _copy_capped(resp: object, max_bytes: int, out: BinaryIO) -> None:
-    for chunk in _iter_capped_chunks(resp, max_bytes):
-        out.write(chunk)
-
-
 def _urlopen(
     req: urllib.request.Request,
     *,
@@ -270,9 +258,10 @@ def _urlopen(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if max_bytes is not None:
                     if out is not None:
-                        _copy_capped(resp, max_bytes, out)
+                        for chunk in _iter_capped_chunks(resp, max_bytes):
+                            out.write(chunk)
                         return b""
-                    return _read_capped(resp, max_bytes)
+                    return b"".join(_iter_capped_chunks(resp, max_bytes))
                 if out is not None:
                     shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
                     return b""
@@ -320,13 +309,7 @@ def _urlopen(
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "freesolo-flash",
-    }
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _github_headers("application/vnd.github+json")
     tar_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -395,7 +378,7 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     return normalized
 
 
-def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> Any:
+def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> object:
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
         timeout=120.0,
@@ -543,10 +526,10 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
     return repo_root
 
 
-def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
+def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path) -> Path:
     tarball = _download_github_tarball(ref)
     try:
-        return _safe_extract_archive(tarball, dest, subdir=subdir)
+        return _safe_extract_archive(tarball, dest)
     finally:
         if isinstance(tarball, Path):
             with contextlib.suppress(OSError):
@@ -568,7 +551,7 @@ def _safe_extract_archive(
 
 def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
     """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    want = [p for p in subdir.split("/") if p] if subdir else []
+    want = [part for part in subdir.split("/") if part]
     top_dirs: set[str] = set()
     reader = LimitedArchiveReader(
         gzip.GzipFile(fileobj=tar_file),
