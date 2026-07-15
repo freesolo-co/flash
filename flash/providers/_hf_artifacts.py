@@ -20,21 +20,66 @@ import time
 from flash.opd_retry_contract import (
     decode_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
+    opd_resume_checkpoint_complete,
     require_opd_retry_contract_version,
 )
 from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._poll import _attempt_int
 
 
-def verify_opd_retry_markers_absent(
+def _opd_resume_checkpoint_present(
+    api, *, hf_repo: str, phase: str, run_id: str, revision: str
+) -> bool:
+    """True iff a COMPLETE full-state opd resume checkpoint exists at the pinned revision.
+
+    Lists files at the SAME repo SHA the marker evidence was pinned to (read-after-write consistency:
+    never unblock on a checkpoint that raced in after the snapshot), then checks the highest
+    ``checkpoint-N`` dir under ``{phase}/{run_id}/checkpoint/`` for the complete required file set. Fails
+    CLOSED (returns False) on any listing error, missing dir, or partial upload, so an uncertain
+    checkpoint never unblocks a replacement.
+    """
+    base = f"{phase}/{run_id}/checkpoint/"
+    try:
+        files = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
+    except Exception:
+        return False
+    by_step: dict[int, set[str]] = {}
+    for path in files:
+        if not isinstance(path, str) or not path.startswith(base):
+            continue
+        seg, sep, tail = path[len(base) :].partition("/")
+        # only files directly inside a checkpoint-n dir (the required state files are written flat).
+        if not sep or not tail or "/" in tail or not seg.startswith("checkpoint-"):
+            continue
+        suffix = seg[len("checkpoint-") :]
+        if not suffix.isdigit():
+            continue
+        step = int(suffix)
+        if step <= 0 or suffix != str(step):
+            continue
+        by_step.setdefault(step, set()).add(tail)
+    if not by_step:
+        return False
+    return opd_resume_checkpoint_complete(by_step[max(by_step)])
+
+
+def verify_opd_replacement_safe(
     *,
     hf_repo: str,
     run_id: str,
     seed: int,
     next_attempt: int,
     contract_version: int,
-) -> None:
-    """Return only when every reserved OPD attempt is proven mutation-marker-free."""
+    phase: str,
+) -> str | None:
+    """Return only when replacing an OPD run's worker is safe.
+
+    Safe means either no reserved attempt crossed the first ``optimizer.step()`` (no mutation marker),
+    OR a marker proves mutation BUT a complete full-state resume checkpoint exists at the same pinned
+    revision, so the replacement worker resumes from it (via ``hf_resume_checkpoint``) instead of
+    training fresh. Fails closed (raises) on marker presence without a usable checkpoint, malformed
+    evidence, or any listing/download/parse uncertainty.
+    """
     try:
         version = require_opd_retry_contract_version(contract_version)
         attempt_count = _attempt_int(next_attempt)
@@ -44,9 +89,11 @@ def verify_opd_retry_markers_absent(
     except Exception as exc:
         raise RuntimeError("opd retry evidence contract is invalid; replacement is blocked") from exc
     if not paths:
-        return
+        return None
     if not isinstance(hf_repo, str) or not hf_repo.strip():
         raise RuntimeError("opd artifact repository is missing; replacement is blocked")
+    if not isinstance(phase, str) or not phase.strip():
+        raise RuntimeError("opd artifact phase is missing; replacement is blocked")
     token = os.environ.get("HF_TOKEN")
     try:
         from huggingface_hub import HfApi
@@ -74,7 +121,8 @@ def verify_opd_retry_markers_absent(
     except Exception as exc:
         raise RuntimeError("opd retry evidence listing is malformed; replacement is blocked") from exc
     if not present:
-        return
+        return None
+    mutated = False
     for attempt, path in enumerate(paths):
         if path not in present:
             continue
@@ -100,9 +148,22 @@ def verify_opd_retry_markers_absent(
             )
         except Exception as exc:
             raise RuntimeError("opd retry evidence is unverifiable; replacement is blocked") from exc
-        raise RuntimeError(
-            f"opd attempt {attempt} may have mutated optimizer state; replacement is blocked"
-        )
+        # one validated marker proves mutation; keep validating every present marker.
+        mutated = True
+    if not mutated:
+        return None
+    # a validated optimizer-start marker proves some attempt crossed the first optimizer.step(). allow
+    # replacement only when a complete full-state resume checkpoint exists at the same pinned revision
+    # (the replacement worker resumes from it); otherwise fail closed. the presence check itself fails
+    # closed on any uncertainty, so an unreadable/partial checkpoint keeps the run blocked.
+    if _opd_resume_checkpoint_present(
+        api, hf_repo=hf_repo, phase=phase, run_id=run_id, revision=revision
+    ):
+        return revision
+    raise RuntimeError(
+        "opd optimizer state may have mutated and no complete resume checkpoint is available; "
+        "replacement is blocked"
+    )
 
 
 def make_hf_text_reader(

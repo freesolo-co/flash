@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.opd_retry_contract import (
+    OPD_RESUME_REVISION_ENV,
     OPD_RETRY_CONTRACT_STATUS_KEY,
     OPD_RETRY_CONTRACT_VERSION,
     canonical_opd_optimizer_start_json,
@@ -30,13 +31,14 @@ def _remote(*, attempt: int = 0) -> dict:
     }
 
 
-def _opd_spec(run_id: str, *, max_retries: int = 1):
+def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
     from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     return JobSpec(
         run_id=run_id,
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
+        seed=seed,
         train=TrainSpec(hf_repo="private/runs", max_examples=1, epochs=1),
         gpu=GpuSpec(type="RTX 4090", max_retries=max_retries),
     )
@@ -441,6 +443,10 @@ class _FakePrivateHf:
         if self.raise_after_upload:
             raise TimeoutError("commit response was lost")
 
+    def list_repo_files(self, **kwargs):
+        self.calls.append(("list_repo_files", kwargs))
+        return list(self.files)
+
     def download(self, **kwargs):
         self.calls.append(("download", kwargs))
         path = kwargs["filename"]
@@ -453,7 +459,7 @@ class _FakePrivateHf:
 
 
 def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, tmp_path):
-    from flash.providers._hf_artifacts import verify_opd_retry_markers_absent
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
 
     calls = []
     present_path = opd_optimizer_start_marker_path("run-1", 1)
@@ -476,13 +482,16 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
         return str(path)
 
     _install_hf_reader(monkeypatch, Api(), download)
-    with pytest.raises(RuntimeError, match="may have mutated optimizer state"):
-        verify_opd_retry_markers_absent(
+    # a validated marker proves mutation; this api exposes no list_repo_files, so the resume-checkpoint
+    # presence check fails closed and replacement stays blocked (now for lack of a usable checkpoint).
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        verify_opd_replacement_safe(
             hf_repo="private/runs",
             run_id="run-1",
             seed=42,
             next_attempt=2,
             contract_version=1,
+            phase="opd",
         )
 
     assert [name for name, _kwargs in calls] == ["repo_info", "get_paths_info", "download"]
@@ -496,7 +505,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
 
 
 def test_strict_reader_all_absent_is_safe(monkeypatch):
-    from flash.providers._hf_artifacts import verify_opd_retry_markers_absent
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
 
     class Api:
         def repo_info(self, **_kwargs):
@@ -510,18 +519,19 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
         Api(),
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not download")),
     )
-    verify_opd_retry_markers_absent(
+    verify_opd_replacement_safe(
         hf_repo="private/runs",
         run_id="run-1",
         seed=42,
         next_attempt=2,
         contract_version=1,
+        phase="opd",
     )
 
 
 @pytest.mark.parametrize("mode", ["malformed", "timeout", "listing"])
 def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
-    from flash.providers._hf_artifacts import verify_opd_retry_markers_absent
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
 
     marker_path = opd_optimizer_start_marker_path("run-1", 0)
 
@@ -543,12 +553,13 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
 
     _install_hf_reader(monkeypatch, Api(), download)
     with pytest.raises(RuntimeError, match="replacement is blocked"):
-        verify_opd_retry_markers_absent(
+        verify_opd_replacement_safe(
             hf_repo="private/runs",
             run_id="run-1",
             seed=42,
             next_attempt=1,
             contract_version=1,
+            phase="opd",
         )
 
 
@@ -557,15 +568,16 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
     [("", 1), ("private/runs", 2), ("private/runs", True), ("private/runs", "1")],
 )
 def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version):
-    from flash.providers._hf_artifacts import verify_opd_retry_markers_absent
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
 
     with pytest.raises(RuntimeError, match="replacement is blocked"):
-        verify_opd_retry_markers_absent(
+        verify_opd_replacement_safe(
             hf_repo=repo,
             run_id="run-1",
             seed=42,
             next_attempt=1,
             contract_version=version,
+            phase="opd",
         )
 
 
@@ -586,6 +598,24 @@ def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatc
     snapshot = runner._verified_opd_next_attempt(spec.run_id)
     assert snapshot == 0
     assert runner._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
+
+
+def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.providers import _hf_artifacts
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _opd_spec("custom-seed-opd", seed=987)
+    _save_status(runner, spec, next_attempt=1)
+    seen = {}
+
+    def verify(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(_hf_artifacts, "verify_opd_replacement_safe", verify)
+
+    assert runner._verified_opd_retry_state(spec.run_id) == (1, None)
+    assert seen["seed"] == 987
 
 
 def test_precontract_opd_fails_closed(monkeypatch, tmp_path):
@@ -686,6 +716,87 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(
     ]
 
 
+def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
+    import flash.providers as providers
+    import flash.providers.allocator as allocator
+    import flash.runner as runner
+    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    private_hf = _FakePrivateHf(tmp_path)
+    private_hf.install(monkeypatch)
+    spec = _opd_spec("automatic-retry-pinned")
+    _save_status(runner, spec, next_attempt=0)
+    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *_args, **_kwargs: Allocation(
+            provider="runpod",
+            gpu="RTX 4090",
+            hourly_usd=0.69,
+            min_vram_gb=24,
+            candidates=(candidate,),
+        ),
+    )
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
+
+    class Provider:
+        supports_weight_cache = False
+
+        def __init__(self):
+            self.runtime_secrets = []
+            self.worker_envs = []
+
+        def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
+            from flash.providers._worker import build_worker_env
+
+            secrets = kwargs.get("runtime_secrets")
+            self.runtime_secrets.append(secrets)
+            self.worker_envs.append(build_worker_env(_spec, _seed, runtime_secrets=secrets))
+            on_handle(_remote(attempt=attempt))
+            if attempt == 0:
+                marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
+                private_hf.files[marker_path] = canonical_opd_optimizer_start_json(
+                    run_id=spec.run_id, attempt=0, seed=42
+                )
+                for path in _ckpt_files("opd", spec.run_id, 20, _COMPLETE_CKPT):
+                    private_hf.files[path] = b"checkpoint"
+                return PollResult(False, failure="poll_error", detail="transient")
+            return PollResult(True, metrics={"train_tokens": 1})
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+
+    metrics = lifecycle._submit_seed_supervised(
+        spec,
+        42,
+        io.StringIO(),
+        runtime_secrets={
+            "WANDB_API_KEY": "real-secret",
+            OPD_RESUME_REVISION_ENV: "spoofed-sha",
+        },
+    )
+
+    assert metrics == {"train_tokens": 1, "allocated_gpu": "RTX 4090"}
+    assert provider.runtime_secrets == [
+        {"WANDB_API_KEY": "real-secret"},
+        {
+            "WANDB_API_KEY": "real-secret",
+            OPD_RESUME_REVISION_ENV: "private-pinned-sha",
+        },
+    ]
+    assert OPD_RESUME_REVISION_ENV not in provider.worker_envs[0]
+    assert provider.worker_envs[1][OPD_RESUME_REVISION_ENV] == "private-pinned-sha"
+
+
 def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(
     monkeypatch, tmp_path
 ):
@@ -731,6 +842,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(
         "repo_info",
         "get_paths_info",
         "download",
+        "list_repo_files",
     ]
     assert private_hf.calls[2][1]["revision"] == "private-pinned-sha"
 
@@ -765,6 +877,7 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
         "repo_info",
         "get_paths_info",
         "download",
+        "list_repo_files",
     ]
 
 
@@ -830,5 +943,171 @@ def test_ambiguous_marker_upload_prevents_step_and_blocks_replacement(monkeypatc
         ),
     )
 
-    with pytest.raises(RuntimeError, match="may have mutated optimizer state"):
+    # the fake private hf exposes no list_repo_files, so the resume-checkpoint presence check fails
+    # closed: a proven mutation with no usable checkpoint keeps replacement blocked before allocation.
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
         lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
+
+
+# --- gate matrix: a proven mutation marker is safe to replace only when paired with a complete
+# full-state resume checkpoint at the same pinned revision. these drive verify_opd_replacement_safe
+# directly with a validated attempt-1 marker present, varying only the checkpoint listing.
+
+_COMPLETE_CKPT = (
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "optimizer.pt",
+    "rng_state.pth",
+    "opd_state.json",
+    "tokenizer.json",
+)
+# adapter written but optimizer.pt missing: a torn/partial upload, not resumable.
+_INCOMPLETE_CKPT = (
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "rng_state.pth",
+    "opd_state.json",
+)
+
+
+def _ckpt_files(phase, run_id, step, names):
+    return [f"{phase}/{run_id}/checkpoint/checkpoint-{step}/{name}" for name in names]
+
+
+def _install_marker_gate(monkeypatch, tmp_path, *, checkpoint_files):
+    """Install an hf fake with one validated attempt-1 marker present, plus a checkpoint listing.
+
+    ``checkpoint_files`` is the list of repo paths ``list_repo_files`` returns, or an Exception instance
+    to raise from it (a listing outage). Records the revision passed to ``list_repo_files`` so callers can
+    assert read-after-write consistency (same pinned sha as the marker snapshot).
+    """
+    present_path = opd_optimizer_start_marker_path("run-1", 1)
+    seen = {"list_revision": None}
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            return SimpleNamespace(sha="pinned-sha")
+
+        def get_paths_info(self, **_kwargs):
+            return [SimpleNamespace(path=present_path)]
+
+        def list_repo_files(self, **kwargs):
+            seen["list_revision"] = kwargs.get("revision")
+            if isinstance(checkpoint_files, Exception):
+                raise checkpoint_files
+            return list(checkpoint_files)
+
+    def download(**_kwargs):
+        path = tmp_path / "marker.json"
+        path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
+        return str(path)
+
+    _install_hf_reader(monkeypatch, Api(), download)
+    return seen
+
+
+def _run_gate():
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+
+    return verify_opd_replacement_safe(
+        hf_repo="private/runs",
+        run_id="run-1",
+        seed=42,
+        next_attempt=2,
+        contract_version=1,
+        phase="opd",
+    )
+
+
+def test_gate_allows_replacement_when_marker_paired_with_complete_checkpoint(monkeypatch, tmp_path):
+    seen = _install_marker_gate(
+        monkeypatch, tmp_path, checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
+    )
+    # mutation is proven, but a complete resume checkpoint lets the replacement worker continue.
+    assert _run_gate() == "pinned-sha"
+    # the checkpoint listing was pinned to the same revision the marker evidence was read at.
+    assert seen["list_revision"] == "pinned-sha"
+
+
+def test_gate_validates_every_present_marker(monkeypatch, tmp_path):
+    paths = [opd_optimizer_start_marker_path("run-1", attempt) for attempt in range(2)]
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            return SimpleNamespace(sha="pinned-sha")
+
+        def get_paths_info(self, **_kwargs):
+            return [SimpleNamespace(path=path) for path in paths]
+
+        def list_repo_files(self, **_kwargs):
+            return _ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
+
+    def download(**kwargs):
+        path = tmp_path / f"marker-{kwargs['filename'].split('attempt-')[1].split('/')[0]}.json"
+        if kwargs["filename"] == paths[0]:
+            path.write_bytes(
+                canonical_opd_optimizer_start_json(run_id="run-1", attempt=0, seed=42)
+            )
+        else:
+            path.write_text("{}")
+        return str(path)
+
+    _install_hf_reader(monkeypatch, Api(), download)
+    with pytest.raises(RuntimeError, match="evidence is unverifiable"):
+        _run_gate()
+
+
+def test_gate_blocks_when_newest_checkpoint_is_incomplete(monkeypatch, tmp_path):
+    # an older complete dir plus a newer incomplete one: the reader keys off the newest step (what
+    # hf_resume_checkpoint downloads), so a torn latest upload fails closed even with an older complete dir.
+    files = _ckpt_files("opd", "run-1", 8, _COMPLETE_CKPT) + _ckpt_files(
+        "opd", "run-1", 40, _INCOMPLETE_CKPT
+    )
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+def test_gate_blocks_when_checkpoint_listing_fails(monkeypatch, tmp_path):
+    _install_marker_gate(
+        monkeypatch, tmp_path, checkpoint_files=PermissionError("auth unavailable")
+    )
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+def test_gate_blocks_when_no_checkpoint_dir_present(monkeypatch, tmp_path):
+    # marker proves mutation but the checkpoint prefix is empty (no save_every boundary reached yet).
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=[])
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+@pytest.mark.parametrize("step", [0, "040"])
+def test_gate_ignores_noncanonical_checkpoint_steps(monkeypatch, tmp_path, step):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_ckpt_files("opd", "run-1", step, _COMPLETE_CKPT),
+    )
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+def test_gate_ignores_checkpoint_under_other_phase(monkeypatch, tmp_path):
+    # a complete checkpoint under a different phase prefix must not unblock an opd replacement.
+    _install_marker_gate(
+        monkeypatch, tmp_path, checkpoint_files=_ckpt_files("rl", "run-1", 40, _COMPLETE_CKPT)
+    )
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()
+
+
+def test_gate_ignores_nested_files_when_checking_completeness(monkeypatch, tmp_path):
+    # optimizer.pt nested one dir deeper is not a direct child of checkpoint-40, so the flat state set
+    # is incomplete and replacement stays blocked.
+    files = _ckpt_files("opd", "run-1", 40, _INCOMPLETE_CKPT)
+    files.append("opd/run-1/checkpoint/checkpoint-40/nested/optimizer.pt")
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+    with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
+        _run_gate()

@@ -26,7 +26,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import FIXED_SEED, JobSpec
+from flash.spec import JobSpec
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -240,8 +240,8 @@ def _infer_next_attempt(raw: dict) -> int:
     return stored
 
 
-def _verified_opd_next_attempt(run_id: str) -> int:
-    """Verify one locked OPD status snapshot and every marker path reserved by it."""
+def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
+    """Verify one locked opd retry snapshot and return its attempt plus resume revision."""
     with _status_guard(run_id):
         raw = _load_status_json(run_id)
         status = _runstatus_from_json(raw)
@@ -256,17 +256,26 @@ def _verified_opd_next_attempt(run_id: str) -> int:
             raise RuntimeError("opd retry contract is missing or invalid; replacement is blocked") from exc
         next_attempt = _infer_next_attempt(raw)
         hf_repo = spec.train.hf_repo
-        seed = FIXED_SEED
-    from flash.providers._hf_artifacts import verify_opd_retry_markers_absent
+        # phase is the hf-prefix component the worker uploads under ({phase}/{run_id}/...), so it locates
+        # both the markers and any full-state resume checkpoint the replacement can continue from.
+        phase = spec.phase
+        seed = spec.seed
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
 
-    verify_opd_retry_markers_absent(
+    resume_revision = verify_opd_replacement_safe(
         hf_repo=hf_repo,
         run_id=run_id,
         seed=seed,
         next_attempt=next_attempt,
         contract_version=contract_version,
+        phase=phase,
     )
-    return next_attempt
+    return next_attempt, resume_revision
+
+
+def _verified_opd_next_attempt(run_id: str) -> int:
+    """Compatibility wrapper returning only the verified next attempt."""
+    return _verified_opd_retry_state(run_id)[0]
 
 
 def _reserve_attempt(

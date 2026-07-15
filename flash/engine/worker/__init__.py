@@ -80,6 +80,7 @@ from flash.engine.worker.hf import (
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
     upload_debug_jsonl,
+    upload_resume_checkpoint,
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
@@ -133,6 +134,7 @@ from flash.engine.worker.wandb_log import (
 )
 from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.spec import FIXED_SEED, load_job_spec_from_env
 
 
@@ -165,6 +167,7 @@ PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
+OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
@@ -408,6 +411,7 @@ __all__ = [
     "ATTEMPT",
     "HF_REPO",
     "JOB_SPEC",
+    "OPD_RESUME_REVISION",
     "PHASE",
     "RUN_ID",
     "RUN_MODE",
@@ -520,6 +524,7 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_debug_jsonl",
+    "upload_resume_checkpoint",
     "wait_for_gpu",
     "wandb_finish",
     "wandb_report_to",

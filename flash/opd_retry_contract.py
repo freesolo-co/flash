@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from typing import Any
+
+from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 
 OPD_RETRY_CONTRACT_STATUS_KEY = "opd_retry_contract_version"
 OPD_RETRY_CONTRACT_VERSION = 1
@@ -12,7 +15,19 @@ OPD_OPTIMIZER_START_CONTRACT = "flash.opd.optimizer-start"
 OPD_OPTIMIZER_START_PHASE = "opd"
 OPD_RETRY_ARTIFACT_PREFIX = "_opd_retry"
 OPD_OPTIMIZER_START_FILENAME = "optimizer-start.v1.json"
+OPD_RESUME_REVISION_ENV = "FLASH_OPD_RESUME_REVISION"
 MAX_BOUNDED_NONNEGATIVE_INTEGER = (1 << 63) - 1
+
+# a full-state opd resume checkpoint (the custom loop's counterpart to the hf trainer's checkpoint-n)
+# is complete only with the adapter config, an adapter weight file, the optimizer moments, the rng
+# blob, and the loop accounting. both the worker restore and the runner replacement gate key off this
+# exact set so "resumable" means the same thing on the write and read sides.
+OPD_RESUME_STATE_REQUIRED_FILES = (
+    "adapter_config.json",
+    "optimizer.pt",
+    "rng_state.pth",
+    "opd_state.json",
+)
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PAYLOAD_KEYS = frozenset({"attempt", "contract", "phase", "run_id", "seed", "version"})
@@ -128,3 +143,16 @@ def decode_opd_optimizer_start_json(
     if encoded != canonical:
         raise ValueError("optimizer-start marker json is not canonical")
     return decoded
+
+
+def opd_resume_checkpoint_complete(basenames: Iterable[str]) -> bool:
+    """True iff `basenames` (the direct children of one checkpoint-N dir) form a complete resume state.
+
+    Complete means every required state file plus at least one adapter weight file is present. A partial
+    upload (e.g. adapter written but optimizer.pt missing) is NOT resumable, so both the restore path and
+    the replacement gate treat it as absent and fail closed.
+    """
+    names = set(basenames)
+    if not all(f in names for f in OPD_RESUME_STATE_REQUIRED_FILES):
+        return False
+    return any(weight in names for weight in ADAPTER_WEIGHT_FILES)

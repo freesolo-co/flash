@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import threading
 import time
 
@@ -188,16 +189,25 @@ def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) 
     )
 
 
-def hf_resume_checkpoint() -> str | None:
-    """Download the latest streamed trainer checkpoint for this run, or return None."""
+def hf_resume_checkpoint(
+    fail_closed: bool = False, revision: str | None = None
+) -> str | None:
+    """Download the latest streamed trainer checkpoint for this run, or return none."""
+    required = bool(revision)
+    strict = bool(fail_closed or required)
     if not _w.HF_REPO:
+        if required:
+            raise RetriableInfraError("required resume checkpoint has no artifact repository")
         return None
+    base = os.path.join("/tmp/resume", hf_prefix(), "checkpoint")
     try:
         from huggingface_hub import snapshot_download
 
         from flash.engine.worker.heartbeat import liveness_heartbeat
 
-        # resume checkpoints carry the full optimizer state (multi-GB); keep the heartbeat fresh.
+        # remove prior local materialization so pinned absence cannot reuse a stale checkpoint.
+        shutil.rmtree(base, ignore_errors=True)
+        # resume checkpoints carry the full optimizer state (multi-gb); keep the heartbeat fresh.
         with liveness_heartbeat("checkpoint_prefetching"):
             _require_hf_deadline_allowance()
             snapshot_download(
@@ -206,19 +216,40 @@ def hf_resume_checkpoint() -> str | None:
                 allow_patterns=[f"{hf_prefix()}/checkpoint/**"],
                 local_dir="/tmp/resume",
                 token=os.environ.get("HF_TOKEN"),
+                revision=revision,
             )
-        base = os.path.join("/tmp/resume", hf_prefix(), "checkpoint")
         if not os.path.isdir(base):
+            if required:
+                detail = f" at revision {revision}" if revision else ""
+                raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
-        cands = [d for d in os.listdir(base) if d.startswith("checkpoint-")]
-        if not cands:
+        candidates: list[tuple[int, str]] = []
+        for name in os.listdir(base):
+            if not name.startswith("checkpoint-"):
+                continue
+            suffix = name[len("checkpoint-") :]
+            if not suffix.isdigit():
+                continue
+            step = int(suffix)
+            if step > 0 and suffix == str(step):
+                candidates.append((step, name))
+        if not candidates:
+            if required:
+                detail = f" at revision {revision}" if revision else ""
+                raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
-        latest = max(cands, key=lambda d: int(d.split("-")[-1]))
+        _, latest = max(candidates)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
         return path
     except Exception as e:
         print("hf_resume_checkpoint warn:", e)
+        if strict:
+            if isinstance(e, RetriableInfraError):
+                raise
+            raise RetriableInfraError(
+                f"required resume checkpoint fetch failed: {e}"
+            ) from e
         return None
 
 
@@ -497,6 +528,53 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
             break
 
 
+def upload_resume_checkpoint(step: int, ckpt_dir: str, *, before_upload=None) -> bool:
+    """Synchronously stream one full-state resume checkpoint and prune older steps."""
+    if not _w.HF_REPO:
+        return True
+
+    from flash.engine.worker.heartbeat import liveness_heartbeat
+
+    with liveness_heartbeat(
+        "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+    ):
+        if before_upload is not None:
+            before_upload()
+        for attempt in range(_CKPT_UPLOAD_RETRIES):
+            try:
+                _require_hf_deadline_allowance()
+                _w.hf_api().upload_folder(
+                    folder_path=ckpt_dir,
+                    path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                    repo_id=_w.HF_REPO,
+                    repo_type="dataset",
+                )
+                # prune only after the atomic folder commit lands, so the prior complete save survives
+                # every failed replacement upload.
+                _prune_stale_resume_checkpoints(step)
+                _w.heartbeat("checkpoint_uploaded", step=step)
+                return True
+            except Exception as e:
+                if attempt + 1 < _CKPT_UPLOAD_RETRIES:
+                    print(
+                        f"[ckpt] step {step} upload retry "
+                        f"{attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
+                    )
+                    try:
+                        if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
+                            break
+                    except Exception:
+                        break
+                else:
+                    print(
+                        f"[ckpt] step {step} upload FAILED after "
+                        f"{_CKPT_UPLOAD_RETRIES} attempts: {e}"
+                    )
+                    with contextlib.suppress(Exception):
+                        _w.heartbeat("checkpoint_upload_failed", step=step)
+    return False
+
+
 def make_checkpoint_upload_callback(save_at_steps=()):
     """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
 
@@ -507,8 +585,6 @@ def make_checkpoint_upload_callback(save_at_steps=()):
     guaranteed to upload, retrying transient HF errors instead of skipping.
     """
     from transformers import TrainerCallback
-
-    from flash.engine.worker.heartbeat import liveness_heartbeat
 
     required_steps = frozenset(int(step) for step in save_at_steps)
     deployable_steps: set[int] = set()
@@ -524,64 +600,18 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         if step in required_steps:
             deployable_steps.add(step)
 
-    def _upload_once(step: int, ckpt_dir: str) -> None:
-        # deployable per-step adapter first: it's small, kept-forever, and the only
-        # artifact that makes a cancelled/preempted run deployable from this step, so
-        # it must land before the larger resume checkpoint (best-effort, latest-only).
-        if step not in deployable_steps:
-            _publish_deployable(ckpt_dir, step)
-        _require_hf_deadline_allowance()
-        _w.hf_api().upload_folder(
-            folder_path=ckpt_dir,
-            path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-            repo_id=_w.HF_REPO,
-            repo_type="dataset",
-        )
-        # Prune older step dirs only after the new one is safely up (latest-only resume).
-        _prune_stale_resume_checkpoints(step)
-        _w.heartbeat("checkpoint_uploaded", step=step)
-
     uploaded_steps: set[int] = set()
 
-    def _upload_with_retries(step: int, ckpt_dir: str) -> bool:
-        """Run the full upload for `step`, retrying transient failures; True once it lands.
+    def _upload(step: int, ckpt_dir: str) -> bool:
+        # publish the small durable deployable first, inside the shared upload keepalive.
+        def _prepare() -> None:
+            if step not in deployable_steps:
+                _publish_deployable(ckpt_dir, step)
 
-        The upload blocks the trainer thread SYNCHRONOUSLY, freezing global_step for its whole
-        duration, so the outer rl_step/sft_step liveness daemon can only emit bare liveness pings —
-        which do NOT advance the provider's stall clock. Without a keepalive a healthy multi-minute
-        upload that outlasts STALL_AFTER_S (1500s) — big model, slow HF, or several backed-off retries —
-        is wrongly killed mid-save. Wrap the whole retry budget in a ``checkpoint_uploading`` keepalive
-        daemon so every 30s tick lands a REAL, stall-clock-advancing heartbeat (stamped with the step so
-        a cancel here still bills it). A genuinely wedged upload still surfaces as the exception that
-        exhausts the retries and returns False, so this masks no real stall.
-        """
-        with liveness_heartbeat(
-            "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
-        ):
-            for attempt in range(_CKPT_UPLOAD_RETRIES):
-                try:
-                    _upload_once(step, ckpt_dir)
-                    uploaded_steps.add(step)
-                    return True
-                except RequiredSaveError:
-                    raise
-                except Exception as e:
-                    if attempt + 1 < _CKPT_UPLOAD_RETRIES:
-                        print(
-                            f"[ckpt] step {step} upload retry {attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
-                        )
-                        try:
-                            if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
-                                break
-                        except Exception:
-                            break
-                    else:
-                        print(
-                            f"[ckpt] step {step} upload FAILED after {_CKPT_UPLOAD_RETRIES} attempts: {e}"
-                        )
-                        with contextlib.suppress(Exception):
-                            _w.heartbeat("checkpoint_upload_failed", step=step)
-        return False
+        if not upload_resume_checkpoint(step, ckpt_dir, before_upload=_prepare):
+            return False
+        uploaded_steps.add(step)
+        return True
 
     class _CheckpointUpload(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
@@ -619,10 +649,10 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                         f"required save step {step} has no trainer checkpoint directory"
                     )
                 return
-            if not _upload_with_retries(step, ckpt_dir):
-                if step in required_steps and step not in deployable_steps:
+            if not _upload(step, ckpt_dir):
+                if step in required_steps:
                     raise RetriableInfraError(
-                        f"required save step {step} was not durably published"
+                        f"required save step {step} full-state checkpoint was not durably published"
                     )
                 print(
                     f"[ckpt] step {step} resume checkpoint not durable on HF after retries; "
@@ -645,11 +675,11 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                 if (
                     should_flush
                     and step not in uploaded_steps
-                    and not _upload_with_retries(step, ckpt_dir)
+                    and not _upload(step, ckpt_dir)
                 ):
-                    if step in required_steps and step not in deployable_steps:
+                    if step in required_steps:
                         raise RetriableInfraError(
-                            f"required save step {step} was not durably published"
+                            f"required save step {step} full-state checkpoint was not durably published"
                         )
                     print(
                         f"[ckpt] final resume checkpoint step {step} not durable on HF after retries; "
