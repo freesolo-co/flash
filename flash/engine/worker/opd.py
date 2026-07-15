@@ -574,7 +574,10 @@ def run_opd(forward_teacher_accounting):
             raise RuntimeError(
                 "opd hybrid requires the platform-managed ForwardTeacher credential; the worker injection is missing"
             )
-        forward_teacher = ForwardTeacherClient(forward_teacher_key, seed=_w.SEED)
+        forward_teacher = ForwardTeacherClient(
+            forward_teacher_key,
+            seed=backend_seed(_w.SEED) % (2**31),
+        )
 
     wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
     setup_perf_backends()

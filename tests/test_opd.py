@@ -1385,6 +1385,29 @@ def test_hybrid_opd_passes_authoritative_worker_seed_to_forward_teacher(monkeypa
     )
 
 
+def test_hybrid_opd_normalizes_large_worker_seed_for_forward_teacher(monkeypatch):
+    large_seed = 2**32 + 7
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=_skip,
+        teacher_model="accounts/fireworks/models/deepseek-v4-pro",
+    )
+    opd_mod._w.SEED = large_seed
+    training_seeds = []
+    monkeypatch.setattr(opd_mod, "seed_training_rngs", training_seeds.append)
+    forward_teacher_calls = _patch_hybrid_forward_teacher(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="no trained step"):
+        opd_mod.run_opd()
+
+    assert training_seeds == [large_seed, large_seed]
+    assert forward_teacher_calls[0] == (
+        "init",
+        {"api_key": "unit-test-forward_teacher-key", "seed": 7},
+    )
+    assert opd_mod.OpdVllmRolloutEngine.instances[0].seed == 7
+
+
 def test_opd_missing_teacher_key_raises_platform_managed_error(monkeypatch):
     """With no key in the worker env, run_opd fails with the platform-managed diagnostic (a
     platform-side injection failure), not the old 'declare and export it' message."""
