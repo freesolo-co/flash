@@ -155,7 +155,6 @@ def _cache_block_device_setup(payload: dict) -> str:
     mount = payload["cache_host_mount"]
     # Match the cache disk by size (±20%) AND require it unmounted, so we never mkfs the wrong device.
     expect_bytes = int(payload.get("cache_size_gb") or 0) * 1000 * 1000 * 1000
-    marker = CACHE_MOUNT_MARKER
     return f"""
 # --- weight-cache block volume: wait-for-device (size-matched, unmounted), format-if-new, mount ---
 echo "FLASH: waiting for the attached cache block device (~{payload.get("cache_size_gb")}GB)..."
@@ -180,7 +179,7 @@ if [ -n "$CACHE_DEV" ]; then
     # visible at the bind path inside the container when the REAL volume is mounted. The preload
     # mount-check requires it, so a failed/absent attach (Docker binding an empty host dir) can't
     # masquerade as a warm cache and silently warm ephemeral disk.
-    touch '{mount}/{marker}' 2>/dev/null || true
+    touch '{mount}/{CACHE_MOUNT_MARKER}' 2>/dev/null || true
   else
     echo "FLASH: cache mount failed; running cold"
   fi
@@ -196,12 +195,11 @@ def _cache_nfs_mount_check(payload: dict) -> str:
     if not payload.get("cache_host_mount") or payload.get("cache_block_device"):
         return ""
     mount = payload["cache_host_mount"]
-    marker = CACHE_MOUNT_MARKER
     return f"""
 # --- weight-cache NFS mount: verify the platform actually mounted it, then drop the sentinel ---
 if mountpoint -q '{mount}'; then
   echo "FLASH: weight-cache NFS mounted at {mount}"
-  touch '{mount}/{marker}' 2>/dev/null || true
+  touch '{mount}/{CACHE_MOUNT_MARKER}' 2>/dev/null || true
 else
   echo "FLASH: weight-cache NFS NOT mounted at {mount} (no sentinel; preload will refuse, train runs cold)"
 fi
