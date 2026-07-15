@@ -20,7 +20,7 @@ from flash.schema import (
     train_schema_metadata,
     validate_train_keys,
 )
-from flash.spec import JobSpec, TrainSpec, load_job_spec_from_env
+from flash.spec import GpuSpec, JobSpec, TrainSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -410,6 +410,53 @@ def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
         spec_from_dict(raw)
 
 
+def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
+    defaults = GpuSpec()
+    missing = _raw()
+    missing["gpu"] = {}
+    explicit_none = _raw(**{"gpu.max_retries": None, "gpu.max_wall_seconds": None})
+    for raw in (missing, explicit_none):
+        spec = spec_from_dict(raw)
+        assert spec.gpu.max_retries == defaults.max_retries
+        assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
+
+    authored_raw = _raw(**{"gpu.max_retries": 7.0, "gpu.max_wall_seconds": 1234.0})
+    authored_raw["gpu"].update(
+        {"type": "not-a-real-gpu", "disk_gb": 999, "future_gpu_field": "ignored"}
+    )
+    authored = spec_from_dict(authored_raw)
+    assert authored.gpu.max_retries == 7
+    assert authored.gpu.max_wall_seconds == 1234
+    assert authored.gpu.type == spec_from_dict(_raw()).gpu.type
+    assert authored.gpu.disk_gb == defaults.disk_gb
+    assert spec_from_dict(_raw(**{"gpu.max_retries": 0})).gpu.max_retries == 0
+
+
+@pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds"])
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        (True, "must be an integer"),
+        ("5", "must be an integer"),
+        (1.5, "must be a finite integer"),
+        (float("inf"), "must be a finite integer"),
+        (float("nan"), "must be a finite integer"),
+    ],
+)
+def test_gpu_integer_fields_reject_invalid_values(key: str, value, match: str) -> None:
+    with pytest.raises(ConfigError, match=rf"gpu\.{key} {match}"):
+        spec_from_dict(_raw(**{f"gpu.{key}": value}))
+
+
+def test_gpu_retry_and_wall_minimums() -> None:
+    with pytest.raises(ConfigError, match=r"gpu\.max_retries must be >= 0"):
+        spec_from_dict(_raw(**{"gpu.max_retries": -1}))
+    for value in (59, 1, 0, -1, -3600):
+        with pytest.raises(ConfigError, match=r"gpu\.max_wall_seconds must be >= 60"):
+            spec_from_dict(_raw(**{"gpu.max_wall_seconds": value}))
+    assert spec_from_dict(_raw(**{"gpu.max_wall_seconds": 60})).gpu.max_wall_seconds == 60
+
+
 def test_environment_subfields_reject_wrong_types() -> None:
     # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
     # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
@@ -469,6 +516,19 @@ def test_environment_subfields_reject_wrong_types() -> None:
     }
     with pytest.raises(ConfigError, match=r"platform-managed"):
         spec_from_dict(raw)
+
+
+def test_grpo_environment_can_declare_fireworks_key() -> None:
+    raw = _raw()
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "secrets": ["FIREWORKS_API_KEY"],
+    }
+
+    spec = spec_from_dict(raw)
+
+    assert spec.algorithm == "grpo"
+    assert spec.environment.secrets == ("FIREWORKS_API_KEY",)
 
 
 def test_environment_subfields_accept_valid_and_missing() -> None:
@@ -539,6 +599,22 @@ def test_job_spec_json_round_trip() -> None:
     restored = JobSpec.from_json(spec.to_json())
     assert restored == spec
     assert restored.phase == "rl"  # grpo's internal phase id
+
+
+def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(
+        _raw(**{"gpu.max_retries": 0, "gpu.max_wall_seconds": 60}), run_id="gpu-rt"
+    )
+    payload = spec_payload(spec)
+    assert payload["gpu"]["max_retries"] == 0
+    assert payload["gpu"]["max_wall_seconds"] == 60
+
+    reparsed = spec_from_dict(payload, run_id="server-reparse")
+    assert reparsed.gpu.max_retries == 0
+    assert reparsed.gpu.max_wall_seconds == 60
+    assert reparsed.gpu.type == spec.gpu.type
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:

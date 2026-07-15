@@ -221,7 +221,7 @@ def test_launch_instance_builds_body_and_returns_first_id(monkeypatch):
 
     def fake(path, method="GET", body=None, retries=4, base_delay=2.0):
         seen.update(path=path, method=method, body=body, retries=retries)
-        return {"data": {"instance_ids": ["i-abc", "i-def"]}}
+        return {"data": {"instance_ids": ["i-abc"]}}
 
     monkeypatch.setattr(lambda_api, "request_with_retries", fake)
     iid = lambda_api.launch_instance(
@@ -270,11 +270,11 @@ def test_launch_instance_raises_when_no_instance_id(monkeypatch):
     }
     # success-shaped dict but no instance_ids -> LambdaApiError
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
-    with pytest.raises(lambda_api.LambdaApiError, match="returned no instance id"):
+    with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
         lambda_api.launch_instance(**kwargs)
     # a non-dict payload (ids can't be read) -> same guard
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": []})
-    with pytest.raises(lambda_api.LambdaApiError, match="returned no instance id"):
+    with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
         lambda_api.launch_instance(**kwargs)
 
 
@@ -285,20 +285,29 @@ def test_create_filesystem_posts_to_unhyphenated_path_and_dict_or_empty(monkeypa
     from flash.providers.lambdalabs import api as lambda_api
 
     seen = {}
+    deadline_at = 1_000_000_000_000.0
 
-    def fake(path, method="GET", body=None, retries=4, base_delay=2.0):
-        seen.update(path=path, method=method, body=body)
+    def fake(path, method="GET", body=None, retries=4, base_delay=2.0, deadline_at=None):
+        seen.update(
+            path=path,
+            method=method,
+            body=body,
+            retries=retries,
+            deadline_at=deadline_at,
+        )
         return {"data": {"mount_point": "/lambda/nfs/w"}}
 
     monkeypatch.setattr(lambda_api, "request_with_retries", fake)
-    out = lambda_api.create_filesystem("w", "us-east-1")
+    out = lambda_api.create_filesystem("w", "us-east-1", deadline_at=deadline_at)
     assert out == {"mount_point": "/lambda/nfs/w"}
     assert seen["path"] == "/filesystems"  # CREATE is NOT hyphenated
     assert seen["method"] == "POST"
     assert seen["body"] == {"name": "w", "region": "us-east-1"}
-    # a non-dict payload collapses to {}
+    assert seen["retries"] == 0
+    assert seen["deadline_at"] == deadline_at
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": ["x"]})
-    assert lambda_api.create_filesystem("w", "us-east-1") == {}
+    with pytest.raises(lambda_api.LambdaApiError, match="returned no verifiable object"):
+        lambda_api.create_filesystem("w", "us-east-1", deadline_at=deadline_at)
 
 
 def test_delete_filesystem_true_on_success_false_on_error(monkeypatch):
@@ -325,10 +334,11 @@ def test_delete_filesystem_true_on_success_false_on_error(monkeypatch):
 def test_ensure_filesystem_reuses_same_name_and_region(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
 
+    deadline_at = 1_000_000_000_000.0
     monkeypatch.setattr(
         lambda_api,
         "list_filesystems",
-        lambda: [
+        lambda **_kwargs: [
             {"name": "other", "region": {"name": "us-east-1"}, "mount_point": "/other"},
             {"name": "w", "region": {"name": "us-west-2"}, "mount_point": "/wrong-region"},
             {"name": "w", "region": None, "mount_point": "/null-region"},  # (region or {}) guard
@@ -340,30 +350,41 @@ def test_ensure_filesystem_reuses_same_name_and_region(monkeypatch):
         raise AssertionError("must reuse an existing same-name/region filesystem, not create")
 
     monkeypatch.setattr(lambda_api, "create_filesystem", no_create)
-    assert lambda_api.ensure_filesystem("w", "us-east-1") == "/lambda/nfs/w"
+    assert (
+        lambda_api.ensure_filesystem("w", "us-east-1", deadline_at=deadline_at) == "/lambda/nfs/w"
+    )
 
     # a matching filesystem with no mount_point falls back to the default host path
     monkeypatch.setattr(
-        lambda_api, "list_filesystems", lambda: [{"name": "w", "region": {"name": "us-east-1"}}]
+        lambda_api,
+        "list_filesystems",
+        lambda **_kwargs: [{"name": "w", "region": {"name": "us-east-1"}}],
     )
-    assert lambda_api.ensure_filesystem("w", "us-east-1") == "/lambda/nfs/w"
+    assert (
+        lambda_api.ensure_filesystem("w", "us-east-1", deadline_at=deadline_at) == "/lambda/nfs/w"
+    )
 
 
 def test_ensure_filesystem_creates_when_absent(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
 
-    monkeypatch.setattr(lambda_api, "list_filesystems", lambda: [])
+    deadline_at = 1_000_000_000_000.0
+    monkeypatch.setattr(lambda_api, "list_filesystems", lambda **_kwargs: [])
     created = {}
     monkeypatch.setattr(
         lambda_api,
         "create_filesystem",
-        lambda n, r: created.update(n=n, r=r) or {"mount_point": "/mnt/new"},
+        lambda n, r, *, deadline_at: (
+            created.update(n=n, r=r, deadline_at=deadline_at) or {"mount_point": "/mnt/new"}
+        ),
     )
-    assert lambda_api.ensure_filesystem("w", "us-east-1") == "/mnt/new"
-    assert created == {"n": "w", "r": "us-east-1"}
+    assert lambda_api.ensure_filesystem("w", "us-east-1", deadline_at=deadline_at) == "/mnt/new"
+    assert created == {"n": "w", "r": "us-east-1", "deadline_at": deadline_at}
     # a create that returns no mount_point falls back to the default host path
-    monkeypatch.setattr(lambda_api, "create_filesystem", lambda n, r: {})
-    assert lambda_api.ensure_filesystem("w", "us-east-1") == "/lambda/nfs/w"
+    monkeypatch.setattr(lambda_api, "create_filesystem", lambda n, r, *, deadline_at: {})
+    assert (
+        lambda_api.ensure_filesystem("w", "us-east-1", deadline_at=deadline_at) == "/lambda/nfs/w"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +440,39 @@ def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
     assert deleted == ["good1", "42"]
     # each surviving id was terminated ONE AT A TIME (batch endpoint 400s the whole set on one bad id)
     assert [b["instance_ids"] for b in bodies] == [["good1"], ["bad"], ["42"]]
+
+
+def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
+    lambda_api.terminate_instance_confirmed("i-1")
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: [])
+    with pytest.raises(lambda_api.LambdaApiError, match="was not confirmed"):
+        lambda_api.terminate_instance_confirmed("i-1")
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(
+        lambda_api,
+        "get_instance",
+        lambda iid, *, strict: {"id": iid, "status": "terminating"},
+    )
+    with pytest.raises(lambda_api.LambdaApiError, match="remains"):
+        lambda_api.terminate_instance_confirmed("i-1")
+
+
+def test_strict_instance_reads_reject_malformed_success_payloads(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": {}})
+    with pytest.raises(lambda_api.LambdaApiError, match=r"listing.*malformed"):
+        lambda_api.list_instances(strict=True)
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": []})
+    with pytest.raises(lambda_api.LambdaApiError, match=r"lookup.*malformed"):
+        lambda_api.get_instance("i-1", strict=True)
 
 
 # ---------------------------------------------------------------------------

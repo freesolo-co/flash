@@ -58,6 +58,7 @@ class VastProvider(InstanceProvider):
         attempt: int,
         runtime_secrets: dict[str, str] | None,
         code_prefix: str | None,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import submit_run_vast
 
@@ -69,6 +70,7 @@ class VastProvider(InstanceProvider):
             attempt=attempt,
             runtime_secrets=runtime_secrets,
             code_prefix=code_prefix,
+            deadline_at=deadline_at,
         )
 
     def _poll_job(
@@ -79,7 +81,7 @@ class VastProvider(InstanceProvider):
         *,
         log: Any,
         heartbeat_reader: Any,
-        deadline_s: float,
+        deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import poll_vast_job
 
@@ -89,19 +91,14 @@ class VastProvider(InstanceProvider):
             seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
-            deadline_s=deadline_s,
+            deadline_at=deadline_at,
         )
-
-    def _reattach_deadline(self, spec) -> float:
-        from flash.providers.vast.jobs import PROVISION_GRACE_S
-
-        return max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
 
     def _teardown_reattached(self, handle: JobHandle, spec) -> None:
         from flash.providers.vast.jobs import _best_effort_destroy, destroy_run_instances
 
         if not _best_effort_destroy(handle.instance_id, context="poll recovery teardown"):
-            # Unconfirmed teardown: the active-run sweep shields this label, so escalate to a
+            # unconfirmed teardown: the active-run sweep shields this label, so escalate to a
             # run-scoped reap by label (re-lists + retries, not active-shielded), mirroring the
             # submit_run_vast teardown finally.
             destroy_run_instances(spec.run_id)
@@ -164,15 +161,15 @@ class VastProvider(InstanceProvider):
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.vast.jobs import cancel
 
-        cancel(handle.to_dict())
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        cancel(strict.to_dict())
 
     def destroy(self, handle: JobHandle) -> None:
         from flash.providers.vast import api as vast_api
         from flash.providers.vast.jobs import _best_effort_destroy
 
-        iid = handle.to_dict().get("instance_id")
-        if not iid:
-            return
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        iid = strict.instance_id
         # Reuse the canonical best-effort teardown (it warns on an unconfirmed success:false/breakdown and
         # passes iid through unconverted), but RE-RAISE on failure so this suppress-wrapped path falls back
         # to sweep_orphans rather than recording a false success.
