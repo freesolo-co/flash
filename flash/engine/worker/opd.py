@@ -22,6 +22,7 @@ module is CPU/offline-safe.
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
 import os
 import random
@@ -43,7 +44,13 @@ from flash.engine.recipe import (
     RECIPE,
     resolve_teacher,
 )
-from flash.engine.steps import on_policy_steps
+from flash.engine.steps import (
+    checkpoint_step_due,
+    final_checkpoint_due,
+    on_policy_steps,
+    resolve_update_horizon,
+    validate_checkpoint_horizon,
+)
 from flash.engine.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
@@ -88,6 +95,7 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 
@@ -277,6 +285,8 @@ class OpdKnobs:
     # gkd reverse-KL scale; reuses the existing [train] kl_penalty_coef knob (default 1.0).
     kl_coef: float = 1.0
     save_every: int = 0
+    max_steps: int = 0
+    checkpoint_landmarks: tuple[int, ...] = ()
     max_length: int = 0
     # Student on-policy sampling stops at these delimiters (parity with GRPO), so the teacher never
     # scores/trains on text past the intended answer boundary.
@@ -335,6 +345,8 @@ def _resolve_opd_knobs() -> OpdKnobs:
         group_size=int(opt("group_size", 0) or d.group_size),
         kl_coef=kl_coef,
         save_every=int(opt("save_every", 0) or 20),
+        max_steps=int(opt("max_steps", 0) or 0),
+        checkpoint_landmarks=tuple(getattr(t, "checkpoint_landmarks", ()) or ()),
         max_length=int(opt("max_context_tokens", 0) or 0),
         stop_sequences=tuple(getattr(t, "stop_sequences", ()) or ()),
         structured_outputs=str(getattr(t, "structured_outputs", "") or ""),
@@ -467,13 +479,17 @@ def _normalize_accumulated_gradients(
             parameter.grad.mul_(scale)
 
 
-def run_opd():
-    forward_teacher_accounting = _ForwardTeacherRuntimeAccounting()
-    try:
-        return _run_opd(forward_teacher_accounting)
-    except Exception as exc:
-        forward_teacher_accounting.attach(exc)
-        raise
+def _with_forward_teacher_accounting(run):
+    @functools.wraps(run)
+    def wrapped():
+        forward_teacher_accounting = _ForwardTeacherRuntimeAccounting()
+        try:
+            return run(forward_teacher_accounting)
+        except Exception as exc:
+            forward_teacher_accounting.attach(exc)
+            raise
+
+    return wrapped
 
 
 def _forward_teacher_runtime_fields(forward_teacher_accounting, *, enabled: bool) -> dict:
@@ -497,13 +513,15 @@ def _emit_opd_trained_heartbeat(
     )
 
 
-def _run_opd(forward_teacher_accounting):
+@_with_forward_teacher_accounting
+def run_opd(forward_teacher_accounting):
     import torch
     from transformers import AutoTokenizer
 
     from flash.engine.worker.forward_teacher import ForwardTeacherClient
     from flash.engine.worker.teacher import TeacherClient
 
+    seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     if getattr(env, "is_tool_env", False):
         # Tool envs need TRL's native tool-call loop (rl.py hands the tool schemas + callables to the
@@ -665,14 +683,17 @@ def _run_opd(forward_teacher_accounting):
             "only that many prompt(s) fit after filtering"
         )
         prompts_per_step = len(examples)
-    steps = on_policy_steps(
+    derived_steps = on_policy_steps(
         epochs=knobs.epochs,
         prompt_count=len(examples),
         prompts_per_step=prompts_per_step,
     )
+    steps = resolve_update_horizon(derived_steps, knobs.max_steps)
+    validate_checkpoint_horizon(knobs.checkpoint_landmarks, steps)
     print(
         f"[opd] epochs={knobs.epochs} over {len(examples)} retained prompt(s) at "
-        f"{prompts_per_step} prompts/step -> steps={steps}"
+        f"{prompts_per_step} prompts/step -> derived_steps={derived_steps} "
+        f"update_horizon={steps}"
     )
 
     # Now that a non-empty on-policy pool is confirmed, prefetch the full base weights (deferred from
@@ -680,15 +701,8 @@ def _run_opd(forward_teacher_accounting):
     # (opt_steps==0 -> wide poller grace), same as when it ran earlier.
     download_seconds = _w.prefetch_model(model_id)
 
-    # Seed torch/CUDA BEFORE constructing the student LoRA: get_peft_model samples the LoRA A matrix
-    # (init_lora_weights=True) from the torch default generator, so seeding must precede _student_model
-    # for the fixed Flash seed to reproduce the same adapter init run-to-run (the fresh-LoRA and VL
-    # warm-start paths both build a fresh LoRA). The colocated vLLM rollout engine receives the same
-    # seed below. The prompt shuffle above uses a SEPARATE random.Random(_w.SEED), so its ordering is
-    # unaffected by where torch is seeded.
-    torch.manual_seed(_w.SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(_w.SEED)
+    # reseed before stochastic student and adapter construction.
+    seed_training_rngs(_w.SEED)
 
     setup_seconds = time.time() - t_start
     _w.heartbeat("opd_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
@@ -763,7 +777,7 @@ def _run_opd(forward_teacher_accounting):
             structured_outputs=_so_spec,
             reasoning_parser=_reasoning_parser,
             lora_rank=lora_rank,
-            seed=_w.SEED,
+            seed=backend_seed(_w.SEED),
             **vllm_kwargs,
         )
         vllm_rollout.sync_from_model(model)
@@ -866,7 +880,13 @@ def _run_opd(forward_teacher_accounting):
         aggregates, and refresh the stall clock. Called after vLLM generation and teacher scoring;
         ``samples_seen`` is advanced by the caller once per generated rollout so its timing is
         unchanged."""
-        nonlocal teacher_ok, teacher_transient, teacher_error, truncated_rollouts, step_loss, step_cov
+        nonlocal \
+            teacher_ok, \
+            teacher_transient, \
+            teacher_error, \
+            truncated_rollouts, \
+            step_loss, \
+            step_cov
         nonlocal granularity_sum, granularity_n, generated_tokens, teacher_input_tokens, nseq
         if r.teacher_status == "ok":
             teacher_ok += 1
@@ -916,6 +936,7 @@ def _run_opd(forward_teacher_accounting):
     max_teacher_workers = _opd_teacher_workers(
         knobs.prompts_per_step * knobs.group_size, teacher_batch_size
     )
+
     # fields= carries opt_steps on the liveness thread's opd_step pings: opd_step is upload-throttled,
     # so a stepless liveness ping could win the slot and overwrite the main thread's stepped heartbeat,
     # leaving actual_steps_run to floor a cancelled run to 1 step (codex[bot]).
@@ -1280,11 +1301,16 @@ def _run_opd(forward_teacher_accounting):
             # Checkpoint on OPTIMIZER-step count, not the loop index: a `step-N` artifact must
             # contain N real updates (skipped no-signal iterations don't advance opt_steps), else a
             # warm-start/deploy from step-N would use fewer updates than its name implies.
-            if knobs.save_every and opt_steps % knobs.save_every == 0:
+            if checkpoint_step_due(opt_steps, knobs.checkpoint_landmarks, knobs.save_every):
                 _save_adapter(model, tok, adapter_dir)
-                # Best-effort: a mid-run publish failure (e.g. a transient upload error) must not abort
-                # the loop after real optimizer steps — the finalize publish is strict.
-                _publish_opd_deployable(adapter_dir, opt_steps, as_default=False, best_effort=True)
+                is_landmark = opt_steps in knobs.checkpoint_landmarks
+                _publish_opd_deployable(
+                    adapter_dir,
+                    opt_steps,
+                    as_default=False,
+                    best_effort=not is_landmark,
+                    checkpoint_required=is_landmark,
+                )
 
     train_wall = time.time() - t_train
     if not loss_curve:
@@ -1334,9 +1360,13 @@ def _run_opd(forward_teacher_accounting):
         )
 
     _save_adapter(model, tok, adapter_dir)
-    # Ship the deployable adapter: the continued (or fresh) LoRA deploys as-is on the catalog base.
-    # Name the final checkpoint by real optimizer steps applied, not the planned `steps` count.
-    _publish_opd_deployable(adapter_dir, opt_steps, as_default=True)
+    # keep the served default while suppressing non-landmark final checkpoints.
+    _publish_opd_deployable(
+        adapter_dir,
+        opt_steps,
+        as_default=True,
+        publish_checkpoint=final_checkpoint_due(opt_steps, knobs.checkpoint_landmarks),
+    )
     # step=opt_steps on this (unthrottled) final ping AND on the opd_train_done ping below keeps the
     # persisted heartbeat's step at the true completed count. Without it, a cancel landing after the
     # adapter publish but before DONE is persisted reads a STEPLESS opd_trained/opd_train_done as the
@@ -1449,7 +1479,9 @@ def _run_opd(forward_teacher_accounting):
                 else None
             ),
             "opd_rollout_pipeline_max_chunks": (
-                _opd_rollout_pipeline_max_chunks(prompts_per_step * group) if not multi_turn else None
+                _opd_rollout_pipeline_max_chunks(prompts_per_step * group)
+                if not multi_turn
+                else None
             ),
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
@@ -1758,7 +1790,9 @@ def _score_many(
                 for _ in pendings
             ]
         return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
-    return [_ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings]
+    return [
+        _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
+    ]
 
 
 @dataclass(frozen=True)
@@ -2422,12 +2456,10 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     )
     student_group_logsum = sp_det.new_zeros(len(prepared.group_lengths))
     student_group_logsum.index_add_(0, group_ids_t, sp_det.index_select(0, flat_idx_t))
-    teacher_logsum_t = torch.tensor(
-        prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device
+    teacher_logsum_t = torch.tensor(prepared.teacher_logsums, dtype=sp_t.dtype, device=sp_t.device)
+    coeffs = (
+        kl_coef * (student_group_logsum - teacher_logsum_t) / group_lengths_t.to(dtype=sp_t.dtype)
     )
-    coeffs = kl_coef * (
-        student_group_logsum - teacher_logsum_t
-    ) / group_lengths_t.to(dtype=sp_t.dtype)
     coeff_vec = coeffs.index_select(0, group_ids_t)
     sp_sel = sp_t.index_select(0, flat_idx_t)
     return (coeff_vec * sp_sel).mean()
@@ -2537,13 +2569,9 @@ def _resolve_samples_batched(
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-            attention_mask = torch.zeros(
-                (len(seqs), max_len), dtype=torch.long, device=device
-            )
+            attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(
-                    seq, dtype=torch.long, device=device
-                )
+                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
                 attention_mask[row, : len(seq)] = 1
             logits = _forward_logits(model, input_ids, attention_mask)
             losses = []
@@ -2626,21 +2654,29 @@ def _save_adapter(model, tok, adapter_dir: str) -> None:
 
 
 def _publish_opd_deployable(
-    adapter_dir: str, step: int, *, as_default: bool, best_effort: bool = False
+    adapter_dir: str,
+    step: int,
+    *,
+    as_default: bool,
+    best_effort: bool = False,
+    publish_checkpoint: bool = True,
+    checkpoint_required: bool = False,
 ) -> None:
-    """Publish the step-``step`` deployable adapter (and, when ``as_default``, the ``<prefix>/adapter``
-    served default). The opd stage CONTINUES the one warm-started adapter in place, so ``adapter_dir``
-    already carries SFT+opd on the catalog base and deploys as-is (same for fresh-LoRA runs) — no
-    recombine. Mirrors GRPO finalize (rl.py).
-
-    ``best_effort`` (mid-run per-step publish): swallow a publish failure and KEEP training — a
-    transient upload error during a save_every publish must not terminate run_opd after real optimizer
-    steps (GRPO's per-step checkpoint callback is likewise best-effort). At finalize
-    (``best_effort=False``) a publish failure is FATAL."""
+    """Publish the served default and, when requested, the step checkpoint."""
     try:
         if as_default:
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(adapter_dir, step)
+        if publish_checkpoint:
+            if checkpoint_required:
+                _w.publish_deployable_checkpoint(
+                    adapter_dir,
+                    step,
+                    retries=3,
+                    backoff_s=5.0,
+                    required=True,
+                )
+            else:
+                _w.publish_deployable_checkpoint(adapter_dir, step)
     except Exception as e:
         if not best_effort:
             raise

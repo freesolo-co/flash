@@ -1099,6 +1099,7 @@ def test_opd_rejects_tool_environments(monkeypatch):
         opd_mod,
         "_w",
         SimpleNamespace(
+            SEED=0,
             hf_resume_checkpoint=lambda: "",
             require_active_env=lambda e=env: e,
         ),

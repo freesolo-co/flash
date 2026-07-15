@@ -66,9 +66,9 @@ def test_worker_image_template_can_define_arch_tags(monkeypatch):
 
 
 def test_per_sm_and_template_never_leak_into_live_endpoints(monkeypatch):
-    # per-SM / template images are durable RunPod queue-worker images (CMD runs rp_handler.py); they
-    # must NOT route into the live-endpoint path (allow_default=False), which expects None unless the
-    # absolute FLASH_WORKER_IMAGE override names a live-compatible image.
+    # per-sm and template images are durable runpod queue-worker images (cmd runs rp_handler.py); they
+    # must not route into the live-endpoint path (allow_default=False), which expects none unless the
+    # absolute flash_worker_image override names a live-compatible image.
     _clear_image_env(monkeypatch)
     monkeypatch.setenv(
         "FLASH_WORKER_IMAGE_TEMPLATE",

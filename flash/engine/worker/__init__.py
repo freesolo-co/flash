@@ -77,6 +77,7 @@ from flash.engine.worker.hf import (
     hf_resume_checkpoint,
     hf_upload_file,
     hf_upload_folder,
+    make_checkpoint_landmark_callback,
     make_checkpoint_upload_callback,
     prefetch_model,
     publish_deployable_checkpoint,
@@ -124,6 +125,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rl import run_rl
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.sft import run_sft
 from flash.engine.worker.wandb_log import (
     wandb_finish,
@@ -134,6 +136,16 @@ from flash.engine.worker.wandb_log import (
 from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import FIXED_SEED, load_job_spec_from_env
+
+
+def _resolve_worker_seed(job_spec, env_seed: str | None) -> int:
+    if job_spec is not None:
+        return int(job_spec.seed)
+    try:
+        seed = int(env_seed) if env_seed is not None else FIXED_SEED
+    except (TypeError, ValueError):
+        return FIXED_SEED
+    return seed if 0 <= seed <= 2**63 - 1 else FIXED_SEED
 
 
 def _parse_attempt_env() -> int:
@@ -147,10 +159,10 @@ def _parse_attempt_env() -> int:
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
-SEED = int(os.environ.get("SEED", str(FIXED_SEED)))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 ATTEMPT = _parse_attempt_env()
 JOB_SPEC = load_job_spec_from_env()
+SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
 PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
@@ -470,6 +482,7 @@ __all__ = [
     "assert_adapter_delta_nonzero",
     "assert_adapter_load_clean",
     "assert_lora_applied",
+    "backend_seed",
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
     # gpu/backend setup
@@ -498,6 +511,7 @@ __all__ = [
     "load_mega_cache",
     "loraplus_optimizer_cls",
     "main",
+    "make_checkpoint_landmark_callback",
     "make_checkpoint_upload_callback",
     "make_lora",
     "make_reward_heartbeat_callback",
@@ -517,6 +531,7 @@ __all__ = [
     "run_opd",
     "run_rl",
     "run_sft",
+    "seed_training_rngs",
     "setup_perf_backends",
     "strip_think",
     "think_token_count",
