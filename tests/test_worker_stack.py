@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,6 +83,127 @@ def test_is_vl_checkpoint_text_model(monkeypatch):
     worker = _import_worker(monkeypatch)
     _fake_transformers(monkeypatch, "llama")
     assert worker.is_vl_checkpoint("openbmb/MiniCPM5-1B") is False
+
+
+@pytest.mark.parametrize(
+    ("revision", "expected"),
+    [("refs/pr/123", {"revision": "refs/pr/123"}), ("", {})],
+)
+def test_model_revision_keyword_is_present_only_when_nonempty(revision, expected):
+    from flash.engine.worker.hf import model_revision_kwargs
+
+    assert model_revision_kwargs(revision) == expected
+
+
+@pytest.mark.parametrize("revision", ["refs/pr/123", ""])
+def test_model_revision_threads_through_config_probes(monkeypatch, revision):
+    calls = []
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append((model_id, kwargs))
+            return SimpleNamespace(
+                model_type="qwen3_5",
+                hidden_size=4096,
+                num_hidden_layers=32,
+                layer_types=("linear_attention",),
+            )
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = _AutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    from flash.engine.worker import lora, packing, sft
+    from flash.engine.worker.perf import liger
+
+    assert lora.is_vl_checkpoint("org/model", revision=revision)
+    assert packing.model_is_gdn_hybrid("org/model", revision=revision)
+    assert not packing.model_is_pure_attention("org/model", revision=revision)
+    assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
+    assert isinstance(liger._liger_default_for_model("org/model", revision=revision), bool)
+
+    expected = {"trust_remote_code": True}
+    if revision:
+        expected["revision"] = revision
+    assert calls
+    assert all(kwargs == expected for _model_id, kwargs in calls)
+
+
+def _fake_arch_probe(monkeypatch, *, hidden, layers):
+    """Stub AutoConfig so ``_model_arch_dims`` sees a probe that yields ``(hidden, layers)``."""
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            return SimpleNamespace(
+                model_type="qwen3_6", hidden_size=hidden, num_hidden_layers=layers
+            )
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoConfig = _AutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+
+def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
+    # regression: the 35B-A3B multimodal-nested config makes the AutoConfig probe return (0, 0). A
+    # revision pin must treat that as "unparseable" and fall back to the curated catalog geometry
+    # (exactly like an unpinned run), NOT as a mismatch -- otherwise revision-pinned SFT on that model
+    # raises after the GPU is already rented.
+    from flash.engine.worker import sft
+
+    _fake_arch_probe(monkeypatch, hidden=0, layers=0)
+    # Qwen/Qwen3.6-35B-A3B is the sole catalog entry carrying (hidden, layers) == (2048, 40).
+    assert sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123") == (2048, 40)
+
+
+def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
+    # a NONZERO probe dim that genuinely disagrees with the catalog is a real revision mismatch and must
+    # still fail closed, so a revision pin can never silently size VRAM with the wrong geometry.
+    from flash.engine.worker import sft
+
+    _fake_arch_probe(monkeypatch, hidden=9999, layers=99)
+    with pytest.raises(RuntimeError, match="revision-specific model architecture"):
+        sft._model_arch_dims("Qwen/Qwen3.6-35B-A3B", revision="refs/pr/123")
+
+
+def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
+    calls = []
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append(("tokenizer", model_id, kwargs))
+            return object()
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = _AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    import huggingface_hub
+
+    import flash.engine.worker as worker
+    from flash.engine.worker import hf
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **kwargs: calls.append(("snapshot", kwargs["repo_id"], kwargs)),
+    )
+    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
+    monkeypatch.setattr(hf, "_hf_cache_bytes", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(hf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+
+    assert hf.load_tokenizer("org/model", revision="refs/pr/123") is not None
+    hf.prefetch_model("org/model", revision="refs/pr/123")
+    assert hf.load_tokenizer("org/model", revision="") is not None
+    hf.prefetch_model("org/model", revision="")
+
+    revision_calls = [kwargs for _kind, _model, kwargs in calls[:2]]
+    empty_calls = [kwargs for _kind, _model, kwargs in calls[2:]]
+    assert all(kwargs["revision"] == "refs/pr/123" for kwargs in revision_calls)
+    assert all("revision" not in kwargs for kwargs in empty_calls)
 
 
 def _fake_torch(monkeypatch):
@@ -613,6 +735,10 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", fake_peft)
 
     worker = _import_worker(monkeypatch)
+    worker.JOB_SPEC = types.SimpleNamespace(
+        train=types.SimpleNamespace(lora_rank=32, lora_alpha=64),
+        model_revision="a" * 40,
+    )
 
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()
@@ -620,6 +746,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is False
+        assert captured.get("revision") == "a" * 40
 
 
 def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
@@ -637,7 +764,7 @@ def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoModelForImageTextToText = _ImageText
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: True)
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": True)
 
     out = adapter_mod.prepare_fresh_lora_base(
         "/tmp/flash_sft_merged_x",
@@ -658,7 +785,7 @@ def test_prepare_fresh_lora_base_uses_multimodal_loader_for_vl(monkeypatch):
 def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
     import flash.engine.worker.adapter as adapter_mod
 
-    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id: False)
+    monkeypatch.setattr(adapter_mod, "is_vl_checkpoint", lambda model_id, revision="": False)
 
     assert (
         adapter_mod.prepare_fresh_lora_base(
@@ -666,6 +793,116 @@ def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
         )
         == "openbmb/MiniCPM5-1B"
     )
+
+
+def test_prepare_fresh_lora_base_forwards_revision_to_probe_and_loader(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    probes = []
+    loads = []
+
+    class _ImageText:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            loads.append((args, kwargs))
+            return object()
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModelForImageTextToText = _ImageText
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(
+        adapter_mod,
+        "is_vl_checkpoint",
+        lambda model_id, revision="": probes.append((model_id, revision)) or True,
+    )
+
+    adapter_mod.prepare_fresh_lora_base(
+        "org/model",
+        "org/model",
+        {"dtype": "bfloat16", "revision": "refs/pr/123"},
+        phase="sft",
+        model_revision="refs/pr/123",
+    )
+
+    assert probes == [("org/model", "refs/pr/123")]
+    assert loads[0][1]["revision"] == "refs/pr/123"
+
+
+def test_prepare_fresh_lora_base_rejects_revision_authority_conflict(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    with pytest.raises(ValueError, match="probe revision must match"):
+        adapter_mod.prepare_fresh_lora_base(
+            "org/model",
+            "org/model",
+            {"revision": "a" * 40},
+            model_revision="b" * 40,
+        )
+
+
+def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
+    import flash.engine.worker.adapter as adapter_mod
+
+    loads = []
+
+    class _Base:
+        _checkpoint_conversion_mapping = None
+
+    class _Causal:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            loads.append((args, kwargs))
+            return _Base()
+
+    class _ImageText:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            raise AssertionError("unexpected vl loader")
+
+    class _Peft:
+        @classmethod
+        def from_pretrained(cls, base, adapter_dir, is_trainable):
+            return cls()
+
+        def load_adapter(self, *args, **kwargs):
+            return object()
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModelForCausalLM = _Causal
+    fake_transformers.AutoModelForImageTextToText = _ImageText
+    fake_peft = types.ModuleType("peft")
+    fake_peft.PeftModel = _Peft
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    monkeypatch.setattr(
+        adapter_mod,
+        "_w",
+        SimpleNamespace(
+            JOB_SPEC=SimpleNamespace(
+                model_revision="refs/pr/123",
+                train=SimpleNamespace(init_from_adapter="owner/repo:sft/source"),
+            )
+        ),
+    )
+    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda prefix: "/tmp/adapter")
+    monkeypatch.setattr(adapter_mod, "adapter_is_vl_warmstart", lambda *args, **kwargs: False)
+    monkeypatch.setattr(adapter_mod, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(adapter_mod, "_assert_warmstart_adapter_applied", lambda *args: None)
+
+    model, peft_config = adapter_mod._init_adapter_model("org/model")
+
+    assert isinstance(model, _Peft)
+    assert peft_config is None
+    assert loads == [
+        (
+            ("org/model",),
+            {
+                "dtype": "bfloat16",
+                "trust_remote_code": True,
+                "revision": "refs/pr/123",
+            },
+        )
+    ]
 
 
 def test_sft_and_rl_wire_vl_full_lora_base_loader():
@@ -682,6 +919,58 @@ def test_sft_and_rl_wire_vl_full_lora_base_loader():
     assert 'model_init_kwargs["device_map"] = None' in rl_src
     assert 'device_map", "auto"' not in rl_src
     assert "model=trainer_model" in rl_src
+
+
+def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.worker import finalize
+    from flash.spec import JobSpec
+
+    captured = []
+    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(model_revision="refs/pr/123"))
+    monkeypatch.setattr(worker, "SEED", 42)
+    monkeypatch.setattr(worker, "THINKING", False)
+    monkeypatch.setattr(worker, "require_active_env", lambda: SimpleNamespace(id="org/env"))
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_finalize", captured.append)
+    monkeypatch.setattr(finalize, "gpu_diagnostics", lambda: {})
+
+    finalize.write_train_meta(
+        phase="sft",
+        adapter_dir="/tmp/adapter",
+        model_id="org/model",
+        train_wall=1.0,
+        setup_seconds=2.0,
+        train_tokens=3,
+        generated_tokens=0,
+        notes={},
+    )
+
+    assert captured[0].notes["job_spec"]["model_revision"] == "refs/pr/123"
+
+
+def test_grpo_colocate_vllm_patch_forwards_nonempty_revision(monkeypatch):
+    import flash.engine.worker.gpu_setup as gpu_setup
+
+    captured = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    for name in ("trl", "trl.generation"):
+        pkg = types.ModuleType(name)
+        pkg.__path__ = []
+        monkeypatch.setitem(sys.modules, name, pkg)
+    module = types.ModuleType("trl.generation.vllm_generation")
+    module.LLM = _FakeLLM
+    monkeypatch.setitem(sys.modules, "trl.generation.vllm_generation", module)
+
+    assert gpu_setup.patch_trl_colocate_llm_kwargs(revision="refs/pr/123")
+    module.LLM(model="org/model")
+
+    assert captured["revision"] == "refs/pr/123"
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
@@ -1085,6 +1374,46 @@ def test_tilelang_pin_is_consistent_and_pinned():
     assert pm.group(1) == pin, (
         f"perf/__init__.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
+
+
+def test_exact_gpu_validation_accepts_alias_and_rejects_neighbor_classes(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+    from flash.engine.worker.perf import RetriableInfraError
+
+    verify_gpu = lifecycle.verify_gpu
+
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (9, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=80 * 10**9),
+        get_device_name=lambda _index: "NVIDIA H100 PCIE",
+    )
+    torch = SimpleNamespace(cuda=cuda)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+    verify_gpu("H100", exact_type="h100")
+
+    for observed in ("NVIDIA H200", "NVIDIA B200"):
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index, name=observed: name)
+        with pytest.raises(RetriableInfraError, match=r"requested='H100'.*observed="):
+            verify_gpu("H100", exact_type="H100")
+
+
+def test_exact_gpu_validation_accepts_pytorch_a100_sxm4_40gb_name(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (8, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=40 * 10**9),
+        get_device_name=lambda _index: "NVIDIA A100-SXM4-40GB",
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+
+    lifecycle.verify_gpu("A100 SXM 40GB", exact_type="A100 SXM 40GB")
 
 
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):

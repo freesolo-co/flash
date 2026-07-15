@@ -86,6 +86,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
 
     engine = OpdVllmRolloutEngine(
         model_source="base-or-merged",
+        model_revision="refs/pr/123",
         max_model_len=2048,
         temperature=0.7,
         top_p=0.9,
@@ -108,6 +109,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     out = engine.generate([[1, 2]], max_tokens=5)
 
     assert _FakeLLM.last_kwargs["model"] == "base-or-merged"
+    assert _FakeLLM.last_kwargs["revision"] == "refs/pr/123"
     assert _FakeLLM.last_kwargs["enable_lora"] is True
     assert _FakeLLM.last_kwargs["max_lora_rank"] == 16
     assert _FakeLLM.last_kwargs["gpu_memory_utilization"] == 0.42
@@ -151,10 +153,11 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
 
     class _FakeLLM:
         batch_sizes: ClassVar[list[int]] = []
+        last_kwargs: ClassVar[dict] = {}
         request_seeds: ClassVar[list[int]] = []
 
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            _FakeLLM.last_kwargs = dict(kwargs)
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
             _FakeLLM.batch_sizes.append(len(prompts))
@@ -201,6 +204,7 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
         [[1], [2], [3], [4], [5]], max_tokens=5, request_seeds=[11, 12, 13, 14, 15]
     )
 
+    assert "revision" not in _FakeLLM.last_kwargs
     assert _FakeLLM.batch_sizes == [2, 2, 1]
     assert _FakeLLM.request_seeds == [11, 12, 13, 14, 15]
     assert [item.token_ids for item in out] == [[3], [3], [3], [3], [3]]
