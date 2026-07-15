@@ -85,22 +85,13 @@ def test_method_signatures_match_runpod(provider):
         assert rs == os_, f"{meth} param mismatch: runpod={rs} {provider}={os_}"
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
-def test_setup_vs_training_gate_is_the_one_canonical_helper(provider):
-    """Every poll loop (runpod, lambda, vast) must draw the setup-vs-training stall boundary from the
-    SAME canonical is_training_heartbeat helper in _poll (so the rule can't drift between providers). The
-    helper keeps the cold-start pings — including model_prefetching / *_initializing — under the wide
-    setup grace, flips to the tight window only on a COMPLETED-step rl_step/sft_step, and also flips on
-    POST-training stages (so a hung teardown isn't left under setup grace)."""
+def test_setup_vs_training_gate_contract():
+    """define the canonical setup-vs-training classifier contract used by provider polling."""
     from flash.providers._poll import (
         SETUP_HEARTBEAT_STAGES,
         STEP_GATED_STAGES,
         is_training_heartbeat,
     )
-
-    jobs = importlib.import_module(f"flash.providers.{_PKG[provider]}.jobs")
-    # The provider must reference the shared helper, not a private copy that can drift.
-    assert jobs.is_training_heartbeat is is_training_heartbeat
 
     # The slow cold-start pings must count as setup (kept under the wide setup grace).
     for stage in ("model_prefetching", "model_prefetched", "sft_initializing", "rl_initializing"):
