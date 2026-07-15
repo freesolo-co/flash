@@ -2692,6 +2692,25 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
+        import types
+
+        import huggingface_hub
+
+        class FakePrivateHf:
+            def repo_info(self, **_kwargs):
+                return types.SimpleNamespace(sha="private-pinned-sha")
+
+            def get_paths_info(self, **_kwargs):
+                return []
+
+        fake_private_hf = FakePrivateHf()
+        monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: fake_private_hf)
+        monkeypatch.setattr(
+            huggingface_hub,
+            "hf_hub_download",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("no marker is present")),
+        )
+
         spec = JobSpec(
             run_id="oom-walk",
             model="Qwen/Qwen3.5-4B",

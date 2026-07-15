@@ -10,6 +10,7 @@ from flash._channel import CHANNEL
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.spec import (
@@ -268,6 +269,12 @@ def build_worker_env(
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)
+    # the pinned resume revision is control-plane-owned transport, not a user-declared secret.
+    # lifecycle removes caller input and supplies only the gate-approved sha on a required replacement.
+    env.pop(OPD_RESUME_REVISION_ENV, None)
+    resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
+    if resume_revision:
+        env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
     # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
     # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
     # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed

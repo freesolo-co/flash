@@ -154,12 +154,14 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
     class _FakeLLM:
         batch_sizes: ClassVar[list[int]] = []
         last_kwargs: ClassVar[dict] = {}
+        request_seeds: ClassVar[list[int]] = []
 
         def __init__(self, **kwargs):
             _FakeLLM.last_kwargs = dict(kwargs)
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
             _FakeLLM.batch_sizes.append(len(prompts))
+            _FakeLLM.request_seeds.extend(params.kwargs["seed"] for params in sampling_params)
             return [
                 SimpleNamespace(
                     outputs=[
@@ -198,10 +200,13 @@ def test_opd_vllm_engine_chunks_generate_by_rollout_batch_size(monkeypatch, tmp_
     )
     engine.sync_from_model(_Model())
 
-    out = engine.generate([[1], [2], [3], [4], [5]], max_tokens=5)
+    out = engine.generate(
+        [[1], [2], [3], [4], [5]], max_tokens=5, request_seeds=[11, 12, 13, 14, 15]
+    )
 
     assert "revision" not in _FakeLLM.last_kwargs
     assert _FakeLLM.batch_sizes == [2, 2, 1]
+    assert _FakeLLM.request_seeds == [11, 12, 13, 14, 15]
     assert [item.token_ids for item in out] == [[3], [3], [3], [3], [3]]
 
 
