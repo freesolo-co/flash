@@ -948,6 +948,294 @@ def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypa
     )
 
 
+@pytest.mark.parametrize("state", ["queued", "smoke_testing"])
+def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
+    tmp_path, monkeypatch, state
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = f"flash-checkpoint-{state}"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    status = orch.get_status(run_id)
+    status.deployment = {
+        "state": state,
+        "requested_at": 123.0,
+        "previous_deployment": previous,
+    }
+    orch._save_status(status)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "adapter_alias_target",
+        lambda _run_id: pytest.fail("ordinary cancellation must not read the serving alias"),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the verified previous checkpoint must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment == previous
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-unknown-previous"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    busy = {
+        "state": "reconciling",
+        "requested_at": 456.0,
+        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = busy
+    orch._save_status(status)
+    alias_reads = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy,
+        "adapter_alias_target",
+        lambda target: alias_reads.append(target) or previous["adapter_revision"],
+    )
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the authoritative previous checkpoint must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert alias_reads == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment == previous
+    assert out.deployment != busy
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority(
+    tmp_path, monkeypatch
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-restore-failure"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    busy = {
+        "state": "reconciling",
+        "requested_at": 456.0,
+        "adapter_revision": f"{run_id}@final." + "b" * 40,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = busy
+    orch._save_status(status)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
+    )
+
+    def fail_restore(*_args, **kwargs):
+        assert kwargs["owner_deployment"] == busy
+        raise OSError("checkpoint status store unavailable")
+
+    monkeypatch.setattr(orch, "mark_checkpoint_deployed", fail_restore)
+    undeploys = []
+
+    def undeploy(target):
+        undeploys.append(target)
+        fenced = orch.get_status(run_id)
+        assert fenced.deployment["state"] == "revocation_failed"
+        assert fenced.deployment != busy
+        assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+
+    out = orch.cancel_run(run_id)
+
+    assert undeploys == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert out.deployment != previous
+    assert out.deployment != busy
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
+def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-checkpoint-restore-ack-failure"
+    previous = _ready_checkpoint(orch, run_id, 40)
+    busy = {
+        "state": "reconciling",
+        "requested_at": 789.0,
+        "adapter_revision": f"{run_id}@final." + "c" * 40,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    status = orch.get_status(run_id)
+    status.deployment = busy
+    orch._save_status(status)
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
+    )
+    real_mark_checkpoint_deployed = orch.mark_checkpoint_deployed
+
+    def persist_then_raise(*args, **kwargs):
+        assert kwargs["owner_deployment"] == busy
+        real_mark_checkpoint_deployed(*args, **kwargs)
+        raise OSError("checkpoint status write acknowledgement lost")
+
+    monkeypatch.setattr(orch, "mark_checkpoint_deployed", persist_then_raise)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the authoritative restored checkpoint must remain serving"),
+    )
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment == previous
+    assert out.deployment != busy
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset({previous["adapter_revision"]})
+
+
+@pytest.mark.parametrize("live_verified", [False, True])
+def test_cancel_unknown_outcome_uses_verified_live_alias_instead_of_stale_previous(
+    tmp_path, monkeypatch, live_verified
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = f"flash-checkpoint-live-{live_verified}"
+    stale_previous = _ready_checkpoint(orch, run_id, 10)
+    live_revision = _checkpoint_revision(run_id, 20, "c")
+    if live_verified:
+        orch.add_verified_adapter_revision(
+            run_id,
+            live_revision,
+            expected_generation=orch.verified_adapter_revision_generation(run_id),
+        )
+    status = orch.get_status(run_id)
+    status.deployment = {
+        "state": "reconciling",
+        "requested_at": 789.0,
+        "activation_outcome_unknown": True,
+        "previous_deployment": stale_previous,
+    }
+    orch._save_status(status)
+    undeploys = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    out = orch.cancel_run(run_id)
+
+    assert out.state == "cancelled"
+    assert out.deployment != stale_previous
+    if live_verified:
+        assert undeploys == []
+        assert out.deployment == {
+            "state": "ready",
+            "adapter_revision": live_revision,
+            "checkpoint_step": 20,
+        }
+        assert orch.read_verified_adapter_revisions(run_id) == frozenset(
+            {stale_previous["adapter_revision"], live_revision}
+        )
+    else:
+        assert undeploys == [run_id]
+        assert out.deployment["state"] == "undeployed"
+        assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
+@pytest.mark.parametrize("alias_result", ["missing", "disabled", "error"])
+def test_cancel_unknown_outcome_alias_failure_revokes_fail_closed(
+    tmp_path, monkeypatch, alias_result
+):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = f"flash-checkpoint-alias-{alias_result}"
+    previous = _ready_checkpoint(orch, run_id, 30)
+    status = orch.get_status(run_id)
+    status.deployment = {
+        "state": "reconciling",
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    orch._save_status(status)
+    alias_reads = []
+
+    def alias_target(target):
+        alias_reads.append(target)
+        if alias_result == "error":
+            raise deploy.ServingError("alias read failed")
+
+    undeploys = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", alias_target)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    out = orch.cancel_run(run_id)
+
+    assert alias_reads == [run_id]
+    assert undeploys == [run_id]
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
+def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, monkeypatch):
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    run_id = "flash-final-alias-unknown"
+    final_revision = f"{run_id}@final." + "f" * 40
+    orch._save_status(
+        orch.RunStatus(
+            run_id=run_id,
+            state="done",
+            spec=_run_spec(run_id).to_dict(),
+            deployment={"state": "reconciling", "activation_outcome_unknown": True},
+        )
+    )
+    orch.add_verified_adapter_revision(
+        run_id,
+        final_revision,
+        expected_generation=orch.verified_adapter_revision_generation(run_id),
+    )
+    undeploys = []
+    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: final_revision)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
+
+    out = orch.cancel_run(run_id)
+
+    assert undeploys == [run_id]
+    assert out.deployment["state"] == "undeployed"
+    assert orch.read_verified_adapter_revisions(run_id) == frozenset()
+
+
 def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
     from flash.runner.deploy import _should_preserve_checkpoint_deployment

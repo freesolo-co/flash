@@ -2107,6 +2107,52 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     assert expected_revisions == [previous_revision, attempted_revision, attempted_revision]
 
 
+@pytest.mark.parametrize("retry_state", ["queued", "smoke_testing"])
+def test_unknown_reconciliation_allows_one_retry_then_blocks_overlap(api, monkeypatch, retry_state):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    status = runner.get_status(run_id)
+    status.deployment = {
+        "state": "reconciling",
+        "requested_at": time.time(),
+        "activation_outcome_unknown": True,
+    }
+    runner._save_status(status)
+    alias_reads = []
+    jobs = []
+    monkeypatch.setattr(
+        app_mod,
+        "adapter_alias_target",
+        lambda target: alias_reads.append(target) or None,
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "start_deployment_job",
+        lambda target, **kwargs: jobs.append((target, kwargs)) or False,
+    )
+
+    first = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert first.status_code == 200, first.text
+    queued = runner.get_status(run_id)
+    assert queued.deployment["state"] == "queued"
+    assert queued.deployment["activation_outcome_unknown"] is True
+    if retry_state == "smoke_testing":
+        queued.deployment["state"] = retry_state
+        queued.deployment["updated_at"] = time.time()
+        runner._save_status(queued)
+
+    second = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert second.status_code == 409, second.text
+    assert f"deployment in {retry_state} state" in second.json()["detail"]
+    assert alias_reads == [run_id]
+    assert len(jobs) == 1
+
+
 def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy
@@ -2136,6 +2182,7 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
     )
 
     monkeypatch.setattr(app_mod, "adapter_alias_target", lambda _run_id: live_revision)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
 
     def fail_before_activation(**kwargs):
         assert kwargs["expected_adapter_revision"] == live_revision
@@ -2174,6 +2221,70 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
     assert cancelled.deployment["adapter_revision"] == live_revision
     assert cancelled.deployment["checkpoint_step"] == 20
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({live_revision})
+
+
+def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, monkeypatch):
+    import flash.runner as runner
+    import flash.serve.deploy as deploy
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "running")
+    previous_revision = f"{run_id}@step-40." + "d" * 40
+    previous = {
+        "state": "ready",
+        "endpoint_name": "https://serve.example",
+        "adapter_revision": previous_revision,
+        "checkpoint_step": 40,
+    }
+    runner.mark_checkpoint_deployed(
+        run_id,
+        previous,
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    previous["requested_at"] = time.time() - 60
+    status = runner.get_status(run_id)
+    busy = {
+        "state": "reconciling",
+        "requested_at": time.time(),
+        "adapter_revision": f"{run_id}@final." + "e" * 40,
+        "activation_outcome_unknown": True,
+        "previous_deployment": previous,
+    }
+    status.deployment = busy
+    runner._save_status(status)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: previous_revision)
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda _run_id: pytest.fail("the restored checkpoint must remain serving"),
+    )
+    served = []
+
+    def serve_chat(**kwargs):
+        served.append(kwargs["run_id"])
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
+
+    cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
+
+    assert cancelled.status_code == 200, cancelled.text
+    restored = runner.get_status(run_id)
+    assert restored.state == "cancelled"
+    assert restored.deployment == previous
+    assert restored.deployment != busy
+
+    chat = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert chat.status_code == 200, chat.text
+    assert served == [run_id]
+    assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):

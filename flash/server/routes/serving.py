@@ -783,7 +783,10 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         if (
             not dry_run
             and current_deployment.get("state") in _DEPLOYMENT_BUSY_STATES
-            and not current_deployment.get("activation_outcome_unknown")
+            and not (
+                current_deployment.get("state") == "reconciling"
+                and current_deployment.get("activation_outcome_unknown")
+            )
             and not _deployment_attempt_is_stale(current_deployment)
         ):
             raise HTTPException(

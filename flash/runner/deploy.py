@@ -41,6 +41,7 @@ class DeploymentRevocationError(RuntimeError):
 
 _BackendOutcome = Literal["confirmed", "not_required", "not_attempted"]
 _BACKEND_OUTCOMES = frozenset({"confirmed", "not_required", "not_attempted"})
+_UNKNOWN_ALIAS_UNCHECKED = object()
 
 
 class DeploymentStatePersistenceError(RuntimeError):
@@ -120,10 +121,70 @@ def _is_preservable_checkpoint_deployment(run_id: str, deployment: object) -> bo
         return False
 
 
-def _preservable_checkpoint_deployment(run_id: str, deployment: object) -> dict | None:
+def _verified_checkpoint_deployment_for_revision(
+    run_id: str, revision: object, *candidates: object
+) -> dict | None:
+    if not isinstance(revision, str):
+        return None
+    parsed_revision = parse_adapter_revision(revision)
+    if parsed_revision is None:
+        return None
+    revision_run_id, revision_step, hf_revision = parsed_revision
+    if revision_step is None:
+        return None
+    if revision_run_id != run_id or revision != format_adapter_revision(
+        revision_run_id, revision_step, hf_revision
+    ):
+        return None
+    from flash.runner.verified_revisions import read_verified_adapter_revisions
+
+    try:
+        if revision not in read_verified_adapter_revisions(run_id):
+            return None
+    except Exception:
+        return None
+
+    candidate = next(
+        (
+            dict(value)
+            for value in candidates
+            if isinstance(value, dict) and value.get("adapter_revision") == revision
+        ),
+        {},
+    )
+    for field in ("previous_deployment", "activation_outcome_unknown", "error", "retryable"):
+        candidate.pop(field, None)
+    if candidate.get("state") not in _RESTORABLE_DEPLOYMENT_STATES:
+        candidate["state"] = "ready"
+    candidate.update(
+        {
+            "adapter_revision": revision,
+            "checkpoint_step": revision_step,
+        }
+    )
+    return candidate
+
+
+def _preservable_checkpoint_deployment(
+    run_id: str,
+    deployment: object,
+    *,
+    live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED,
+) -> dict | None:
+    if not isinstance(deployment, dict):
+        return None
+    if deployment.get("activation_outcome_unknown"):
+        if live_alias_target is _UNKNOWN_ALIAS_UNCHECKED:
+            return None
+        return _verified_checkpoint_deployment_for_revision(
+            run_id,
+            live_alias_target,
+            deployment,
+            deployment.get("previous_deployment"),
+        )
     if _is_preservable_checkpoint_deployment(run_id, deployment):
         return dict(deployment)
-    if isinstance(deployment, dict) and deployment.get("activation_outcome_unknown"):
+    if deployment.get("state") in {"queued", "smoke_testing"}:
         predecessor = deployment.get("previous_deployment")
         if _is_preservable_checkpoint_deployment(run_id, predecessor):
             return dict(predecessor)
@@ -193,11 +254,14 @@ def cancel_run(run_id: str) -> RunStatus:
         if not lock_acquired:
             prelock_status = get_status(run_id)
             _, prelock_active = _deployment_state_and_requires_revocation(prelock_status.deployment)
+            unknown_prelock_outcome = isinstance(
+                prelock_status.deployment, dict
+            ) and prelock_status.deployment.get("activation_outcome_unknown")
             preserve_prelock_checkpoint = (
                 prelock_status.state != "dry_run"
                 and _should_preserve_checkpoint_deployment(run_id, prelock_status.deployment)
             )
-            if prelock_active and not preserve_prelock_checkpoint:
+            if prelock_active and not preserve_prelock_checkpoint and not unknown_prelock_outcome:
                 try:
                     mark_deployment_revocation_failed(
                         run_id,
@@ -213,20 +277,59 @@ def cancel_run(run_id: str) -> RunStatus:
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
         _, active_deployment = _deployment_state_and_requires_revocation(status.deployment)
+        live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED
+        if (
+            status.state != "dry_run"
+            and isinstance(status.deployment, dict)
+            and status.deployment.get("activation_outcome_unknown")
+        ):
+            try:
+                from flash.serve.deploy import adapter_alias_target
+
+                live_alias_target = adapter_alias_target(run_id)
+            except Exception:
+                live_alias_target = None
         preserved_checkpoint = (
             None
             if status.state == "dry_run"
-            else _preservable_checkpoint_deployment(run_id, status.deployment)
+            else _preservable_checkpoint_deployment(
+                run_id,
+                status.deployment,
+                live_alias_target=live_alias_target,
+            )
         )
         if preserved_checkpoint is not None and status.deployment != preserved_checkpoint:
-            status = mark_checkpoint_deployed(
-                run_id,
-                preserved_checkpoint,
-                expect_state=status.state,
-                verification_generation=verified_adapter_revision_generation(run_id),
-            )
+            intended_revision = preserved_checkpoint.get("adapter_revision")
+            owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
+            try:
+                status = mark_checkpoint_deployed(
+                    run_id,
+                    preserved_checkpoint,
+                    expect_state=status.state,
+                    verification_generation=verified_adapter_revision_generation(run_id),
+                    owner_deployment=owner_deployment,
+                )
+            except Exception:
+                try:
+                    status = get_status(run_id)
+                    stored_deployment = status.deployment
+                    if (
+                        not isinstance(stored_deployment, dict)
+                        or stored_deployment.get("adapter_revision") != intended_revision
+                        or not _is_preservable_checkpoint_deployment(run_id, stored_deployment)
+                    ):
+                        preserved_checkpoint = None
+                    else:
+                        preserved_checkpoint = dict(stored_deployment)
+                except Exception:
+                    preserved_checkpoint = None
+            else:
+                if (
+                    status.deployment != preserved_checkpoint
+                    or not _is_preservable_checkpoint_deployment(run_id, status.deployment)
+                ):
+                    preserved_checkpoint = None
             entered_deployed = entered_deployed or status.state == "deployed"
-            preserved_checkpoint = _preservable_checkpoint_deployment(run_id, status.deployment)
         preserve_checkpoint = preserved_checkpoint is not None
         backend_error: Exception | None = None
         persistence_error: tuple[Exception, _BackendOutcome] | None = None
@@ -546,6 +649,7 @@ def mark_checkpoint_deployed(
     expect_state: str | None = None,
     *,
     verification_generation: int | None = None,
+    owner_deployment: dict | None = None,
 ) -> RunStatus:
     """Record a checkpoint deployment using the run's current lifecycle state.
 
@@ -560,7 +664,8 @@ def mark_checkpoint_deployed(
             return status
         if expect_state is not None and status.state != expect_state:
             return status
-        if not _deployment_attempt_is_owned(status, deployment):
+        ownership_token = deployment if owner_deployment is None else owner_deployment
+        if not _deployment_attempt_is_owned(status, ownership_token):
             return status
 
         def _commit() -> None:
