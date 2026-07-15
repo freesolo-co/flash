@@ -84,6 +84,7 @@ from flash.engine.worker.hf import (
     publish_opd_optimizer_start_marker,
     upload_debug_jsonl,
     upload_resume_checkpoint,
+    write_base_model_provenance,
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
@@ -536,6 +537,7 @@ __all__ = [
     "wandb_report_to",
     "wandb_run_info",
     "wandb_run_name",
+    "write_base_model_provenance",
     "write_train_meta",
 ]
 
