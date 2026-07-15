@@ -115,19 +115,3 @@ def adapter_artifact_exists(
     files = _repo_files(spec, strict=True, revision=revision)
     prefix = adapter_prefix(spec) if step is None else checkpoint_adapter_prefix(spec, int(step))
     return _adapter_folder_has_required_files(files, prefix)
-
-
-def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
-    """Authoritatively verify a warm-start checkpoint step before provisioning a worker."""
-    return adapter_artifact_exists(spec, step=step)
-
-
-def final_adapter_exists(spec: JobSpec) -> bool:
-    """Authoritatively verify that the run-level final adapter exists in the artifact repo."""
-    try:
-        return adapter_artifact_exists(spec, step=None)
-    except CheckpointListingError as exc:
-        cause = exc.__cause__ or exc
-        raise CheckpointListingError(
-            f"could not verify final adapter for {spec.run_id}: {cause}"
-        ) from cause
