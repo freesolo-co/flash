@@ -125,12 +125,7 @@ def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
         )
         return True
     except RunpodApiError as e:
-        return _is_not_found(e)
-
-
-def _is_not_found(err: RunpodApiError) -> bool:
-    """True when the error represents a genuine 404 (endpoint already gone)."""
-    return is_not_found(err)
+        return is_not_found(e)
 
 
 def endpoint_health_for_key(
