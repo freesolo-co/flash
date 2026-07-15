@@ -284,6 +284,14 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
     return upload_deadline_at, reaping_deadline_at
 
 
+def _worker_execution_deadline(upload_deadline_at: float) -> float:
+    return (
+        upload_deadline_at
+        - _CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+    )
+
+
 def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) -> None:
     remaining = max(
         0.0,
@@ -541,11 +549,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
+    worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
     timed_out = False
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
-        if deadline_ts - _finite_positive_number(time.time(), "current clock") <= 0:
+        if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
             raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
         proc = subprocess.Popen(
             [sys.executable, "-m", "flash.engine.worker_entrypoint"],
@@ -576,23 +585,23 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         t.start()
         uploader, stop_upload = _start_console_uploader(payload, console, mode)
         try:
-            remaining = deadline_ts - _finite_positive_number(time.time(), "current clock")
+            remaining = worker_deadline_at - _finite_positive_number(time.time(), "current clock")
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
             proc.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=1.0)
-
-        drain_timeout = (
-            1.0
-            if timed_out
-            else max(
+            remaining = max(
                 0.0,
-                deadline_ts - _finite_positive_number(time.time(), "current clock"),
+                worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
             )
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=remaining)
+
+        drain_timeout = max(
+            0.0,
+            worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
         )
         pump_finished = pump_done.wait(drain_timeout)
         if pump_finished:
