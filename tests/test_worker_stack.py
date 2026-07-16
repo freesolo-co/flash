@@ -1967,3 +1967,54 @@ def test_non_sm100_fla_tilelang_untouched(monkeypatch, cc):
     perf._force_fla_triton_gdn_on_sm100()
 
     assert "FLA_TILELANG" not in os.environ
+
+
+def test_exact_type_pin_overrides_larger_requested_gpu_hint(monkeypatch):
+    # regression (PR #538 finding 2): exact_type is the authoritative hardware pin. once the live card
+    # matches the pinned class, the softer requested_gpu hint (gpu.type) must NOT be re-checked against
+    # _gpu_mismatch_reason, which can name a larger class and reject a correctly-provisioned card.
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+    from flash.engine.worker.perf import RetriableInfraError
+
+    # live card is an 80 GB H100 (sm90). exact_type pins H100 (a match); the requested hint names the
+    # larger B200 class, which a bare _gpu_mismatch_reason would reject (80 GB < B200 need, sm90 < sm100).
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (9, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=80 * 10**9),
+        get_device_name=lambda _index: "NVIDIA H100 PCIE",
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+
+    # pin matches the live card -> accept, despite the larger requested hint (pre-fix this raised).
+    lifecycle.verify_gpu("B200", exact_type="H100")
+
+    # control: when the pin itself does not match the live card, it still raises.
+    with pytest.raises(RetriableInfraError, match="exact-class mismatch"):
+        lifecycle.verify_gpu("B200", exact_type="B200")
+
+
+def test_exact_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
+    # regression (PR #538 finding 2): honoring the exact_type pin must NOT drop the live safety net.
+    # a card whose NAME canonicalizes to the pinned class but is under-provisioned (a mig slice with
+    # reduced vram, or a too-old host driver) has no quote-time equivalent check, so it must still be
+    # caught here -- validated against the pinned class itself, not the softer requested hint.
+    from types import SimpleNamespace
+
+    import flash.engine.worker.perf.lifecycle as lifecycle
+    from flash.engine.worker.perf import RetriableInfraError
+
+    # live card reports an H100 name (canonical class matches the H100 pin) but only 40 GB, below the
+    # 90% floor for the full 80 GB class. an early return on class-name match would wrongly accept it.
+    cuda = SimpleNamespace(
+        get_device_capability=lambda _index: (9, 0),
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=40 * 10**9),
+        get_device_name=lambda _index: "NVIDIA H100 PCIE",
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
+
+    with pytest.raises(RetriableInfraError, match="does not match requested"):
+        lifecycle.verify_gpu("H100", exact_type="H100")

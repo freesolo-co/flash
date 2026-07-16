@@ -86,7 +86,7 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
 
 
 def _sft_realized_batch(spec) -> int:
-    from flash.catalog import vocab_size_for
+    from flash.catalog import resolve_vocab_size
     from flash.engine.recipe import RECIPE
     from flash.engine.vram import resolve_params_b, sft_logits_fused, sft_realized_batch
 
@@ -102,7 +102,10 @@ def _sft_realized_batch(spec) -> int:
         resolve_params_b(spec.model, revision=spec.model_revision), sft_seq
     )
     return sft_realized_batch(
-        requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
+        requested_batch,
+        seq_len=sft_seq,
+        vocab=resolve_vocab_size(spec.model, spec.model_revision),
+        fused=sft_fused,
     )
 
 

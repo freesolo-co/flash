@@ -83,7 +83,10 @@ def setup_seconds(config: RunConfig) -> float:
     """Cold-start wall time before the first optimizer step: container boot + deps + model load
     (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for rollouts.
     This elapsed setup time is reported but not included in customer-facing cost."""
-    model_load = MODEL_LOAD_BASE_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
+    model_load = (
+        MODEL_LOAD_BASE_S
+        + download_weight_gb(config.model_id, config.model_revision) / DOWNLOAD_RATE_GBPS
+    )
     s = WORKER_BOOT_S + DEPS_INSTALL_S + model_load
     if config.has_rollout:
         s += VLLM_INIT_S
@@ -105,7 +108,9 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
         return 0.0
     n = config.normalized()
     serialize_s = (
-        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 * total_params_b(n.model_id) * (n.lora_rank / 32.0)
+        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32
+        * total_params_b(n.model_id, n.model_revision)
+        * (n.lora_rank / 32.0)
     )
     per_save = commits * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_s
     return len(n.save_at_steps) * per_save
@@ -177,13 +182,6 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         thinking=config.thinking,
         model_revision=config.model_revision,
     )
-    if config.exact_type:
-        if gpu_vram_gb(config.exact_type) < need:
-            raise ValueError(
-                f"exact_type {config.exact_type!r} has {gpu_vram_gb(config.exact_type)} GB VRAM, "
-                f"but this run requires at least {need} GB"
-            )
-        return config.exact_type, need
     gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
 
@@ -247,7 +245,10 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    if config.exact_type and config.provider == "auto":
+    if config.exact_type:
+        # exact_type is provisioned at LAUNCH through allocate (disk-aware, live rate). quote the same
+        # path for BOTH auto and a pinned provider so the estimate matches the actual launch rate, and a
+        # disk floor lifts the quote off the wrong class. provider="" lets allocate pick when unpinned.
         from flash.providers.allocator import allocate
 
         allocation = allocate(
@@ -257,7 +258,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             thinking=config.thinking,
             max_wall_seconds=market_wall_s,
             disk_gb=config.disk_gb,
-            provider="",
+            provider=("" if config.provider == "auto" else config.provider),
             exact_type=config.exact_type,
             model_revision=config.model_revision,
         )
@@ -276,7 +277,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             provider=quote_provider,
             max_wall_seconds=market_wall_s,
             min_vram_gb=need,
-            exact_type=config.exact_type,
+            exact_type="",  # this branch is only reached when exact_type is empty
         )
 
     setup = setup_seconds(config)

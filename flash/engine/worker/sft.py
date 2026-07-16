@@ -247,7 +247,7 @@ def run_sft():
         if _w.JOB_SPEC and _w.JOB_SPEC.train.epochs is not None
         else RECIPE.sft.num_epochs
     )
-    from flash.catalog import MODELS, vocab_size_for
+    from flash.catalog import MODELS, resolve_vocab_size
     from flash.engine.vram import sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
@@ -285,7 +285,9 @@ def run_sft():
     # checkpointing (and the allocator, vram.py) for that UNFUSED path UP FRONT — cap the micro-batch and
     # raise grad-accum to hold the effective batch — instead of sizing fused and fixing it up AFTER the
     # trainer's Accelerator is built (which left the accelerator's grad-accum stale; codex[bot]).
-    _sft_vocab = vocab_size_for(model_id)
+    # revision-aware vocab so the worker sizes the same batch the cost quote priced
+    # (cost/spec.py _sft_realized_batch uses resolve_vocab_size on the same (model, revision)).
+    _sft_vocab = resolve_vocab_size(model_id, model_revision)
     _sft_fused = False
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
@@ -449,7 +451,7 @@ def run_sft():
         _pd_pack, _ = sft_grad_accum(
             effective_batch,
             seq_len=sft_max_len,
-            vocab=vocab_size_for(model_id),
+            vocab=_sft_vocab,  # reuse the revision-aware vocab resolved above (single source of truth)
             fused=_sft_fused,
         )
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
