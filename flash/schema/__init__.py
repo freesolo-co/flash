@@ -564,6 +564,9 @@ def _validate_opd(spec: JobSpec) -> None:
                 f"invalid budget fails before a GPU worker is provisioned."
             )
 
+        # short hybrid-mamba contexts are safe because the worker compares vllm's derived scheduler
+        # budget with the catalogued block size and supplies an explicit floor only when required.
+
 
 # Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
 # adds a function + a map entry rather than another scattered ``if spec.algorithm == ...`` block.
