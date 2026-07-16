@@ -469,6 +469,64 @@ spirals when told to be brief on a problem it finds hard), which is exactly the 
 runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
 failures. This assumes the teacher is still strong at the task (vet it first, above).
 
+### Reverse-KL over-sharpens — cut steps and watch entropy (every model)
+
+Reverse-KL is **mode-seeking**: it sharpens the student's next-token distribution toward the
+teacher's dominant mode, and it keeps sharpening for as long as you train. This affects **every OPD
+run, at every size** — the whole Flash catalog is small by frontier standards (0.8B-9B dense plus a
+3B-active MoE), so treat over-sharpening as a default risk, not a small-model edge case. The student's
+per-token entropy falls as training proceeds; past the point where it has learned the task, extra
+steps only over-sharpen — *lowering* accuracy. Push it far enough and the distribution peaks so hard
+that **greedy (temperature=0) decoding falls into a repetition loop** that repeats a phrase to the
+length cap and never emits your answer. The loss looks healthy the whole run (reverse-KL is being
+minimized *by* the collapse), so it is invisible in the loss curve and only surfaces at serving —
+where **temperature=0 is the default**, so it hits real callers, not just a sampled eval.
+
+**Severity scales with size**: on the largest catalog models over-training mostly just leaves
+accuracy on the table (a late checkpoint slightly worse than an earlier one); on the smallest it
+turns into the full-blown greedy loop. But the fix is the same everywhere, and cutting steps helped
+*every* size tested. Four levers, each attacking the same over-sharpening — the first two apply to
+every run, the last two matter more the smaller the model:
+
+- **Train fewer steps (highest leverage, every size).** The student typically peaks early — often
+  around ~20 optimizer steps — and every step after is pure over-sharpening that *lowers* accuracy
+  while *raising* the loop rate. Cut `max_examples` (or `epochs`) so the run stops before the collapse,
+  and deploy an early **checkpoint** (`flash checkpoints <run>`, `flash deploy <run>/step-N`) rather
+  than the final adapter. This helped at every size tested — a 4B went 42% acc / 44% loop at full
+  length -> **74% / 0% at step 20**, and even models that never looped came out equal-or-better at the
+  earlier checkpoint. When in doubt, sweep a few checkpoints and pick the best, don't assume the last
+  step is the best.
+- **Lower the rank (more, the smaller the model).** A rank-32 adapter is a large relative perturbation
+  to a small model, giving reverse-KL more capacity to over-sharpen. Dropping `lora_rank` to 16 (or 8)
+  often clears the loop outright (a 4B sft->opd went 42%/44% at rank 32 -> 76%/2% at rank 16). Since
+  the whole catalog is small, prefer a modest rank (16) as the default for OPD and only raise it with a
+  reason.
+- **Match the teacher to the student.** A *stronger* teacher is not universally better — the harder
+  it is for the student to match, the harder the collapse. On a 2B, a closer/weaker teacher can beat a
+  frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
+  enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
+  over-sharpening only compounds over many steps.
+- **Diagnose it in-band.** Watch the per-step **mean completion entropy** in the run's telemetry — a
+  steady decline toward zero is the collapse happening. Confirm at serving by evaluating at
+  **temperature=0** and flagging `finish_reason=length` completions that never emit your answer token,
+  and compare an early checkpoint against the final one to watch the loop emerge over steps.
+
+### Distilling from base with no format anchor
+
+`opd` straight from a base model (no SFT warm-start) faithfully distils the teacher's *reasoning* but
+the student never learns your **answer format** — it terminates (`finish_reason=stop`) without ever
+emitting the boxed/tagged answer, so completions score unparseable even when the reasoning is fine.
+On-policy distillation reinforces the student's *own* tokens, so if the base never produces the
+format there is nothing to reinforce (and a downstream GRPO pass can't rescue it — with no
+correctly-formatted rollout to reward, RL has no signal to climb). Two fixes:
+
+- **Warm-start from an SFT adapter** (`[train] init_from_adapter`) — the SFT installs the output
+  format first, then OPD refines the content. This is the reliable default for structured-answer tasks.
+- **Constrain the rollouts with `[train] structured_outputs`** (guided decoding) to a schema whose
+  **answer field comes first** — the model learns to commit a parseable answer *before* any reasoning
+  that might run long, so the answer survives even if the reasoning still loops. This separates the
+  *format* problem (fixed here) from the *loop* problem (fixed by the levers above).
+
 ---
 
 ## GRPO knobs that matter
