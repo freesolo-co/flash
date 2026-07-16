@@ -40,6 +40,22 @@ MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
+# --- MoE (mixture-of-experts) per-step correction ----------------------------------------------
+# For an MoE model (active params << total, e.g. Qwen3.6-35B-A3B: ~3B active / 35B total) the wall
+# time per step is NOT the tiny active-param FLOPs the dense model predicts. Routing, all-expert
+# coordination, and grouped-GEMM under-utilization at small batch make the step scale with TOTAL
+# params. Pricing 35B-A3B on active params under-quoted real RunPod runs by 13-27x (SFT ~1.2s vs
+# ~42s realized/step; GRPO ~1.4s vs ~24s). So an MoE prices on TOTAL params at a reduced effective
+# MFU + a per-step overhead + a one-time compile. DENSE models (active == total) are unaffected --
+# they keep the original active-param path and the MFUs above.
+MFU_SFT_TRAIN_MOE = 0.10  # MoE SFT fwd/bwd priced on total params
+MFU_TRAIN_MOE = 0.09  # MoE GRPO/OPD policy update priced on total params
+MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays every step
+# One-time kernel/graph compile amortized into the first training step (fused Triton kernels;
+# + vLLM cudagraph capture for rollout methods). MoE-only; the prior model omitted it entirely.
+COMPILE_MOE_SFT_S = 35.0
+COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
+
 # Reward grading is CONCURRENT: a step's completions score in parallel slots, so the reward
 # wall is ceil(completions / slots) waves x latency, not completions x latency.
 REWARD_CONCURRENCY = 16.0
@@ -116,13 +132,32 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
     return len(n.save_at_steps) * per_save
 
 
+def _is_moe(model_id: str) -> bool:
+    """True when the model routes each token through a subset of experts (active < total params)."""
+    return active_params_b(model_id) < total_params_b(model_id)
+
+
+def compile_seconds(config: RunConfig, gpu: str) -> float:
+    """One-time kernel/graph compile folded into the first training step. MoE-only; 0 for dense
+    (whose original timing did not model it). Larger for rollout methods (add vLLM cudagraph
+    capture)."""
+    _ = gpu
+    if not _is_moe(config.model_id):
+        return 0.0
+    return COMPILE_MOE_SFT_S if config.method == "sft" else COMPILE_MOE_ROLLOUT_S
+
+
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
-    # Per-token FLOPs scale with the ACTIVE params (an MoE token routes through only a subset of
-    # experts); for a dense model this equals the total. Memory/size terms below keep total_params_b.
-    params = active_params_b(n.model_id) * 1e9
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
+    # An MoE's per-step wall scales with TOTAL params (routing + all-expert coordination + grouped
+    # GEMM under-utilization), not the tiny active-param FLOPs; dense models keep active (== total).
+    moe = _is_moe(n.model_id)
+    params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
+    overhead = MOE_STEP_OVERHEAD_S if moe else 0.0
+    sft_mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
+    update_mfu = MFU_TRAIN_MOE if moe else MFU_TRAIN
 
     if n.is_opd:
         # OPD step = on-policy student rollout (like GRPO) + remote teacher scoring (CONCURRENT
@@ -131,7 +166,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
         completions, seq_tokens = _opd_step_shape(n)
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
-        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_TRAIN)
+        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * update_mfu)
         teacher_lat = teacher_seconds_per_completion()
         # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
         # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
@@ -139,30 +174,33 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
         # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
         teacher_s = teacher_lat
-        return gen_s + teacher_s + update_s
+        return overhead + gen_s + teacher_s + update_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
-        return flops / (peak * MFU_SFT_TRAIN)
+        return overhead + flops / (peak * sft_mfu)
 
     # GRPO step = rollout (G completions/prompt) + concurrent reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
-    update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
+    update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     reward_s = (
         math.ceil(completions / REWARD_CONCURRENCY) * latency
     )  # ceil: a partial wave still costs one latency
-    return gen_s + reward_s + update_s
+    return overhead + gen_s + reward_s + update_s
 
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
     """SFT steady-state wall time for an actual token count on ``gpu``."""
     n = config.normalized()
-    params = active_params_b(n.model_id) * 1e9
+    # MoE prices on total params at a reduced MFU (see seconds_per_step); dense keeps active.
+    moe = _is_moe(n.model_id)
+    params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
+    mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = gpu_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
-    return flops / (peak * MFU_SFT_TRAIN)
+    return flops / (peak * mfu)
 
 
 def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str, int]:
@@ -220,6 +258,11 @@ def _notes(
         notes.append(
             f"{len(n.save_at_steps)} synchronous required save(s) add "
             f"~{_fmt_duration(required_save_s)}"
+        )
+    if _is_moe(n.model_id):
+        notes.append(
+            "MoE model: per-step time priced on total params (routing + all-expert coordination), "
+            "not just active-param FLOPs, plus a one-time kernel compile"
         )
     notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
@@ -283,9 +326,12 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
     required_save_s = required_save_overhead_seconds(config)
-    raw_train = config.steps * sps + required_save_s
+    # A one-time kernel/graph compile is paid once on the first step (MoE-only; 0 for dense). It is
+    # training GPU time, so it belongs in the (billed) train term, not setup.
+    compile_s = compile_seconds(config, gpu)
+    raw_train = compile_s + config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
-        raw_train = sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+        raw_train = compile_s + sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
     sps = raw_train / config.steps
 
     # The cap is on total elapsed wall; setup is reported but not billed, so only training
