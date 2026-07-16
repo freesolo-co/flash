@@ -1440,17 +1440,6 @@ def run_opd(forward_teacher_accounting):
                 - (opd_phase_seconds["forward_objective_forward_backward"] - forward_seconds_before)
             )
             opd_phase_counts["optimizer_steps"] += 1
-            # On-policy means the next rollout must sample from the just-updated student LoRA.
-            # The final trained adapter is saved from the HF/PEFT model below, so skip a useless
-            # post-final vLLM sync that can fail after all optimizer updates have already landed.
-            if opt_steps < steps:
-                with liveness_heartbeat(
-                    "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
-                ):
-                    sync_started = time.perf_counter()
-                    vllm_rollout.sync_from_model(model)
-                    opd_phase_seconds["vllm_sync"] += time.perf_counter() - sync_started
-                    opd_phase_counts["vllm_syncs"] += 1
             avg_loss = reverse_avg_loss
             avg_cov = step_cov / nseq
             total_loss = avg_loss + forward_loss if forward_loss is not None else avg_loss
