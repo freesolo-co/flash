@@ -451,3 +451,32 @@ def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     gpu = pick_gpu(8, provider="vast")
     assert gpu  # a fitting class is still chosen from the static fallback
+
+
+def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monkeypatch):
+    # regression (PR #538 finding 1): a PINNED provider + exact_type must quote through the same
+    # disk-aware allocate path as launch, forwarding the pinned provider and the run's disk floor.
+    # pre-fix only provider="auto" + exact_type took this path, so a pinned provider was quoted off the
+    # non-disk-aware gpu_hourly_usd branch and could misprice against the wrong class.
+    from types import SimpleNamespace
+
+    import flash.providers.allocator as allocator_mod
+
+    seen: dict = {}
+
+    def fake_allocate(model_id, method, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80)
+
+    monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
+    est = estimate_cost(
+        RunConfig(
+            "Qwen/Qwen3.5-0.8B", "grpo", 10, provider="runpod", exact_type="H100", disk_gb=200.0
+        )
+    )
+    # the pinned provider and disk floor thread through to allocate (not "" and not 0).
+    assert seen["provider"] == "runpod"
+    assert seen["exact_type"] == "H100"
+    assert seen["disk_gb"] == 200.0
+    # and the quote reflects the live allocation rather than a static gpu_hourly_usd lookup.
+    assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
