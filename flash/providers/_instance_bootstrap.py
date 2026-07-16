@@ -161,7 +161,7 @@ def _code_dir(payload: dict) -> str:
     raw = payload.get("code_prefix")
     if not isinstance(raw, str) or not raw.strip():
         return os.path.join(CODE_ROOT, "code")
-    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)) or ".")
+    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)))
 
 
 def _hf_status_code(exc: BaseException) -> int | None:
@@ -794,13 +794,12 @@ def run_preload(payload: dict) -> dict:
     if payload.get("cache_mount_marker"):
         marker = os.path.join(mount, payload["cache_mount_marker"])
         if not os.path.exists(marker):
-            kind = "block volume" if payload.get("cache_block_device") else "NFS filesystem"
             return {
                 "preloaded": [],
                 "already_cached": [],
                 "failed": {},
                 "error": (
-                    f"weight-cache {kind} not mounted (no sentinel at {marker}); "
+                    f"weight-cache NFS filesystem not mounted (no sentinel at {marker}); "
                     "refusing to warm ephemeral disk"
                 ),
             }
@@ -842,7 +841,6 @@ def main() -> int:
     ok = False
     error = ""
     retriable = False
-    deadline = None
     deadline_watchdog = None
     try:
         try:

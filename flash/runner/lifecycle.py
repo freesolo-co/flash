@@ -11,8 +11,9 @@ import os
 import time
 from dataclasses import dataclass
 
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._deadline import deadline_kwargs
-from flash.spec import JobSpec
+from flash.spec import JobSpec, require_matching_seed
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
@@ -191,6 +192,7 @@ def _submit_seed_supervised(
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
+    seed = require_matching_seed(spec, seed)
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
     from flash.providers.base import PollResult
@@ -206,6 +208,7 @@ def _submit_seed_supervised(
         _spec_with_remaining_wall,
         _TerminalHandleRace,
         _update,
+        _verified_opd_retry_state,
         flash_code_prefix,
         get_status,
     )
@@ -291,14 +294,14 @@ def _submit_seed_supervised(
     last_detail = None
     # Sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-DC pool.
     drop_weight_cache = False
-    # One free cache-less fallback when the shared cache's DC-set restriction may have caused no_capacity.
-    # A non-shared per-org volume earns no bonus — that's the user's own choice.
+    # one cache-less fallback is available only when the user enabled retries; max_retries=0 is
+    # exactly one provider submission. a non-shared per-org volume earns no bonus.
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    cache_fallback_attempts = 1 if started_with_shared_cache else 0
+    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
     retry_budget = _RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
     # Grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = set()
@@ -354,11 +357,20 @@ def _submit_seed_supervised(
         except RuntimeError:
             _gc_seen_endpoints()
             raise
+        if spec.algorithm == "opd":
+            expected_next_attempt, opd_resume_revision = _verified_opd_retry_state(spec.run_id)
+        else:
+            expected_next_attempt, opd_resume_revision = None, None
         attempt = _reserve_attempt(
             spec.run_id,
             minimum_attempt=attempt_start if local_attempt == 0 else 0,
+            expected_next_attempt=expected_next_attempt,
         )
         current_attempt["value"] = attempt
+        attempt_runtime_secrets = dict(runtime_secrets or {})
+        attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
+        if opd_resume_revision is not None:
+            attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
         res = None
         alloc = None
         chosen = None
@@ -382,6 +394,9 @@ def _submit_seed_supervised(
                 disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
                 # the remaining run-global wall cap, so retries cannot reset the duration budget.
                 max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
+                provider=getattr(attempt_spec.gpu, "provider", ""),
+                exact_type=getattr(attempt_spec.gpu, "exact_type", ""),
+                model_revision=attempt_spec.model_revision,
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError
@@ -466,8 +481,8 @@ def _submit_seed_supervised(
                         "code_prefix": code_prefix,
                         "_deadline_at": _load_run_deadline_at(spec.run_id),
                     }
-                    if runtime_secrets:
-                        submit_kwargs["runtime_secrets"] = runtime_secrets
+                    if attempt_runtime_secrets:
+                        submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
                     res = provider.submit_run(run_spec, seed, **submit_kwargs)
                 except _TerminalHandleRace:
                     raise

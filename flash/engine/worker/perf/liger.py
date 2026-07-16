@@ -21,12 +21,18 @@ def _estimate_params(cfg) -> float:
     return float(emb + blocks)
 
 
-def _liger_default_for_model(model_id: str) -> bool:
+def _liger_default_for_model(model_id: str, revision: str = "") -> bool:
     """Return True if the model is large enough for Liger's fused-CE to be a net win."""
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **model_revision_kwargs(revision),
+        )
         return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
     except Exception as e:
         print("liger model-size probe failed (default off):", e)

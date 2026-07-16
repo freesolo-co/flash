@@ -664,7 +664,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
+    metrics = lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
@@ -729,7 +729,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
+    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     assert provider.attempts == [0, 1]
     assert runner.get_status(spec.run_id).remote["attempt"] == 1
@@ -813,7 +813,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
+    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     assert provider.attempts == [0, 1]
     assert allocation_walls == [200.0, 120.0]
@@ -890,7 +890,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
 
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance") as exc_info:
-        lifecycle._submit_seed_supervised(spec, 0, log)
+        lifecycle._submit_seed_supervised(spec, spec.seed, log)
 
     assert provider.attempts == [0]
     assert allocations == [True]
@@ -1359,7 +1359,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
     monkeypatch.setattr(allocator, "allocate", lambda *_args, **_kwargs: allocations.append(True))
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
+        lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
 
     assert allocations == []
     assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 0
@@ -1718,7 +1718,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     with pytest.raises(runner._TerminalHandleRace):
         lifecycle._submit_seed_supervised(
             spec,
-            0,
+            spec.seed,
             io.StringIO(),
             code_prefix="code/revision",
         )
@@ -1794,7 +1794,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     with pytest.raises(runner._TerminalHandleRace):
         lifecycle._submit_seed_supervised(
             spec,
-            0,
+            spec.seed,
             io.StringIO(),
             code_prefix="code/revision",
         )

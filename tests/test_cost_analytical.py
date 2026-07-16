@@ -306,3 +306,42 @@ def test_opd_teacher_scoring_is_one_parallel_wave():
         "full-parallel teacher scoring bills one wave; doubling completions at equal total tokens "
         "must not add teacher latency"
     )
+
+
+def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, tmp_path):
+    # regression (PR #538 finding 0): cold-start setup + required-save cost must size the PINNED
+    # commit's weights, not the catalog default-revision param count, so a run whose revision differs
+    # from the catalog is priced on the checkpoint the worker actually downloads and serializes.
+    import json
+    from types import SimpleNamespace
+
+    from flash.cost.analytical import required_save_overhead_seconds
+    from flash.cost.facts import download_weight_gb, total_params_b
+
+    # a pinned commit the Hub reports at 0.87B, within the 5% catalog-drift gate (catalog is 0.9B).
+    # vocab must equal the catalog to clear the fail-closed validation for a cataloged model.
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"vocab_size": 248320}))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
+
+    class Api:
+        def __init__(self, *, token):
+            pass
+
+        def model_info(self, model, **kwargs):
+            return SimpleNamespace(safetensors=SimpleNamespace(total=int(0.87e9)))
+
+    monkeypatch.setattr("huggingface_hub.HfApi", Api)
+
+    rev = "d" * 40
+    # the facts accessors resolve the pinned commit's size, distinct from the catalog default.
+    assert total_params_b(SMALL, rev) == pytest.approx(0.87)
+    assert total_params_b(SMALL) == pytest.approx(0.9)
+    assert download_weight_gb(SMALL, rev) == pytest.approx(1.74)
+
+    # both cold-start setup (download term) and required-save (serialize term) track the smaller pinned
+    # weights, so the 0.87B revision quotes strictly cheaper than the 0.9B catalog default.
+    pinned = RunConfig(SMALL, "sft", 100, model_revision=rev, save_at_steps=(100,))
+    default = RunConfig(SMALL, "sft", 100, save_at_steps=(100,))
+    assert setup_seconds(pinned) < setup_seconds(default)
+    assert required_save_overhead_seconds(pinned) < required_save_overhead_seconds(default)

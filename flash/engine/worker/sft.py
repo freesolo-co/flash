@@ -10,11 +10,11 @@ import time
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
-    configure_trainer_checkpoint_schedule,
-    final_checkpoint_due,
+    configure_trainer_save_schedule,
+    final_save_due,
     resolve_update_horizon,
     sft_update_steps,
-    validate_checkpoint_horizon,
+    validate_save_steps,
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -74,7 +74,7 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     return [t for t, _ in kept], [r for _, r in kept], len(pretok) - len(kept)
 
 
-def _model_arch_dims(model_id: str) -> tuple[int, int]:
+def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
     """``(hidden_size, num_hidden_layers)`` used to size the GC-off activation estimate.
 
     Prefer the CURATED catalog geometry (deterministic, no network/parse risk) for known models — a
@@ -88,21 +88,34 @@ def _model_arch_dims(model_id: str) -> tuple[int, int]:
     info = MODELS.get(model_id)
     c_hidden = int(getattr(info, "hidden_size", 0) or 0) if info else 0
     c_layers = int(getattr(info, "num_layers", 0) or 0) if info else 0
-    if c_hidden and c_layers:
+    if c_hidden and c_layers and not revision:
         return c_hidden, c_layers
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        tc = getattr(cfg, "text_config", None) or cfg
-        hidden = c_hidden or int(
-            getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **_w.model_revision_kwargs(revision),
         )
-        layers = c_layers or int(
+        tc = getattr(cfg, "text_config", None) or cfg
+        layers = int(
             getattr(tc, "num_hidden_layers", 0) or getattr(cfg, "num_hidden_layers", 0) or 0
         )
-        return hidden, layers
+        hidden = int(getattr(tc, "hidden_size", 0) or getattr(cfg, "hidden_size", 0) or 0)
+        # Only a NONZERO probe dim that disagrees with the catalog is a real revision mismatch. A (0, 0)
+        # probe means "couldn't parse" (the 35B-A3B multimodal-nested config does exactly this), not
+        # "differs" -- treat it like the unpinned path and fall back to catalog dims below, otherwise a
+        # revision pin would spuriously fail such models after the GPU is already rented.
+        if revision and (
+            (c_hidden and hidden and hidden != c_hidden)
+            or (c_layers and layers and layers != c_layers)
+        ):
+            raise ValueError("revision architecture does not match catalog geometry")
+        return hidden or c_hidden, layers or c_layers
     except Exception as e:
+        if revision:
+            raise RuntimeError("could not validate revision-specific model architecture") from e
         print(f"[sft] arch-dims probe failed ({e}); GC decision stays conservative (keep GC on)")
         return c_hidden, c_layers
 
@@ -122,9 +135,36 @@ def select_sft_examples(train, max_examples, seed):
     return train
 
 
+def sft_completed_train_tokens(
+    tokens_per_epoch: int,
+    epochs: int,
+    derived_steps: int,
+    completed_steps: int,
+) -> int:
+    """Estimate tokens processed from completed updates while preserving epoch accounting at parity."""
+    epoch_tokens = max(0, int(tokens_per_epoch)) * max(0, int(epochs))
+    completed = max(0, int(completed_steps))
+    derived = max(1, int(derived_steps))
+    if completed == derived:
+        return epoch_tokens
+    if completed == 0 or epoch_tokens == 0:
+        return 0
+    return max(1, round(epoch_tokens * completed / derived))
+
+
+def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
+    """True when a max_steps-authoritative run completed fewer updates than requested.
+
+    with max_steps authoritative, trl's max_steps override lands a fresh run exactly on the horizon,
+    and a resume from a checkpoint past a lowered horizon does zero new steps yet holds a fully-trained
+    adapter (final_step >= horizon). fail loudly only on a genuine under-run, mirroring grpo
+    (steps_run < steps) and opd (opt_steps < steps).
+    """
+    return int(max_steps) > 0 and int(final_step) < int(update_horizon)
+
+
 def run_sft():
     from datasets import Dataset
-    from transformers import AutoTokenizer
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
@@ -132,10 +172,18 @@ def run_sft():
     env = _w.require_active_env()
     t_start = time.time()
     _w.heartbeat("sft_start", gpu=gpu_diagnostics())
-    wait_for_gpu(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = _w.prefetch_model(model_id)
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    download_seconds = (
+        _w.prefetch_model(model_id, revision=model_revision)
+        if model_revision
+        else _w.prefetch_model(model_id)
+    )
 
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
 
@@ -146,7 +194,7 @@ def run_sft():
     # tokenizer + dataset download + O(N) chat-template render can run for minutes on a big
     # dataset with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("sft_data_loading"):
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tok = _w.load_tokenizer(model_id, revision=model_revision)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -199,7 +247,7 @@ def run_sft():
         if _w.JOB_SPEC and _w.JOB_SPEC.train.epochs is not None
         else RECIPE.sft.num_epochs
     )
-    from flash.catalog import MODELS, vocab_size_for
+    from flash.catalog import MODELS, resolve_vocab_size
     from flash.engine.vram import sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
@@ -237,7 +285,9 @@ def run_sft():
     # checkpointing (and the allocator, vram.py) for that UNFUSED path UP FRONT — cap the micro-batch and
     # raise grad-accum to hold the effective batch — instead of sizing fused and fixing it up AFTER the
     # trainer's Accelerator is built (which left the accelerator's grad-accum stale; codex[bot]).
-    _sft_vocab = vocab_size_for(model_id)
+    # revision-aware vocab so the worker sizes the same batch the cost quote priced
+    # (cost/spec.py _sft_realized_batch uses resolve_vocab_size on the same (model, revision)).
+    _sft_vocab = resolve_vocab_size(model_id, model_revision)
     _sft_fused = False
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
@@ -261,7 +311,7 @@ def run_sft():
             _gc_cap = _torch_gc.cuda.get_device_capability(0)
     except Exception:
         _gc_card_gb, _gc_cap = 0.0, None
-    _gc_hidden, _gc_layers = _model_arch_dims(model_id)
+    _gc_hidden, _gc_layers = _model_arch_dims(model_id, revision=model_revision)
     _gc_active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0) or None
     _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
     _grad_ckpt = grad_checkpointing_on(
@@ -276,10 +326,11 @@ def run_sft():
         fused_ce=_sft_fused,
         per_device_bs=per_device_bs,
         lora_rank=_gc_lora_rank,
+        revision=model_revision,
     )
 
     max_steps = int(_t.max_steps or 0) if _t else 0
-    checkpoint_landmarks = tuple(getattr(_t, "checkpoint_landmarks", ()) or ())
+    save_at_steps = tuple(getattr(_t, "save_at_steps", ()) or ())
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -318,11 +369,11 @@ def run_sft():
         cfg_kwargs["use_liger_kernel"] = False
     if max_steps > 0:
         cfg_kwargs["max_steps"] = max_steps
-    configure_trainer_checkpoint_schedule(cfg_kwargs, checkpoint_landmarks)
+    configure_trainer_save_schedule(cfg_kwargs, save_at_steps)
     # TRL 'bfd' packing: boundary-correct only under FA2/FA3 varlen (SDPA cross-contaminates).
     # GDN hybrids can't use bfd (no seq_idx to reset causal conv); they pack via the varlen collator.
-    _pure_attn = model_is_pure_attention(model_id)
-    _gdn = model_is_gdn_hybrid(model_id)
+    _pure_attn = model_is_pure_attention(model_id, revision=model_revision)
+    _gdn = model_is_gdn_hybrid(model_id, revision=model_revision)
     _bfd_block_count: int | None = None
     _fa_ok = _flash_attn_available()
     if _fa_ok and _pure_attn:
@@ -340,7 +391,7 @@ def run_sft():
         print(
             f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below."
         )
-    if _memory_mode(model_id, sft_max_len):
+    if _memory_mode(model_id, sft_max_len, revision=model_revision):
         print("[sft] chalk standalone fused kernels scheduled after trainer build")
     _attn = optimal_attn_impl()
     # When bfd packing is on, ensure a varlen-capable flash impl; sdpa cross-contaminates packed examples.
@@ -400,7 +451,7 @@ def run_sft():
         _pd_pack, _ = sft_grad_accum(
             effective_batch,
             seq_len=sft_max_len,
-            vocab=vocab_size_for(model_id),
+            vocab=_sft_vocab,  # reuse the revision-aware vocab resolved above (single source of truth)
             fused=_sft_fused,
         )
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
@@ -418,7 +469,10 @@ def run_sft():
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
     elif (
-        not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok
+        not cfg_kwargs.get("packing")
+        and _gdn
+        and gdn_packing_available(model_id, revision=model_revision)
+        and _mask_pack_ok
     ):
         # GDN hybrid: 4D mask for full-attn layers + cu_seqlens/seq_idx to reset DeltaNet recurrence.
         # Flash varlen would ignore the 4D mask — downgrade to sdpa for the full-attn layers.
@@ -465,7 +519,11 @@ def run_sft():
         )
     # Explicit bf16 + device_map=None: transformers-5 string loading otherwise falls back to fp32
     # (2x VRAM) or accelerate-offloads to meta ("expected device meta but got cuda:0" in backward).
-    model_init_kwargs = {"dtype": "bfloat16", "device_map": None}
+    model_init_kwargs = {
+        "dtype": "bfloat16",
+        "device_map": None,
+        **_w.model_revision_kwargs(model_revision),
+    }
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = model_init_kwargs
@@ -479,7 +537,7 @@ def run_sft():
         packed_block_count=_bfd_block_count if cfg_kwargs.get("packing") else None,
     )
     update_horizon = resolve_update_horizon(derived_steps, max_steps)
-    validate_checkpoint_horizon(checkpoint_landmarks, update_horizon)
+    validate_save_steps(save_at_steps, update_horizon)
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (arXiv 2402.12354): B-matrix LR ratio=16, measured -52% train loss. Must override
@@ -548,7 +606,13 @@ def run_sft():
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
     with liveness_heartbeat("sft_initializing"):
         seed_training_rngs(_w.SEED)
-        sft_model = _w.prepare_fresh_lora_base(model_id, model_id, model_init_kwargs, phase="sft")
+        sft_model = _w.prepare_fresh_lora_base(
+            model_id,
+            model_id,
+            model_init_kwargs,
+            phase="sft",
+            model_revision=model_revision,
+        )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
         trainer = _SFT(
@@ -560,12 +624,7 @@ def run_sft():
             data_collator=_collator,
             callbacks=[
                 _w.make_sft_heartbeat_callback(),
-                *(
-                    [_w.make_checkpoint_landmark_callback(checkpoint_landmarks)]
-                    if checkpoint_landmarks
-                    else []
-                ),
-                _w.make_checkpoint_upload_callback(checkpoint_landmarks),
+                _w.make_checkpoint_upload_callback(save_at_steps),
             ],
         )
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
@@ -601,7 +660,7 @@ def run_sft():
     sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
     _final_step = int(getattr(trainer.state, "global_step", 0) or 0)
-    if max_steps > 0 and _final_step != update_horizon:
+    if sft_under_ran(_final_step, update_horizon, max_steps):
         raise RuntimeError(
             f"sft completed {_final_step}/{update_horizon} requested optimizer updates"
         )
@@ -615,15 +674,22 @@ def run_sft():
         "sft_finalizing", progress=lambda: _final_step, progress_step=True, keepalive=True
     ):
         adapter_dir = f"{out_dir}/adapter"
+        _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
+        _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the historical final step only when exact landmarks are not configured.
-        if final_checkpoint_due(_final_step, checkpoint_landmarks):
+        # preserve the final checkpoint only when exact save steps are not configured.
+        if final_save_due(_final_step, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _final_step)
     _w.heartbeat("sft_trained", train_wall=train_wall, step=_final_step, gpu=gpu_diagnostics())
 
-    train_tokens = _total_tok * epochs
+    train_tokens = sft_completed_train_tokens(
+        _total_tok,
+        epochs,
+        derived_steps,
+        _final_step,
+    )
     _w.write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,

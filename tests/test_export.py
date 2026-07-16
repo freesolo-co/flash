@@ -188,8 +188,38 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
     )
 
     assert uploaded["adapter_config"]["base_model_name_or_path"] == BASE_MODEL
+    assert uploaded["adapter_config"]["revision"] is None
     assert BASE_MODEL in uploaded["readme"]
     assert temp_base not in uploaded["readme"]
+
+
+def test_export_adapter_config_validates_and_preserves_revision(tmp_path):
+    from flash.serve import export
+
+    revision = "a" * 40
+    path = tmp_path / "adapter_config.json"
+    path.write_text(
+        json.dumps({"base_model_name_or_path": BASE_MODEL, "revision": revision}),
+        encoding="utf-8",
+    )
+
+    assert export._rewrite_adapter_config_base_model(
+        tmp_path, BASE_MODEL, revision
+    ) is False
+
+    path.write_text(
+        json.dumps({"base_model_name_or_path": "other/model", "revision": revision}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match run model"):
+        export._rewrite_adapter_config_base_model(tmp_path, BASE_MODEL, revision)
+
+    path.write_text(
+        json.dumps({"base_model_name_or_path": BASE_MODEL, "revision": "b" * 40}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="revision does not match"):
+        export._rewrite_adapter_config_base_model(tmp_path, BASE_MODEL, revision)
 
 
 def test_export_metadata_repair_skips_non_utf8_files(tmp_path):

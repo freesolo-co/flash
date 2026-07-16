@@ -117,6 +117,7 @@ def patch_trl_colocate_llm_kwargs(
     attention_backend: str | None = None,
     mm_encoder_attn_backend: str | None = None,
     reasoning_parser: str | None = None,
+    revision: str | None = None,
 ) -> bool:
     """Inject vLLM ``LLM(...)`` kwargs into TRL's colocated rollout engine that can't be expressed via
     ``GRPOConfig`` or the (pinned) vLLM env registry — must run BEFORE ``GRPOTrainer.__init__`` builds
@@ -155,6 +156,8 @@ def patch_trl_colocate_llm_kwargs(
       (``EngineArgs.reasoning_parser`` -> vLLM's V1 structured-output manager defers the bitmask until
       reasoning ends). Only meaningful alongside a structured-outputs constraint under ``thinking``;
       TRL/``GRPOConfig`` exposes no field for it, so it must ride this ``LLM(...)`` override.
+    * ``revision``: pin the colocated rollout engine to the same student repository revision as the
+      trainer. empty revisions are omitted rather than forwarded as ``revision=""``.
 
     Repeated calls COMPOSE: run_rl injects the attention backend, the KV/prefill knobs, and eager mode
     at three SEPARATE points, so each call merges its kwargs into one accumulated module-level override
@@ -174,6 +177,8 @@ def patch_trl_colocate_llm_kwargs(
         new_overrides["mm_encoder_attn_backend"] = mm_encoder_attn_backend
     if reasoning_parser is not None:
         new_overrides["reasoning_parser"] = reasoning_parser
+    if revision:
+        new_overrides["revision"] = revision
     if not new_overrides:
         return False
     try:
