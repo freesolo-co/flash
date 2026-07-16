@@ -316,6 +316,56 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
     assert stop_over_eos_over_length.terminal_eos_id == 99
 
 
+def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80):
+    from flash.engine import vram
+    from flash.engine.worker import gpu_setup
+
+    class _Cuda:
+        @staticmethod
+        def get_device_capability():
+            return (8, 9)
+
+        @staticmethod
+        def get_device_properties(_idx):
+            return SimpleNamespace(total_memory=card_gb * 1024**3)
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = _Cuda
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
+    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.0)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.37)
+
+
+def test_opd_vllm_kwargs_floors_hybrid_mamba_budget_on_sub_140gb_card(monkeypatch):
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.6-35B-A3B",
+        SimpleNamespace(prompts_per_step=4, group_size=1),
+        256,
+    )
+
+    assert out["max_num_batched_tokens"] == 1072
+
+
+def test_opd_vllm_kwargs_leaves_non_mamba_budget_unset_on_sub_140gb_card(monkeypatch):
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=4, group_size=1),
+        256,
+    )
+
+    assert out["max_num_batched_tokens"] is None
+
+
 def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
@@ -557,6 +607,7 @@ def test_opd_vllm_kwargs_forces_b200_v1_inprocess_on_vllm_0190(monkeypatch):
 
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=1, group_size=1), 4096)
 
+    assert out["max_num_batched_tokens"] == 8192
     assert out["enforce_eager"] is False
     assert out["compilation_config"] == {
         "mode": 0,

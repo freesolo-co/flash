@@ -37,6 +37,15 @@ def test_recipe_and_jobspec_defaults_match_catalog_default():
     assert JobSpec().model == DEFAULT_MODEL
 
 
+def test_opd_mamba_block_size_is_catalogued_only_for_hybrid_rollout_model():
+    assert MODELS["Qwen/Qwen3.6-35B-A3B"].mamba_block_size == 1072
+    assert all(
+        info.mamba_block_size == 0
+        for model_id, info in MODELS.items()
+        if model_id != "Qwen/Qwen3.6-35B-A3B"
+    )
+
+
 def test_thinking_capability_values_are_valid():
     # The config validator branches on these exact values; "unknown" is reserved for
     # open-model-policy entries and must not appear in the curated catalog.

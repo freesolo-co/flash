@@ -127,7 +127,12 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
     fp8_kv = bool(cc >= (8, 9))
     kwargs["kv_cache_dtype"] = "fp8" if fp8_kv else None
-    kwargs["max_num_batched_tokens"] = max(8192, int(seq_cap)) if card_gb >= 140 else None
+    if card_gb >= 140:
+        kwargs["max_num_batched_tokens"] = max(8192, int(seq_cap))
+    else:
+        from flash.catalog import opd_mamba_batched_token_floor
+
+        kwargs["max_num_batched_tokens"] = opd_mamba_batched_token_floor(model_id, seq_cap)
 
     if card_gb > 0:
         try:
