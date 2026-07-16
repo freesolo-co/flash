@@ -81,6 +81,59 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     assert "operator must check" not in msg
 
 
+def _stub_healthz(monkeypatch, deploy_mod, capabilities: list[str]) -> None:
+    """Stub the serving /healthz GET so _require_serving_capabilities sees `capabilities`."""
+
+    class _Resp:
+        def json(self):
+            return {"capabilities": list(capabilities)}
+
+    monkeypatch.setattr(deploy_mod, "_serving_request", lambda method, url, **k: _Resp())
+
+
+def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
+    # The production serving backend advertises the two safety-critical caps + the deferred
+    # thinking/structured-outputs cap, but NOT `revision_provenance`. That must NOT block deploys
+    # (it only gates the rare ambiguous-registration recovery path).
+    import flash.serve.deploy as deploy_mod
+
+    _stub_healthz(
+        monkeypatch,
+        deploy_mod,
+        [
+            "immutable_adapter_revisions",
+            "alias_compare_and_swap",
+            "thinking_structured_outputs_deferred_v1",
+        ],
+    )
+    # Does not raise, with or without the thinking/structured-outputs requirement.
+    deploy_mod._require_serving_capabilities()
+    deploy_mod._require_serving_capabilities(thinking_structured_outputs=True)
+
+
+def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    # Missing the atomic alias CAS (safety-critical) -> deploy MUST still be blocked.
+    _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "revision_provenance"])
+    with pytest.raises(ServingError) as ei:
+        deploy_mod._require_serving_capabilities()
+    assert "alias_compare_and_swap" in str(ei.value)
+    assert "revision_provenance" not in str(ei.value)  # provenance is not the blocker
+
+
+def test_require_capabilities_thinking_structured_outputs_required_when_used(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    # Backend lacks the deferred thinking/structured-outputs cap -> a thinking+SO deploy is blocked.
+    _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "alias_compare_and_swap"])
+    deploy_mod._require_serving_capabilities()  # fine without SO
+    with pytest.raises(ServingError):
+        deploy_mod._require_serving_capabilities(thinking_structured_outputs=True)
+
+
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
     import httpx
 
@@ -323,7 +376,9 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
     assert events == ["sha", "verify", "capabilities", "register", "ready", "smoke", "activate"]
     registration = requests[0][2]
     assert registration["adapter_id"] == revision
-    assert registration["status"] == "ready"
+    # the client does NOT send a "status" -- the serving backend sets it and rejects it as an
+    # extra field (see deploy._register body).
+    assert "status" not in registration
     assert registration["metadata"]["hf_revision"] == sha
     assert requests[1][2] == {"expected_adapter_revision": previous}
     assert result.adapter_revision == revision

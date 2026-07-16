@@ -391,7 +391,9 @@ def deploy_adapter(
         "subfolder": subfolder,
         "repo_type": "dataset",
         "checkpoint": checkpoint,
-        "status": "ready",
+        # NOTE: do NOT send a client-chosen "status" -- the serving backend sets the record status
+        # itself on registration and rejects an incoming "status" as an extra field (HTTP 422
+        # extra_forbidden). Sending it blocked every deploy against the deployed serving backend.
         "metadata": {
             "record_type": "revision",
             "run_id": run_id,
@@ -494,12 +496,22 @@ def _matches_revision_identity(record: dict, expected: dict) -> bool:
 
 
 def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> None:
+    # SAFETY-CRITICAL capabilities the deploy correctness contract genuinely depends on: immutable
+    # revisions (a revision id always maps to one artifact) and an atomic alias compare-and-swap
+    # (the alias flip can't race). These are hard-required.
     required = {
         "immutable_adapter_revisions",
         "alias_compare_and_swap",
-        "revision_provenance",
     }
+    # PREFERRED (not required): `revision_provenance` only lets the serving backend echo back the
+    # run/checkpoint/hf_revision metadata, which is used ONLY on the rare 5xx-during-registration
+    # recovery path (`_matches_revision_identity`). Hard-requiring it blocked EVERY deploy org-wide
+    # whenever the serving build lagged on advertising it, even though the happy path never uses it.
+    # So its absence is a logged warning, not a deploy-blocking error.
+    preferred = {"revision_provenance"}
     if thinking_structured_outputs:
+        # Genuinely required for this run: thinking + structured outputs needs the serving backend's
+        # deferred-constraint support (grammar applied after </think>) or served output is invalid.
         required.add(THINKING_STRUCTURED_OUTPUTS_CAPABILITY)
     url = f"{serving_base_url()}/healthz"
     response = _serving_request("GET", url)
@@ -524,11 +536,22 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
             f"serving_contract_unsupported: serving health check at {url} capabilities must be "
             "strings"
         )
-    missing = sorted(required - set(capabilities))
+    advertised = set(capabilities)
+    missing = sorted(required - advertised)
     if missing:
         raise ServingError(
             "serving_contract_unsupported: serving is missing required capabilities "
             + ", ".join(missing)
+        )
+    missing_preferred = sorted(preferred - advertised)
+    if missing_preferred:
+        # Not fatal: the happy-path deploy does not use these; only the ambiguous-registration
+        # recovery path degrades (best-effort identity check). Surface it so an operator can ship
+        # the serving build that advertises them, without blocking customers meanwhile.
+        logger.warning(
+            "serving backend does not advertise preferred capabilities %s; deploying anyway "
+            "(ambiguous-registration recovery will be best-effort)",
+            ", ".join(missing_preferred),
         )
 
 
