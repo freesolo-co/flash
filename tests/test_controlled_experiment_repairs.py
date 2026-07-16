@@ -363,3 +363,33 @@ def test_opd_model_revision_is_keyword_only():
 
     parameter = inspect.signature(OpdVllmRolloutEngine).parameters["model_revision"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch, tmp_path):
+    # regression (PR #538 finding 4): SFT batch sizing resolves vocab through resolve_vocab_size. for a
+    # pinned revision on an uncataloged open-policy model it must return the commit's real vocab (mirroring
+    # resolve_params_b), not the default, so the fused-CE micro-batch cap tracks the served tokenizer.
+    from flash.catalog import _DEFAULT_VOCAB_SIZE, resolve_vocab_size
+
+    # cataloged model, no revision -> catalog vocab (unchanged default path).
+    assert resolve_vocab_size("Qwen/Qwen3.5-0.8B") == 248320
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"vocab_size": 151936, "hidden_size": 2048, "num_hidden_layers": 24})
+    )
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
+
+    class Api:
+        def __init__(self, *, token):
+            pass
+
+        def model_info(self, model, **kwargs):
+            return SimpleNamespace(safetensors=SimpleNamespace(total=int(3e9)))
+
+    monkeypatch.setattr("huggingface_hub.HfApi", Api)
+
+    # uncataloged open-policy model with a pinned revision -> the fetched commit vocab, not the default.
+    got = resolve_vocab_size("open-org/Open-Model-3B", revision="d" * 40)
+    assert got == 151936
+    assert got != _DEFAULT_VOCAB_SIZE

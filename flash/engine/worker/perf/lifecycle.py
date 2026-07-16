@@ -150,6 +150,11 @@ def verify_gpu(requested_gpu: str | None, *, exact_type: str = "") -> None:
                 f"requested={requested_canonical!r}, observed={observed_canonical!r}, "
                 f"device_name={live_name!r}; retrying on a correctly-provisioned GPU"
             )
+        # the pinned class is authoritative: validate the live card against IT below, not the softer
+        # requested_gpu hint (which may name a larger class and false-reject this correct card). this
+        # keeps the live vram/driver/capability safety net for the pinned card, so a same-named but
+        # under-provisioned card (e.g. a mig slice, or a too-old host driver) is still caught.
+        requested_gpu = exact_type
 
     live_cap = None
     live_vram_gb = None

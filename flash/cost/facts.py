@@ -135,9 +135,19 @@ def _catalog_model_info(model_id: str) -> ModelInfo:
     return info
 
 
-def total_params_b(model_id: str) -> float:
-    """Total parameter count (billions) for a catalog model."""
-    return _catalog_model_info(model_id).params_b
+def total_params_b(model_id: str, revision: str = "") -> float:
+    """Total parameter count (billions) for a catalog model.
+
+    when a revision is pinned, size the pinned commit (validated against the catalog, fail-closed)
+    so setup/save cost tracks the weights the worker actually loads, not the default-revision count.
+    """
+    info = _catalog_model_info(model_id)
+    if revision:
+        from flash.engine.vram import _validated_revision_geometry
+
+        params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
+        return params_b
+    return info.params_b
 
 
 def active_params_b(model_id: str) -> float:
@@ -152,9 +162,9 @@ def model_quant(model_id: str) -> str:
     return (info.quant or "bf16") if info is not None else "bf16"
 
 
-def download_weight_gb(model_id: str) -> float:
+def download_weight_gb(model_id: str, revision: str = "") -> float:
     """Full bf16 checkpoint size in GB (2 bytes/param)."""
-    return total_params_b(model_id) * 2.0
+    return total_params_b(model_id, revision) * 2.0
 
 
 # ~1s mid-range default across grader types (regex ~0.01s to LLM judge ~3s).
