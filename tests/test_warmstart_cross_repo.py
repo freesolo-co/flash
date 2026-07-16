@@ -205,7 +205,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     assert public_spec.train.init_from_adapter == "source-run"
     assert worker_spec.train.init_from_adapter == "owner/source-runs:sft/source-run"
     assert worker_spec.train.init_from_adapter_revision == _REVISION
-    assert (public_spec.train.lora_rank, public_spec.train.lora_alpha) == (8, 16)
+    assert (public_spec.train.lora_rank, public_spec.train.lora_alpha) == (8, 128)
     assert (worker_spec.train.lora_rank, worker_spec.train.lora_alpha) == (64, 128)
     assert identity == {
         "digest": "digest",
@@ -309,7 +309,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     prepared = R.prepare_job(child)
 
     assert prepared.public_spec.train.init_from_adapter == "source-run/step-20"
-    assert (prepared.public_spec.train.lora_rank, prepared.public_spec.train.lora_alpha) == (8, 16)
+    assert (prepared.public_spec.train.lora_rank, prepared.public_spec.train.lora_alpha) == (8, 128)
     assert prepared.worker_spec.train.init_from_adapter == (
         "owner/source-runs:sft/source-run/checkpoints/step-20"
     )

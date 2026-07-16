@@ -700,6 +700,27 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
         _spec({"max_context_tokens": 256})
 
 
+def test_opd_rejects_zero_kl_penalty_at_parse_time():
+    from flash.schema import ConfigError, spec_from_dict
+
+    def _spec(algorithm, train_extra):
+        return spec_from_dict(
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "algorithm": algorithm,
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                "train": {"epochs": 1, "max_examples": 5, **train_extra},
+            },
+            run_id="x",
+        )
+
+    with pytest.raises(ConfigError, match=r"kl_penalty_coef must be > 0 for opd"):
+        _spec("opd", {"kl_penalty_coef": 0})
+
+    assert _spec("opd", {}).train.kl_penalty_coef is None
+    assert _spec("grpo", {"kl_penalty_coef": 0}).train.kl_penalty_coef == 0
+
+
 @pytest.mark.parametrize("max_context_tokens", [256, 512])
 def test_opd_accepts_short_hybrid_mamba_context_with_conditional_worker_floor(
     max_context_tokens,
