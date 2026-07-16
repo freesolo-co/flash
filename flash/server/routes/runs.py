@@ -102,11 +102,11 @@ def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) 
 def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
     dry_run = _require_bool(payload, "dry_run", False)
     schema = _client_train_schema(payload)
+    submitted = payload.get("spec")
+    submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
     try:
         spec = _parse_spec(payload, run_id=new_run_id())
     except HTTPException as exc:
-        submitted = payload.get("spec")
-        submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
         server_fields = train_schema_metadata()
         unsupported = (
             sorted(
@@ -130,7 +130,7 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             )
             raise HTTPException(status_code=400, detail=detail) from exc
         raise
-    runtime_secrets = _runtime_secrets(payload, spec, require_environment_secrets=not dry_run)
+    runtime_secrets = _runtime_secrets(payload, spec)
     affordability_org_id = str(key.get("org_id") or "").strip()
     bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
     billing_context = None
@@ -176,6 +176,21 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                     ),
                 ) from exc
             raise
+        if (
+            spec.train.init_from_adapter
+            and isinstance(submitted_train, dict)
+            and "lora_alpha" in submitted_train
+            and spec.train.lora_alpha != prepared.worker_spec.train.lora_alpha
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"train.lora_alpha={spec.train.lora_alpha} does not match the "
+                    "train.init_from_adapter source adapter "
+                    f"lora_alpha={prepared.worker_spec.train.lora_alpha}; omit train.lora_alpha "
+                    "because source adapter alpha metadata is authoritative"
+                ),
+            )
         run_id = prepared.public_spec.run_id
         if bill_on_completion:
             _precheck_budget_or_block(

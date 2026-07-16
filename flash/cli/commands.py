@@ -214,6 +214,7 @@ def _cmd_train_cost(args) -> int:
     Catalog-only and deterministic. SFT cost never imports the environment; it requires a positive
     [train].max_examples row count instead of guessing or locally counting a dataset."""
     from flash.cost import estimate_cost
+    from flash.lora_rank import preflight_train_context_within_serving
 
     spec = spec_from_file(
         args.config,
@@ -221,6 +222,7 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
+    preflight_train_context_within_serving(spec)
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
         # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
@@ -302,17 +304,17 @@ def cmd_train(args) -> int:
     )
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
+    runtime_secrets = (
+        runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
+    )
     if args.dry_run:
-        # Dry-run is a faithful server-side preview: the control plane runs the SAME config
-        # validation and warm-start/serving preflights it would at real submit (serving rank/context
-        # caps, the continued warm-start rank match, cost quote) and records a state=dry_run run, but
-        # allocates no GPU and charges nothing. Local runtime secrets aren't sent — the server
-        # relaxes the required-[environment].secrets check for a preview, so `--dry-run` works before
-        # prod secrets are wired up. A rejection surfaces as the server's `error: ...` (exit 1),
-        # exactly as a real submit would.
+        # dry-run is a faithful server-side preview: it sends the same declared secrets and runs the
+        # same config, warm-start, serving, and cost preflights as a real submit, but allocates no gpu
+        # and charges nothing. a rejection surfaces as the server's error with exit status 1.
         try:
             status = client.create_run(
                 payload,
+                runtime_secrets=runtime_secrets,
                 dry_run=True,
                 client_train_schema={
                     "version": __version__,
@@ -336,10 +338,7 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         return 0
-    status = client.create_run(
-        payload,
-        runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),
-    )
+    status = client.create_run(payload, runtime_secrets=runtime_secrets)
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",

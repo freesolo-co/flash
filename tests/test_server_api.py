@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -445,6 +446,72 @@ def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(ap
         "rank metadata is authoritative"
     )
     assert calls == {"prepare": 0, "persist": 0}
+    assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    def prepare(spec, **_kwargs):
+        resolved = replace(spec, train=replace(spec.train, lora_alpha=32))
+        return runner.PreparedJob(
+            public_spec=resolved,
+            worker_spec=resolved,
+            estimated_cost_usd=1.25,
+            adapter_identity=None,
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run"},
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+
+
+def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    def prepare(spec, **_kwargs):
+        resolved = replace(spec, train=replace(spec.train, lora_alpha=32))
+        return runner.PreparedJob(
+            public_spec=resolved,
+            worker_spec=resolved,
+            estimated_cost_usd=1.25,
+            adapter_identity=None,
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+            "lora_alpha": 64,
+        },
+    }
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "train.lora_alpha=64 does not match the train.init_from_adapter source adapter "
+        "lora_alpha=32; omit train.lora_alpha because source adapter alpha metadata is authoritative"
+    )
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -977,13 +1044,17 @@ def test_runtime_secret_validation_and_non_persistence(api):
     assert "runtime_secrets" not in dumped
     assert body["spec"]["environment"]["secrets"] == ["SERPAPI_API_KEY"]
 
-    missing = api.post(
-        "/v1/runs",
-        json={"spec": env_secret_spec, "runtime_secrets": {}},
-        headers=_bearer(key),
-    )
-    assert missing.status_code == 400
-    assert "missing runtime secret" in missing.json()["detail"]
+    for dry_run in (False, True):
+        missing = api.post(
+            "/v1/runs",
+            json={"spec": env_secret_spec, "dry_run": dry_run, "runtime_secrets": {}},
+            headers=_bearer(key),
+        )
+        assert missing.status_code == 400
+        assert (
+            missing.json()["detail"]
+            == "missing runtime secret(s) required by [environment] secrets: SERPAPI_API_KEY"
+        )
 
 
 def test_logs_offset_paging(api):
