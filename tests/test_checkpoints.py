@@ -311,6 +311,57 @@ def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake
     ], "each save must publish its own deployable — no step coalesced away"
 
 
+def test_on_save_writes_base_model_provenance_for_deployable(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """Per-step deployables must carry base-model provenance, exactly like the final adapter, so a
+    deployed RUN_ID/step-N proves its base weights (#538: SFT/GRPO step deployables lacked it)."""
+    import json
+
+    from flash.engine.worker import hf as worker_hf
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(
+        worker_hf, "resolve_cached_model_commit", lambda model_id, revision: "e" * 40
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    ckpt = _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback(model_id="org/m", model_revision="main")
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+
+    prov = ckpt / "base_model_provenance.json"
+    assert prov.exists(), "per-step deployable must include base_model_provenance.json"
+    assert json.loads(prov.read_text()) == {
+        "model_id": "org/m",
+        "requested_revision": "main",
+        "resolved_commit": "e" * 40,
+    }
+    # the provenance file rides along in the deployable upload (not excluded like trainer state).
+    deployable = next(
+        u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-4/adapter")
+    )
+    assert "base_model_provenance.json" not in deployable["ignore_patterns"]
+
+
+def test_on_save_without_model_id_writes_no_provenance(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """Back-compat: a callback built without a model id writes no base_model_provenance.json rather
+    than a misleading empty record, and still publishes the deployable (provenance is additive)."""
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    out = tmp_path / "out"
+    out.mkdir()
+    ckpt = _make_ckpt_dir(out, 4)
+    cb = worker.make_checkpoint_upload_callback()  # no model id
+    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+
+    assert not (ckpt / "base_model_provenance.json").exists()
+    assert any(u["path_in_repo"].endswith("checkpoints/step-4/adapter") for u in rec.uploads)
+
+
 def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trainer_callback):
     """A transient HF error must not cost the step: the synchronous upload retries until it lands,
     so `save_every` is a guarantee, not best-effort."""
@@ -724,3 +775,15 @@ def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     # SFT derives the final step from trainer state (no _steps_run var) and publishes it.
     assert "global_step" in src
     assert "publish_deployable_checkpoint(adapter_dir, _final_step)" in src
+
+
+def test_run_sft_threads_model_provenance_into_checkpoint_callback():
+    # the per-step deployable callback needs the base model + revision to stamp provenance, exactly
+    # like the final adapter upload does (#538: step deployables otherwise omit base_model_provenance).
+    src = _finalize_src("flash.engine.worker.sft", "run_sft")
+    assert "make_checkpoint_upload_callback(save_at_steps, model_id, model_revision)" in src
+
+
+def test_run_rl_threads_model_provenance_into_checkpoint_callback():
+    src = _finalize_src("flash.engine.worker.rl", "run_rl")
+    assert "make_checkpoint_upload_callback(save_at_steps, model_id, model_revision)" in src

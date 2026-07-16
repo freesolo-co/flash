@@ -718,7 +718,7 @@ def upload_resume_checkpoint(
     return False
 
 
-def make_checkpoint_upload_callback(save_at_steps=()):
+def make_checkpoint_upload_callback(save_at_steps=(), model_id: str = "", model_revision: str = ""):
     """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
 
     Uploads are SYNCHRONOUS: on_save blocks the training loop until the checkpoint is durably on
@@ -739,6 +739,10 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         adapter, so the trainer checkpoint's adapter IS the deployable — it carries the full policy on
         the catalog base and serves as-is (no merge, no SFT rank-stack recombine).
         """
+        # record base-model provenance next to the deployable, mirroring the final adapter upload, so
+        # a deployed RUN_ID/step-N proves its base weights the same way the default adapter does (#538).
+        if model_id:
+            write_base_model_provenance(ckpt_dir, model_id, model_revision)
         publish_deployable_checkpoint(ckpt_dir, step, required=step in required_steps)
         if step in required_steps:
             deployable_steps.add(step)

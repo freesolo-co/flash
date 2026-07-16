@@ -660,7 +660,7 @@ def run_rl():
             processing_class=tok,
             callbacks=[
                 hb_cb,
-                _w.make_checkpoint_upload_callback(save_at_steps),
+                _w.make_checkpoint_upload_callback(save_at_steps, model_id, model_revision),
             ],
             **extra_trainer_kwargs,
         )
