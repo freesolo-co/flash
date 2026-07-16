@@ -388,6 +388,30 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
+def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'algorithm = "sft"\n'
+        "[environment]\n"
+        'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+        "[train]\n"
+        "epochs = 1\n"
+        "max_examples = 8\n"
+        "max_context_tokens = 9000\n"
+        'hf_repo = "owner/runs"\n'
+    )
+    args = types.SimpleNamespace(
+        config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"train\.max_context_tokens=9000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=8192",
+    ):
+        cmd_train(args)
+
+
 def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
     """Cost is catalog-only: ``--cost`` on a non-catalog model errors cleanly (no open-model
     sizing)."""

@@ -343,8 +343,8 @@ class ApiClient:
             # Server-side preview: runs the same validation/preflights as a real submit and records a
             # state=dry_run run, but allocates no GPU and charges nothing. Returns that status.
             body["dry_run"] = True
-            if client_train_schema is not None:
-                body["client_train_schema"] = client_train_schema
+        if client_train_schema is not None:
+            body["client_train_schema"] = client_train_schema
         return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:
