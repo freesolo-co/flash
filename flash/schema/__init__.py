@@ -546,7 +546,12 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """validate that the opd context budget leaves room for a prompt."""
+    """validate opd-specific training constraints."""
+    if spec.train.kl_penalty_coef == 0.0:
+        raise ConfigError(
+            "[train] kl_penalty_coef must be > 0 for opd because it scales the gkd "
+            "distillation objective; omit it to use the default 1.0 or set a positive value"
+        )
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is
@@ -563,6 +568,9 @@ def _validate_opd(spec: JobSpec) -> None:
                 f"max_context_tokens > max_completion_tokens. Rejected at parse time so an "
                 f"invalid budget fails before a GPU worker is provisioned."
             )
+
+        # short hybrid-mamba contexts are safe because the worker compares vllm's derived scheduler
+        # budget with the catalogued block size and supplies an explicit floor only when required.
 
 
 # Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
