@@ -10,11 +10,18 @@ from flash._channel import CHANNEL
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.envs.registry import FREESOLO_WORKER_SPEC
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.providers._hf_retry import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
-from flash.spec import JobSpec
+from flash.spec import (
+    RESERVED_WORKER_ENV_KEYS,
+    JobSpec,
+    require_matching_seed,
+    validate_worker_env_reserved,
+)
 
-# Literal name so the logger stays "flash.providers.runpod.train" after the package split — tests assert this.
+# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
+# after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
 logger = get_logger("flash.providers.runpod.train")
 
 
@@ -46,7 +53,7 @@ WORKER_DEPS = [
     # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
     # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
-    # tilelang version-pinned in lockstep with Dockerfile.worker + perf.py runtime reinstall.
+    # tilelang version-pinned with the worker image and flash/engine/worker/perf/__init__.py runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
     # causal_conv1d NOT pip-listed: CUDA extension compiled in Dockerfile.worker with TORCH_CUDA_ARCH_LIST.
@@ -55,19 +62,10 @@ WORKER_DEPS = [
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
-WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
 # back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
-
-
-def _append_tag_suffix(image: str, suffix: str) -> str:
-    slash = image.rfind("/")
-    colon = image.rfind(":")
-    if colon > slash:
-        return f"{image[:colon]}:{image[colon + 1 :]}-{suffix}"
-    return f"{image}-{suffix}"
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
@@ -77,33 +75,16 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
         return override
     if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
-        template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
-        if template:
-            return template.format(
-                base_image=WORKER_IMAGE,
-                gpu=info.name,
-                gpu_short=info.short,
-                sm=info.sm,
-                sm_num=info.sm.removeprefix("sm"),
-            )
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
-            return _append_tag_suffix(WORKER_IMAGE, info.sm)
+            return f"{WORKER_IMAGE}-{info.sm}"
     return WORKER_IMAGE if allow_default else None
 
 
 def resolve_worker_deps() -> list[str]:
     """Return the pinned worker dependency list."""
     return list(WORKER_DEPS)
-
-
-def _effective_worker_env(spec=None) -> dict[str, str]:
-    """os.environ overlaid with spec.worker_env — mirrors what build_worker_env sends the worker."""
-    eff: dict[str, str] = dict(os.environ)
-    for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        eff[str(k)] = str(v)
-    return eff
 
 
 # Chalk is published to PUBLIC PyPI on every version bump (chalk .github/workflows/publish.yml).
@@ -130,16 +111,16 @@ LATEST_CHALK_MAIN_SHA = "e89b52145778102418f00e2b99d27968577ca43a"
 
 def chalk_extra_pip(spec=None) -> list[str]:
     """Return chalk pip spec(s) for the worker's extra_pip; resolved against the effective worker env."""
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
+    worker_env: dict[str, str] = dict(os.environ)
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        worker_env[str(k)] = str(v)
+    spec_str = worker_env.get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
-
-
-_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 # Optimization toggles dropped in PR #175 (deterministic behavior). Filtered from [worker_env]
@@ -183,15 +164,6 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
 
 
-def drop_unmounted_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Strip mount-rooted cache vars if the volume isn't actually mounted (mutates+returns)."""
-    if os.path.isdir(mount):
-        return env
-    for k in [k for k, v in env.items() if str(v).startswith(mount)]:
-        env.pop(k, None)
-    return env
-
-
 def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
     """Remove the RunPod weight-cache redirect from an env bound for a non-RunPod worker (mutates)."""
     for k in [k for k, v in env.items() if str(v).startswith(mount)]:
@@ -205,7 +177,9 @@ def build_worker_env(
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker (platform creds + recipe overrides)."""
-    # GRPO uses a non-expandable alloc conf: expandable_segments crashes the vLLM sleep-mode engine.
+    canonical_seed = require_matching_seed(spec, seed)
+    validate_worker_env_reserved(spec.worker_env)
+    # grpo uses a non-expandable alloc conf: expandable_segments crashes the vllm sleep-mode engine.
     # The worker upgrades RL to expandable when it resolves sleep=OFF (finalize_alloc_conf_for_sleep).
     # SFT and OPD have NO vLLM sleep engine and allocate large HF generate/logit tensors, so both take
     # the anti-fragmentation expandable allocator up front: OPD was previously lumped in with RL here
@@ -221,7 +195,7 @@ def build_worker_env(
         "RUN_ID": spec.run_id,
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
-        "SEED": str(int(seed)),
+        "SEED": str(canonical_seed),
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
@@ -240,12 +214,8 @@ def build_worker_env(
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
-    # run_id, hf_repo, flash_arm, and seed are control-plane-owned.
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM", "SEED"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         ku = str(k).upper()
-        if ku in _RESERVED_WORKER_ENV:
-            continue
         if ku in _REMOVED_OPTIMIZATION_ENV:
             logger.warning(
                 "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
@@ -254,10 +224,23 @@ def build_worker_env(
             )
             continue
         env[str(k)] = str(v)
-    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+    # runtime secrets and declared env secrets may never clobber a control-plane-owned key: the
+    # canonical seed, run id, hf repo, and arm are set above, and a runtime seed override would break
+    # the authoritative-seed invariant regardless of how environment.secrets was populated.
+    allowed_runtime_secrets = {
+        k
+        for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
+        if k.upper() not in RESERVED_WORKER_ENV_KEYS
+    }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)
+    # the pinned resume revision is control-plane-owned transport, not a user-declared secret.
+    # lifecycle removes caller input and supplies only the gate-approved sha on a required replacement.
+    env.pop(OPD_RESUME_REVISION_ENV, None)
+    resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
+    if resume_revision:
+        env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
     # The opd GLM teacher key is a platform-owned credential injected from the control-plane env for
     # opd runs — like HF_TOKEN/GITHUB_TOKEN above, not a user secret. Set it LAST so the platform
     # value is authoritative: bring-your-own teacher keys are not supported, so no user-routed
@@ -280,10 +263,6 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
     )
 
 
-def _is_hf_not_found(exc: BaseException) -> bool:
-    return hf_status_code(exc) == 404 or exc.__class__.__name__ == "RepositoryNotFoundError"
-
-
 def _ensure_private_artifact_repo(
     api,
     repo: str,
@@ -297,7 +276,7 @@ def _ensure_private_artifact_repo(
             deadline_at=deadline_at,
         )
     except Exception as exc:
-        if not _is_hf_not_found(exc):
+        if hf_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
             raise
         _hf_call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),

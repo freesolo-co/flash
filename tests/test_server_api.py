@@ -380,6 +380,34 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     assert not row.get("email")
 
 
+def test_invalid_external_email_is_not_persisted(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {
+            "email": "not-an-email",
+            "key_prefix": "fslo_invalidemail",
+            "org_slug": "acme",
+            "org_id": "org-acme",
+        },
+    )
+    captured = {}
+    ensure_external_key = auth_mod.db.ensure_external_key
+
+    def capture_ensure_external_key(token, *, key_prefix=None, email=None):
+        captured["email"] = email
+        return ensure_external_key(token, key_prefix=key_prefix, email=email)
+
+    monkeypatch.setattr(auth_mod.db, "ensure_external_key", capture_ensure_external_key)
+
+    assert auth_mod.authenticate("Bearer fslo-invalid-email") is not None
+    assert captured["email"] is None
+
+
 def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(api, monkeypatch):
     import flash.server.app as app_mod
 
@@ -655,6 +683,41 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
     state["code"] = 401
     assert auth_mod._freesolo_verify("bad") is False
     assert auth_mod._verify_cache.get("bad", (None,))[0] is False
+
+
+def test_freesolo_verify_discards_identity_on_exit_http_error(monkeypatch):
+    import io
+    import urllib.error
+
+    import flash.server.auth as auth_mod
+
+    importlib.reload(auth_mod)
+    auth_mod._verify_cache.clear()
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"email":"user@example.com","org_id":"org-1","org_slug":"acme"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            raise urllib.error.HTTPError(
+                "https://api.freesolo.co/api/auth/verify",
+                401,
+                "unauthorized",
+                {},
+                io.BytesIO(b'{"detail":"unauthorized"}'),
+            )
+
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+
+    assert auth_mod._freesolo_verify("tok") is False
+    verified, identity, _expires_at = auth_mod._verify_cache["tok"]
+    assert verified is False
+    assert identity == {}
 
 
 def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
@@ -1145,6 +1208,21 @@ def test_non_object_spec_fields_get_targeted_400(api):
         assert "runtime_secrets must be a JSON object" in r.json()["detail"], (bad_secrets, r.text)
 
 
+def test_create_run_rejects_top_level_and_gpu_typos_as_400(api):
+    key = _login()
+    for spec, expected in (
+        ({**SPEC, "model_revison": "main"}, "model_revison"),
+        ({**SPEC, "gpu": {"exact_typ": "H100"}}, "exact_typ"),
+    ):
+        response = api.post(
+            "/v1/runs",
+            json={"spec": spec, "dry_run": True},
+            headers=_bearer(key),
+        )
+        assert response.status_code == 400, response.text
+        assert expected in response.json()["detail"]
+
+
 def test_deploy_dry_run(api):
     key = _login()
     run_id = api.post(
@@ -1156,6 +1234,27 @@ def test_deploy_dry_run(api):
     assert "mode" not in dep.json()
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
+
+
+def test_deploy_rejects_revision_pinned_base_model(api):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "a" * 40
+    runner._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "does not support revision-pinned base models" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
@@ -2479,7 +2578,7 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
     assert "smoke generation returned no content" in deployment["last_deploy_error"]
 
 
-def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
+def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -2489,7 +2588,7 @@ def test_deploy_ignores_unsupported_stored_gpu(api, monkeypatch):
     ).json()["run_id"]
     status = runner.get_status(run_id)
     status.state = "done"
-    status.spec["gpu"]["type"] = "Quantum TPU"
+    status.spec["gpu"]["type"] = "H200"
     status.effective_preparation = None
     runner._save_status(status)
     seen: dict = {}
@@ -5153,3 +5252,117 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     )
     assert bad.status_code == 404, bad.text
     assert "step 99" in bad.json()["detail"]
+
+
+# --- export: product-analytics report ------------------------------------------------------
+
+
+def test_export_reports_product_analytics_event(api, monkeypatch):
+    """A successful export fires the platform product-event reporter (best-effort) with the
+    destination repo, url, and step; the report failing must never fail the export itself."""
+    import flash.server.app as app_mod
+    import flash.server.run_registry as run_registry
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
+    )
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return True
+
+    monkeypatch.setattr(run_registry, "record_model_exported", capture)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["repository"] == "me/adapters"
+    assert seen["url"] == "https://huggingface.co/me/adapters"
+    assert seen["step"] is None
+    assert seen["status"].run_id == run_id
+
+
+def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
+    import flash.server.app as app_mod
+    import flash.server.run_registry as run_registry
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    monkeypatch.setattr(
+        app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
+    )
+
+    def boom(**_kwargs):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(run_registry, "record_model_exported", boom)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/adapters", "hf_token": "hf_user"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_record_model_exported_posts_allowlisted_event(monkeypatch):
+    """The reporter posts the flash_model_exported event with org/user attribution and the
+    export detail; no org in context disables the report entirely."""
+    import flash.server.run_registry as run_registry
+
+    posted: dict = {}
+    monkeypatch.setattr(
+        run_registry,
+        "_post",
+        lambda path, body: posted.update({"path": path, "body": body}) or True,
+    )
+
+    class _Status:
+        def __init__(self):
+            self.run_id = "run-9"
+            self.platform_context = {"org_id": "org-A", "user_id": "user-1"}
+            self.billing_context = None
+            self.spec = {"model": "Qwen/Qwen3.5-0.8B"}
+
+    ok = run_registry.record_model_exported(
+        status=_Status(),
+        repository="me/adapters",
+        url="https://huggingface.co/me/adapters",
+        step=120,
+    )
+    assert ok is True
+    assert posted["path"] == "/api/flash/events/internal"
+    assert posted["body"]["orgId"] == "org-A"
+    assert posted["body"]["userId"] == "user-1"
+    assert posted["body"]["event"] == "flash_model_exported"
+    props = posted["body"]["properties"]
+    assert props == {
+        "run_id": "run-9",
+        "repository": "me/adapters",
+        "url": "https://huggingface.co/me/adapters",
+        "step": 120,
+        "model": "Qwen/Qwen3.5-0.8B",
+    }
+
+    class _NoOrg:
+        def __init__(self):
+            self.run_id = "run-9"
+            self.platform_context = None
+            self.billing_context = None
+            self.spec = {}
+
+    posted.clear()
+    assert (
+        run_registry.record_model_exported(
+            status=_NoOrg(), repository="x/y", url="https://x", step=None
+        )
+        is False
+    )
+    assert posted == {}

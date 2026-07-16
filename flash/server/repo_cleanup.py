@@ -86,7 +86,7 @@ RUN_REPO_PREFIX = "flashrun-"
 # Delete an undeployed run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
-_SCAN_WORKERS = int(os.environ.get("FLASH_GC_SCAN_WORKERS", "8"))  # HF tree-listing concurrency
+_SCAN_WORKERS = 8  # hf tree-listing concurrency
 
 # Only these top-level dirs are deletable model-artifact phases (``JobSpec.phase``: grpo -> "rl",
 # plus the VL warm-start ``recomb`` recombined adapter). Anything else — ``code/`` snapshots,

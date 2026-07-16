@@ -1,4 +1,4 @@
-"""Small shared file-IO helpers for credential/manifest JSON under ``~/.flash``."""
+"""Small shared JSON file helpers for data under ``~/.flash``."""
 
 from __future__ import annotations
 

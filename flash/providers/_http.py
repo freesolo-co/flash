@@ -40,25 +40,18 @@ class RestClient:
         env_var: str,
         error_cls: type[Exception],
         base_url: str = "",
-        missing_key_message: str | None = None,
         keys_provider: Callable[[], list[str]] | None = None,
         failover_predicate: Callable[[Exception], bool] | None = None,
         extra_headers: dict[str, str] | None = None,
-        auth_header_name: str = "Authorization",
-        auth_value_format: str = "Bearer {key}",
     ) -> None:
         self.env_var = env_var
         self.error_cls = error_cls
         self.base_url = base_url
-        self.missing_key_message = (
-            missing_key_message or f"{env_var} not configured on the control-plane host"
-        )
+        self.missing_key_message = f"{env_var} not configured on the control-plane host"
         self.keys_provider = keys_provider
         self.failover_predicate = failover_predicate
         # Lambda sits behind Cloudflare, which 403s the stdlib default UA — pass a real UA via extra_headers.
         self.extra_headers = dict(extra_headers or {})
-        self.auth_header_name = auth_header_name
-        self.auth_value_format = auth_value_format
 
     def api_key(self) -> str:
         key = os.environ.get(self.env_var)
@@ -89,7 +82,7 @@ class RestClient:
             data=json.dumps(body).encode() if body is not None else None,
             headers={
                 **self.extra_headers,
-                self.auth_header_name: self.auth_value_format.format(key=key or self.api_key()),
+                "Authorization": f"Bearer {key or self.api_key()}",
                 "Content-Type": "application/json",
             },
         )
@@ -139,7 +132,7 @@ class RestClient:
             except json.JSONDecodeError as e:
                 # Cloudflare HTML interstitial or truncated body — treat as transient.
                 last = e
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            except OSError as e:
                 last = e
             if attempt < retries:
                 delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
@@ -189,7 +182,6 @@ class RestClient:
     ) -> Any:
         """REST call with jittered backoff; with a key pool, failover-class errors try the next key."""
         ordered = self._ordered_keys()
-        last_exc: Exception | None = None
         for i, key in enumerate(ordered):
             try:
                 return self._request_one_key(
@@ -202,9 +194,11 @@ class RestClient:
                     deadline_at,
                 )
             except self.error_cls as e:
-                last_exc = e
-                more_keys = i < len(ordered) - 1
-                if more_keys and self.failover_predicate is not None and self.failover_predicate(e):
+                if (
+                    i < len(ordered) - 1
+                    and self.failover_predicate is not None
+                    and self.failover_predicate(e)
+                ):
                     continue
                 raise
-        raise last_exc or self.error_cls(self.missing_key_message)
+        raise AssertionError("unreachable")

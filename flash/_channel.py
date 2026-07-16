@@ -1,7 +1,5 @@
 """Single switch between prod and dev channels; ``scripts/build_dev_dist.py`` rewrites CHANNEL to "dev"."""
 
-from __future__ import annotations
-
 CHANNEL = "prod"
 
 # Must stay in lockstep with [project.scripts] in pyproject.toml.

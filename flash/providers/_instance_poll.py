@@ -41,17 +41,16 @@ from flash.providers._poll import (
 )
 from flash.providers.base import PollResult
 
-# A fresh DONE can precede the separately-uploaded metrics.json (HF read-after-write lag). Re-read
-# metrics a few times before falling back to the infra-retryable poll_error, so a DONE-signalled
-# success isn't hard-failed on a transient read gap.
-_METRICS_AFTER_DONE_RETRIES = 6
-_METRICS_AFTER_DONE_WAIT_S = 5.0
+# a strict success marker can precede the separately uploaded metrics.json under hf read-after-write
+# lag. re-read metrics before falling back to the infra-retryable poll_error so marker-authorized
+# success is not hard-failed on a transient read gap.
+_METRICS_AFTER_SUCCESS_RETRIES = 6
+_METRICS_AFTER_SUCCESS_WAIT_S = 5.0
 
-# A successful box self-destroys / vanishes the instant it finishes — often before HF exposes its DONE /
-# attempt marker. Re-read terminal artifacts a few times before concluding host loss, so a
-# finished-then-gone seed isn't mis-retried against its own artifacts.
-_TERMINAL_AFTER_DEAD_RETRIES = 6
-_TERMINAL_AFTER_DEAD_WAIT_S = 5.0
+# any boundary exit can race terminal-artifact visibility under hf read-after-write lag. re-read
+# terminal artifacts before classifying the exit so a completed seed is not retried against its work.
+_TERMINAL_REREAD_RETRIES = 6
+_TERMINAL_REREAD_WAIT_S = 5.0
 
 
 def _read_with_retries(
@@ -220,43 +219,40 @@ def poll_instance_job(
         *,
         read_deadline_at: float | None = absolute_deadline,
     ) -> PollResult:
-        # metrics.json is written before DONE but HF read-after-write lags: re-read a few times before
-        # falling back to the poll_error retry on a DONE-without-metrics.
+        # the strict success marker authorizes completion, but metrics.json visibility can lag it on hf.
+        # re-read before falling back to the poll_error retry used for a success without metrics.
         raw = _read_with_retries(
             lambda: read_artifact(
                 metrics_reader,
                 force=True,
                 read_deadline_at=read_deadline_at,
             ),
-            tries=_METRICS_AFTER_DONE_RETRIES,
-            wait_s=_METRICS_AFTER_DONE_WAIT_S,
+            tries=_METRICS_AFTER_SUCCESS_RETRIES,
+            wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
             say=say,
             message="DONE seen but metrics.json not visible yet; waiting for HF read-after-write",
             deadline_at=read_deadline_at,
         )
         if raw is None:
-            # DONE means the worker SIGNALLED SUCCESS; an unreadable metrics.json after the in-line
-            # retries is a transient HF read-after-write gap, not a worker error. Don't fast-fail a
-            # successful run as job_failed — return the infra-retryable poll_error so it gets its
-            # bounded infra budget (never a forever-spin) instead of a hard terminal failure.
+            # the strict success marker has authorized completion, so missing metrics after the inline
+            # retries is a transient hf read gap, not a worker error. return the infra-retryable
+            # poll_error so the run gets its bounded infra budget instead of a hard terminal failure.
             return PollResult(
                 False, failure="poll_error", detail="DONE without metrics.json (transient HF read)"
             )
         try:
             metrics = json.loads(raw)
         except ValueError:
-            # A present-but-unparseable metrics.json (truncated read-after-write / corrupt) must NOT
-            # escape the poll loop as a raw JSONDecodeError and abort the run past the teardown finally.
-            # Same transient read-after-write gap on a DONE-signalled success: classify it exactly like
-            # the DONE-without-metrics case above -- infra-retryable poll_error, not job_failed.
+            # a present but unparseable metrics.json must not escape as a raw json decode error and
+            # bypass the poll result path. treat this marker-authorized success like missing metrics:
+            # infra-retryable poll_error, not job_failed.
             return PollResult(
                 False,
                 failure="poll_error",
                 detail="DONE with unparseable metrics.json (transient HF read)",
             )
-        # end_ts is the worker's completion time — the DONE sentinel's payload (a str) or an ok marker's
-        # ts (a float) — else now; adopt only if in [launch, now]. float() tolerates surrounding
-        # whitespace, so no pre-strip is needed.
+        # end_ts is the worker completion time: prefer the optional fresh done timestamp supplied by
+        # the caller, otherwise use the strict ok marker timestamp. adopt only values in [launch, now].
         end_ts = time.time()
         if end_ts_hint is not None:
             with contextlib.suppress(TypeError, ValueError):
@@ -282,26 +278,25 @@ def poll_instance_job(
         )
 
     def finish_from_ok_marker(
-        marker: dict | None = None,
+        marker: dict,
         *,
         read_deadline_at: float | None = absolute_deadline,
     ) -> PollResult:
-        # An ok marker means the worker finished (metrics.json was written first), even if DONE is stale.
-        # Pass DONE only when fresh; else use the marker's own completion ts for the wall note.
+        # a strict ok marker authorizes completion even if done is stale or absent. prefer a fresh done
+        # timestamp when available; otherwise use the marker's completion timestamp for the wall note.
         d = read_artifact(
             done_reader,
             force=True,
             read_deadline_at=read_deadline_at,
         )
         fresh = d is not None and done_is_fresh(d)
-        marker_ts = marker.get("ts") if isinstance(marker, dict) else None
+        marker_ts = marker["ts"]
         return finish_ok(d if fresh else marker_ts, read_deadline_at=read_deadline_at)
 
-    def fail_from_marker(marker: dict | None) -> PollResult:
-        # A real worker error fails fast UNLESS flagged retriable (in the marker, or the worker's
-        # heartbeat for a RetriableInfraError). Gate the heartbeat flag to THIS attempt so a stale
-        # retriable=True from a prior attempt can't turn a fast-fail into a GPU-burning retry loop.
-        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(
+    def fail_from_marker(marker: dict) -> PollResult:
+        # a real worker error fails fast unless flagged retriable in the marker or the worker heartbeat.
+        # gate the heartbeat flag to this attempt so a stale prior-attempt flag cannot trigger a retry.
+        retriable = marker["retriable"] or worker_flagged_retriable(
             heartbeat_reader, launch_ts=launch_ts, current_attempt=adapter.current_attempt
         )
         return PollResult(
@@ -350,15 +345,15 @@ def poll_instance_job(
         # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
         deferred_deadline_failure = None
         read_deadline = time.time() + (
-            _TERMINAL_AFTER_DEAD_RETRIES * _TERMINAL_AFTER_DEAD_WAIT_S
+            _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S
         )
         terminal = _read_with_retries(
             lambda: terminal_artifact_result(
                 read_deadline_at=read_deadline,
                 defer_deadline_failure=True,
             ),
-            tries=_TERMINAL_AFTER_DEAD_RETRIES,
-            wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
             say=say,
             message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
             deadline_at=read_deadline,
@@ -376,8 +371,8 @@ def poll_instance_job(
         # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
         terminal = _read_with_retries(
             terminal_artifact_result,
-            tries=_TERMINAL_AFTER_DEAD_RETRIES,
-            wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
             say=say,
             message="stall boundary; waiting for HF to expose any terminal DONE/marker before stalled",
             deadline_at=absolute_deadline,
@@ -431,8 +426,8 @@ def poll_instance_job(
                 # a second worker for an attempt that already finished (duplicate work + double-bill).
                 terminal = _read_with_retries(
                     terminal_artifact_result,
-                    tries=_TERMINAL_AFTER_DEAD_RETRIES,
-                    wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+                    tries=_TERMINAL_REREAD_RETRIES,
+                    wait_s=_TERMINAL_REREAD_WAIT_S,
                     say=say,
                     message="status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error",
                     deadline_at=absolute_deadline,
@@ -490,8 +485,8 @@ def poll_instance_job(
             # times before concluding loss.
             terminal = _read_with_retries(
                 terminal_artifact_result,
-                tries=_TERMINAL_AFTER_DEAD_RETRIES,
-                wait_s=_TERMINAL_AFTER_DEAD_WAIT_S,
+                tries=_TERMINAL_REREAD_RETRIES,
+                wait_s=_TERMINAL_REREAD_WAIT_S,
                 say=say,
                 message="instance gone; waiting for HF to expose any terminal DONE/marker before failover",
                 deadline_at=absolute_deadline,
@@ -524,9 +519,7 @@ def poll_instance_job(
             # buys no fresh window. ``fresh`` is False for a leftover prior-attempt heartbeat.
             hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts, adapter.current_attempt)
             if fresh:
-                seen_fresh_hb = (
-                    True  # any fresh hb (incl. a bare liveness ping) disarms first-liveness
-                )
+                seen_fresh_hb = True
                 # Advance the stall clock ONLY on a STAGED heartbeat (stage is not None): a bare liveness
                 # ping must not let a wedged worker keep resetting the setup/training stall window.
                 # MONOTONIC: never regress on an out-of-order upload.

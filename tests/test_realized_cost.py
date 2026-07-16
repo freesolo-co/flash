@@ -163,9 +163,9 @@ def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
 
 
 def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(monkeypatch):
-    """A persisted provider handle whose from_dict coerced a MISSING started_ts to 0.0 must NOT be
-    billed from the 1970 epoch (which would massively inflate realized cost). reconcile_run treats a
-    falsey started_ts as unknown and falls back to status.created_at for the billing `start`."""
+    """raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
+    unknown launch rather than the epoch; falling back to status.created_at prevents inflated
+    flat-rate instance billing."""
     captured: dict = {}
 
     def fake_realized(remote, **kw):
@@ -177,7 +177,7 @@ def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(
     monkeypatch.setattr(runner, "record_realized_cost", lambda *a, **k: None)
     now = 1_000_000.0
     created = now - 9000.0
-    for started in (0.0, None):  # coerced-to-0.0 and genuinely-absent both fall back
+    for started in (0.0, None):  # explicit zero and absent values both fall back
         captured.clear()
         remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
         if started is not None:

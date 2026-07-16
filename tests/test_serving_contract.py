@@ -168,28 +168,29 @@ def test_deployment_roundtrip_dict():
 
 def test_serving_prices_cover_catalog():
     from flash.catalog import MODELS
-    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES, serving_price_rows
+    from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES
 
     assert set(SERVING_PRICES) == set(MODELS)
+    ordered_prices = sorted(SERVING_PRICES.items())
+    assert [model_id for model_id, _price in ordered_prices] == sorted(MODELS)
     assert pytest.approx(1.20) == SERVING_MARKUP
-    rows = serving_price_rows()
-    assert len(rows) == len(MODELS)
-    for row in rows:
-        assert row["typical_input_usd_per_mtok"] > 0
-        assert row["typical_output_usd_per_mtok"] > 0
-        assert row["typical_cached_input_usd_per_mtok"] > 0
-        assert row["billed_input_usd_per_mtok"] > 0
-        assert row["billed_output_usd_per_mtok"] > 0
-        assert row["billed_cached_input_usd_per_mtok"] > 0
-        assert row["billed_cached_input_usd_per_mtok"] < row["billed_input_usd_per_mtok"]
-        assert row["billed_input_usd_per_mtok"] == pytest.approx(
-            row["typical_input_usd_per_mtok"] * SERVING_MARKUP
+    for model_id, price in ordered_prices:
+        assert price.model_id == model_id
+        assert price.typical_input_usd_per_mtok > 0
+        assert price.typical_output_usd_per_mtok > 0
+        assert price.typical_cached_input_usd_per_mtok > 0
+        assert price.billed_input_usd_per_mtok > 0
+        assert price.billed_output_usd_per_mtok > 0
+        assert price.billed_cached_input_usd_per_mtok > 0
+        assert price.billed_cached_input_usd_per_mtok < price.billed_input_usd_per_mtok
+        assert price.billed_input_usd_per_mtok == pytest.approx(
+            price.typical_input_usd_per_mtok * SERVING_MARKUP
         )
-        assert row["billed_output_usd_per_mtok"] == pytest.approx(
-            row["typical_output_usd_per_mtok"] * SERVING_MARKUP
+        assert price.billed_output_usd_per_mtok == pytest.approx(
+            price.typical_output_usd_per_mtok * SERVING_MARKUP
         )
-        assert row["billed_cached_input_usd_per_mtok"] == pytest.approx(
-            row["typical_cached_input_usd_per_mtok"] * SERVING_MARKUP
+        assert price.billed_cached_input_usd_per_mtok == pytest.approx(
+            price.typical_cached_input_usd_per_mtok * SERVING_MARKUP
         )
 
 

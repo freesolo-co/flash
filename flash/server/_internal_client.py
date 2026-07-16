@@ -1,4 +1,4 @@
-"""Shared transport for internal-backend POSTs (key gate, org-id extraction, request builder)."""
+"""shared transport for internal-backend JSON requests (key gate, org-id extraction, request builder)."""
 
 from __future__ import annotations
 
@@ -23,12 +23,6 @@ def internal_key() -> str | None:
     ``Authorization: Bearer <whitespace>`` header — every internal reporter shares this gate."""
     key = (os.environ.get(INTERNAL_KEY_ENV) or "").strip()
     return key or None
-
-
-def enabled() -> bool:
-    """Internal-backend reporting is on only when the operator INTERNAL key is set and non-blank.
-    Derives from ``internal_key()`` so every call site shares ONE definition of 'enabled'."""
-    return internal_key() is not None
 
 
 def org_id_of(context: dict[str, Any] | None) -> str:
@@ -93,7 +87,7 @@ def request_internal_json(
         with suppress(Exception):
             detail = exc.read().decode("utf-8", "replace")[:500]
         logger.warning("failed to %s: HTTP %s %s", subject, exc.code, detail)
-    except (urllib.error.URLError, OSError) as exc:
+    except OSError as exc:
         logger.warning("failed to %s: %s", subject, exc)
     return False
 
