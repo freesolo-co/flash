@@ -11,14 +11,22 @@ from pathlib import Path
 from flash.envs import loader as adapter
 
 
-def test_cache_limits_ignore_ambient_overrides():
+def test_cache_config_ignores_ambient_overrides():
+    # the on-disk env cache location and bounds are hardcoded, not env-tunable: ambient
+    # FLASH_ENV_CACHE_* vars (a stray shell or CI export) must never change them.
     script = (
+        "from pathlib import Path; "
         "from flash.envs import loader; "
+        "assert loader._CACHE_ROOT == Path('/tmp/flash-env-cache'); "
         "assert loader._CACHE_MAX_ENTRIES == 32; "
         "assert loader._CACHE_MAX_BYTES == 4 * 1024 * 1024 * 1024"
     )
-    for max_entries, max_bytes in (("1", "2"), ("invalid", "also-invalid")):
+    for cache_dir, max_entries, max_bytes in (
+        ("/some/other/dir", "1", "2"),
+        ("also-bogus", "invalid", "also-invalid"),
+    ):
         env = os.environ.copy()
+        env["FLASH_ENV_CACHE_DIR"] = cache_dir
         env["FLASH_ENV_CACHE_MAX_ENTRIES"] = max_entries
         env["FLASH_ENV_CACHE_MAX_BYTES"] = max_bytes
         subprocess.run(
