@@ -36,7 +36,15 @@ def test_deploy_dry_run_has_no_user_facing_mode():
 def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
     monkeypatch.setattr(deploy_mod, "resolve_hf_revision", lambda repo: "a" * 40)
     monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
-    monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        deploy_mod,
+        "_require_serving_capabilities",
+        lambda **_kwargs: {
+            "immutable_adapter_revisions",
+            "alias_compare_and_swap",
+            "revision_provenance",
+        },
+    )
 
 
 def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
@@ -79,6 +87,59 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     assert "FREESOLO_INTERNAL_KEY" in msg
     assert "no engine" not in msg
     assert "operator must check" not in msg
+
+
+def _stub_healthz(monkeypatch, deploy_mod, capabilities: list[str]) -> None:
+    """Stub the serving /healthz GET so _require_serving_capabilities sees `capabilities`."""
+
+    class _Resp:
+        def json(self):
+            return {"capabilities": list(capabilities)}
+
+    monkeypatch.setattr(deploy_mod, "_serving_request", lambda method, url, **k: _Resp())
+
+
+def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
+    # The production serving backend advertises the two safety-critical caps + the deferred
+    # thinking/structured-outputs cap, but NOT `revision_provenance`. That must NOT block deploys
+    # (it only gates the rare ambiguous-registration recovery path).
+    import flash.serve.deploy as deploy_mod
+
+    _stub_healthz(
+        monkeypatch,
+        deploy_mod,
+        [
+            "immutable_adapter_revisions",
+            "alias_compare_and_swap",
+            "thinking_structured_outputs_deferred_v1",
+        ],
+    )
+    # Does not raise, with or without the thinking/structured-outputs requirement.
+    deploy_mod._require_serving_capabilities()
+    deploy_mod._require_serving_capabilities(thinking_structured_outputs=True)
+
+
+def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    # Missing the atomic alias CAS (safety-critical) -> deploy MUST still be blocked.
+    _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "revision_provenance"])
+    with pytest.raises(ServingError) as ei:
+        deploy_mod._require_serving_capabilities()
+    assert "alias_compare_and_swap" in str(ei.value)
+    assert "revision_provenance" not in str(ei.value)  # provenance is not the blocker
+
+
+def test_require_capabilities_thinking_structured_outputs_required_when_used(monkeypatch):
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    # Backend lacks the deferred thinking/structured-outputs cap -> a thinking+SO deploy is blocked.
+    _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "alias_compare_and_swap"])
+    deploy_mod._require_serving_capabilities()  # fine without SO
+    with pytest.raises(ServingError):
+        deploy_mod._require_serving_capabilities(thinking_structured_outputs=True)
 
 
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
@@ -274,9 +335,15 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         return 32
 
     monkeypatch.setattr(deploy, "adapter_artifact_lora_rank", artifact_rank)
-    monkeypatch.setattr(
-        deploy, "_require_serving_capabilities", lambda **_kwargs: events.append("capabilities")
-    )
+    def _caps(**_kwargs):
+        events.append("capabilities")
+        return {
+            "immutable_adapter_revisions",
+            "alias_compare_and_swap",
+            "revision_provenance",
+        }
+
+    monkeypatch.setattr(deploy, "_require_serving_capabilities", _caps)
 
     def request(method, url, *, json=None, ok_statuses=()):
         requests.append((method, url, json))
@@ -296,7 +363,13 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "_serving_request", request)
 
-    def wait_ready(adapter_revision, subfolder, *, expected_identity=None):
+    def wait_ready(
+        adapter_revision,
+        subfolder,
+        *,
+        expected_identity=None,
+        require_provenance=True,
+    ):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha
         events.append("ready")
@@ -323,7 +396,9 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
     assert events == ["sha", "verify", "capabilities", "register", "ready", "smoke", "activate"]
     registration = requests[0][2]
     assert registration["adapter_id"] == revision
-    assert registration["status"] == "ready"
+    # the client does NOT send a "status" -- the serving backend sets it and rejects it as an
+    # extra field (see deploy._register body).
+    assert "status" not in registration
     assert registration["metadata"]["hf_revision"] == sha
     assert requests[1][2] == {"expected_adapter_revision": previous}
     assert result.adapter_revision == revision
@@ -428,6 +503,56 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
             revision,
             expected["subfolder"],
             expected_identity=expected,
+        )
+
+
+def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "flash-1@final." + "a" * 40
+    expected = {
+        "adapter_id": revision,
+        "repo_id": "org/repo",
+        "repo_type": "dataset",
+        "subfolder": "sft/flash-1/seed0/adapter",
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "checkpoint": "flash-1",
+        "thinking": False,
+        "metadata": {
+            "record_type": "revision",
+            "run_id": "flash-1",
+            "checkpoint_step": None,
+            "hf_revision": "a" * 40,
+        },
+    }
+    record = {**expected, "metadata": {"lifecycle_state": "ready"}}
+    readback = {"record": record}
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        deploy,
+        "_registered_adapter",
+        lambda adapter_id, **_kwargs: readback["record"],
+    )
+
+    assert (
+        deploy._wait_revision_ready(
+            revision,
+            expected["subfolder"],
+            expected_identity=expected,
+            require_provenance=False,
+            budget_s=0.1,
+        )
+        == record
+    )
+
+    readback["record"] = {**record, "repo_id": "other/repo"}
+    with pytest.raises(deploy.ServingError, match="different immutable identity"):
+        deploy._wait_revision_ready(
+            revision,
+            expected["subfolder"],
+            expected_identity=expected,
+            require_provenance=False,
+            budget_s=0.1,
         )
 
 
