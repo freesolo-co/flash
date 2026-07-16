@@ -384,7 +384,7 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
         _p, vocab, _h, _l = fetch_hf_model_geometry(model_id, revision, strict=True)
         if vocab:
             return int(vocab)
-    return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
+    return vocab_size_for(model_id)
 
 
 def resolve_model(
