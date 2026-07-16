@@ -26,6 +26,7 @@ READBACK_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 
 
@@ -382,7 +383,10 @@ def deploy_adapter(
     dep.adapter_revision = revision
     checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
     so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
-    _require_serving_capabilities(thinking_structured_outputs=thinking and so_default is not None)
+    advertised = _require_serving_capabilities(
+        thinking_structured_outputs=thinking and so_default is not None
+    )
+    require_provenance = REVISION_PROVENANCE_CAPABILITY in advertised
 
     body = {
         "adapter_id": revision,
@@ -421,14 +425,18 @@ def deploy_adapter(
             record = _registered_adapter(revision)
         except ServingError as read_exc:
             raise exc from read_exc
-        if record is None or not _matches_revision_identity(record, body):
+        if record is None or not _matches_revision_identity(
+            record, body, require_provenance=require_provenance
+        ):
             raise exc
         logger.warning(
             "adapter registration response was ambiguous; revision %s exists with matching identity",
             revision,
         )
 
-    _wait_revision_ready(revision, subfolder, expected_identity=body)
+    _wait_revision_ready(
+        revision, subfolder, expected_identity=body, require_provenance=require_provenance
+    )
     if before_activate is not None:
         before_activate(revision, checkpoint)
     activation = _activate_revision(
@@ -471,9 +479,9 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
     return record
 
 
-def _matches_revision_identity(record: dict, expected: dict) -> bool:
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    expected_metadata = expected["metadata"]
+def _matches_revision_identity(
+    record: dict, expected: dict, *, require_provenance: bool = True
+) -> bool:
     scalar_fields = (
         "adapter_id",
         "repo_id",
@@ -489,13 +497,19 @@ def _matches_revision_identity(record: dict, expected: dict) -> bool:
         return False
     if (record.get("structured_outputs") or None) != (expected.get("structured_outputs") or None):
         return False
+    if not require_provenance:
+        # backends without revision_provenance do not echo provenance metadata; the immutable
+        # adapter_id already pins the artifact, so this cross-check is best effort here.
+        return True
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    expected_metadata = expected["metadata"]
     return all(
         metadata.get(field) == expected_metadata.get(field)
         for field in ("record_type", "run_id", "checkpoint_step", "hf_revision")
     )
 
 
-def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> None:
+def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> set[str]:
     # SAFETY-CRITICAL capabilities the deploy correctness contract genuinely depends on: immutable
     # revisions (a revision id always maps to one artifact) and an atomic alias compare-and-swap
     # (the alias flip can't race). These are hard-required.
@@ -508,7 +522,7 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     # recovery path (`_matches_revision_identity`). Hard-requiring it blocked EVERY deploy org-wide
     # whenever the serving build lagged on advertising it, even though the happy path never uses it.
     # So its absence is a logged warning, not a deploy-blocking error.
-    preferred = {"revision_provenance"}
+    preferred = {REVISION_PROVENANCE_CAPABILITY}
     if thinking_structured_outputs:
         # Genuinely required for this run: thinking + structured outputs needs the serving backend's
         # deferred-constraint support (grammar applied after </think>) or served output is invalid.
@@ -553,6 +567,7 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
             "(ambiguous-registration recovery will be best-effort)",
             ", ".join(missing_preferred),
         )
+    return advertised
 
 
 def _wait_revision_ready(
@@ -560,6 +575,7 @@ def _wait_revision_ready(
     subfolder: str,
     *,
     expected_identity: dict | None = None,
+    require_provenance: bool = True,
     budget_s: float = REVISION_READY_BUDGET_SECONDS,
 ) -> dict:
     deadline = time.monotonic() + max(0.0, float(budget_s))
@@ -589,7 +605,7 @@ def _wait_revision_ready(
             continue
         last_read_error = None
         if expected_identity is not None and not _matches_revision_identity(
-            record, expected_identity
+            record, expected_identity, require_provenance=require_provenance
         ):
             raise ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"

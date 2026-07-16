@@ -62,7 +62,11 @@ def _stub_adapter_config(
     import flash.serve.deploy as deploy
 
     if stub_capabilities:
-        monkeypatch.setattr(deploy, "_require_serving_capabilities", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            deploy,
+            "_require_serving_capabilities",
+            lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
+        )
     monkeypatch.setattr(deploy, "_wait_revision_ready", lambda *a, **k: {})
     monkeypatch.setattr(
         deploy,
@@ -645,6 +649,64 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
             structured_outputs=json.dumps({"choice": ["4"]}),
         )
     assert posts == ["https://serve.example/adapters"]  # registration WAS attempted
+
+
+def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
+    advertised = sorted(
+        (_IMMUTABLE_SERVING_CAPABILITIES - {"revision_provenance"})
+        | {d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY}
+    )
+    captured: dict[str, bool] = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"capabilities": advertised}
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://serve.example/healthz"
+        return _Resp()
+
+    def wait_ready(
+        adapter_revision,
+        subfolder,
+        *,
+        expected_identity=None,
+        require_provenance=True,
+    ):
+        captured["require_provenance"] = require_provenance
+        return {}
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
+
+    d.deploy_adapter(
+        run_id="flash-7-no-provenance",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-no-provenance/seed0",
+    )
+    assert captured["require_provenance"] is False
+
+    advertised = sorted(_IMMUTABLE_SERVING_CAPABILITIES)
+    captured.clear()
+    d.deploy_adapter(
+        run_id="flash-7-with-provenance",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-with-provenance/seed0",
+    )
+    assert captured["require_provenance"] is True
 
 
 def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
