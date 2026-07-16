@@ -34,11 +34,6 @@ from flash.providers._poll import (
     make_say,
     preload_box_reap_due,
 )
-
-# Re-exported (unused here) so the cross-provider symmetry guard can assert every rent-a-box jobs module
-# draws the setup-vs-training stall boundary from the ONE canonical helper (the shared poll driver uses
-# it); keeps the rule from drifting between providers.
-from flash.providers._poll import is_training_heartbeat as is_training_heartbeat
 from flash.providers.base import GPU_INFO, PollResult, UnreconciledCreateError
 from flash.providers.lambdalabs import api as lambda_api
 from flash.providers.lambdalabs.jobs.builders import (

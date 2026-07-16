@@ -6,8 +6,6 @@ import inspect
 import math
 import time
 
-MIN_CREATE_SECONDS = 60.0
-
 
 def deadline_kwargs(call, deadline_at: float | None) -> dict[str, float | None]:
     """Return a deadline keyword only when the callable accepts it."""
@@ -46,7 +44,7 @@ def remaining_seconds(deadline_at: object, *, now: float | None = None) -> float
 
 def require_create_allowance(deadline_at: object, *, now: float | None = None) -> float:
     remaining = remaining_seconds(deadline_at, now=now)
-    if remaining < MIN_CREATE_SECONDS:
+    if remaining < 60.0:
         raise RuntimeError(
             "run wall deadline has less than the 60-second minimum provider allowance remaining"
         )

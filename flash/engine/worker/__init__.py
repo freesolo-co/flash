@@ -25,6 +25,7 @@ from flash.engine.worker.adapter import (
     make_lora,
     prepare_fresh_lora_base,
     require_vllm_for_rollout_func,
+    stamp_adapter_provenance,
 )
 from flash.engine.worker.decoding import (
     graded_text,
@@ -75,10 +76,15 @@ from flash.engine.worker.hf import (
     hf_resume_checkpoint,
     hf_upload_file,
     hf_upload_folder,
+    load_tokenizer,
     make_checkpoint_upload_callback,
+    model_revision_kwargs,
     prefetch_model,
     publish_deployable_checkpoint,
+    publish_opd_optimizer_start_marker,
     upload_debug_jsonl,
+    upload_resume_checkpoint,
+    write_base_model_provenance,
 )
 from flash.engine.worker.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.lora import (
@@ -132,6 +138,7 @@ from flash.engine.worker.wandb_log import (
 )
 from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
+from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
 from flash.spec import FIXED_SEED, load_job_spec_from_env
 
 
@@ -164,6 +171,7 @@ PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
 )
+OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
 
 _HB_LAST_UPLOAD = 0.0
 _HB_LAST_PROGRESS_TS = 0.0
@@ -407,6 +415,7 @@ __all__ = [
     "ATTEMPT",
     "HF_REPO",
     "JOB_SPEC",
+    "OPD_RESUME_REVISION",
     "PHASE",
     "RUN_ID",
     "RUN_MODE",
@@ -491,12 +500,14 @@ __all__ = [
     "is_vl_checkpoint",
     "liger_on",
     "load_mega_cache",
+    "load_tokenizer",
     "loraplus_optimizer_cls",
     "main",
     "make_checkpoint_upload_callback",
     "make_lora",
     "make_reward_heartbeat_callback",
     "make_sft_heartbeat_callback",
+    "model_revision_kwargs",
     "optimal_attn_impl",
     "patch_grpo_mask_aware_lm_head",
     "patch_trl_colocate_llm_kwargs",
@@ -504,6 +515,7 @@ __all__ = [
     "prepare_fresh_lora_base",
     "prompt_opens_thinking",
     "publish_deployable_checkpoint",
+    "publish_opd_optimizer_start_marker",
     "render_prompt",
     "require_active_env",
     "require_vllm_for_rollout_func",
@@ -514,15 +526,18 @@ __all__ = [
     "run_sft",
     "seed_training_rngs",
     "setup_perf_backends",
+    "stamp_adapter_provenance",
     "strip_think",
     "think_token_count",
     "thinking_text",
     "upload_debug_jsonl",
+    "upload_resume_checkpoint",
     "wait_for_gpu",
     "wandb_finish",
     "wandb_report_to",
     "wandb_run_info",
     "wandb_run_name",
+    "write_base_model_provenance",
     "write_train_meta",
 ]
 

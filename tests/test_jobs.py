@@ -516,7 +516,7 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
-        gpu=GpuSpec(type="A100"),
+        gpu=GpuSpec(type="A100 PCIe"),
     )
     base = {
         "provider": "runpod",
@@ -1235,9 +1235,9 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
 
 
 def test_poll_job_malformed_step_does_not_crash(monkeypatch):
-    # A heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
-    # no local handler — a ValueError would abort poll_job). The step is coerced like `attempt`, so an
-    # unparseable step is treated as 0 (keep setup grace, don't tighten).
+    # a heartbeat whose `step` is missing or non-numeric must NOT raise inside the poll loop (there is
+    # no local handler — a ValueError would abort poll_job). the step is validated strictly through the
+    # same bounded integer helper; an invalid step stays setup-classified and must not raise.
     import itertools
 
     from flash.providers.runpod import api as runpod_api
@@ -2070,7 +2070,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
 
         def fail_listing(spec, *, step, revision=None):
             raise checkpoints.CheckpointListingError(
-                "could not verify deployable checkpoints for source-run: 503"
+                "could not verify adapter artifacts for source-run: 503"
             )
 
         monkeypatch.setattr(checkpoints, "adapter_artifact_exists", fail_listing)
@@ -2082,7 +2082,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
             }
         )
 
-        with pytest.raises(ValueError, match="could not verify deployable checkpoints"):
+        with pytest.raises(ValueError, match="could not verify adapter artifacts"):
             orch.submit_job(
                 spec,
                 dry_run=True,
@@ -2552,7 +2552,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
-def test_shared_cache_zero_retry_budget_gets_free_cacheless_fallback(monkeypatch, failure):
+def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failure):
     from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2580,17 +2580,14 @@ def test_shared_cache_zero_retry_budget_gets_free_cacheless_fallback(monkeypatch
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
 
-        assert submissions == [
-            (0, orch.WEIGHT_CACHE_VOLUME_NAME, False),
-            (1, None, True),
-        ]
+        assert submissions == [(0, orch.WEIGHT_CACHE_VOLUME_NAME, True)]
 
 
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
-    # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
-    # down the ranked candidate list, not burn every retry on the same (capacity-starved)
-    # class. With static rates the validated >=24 GB pool for a 0.8B GRPO run ranks
-    # RTX 4090 < RTX 5090 < A100 PCIe < ... by $/hr, so successive attempts step through them.
+    # a managed gpu request that keeps hitting infra-shaped failures must walk
+    # down the ranked candidate list, not burn every retry on the same capacity-starved
+    # class. with static rates the validated >=24 gb pool for a 0.8b grpo run ranks
+    # rtx 4090 < rtx 5090 < a100 pcie < ... by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
@@ -2627,7 +2624,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2695,12 +2692,31 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         monkeypatch.setattr("flash.providers._worker.upload_code", lambda repo=None, **_: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
+        import types
+
+        import huggingface_hub
+
+        class FakePrivateHf:
+            def repo_info(self, **_kwargs):
+                return types.SimpleNamespace(sha="private-pinned-sha")
+
+            def get_paths_info(self, **_kwargs):
+                return []
+
+        fake_private_hf = FakePrivateHf()
+        monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: fake_private_hf)
+        monkeypatch.setattr(
+            huggingface_hub,
+            "hf_hub_download",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("no marker is present")),
+        )
+
         spec = JobSpec(
             run_id="oom-walk",
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2734,7 +2750,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         with pytest.raises(RuntimeError, match="bad reward fn"):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -2805,7 +2821,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2870,7 +2886,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2932,7 +2948,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3466,6 +3482,51 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         assert uploads == [(seen["hf_repo"], seen["code_prefix"])]
         assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
+
+
+def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        spec = _spec("one-shot-recovery")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote={
+                    "provider": "runpod",
+                    "endpoint_id": "epA",
+                    "endpoint_name": "n",
+                    "key_fingerprint": _RUNPOD_FINGERPRINT,
+                    "job_id": "jA",
+                    "on_last_gpu": True,
+                    "attempt": 0,
+                    "started_ts": 1.0,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        training_calls = []
+        monkeypatch.setattr(orch, "_run_training", lambda *a, **k: training_calls.append((a, k)))
+
+        status = orch.attach_run(spec.run_id, log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert status.error == "stalled: host vanished"
+        assert training_calls == []
+        assert status.remote is None
 
 
 def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):

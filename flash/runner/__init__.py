@@ -20,8 +20,13 @@ except ImportError:  # pragma: no cover - linux production fails closed below
     fcntl = None
 
 from flash.catalog import ModelInfo, resolve_model
+from flash.opd_retry_contract import (
+    OPD_RETRY_CONTRACT_STATUS_KEY,
+    OPD_RETRY_CONTRACT_VERSION,
+    require_opd_retry_contract_version,
+)
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import FIXED_SEED, JobSpec  # noqa: F401  (re-exported for lifecycle/deploy)
+from flash.spec import JobSpec
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -34,11 +39,13 @@ _STATUS_LOCK = threading.Lock()
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
+_OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
+        _OPD_RETRY_CONTRACT_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
@@ -233,15 +240,80 @@ def _infer_next_attempt(raw: dict) -> int:
     return stored
 
 
-def _reserve_attempt(run_id: str, *, minimum_attempt: int = 0) -> int:
+def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
+    """Verify one locked opd retry snapshot and return its attempt plus resume revision."""
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        spec = JobSpec.from_dict(status.spec)
+        if spec.algorithm != "opd":
+            raise RuntimeError("opd retry verification requires an opd run")
+        try:
+            contract_version = require_opd_retry_contract_version(
+                raw.get(_OPD_RETRY_CONTRACT_KEY)
+            )
+        except ValueError as exc:
+            raise RuntimeError("opd retry contract is missing or invalid; replacement is blocked") from exc
+        next_attempt = _infer_next_attempt(raw)
+        hf_repo = spec.train.hf_repo
+        # phase is the hf-prefix component the worker uploads under ({phase}/{run_id}/...), so it locates
+        # both the markers and any full-state resume checkpoint the replacement can continue from.
+        phase = spec.phase
+        seed = spec.seed
+    from flash.providers._hf_artifacts import verify_opd_replacement_safe
+
+    resume_revision = verify_opd_replacement_safe(
+        hf_repo=hf_repo,
+        run_id=run_id,
+        seed=seed,
+        next_attempt=next_attempt,
+        contract_version=contract_version,
+        phase=phase,
+    )
+    return next_attempt, resume_revision
+
+
+def _verified_opd_next_attempt(run_id: str) -> int:
+    """Return just the verified next attempt, discarding the resume revision."""
+    return _verified_opd_retry_state(run_id)[0]
+
+
+def _reserve_attempt(
+    run_id: str,
+    *,
+    minimum_attempt: int = 0,
+    expected_next_attempt: int | None = None,
+) -> int:
     """Durably consume one run-global attempt identity before provider creation."""
     minimum = _attempt_int(minimum_attempt)
     if minimum is None:
         raise RuntimeError("minimum attempt identity is invalid")
+    expected = None
+    if expected_next_attempt is not None:
+        expected = _attempt_int(expected_next_attempt)
+        if expected is None:
+            raise RuntimeError("expected next attempt identity is invalid")
     with _status_guard(run_id):
         raw = _load_status_json(run_id)
         status = _runstatus_from_json(raw)
-        attempt = max(_infer_next_attempt(raw), minimum)
+        current = _infer_next_attempt(raw)
+        if expected is not None and current != expected:
+            raise RuntimeError("stored next attempt identity changed after retry verification")
+        spec = JobSpec.from_dict(status.spec)
+        if spec.algorithm == "opd":
+            try:
+                require_opd_retry_contract_version(raw.get(_OPD_RETRY_CONTRACT_KEY))
+            except ValueError as exc:
+                raise RuntimeError(
+                    "opd retry contract is missing or invalid; replacement is blocked"
+                ) from exc
+            if expected is None:
+                raise RuntimeError("opd attempt reservation requires verified retry evidence")
+            if minimum > expected:
+                raise RuntimeError("minimum opd attempt exceeds the verified retry snapshot")
+            attempt = expected
+        else:
+            attempt = max(current, minimum)
         if attempt >= _MAX_ATTEMPT_ID:
             raise RuntimeError("run attempt identity is exhausted")
         _save_status_unlocked(status, _next_attempt=attempt + 1)
@@ -662,6 +734,12 @@ def _prepare_init_from_adapter(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
             f"{spec.model!r}"
         )
+    if src_spec.model_revision != spec.model_revision:
+        raise ValueError(
+            "train.init_from_adapter source model_revision "
+            f"{src_spec.model_revision!r} does not match target model_revision "
+            f"{spec.model_revision!r}"
+        )
     if not src_spec.train.hf_repo:
         raise ValueError(
             f"train.init_from_adapter run {src_run_id!r} has no stored adapter artifacts"
@@ -821,6 +899,28 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         raise ValueError("persisted effective preparation has no pinned source revision")
 
 
+def _resolve_model_revision(spec: JobSpec) -> JobSpec:
+    authored = spec.model_revision
+    if not authored:
+        return spec
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
+            spec.model,
+            revision=authored,
+        )
+        resolved = str(getattr(info, "sha", "") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
+            raise ValueError("resolved revision is not an immutable commit")
+    except Exception as exc:
+        raise ValueError(
+            f"could not resolve model_revision for model {spec.model!r}; "
+            "verify that the revision exists and the operator token can access it"
+        ) from exc
+    return replace(spec, model_revision=resolved)
+
+
 @dataclass(frozen=True)
 class PreparedJob:
     public_spec: JobSpec
@@ -837,9 +937,31 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    if spec.gpu.provider or spec.gpu.exact_type:
+        from flash.providers import PROVIDER_NAMES, available_providers
+        from flash.providers.base import providers_for
+
+        configured = available_providers()
+        provider = spec.gpu.provider.strip().lower()
+        if provider:
+            if provider not in PROVIDER_NAMES:
+                raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
+            if provider not in configured:
+                raise ValueError(f"requested gpu.provider {provider!r} is not configured")
+        elif not any(name in configured for name in providers_for(spec.gpu.exact_type)):
+            raise ValueError(
+                f"no configured provider can provision gpu.exact_type {spec.gpu.exact_type!r}"
+            )
+    info = resolve_model(
+        spec.model,
+        spec.algorithm,
+        policy=spec.model_policy,
+        gpu=spec.gpu.exact_type or spec.gpu.type,
+        model_revision=spec.model_revision,
+    )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)
@@ -944,6 +1066,11 @@ def submit_job(
         status,
         _run_deadline_at=status.created_at + float(public_spec.gpu.max_wall_seconds),
         _next_attempt=0,
+        _opd_retry_contract_version=(
+            OPD_RETRY_CONTRACT_VERSION
+            if public_spec.algorithm == "opd"
+            else _PRIVATE_VALUE_UNSET
+        ),
     )
     _report_status(status)
     if dry_run:
@@ -1444,8 +1571,13 @@ def _save_status(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+    _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     with _status_guard(status.run_id):
+        if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
+            require_opd_retry_contract_version(_opd_retry_contract_version)
+            if JobSpec.from_dict(status.spec).algorithm != "opd":
+                raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
             if _run_deadline_at is _PRIVATE_VALUE_UNSET:
                 spec = JobSpec.from_dict(status.spec)
@@ -1460,6 +1592,7 @@ def _save_status(
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
+            _opd_retry_contract_version=_opd_retry_contract_version,
         )
 
 
@@ -1469,6 +1602,7 @@ def _save_status_unlocked(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | None | object = _PRIVATE_VALUE_UNSET,
+    _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
     # write-then-rename so concurrent readers never see a half-written file.
@@ -1478,6 +1612,7 @@ def _save_status_unlocked(
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+        _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:

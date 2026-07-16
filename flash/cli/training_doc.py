@@ -31,7 +31,7 @@ command.
 pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
 flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
 flash whoami                         # confirm the identity behind your key
-flash models                         # supported base models (and which support `thinking`)
+flash models                         # supported base model ids
 flash gpus                           # managed GPU classes with estimated $/hr
 ```
 
@@ -93,6 +93,7 @@ edit to `environment.py` or `dataset/` so the managed run uses your change.
 
 ```toml
 model = "Qwen/Qwen3.5-4B"   # see `flash models`
+# model_revision = "main"   # optional ref resolved to an immutable hugging face commit before submit
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # reproducible per-run seed; omitted defaults to 42
@@ -113,9 +114,11 @@ lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
-GPU and HF artifacts are **fully managed** — do not pick `gpu.type` or set
-`train.hf_repo`; the allocator picks the cheapest validated managed GPU class that fits,
-and run artifacts are stored in a private environment-scoped repo with content-addressed
+GPU and HF artifacts are **managed by default**: `gpu.type` is a non-pinning managed
+hint and `train.hf_repo` remains platform-managed. For controlled
+experiments, `[gpu] provider` restricts allocation to one provider and `[gpu] exact_type`
+pins one active validated GPU class; otherwise the allocator picks the cheapest fitting
+class. Run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
 `SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
 extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
@@ -135,7 +138,6 @@ flash train configs/sft.toml --background  # submit and return immediately
 flash status <run-id>            # state + accrued cost
 flash log <run-id>               # reward/loss trend + worker console/error logs + any traceback
 flash log <run-id> --follow      # stream a live run to completion
-flash status <run-id>            # current run state, cost, and deployment info
 flash runs                       # all your runs and their state/cost
 flash cancel <run-id>            # stop a run
 ```
@@ -209,7 +211,7 @@ spending another GPU run:
 | Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
 | Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
-| Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Use `flash models`; set `thinking = true` only for supported models. Thinking is a training-time/run-level choice and serving preserves that parity, so `flash chat` does not expose an override flag. |
+| Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash chat` does not expose an override flag. |
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |
 | All-zero or flat GRPO reward | `reward` stays near 0 and outputs do not improve | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward. |
 | Reward rises but behavior is worse | Short, templated, malformed, or reward-hacked outputs score well | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string. |

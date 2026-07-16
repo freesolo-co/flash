@@ -11,15 +11,15 @@ import time
 from typing import Any
 
 from flash.diagnostics import sanitize_diagnostic
-from flash.providers.base import canonical_gpu, gpu_short
-from flash.providers.runpod.gpus import flash_gpu
-from flash.providers.runpod.train.deps import (
+from flash.providers._worker import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_SYSTEM_DEPS,
     logger,
     resolve_worker_deps,
     worker_image_for_gpu,
 )
+from flash.providers.base import canonical_gpu, gpu_short
+from flash.providers.runpod.gpus import flash_gpu
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
@@ -470,7 +470,7 @@ def _train_body(input_data: dict) -> dict:
 
         env = dict(os.environ)
         env.update(overrides)
-        # INLINED: handler is baked standalone (flash not importable). Mirrors deps.drop_unmounted_cache_env.
+        # inlined: handler is baked standalone (flash not importable); mirrors the worker cache cleanup.
         if not os.path.isdir("/runpod-volume"):
             for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
                 env.pop(_k, None)

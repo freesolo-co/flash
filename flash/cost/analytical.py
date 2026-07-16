@@ -83,7 +83,10 @@ def setup_seconds(config: RunConfig) -> float:
     """Cold-start wall time before the first optimizer step: container boot + deps + model load
     (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for rollouts.
     This elapsed setup time is reported but not included in customer-facing cost."""
-    model_load = MODEL_LOAD_BASE_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
+    model_load = (
+        MODEL_LOAD_BASE_S
+        + download_weight_gb(config.model_id, config.model_revision) / DOWNLOAD_RATE_GBPS
+    )
     s = WORKER_BOOT_S + DEPS_INSTALL_S + model_load
     if config.has_rollout:
         s += VLLM_INIT_S
@@ -105,7 +108,9 @@ def required_save_overhead_seconds(config: RunConfig) -> float:
         return 0.0
     n = config.normalized()
     serialize_s = (
-        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 * total_params_b(n.model_id) * (n.lora_rank / 32.0)
+        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32
+        * total_params_b(n.model_id, n.model_revision)
+        * (n.lora_rank / 32.0)
     )
     per_save = commits * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_s
     return len(n.save_at_steps) * per_save
@@ -133,7 +138,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # every completion in a step is scored in ONE parallel wave — the teacher wall is a single
         # latency, NOT the full serial sum (that describes only the CPU-test fallback that can't
         # batch-generate). The teacher endpoint's rate limit is the real ceiling on this fan-out.
-        teacher_s = teacher_lat if completions else 0.0
+        teacher_s = teacher_lat
         return gen_s + teacher_s + update_s
 
     if not n.is_grpo:
@@ -175,6 +180,7 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         config.method,
         train=config.train_knobs(),
         thinking=config.thinking,
+        model_revision=config.model_revision,
     )
     gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
@@ -239,13 +245,40 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
-    # Quote the SAME VRAM-floored Vast market pick_gpu selected under (min_vram_gb=need): without the
-    # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
-    # crowd a high-VRAM selection off the limited page -> it silently falls back to the static rate.
-    hourly = gpu_hourly_usd(
-        gpu, provider=config.provider, max_wall_seconds=market_wall_s, min_vram_gb=need
-    )
+    if config.exact_type:
+        # exact_type is provisioned at LAUNCH through allocate (disk-aware, live rate). quote the same
+        # path for BOTH auto and a pinned provider so the estimate matches the actual launch rate, and a
+        # disk floor lifts the quote off the wrong class. provider="" lets allocate pick when unpinned.
+        from flash.providers.allocator import allocate
+
+        allocation = allocate(
+            config.model_id,
+            config.method,
+            train=config.train_knobs(),
+            thinking=config.thinking,
+            max_wall_seconds=market_wall_s,
+            disk_gb=config.disk_gb,
+            provider=("" if config.provider == "auto" else config.provider),
+            exact_type=config.exact_type,
+            model_revision=config.model_revision,
+        )
+        gpu = allocation.gpu
+        quote_provider = allocation.provider
+        hourly = allocation.hourly_usd
+        need = allocation.min_vram_gb
+    else:
+        gpu, need = select_gpu(config, max_wall_seconds=market_wall_s)
+        quote_provider = config.provider
+        # quote the same vram-floored vast market pick_gpu selected under (min_vram_gb=need): without the
+        # floor the rate lookup searches from the smallest managed class, letting cheap small-card offers
+        # crowd a high-vram selection off the limited page -> it silently falls back to the static rate.
+        hourly = gpu_hourly_usd(
+            gpu,
+            provider=quote_provider,
+            max_wall_seconds=market_wall_s,
+            min_vram_gb=need,
+            exact_type="",  # this branch is only reached when exact_type is empty
+        )
 
     setup = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
@@ -279,7 +312,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         method=config.method,
         steps=config.steps,
         gpu=gpu,
-        provider=config.provider,
+        provider=quote_provider,
         gpu_vram_gb=gpu_vram_gb(gpu),
         required_vram_gb=need,
         gpu_hourly_usd=hourly,
@@ -288,10 +321,8 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
-        # GPU (platform-billed) time only. OPD's teacher tokens are billed by Fireworks to the
-        # platform-managed teacher key — never through this GPU charge — so folding teacher_api_usd
-        # into the charged total would bill it a second time. Keep it itemized as a diagnostic
-        # instead (codex[bot]).
+        # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
+        # only as a diagnostic and is not passed through to the customer.
         total_usd=train / 3600.0 * hourly,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),

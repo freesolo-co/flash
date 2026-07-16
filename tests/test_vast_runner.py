@@ -149,7 +149,7 @@ def test_onstart_ships_payload_and_runs_shared_bootstrap(monkeypatch):
 
 
 def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch):
-    """Copilot MsGxp/MsGxy: the heredoc terminators must start on their own line (a bootstrap
+    """the heredoc terminators must start on their own line (a bootstrap
     source without a trailing newline would otherwise swallow the rest of the script), and the
     python-interpreter resolution must fall back past python3 to python with a clear diagnostic."""
     from flash.providers.vast.jobs import builders
@@ -163,14 +163,14 @@ def test_onstart_heredoc_terminators_on_own_line_and_python_fallback(monkeypatch
     # PYBIN never silently empty: python fallback + a diagnostic when nothing resolves.
     assert "command -v python3 || command -v python" in script
     assert "no python interpreter" in script
-    # Copilot Msbs6: an empty PYBIN must EXIT (after a log-retrieval hold), not fall through to the
+    # an empty PYBIN must EXIT (after a log-retrieval hold), not fall through to the
     # doomed `"$PYBIN"` bootstrap + self-destroy invocations.
     assert 'if [ -z "$PYBIN" ]; then' in script
     assert "exit 1" in script
 
 
 def test_onstart_spills_large_spec_to_hf(monkeypatch):
-    """Codex MsMPw: a large inline job spec is spilled to HF (parity with Lambda's build_user_data)
+    """a large inline job spec is spilled to HF (parity with Lambda's build_user_data)
     so it never inflates the base64 onstart past Vast's exec-arg / onstart length limit and fails the
     rent before a handle is persisted. A small spec rides inline unchanged."""
     import huggingface_hub
@@ -508,6 +508,39 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     h = _deploy(vast,_spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
     assert h.instance_id == 7
     assert h.offer_id == 99
+
+
+def test_deploy_refresh_threads_user_pin_not_allocated_class(monkeypatch):
+    # regression: the refresh re-search must key its exact-alias narrowing on the user's hard pin
+    # (spec.gpu.exact_type), NOT the single allocated class inferred from the in-flight offers. A
+    # non-exact run's offers are pre-filtered to one canonical class, so inferring exact_type from
+    # ``allowed`` forced an exact refresh and dropped the fungible cross-architecture capacity the
+    # first broad search had matched.
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    seen: dict[str, str] = {}
+
+    def fake_create(offer_id, **kw):
+        if offer_id != 99:
+            raise vast_api.VastCreateRejected("taken")
+        return 7
+
+    def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
+        seen["exact_type"] = exact_type
+        return [_offer(offer_id=99, machine_id=99, gpu="RTX 4090")]
+
+    monkeypatch.setattr(vast_api, "create_instance", fake_create)
+    monkeypatch.setattr(vast, "usable_offers", capture)
+
+    # non-exact run: the refresh keeps the broad fungible search (exact_type stays empty)
+    _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+    assert seen["exact_type"] == ""
+
+    # exact-pinned run (type == exact_type): the refresh narrows on the pinned class
+    seen.clear()
+    _deploy(vast, _spec(exact_type="RTX 4090"), seed=0, offers=[_offer(offer_id=1)], attempt=0)
+    assert seen["exact_type"] == "RTX 4090"
 
 
 def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
@@ -928,7 +961,7 @@ def test_poll_dead_host_waits_for_late_terminal_artifact(monkeypatch):
     ],
 )
 def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
-    # Codex/Cursor: a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
+    # a transient MALFORMED 200 body from the instance-detail API makes RestClient.request
     # raise JSONDecodeError/UnicodeDecodeError, or IncompleteRead/http.client.HTTPException on a truncated
     # body read (NOT a VastApiError — the _http wrapper only catches the OSError-family transients). The
     # poll loop must treat all of those as a TRANSIENT poll error (count + keep polling, give up only once
@@ -954,7 +987,7 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
 
 
 def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
-    # Codex 3519040492: when Vast's detail API lags in 'loading'/'unknown' and never flips to
+    # when Vast's detail API lags in 'loading'/'unknown' and never flips to
     # 'running', a worker that HAS booted still uploads fresh heartbeats to HF. Those prove it
     # started, so they disarm the load timeout — else a healthy, heartbeating box is torn down at
     # LOAD_TIMEOUT_S (15m) on a stale status feed (deadline_s + the finally destroy stay the spend
@@ -987,9 +1020,9 @@ def test_poll_fresh_heartbeat_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
-    # Cursor 3519197324: the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh
-    # heartbeat arriving on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. If the guard is
-    # ordered BEFORE the read (the incomplete 91daa363 fix), seen_fresh_hb is still False on that tick
+    # the load-timeout guard must run AFTER the heartbeat read, so the FIRST fresh heartbeat arriving
+    # on the very tick elapsed crosses LOAD_TIMEOUT_S disarms it. if the guard is ordered BEFORE the
+    # read, seen_fresh_hb is still False on that tick
     # -> a healthy, heartbeating box is torn down as 'stalled'. The heartbeat is ABSENT until the
     # crossing tick (unlike the sibling test, whose heartbeat is present from iteration 1 and so can't
     # expose the ordering race).
@@ -1022,7 +1055,7 @@ def test_poll_first_heartbeat_on_timeout_tick_disarms_load_timeout(monkeypatch):
 
 
 def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
-    """Codex/Cursor: when the Vast status endpoint keeps raising and the poll-error budget is spent, the
+    """when the Vast status endpoint keeps raising and the poll-error budget is spent, the
     poller does a BOUNDED terminal DONE/marker read (same as the deadline / dead-host paths) BEFORE
     returning poll_error. A worker that COMPLETED during a prolonged outage — DONE on HF, a separate
     endpoint, but lagged on the first read — is finished rather than abandoned to a duplicate retry that
@@ -2146,6 +2179,29 @@ def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
     )  # a policy word that never reached the allocator
     with pytest.raises(vast_api.VastApiError, match="concrete gpu class"):
         _submit(vast,spec, seed=0)
+
+
+def test_submit_gates_exact_search_on_user_pin_not_allocated_class(monkeypatch):
+    # regression: the submit-time exact-alias narrowing must key on the user's hard pin
+    # (gpu.exact_type), not the allocated gpu.type. passing gpu.type unconditionally dropped
+    # fungible cross-architecture capacity (e.g. a 40GB "A100 PCIE" board usable as A100 SXM 40GB)
+    # for non-exact runs, whose verify_gpu is soft and would have accepted those boards.
+    seen: dict[str, str] = {}
+
+    def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
+        seen["exact_type"] = exact_type
+        return [_offer(gpu="H100")]
+
+    vast, _ = _wire_submit(monkeypatch)
+    monkeypatch.setattr(vast, "usable_offers", capture)
+
+    # non-exact run: keep the broad fungible search so cross-arch capacity still counts
+    _submit(vast, _spec(gpu_type="H100"), seed=0)
+    assert seen["exact_type"] == ""
+
+    # exact-pinned run (type == exact_type): attestation-safe narrowing on the pinned class
+    _submit(vast, _spec(gpu_type="H100", exact_type="H100"), seed=0)
+    assert seen["exact_type"] == "H100"
 
 
 def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):

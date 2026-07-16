@@ -6,6 +6,7 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import multiprocessing
@@ -781,6 +782,14 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
+        if spec.model_revision:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "deployment does not support revision-pinned base models; "
+                    "train without model_revision to deploy this run"
+                ),
+            )
         try:
             effective_spec = effective_spec_from_status(status)
         except ValueError as exc:
@@ -1004,11 +1013,24 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_token=hf_token,
                 private=private,
                 base_model=spec.model,
+                base_model_revision=spec.model_revision,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ServingError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # best-effort product-analytics report: exports never otherwise touch the
+    # platform backend (the copy is hf-to-hf inside flash).
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_model_exported
+
+        record_model_exported(
+            status=status,
+            key=key,
+            repository=repository,
+            url=url,
+            step=checkpoint_step if is_checkpoint else None,
+        )
     result = {
         "run_id": run_id,
         "adapter_id": run_id,

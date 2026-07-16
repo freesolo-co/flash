@@ -149,6 +149,40 @@ def _parse_chat_target(target: str) -> tuple[str, str | None]:
     return run_id, None
 
 
+def _prepare_chat_request(
+    target: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    *,
+    stream: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    base_run_id, adapter_revision = _parse_chat_target(target)
+    _validate_chat_messages(messages)
+    body: dict[str, Any] = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if stream:
+        body["stream"] = True
+    if adapter_revision is not None:
+        body["adapter_revision"] = adapter_revision
+    return base_run_id, body
+
+
+def _parse_adapter_target(target: str) -> tuple[str, int | None]:
+    from flash.schema import parse_checkpoint_ref
+
+    parsed = parse_checkpoint_ref(target)
+    if parsed is None:
+        raise ClientError(
+            "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
+            "for a saved checkpoint"
+        )
+    return parsed
+
+
 class ApiClient:
     def __init__(
         self,
@@ -161,6 +195,11 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+
+    def _auth_headers(self) -> dict[str, str]:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     def _auth_error_detail(self, status: int, detail: str) -> str:
         if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
@@ -202,9 +241,7 @@ class ApiClient:
         timeout: float | None = None,
         progress: ProgressCallback | None = None,
     ) -> Any:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
         if progress is not None:
             payload = json.dumps(body).encode()
             headers["Content-Length"] = str(len(payload))
@@ -232,9 +269,7 @@ class ApiClient:
         timeout: float | None = None,
         max_bytes: int | None = None,
     ) -> bytes:
-        headers = {"Accept": "application/gzip"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = {"Accept": "application/gzip", **self._auth_headers()}
         req = urllib.request.Request(
             f"{self.api_url}{path}",
             method=method,
@@ -284,14 +319,14 @@ class ApiClient:
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Flash control plane."""
-        from flash.envs import loader as adapter
+        from flash.envs import loader
 
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_bytes(
             "GET",
             f"/v1/envs/{quoted}/package",
             timeout=1800.0,
-            max_bytes=adapter._MAX_ARCHIVE_BYTES,
+            max_bytes=loader._MAX_ARCHIVE_BYTES,
         )
 
     def create_run(
@@ -377,15 +412,7 @@ class ApiClient:
         run_id: str,
         dry_run: bool = False,
     ) -> dict:
-        from flash.schema import parse_checkpoint_ref
-
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
-            raise ClientError(
-                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
-                "for a saved checkpoint"
-            )
-        base_run_id, step = parsed
+        base_run_id, step = _parse_adapter_target(run_id)
         # smoke verification is mandatory server-side; there is no opt-out to forward.
         body: dict = {"dry_run": dry_run}
         if step is not None:
@@ -405,15 +432,7 @@ class ApiClient:
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
-        from flash.schema import parse_checkpoint_ref
-
-        parsed = parse_checkpoint_ref(run_id)
-        if parsed is None:
-            raise ClientError(
-                "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
-                "for a saved checkpoint"
-            )
-        base_run_id, step = parsed
+        base_run_id, step = _parse_adapter_target(run_id)
         body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
         if step is not None:
             body["step"] = step
@@ -433,11 +452,12 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
     ) -> dict:
-        base_run_id, adapter_revision = _parse_chat_target(run_id)
-        _validate_chat_messages(messages)
-        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        if adapter_revision is not None:
-            body["adapter_revision"] = adapter_revision
+        base_run_id, body = _prepare_chat_request(
+            run_id,
+            messages,
+            temperature,
+            max_tokens,
+        )
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
@@ -452,27 +472,18 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> Iterator[str]:
-        base_run_id, adapter_revision = _parse_chat_target(run_id)
-        _validate_chat_messages(messages)
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        base_run_id, body = _prepare_chat_request(
+            run_id,
+            messages,
+            temperature,
+            max_tokens,
+            stream=True,
+        )
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
         req = urllib.request.Request(
             f"{self.api_url}/v1/runs/{base_run_id}/chat",
             method="POST",
-            data=json.dumps(
-                {
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": True,
-                    **(
-                        {"adapter_revision": adapter_revision}
-                        if adapter_revision is not None
-                        else {}
-                    ),
-                }
-            ).encode(),
+            data=json.dumps(body).encode(),
             headers=headers,
         )
         decoder = codecs.getincrementaldecoder("utf-8")()

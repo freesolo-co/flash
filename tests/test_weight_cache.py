@@ -20,6 +20,8 @@ import os
 import tempfile
 import types
 
+import pytest
+
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
@@ -58,14 +60,11 @@ def test_default_spec_has_no_volume():
     assert JobSpec(model="m").gpu.network_volume is None
 
 
-def test_legacy_datacenter_key_tolerated():
-    # A stale spec from the reverted single-DC pin may still carry gpu.datacenter; it must be
-    # ignored (the DC set is deploy-time policy now), not raise.
-    spec = JobSpec.from_dict(
-        {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
-    )
-    assert spec.gpu.network_volume == "v"
-    assert not hasattr(spec.gpu, "datacenter")
+def test_stale_datacenter_key_rejected():
+    with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): datacenter"):
+        JobSpec.from_dict(
+            {"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}}
+        )
 
 
 def test_network_volume_gb_tolerant_of_bad_values():
@@ -282,10 +281,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# deps.weight_cache_env / build_worker_env redirect
+# worker weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers.runpod.train.deps import weight_cache_env
+    from flash.providers._worker import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -303,13 +302,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers.runpod.train.deps import weight_cache_env
+    from flash.providers._worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
@@ -318,7 +317,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -327,7 +326,7 @@ def test_build_worker_env_no_cache_without_volume():
 
 
 def test_build_worker_env_per_run_override_wins():
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     spec = _vol_spec()
     spec = JobSpec.from_dict(
@@ -335,27 +334,6 @@ def test_build_worker_env_per_run_override_wins():
     )
     # a per-run [worker_env] override is merged last and must win over the cache redirect.
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
-
-
-def test_drop_unmounted_cache_env_strips_when_unmounted(monkeypatch):
-    import flash.providers.runpod.train.deps as deps
-
-    # volume NOT mounted -> the /runpod-volume cache var is stripped (cold fallback), others kept.
-    monkeypatch.setattr(deps.os.path, "isdir", lambda p: False)
-    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub", "OTHER": "x"}
-    out = deps.drop_unmounted_cache_env(env)
-    assert "FLASH_WEIGHT_CACHE_DIR" not in out
-    assert out["OTHER"] == "x"
-
-
-def test_drop_unmounted_cache_env_keeps_when_mounted(monkeypatch):
-    import flash.providers.runpod.train.deps as deps
-
-    monkeypatch.setattr(deps.os.path, "isdir", lambda p: True)
-    env = {"FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"}
-    assert deps.drop_unmounted_cache_env(env) == {
-        "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub"
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +460,7 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 # instance-provider integration (Lambda reuses RunPod's build_worker_env)
 # ---------------------------------------------------------------------------
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
-    from flash.providers.runpod.train.deps import strip_runpod_volume_env
+    from flash.providers._worker import strip_runpod_volume_env
 
     env = {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
@@ -500,7 +478,7 @@ def test_instance_payload_strips_runpod_volume_redirect():
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
     from flash.providers import _instance
-    from flash.providers.runpod.train.deps import build_worker_env
+    from flash.providers._worker import build_worker_env
 
     spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
@@ -852,7 +830,7 @@ def _supervised_walk(monkeypatch, failures):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="cheapest", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
         assert orch.get_status("wc-walk").state == "done"
@@ -1279,7 +1257,7 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Eager PROVISION — create the instance-provider cache storage in every region/env (no GPU)
+# eager provision: create lambda weight-cache filesystems in every region without a gpu
 # ---------------------------------------------------------------------------
 def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
@@ -1332,12 +1310,13 @@ def test_provision_lambda_no_key_is_noop(monkeypatch):
     assert preload.provision_lambda_filesystems() == []
 
 
-def test_provision_cli_creates_instance_storage(monkeypatch):
-    """`preload --provision` creates Lambda storage (GPU-free) and exits 0."""
+def test_provision_cli_creates_lambda_filesystems(monkeypatch, capsys):
+    """`preload --provision` creates Lambda filesystems (GPU-free) and exits 0."""
     from flash.providers.runpod import preload
 
     monkeypatch.setattr(preload, "provision_lambda_filesystems", lambda: ["lambda:us-east-1"])
     assert preload.main(["--provision"]) == 0
+    assert capsys.readouterr().out == "provisioned 1 Lambda filesystem(s): lambda:us-east-1\n"
 
 
 def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
@@ -1716,98 +1695,15 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     assert real_downloads == []  # no network re-download for a cache hit
 
 
-def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeypatch):
-    """A block-volume preload with the mount dir present but NO sentinel must refuse.
-
-    Regression: a failed/absent volume attach lets Docker bind an EMPTY host dir, so isdir(mount)
-    passes; without requiring the on-device sentinel the worker would warm EPHEMERAL disk and report
-    success. The cloud-init preamble writes .flash-cache-mounted only onto a real mount.
-    """
-    import sys
-
-    from flash.providers import _instance_bootstrap as b
-
-    def _boom(**k):
-        raise AssertionError("must not download when the block volume isn't really mounted")
-
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = _boom
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    cache_dir_env = str(
-        tmp_path / "hf-cache" / "hub"
-    )  # grandparent (the mount) exists but has no sentinel
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
-            "models": ["a/b"],
-            "cache_block_device": True,
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == []
-    assert "not mounted" in r["error"]
-
-
-def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, monkeypatch):
-    """With the on-device sentinel present, a block-volume preload proceeds to download."""
-    import sys
-
-    from flash.providers import _instance_bootstrap as b
-
-    calls = []
-
-    def _snap(**k):
-        if k.get("local_files_only"):
-            raise FileNotFoundError("not cached")  # force the real download
-        calls.append(k)
-
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = _snap
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    mount = tmp_path
-    (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
-    cache_dir_env = str(mount / "hf-cache" / "hub")
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir_env},
-            "models": ["a/b"],
-            "cache_block_device": True,
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == ["a/b"]
-    assert not r["failed"]
-
-
-def test_block_device_preamble_writes_mount_sentinel():
-    """The block-device preamble drops the sentinel only on a SUCCESSFUL mount."""
-    from flash.providers import _instance
-
-    pre = _instance._cache_block_device_setup(
-        {"cache_block_device": True, "cache_host_mount": "/mnt/cache", "cache_size_gb": 100}
-    )
-    # sentinel is written inside the mount-success branch (after `mount ... &&`), not unconditionally
-    assert "touch '/mnt/cache/.flash-cache-mounted'" in pre
-    assert _instance.CACHE_MOUNT_MARKER == ".flash-cache-mounted"
-
-
 def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
     auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
     from flash.providers import _instance
 
-    pre = _instance._cache_nfs_mount_check(
-        {"cache_host_mount": "/lambda/nfs/flash-weights"}  # NFS: no cache_block_device
-    )
+    pre = _instance._cache_nfs_mount_check({"cache_host_mount": "/lambda/nfs/flash-weights"})
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
     assert "touch '/lambda/nfs/flash-weights/.flash-cache-mounted'" in pre
-    # No-op for block-volume (handled by the block preamble) and for cold runs.
-    assert (
-        _instance._cache_nfs_mount_check(
-            {"cache_host_mount": "/mnt/cache", "cache_block_device": True}
-        )
-        == ""
-    )
+    # no-op for cold runs.
     assert _instance._cache_nfs_mount_check({}) == ""
 
 
@@ -1833,7 +1729,7 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
             "models": ["a/b"],
             "cache_mount_marker": ".flash-cache-mounted",
         }
-    )  # NFS: no cache_block_device
+    )
     assert r["preloaded"] == []
     assert "not mounted" in r["error"]
     assert "NFS" in r["error"]
@@ -1868,8 +1764,8 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
 
 
 def test_build_payload_carries_mount_marker_for_nfs_cache():
-    """A cache-attached preload payload (even NFS) carries cache_mount_marker so the in-container check
-    can require the sentinel regardless of substrate."""
+    """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
+    can require the NFS mount sentinel."""
     from flash.providers import _instance
 
     spec = _preload_spec()
@@ -1884,7 +1780,6 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
         models=["a/b"],
     )
     assert p["cache_mount_marker"] == _instance.CACHE_MOUNT_MARKER
-    assert "cache_block_device" not in p  # NFS, not a block volume
 
 
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
@@ -2080,9 +1975,7 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
         lj, "launch_and_submit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity"))
     )
     monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
-    res = preload.warm_instances(
-        models=["a/b"], providers=["lambda"], timeout_s=5, poll_interval_s=0.0
-    )
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
     assert res[0]["status"] == "error"
     assert "no capacity" in res[0]["error"]
     assert len(terminated) == 1  # finally still tears down
@@ -2121,9 +2014,7 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
             time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)
         ),
     )
-    res = preload.warm_instances(
-        models=["a/b"], providers=["lambda"], timeout_s=600, poll_interval_s=0.0
-    )
+    res = preload.warm_instances(models=["a/b"], timeout_s=600, poll_interval_s=0.0)
     assert res[0]["status"] == "error"
     assert "image pull failed" in res[0]["error"]
     assert clock["t"] - start < 5  # bailed immediately, did NOT poll the full 600s
@@ -2139,27 +2030,29 @@ def test_warm_instances_no_capacity_returns_empty(monkeypatch):
     assert preload.warm_instances(models=["a/b"]) == []
 
 
-def test_warm_instances_uses_per_provider_default_gpu(monkeypatch):
-    """With no --gpu override, each provider warms with a GPU IT offers (A10 is Lambda's default)."""
+def test_warm_instances_uses_managed_lambda_default_gpu(monkeypatch):
+    """With no --gpu override, Lambda warming uses the managed A10 default."""
+    import importlib
+
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
+    monkeypatch.setenv("FLASH_PRELOAD_INSTANCE_GPU", "H100")
+    importlib.reload(preload)
     seen = {}
 
-    def _rec(provider):
-        def _u(gpu):
-            seen[provider] = gpu
-            return []
+    def capture_gpu(gpu):
+        seen["lambda"] = gpu
+        return []
 
-        return _u
+    monkeypatch.setattr(lj, "usable_instances", capture_gpu)
+    preload.warm_instances(models=["a/b"])
 
-    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
-    monkeypatch.setattr(lj, "usable_instances", _rec("lambda"))
-    preload.warm_instances(models=["a/b"])  # gpu=None -> per-provider defaults
-    assert seen["lambda"] == preload._PRELOAD_GPU_BY_PROVIDER["lambda"] == "A10"
+    assert seen == {"lambda": "A10"}
+    assert preload._LAMBDA_PRELOAD_GPU == "A10"
 
 
-def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
+def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
@@ -2178,6 +2071,65 @@ def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
     assert seen == {"lambda": "H100"}
 
 
+def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
+    import importlib
+    import json
+
+    import huggingface_hub
+
+    from flash.providers.runpod import preload
+
+    monkeypatch.setenv("FLASH_PRELOAD_STATUS_REPO", "other/repo")
+    importlib.reload(preload)
+    managed_repo = "Freesolo-Co/flash-weight-preload"
+    created = []
+    readers = []
+    submitted = []
+    terminated = []
+
+    class FakeHfApi:
+        def __init__(self, token):
+            self.token = token
+
+        def create_repo(self, repo, **kwargs):
+            created.append((repo, self.token, kwargs))
+
+    def reader_factory(repo, path, min_interval_s=45.0):
+        readers.append((repo, path))
+        if path.endswith("preload_result.json"):
+            return lambda force=False: json.dumps({"preloaded": ["a/b"], "failed": {}})
+        return lambda force=False: None
+
+    def capture_launch(spec, *args, **kwargs):
+        submitted.append(spec)
+
+    jobs_mod = types.SimpleNamespace(
+        launch_and_submit=capture_launch,
+        terminate_run_instances=lambda run_id: terminated.append(run_id),
+    )
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+    monkeypatch.setattr(preload, "make_hf_text_reader", reader_factory)
+
+    preload._ensure_status_repo("token")
+    spec = preload._preload_instance_spec("A10", "preload-test")
+    result = preload._warm_one_lambda_instance(
+        jobs_mod, _cand("us-east-1"), ["a/b"], "A10", 5, 0.0
+    )
+
+    assert managed_repo == preload._PRELOAD_STATUS_REPO
+    assert created == [
+        (managed_repo, "token", {"repo_type": "dataset", "exist_ok": True, "private": True})
+    ]
+    assert spec.train.hf_repo == managed_repo
+    assert len(submitted) == 1
+    assert managed_repo == submitted[0].train.hf_repo
+    assert [repo for repo, _path in readers] == [managed_repo, managed_repo]
+    assert readers[0][1].endswith("/preload_result.json")
+    assert readers[1][1].endswith("/lambda_attempt0.json")
+    assert result["status"] == "ok"
+    assert len(terminated) == 1
+
+
 def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
     """With targets available, warm must validate the status repo BEFORE launching any paid box.
     Capacity enumeration is cheap/read-only, so it runs first (to decide if there's anything to do);
@@ -2189,7 +2141,7 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
-    # Lambda (an unfiltered provider) has capacity -> a real launch target exists.
+    # lambda has capacity -> a real launch target exists.
     monkeypatch.setattr(
         lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")]
     )
@@ -2244,7 +2196,7 @@ def test_cli_gpu_default_is_none_per_mode(monkeypatch):
     """
     from flash.providers.runpod import preload
 
-    # --warm-instances, no --gpu -> warm_instances receives gpu=None (it applies _PRELOAD_INSTANCE_GPU)
+    # --warm-instances, no --gpu -> warm_instances receives gpu=None and applies the managed lambda a10
     seen = {}
     monkeypatch.setattr(preload, "warm_instances", lambda **k: seen.update(k) or [])
     assert preload.main(["--warm-instances"]) == 0

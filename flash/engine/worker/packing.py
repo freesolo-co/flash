@@ -15,14 +15,22 @@ def _text_config(cfg):
     return getattr(cfg, "text_config", None) or cfg
 
 
-def model_is_pure_attention(model_id: str) -> bool:
+def model_is_pure_attention(model_id: str, revision: str = "") -> bool:
     """True when every decoder layer is full softmax attention (safe for 4D block-diagonal mask).
     Returns False for GDN hybrids, sliding-window arches, and on any config error.
     """
     try:
         from transformers import AutoConfig
 
-        cfg = _text_config(AutoConfig.from_pretrained(model_id, trust_remote_code=True))
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = _text_config(
+            AutoConfig.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **model_revision_kwargs(revision),
+            )
+        )
         layer_types = getattr(cfg, "layer_types", None)
         if layer_types:
             return all(t == "full_attention" for t in layer_types)
@@ -38,12 +46,20 @@ def model_is_pure_attention(model_id: str) -> bool:
         return False
 
 
-def model_is_gdn_hybrid(model_id: str) -> bool:
+def model_is_gdn_hybrid(model_id: str, revision: str = "") -> bool:
     """True for a GatedDeltaNet hybrid (Qwen3.5/3.6) that needs cu_seqlens + seq_idx to pack."""
     try:
         from transformers import AutoConfig
 
-        cfg = _text_config(AutoConfig.from_pretrained(model_id, trust_remote_code=True))
+        from flash.engine.worker.hf import model_revision_kwargs
+
+        cfg = _text_config(
+            AutoConfig.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **model_revision_kwargs(revision),
+            )
+        )
         layer_types = getattr(cfg, "layer_types", None)
         if layer_types and any(t == "linear_attention" for t in layer_types):
             return True
@@ -56,7 +72,7 @@ def model_is_gdn_hybrid(model_id: str) -> bool:
         return False
 
 
-def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
+def _gdn_forward_threads_reset_kwargs(model_id: str | None, revision: str = "") -> bool:
     """Check that THIS arch's GDN forward actually accepts cu_seq_lens_q and seq_idx (varies by transformers version)."""
     try:
         import importlib
@@ -66,7 +82,13 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
         if model_id:
             from transformers import AutoConfig
 
-            cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            from flash.engine.worker.hf import model_revision_kwargs
+
+            cfg = AutoConfig.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **model_revision_kwargs(revision),
+            )
             model_type = getattr(cfg, "model_type", None) or model_type
         mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
         gdn_cls = next(
@@ -82,7 +104,7 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
         return False
 
 
-def gdn_packing_available(model_id: str | None = None) -> bool:
+def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bool:
     """True when flash-linear-attention and causal_conv1d are both present, functional, and the
     GDN forward actually threads cu_seq_lens_q + seq_idx (varies by transformers version).
     """
@@ -97,7 +119,7 @@ def gdn_packing_available(model_id: str | None = None) -> bool:
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
         importlib.import_module("causal_conv1d")  # fail a built-but-broken ABI here, not at model load
-        if not _gdn_forward_threads_reset_kwargs(model_id):
+        if not _gdn_forward_threads_reset_kwargs(model_id, revision=revision):
             return False
         # causal_conv1d compiled without the current GPU arch imports fine but raises at first forward;
         # smoke it now so we fall back to unpacked rather than crashing mid-train.

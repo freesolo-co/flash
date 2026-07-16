@@ -594,6 +594,13 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "_lp_ratio" in src
     # large-vocab logits cap (per-device micro-batch sizing)
     assert "sft_grad_accum(" in src
+    # PR #538 finding (worker/quote SFT vocab drift): the worker must size the realized batch through the
+    # SAME revision-aware resolver the cost quote priced with (cost/spec.py _sft_realized_batch ->
+    # resolve_vocab_size on the same (model, revision)). sizing via the revision-blind vocab_size_for made a
+    # revision-pinned run's realized batch drift from its quote. resolve once, reuse for the packing path.
+    assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
+    assert "vocab=_sft_vocab" in src
+    assert "vocab_size_for(model_id)" not in src
     # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. The GC decision now runs through
     # the SFT GC-off gate (grad_checkpointing_on(model_id, sft_max_len, allow_disable=True, ...)) and is
     # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.

@@ -105,7 +105,7 @@ def main() -> int:
     chalk_spec = os.environ.get("FLASH_CHALK_SPEC", "").strip()
     if not chalk_spec:
         try:
-            from flash.providers.runpod.train.deps import DEFAULT_CHALK_SPEC
+            from flash.providers._worker import DEFAULT_CHALK_SPEC
 
             chalk_spec = DEFAULT_CHALK_SPEC
         except Exception as exc:

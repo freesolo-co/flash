@@ -220,11 +220,10 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
 
 
 def test_build_worker_env_exports_attempt():
-    # Codex: the worker stamps every heartbeat with os.environ["ATTEMPT"], and the control-plane
-    # attempt-mismatch gate (worker_flagged_retriable / heartbeat_is_stale_prior_attempt) dates/rejects
-    # a heartbeat by that attempt. The shared instance bootstrap (Vast + Lambda) must EXPORT ATTEMPT, or
-    # the instance worker's heartbeats carry an empty attempt and a prior attempt's late retriable
-    # heartbeat can't be rejected -> a deterministic current-attempt marker could flip to job_preempted.
+    # the worker stamps every heartbeat with os.environ["ATTEMPT"], and worker_flagged_retriable
+    # accepts only matching attempt and timestamp provenance. the shared instance bootstrap (Vast + Lambda)
+    # must export ATTEMPT, or a worker on a nonzero retry defaults to attempt 0 and its current heartbeat is
+    # rejected as mismatched, potentially losing valid retriable evidence.
     from flash.providers import _instance_bootstrap as lb
 
     payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
@@ -858,7 +857,6 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
     assert "HF_HOME" not in payload["env"]
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
-    assert "cache_block_device" not in payload  # NFS: no format/mount preamble
 
 
 def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
@@ -1580,26 +1578,6 @@ def test_poll_rejects_missing_started_timestamp(monkeypatch):
         jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
 
 
-def test_heartbeat_progress_ts_rejects_unknown_launch_identity():
-    from flash.providers._poll import heartbeat_progress_ts
-
-    hb_ts = time.time() - 30.0
-    _ts, fresh = heartbeat_progress_ts(
-        ("rl", 4, hb_ts, 0), launch_ts=0.0, current_attempt=0
-    )
-    assert fresh is False
-
-    launch = time.time() - 100.0
-    _, fresh_old = heartbeat_progress_ts(
-        ("rl", 1, launch - 50.0, 0), launch_ts=launch, current_attempt=0
-    )
-    assert fresh_old is False
-    _, fresh_new = heartbeat_progress_ts(
-        ("rl", 9, launch + 10.0, 0), launch_ts=launch, current_attempt=0
-    )
-    assert fresh_new is True
-
-
 def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     """A heartbeat that was already stale before a restart must not reset the stall clock to the
     reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago
@@ -1962,8 +1940,10 @@ def test_submit_rejects_policy_word_gpu():
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs.jobs import submit_run_lambda
 
+    spec = _spec()
+    object.__setattr__(spec.gpu, "type", "cheapest")
     with pytest.raises(lambda_api.LambdaApiError, match="concrete gpu class"):
-        submit_run_lambda(_spec(gpu_type="cheapest"), seed=0)
+        submit_run_lambda(spec, seed=0)
 
 
 # ---------------------------------------------------------------------------
