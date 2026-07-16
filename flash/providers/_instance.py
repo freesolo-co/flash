@@ -139,69 +139,24 @@ class InstanceJobHandle:
         )
 
 
-# Fixed container path the per-region cache is bind-mounted at (host mount differs per provider).
+# fixed container path for Lambda's per-region NFS cache bind mount.
 CACHE_CONTAINER_MOUNT = "/weight-cache"
 CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
 # Sentinel on a successfully-mounted cache so the preload check can tell a real mount from an empty bind.
 CACHE_MOUNT_MARKER = ".flash-cache-mounted"
 
 
-def _cache_block_device_setup(payload: dict) -> str:
-    """Cloud-init preamble (block-volume providers): wait for the attached volume's
-    block device, format it ONCE if it has no filesystem (NEVER reformat a populated cache — guarded
-    by ``blkid``), and mount it at the host ``cache_host_mount``."""
-    if not payload.get("cache_block_device") or not payload.get("cache_host_mount"):
-        return ""
-    mount = payload["cache_host_mount"]
-    # Match the cache disk by size (±20%) AND require it unmounted, so we never mkfs the wrong device.
-    expect_bytes = int(payload.get("cache_size_gb") or 0) * 1000 * 1000 * 1000
-    marker = CACHE_MOUNT_MARKER
-    return f"""
-# --- weight-cache block volume: wait-for-device (size-matched, unmounted), format-if-new, mount ---
-echo "FLASH: waiting for the attached cache block device (~{payload.get("cache_size_gb")}GB)..."
-EXPECT_BYTES={expect_bytes}
-CACHE_DEV=""
-for i in $(seq 1 60); do
-  for d in $(lsblk -dpbn -o NAME,TYPE,SIZE | awk -v e="$EXPECT_BYTES" \
-      '$2=="disk" && e>0 {{lo=e*0.8; hi=e*1.2; if ($3+0>=lo && $3+0<=hi) print $1}}'); do
-    # Skip any disk with a mounted partition (boot/data disks in use) — only a free disk is ours.
-    if lsblk -pnr -o MOUNTPOINT "$d" | grep -q '[^[:space:]]'; then continue; fi
-    CACHE_DEV="$d"; break
-  done
-  [ -n "$CACHE_DEV" ] && break
-  deadline_sleep 5 || break
-done
-if [ -n "$CACHE_DEV" ]; then
-  echo "FLASH: cache device $CACHE_DEV"
-  blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4 -q "$CACHE_DEV" || true   # format ONCE; never reformat a populated cache
-  mkdir -p '{mount}'
-  if mount "$CACHE_DEV" '{mount}' 2>/dev/null; then
-    # Sentinel written ONTO the mounted block device (not the underlying empty dir): it is only
-    # visible at the bind path inside the container when the REAL volume is mounted. The preload
-    # mount-check requires it, so a failed/absent attach (Docker binding an empty host dir) can't
-    # masquerade as a warm cache and silently warm ephemeral disk.
-    touch '{mount}/{marker}' 2>/dev/null || true
-  else
-    echo "FLASH: cache mount failed; running cold"
-  fi
-else
-  echo "FLASH: no matching cache block device appeared; running cold"
-fi
-"""
-
-
 def _cache_nfs_mount_check(payload: dict) -> str:
-    """Cloud-init preamble (NFS providers, e.g. Lambda): the platform auto-mounts the weight-cache
-    filesystem on the host at ``cache_host_mount`` — but ONLY if Lambda actually attached + readied it."""
-    if not payload.get("cache_host_mount") or payload.get("cache_block_device"):
+    """cloud-init preamble for Lambda: the platform auto-mounts the weight-cache filesystem on the
+    host at ``cache_host_mount`` only when the cache is attached and ready."""
+    if not payload.get("cache_host_mount"):
         return ""
     mount = payload["cache_host_mount"]
-    marker = CACHE_MOUNT_MARKER
     return f"""
 # --- weight-cache NFS mount: verify the platform actually mounted it, then drop the sentinel ---
 if mountpoint -q '{mount}'; then
   echo "FLASH: weight-cache NFS mounted at {mount}"
-  touch '{mount}/{marker}' 2>/dev/null || true
+  touch '{mount}/{CACHE_MOUNT_MARKER}' 2>/dev/null || true
 else
   echo "FLASH: weight-cache NFS NOT mounted at {mount} (no sentinel; preload will refuse, train runs cold)"
 fi
@@ -216,7 +171,6 @@ def build_payload(
     arm: str,
     runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
-    cache_block_device: bool = False,
     mode: str | None = None,
     models: list | None = None,
     code_prefix: str | None = None,
@@ -232,12 +186,14 @@ def build_payload(
         strip_runpod_volume_env,
     )
     from flash.runner import flash_code_prefix
+    from flash.spec import require_matching_seed
 
-    # Strip the RunPod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
+    canonical_seed = require_matching_seed(spec, seed)
+    # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
     env = strip_runpod_volume_env(
         build_worker_env(
             spec,
-            seed,
+            canonical_seed,
             runtime_secrets=runtime_secrets,
         )
     )
@@ -253,7 +209,7 @@ def build_payload(
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "run_id": spec.run_id,
-        "seed": int(seed),
+        "seed": spec.seed,
         "flash_arm": arm,
         "env": env,
         # per-run env wheel + opt-in chalk spec; the bootstrap pip-installs extra_pip for every job.
@@ -270,15 +226,6 @@ def build_payload(
         payload["cache_host_mount"] = cache_host_mount
         # Carry the mount sentinel filename so the bootstrap's mount-check reads it from one constant.
         payload["cache_mount_marker"] = CACHE_MOUNT_MARKER
-        if cache_block_device:
-            payload["cache_block_device"] = True
-            # Carry the provisioned volume size for the block-device size-match; parse tolerantly so a bad value defaults.
-            from flash.runner import WEIGHT_CACHE_VOLUME_GB
-            from flash.spec import _volume_gb
-
-            payload["cache_size_gb"] = _volume_gb(
-                getattr(spec.gpu, "network_volume_gb", None), default=WEIGHT_CACHE_VOLUME_GB
-            )
     # Preload (warm) mode: the bootstrap downloads ``models`` into the cache and exits — no worker.
     if mode:
         payload["mode"] = mode
@@ -319,13 +266,11 @@ try:
         time.sleep(delay)
     if requested >= remaining:
         raise SystemExit(124)
-except SystemExit:
-    raise
 except Exception:
     raise SystemExit(125)
 """
 
-# host helper: best-effort upload of the boot log to hf (no provider console api). attempt-scoped path.
+# host helper: best-effort Lambda boot-log upload to hf. attempt-scoped path.
 _HOSTLOG_PY = """\
 import json, math, time
 try:
@@ -454,13 +399,13 @@ def build_user_data(payload: dict, *, image: str) -> str:
     cache_bind = (
         f"-v '{cache_host_mount}':{CACHE_CONTAINER_MOUNT} \\\n  " if cache_host_mount else ""
     )
-    cache_setup = _cache_block_device_setup(payload) + _cache_nfs_mount_check(payload)
+    cache_setup = _cache_nfs_mount_check(payload)
     return f"""#!/bin/bash
 # flash instance worker (generated by flash.providers._instance.build_user_data; arm={payload.get("flash_arm")})
 set -x
 mkdir -p /opt/flash
 # Consolidate ALL boot output (this script + the container) into one host log the uploader ships
-# to HF — neither substrate has a console API, so this is the only window into a pre-worker failure.
+# to HF since Lambda has no provider console API, so this is the only window into a pre-worker failure.
 exec >>/opt/flash/host_boot.log 2>&1
 cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}FLASH_PAYLOAD_EOF

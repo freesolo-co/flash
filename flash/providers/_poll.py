@@ -50,12 +50,10 @@ BOOT_LOG_ABSENT_POLLS = 3
 # LOAD_TIMEOUT_S: how long an instance may sit non-running (image pull / provisioning) before we give up.
 # SETUP_GRACE_S / STALL_AFTER_S: the staged no-progress window once running — the larger setup grace
 # covers the heartbeat-less cold start (pip install + base-model download), tightening to STALL_AFTER_S
-# only once a real training heartbeat arrives. PROVISION_GRACE_S: provision + cold-start slack added to
-# the run's wall cap for the client-side poll deadline (neither substrate has a server-side timeout).
+# only once a real training heartbeat arrives.
 LOAD_TIMEOUT_S = 900.0
 SETUP_GRACE_S = 3000.0
 STALL_AFTER_S = 1500.0
-PROVISION_GRACE_S = 3000.0
 
 
 def make_say(log) -> Callable[[str], None]:
@@ -127,11 +125,6 @@ def _fmt_watts(value: Any) -> str | None:
     return f"{num:.0f}W"
 
 
-def _short_process_name(name: str) -> str:
-    base = os.path.basename(str(name or "").strip())
-    return base or "process"
-
-
 def format_gpu_status(gpu: Any) -> str:
     """Human-readable one-line GPU telemetry summary for heartbeat log lines."""
     if not isinstance(gpu, dict) or not gpu:
@@ -184,7 +177,7 @@ def format_gpu_status(gpu: Any) -> str:
         for proc in processes[:3]:
             if not isinstance(proc, dict):
                 continue
-            pname = _short_process_name(str(proc.get("process_name") or ""))
+            pname = os.path.basename(str(proc.get("process_name") or "").strip()) or "process"
             pid = proc.get("pid")
             mem = _fmt_gb(proc.get("used_memory_gb"))
             label = f"{pname}:{pid}" if pid is not None else pname

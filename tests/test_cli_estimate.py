@@ -77,6 +77,100 @@ def test_grpo_positive_max_steps_is_authoritative():
     assert _spec_steps(_spec(**{"train.max_steps": 0})) == 50
 
 
+def test_required_save_density_adds_wall_time_and_cost_without_changing_steps():
+    from flash.cost.analytical import estimate_cost
+
+    for method in ("sft", "grpo"):
+        common = {
+            "model_id": "Qwen/Qwen3.5-4B",
+            "method": method,
+            "steps": 10,
+            "seq_len": 1024,
+            "batch_size": 4,
+        }
+        if method == "grpo":
+            common.update(completion_len=128, group_size=2)
+        baseline = RunConfig(**common)
+        sparse = RunConfig(**common, save_at_steps=(5,))
+        dense = RunConfig(**common, save_at_steps=(2, 4, 6, 8))
+
+        baseline_estimate = estimate_cost(baseline)
+        sparse_estimate = estimate_cost(sparse)
+        dense_estimate = estimate_cost(dense)
+
+        assert baseline.steps == sparse.steps == dense.steps == 10
+        assert baseline_estimate.train_seconds < sparse_estimate.train_seconds
+        assert sparse_estimate.train_seconds < dense_estimate.train_seconds
+        assert baseline_estimate.total_usd < sparse_estimate.total_usd < dense_estimate.total_usd
+
+
+def test_required_save_overhead_uses_contractual_commit_counts():
+    from flash.cost.analytical import (
+        REQUIRED_SAVE_COMMIT_FLOOR_S,
+        REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32,
+        required_save_overhead_seconds,
+    )
+    from flash.cost.facts import total_params_b
+
+    model_id = "Qwen/Qwen3.5-4B"
+    save_at_steps = (2, 4, 6)
+    common = {
+        "model_id": model_id,
+        "steps": 10,
+        "seq_len": 1024,
+        "batch_size": 4,
+        "lora_rank": 32,
+        "save_at_steps": save_at_steps,
+    }
+    serialize_per_save = REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 * total_params_b(model_id)
+
+    for method, commits_per_save in (("sft", 2), ("grpo", 2), ("opd", 1)):
+        config = RunConfig(method=method, **common)
+        expected = len(save_at_steps) * (
+            commits_per_save * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_per_save
+        )
+        assert required_save_overhead_seconds(config) == pytest.approx(expected)
+
+
+def test_opd_required_saves_add_overhead_without_changing_steps():
+    from flash.cost.analytical import estimate_cost
+
+    common = {
+        "model_id": "Qwen/Qwen3.5-4B",
+        "method": "opd",
+        "steps": 10,
+        "seq_len": 1024,
+        "batch_size": 4,
+        "completion_len": 128,
+        "group_size": 1,
+    }
+    baseline = RunConfig(**common)
+    withsave = RunConfig(**common, save_at_steps=(2, 4, 6))
+
+    # opd publishes a deployable adapter at each exact save, so exact saves cost wall/dollars too.
+    assert baseline.steps == withsave.steps == 10
+    assert estimate_cost(withsave).train_seconds > estimate_cost(baseline).train_seconds
+    assert estimate_cost(withsave).total_usd > estimate_cost(baseline).total_usd
+
+
+def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
+    from flash.runner import charge_usd_for_spec
+
+    def partial_charge(save_at_steps):
+        raw = copy.deepcopy(GRPO_RAW)
+        raw["train"].update({"max_steps": 100, "save_at_steps": save_at_steps})
+        return charge_usd_for_spec(spec_from_dict(raw), steps=10, fallback=-1.0)
+
+    # cancel at step 10: step 5 landed and remains priced, while steps 50/100 are dropped before the
+    # reduced run config is built so neither estimate falls back.
+    reached_save_charge = partial_charge([5, 50, 100])
+    future_only_charge = partial_charge([50, 100])
+
+    assert reached_save_charge != -1.0
+    assert future_only_charge != -1.0
+    assert reached_save_charge > future_only_charge > 0.0
+
+
 def test_opd_epochs_derive_steps_from_max_examples():
     raw = copy.deepcopy(GRPO_RAW)
     raw["algorithm"] = "opd"

@@ -1,9 +1,8 @@
-"""Static lookup facts for the cost model: GPU price/VRAM/compute + cheapest-fit
-selection, model size/quant, and reward-grader latency. Pure tables + accessors."""
+"""Catalog facts and provider-aware pricing accessors for the cost model."""
 
 from __future__ import annotations
 
-from flash.catalog import MODELS
+from flash.catalog import MODELS, ModelInfo
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -32,7 +31,11 @@ def gpu_tflops(name: str) -> float:
 
 
 def gpu_hourly_usd(
-    name: str, provider: str | None = None, max_wall_seconds: float = 0.0, min_vram_gb: int = 0
+    name: str,
+    provider: str | None = None,
+    max_wall_seconds: float = 0.0,
+    min_vram_gb: int = 0,
+    exact_type: str = "",
 ) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
@@ -59,7 +62,12 @@ def gpu_hourly_usd(
         # provider="vast" quote through the Vast pricing module (live + static fallback).
         from flash.providers.vast.pricing import hourly_rate
 
-        return hourly_rate(name, max_wall_seconds=max_wall_seconds, min_vram_gb=min_vram_gb)
+        return hourly_rate(
+            name,
+            max_wall_seconds=max_wall_seconds,
+            min_vram_gb=min_vram_gb,
+            exact_type=exact_type,
+        )
     return info.hourly_usd
 
 
@@ -117,25 +125,34 @@ def pick_gpu(
     return best.name
 
 
-def total_params_b(model_id: str) -> float:
-    """Total parameter count (billions) for a catalog model."""
+def _catalog_model_info(model_id: str) -> ModelInfo:
     info = MODELS.get(model_id)
     if info is None:
         raise ValueError(
             f"unknown model {model_id!r}; cost estimation supports catalog models only "
             f"({', '.join(MODELS)})"
         )
+    return info
+
+
+def total_params_b(model_id: str, revision: str = "") -> float:
+    """Total parameter count (billions) for a catalog model.
+
+    when a revision is pinned, size the pinned commit (validated against the catalog, fail-closed)
+    so setup/save cost tracks the weights the worker actually loads, not the default-revision count.
+    """
+    info = _catalog_model_info(model_id)
+    if revision:
+        from flash.engine.vram import _validated_revision_geometry
+
+        params_b, _vocab = _validated_revision_geometry(model_id, revision, info)
+        return params_b
     return info.params_b
 
 
 def active_params_b(model_id: str) -> float:
     """Active params per token (billions); falls back to total for dense models. Use for FLOPs, not VRAM."""
-    info = MODELS.get(model_id)
-    if info is None:
-        raise ValueError(
-            f"unknown model {model_id!r}; cost estimation supports catalog models only "
-            f"({', '.join(MODELS)})"
-        )
+    info = _catalog_model_info(model_id)
     return info.active_params_b or info.params_b
 
 
@@ -145,9 +162,9 @@ def model_quant(model_id: str) -> str:
     return (info.quant or "bf16") if info is not None else "bf16"
 
 
-def download_weight_gb(model_id: str) -> float:
+def download_weight_gb(model_id: str, revision: str = "") -> float:
     """Full bf16 checkpoint size in GB (2 bytes/param)."""
-    return total_params_b(model_id) * 2.0
+    return total_params_b(model_id, revision) * 2.0
 
 
 # ~1s mid-range default across grader types (regex ~0.01s to LLM judge ~3s).
@@ -168,11 +185,11 @@ AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
 def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
     """(input, output) $/1M tokens for a teacher model.
 
-    Routes through resolve_teacher — the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
+    Routes through resolve_teacher, the single OPD-teacher resolver, whose recipe.TEACHER_MODELS is
     the one source of teacher prices. ``teacher_model`` is the Fireworks model id chosen via ``[train]
-    teacher_model``, or "" for the default GLM 5.2 teacher. Static/offline like gpu_hourly_usd (needs
-    NO FIREWORKS_API_KEY): opd echo-scores completions (max_tokens=0) so only the INPUT column is
-    billed, but both are returned. An unsupported value falls back defensively to the default rate."""
+    teacher_model``, or "" for the default GLM 5.2 teacher. Teacher pricing is static, offline, and
+    credential-free. OPD echo-scores completions (max_tokens=0), so only the input column is billed,
+    but both are returned. An unsupported value falls back defensively to the default rate."""
     from flash.engine.recipe import resolve_teacher
 
     try:

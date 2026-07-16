@@ -47,15 +47,12 @@ from flash.providers._poll import (
     STALL_AFTER_S,
     make_say,
 )
-
-# Re-exported (unused here) so the cross-provider symmetry guard can assert every rent-a-box jobs module
-# draws the setup-vs-training stall boundary from the ONE canonical helper (the shared poll driver uses
-# it); keeps the rule from drifting between providers.
-from flash.providers._poll import is_training_heartbeat as is_training_heartbeat
 from flash.providers.base import (
     GPU_INFO,
     PollResult,
     UnreconciledCreateError,
+    UnsupportedGpuError,
+    canonical_gpu,
     min_cuda_modern,
     vast_gpu_for_offer,
 )
@@ -105,12 +102,33 @@ def _effective_disk_gb(spec) -> float:
     return max(float(spec.gpu.disk_gb), MIN_DISK_GB)
 
 
+def _exact_search_aliases(info) -> tuple[str, ...]:
+    """Vast alias spellings safe to seed an EXACT-class offer search with.
+
+    An exact pin is attested on the box against the live device name (``verify_gpu`` -> ``canonical_gpu``).
+    Keep only alias spellings that canonicalize back to THIS class, so the search never pulls a board that
+    attestation would then reject: "A100 PCIE" (kept as fungible A100 SXM 40GB capacity for NON-exact runs
+    by ``vast_gpu_for_offer``) names a PCIe board that canonicalizes to the distinct "A100 PCIe" class, so
+    it would be rented then fail an exact A100-SXM-40GB attestation; H100's "H100 PCIE" canonicalizes to
+    "H100" and stays fungible. Ambiguous/unknown spellings (``canonical_gpu`` raises) are dropped.
+    """
+    kept: list[str] = []
+    for alias in info.vast_aliases:
+        try:
+            if canonical_gpu(alias) == info.name:
+                kept.append(alias)
+        except UnsupportedGpuError:
+            pass
+    return tuple(kept)
+
+
 def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     limit: int = 256,
     max_wall_seconds: float = 0,
+    exact_type: str = "",
     deadline_at: float | None = None,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
@@ -126,12 +144,28 @@ def usable_offers(
     min_duration = (
         max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
     )
+    exact_info = GPU_INFO.get(exact_type) if exact_type else None
+    if exact_type and exact_info is None:
+        raise ValueError(f"unknown exact Vast GPU class {exact_type!r}")
+    # Seed an exact search only with spellings that will attest as this class on the box (the ambiguous
+    # vast_name itself is always kept and disambiguated by the max_vram_mb ceiling below); a cross-
+    # architecture capacity alias would rent a board that live-device attestation then rejects.
+    gpu_names = (
+        (exact_info.vast_name, *_exact_search_aliases(exact_info))
+        if exact_info is not None and exact_info.vast_name
+        else ()
+    )
+    search_vram_gb = max(min_vram_gb, exact_info.vram_gb if exact_info is not None else 0)
+    search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
+    if exact_info is not None:
+        search_kwargs["max_vram_mb"] = int(exact_info.vram_gb * 1024)
     rows = vast_api.search_offers(
-        int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
+        int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
         min_duration_seconds=min_duration,
         limit=int(limit),
+        **search_kwargs,
         **deadline_kwargs(vast_api.search_offers, deadline_at),
     )
     out: list[VastOffer] = []
@@ -149,6 +183,7 @@ def usable_offers(
             or r.get("verification") != "verified"
             # Exact class gate: the server-side gpu_ram filter only carries slack, so re-check nominal VRAM.
             or info.vram_gb < min_vram_gb
+            or (exact_type and gpu != exact_type)
             or float(r.get("reliability2") or 0) < RELIABILITY_FLOOR
             or float(r.get("disk_space") or 0) < float(disk_gb)
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
@@ -379,6 +414,11 @@ def deploy_and_submit(
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+                            # Mirror the initial submit search: narrow to exact aliases ONLY on the user's
+                            # hard pin. Inferring exact_type from ``allowed`` forced an exact refresh for a
+                            # non-exact run (its offers are pre-filtered to one canonical class), dropping the
+                            # fungible cross-architecture capacity the first broad search had matched.
+                            exact_type=spec.gpu.exact_type,
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
@@ -431,7 +471,7 @@ def _failure_detail(
     prefix: str,
     phase: str,
     marker: dict | None,
-    instance_id: int | None = None,
+    instance_id: int,
     attempt: int = 0,
 ) -> str:
     """Assemble bounded failure detail from worker artifacts and the Vast console."""
@@ -444,13 +484,12 @@ def _failure_detail(
         parts.append(
             f"--- {err_name} ---\n{sanitize_diagnostic(content[-4096:], limit=4096)}"
         )
-    if instance_id:
-        logs = vast_api.instance_logs(int(instance_id))
-        if logs:
-            parts.append(
-                "--- instance log tail ---\n"
-                f"{sanitize_diagnostic(logs[-4096:], limit=4096)}"
-            )
+    logs = vast_api.instance_logs(int(instance_id))
+    if logs:
+        parts.append(
+            "--- instance log tail ---\n"
+            f"{sanitize_diagnostic(logs[-4096:], limit=4096)}"
+        )
     return "\n".join(parts) or "vast worker terminated without a strict terminal marker"
 
 
@@ -607,6 +646,10 @@ def submit_run_vast(
             info.vram_gb,
             _effective_disk_gb(spec),
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
+            # Narrow to attestation-safe exact aliases ONLY when the user hard-pinned the class.
+            # A non-exact run (exact_type == "") keeps the broad fungible search so cross-architecture
+            # capacity (e.g. 40GB "A100 PCIE" as A100 SXM 40GB) still counts, matching soft verify_gpu.
+            exact_type=spec.gpu.exact_type,
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type

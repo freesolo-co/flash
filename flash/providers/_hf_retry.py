@@ -28,9 +28,7 @@ def hf_status_code(exc: BaseException) -> int | None:
         return None
 
 
-def hf_retry_after(
-    exc: BaseException, *, max_seconds: float = HF_RETRY_AFTER_MAX_S
-) -> float | None:
+def hf_retry_after(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -51,13 +49,7 @@ def hf_retry_after(
             seconds = (retry_at - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(max_seconds, max(0.0, seconds))
-
-
-def _call_before_deadline(call: Callable[[], T], label: str, deadline: float) -> T:
-    if remaining_seconds(deadline) <= 0:
-        raise TimeoutError(f"{label} exceeded the run wall deadline")
-    return call()
+    return min(HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
 def hf_call(
@@ -73,7 +65,9 @@ def hf_call(
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     for attempt in range(len(retry_delays) + 1):
         try:
-            return call() if deadline is None else _call_before_deadline(call, label, deadline)
+            if deadline is not None and remaining_seconds(deadline) <= 0:
+                raise TimeoutError(f"{label} exceeded the run wall deadline")
+            return call()
         except Exception as exc:
             if hf_status_code(exc) not in transient_status_codes or attempt >= len(retry_delays):
                 raise

@@ -438,7 +438,7 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
-def _run_gpu(spec: dict, remote: dict) -> str:
+def gpu_label(spec: dict, remote: dict) -> str:
     """Human-facing GPU label. Provider metadata stays internal."""
     return remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
 
@@ -450,7 +450,7 @@ def runs_table(runs: list[dict]) -> str:
         spec = r.get("spec") or {}
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
-        where = _run_gpu(spec, r.get("remote") or {})
+        where = gpu_label(spec, r.get("remote") or {})
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
         body.append(
             [
@@ -574,7 +574,7 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
-    where = _run_gpu(spec, obj.get("remote") or {}) or None
+    where = gpu_label(spec, obj.get("remote") or {}) or None
     pairs = [
         ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),

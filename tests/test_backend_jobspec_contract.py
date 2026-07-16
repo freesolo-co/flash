@@ -5,15 +5,16 @@ The platform backend accepts a training run via RunCreateRequest
 (backend/src/schemas/runs.py), whose freeform `config` dict carries the training
 spec the SDK/agent authored (model / algorithm / [environment] id / [train] params).
 That same config shape is what flash parses into a JobSpec
-(flash/flash/schema.py spec_from_dict -> flash/flash/spec.py JobSpec). If the
-backend accepts a config flash rejects (or the two drift on field names), a run the
-backend admits never trains. This test pins that seam.
+(flash/schema/__init__.py spec_from_dict, with field validators in
+flash/schema/fields.py, producing the flash/spec.py JobSpec). If the backend accepts
+a config flash rejects (or the two drift on field names), a run the backend admits
+never trains. This test pins that seam.
 
 Both packages import in the flash venv (the backend schemas are pure pydantic), so
 we add ../backend to sys.path the way the e2e tests import across packages. If the
 backend isn't importable, its half is skipped.
 
-Run: cd flash && .venv/bin/python -m pytest \
+Run: cd flash && uv run pytest \
         tests/test_backend_jobspec_contract.py -q
 """
 

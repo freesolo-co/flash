@@ -1,11 +1,11 @@
-"""List a run's deployable per-step RL checkpoints from its HF artifact repo.
+"""List a run's deployable per-step training checkpoints from its HF artifact repo.
 
 The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
 ``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
 reader: it enumerates those snapshots so ``flash checkpoints`` can list them and
 ``flash deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
-failed mid-RL and so never sealed a final adapter. HF (not the backend DB) is the source of
+failed mid-training and so never sealed a final adapter. HF (not the backend DB) is the source of
 truth for what's deployable; backend persistence is a mirror (see
 ``flash.server.checkpoints``)."""
 
@@ -32,9 +32,8 @@ def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
     return f"{adapter_prefix(spec)}/checkpoints/step-{step}"
 
 
-def _adapter_file_re(base: str) -> re.Pattern[str]:
-    """Matches ``<base>/checkpoints/step-<N>/adapter/<filename>`` and captures (step, filename)."""
-    return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
+def _has_required_adapter_files(names: set[str]) -> bool:
+    return "adapter_config.json" in names and not names.isdisjoint(ADAPTER_WEIGHT_FILES)
 
 
 def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:
@@ -44,7 +43,7 @@ def _adapter_folder_has_required_files(files: list[str], prefix: str) -> bool:
         if path.startswith(f"{prefix}/adapter/")
         and "/" not in path.removeprefix(f"{prefix}/adapter/")
     }
-    return "adapter_config.json" in names and not names.isdisjoint(ADAPTER_WEIGHT_FILES)
+    return _has_required_adapter_files(names)
 
 
 def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> list[str]:
@@ -60,7 +59,7 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
     except Exception as exc:
         if strict:
             raise CheckpointListingError(
-                f"could not verify deployable checkpoints for {spec.run_id}: {exc}"
+                f"could not verify adapter artifacts for {spec.run_id}: {exc}"
             ) from exc
         print(f"[ckpt] list warn for {spec.run_id}: {exc}")
         return []
@@ -68,10 +67,8 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
 
 def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     repo = spec.train.hf_repo
-    if not repo:
-        return []
     base = adapter_prefix(spec)
-    pattern = _adapter_file_re(base)
+    pattern = re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
     # Collect each step's adapter-folder filenames, then keep only steps with config + weights.
     by_step: dict[int, set[str]] = {}
     for path in files:
@@ -81,7 +78,7 @@ def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     out: list[dict] = []
     for step in sorted(by_step):
         names = by_step[step]
-        if "adapter_config.json" not in names or names.isdisjoint(ADAPTER_WEIGHT_FILES):
+        if not _has_required_adapter_files(names):
             continue
         prefix = checkpoint_adapter_prefix(spec, step)
         out.append(
@@ -115,19 +112,3 @@ def adapter_artifact_exists(
     files = _repo_files(spec, strict=True, revision=revision)
     prefix = adapter_prefix(spec) if step is None else checkpoint_adapter_prefix(spec, int(step))
     return _adapter_folder_has_required_files(files, prefix)
-
-
-def checkpoint_step_exists(spec: JobSpec, step: int) -> bool:
-    """Authoritatively verify a warm-start checkpoint step before provisioning a worker."""
-    return adapter_artifact_exists(spec, step=step)
-
-
-def final_adapter_exists(spec: JobSpec) -> bool:
-    """Authoritatively verify that the run-level final adapter exists in the artifact repo."""
-    try:
-        return adapter_artifact_exists(spec, step=None)
-    except CheckpointListingError as exc:
-        cause = exc.__cause__ or exc
-        raise CheckpointListingError(
-            f"could not verify final adapter for {spec.run_id}: {cause}"
-        ) from cause
