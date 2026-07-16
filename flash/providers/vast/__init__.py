@@ -142,10 +142,14 @@ class VastProvider(InstanceProvider):
             return []
         try:
             # Search once at the smallest fitting class's VRAM; the market covers every class at/above it.
+            rate_kwargs = (
+                {"exact_type": constraints.exact_type} if constraints.exact_type else {}
+            )
             rates = live_candidate_rates(
                 min(g.vram_gb for g in fitting),
                 constraints.disk_gb,
                 constraints.max_wall_seconds,
+                **rate_kwargs,
             )
         except Exception as exc:
             # Transient market/API blip -> signal allocate() (see CapacityLookupError): a Vast-only run must

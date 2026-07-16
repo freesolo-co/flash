@@ -115,7 +115,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
-    assert TRAIN_KEY_MIN_VERSIONS["checkpoint_landmarks"] == "0.2.57"
+    assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -127,7 +127,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "max_completion_tokens",
             "teacher_model",
             "structured_outputs",
-            "checkpoint_landmarks",
+            "save_at_steps",
         }
     } == {"0.2.0"}
 
@@ -174,9 +174,9 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. current adds checkpoint_landmarks and removes the legacy opd eos key.
+    # did. current adds save_at_steps and removes the legacy opd eos key.
     assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
-        "checkpoint_landmarks"
+        "save_at_steps"
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
@@ -424,15 +424,18 @@ def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
         assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
 
     authored_raw = _raw(**{"gpu.max_retries": 7.0, "gpu.max_wall_seconds": 1234.0})
-    authored_raw["gpu"].update(
-        {"type": "not-a-real-gpu", "disk_gb": 999, "future_gpu_field": "ignored"}
-    )
+    authored_raw["gpu"].update({"type": "not-a-real-gpu", "disk_gb": 999})
     authored = spec_from_dict(authored_raw)
     assert authored.gpu.max_retries == 7
     assert authored.gpu.max_wall_seconds == 1234
     assert authored.gpu.type == spec_from_dict(_raw()).gpu.type
     assert authored.gpu.disk_gb == defaults.disk_gb
     assert spec_from_dict(_raw(**{"gpu.max_retries": 0})).gpu.max_retries == 0
+
+    unknown = _raw()
+    unknown["gpu"]["future_gpu_field"] = "rejected"
+    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key\(s\): future_gpu_field"):
+        spec_from_dict(unknown)
 
 
 @pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds"])
@@ -590,9 +593,11 @@ def test_sft_caps_parse_from_toml() -> None:
     )
     assert spec.train.max_steps == 50
     assert spec.train.max_examples == 200
-    # explicit 0 means "no cap" (not rejected); negatives are rejected.
-    spec0 = spec_from_dict(_raw(**{"train.max_steps": 0}), run_id="caps-0")
-    assert spec0.train.max_steps == 0
+    # explicit non-positive max_steps (0 or negative) is not rejected: it canonicalizes to none so a
+    # single sentinel means "use the derived horizon" (max_examples still rejects negatives below).
+    for bad in (0, -7):
+        spec_np = spec_from_dict(_raw(**{"train.max_steps": bad}), run_id="caps-np")
+        assert spec_np.train.max_steps is None
     with pytest.raises(ConfigError, match="max_examples must be >= 0"):
         spec_from_dict(_raw(**{"train.max_examples": -5}))
 
@@ -608,16 +613,109 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     from flash.client.specs import spec_payload
 
     spec = spec_from_dict(
-        _raw(**{"gpu.max_retries": 0, "gpu.max_wall_seconds": 60}), run_id="gpu-rt"
+        _raw(
+            **{
+                "gpu.max_retries": 0,
+                "gpu.max_wall_seconds": 60,
+                "gpu.provider": " RunPod ",
+                "gpu.exact_type": "rtx-4090",
+            }
+        ),
+        run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     assert payload["gpu"]["max_retries"] == 0
     assert payload["gpu"]["max_wall_seconds"] == 60
+    assert payload["gpu"]["provider"] == "runpod"
+    assert payload["gpu"]["exact_type"] == "RTX 4090"
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.max_retries == 0
     assert reparsed.gpu.max_wall_seconds == 60
+    assert reparsed.gpu.provider == "runpod"
+    assert reparsed.gpu.exact_type == "RTX 4090"
     assert reparsed.gpu.type == spec.gpu.type
+
+
+def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
+    with pytest.raises(ConfigError, match=r"gpu\.provider"):
+        spec_from_dict(_raw(**{"gpu.provider": "aws"}))
+    with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
+        spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
+    with pytest.raises(ConfigError, match="validated"):
+        spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
+    with pytest.raises(ConfigError, match="requires at least"):
+        spec_from_dict(
+            _raw(
+                model="Qwen/Qwen3.5-9B",
+                **{"gpu.exact_type": "RTX 4090"},
+            )
+        )
+    with pytest.raises(ConfigError, match="cannot provision"):
+        spec_from_dict(
+            _raw(
+                **{
+                    "gpu.provider": "lambda",
+                    "gpu.exact_type": "RTX 4090",
+                }
+            )
+        )
+
+
+def test_gpu_type_is_non_pinning_managed_input() -> None:
+    baseline = spec_from_dict(_raw())
+    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    assert authored.gpu.type == baseline.gpu.type
+    assert authored.gpu.exact_type == ""
+
+
+def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
+    assert JobSpec.from_dict({"gpu": {"type": " h100 "}}).gpu.type == "H100"
+    with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
+        JobSpec.from_dict({"gpu": {"type": 1}})
+    with pytest.raises(ValueError, match=r"gpu\.type: unsupported gpu 'H10O'"):
+        JobSpec.from_dict({"gpu": {"type": "H10O"}})
+    with pytest.raises(ValueError, match="active validated GPU class"):
+        JobSpec.from_dict({"gpu": {"type": "RTX A6000"}})
+
+
+def test_model_revision_strips_round_trips_and_rejects_non_strings() -> None:
+    from flash.client.specs import spec_payload
+
+    spec = spec_from_dict(_raw(model_revision="  refs/pr/123  "), run_id="revision-rt")
+    assert spec.model_revision == "refs/pr/123"
+    assert spec_payload(spec)["model_revision"] == "refs/pr/123"
+    assert JobSpec.from_json(spec.to_json()).model_revision == "refs/pr/123"
+    assert spec_from_dict(_raw(model_revision="   ")).model_revision == ""
+
+    for value in (None, 123, False, ["main"], {"revision": "main"}):
+        with pytest.raises(ConfigError, match="model_revision must be a string"):
+            spec_from_dict(_raw(model_revision=value))
+        with pytest.raises(TypeError, match="model_revision must be a string"):
+            JobSpec.from_dict({"model_revision": value})
+
+
+def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
+        spec_from_dict(_raw(model_revison="main"))
+
+    for gpu in (False, "H100", ["H100"]):
+        with pytest.raises(TypeError, match="gpu must be an object"):
+            JobSpec.from_dict({"gpu": gpu})
+    with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): exact_typ"):
+        JobSpec.from_dict({"gpu": {"exact_typ": "H100"}})
+    with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
+        JobSpec.from_dict({"gpu": {"provider": 1}})
+    with pytest.raises(TypeError, match=r"gpu\.exact_type must be a string"):
+        JobSpec.from_dict({"gpu": {"exact_type": 1}})
+    with pytest.raises(ValueError, match="cannot provision"):
+        JobSpec.from_dict({"gpu": {"provider": "lambda", "exact_type": "RTX 4090"}})
+
+    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "exact_type": "h100"}})
+    assert restored.gpu.provider == "lambda"
+    assert restored.gpu.exact_type == "H100"
+    assert JobSpec.from_dict({}).gpu.provider == ""
+    assert JobSpec.from_dict({}).gpu.exact_type == ""
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:

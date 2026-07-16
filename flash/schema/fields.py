@@ -8,7 +8,7 @@ from typing import Any
 
 from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec, parse_positive_int_tuple
+from flash.spec import WandbSpec, validate_worker_env_reserved
 
 
 def _section_int(
@@ -32,14 +32,6 @@ def _section_int(
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400)."""
     return _section_int(train_raw, "train", key, minimum=minimum)
-
-
-def _train_positive_int_tuple(train_raw: dict, key: str) -> tuple[int, ...]:
-    """Validate an optional strictly increasing list of positive integer steps."""
-    try:
-        return parse_positive_int_tuple(train_raw.get(key), name=f"train.{key}")
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
 
 
 def _train_float(
@@ -285,6 +277,7 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "RUN_ID",
         "HF_REPO",
         "FLASH_ARM",
+        "SEED",
     }
 )
 
@@ -293,7 +286,7 @@ def _environment_secrets(raw: Any) -> tuple[str, ...]:
     """Parse [environment].secrets as declared worker env-var secret names."""
     if raw is None:
         return ()
-    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+    if not isinstance(raw, (list, tuple)):
         raise ConfigError("[environment] secrets must be a list of environment variable names")
     if not all(isinstance(name, str) for name in raw):
         raise ConfigError("[environment] secrets entries must be strings")
@@ -315,6 +308,10 @@ def _worker_env(raw: Any) -> dict[str, str]:
         raise ConfigError("[worker_env] must be a table of string key/values")
     env = {str(k): str(v) for k, v in raw.items()}
     _validate_env_var_names(env, "[worker_env]")
+    try:
+        validate_worker_env_reserved(env)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     # [worker_env] is serialized into job_spec_json (persisted + logged) — must not carry secrets.
     # Match by word components (not substring): KEY only flagged when qualified by a credential context.
     _secret_words = {

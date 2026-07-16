@@ -6,6 +6,9 @@ can't be confirmed. These tests pin those invariants and the fixed 7-day policy.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import types
 from datetime import UTC, datetime
 
@@ -117,6 +120,20 @@ def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is True
 
 
+@pytest.mark.parametrize("value", ["1", "64", "0", "-1", "not-a-number"])
+def test_scan_workers_ignores_environment(value):
+    env = os.environ.copy()
+    env["FLASH_GC_SCAN_WORKERS"] = value
+    result = subprocess.run(
+        [sys.executable, "-c", "from flash.server.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "8"
+
+
 def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
     monkeypatch.setattr(rc, "HfApi", None)
     monkeypatch.setattr(rc, "_warned_hf_unavailable", False)
@@ -158,6 +175,30 @@ def test_scan_repo_classifies_paths():
     assert prefixes["sft/flash-1-a"][1] == pytest.approx(_ago(OLD))
     assert ref_recent_ts == pytest.approx(_ago(OLD))  # from the referenced_by marker
     assert unknown == {"telemetry"}
+
+
+def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
+    from flash.opd_retry_contract import opd_optimizer_start_marker_path
+
+    repo = _managed("opd-retry")
+    marker_path = opd_optimizer_start_marker_path("flash-1-a", 0)
+    api = FakeApi(
+        {
+            repo: [
+                _adapter("opd/flash-1-a/adapter/w.safetensors", OLD),
+                _adapter(marker_path, OLD, size=123),
+            ]
+        }
+    )
+
+    prefixes, _ref_recent_ts, unknown = rc._scan_repo(api, repo)
+    assert set(prefixes) == {"opd/flash-1-a"}
+    assert unknown == {"_opd_retry"}
+
+    _wire(monkeypatch)
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 1
+    assert api.deleted == [(repo, "opd/flash-1-a")]
+    assert all(marker_path != deleted_path for _repo, deleted_path in api.deleted)
 
 
 # ---- the global serving set (deployed_prefixes) -----------------------------------------------

@@ -181,6 +181,7 @@ def resolve_grpo_sleep_mode() -> tuple[bool, int, float, bool]:
         thinking=_w.THINKING,
         card_vram_gb=card_gb,
         fp8_kv=fp8_kv,
+        revision=spec.model_revision if spec else "",
     )
     return sleep_mode, ctx, card_gb, fp8_kv
 

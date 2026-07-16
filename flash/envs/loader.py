@@ -15,24 +15,22 @@ import json
 import os
 import re
 import shutil
-import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
+from flash.envs.archive import extract_validated_archive_members
 from flash.envs.archive_policy import (
     ARCHIVE_MEMBER_LIMIT,
     ARCHIVE_SCAN_MEMBER_LIMIT,
-    TAR_METADATA_TYPES,
     LimitedArchiveReader,
     archive_stream_limit,
-    tar_member_segments,
 )
 
 _DEFAULT_GITHUB_REF = "main"
@@ -41,8 +39,8 @@ _DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 # bound the on-disk env cache so it cannot grow without limit (one subdir per env
 # content-sha, ~30-80 MB each). evicted LRU by dir mtime, which we bump on cache hit.
-_CACHE_MAX_ENTRIES = int(os.environ.get("FLASH_ENV_CACHE_MAX_ENTRIES", "32"))
-_CACHE_MAX_BYTES = int(os.environ.get("FLASH_ENV_CACHE_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
+_CACHE_MAX_ENTRIES = 32
+_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 # never evict an entry used within this window; a concurrent run may be loading it.
 _CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -211,10 +209,7 @@ def _resolve_ref_sha(
     if _is_commit_sha(parsed.ref):
         return parsed.ref
     # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _github_headers("application/vnd.github+json")
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
     data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
@@ -245,15 +240,6 @@ def _iter_capped_chunks(resp: object, max_bytes: int) -> Iterator[bytes]:
         yield chunk
 
 
-def _read_capped(resp: object, max_bytes: int) -> bytes:
-    return b"".join(_iter_capped_chunks(resp, max_bytes))
-
-
-def _copy_capped(resp: object, max_bytes: int, out: BinaryIO) -> None:
-    for chunk in _iter_capped_chunks(resp, max_bytes):
-        out.write(chunk)
-
-
 def _urlopen(
     req: urllib.request.Request,
     *,
@@ -272,9 +258,10 @@ def _urlopen(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if max_bytes is not None:
                     if out is not None:
-                        _copy_capped(resp, max_bytes, out)
+                        for chunk in _iter_capped_chunks(resp, max_bytes):
+                            out.write(chunk)
                         return b""
-                    return _read_capped(resp, max_bytes)
+                    return b"".join(_iter_capped_chunks(resp, max_bytes))
                 if out is not None:
                     shutil.copyfileobj(resp, out, length=_DOWNLOAD_CHUNK_BYTES)
                     return b""
@@ -322,13 +309,7 @@ def _urlopen(
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> Path:
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "freesolo-flash",
-    }
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _github_headers("application/vnd.github+json")
     tar_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -397,7 +378,7 @@ def _safe_contents_path(path: object, root_parts: list[str]) -> str:
     return normalized
 
 
-def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> Any:
+def _download_github_json(ref: GitHubEnvironmentRef, url: str, context: str) -> object:
     data = _urlopen(
         urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
         timeout=120.0,
@@ -545,94 +526,29 @@ def _download_github_directory(ref: GitHubEnvironmentRef, repo_dir: str, dest: P
     return repo_root
 
 
-def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path, subdir: str = "") -> Path:
+def _extract_github_tarball(ref: GitHubEnvironmentRef, dest: Path) -> Path:
     tarball = _download_github_tarball(ref)
     try:
-        return _safe_extract_archive(tarball, dest, subdir=subdir)
+        return _safe_extract_archive(tarball, dest)
     finally:
         if isinstance(tarball, Path):
             with contextlib.suppress(OSError):
                 tarball.unlink()
 
 
-def _safe_extract_archive(
-    tar_source: bytes | bytearray | Path, dest: Path, subdir: str = ""
-) -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
+def _safe_extract_archive(tar_source: bytes | bytearray | Path, dest: Path) -> Path:
+    """Extract a GitHub repo tarball; expects a single top-level repo directory."""
     if isinstance(tar_source, (bytes, bytearray)):
         with tempfile.NamedTemporaryFile(prefix="flash-env-tar-", suffix=".tar.gz") as spill:
             spill.write(tar_source)
             spill.seek(0)
-            return _safe_extract_archive_file(spill, dest, subdir)
+            return _safe_extract_archive_file(spill, dest)
     with tar_source.open("rb") as spill:
-        return _safe_extract_archive_file(spill, dest, subdir)
+        return _safe_extract_archive_file(spill, dest)
 
 
-def _extract_validated_archive_members(
-    reader: LimitedArchiveReader,
-    *,
-    extract_base: Path,
-    guard_root: Path,
-    member_filter: Callable[[list[str]], bool] | None = None,
-    on_segments: Callable[[list[str]], None] | None = None,
-) -> None:
-    """Stream a tar archive from ``reader`` and extract its members into ``extract_base``.
-
-    Enforces the archive-bomb / path-traversal guards shared by the GitHub-repo and the
-    flat-package extractors: a scan-count cap, per-member path normalization plus a
-    traversal guard against ``guard_root``, a member-count cap, and an uncompressed-byte
-    cap. ``on_segments`` observes each surviving member's path segments (after the
-    empty-path skip, before filtering); ``member_filter`` drops members whose segments it
-    rejects, before they count toward the member/byte caps.
-    """
-    total = 0
-    extracted = 0
-    scanned = 0
-    with tarfile.open(fileobj=reader, mode="r|") as tar:
-        for member in tar:
-            scanned += 1
-            if scanned > _MAX_ARCHIVE_SCAN_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many entries to scan (limit {_MAX_ARCHIVE_SCAN_MEMBERS})"
-                )
-            if member.type in TAR_METADATA_TYPES:
-                continue
-            raw = tar_member_segments(
-                member.name,
-                unsafe_error=lambda name: RuntimeError(
-                    f"unsafe path in environment archive: {name!r}"
-                ),
-            )
-            if not raw:
-                continue
-            if on_segments is not None:
-                on_segments(raw)
-            if member_filter is not None and not member_filter(raw):
-                continue
-            normalized_name = "/".join(raw)
-            target = (extract_base / normalized_name).resolve()
-            if target != guard_root and guard_root not in target.parents:
-                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
-            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
-                continue
-            extracted += 1
-            if extracted > _MAX_ARCHIVE_MEMBERS:
-                raise RuntimeError(
-                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
-                )
-            total += max(0, member.size)
-            if total > _MAX_ARCHIVE_BYTES:
-                raise RuntimeError(
-                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-                )
-            member.name = normalized_name
-            tar.extract(member, extract_base)
-
-
-def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "") -> Path:
-    """Extract a GitHub repo tarball and optionally keep only one repo subdirectory."""
-    root = dest.resolve()
-    want = [p for p in subdir.split("/") if p] if subdir else []
+def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path) -> Path:
+    """Extract a GitHub repo tarball; expects a single top-level repo directory."""
     top_dirs: set[str] = set()
     reader = LimitedArchiveReader(
         gzip.GzipFile(fileobj=tar_file),
@@ -641,12 +557,13 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
             f"environment archive is too large uncompressed (limit {_MAX_ARCHIVE_BYTES} bytes)"
         ),
     )
-    _extract_validated_archive_members(
+    extract_validated_archive_members(
         reader,
         extract_base=dest,
-        guard_root=root,
-        member_filter=lambda raw: not (want and raw[1 : 1 + len(want)] != want),
-        on_segments=lambda raw: top_dirs.add(raw[0]),
+        content_byte_limit=_MAX_ARCHIVE_BYTES,
+        extracted_member_limit=_MAX_ARCHIVE_MEMBERS,
+        scanned_member_limit=_MAX_ARCHIVE_SCAN_MEMBERS,
+        segment_observer=lambda segments: top_dirs.add(segments[0]),
     )
     if len(top_dirs) != 1:
         raise RuntimeError("environment archive had an unexpected layout")
@@ -654,10 +571,7 @@ def _safe_extract_archive_file(tar_file: BinaryIO, dest: Path, subdir: str = "")
     if extracted_dir.exists() and not extracted_dir.is_dir():
         raise RuntimeError("environment archive had an unexpected layout")
     if not extracted_dir.is_dir():
-        if want:
-            extracted_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            raise RuntimeError("environment archive did not extract to a directory")
+        raise RuntimeError("environment archive did not extract to a directory")
     return extracted_dir
 
 

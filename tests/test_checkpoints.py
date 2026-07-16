@@ -16,8 +16,8 @@ import pytest
 
 from flash.runner.checkpoints import (
     CheckpointListingError,
+    adapter_artifact_exists,
     checkpoint_adapter_prefix,
-    final_adapter_exists,
     list_checkpoints,
 )
 from flash.spec import JobSpec
@@ -90,6 +90,81 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
     assert "optimizer.pt" in up["ignore_patterns"]
     # The deployable path must NOT prune older steps (every step stays deployable).
     assert "delete_patterns" not in up
+
+
+def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, monkeypatch):
+    # regression (#538 finding 6): a per-step / opd-reconcile deployable is published straight from a
+    # trainer dir that never passed through the final _save_adapter path, so publish itself stamps the
+    # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
+    import json
+
+    import flash.engine.worker as worker
+    import flash.engine.worker.hf as hf
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    commit = "e" * 40
+    monkeypatch.setattr(
+        worker, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
+    )
+    monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
+    ckpt = tmp_path / "checkpoint-80"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    worker.publish_deployable_checkpoint(str(ckpt), 80)
+
+    payload = json.loads((ckpt / "base_model_provenance.json").read_text())
+    assert payload == {
+        "model_id": "org/base",
+        "requested_revision": "main",
+        "resolved_commit": commit,
+    }
+    # the sidecar rides inside the same atomic upload; it must not be stripped as trainer state.
+    assert len(rec.uploads) == 1
+    assert "base_model_provenance.json" not in rec.uploads[0]["ignore_patterns"]
+
+
+def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(tmp_path, monkeypatch):
+    # back-compat: with no JOB_SPEC (e.g. local recipe runs) publish writes no base_model_provenance.json
+    # rather than a misleading empty record, and still publishes the deployable (provenance is additive).
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker, "JOB_SPEC", None, raising=False)
+    ckpt = tmp_path / "checkpoint-80"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    worker.publish_deployable_checkpoint(str(ckpt), 80)
+
+    assert not (ckpt / "base_model_provenance.json").exists()
+    assert len(rec.uploads) == 1
+
+
+def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp_path, monkeypatch):
+    # #542 finding: the guard mirrors the final-save path (write only for a non-empty base model), so a
+    # JOB_SPEC with no model stamps no sidecar rather than a misleading empty-model_id record, and still
+    # publishes the deployable.
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(
+        worker, "JOB_SPEC", SimpleNamespace(model="", model_revision=""), raising=False
+    )
+    ckpt = tmp_path / "checkpoint-80"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    worker.publish_deployable_checkpoint(str(ckpt), 80)
+
+    assert not (ckpt / "base_model_provenance.json").exists()
+    assert len(rec.uploads) == 1
 
 
 def test_publish_deployable_checkpoint_accepts_legacy_bin_weights(tmp_path, monkeypatch):
@@ -473,7 +548,7 @@ def test_list_checkpoints_swallows_hf_error(monkeypatch):
     assert list_checkpoints(_spec()) == []  # best-effort: never raises into a run/route
 
 
-def test_final_adapter_exists_requires_config_and_weights(monkeypatch):
+def test_final_adapter_artifact_exists_requires_config_and_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -483,10 +558,10 @@ def test_final_adapter_exists_requires_config_and_weights(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is True
+    assert adapter_artifact_exists(_spec(), step=None) is True
 
 
-def test_final_adapter_exists_accepts_legacy_bin_weights(monkeypatch):
+def test_final_adapter_artifact_exists_accepts_legacy_bin_weights(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -496,10 +571,10 @@ def test_final_adapter_exists_accepts_legacy_bin_weights(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is True
+    assert adapter_artifact_exists(_spec(), step=None) is True
 
 
-def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
+def test_final_adapter_artifact_exists_rejects_incomplete_or_nested_files(monkeypatch):
     base = "rl/flash-ckpt-1"
     _patch_hf_files(
         monkeypatch,
@@ -509,10 +584,10 @@ def test_final_adapter_exists_rejects_incomplete_or_nested_files(monkeypatch):
         ],
     )
 
-    assert final_adapter_exists(_spec()) is False
+    assert adapter_artifact_exists(_spec(), step=None) is False
 
 
-def test_final_adapter_exists_raises_final_adapter_listing_error(monkeypatch):
+def test_final_adapter_artifact_exists_raises_listing_error(monkeypatch):
     import huggingface_hub
 
     class _Boom:
@@ -524,12 +599,11 @@ def test_final_adapter_exists_raises_final_adapter_listing_error(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _Boom())
 
-    with pytest.raises(CheckpointListingError) as exc_info:
-        final_adapter_exists(_spec())
-
-    message = str(exc_info.value)
-    assert "could not verify final adapter for flash-ckpt-1: hf down" in message
-    assert "deployable checkpoints" not in message
+    with pytest.raises(
+        CheckpointListingError,
+        match="could not verify adapter artifacts for flash-ckpt-1: hf down",
+    ):
+        adapter_artifact_exists(_spec(), step=None)
 
 
 # --------------------------------------------------------------------------------------------

@@ -17,8 +17,174 @@ import math
 import os
 import time
 
+from flash.opd_retry_contract import (
+    decode_opd_optimizer_start_json,
+    opd_optimizer_start_marker_path,
+    opd_resume_checkpoint_complete,
+    require_opd_retry_contract_version,
+    validate_opd_resume_state_metadata,
+)
 from flash.providers._deadline import deadline_kwargs, remaining_seconds, require_deadline_at
 from flash.providers._poll import _attempt_int
+
+
+def _opd_resume_checkpoint_step(
+    api, *, hf_repo: str, phase: str, run_id: str, revision: str
+) -> int | None:
+    """Return the newest filename-complete OPD checkpoint step at the pinned revision."""
+    base = f"{phase}/{run_id}/checkpoint/"
+    try:
+        files = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
+    except Exception:
+        return None
+    by_step: dict[int, set[str]] = {}
+    for path in files:
+        if not isinstance(path, str) or not path.startswith(base):
+            continue
+        seg, sep, tail = path[len(base) :].partition("/")
+        # only files directly inside a checkpoint-n dir count toward filename completeness.
+        if not sep or not tail or "/" in tail or not seg.startswith("checkpoint-"):
+            continue
+        suffix = seg[len("checkpoint-") :]
+        if not suffix.isdigit():
+            continue
+        step = int(suffix)
+        if step <= 0 or suffix != str(step):
+            continue
+        by_step.setdefault(step, set()).add(tail)
+    if not by_step:
+        return None
+    step = max(by_step)
+    return step if opd_resume_checkpoint_complete(by_step[step]) else None
+
+
+def verify_opd_replacement_safe(
+    *,
+    hf_repo: str,
+    run_id: str,
+    seed: int,
+    next_attempt: int,
+    contract_version: int,
+    phase: str,
+) -> str | None:
+    """Return only when replacing an OPD run's worker is safe.
+
+    Safe means either no reserved attempt crossed the first ``optimizer.step()`` (no mutation marker),
+    OR a marker proves mutation BUT a complete full-state resume checkpoint exists at the same pinned
+    revision, so the replacement worker resumes from it (via ``hf_resume_checkpoint``) instead of
+    training fresh. Fails closed (raises) on marker presence without a usable checkpoint, malformed
+    evidence, or any listing/download/parse uncertainty.
+    """
+    try:
+        version = require_opd_retry_contract_version(contract_version)
+        attempt_count = _attempt_int(next_attempt)
+        if attempt_count is None:
+            raise ValueError("next attempt identity is invalid")
+        paths = [opd_optimizer_start_marker_path(run_id, attempt) for attempt in range(attempt_count)]
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence contract is invalid; replacement is blocked") from exc
+    if not paths:
+        return None
+    if not isinstance(hf_repo, str) or not hf_repo.strip():
+        raise RuntimeError("opd artifact repository is missing; replacement is blocked")
+    if not isinstance(phase, str) or not phase.strip():
+        raise RuntimeError("opd artifact phase is missing; replacement is blocked")
+    token = os.environ.get("HF_TOKEN")
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        revision = str(api.repo_info(repo_id=hf_repo, repo_type="dataset").sha or "").strip()
+        if not revision:
+            raise ValueError("repository revision is missing")
+        infos = api.get_paths_info(
+            repo_id=hf_repo,
+            paths=paths,
+            repo_type="dataset",
+            revision=revision,
+        )
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence could not be listed; replacement is blocked") from exc
+    expected_paths = set(paths)
+    present: dict[str, object] = {}
+    try:
+        for info in infos:
+            path = str(getattr(info, "path", ""))
+            if path not in expected_paths or path in present:
+                raise ValueError("HF returned ambiguous optimizer-start marker evidence")
+            present[path] = info
+    except Exception as exc:
+        raise RuntimeError("opd retry evidence listing is malformed; replacement is blocked") from exc
+    if not present:
+        return None
+    mutated = False
+    for attempt, path in enumerate(paths):
+        if path not in present:
+            continue
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local_path = hf_hub_download(
+                repo_id=hf_repo,
+                repo_type="dataset",
+                filename=path,
+                revision=revision,
+                token=token,
+                force_download=True,
+            )
+            with open(local_path, "rb") as file:
+                raw = file.read()
+            decode_opd_optimizer_start_json(
+                raw,
+                run_id=run_id,
+                attempt=attempt,
+                seed=seed,
+                version=version,
+            )
+        except Exception as exc:
+            raise RuntimeError("opd retry evidence is unverifiable; replacement is blocked") from exc
+        # one validated marker proves mutation; keep validating every present marker.
+        mutated = True
+    if not mutated:
+        return None
+    # a validated optimizer-start marker proves some attempt crossed the first optimizer.step(). allow
+    # replacement only when the newest canonical checkpoint is filename-complete and its lightweight
+    # metadata validates at the same pinned revision. tensor, optimizer, rng, tokenizer, and model checks
+    # remain worker-side.
+    checkpoint_step = _opd_resume_checkpoint_step(
+        api, hf_repo=hf_repo, phase=phase, run_id=run_id, revision=revision
+    )
+    if checkpoint_step is None:
+        raise RuntimeError(
+            "opd optimizer state may have mutated and no complete resume checkpoint is available; "
+            "replacement is blocked"
+        )
+    state_path = (
+        f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
+    )
+    try:
+        from huggingface_hub import hf_hub_download
+
+        local_path = hf_hub_download(
+            repo_id=hf_repo,
+            repo_type="dataset",
+            filename=state_path,
+            revision=revision,
+            token=token,
+            force_download=True,
+        )
+        with open(local_path, encoding="utf-8") as file:
+            state = json.load(file)
+        validate_opd_resume_state_metadata(
+            state,
+            expected_seed=seed,
+            checkpoint_step=checkpoint_step,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "opd resume checkpoint metadata is unverifiable; replacement is blocked"
+        ) from exc
+    return revision
 
 
 def make_hf_text_reader(
@@ -162,7 +328,7 @@ def _heartbeat_matches_attempt(hb: dict, launch_ts: float | None, current_attemp
         return False
     now = time.time()
     timestamp = float(ts)
-    return bool(
+    return (
         math.isfinite(launch)
         and launch > 0
         and math.isfinite(timestamp)
@@ -177,7 +343,7 @@ def worker_flagged_retriable(
     if heartbeat_reader is None:
         return False
     hb = heartbeat_reader(force=True)
-    return bool(
+    return (
         isinstance(hb, dict)
         and hb.get("retriable") is True
         and _heartbeat_matches_attempt(hb, launch_ts, current_attempt)

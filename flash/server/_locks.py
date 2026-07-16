@@ -1,4 +1,4 @@
-"""Per-run deploy/undeploy mutexes for the control plane."""
+"""per-run deploy, undeploy, and export mutexes for the control plane."""
 
 from __future__ import annotations
 
