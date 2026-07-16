@@ -349,7 +349,23 @@ def test_opd_vllm_kwargs_floors_hybrid_mamba_budget_on_sub_140gb_card(monkeypatc
         256,
     )
 
+    assert out["max_num_seqs"] == 4
     assert out["max_num_batched_tokens"] == 1072
+
+
+def test_opd_vllm_kwargs_keeps_derived_hybrid_mamba_budget_on_sub_140gb_card(monkeypatch):
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.6-35B-A3B",
+        SimpleNamespace(prompts_per_step=8, group_size=1),
+        1536,
+    )
+
+    assert out["max_num_seqs"] == 8
+    assert out["max_num_batched_tokens"] is None
 
 
 def test_opd_vllm_kwargs_leaves_non_mamba_budget_unset_on_sub_140gb_card(monkeypatch):

@@ -701,7 +701,9 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
 
 
 @pytest.mark.parametrize("max_context_tokens", [256, 512])
-def test_opd_accepts_short_hybrid_mamba_context_with_worker_floor(max_context_tokens):
+def test_opd_accepts_short_hybrid_mamba_context_with_conditional_worker_floor(
+    max_context_tokens,
+):
     from flash.schema import spec_from_dict
 
     spec = spec_from_dict(

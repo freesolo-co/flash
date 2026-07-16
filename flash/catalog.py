@@ -320,12 +320,15 @@ MODELS: dict[str, ModelInfo] = {
 }
 
 
-def opd_mamba_batched_token_floor(model_id: str, seq_cap: int) -> int | None:
-    """return the catalog-driven vllm scheduler floor for hybrid-mamba opd rollouts."""
+def opd_mamba_batched_token_floor(
+    model_id: str, seq_cap: int, max_num_seqs: int | None
+) -> int | None:
+    """return a mamba floor only when vllm's derived opd scheduler budget is too small."""
     info = MODELS.get(model_id)
-    if info is None or info.mamba_block_size <= 0:
+    if info is None or info.mamba_block_size <= 0 or max_num_seqs is None:
         return None
-    return max(int(seq_cap), info.mamba_block_size)
+    derived_budget = int(max_num_seqs) * int(seq_cap)
+    return info.mamba_block_size if derived_budget < info.mamba_block_size else None
 
 
 def list_models() -> list[ModelInfo]:

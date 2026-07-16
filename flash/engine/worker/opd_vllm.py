@@ -129,10 +129,6 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     kwargs["kv_cache_dtype"] = "fp8" if fp8_kv else None
     if card_gb >= 140:
         kwargs["max_num_batched_tokens"] = max(8192, int(seq_cap))
-    else:
-        from flash.catalog import opd_mamba_batched_token_floor
-
-        kwargs["max_num_batched_tokens"] = opd_mamba_batched_token_floor(model_id, seq_cap)
 
     if card_gb > 0:
         try:
@@ -194,6 +190,12 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
             kwargs["rollout_batch_size"] = rollout_concurrency
         except Exception as exc:
             print(f"[opd] vLLM memory-util sizing failed; using 0.10: {exc}")
+    if card_gb < 140:
+        from flash.catalog import opd_mamba_batched_token_floor
+
+        kwargs["max_num_batched_tokens"] = opd_mamba_batched_token_floor(
+            model_id, seq_cap, kwargs["max_num_seqs"]
+        )
     if startup_oom is not None:
         raise startup_oom
 

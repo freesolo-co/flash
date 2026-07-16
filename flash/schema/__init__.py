@@ -9,13 +9,7 @@ from collections.abc import Collection
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
-from flash.catalog import (
-    MODELS,
-    normalize_algorithm,
-    opd_mamba_batched_token_floor,
-    resolve_model,
-    serving_lora_rank_cap,
-)
+from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
 from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     GPU_INFO,
@@ -570,18 +564,8 @@ def _validate_opd(spec: JobSpec) -> None:
                 f"invalid budget fails before a GPU worker is provisioned."
             )
 
-        # short hybrid-mamba contexts are safe because the worker applies this same catalog floor
-        # explicitly instead of letting vllm derive a smaller scheduler budget from max_model_len.
-        info = MODELS.get(spec.model)
-        if info is not None and info.mamba_block_size > 0:
-            effective_tokens = opd_mamba_batched_token_floor(
-                spec.model, spec.train.max_context_tokens
-            )
-            if effective_tokens is None or effective_tokens < info.mamba_block_size:
-                raise ConfigError(
-                    f"{spec.model} requires opd vllm max_num_batched_tokens >= "
-                    f"{info.mamba_block_size}, but the catalog floor resolved to {effective_tokens}"
-                )
+        # short hybrid-mamba contexts are safe because the worker compares vllm's derived scheduler
+        # budget with the catalogued block size and supplies an explicit floor only when required.
 
 
 # Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
