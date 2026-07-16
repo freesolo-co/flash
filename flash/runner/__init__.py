@@ -691,7 +691,7 @@ def _prepare_init_from_adapter(
     owner_key_id: int | None = None,
     token: str | None = None,
 ) -> tuple[JobSpec, JobSpec, dict | None]:
-    """Preserve the public request while applying source metadata only to the worker spec."""
+    """prepare public and worker specs with source-authoritative adapter metadata."""
     _require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
@@ -776,7 +776,7 @@ def _prepare_init_from_adapter(
     )
     assert metadata is not None
     identity = adapter_artifact_identity(storage, config, token, revision).to_dict()
-    public_spec = spec
+    public_spec = replace(spec, train=replace(spec.train, lora_alpha=metadata.alpha))
     worker_spec = replace(
         worker_spec,
         train=replace(worker_spec.train, lora_rank=metadata.rank, lora_alpha=metadata.alpha),

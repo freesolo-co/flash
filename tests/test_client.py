@@ -177,7 +177,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
     assert spec_payload(spec, authored_train_keys=set())["train"] == {}
 
 
-def test_create_run_sends_schema_metadata_only_for_dry_run(stub) -> None:
+def test_create_run_sends_schema_metadata_for_dry_run_and_live_submit(stub) -> None:
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     spec = {"model": "m", "train": {"epochs": 1}}
@@ -195,7 +195,7 @@ def test_create_run_sends_schema_metadata_only_for_dry_run(stub) -> None:
     }
 
     client.create_run(spec, client_train_schema=metadata)
-    assert seen["body"] == {"spec": spec}
+    assert seen["body"] == {"spec": spec, "client_train_schema": metadata}
 
 
 def test_api_error_carries_server_detail(stub):
