@@ -182,13 +182,6 @@ def select_gpu(config: RunConfig, *, max_wall_seconds: float = 0.0) -> tuple[str
         thinking=config.thinking,
         model_revision=config.model_revision,
     )
-    if config.exact_type:
-        if gpu_vram_gb(config.exact_type) < need:
-            raise ValueError(
-                f"exact_type {config.exact_type!r} has {gpu_vram_gb(config.exact_type)} GB VRAM, "
-                f"but this run requires at least {need} GB"
-            )
-        return config.exact_type, need
     gpu = pick_gpu(need, provider=config.provider, max_wall_seconds=max_wall_seconds)
     return gpu, need
 
