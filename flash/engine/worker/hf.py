@@ -534,6 +534,16 @@ def publish_deployable_checkpoint(
                 f"required save step {step} has no deployable adapter in {ckpt_dir}"
             )
         return None
+    # a published deployable is a servable adapter, so it carries the same base-weight provenance
+    # sidecar as the final adapter and opd saves. companions published straight from a trainer dir
+    # (per-step saves, opd resume reconcile) never passed through the final _save_adapter path, so
+    # write the sidecar here from the job spec's base model. written into ckpt_dir before upload so
+    # it lands inside the same atomic upload_folder commit as the adapter it describes.
+    _spec = getattr(_w, "JOB_SPEC", None)
+    if _spec is not None:
+        write_base_model_provenance(
+            ckpt_dir, _spec.model, getattr(_spec, "model_revision", "") or ""
+        )
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
     attempts = max(1, int(retries))
     last_error: Exception | None = None
