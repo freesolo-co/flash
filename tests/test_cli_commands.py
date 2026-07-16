@@ -322,6 +322,26 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
 
 
+def test_train_dry_run_sends_declared_runtime_secrets(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    config = tmp_path / "train.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "owner/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
+        '[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n'
+    )
+    monkeypatch.setenv("SERPAPI_API_KEY", "serp-secret")
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    capsys.readouterr()
+    call = next(call for call in fake_client.calls if call[0] == "create_run")
+
+    assert call[2] == {"SERPAPI_API_KEY": "serp-secret"}
+    assert call[3] is True
+
+
 def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
@@ -415,7 +435,7 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
     assert calls[0][3] is True
     assert calls[0][4] is not None
     assert calls[1][3] is False
-    assert calls[1][4] is None
+    assert calls[1][4] == calls[0][4]
 
 
 def test_status_runs_and_log_command(fake_client, capsys) -> None:

@@ -74,9 +74,7 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _runtime_secrets(
-    payload: dict, spec: JobSpec, *, require_environment_secrets: bool
-) -> dict[str, str]:
+def _runtime_secrets(payload: dict, spec: JobSpec) -> dict[str, str]:
     # Use get()+None check, not `or {}` — falsy non-objects must still hit the type check below.
     raw = payload.get("runtime_secrets")
     if raw is None:
@@ -102,14 +100,12 @@ def _runtime_secrets(
         value = value.strip()
         if value:
             out[key] = value
-    if require_environment_secrets:
-        missing = sorted(set(spec.environment.secrets) - set(out))
-        if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "missing runtime secret(s) required by [environment] secrets: "
-                    f"{', '.join(missing)}"
-                ),
-            )
+    missing = sorted(set(spec.environment.secrets) - set(out))
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"missing runtime secret(s) required by [environment] secrets: {', '.join(missing)}"
+            ),
+        )
     return out
