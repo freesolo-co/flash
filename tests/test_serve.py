@@ -62,7 +62,11 @@ def _stub_adapter_config(
     import flash.serve.deploy as deploy
 
     if stub_capabilities:
-        monkeypatch.setattr(deploy, "_require_serving_capabilities", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            deploy,
+            "_require_serving_capabilities",
+            lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
+        )
     monkeypatch.setattr(deploy, "_wait_revision_ready", lambda *a, **k: {})
     monkeypatch.setattr(
         deploy,
@@ -431,7 +435,8 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
         "repo_type": "dataset",
         "checkpoint": "flash-7-abcd",
-        "status": "ready",
+        # no client-sent "status": the serving backend sets it on registration and rejects an
+        # incoming "status" as an extra field (HTTP 422).
         "metadata": {
             "record_type": "revision",
             "run_id": "flash-7-abcd",
@@ -525,7 +530,10 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
     [
         ("missing_immutable_revisions", "immutable_adapter_revisions"),
         ("missing_alias_cas", "alias_compare_and_swap"),
-        ("missing_provenance", "revision_provenance"),
+        # NOTE: `missing_provenance` is intentionally NOT here anymore -- revision_provenance is a
+        # PREFERRED (warn-only) capability, not a deploy blocker. Its "deploy proceeds when only
+        # provenance is missing" behavior is covered by
+        # test_missing_provenance_only_still_deploys below.
         ("missing_thinking_structured", "thinking_structured_outputs_deferred_v1"),
         ("malformed", "must return a list field named capabilities"),
         ("invalid_json", "did not return valid JSON"),
@@ -592,6 +600,113 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
             structured_outputs=json.dumps({"choice": ["4"]}),
         )
     assert posts == []
+
+
+def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
+    """The production serving backend advertises immutable revisions + alias CAS + the deferred
+    thinking/structured-outputs cap, but NOT revision_provenance. That must NOT block the deploy
+    (regression guard for the org-wide `serving_contract_unsupported: ... revision_provenance`
+    outage): the capability check passes and registration is attempted."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
+    posts: list[str] = []
+
+    advertised = sorted(
+        (_IMMUTABLE_SERVING_CAPABILITIES - {"revision_provenance"})
+        | {d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY}
+    )
+
+    class _HealthResp:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"capabilities": advertised}
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://serve.example/healthz"
+        return _HealthResp()
+
+    def fake_post(url, **_kwargs):
+        posts.append(url)
+        raise RuntimeError("REACHED_POST")  # stop after proving the capability gate let us through
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="REACHED_POST"):
+        d.deploy_adapter(
+            run_id="flash-7-abcd",
+            model="Qwen/Qwen3.5-0.8B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/flash-7-abcd/seed0",
+            thinking=True,
+            structured_outputs=json.dumps({"choice": ["4"]}),
+        )
+    assert posts == ["https://serve.example/adapters"]  # registration WAS attempted
+
+
+def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatch, tmp_path):
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
+    advertised = sorted(
+        (_IMMUTABLE_SERVING_CAPABILITIES - {"revision_provenance"})
+        | {d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY}
+    )
+    captured: dict[str, bool] = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"capabilities": advertised}
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://serve.example/healthz"
+        return _Resp()
+
+    def wait_ready(
+        adapter_revision,
+        subfolder,
+        *,
+        expected_identity=None,
+        require_provenance=True,
+    ):
+        captured["require_provenance"] = require_provenance
+        return {}
+
+    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(d.httpx, "post", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
+
+    d.deploy_adapter(
+        run_id="flash-7-no-provenance",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-no-provenance/seed0",
+    )
+    assert captured["require_provenance"] is False
+
+    advertised = sorted(_IMMUTABLE_SERVING_CAPABILITIES)
+    captured.clear()
+    d.deploy_adapter(
+        run_id="flash-7-with-provenance",
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-with-provenance/seed0",
+    )
+    assert captured["require_provenance"] is True
 
 
 def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
