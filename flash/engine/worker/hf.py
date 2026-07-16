@@ -538,9 +538,10 @@ def publish_deployable_checkpoint(
     # sidecar as the final adapter and opd saves. companions published straight from a trainer dir
     # (per-step saves, opd resume reconcile) never passed through the final _save_adapter path, so
     # write the sidecar here from the job spec's base model. written into ckpt_dir before upload so
-    # it lands inside the same atomic upload_folder commit as the adapter it describes.
+    # it lands inside the same atomic upload_folder commit as the adapter it describes. guard on a
+    # non-empty base model so an unspecified base never stamps a misleading empty-model_id sidecar.
     _spec = getattr(_w, "JOB_SPEC", None)
-    if _spec is not None:
+    if _spec is not None and _spec.model:
         write_base_model_provenance(
             ckpt_dir, _spec.model, getattr(_spec, "model_revision", "") or ""
         )
