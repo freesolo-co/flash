@@ -45,12 +45,7 @@ class VastCreateNotSent(VastApiError):
 
 
 # env-only key (like runpod_api_key): never written to config files or shipped to workers.
-_CLIENT = RestClient(
-    env_var="VAST_API_KEY",
-    error_cls=VastApiError,
-    base_url=VAST_BASE,
-    missing_key_message=("VAST_API_KEY not configured on the control-plane host"),
-)
+_CLIENT = RestClient(env_var="VAST_API_KEY", error_cls=VastApiError, base_url=VAST_BASE)
 
 
 def request_with_retries(
@@ -62,10 +57,6 @@ def request_with_retries(
     deadline_at: float | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
-    if deadline_at is None:
-        return _CLIENT.request_with_retries(
-            path, method=method, body=body, retries=retries, base_delay=base_delay
-        )
     return _CLIENT.request_with_retries(
         path,
         method=method,
@@ -82,10 +73,12 @@ def request_with_retries(
 def search_offers(
     min_vram_mb: int,
     *,
+    max_vram_mb: int = 0,
     min_disk_gb: float = 0,
     min_reliability: float = 0.95,
     min_duration_seconds: float = 0,
     limit: int = 64,
+    gpu_names: tuple[str, ...] = (),
     deadline_at: float | None = None,
 ) -> list[dict]:
     """Rentable single-GPU offers from verified datacenter hosts, cheapest first.
@@ -106,6 +99,10 @@ def search_offers(
         "order": [["dph_total", "asc"]],
         "limit": int(limit),
     }
+    if max_vram_mb > 0:
+        q["gpu_ram"]["lte"] = int(max_vram_mb)
+    if gpu_names:
+        q["gpu_name"] = {"in": list(dict.fromkeys(gpu_names))}
     if min_disk_gb:
         q["disk_space"] = {"gte": float(min_disk_gb)}
     if min_duration_seconds > 0:
@@ -182,7 +179,7 @@ def _http_error_response(error: VastApiError) -> dict | None:
 
     try:
         decoded = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return None
     return decoded if isinstance(decoded, dict) else None
 

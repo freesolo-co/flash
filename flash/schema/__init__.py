@@ -10,9 +10,13 @@ from dataclasses import fields as dataclass_fields
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
+    GPU_INFO,
     UnsupportedGpuError,
     canonical_gpu,
+    get_gpu_info,
+    providers_for,
     provisional_gpu,
 )
 from flash.schema.fields import (
@@ -61,12 +65,7 @@ def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
     if match is None:
         return None
     step = match.group("step")
-    if step is None:
-        return match.group("run_id"), None
-    try:
-        return match.group("run_id"), int(step)
-    except ValueError:
-        return None
+    return match.group("run_id"), int(step) if step is not None else None
 
 
 def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
@@ -177,13 +176,12 @@ def spec_and_train_keys_from_file(
     return spec_from_dict(raw, run_id=run_id), authored_train_keys
 
 
-def _deep_merge(base: dict, extra: dict) -> dict:
+def _deep_merge(base: dict, extra: dict) -> None:
     for k, v in extra.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
             _deep_merge(base[k], v)
         else:
             base[k] = v
-    return base
 
 
 def _apply_override(raw: dict, item: str) -> None:
@@ -213,7 +211,7 @@ def _job_seed(raw: dict[str, Any]) -> int:
     try:
         return parse_seed(raw.get("seed", FIXED_SEED))
     except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
+        raise ConfigError(str(exc)) from None
 
 
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
@@ -233,12 +231,13 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     )
 
 
-# Unknown tables are rejected loudly: a stray [grpo] table silently dropped GRPO knobs and trained
-# at 16x-cost defaults. Platform-managed keys (gpu, run_id, hf_repo) remain recognized (not
-# rejected) so a round-tripped JobSpec.to_dict() doesn't fail re-validation on submit.
+# unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
+# at 16x-cost defaults. managed fields remain recognized in their canonical sections so a
+# round trip through public serialization does not fail re-validation on submit.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
+        "model_revision",
         "algorithm",
         "model_policy",
         "thinking",
@@ -251,6 +250,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "run_id",
     }
 )
+_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec))
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
     for item in dataclass_fields(TrainSpec)
@@ -275,17 +275,17 @@ def validate_train_keys(keys: Collection[str]) -> None:
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
-    # Only reject table-valued unknowns — callers pass harmless scalar flags like dry_run alongside spec.
-    unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
+    unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
         if {"grpo", "sft", "opd"} & set(unknown):
             hint = (
-                " — GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, …) "
+                " - GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, ...) "
                 "belong under [train], not a [grpo]/[sft]/[opd] table"
             )
+        noun = "section(s)" if any(isinstance(raw[key], dict) for key in unknown) else "key(s)"
         raise ConfigError(
-            f"unknown config section(s): {', '.join(unknown)} "
+            f"unknown config {noun}: {', '.join(unknown)} "
             f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
         )
     try:
@@ -296,6 +296,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # escaping the callers' ConfigError/ValueError guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
         raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
+    model_revision_raw = raw.get("model_revision", "")
+    if not isinstance(model_revision_raw, str):
+        raise ConfigError("model_revision must be a string")
+    model_revision = model_revision_raw.strip()
 
     try:
         algorithm = normalize_algorithm(raw.get("algorithm"))
@@ -340,6 +344,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
+    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS)
+    if unknown_gpu:
+        raise ConfigError(
+            f"[gpu] unknown key(s): {', '.join(unknown_gpu)} "
+            f"(allowed: {', '.join(sorted(_GPU_KEYS))})"
+        )
     gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
     gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
     gpu_options = {}
@@ -348,13 +358,55 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if gpu_max_wall_seconds is not None:
         gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
 
+    provider_raw = gpu_raw.get("provider", "")
+    if not isinstance(provider_raw, str):
+        raise ConfigError("gpu.provider must be a string")
+    gpu_provider = provider_raw.strip().lower()
+    if gpu_provider and gpu_provider not in PROVIDER_NAMES:
+        raise ConfigError(
+            f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
+        )
+
+    exact_type_raw = gpu_raw.get("exact_type", "")
+    if not isinstance(exact_type_raw, str):
+        raise ConfigError("gpu.exact_type must be a string")
+    exact_type = ""
+    if exact_type_raw.strip():
+        try:
+            exact_type = canonical_gpu(exact_type_raw)
+        except UnsupportedGpuError as exc:
+            raise ConfigError(f"gpu.exact_type: {exc}") from exc
+        exact_info = GPU_INFO.get(exact_type)
+        if exact_info is None or not exact_info.validated:
+            raise ConfigError(
+                f"gpu.exact_type {exact_type!r} must name an active validated GPU class"
+            )
+        if gpu_provider and gpu_provider not in providers_for(exact_type):
+            raise ConfigError(
+                f"gpu.provider {gpu_provider!r} cannot provision gpu.exact_type {exact_type!r}"
+            )
+
     try:
-        # Offline sizing/display only; allocator re-resolves at submit time.
+        # offline sizing/display only; allocator re-resolves at submit time.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
-    except UnsupportedGpuError as exc:
+        if exact_type and not model_revision:
+            from flash.providers.allocator import required_vram_gb
+
+            required_vram = required_vram_gb(
+                model,
+                algorithm,
+                train=train_raw,
+                thinking=thinking,
+            )
+            if get_gpu_info(exact_type).vram_gb < required_vram:
+                raise ConfigError(
+                    f"gpu.exact_type {exact_type!r} has {get_gpu_info(exact_type).vram_gb} GB VRAM, "
+                    f"but this run requires at least {required_vram} GB"
+                )
+    except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=exact_type or gpu_type)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -431,6 +483,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
     spec = JobSpec(
         model=model,
+        model_revision=model_revision,
         algorithm=algorithm,
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),
@@ -439,7 +492,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             secrets=environment_secrets,
         ),
         train=train_spec,
-        gpu=GpuSpec(type=gpu_type, **gpu_options),
+        gpu=GpuSpec(
+            type=gpu_type,
+            provider=gpu_provider,
+            exact_type=exact_type,
+            **gpu_options,
+        ),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
         seed=_job_seed(raw),
         worker_env=worker_env,
@@ -463,9 +521,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
 
 
 def _validate_sft(spec: JobSpec) -> None:
-    """SFT contract: positive epochs, and a positive row count to price/train against."""
-    if spec.train.epochs is not None and spec.train.epochs <= 0:
-        raise ConfigError("train.epochs must be positive for SFT")
+    """validate sft row-count and structured-output constraints."""
     if int(spec.train.max_examples or 0) <= 0:
         raise ConfigError(
             "train.max_examples must be set to a positive row count for SFT "
@@ -481,7 +537,7 @@ def _validate_sft(spec: JobSpec) -> None:
 
 
 def _validate_grpo(spec: JobSpec) -> None:
-    """GRPO contract: epochs derive passes over retained prompts."""
+    """validate the grpo group-size constraint."""
     if spec.train.group_size is not None and spec.train.group_size < 2:
         raise ConfigError(
             "train.group_size must be >= 2 for GRPO (TRL needs at least two generations "
@@ -490,10 +546,7 @@ def _validate_grpo(spec: JobSpec) -> None:
 
 
 def _validate_opd(spec: JobSpec) -> None:
-    """OPD contract: epochs derive passes over retained prompts.
-
-    The teacher key (FIREWORKS_API_KEY) is a platform-owned credential the control plane injects into
-    the worker env (build_worker_env), like HF_TOKEN — never a user-declared secret."""
+    """validate that the opd context budget leaves room for a prompt."""
     if spec.train.max_context_tokens:
         # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
         # for any prompt after the completion budget is rejected here, BEFORE a paid worker is
@@ -522,6 +575,17 @@ def _validate_spec(spec: JobSpec) -> None:
         canonical_gpu(spec.gpu.type)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
+    if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
+        raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")
+    if spec.gpu.exact_type:
+        exact = GPU_INFO.get(spec.gpu.exact_type)
+        if exact is None or not exact.validated:
+            raise ConfigError("gpu.exact_type must name an active validated GPU class")
+        if spec.gpu.provider and spec.gpu.provider not in providers_for(spec.gpu.exact_type):
+            raise ConfigError(
+                f"gpu.provider {spec.gpu.provider!r} cannot provision "
+                f"gpu.exact_type {spec.gpu.exact_type!r}"
+            )
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)
@@ -535,8 +599,3 @@ def _validate_spec(spec: JobSpec) -> None:
         spec.environment.id,
         '[environment] id must be a Freesolo environment id (for example "your-name/your-env")',
     )
-    if spec.train.lora_rank <= 0:
-        raise ConfigError("train.lora_rank must be positive")
-    # lora_alpha=0 produces a no-op adapter (zero scaling at serve) — reject up front.
-    if spec.train.lora_alpha <= 0:
-        raise ConfigError("train.lora_alpha must be positive")

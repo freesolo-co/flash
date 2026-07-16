@@ -80,6 +80,22 @@ def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
     _assert_safe_entrypoint_failure(result, secret)
 
 
+def test_managed_entrypoint_sanitizes_worker_import_failure(tmp_path):
+    secret = "managed-private-import-response"
+    result = _run_safe_entrypoint(
+        tmp_path,
+        "import importlib.abc\n"
+        "import sys\n"
+        "class FailWorkerImport(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path, target=None):\n"
+        "        if fullname == 'flash.engine.worker':\n"
+        f"            raise RuntimeError({secret!r})\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, FailWorkerImport())\n",
+    )
+    _assert_safe_entrypoint_failure(result, secret)
+
+
 def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     secret = "direct-worker-diagnostic"
     (tmp_path / "sitecustomize.py").write_text(

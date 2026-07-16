@@ -577,6 +577,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _spec_with_remaining_wall,
         _status_estimated_charge,
         _update,
+        _verified_opd_next_attempt,
         artifacts_dir,
         effective_spec_from_status,
         get_status,
@@ -668,6 +669,22 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                     file=log,
                 )
                 return status_for_return()
+            if int(worker_spec.gpu.max_retries) == 0:
+                detail = f"{res.failure or 'job_failed'}: {res.detail or 'provider attempt failed'}"
+                _update(run_id, "failed", error=detail)
+                print(
+                    f"attach: {run_id} exhausted its one-shot retry budget; not resubmitting",
+                    file=log,
+                )
+                return status_for_return()
+            if worker_spec.algorithm == "opd":
+                verified_next_attempt = _verified_opd_next_attempt(run_id)
+                if verified_next_attempt != next_attempt:
+                    raise RuntimeError(
+                        "persisted opd attempt identity does not match the attached worker; "
+                        "replacement is blocked"
+                    )
+                next_attempt = verified_next_attempt
             try:
                 _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
             except RuntimeError as exc:

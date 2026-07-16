@@ -9,10 +9,10 @@ reattach deadline formula, and how a reattached instance is torn down).
 small hook the subclass overrides. "Add a rent-a-box provider" becomes "subclass ``InstanceProvider``
 and define the hooks below" — no need to re-derive the poll/submit/gc plumbing.
 
-Imports stay confined to the shared kernel (``base``, ``_hf_artifacts``, ``contextlib``); every
-substrate call is a lazy import inside a hook so this module is import-side-effect-free and the hooks
-resolve their targets at call time (tests monkeypatch e.g. ``vast.jobs.submit_run_vast`` /
-``lambda_api.terminate_instances`` — binding at class-definition would defeat those seams).
+top-level project imports are confined to shared ``_instance`` and ``base``. ``_hf_artifacts``,
+``contextlib``, and substrate-specific modules are imported lazily inside methods. hooks therefore
+resolve their targets at call time for monkeypatch seams such as ``vast.jobs.submit_run_vast`` and
+``lambda_api.terminate_instances``.
 """
 
 from __future__ import annotations

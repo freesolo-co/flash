@@ -134,11 +134,29 @@ def _gpu_mismatch_reason(
     return "; ".join(reasons) or None
 
 
-def verify_gpu(requested_gpu: str | None) -> None:
-    """Assert the live GPU matches the requested class (model + CUDA floor), or raise RetriableInfraError."""
-    if not requested_gpu:
+def verify_gpu(requested_gpu: str | None, *, exact_type: str = "") -> None:
+    """Assert the live GPU satisfies the requested class and optional exact identity."""
+    if not requested_gpu and not exact_type:
         return
     import torch
+
+    live_name = "?"
+    with contextlib.suppress(Exception):
+        live_name = torch.cuda.get_device_name(0)
+    if exact_type:
+        from flash.providers.base import canonical_gpu
+
+        requested_canonical = canonical_gpu(exact_type)
+        try:
+            observed_canonical = canonical_gpu(live_name)
+        except Exception:
+            observed_canonical = "unrecognized"
+        if observed_canonical != requested_canonical:
+            raise RetriableInfraError(
+                "assigned GPU exact-class mismatch: "
+                f"requested={requested_canonical!r}, observed={observed_canonical!r}, "
+                f"device_name={live_name!r}; retrying on a correctly-provisioned GPU"
+            )
 
     live_cap = None
     live_vram_gb = None
@@ -176,7 +194,7 @@ def _nvml_alive() -> bool:
         return False
 
 
-def wait_for_gpu(requested_gpu: str | None = None):
+def wait_for_gpu(requested_gpu: str | None = None, *, exact_type: str = ""):
     """Poll until CUDA is live; raise RetriableInfraError if the host NVML is dead or it never readies."""
     import time as _t
 
@@ -189,7 +207,7 @@ def wait_for_gpu(requested_gpu: str | None = None):
                 _ = torch.zeros(8, device="cuda") + 1
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
-                verify_gpu(requested_gpu)
+                verify_gpu(requested_gpu, exact_type=exact_type)
                 return True
             last = "cuda not available"
         except RetriableInfraError:

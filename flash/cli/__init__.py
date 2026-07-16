@@ -11,20 +11,14 @@ from typing import NoReturn
 
 from flash import __version__
 from flash._channel import CLI_NAME
-from flash._logging import configure_logging, get_logger
+from flash._logging import configure_logging
 from flash._update_check import emit_update_notice, maybe_start_update_check
 from flash.cli import render
 
-# Command handlers + the patched client surface live in submodules; re-export them so
-# `flash.cli` stays the single public import surface (and so monkeypatching
-# `flash.cli.commands` reaches the bare globals the handlers read).
+# package-level command imports remain available through flash.cli.
 from flash.cli.commands import (  # noqa: F401
     _CLI_DONE_STATES,
-    _OK_STATES,
-    _STARTER_ENV_PY,
     _USER_ERRORS,
-    _follow_run,
-    _poll_logs,
     client_from_config,
     cmd_cancel,
     cmd_chat,
@@ -32,7 +26,6 @@ from flash.cli.commands import (  # noqa: F401
     cmd_deploy,
     cmd_deployments,
     cmd_env_list,
-    cmd_env_setup,
     cmd_export,
     cmd_gpus,
     cmd_log,
@@ -46,9 +39,8 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
+from flash.cli.env_setup import cmd_env_setup
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
-
-logger = get_logger("flash.cli")
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on

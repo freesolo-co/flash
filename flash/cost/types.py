@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from flash.catalog import normalize_algorithm, samples_on_policy
 from flash.engine.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES
+from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 from flash.spec import parse_positive_int_tuple
 
 
@@ -40,6 +41,11 @@ class RunConfig:
     # from this token count instead of the padded batch_size * seq_len slot estimate.
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
+    exact_type: str = ""
+    model_revision: str = ""
+    # Spec gpu.disk_gb, carried so an exact-auto quote allocates at the run's real disk floor (parity
+    # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
+    disk_gb: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -51,6 +57,18 @@ class RunConfig:
                 f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
             )
         object.__setattr__(self, "provider", prov)
+        exact = ""
+        if self.exact_type:
+            exact = canonical_gpu(self.exact_type)
+            info = GPU_INFO.get(exact)
+            if info is None or not info.validated:
+                raise ValueError(f"exact_type {exact!r} must name an active validated GPU class")
+            if prov != "auto" and prov not in providers_for(exact):
+                raise ValueError(f"provider {prov!r} cannot provision exact_type {exact!r}")
+        object.__setattr__(self, "exact_type", exact)
+        if not isinstance(self.model_revision, str):
+            raise TypeError("model_revision must be a string")
+        object.__setattr__(self, "model_revision", self.model_revision.strip())
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
@@ -136,9 +154,9 @@ class CostEstimate:
     """A pre-flight estimate.
 
     ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
-    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) is
-    itemized as a diagnostic but NOT part of ``total_usd``: the teacher runs on the user's own
-    Fireworks key, so Fireworks bills them directly.
+    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) uses
+    the platform-managed teacher key and remains itemized separately from the customer GPU charge,
+    so it is not included in ``total_usd``.
     """
 
     model_id: str
@@ -149,15 +167,15 @@ class CostEstimate:
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
-    setup_seconds: float  # cold start: boot + deps + model load (+ vLLM init for GRPO)
+    setup_seconds: float  # cold start: boot + deps + model load (+ vllm init for grpo/opd)
     seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
-    # opd only: external Fireworks teacher token spend (0.0 for sft/grpo). Billed by Fireworks
+    # opd only: external fireworks teacher token spend (0.0 for sft/grpo). billed by fireworks
     # to the platform-managed teacher key (users don't supply one), tracked separately from the
-    # platform-billed GPU charge — so it is NOT part of total_usd; shown as its own itemized
+    # platform-billed gpu charge, so it is not part of total_usd and is shown as its own itemized
     # diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
