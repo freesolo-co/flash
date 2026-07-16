@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import os
 
-from flash.catalog import DEFAULT_MODEL, MODELS, SERVING_FP8_MODEL_REPOS, get_model
+from flash.catalog import (
+    DEFAULT_MODEL,
+    MODELS,
+    SERVING_FP8_MODEL_REPOS,
+    get_model,
+    opd_mamba_batched_token_floor,
+)
 from flash.providers.base import KNOWN, canonical_gpu
 
 
@@ -35,6 +41,22 @@ def test_recipe_and_jobspec_defaults_match_catalog_default():
     if not os.environ.get("BENCH_HF_MODEL"):
         assert RECIPE.hf_model_id == DEFAULT_MODEL
     assert JobSpec().model == DEFAULT_MODEL
+
+
+def test_opd_mamba_block_size_is_catalogued_only_for_hybrid_rollout_model():
+    assert MODELS["Qwen/Qwen3.6-35B-A3B"].mamba_block_size == 1072
+    assert all(
+        info.mamba_block_size == 0
+        for model_id, info in MODELS.items()
+        if model_id != "Qwen/Qwen3.6-35B-A3B"
+    )
+
+
+def test_opd_mamba_batched_token_floor_only_overrides_unsafe_derived_budgets():
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+    assert opd_mamba_batched_token_floor(model_id, 256, 4) == 1072
+    assert opd_mamba_batched_token_floor(model_id, 1536, 8) is None
+    assert opd_mamba_batched_token_floor("Qwen/Qwen3.5-4B", 256, 4) is None
 
 
 def test_thinking_capability_values_are_valid():

@@ -111,6 +111,8 @@ class ModelInfo:
     # multimodal-nested config, so the curated values are what actually engage the gate.
     num_layers: int = 0
     hidden_size: int = 0
+    # vllm hybrid-mamba cache block size in tokens. 0 means the model has no catalogued mamba floor.
+    mamba_block_size: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -124,6 +126,8 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        if not data["mamba_block_size"]:
+            del data["mamba_block_size"]
         serving = data["serving"]
         if serving is None:
             del data["serving"]
@@ -271,6 +275,10 @@ MODELS: dict[str, ModelInfo] = {
         # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).
         num_layers=40,
         hidden_size=2048,
+        # vllm 0.19.1 model_executor/models/config.py derives this from the qwen config via
+        # mamba_utils.py: the 1,097,728-byte gdn state page needs 1072 fp8 attention tokens
+        # after the 16-token backend alignment applied by hybridattentionmambamodelconfig.
+        mamba_block_size=1072,
         vocab_size=248_320,
         algos=ALGORITHMS,
         min_vram_gb=141,
@@ -310,6 +318,17 @@ MODELS: dict[str, ModelInfo] = {
         "VRAM); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB copies).",
     ),
 }
+
+
+def opd_mamba_batched_token_floor(
+    model_id: str, seq_cap: int, max_num_seqs: int | None
+) -> int | None:
+    """return a mamba floor only when vllm's derived opd scheduler budget is too small."""
+    info = MODELS.get(model_id)
+    if info is None or info.mamba_block_size <= 0 or max_num_seqs is None:
+        return None
+    derived_budget = int(max_num_seqs) * int(seq_cap)
+    return info.mamba_block_size if derived_budget < info.mamba_block_size else None
 
 
 def list_models() -> list[ModelInfo]:

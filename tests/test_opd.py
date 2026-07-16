@@ -721,6 +721,30 @@ def test_opd_rejects_zero_kl_penalty_at_parse_time():
     assert _spec("grpo", {"kl_penalty_coef": 0}).train.kl_penalty_coef == 0
 
 
+@pytest.mark.parametrize("max_context_tokens", [256, 512])
+def test_opd_accepts_short_hybrid_mamba_context_with_conditional_worker_floor(
+    max_context_tokens,
+):
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.6-35B-A3B",
+            "algorithm": "opd",
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
+            "train": {
+                "epochs": 1,
+                "max_examples": 5,
+                "max_context_tokens": max_context_tokens,
+                "max_completion_tokens": 128,
+            },
+        },
+        run_id="x",
+    )
+
+    assert spec.train.max_context_tokens == max_context_tokens
+
+
 def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
     """Regression (codex[bot], opd.py:380-381): when EVERY sample in a step skips (empty completion
     / no teacher signal, or an over-budget re-render), the per-sample SUCCESS ping is never reached.
