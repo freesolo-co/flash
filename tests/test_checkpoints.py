@@ -92,6 +92,59 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
     assert "delete_patterns" not in up
 
 
+def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, monkeypatch):
+    # regression (#538 finding 6): a per-step / opd-reconcile deployable is published straight from a
+    # trainer dir that never passed through the final _save_adapter path, so publish itself stamps the
+    # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
+    import json
+
+    import flash.engine.worker as worker
+    import flash.engine.worker.hf as hf
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    commit = "e" * 40
+    monkeypatch.setattr(
+        worker, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
+    )
+    monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
+    ckpt = tmp_path / "checkpoint-80"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    worker.publish_deployable_checkpoint(str(ckpt), 80)
+
+    payload = json.loads((ckpt / "base_model_provenance.json").read_text())
+    assert payload == {
+        "model_id": "org/base",
+        "requested_revision": "main",
+        "resolved_commit": commit,
+    }
+    # the sidecar rides inside the same atomic upload; it must not be stripped as trainer state.
+    assert len(rec.uploads) == 1
+    assert "base_model_provenance.json" not in rec.uploads[0]["ignore_patterns"]
+
+
+def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(tmp_path, monkeypatch):
+    # back-compat: with no JOB_SPEC (e.g. local recipe runs) publish writes no base_model_provenance.json
+    # rather than a misleading empty record, and still publishes the deployable (provenance is additive).
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker, "JOB_SPEC", None, raising=False)
+    ckpt = tmp_path / "checkpoint-80"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")
+    (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
+
+    worker.publish_deployable_checkpoint(str(ckpt), 80)
+
+    assert not (ckpt / "base_model_provenance.json").exists()
+    assert len(rec.uploads) == 1
+
+
 def test_publish_deployable_checkpoint_accepts_legacy_bin_weights(tmp_path, monkeypatch):
     import flash.engine.worker as worker
 
@@ -309,57 +362,6 @@ def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",
         "rl/flash-ckpt-1/checkpoints/step-8/adapter",
     ], "each save must publish its own deployable — no step coalesced away"
-
-
-def test_on_save_writes_base_model_provenance_for_deployable(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """Per-step deployables must carry base-model provenance, exactly like the final adapter, so a
-    deployed RUN_ID/step-N proves its base weights (#538: SFT/GRPO step deployables lacked it)."""
-    import json
-
-    from flash.engine.worker import hf as worker_hf
-
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(
-        worker_hf, "resolve_cached_model_commit", lambda model_id, revision: "e" * 40
-    )
-    out = tmp_path / "out"
-    out.mkdir()
-    ckpt = _make_ckpt_dir(out, 4)
-    cb = worker.make_checkpoint_upload_callback(model_id="org/m", model_revision="main")
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-
-    prov = ckpt / "base_model_provenance.json"
-    assert prov.exists(), "per-step deployable must include base_model_provenance.json"
-    assert json.loads(prov.read_text()) == {
-        "model_id": "org/m",
-        "requested_revision": "main",
-        "resolved_commit": "e" * 40,
-    }
-    # the provenance file rides along in the deployable upload (not excluded like trainer state).
-    deployable = next(
-        u for u in rec.uploads if u["path_in_repo"].endswith("checkpoints/step-4/adapter")
-    )
-    assert "base_model_provenance.json" not in deployable["ignore_patterns"]
-
-
-def test_on_save_without_model_id_writes_no_provenance(
-    tmp_path, monkeypatch, fake_trainer_callback
-):
-    """Back-compat: a callback built without a model id writes no base_model_provenance.json rather
-    than a misleading empty record, and still publishes the deployable (provenance is additive)."""
-    rec = _RecordingHfApi()
-    worker = _prime_worker(monkeypatch, rec)
-    out = tmp_path / "out"
-    out.mkdir()
-    ckpt = _make_ckpt_dir(out, 4)
-    cb = worker.make_checkpoint_upload_callback()  # no model id
-    cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-
-    assert not (ckpt / "base_model_provenance.json").exists()
-    assert any(u["path_in_repo"].endswith("checkpoints/step-4/adapter") for u in rec.uploads)
 
 
 def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trainer_callback):
@@ -775,15 +777,3 @@ def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     # SFT derives the final step from trainer state (no _steps_run var) and publishes it.
     assert "global_step" in src
     assert "publish_deployable_checkpoint(adapter_dir, _final_step)" in src
-
-
-def test_run_sft_threads_model_provenance_into_checkpoint_callback():
-    # the per-step deployable callback needs the base model + revision to stamp provenance, exactly
-    # like the final adapter upload does (#538: step deployables otherwise omit base_model_provenance).
-    src = _finalize_src("flash.engine.worker.sft", "run_sft")
-    assert "make_checkpoint_upload_callback(save_at_steps, model_id, model_revision)" in src
-
-
-def test_run_rl_threads_model_provenance_into_checkpoint_callback():
-    src = _finalize_src("flash.engine.worker.rl", "run_rl")
-    assert "make_checkpoint_upload_callback(save_at_steps, model_id, model_revision)" in src

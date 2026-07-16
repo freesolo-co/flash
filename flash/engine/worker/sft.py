@@ -622,7 +622,7 @@ def run_sft():
             data_collator=_collator,
             callbacks=[
                 _w.make_sft_heartbeat_callback(),
-                _w.make_checkpoint_upload_callback(save_at_steps, model_id, model_revision),
+                _w.make_checkpoint_upload_callback(save_at_steps),
             ],
         )
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
