@@ -1747,7 +1747,9 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         st = orch.get_status("warm-run")
         assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
         assert "lora_rank" not in st.spec["train"]
-        assert st.spec["train"]["lora_alpha"] == 16
+        # the public spec reports the source adapter's authoritative alpha so status matches
+        # what the worker actually trains with
+        assert st.spec["train"]["lora_alpha"] == 64
         assert (
             launched["init_from_adapter"]
             == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
@@ -1845,7 +1847,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         assert status.state == "dry_run"
 
 
-def test_submit_dry_run_omits_public_warmstart_rank_and_preserves_alpha(monkeypatch):
+def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         from flash.spec import JobSpec
@@ -1896,7 +1898,9 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_preserves_alpha(monkeypa
         assert status.state == "dry_run"
         assert "lora_rank" not in status.spec["train"]
         assert "init_from_adapter_revision" not in status.spec["train"]
-        assert status.spec["train"]["lora_alpha"] == 16
+        # dry-run displays the source adapter's authoritative alpha, not the submitted value,
+        # so preflight and execution report the same effective spec
+        assert status.spec["train"]["lora_alpha"] == 128
         assert status.to_dict()["spec"] == status.spec
 
 
