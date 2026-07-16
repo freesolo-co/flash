@@ -178,8 +178,8 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
             raise
         if (
             spec.train.init_from_adapter
-            and isinstance(submitted_train, dict)
-            and "lora_alpha" in submitted_train
+            and schema is not None
+            and "lora_alpha" in schema["authored_keys"]
             and spec.train.lora_alpha != prepared.worker_spec.train.lora_alpha
         ):
             raise HTTPException(

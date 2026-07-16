@@ -304,6 +304,11 @@ def cmd_train(args) -> int:
     )
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
+    client_train_schema = {
+        "version": __version__,
+        "fields": train_schema_metadata(),
+        "authored_keys": sorted(authored_train_keys),
+    }
     runtime_secrets = (
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
@@ -316,11 +321,7 @@ def cmd_train(args) -> int:
                 payload,
                 runtime_secrets=runtime_secrets,
                 dry_run=True,
-                client_train_schema={
-                    "version": __version__,
-                    "fields": train_schema_metadata(),
-                    "authored_keys": sorted(authored_train_keys),
-                },
+                client_train_schema=client_train_schema,
             )
         except ApiError as exc:
             detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
@@ -338,7 +339,11 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         return 0
-    status = client.create_run(payload, runtime_secrets=runtime_secrets)
+    status = client.create_run(
+        payload,
+        runtime_secrets=runtime_secrets,
+        client_train_schema=client_train_schema,
+    )
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s",

@@ -478,9 +478,43 @@ def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     assert resp.json()["spec"]["train"]["lora_alpha"] == 32
 
 
+def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.spec import JobSpec
+
+    def prepare(spec, **_kwargs):
+        resolved = replace(spec, train=replace(spec.train, lora_alpha=32))
+        return runner.PreparedJob(
+            public_spec=resolved,
+            worker_spec=resolved,
+            estimated_cost_usd=1.25,
+            adapter_identity=None,
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", prepare)
+    normalized = JobSpec.from_dict(
+        {
+            **SPEC,
+            "train": {**SPEC["train"], "init_from_adapter": "source-run"},
+        }
+    ).to_dict()
+    assert normalized["train"]["lora_alpha"] == 64
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": normalized, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+
+
 def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
+    from flash.schema import train_schema_metadata
 
     def prepare(spec, **_kwargs):
         resolved = replace(spec, train=replace(spec.train, lora_alpha=32))
@@ -504,7 +538,15 @@ def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     resp = api.post(
         "/v1/runs",
         headers=_bearer("fslo-internal-test"),
-        json={"spec": spec, "dry_run": True},
+        json={
+            "spec": spec,
+            "dry_run": True,
+            "client_train_schema": {
+                "version": "0.2.56",
+                "fields": train_schema_metadata(),
+                "authored_keys": ["init_from_adapter", "lora_alpha"],
+            },
+        },
     )
 
     assert resp.status_code == 400

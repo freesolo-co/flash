@@ -435,7 +435,7 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
     assert calls[0][3] is True
     assert calls[0][4] is not None
     assert calls[1][3] is False
-    assert calls[1][4] is None
+    assert calls[1][4] == calls[0][4]
 
 
 def test_status_runs_and_log_command(fake_client, capsys) -> None:
