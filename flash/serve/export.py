@@ -194,6 +194,23 @@ def _hf_api():
     return HfApi, snapshot_download
 
 
+def _hub_error_types() -> tuple[type[BaseException], ...]:
+    error_types: list[type[BaseException]] = []
+    try:
+        from huggingface_hub.errors import HfHubHTTPError
+    except ImportError:
+        pass
+    else:
+        error_types.append(HfHubHTTPError)
+    try:
+        from requests import RequestException
+    except ImportError:
+        pass
+    else:
+        error_types.append(RequestException)
+    return tuple(error_types)
+
+
 def export_adapter(
     *,
     source_repo: str,
@@ -226,6 +243,8 @@ def export_adapter(
                 token=read_token,
             )
         except Exception as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, _hub_error_types()):
+                raise
             raise ServingError(
                 f"could not download adapter {source_repo}:{source_subfolder}: {exc}"
             ) from exc
@@ -261,6 +280,8 @@ def export_adapter(
             if not private:
                 api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=False)
         except Exception as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, _hub_error_types()):
+                raise
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
         "exported %s:%s -> %s (%d files)", source_repo, source_subfolder, dest_repo, len(files)
