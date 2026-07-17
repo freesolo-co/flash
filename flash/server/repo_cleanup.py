@@ -59,6 +59,7 @@ plane with an operator ``HF_TOKEN`` — without it the sweep cannot delete opera
 from __future__ import annotations
 
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -87,6 +88,26 @@ RUN_REPO_PREFIX = "flashrun-"
 DELETE_AGE_SECONDS = 7.0 * 86400.0
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
 _SCAN_WORKERS = 8  # hf tree-listing concurrency
+# ``list_repo_tree(..., expand=True)`` is HF's most expensive listing mode (expand bypasses the
+# CDN and hits origin for a last_commit lookup per entry) -- it rate-limits well below the
+# general API quota. _scan_repo (one call per repo, fanned across _SCAN_WORKERS) and
+# _prefix_written_within (one call per delete target) both hit it; with no shared pacing, the
+# worker pool lets up to _SCAN_WORKERS calls land on HF in the same instant, which is enough on
+# its own to trip the rate limit on a sweep over more than a handful of repos. This floor paces
+# EVERY list_repo_tree call across the whole sweep (not per-thread), so concurrency no longer
+# translates into a request burst.
+_TREE_LIST_MIN_INTERVAL_S = 0.5  # cap ~2 req/s across the whole sweep, workers included
+_tree_list_lock = threading.Lock()
+_tree_list_last_call = 0.0
+
+
+def _throttle_tree_list() -> None:
+    global _tree_list_last_call
+    with _tree_list_lock:
+        wait = _tree_list_last_call + _TREE_LIST_MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _tree_list_last_call = time.monotonic()
 
 # Only these top-level dirs are deletable model-artifact phases (``JobSpec.phase``: grpo -> "rl",
 # plus the VL warm-start ``recomb`` recombined adapter). Anything else — ``code/`` snapshots,
@@ -187,6 +208,7 @@ def _scan_repo(api, repo_id: str) -> tuple[dict[str, list], float | None, set[st
     ``prefixes`` maps ``"<phase>/<run_id>"`` -> ``[total_size, newest_commit_ts]`` for ARTIFACT_PHASES
     only, ``ref_recent_ts`` is the newest commit among ``referenced_by/`` markers (warm-start-source
     signal), and ``unknown_tops`` are unrecognized top-level dirs (reported, never deleted)."""
+    _throttle_tree_list()
     entries = api.list_repo_tree(
         repo_id=repo_id, repo_type="dataset", recursive=True, expand=True
     )
@@ -246,6 +268,7 @@ def _prefix_written_within(api, repo_id: str, prefix: str, now: float, max_age_s
     redeploy read-back that landed after enumeration must spare the prefix. Raises on an API error (the
     caller then skips this target to stay safe). If the listing carries no commit dates (older
     ``huggingface_hub``), returns ``False`` — the enumeration age gate already qualified it."""
+    _throttle_tree_list()
     entries = api.list_repo_tree(
         repo_id=repo_id, repo_type="dataset", path_in_repo=prefix, recursive=True, expand=True
     )
