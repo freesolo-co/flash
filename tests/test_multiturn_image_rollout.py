@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import sys
 import types
+from itertools import pairwise
 from types import SimpleNamespace
 
 import pytest
 
 from flash.engine.multiturn_rollout import build_rollout_func
-from flash.multimodal import image_content_key, multimodal_prompt_key
+from flash.multimodal import (
+    collapse_image_pad_runs,
+    image_content_key,
+    multimodal_prompt_key,
+    resolve_image_pad_token_id,
+)
+
+_IMAGE_PAD_ID = 99
 
 
 class _Tokenizer:
@@ -20,12 +28,21 @@ class _Tokenizer:
 
 
 class _Processor:
+    image_token_id = _IMAGE_PAD_ID
+
     def __init__(self):
         self.calls = []
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((multimodal_prompt_key(messages), kwargs))
-        return {"input_ids": [[11, 12, 13]]}
+        image_count = sum(
+            part.get("type") == "image"
+            for message in messages
+            for part in message.get("content", [])
+            if isinstance(part, dict)
+        )
+        image_ids = [token for _ in range(image_count) for token in [_IMAGE_PAD_ID] * 3 + [14]]
+        return {"input_ids": [[11, *image_ids, 13]]}
 
 
 class _TwoTurnEnv:
@@ -48,6 +65,20 @@ class _TwoTurnEnv:
 
     def reward(self, completion, example, state=None):
         return 1.0
+
+
+def test_collapse_image_pad_runs_collapses_one_expanded_run():
+    assert collapse_image_pad_runs([1, 9, 9, 9, 2], 9, 1) == [1, 9, 2]
+
+
+def test_collapse_image_pad_runs_collapses_separated_runs_and_preserves_other_tokens():
+    ids = [1, 9, 9, 2, 3, 9, 9, 9, 4]
+    assert collapse_image_pad_runs(ids, 9, 2) == [1, 9, 2, 3, 9, 4]
+
+
+def test_collapse_image_pad_runs_rejects_image_count_mismatch():
+    with pytest.raises(ValueError, match=r"found 1 image-pad run.*expected 2"):
+        collapse_image_pad_runs([1, 9, 9, 2], 9, 2)
 
 
 class _Engine:
@@ -146,6 +177,7 @@ def test_multiturn_image_rollout_attaches_images_to_every_request(image_count):
     result = rollout([prompt], _trainer(engine))
 
     assert result["reward"] == [1.0]
+    assert result["prompt_ids"][0].count(_IMAGE_PAD_ID) == 3 * image_count
     assert len(engine.requests) == 2
     assert len(processor.calls) == 1
     rendered_key, render_kwargs = processor.calls[0]
@@ -158,11 +190,59 @@ def test_multiturn_image_rollout_attaches_images_to_every_request(image_count):
     }
     for request in engine.requests:
         assert set(request) == {"prompt_token_ids", "multi_modal_data"}
+        request_ids = request["prompt_token_ids"]
+        assert request_ids.count(_IMAGE_PAD_ID) == image_count
+        assert all(
+            current != _IMAGE_PAD_ID or previous != _IMAGE_PAD_ID
+            for previous, current in pairwise(request_ids)
+        )
         attached = request["multi_modal_data"]["image"]
         attached_images = attached if isinstance(attached, list) else [attached]
         assert [image_content_key(image) for image in attached_images] == [
             image_content_key(image) for image in images
         ]
+
+
+def test_real_qwen_processor_image_pad_id_and_expansion():
+    image_module = pytest.importorskip("PIL.Image")
+    auto_processor = pytest.importorskip("transformers").AutoProcessor
+    try:
+        processor = auto_processor.from_pretrained(
+            "Qwen/Qwen3.5-0.8B",
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except (ImportError, OSError, ValueError) as exc:
+        pytest.skip(f"Qwen3.5 processor is unavailable offline: {exc}")
+
+    image_pad_id = resolve_image_pad_token_id(processor, processor.tokenizer)
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image_module.new("RGB", (2, 2), "red")},
+                {"type": "text", "text": "what color?"},
+            ],
+        }
+    ]
+    rendered = processor.apply_chat_template(
+        prompt,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        enable_thinking=False,
+    )
+    ids = rendered["input_ids"]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+
+    collapsed = collapse_image_pad_runs(list(ids), image_pad_id, 1)
+    assert image_pad_id >= 0
+    assert ids.count(image_pad_id) > 1
+    assert collapsed.count(image_pad_id) == 1
+    assert len(collapsed) == len(ids) - ids.count(image_pad_id) + 1
 
 
 @pytest.mark.usefixtures("_stub_vllm")

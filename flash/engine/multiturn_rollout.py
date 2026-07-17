@@ -805,10 +805,17 @@ def build_rollout_func(
 
         _SOParams = StructuredOutputsParams
 
+    image_pad_id = None
     if multimodal:
         if processor is None:
             raise ValueError("multimodal rollout requires a processor")
-        from flash.multimodal import multimodal_prompt_key
+        from flash.multimodal import (
+            collapse_image_pad_runs,
+            multimodal_prompt_key,
+            resolve_image_pad_token_id,
+        )
+
+        image_pad_id = resolve_image_pad_token_id(processor, tok)
 
         def render(messages: list, add_generation_prompt: bool) -> list[int]:
             rendered = processor.apply_chat_template(
@@ -883,9 +890,16 @@ def build_rollout_func(
                 # env contract has no per-turn schema channel; unconstrained env/tool turns are
                 # not generated here.
                 sp_kwargs["structured_outputs"] = _SOParams(**copy.deepcopy(structured_outputs))
-            prompt = {"prompt_token_ids": list(prefix_ids)}
             if images:
-                prompt["multi_modal_data"] = {"image": images if len(images) > 1 else images[0]}
+                if image_pad_id is None:
+                    raise ValueError("multimodal rollout is missing the image-pad token id")
+                collapsed = collapse_image_pad_runs(list(prefix_ids), image_pad_id, len(images))
+                prompt = {
+                    "prompt_token_ids": collapsed,
+                    "multi_modal_data": {"image": images if len(images) > 1 else images[0]},
+                }
+            else:
+                prompt = {"prompt_token_ids": list(prefix_ids)}
             llm_engine.add_request(req_id, prompt, SamplingParams(**sp_kwargs))
             active_ids.add(req_id)
 

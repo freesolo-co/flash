@@ -531,7 +531,8 @@ def test_image_content_key_is_stable_and_pixel_sensitive():
     assert mm.image_content_key(red) != mm.image_content_key(wide_red)
 
 
-def test_multimodal_prompt_key_and_index_distinguish_image_content():
+def test_multimodal_prompt_key_and_index_distinguish_image_content(monkeypatch):
+    pytest.importorskip("trl")
     from trl.data_utils import prepare_multimodal_messages
 
     image_module = pytest.importorskip("PIL.Image")
@@ -553,9 +554,19 @@ def test_multimodal_prompt_key_and_index_distinguish_image_content():
         {"prompt": placeholder, "images": [blue_descriptor], "example": blue_example},
     ]
 
-    index = mm.build_multimodal_examples_index(prompts, None)
+    decoded_images = 0
+    real_decode = mm.decode_image_descriptors
+
+    def counted_decode(descriptors, package_root):
+        nonlocal decoded_images
+        decoded_images += len(descriptors)
+        return real_decode(descriptors, package_root)
+
+    monkeypatch.setattr(mm, "decode_image_descriptors", counted_decode)
+    index, collisions = mm.build_multimodal_examples_index(prompts, None)
     assert len(index) == 2
-    assert mm.multimodal_index_collisions(prompts, None) == 0
+    assert collisions == 0
+    assert decoded_images == 2
 
     red_messages = prepare_multimodal_messages(
         placeholder,
@@ -574,6 +585,7 @@ def test_multimodal_prompt_key_and_index_distinguish_image_content():
 
 
 def test_multimodal_examples_index_reports_identical_prompt_image_collision():
+    pytest.importorskip("trl")
     image_module = pytest.importorskip("PIL.Image")
     placeholder = [{"role": "user", "content": [{"type": "image"}]}]
     descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
@@ -582,8 +594,8 @@ def test_multimodal_examples_index_reports_identical_prompt_image_collision():
         {"prompt": placeholder, "images": [descriptor], "example": {"answer": "last"}},
     ]
 
-    index = mm.build_multimodal_examples_index(prompts, None)
-    assert mm.multimodal_index_collisions(prompts, None) == 1
+    index, collisions = mm.build_multimodal_examples_index(prompts, None)
+    assert collisions == 1
     assert len(index) == 1
     assert next(iter(index.values())) == {"answer": "last"}
 

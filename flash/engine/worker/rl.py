@@ -677,13 +677,9 @@ def run_rl():
         _rollout_request_timeout = resolve_rollout_request_timeout_seconds(vllm_max_len)
         _rollout_request_max_attempts = 2
         if multimodal:
-            from flash.multimodal import (
-                build_multimodal_examples_index,
-                multimodal_index_collisions,
-            )
+            from flash.multimodal import build_multimodal_examples_index
 
-            examples_by_key = build_multimodal_examples_index(prompts, package_root)
-            ncol = multimodal_index_collisions(prompts, package_root)
+            examples_by_key, ncol = build_multimodal_examples_index(prompts, package_root)
         else:
             examples_by_key = build_examples_index(train, env.prompt_messages)
             ncol = index_collisions(train, env.prompt_messages)

@@ -546,6 +546,59 @@ def decode_image_descriptors(
     return [_decode_image_bytes(data) for data in prepared]
 
 
+def collapse_image_pad_runs(ids: list[int], image_pad_id: int, num_images: int) -> list[int]:
+    """Collapse each maximal image-pad run to one token and verify the image count."""
+    collapsed: list[int] = []
+    run_count = 0
+    in_run = False
+    for token_id in ids:
+        if token_id == image_pad_id:
+            if not in_run:
+                collapsed.append(token_id)
+                run_count += 1
+            in_run = True
+        else:
+            collapsed.append(token_id)
+            in_run = False
+    if run_count != num_images:
+        raise ValueError(
+            f"found {run_count} image-pad run(s) in multimodal prompt; expected {num_images}"
+        )
+    return collapsed
+
+
+def resolve_image_pad_token_id(processor, tok) -> int:
+    """Resolve the Qwen VL image-pad token id without assuming a model-specific constant."""
+
+    def valid_token_id(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            token_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return token_id if token_id >= 0 else None
+
+    token_id = valid_token_id(getattr(processor, "image_token_id", None))
+    if token_id is not None:
+        return token_id
+
+    convert = getattr(tok, "convert_tokens_to_ids", None)
+    if callable(convert):
+        image_token = getattr(processor, "image_token", None)
+        candidates = [image_token] if isinstance(image_token, str) else []
+        candidates.append("<|image_pad|>")
+        for token in candidates:
+            try:
+                token_id = valid_token_id(convert(token))
+            except Exception:
+                token_id = None
+            if token_id is not None:
+                return token_id
+
+    raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
+
+
 def image_content_key(image) -> str:
     """Return a stable content key for a PIL image."""
     digest = hashlib.sha256()
@@ -597,18 +650,11 @@ def _multimodal_prompt_keys(prompts: list[dict], package_root: str | Path | None
 
 def build_multimodal_examples_index(
     prompts: list[dict], package_root: str | Path | None
-) -> dict[str, dict]:
-    """Map TRL-shaped multimodal prompt keys to examples, keeping the last collision."""
-    return {
-        key: item["example"]
-        for key, item in zip(_multimodal_prompt_keys(prompts, package_root), prompts, strict=True)
-    }
-
-
-def multimodal_index_collisions(prompts: list[dict], package_root: str | Path | None) -> int:
-    """Rows dropped by collisions in :func:`build_multimodal_examples_index`."""
+) -> tuple[dict[str, dict], int]:
+    """Build the prompt index and collision count from one decoded key pass."""
     keys = _multimodal_prompt_keys(prompts, package_root)
-    return len(keys) - len(set(keys))
+    index = {key: item["example"] for key, item in zip(keys, prompts, strict=True)}
+    return index, len(keys) - len(index)
 
 
 def decode_arrow_examples(examples: list[dict], package_root: str | Path | None) -> list[dict]:
