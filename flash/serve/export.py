@@ -16,7 +16,6 @@ import tempfile
 from pathlib import Path
 
 from flash._logging import get_logger
-from flash.engine.worker.lora import strip_language_model_infix
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -28,6 +27,15 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
     r"(?:/[^\s\"'`,\]\){}]+)*/flash_sft_merged_[^\s\"'`,\]\){}]+"
 )
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
+def _strip_language_model_infix(key: str) -> str:
+    # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/lora.py
+    infix = ".language_model."
+    index = key.find(infix)
+    if index == -1:
+        return key
+    return key[:index] + "." + key[index + len(infix) :]
 
 
 def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -74,7 +82,7 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
             remapped = 0
             for key, value in header.items():
                 normalized_key = (
-                    key if key == "__metadata__" else strip_language_model_infix(key)
+                    key if key == "__metadata__" else _strip_language_model_infix(key)
                 )
                 if normalized_key in normalized:
                     raise ValueError(

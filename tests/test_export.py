@@ -7,7 +7,9 @@ the calls instead of touching the Hub).
 from __future__ import annotations
 
 import json
+import os
 import struct
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -35,6 +37,31 @@ def _parse_safetensors_bytes(contents: bytes) -> tuple[dict, bytes]:
     (header_length,) = struct.unpack("<Q", contents[:8])
     data_start = 8 + header_length
     return json.loads(contents[8:data_start]), contents[data_start:]
+
+
+def test_export_import_does_not_initialize_worker_package(tmp_path):
+    malformed_spec = tmp_path / "job-spec.json"
+    malformed_spec.write_text("not-json", encoding="utf-8")
+    env = os.environ.copy()
+    env["FLASH_JOB_SPEC_JSON"] = "not-json"
+    env["FLASH_JOB_SPEC_PATH"] = str(malformed_spec)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import flash.serve.export; "
+            "assert 'flash.engine.worker' not in sys.modules",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_token(monkeypatch):
