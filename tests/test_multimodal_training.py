@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import importlib.util
 import io
 import json
@@ -518,11 +519,79 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
         _reject_image_completion(completion)
 
 
+def test_image_content_key_is_stable_and_pixel_sensitive():
+    image_module = pytest.importorskip("PIL.Image")
+    red = image_module.new("RGB", (2, 2), (255, 0, 0))
+    red_copy = copy.deepcopy(red)
+    blue = image_module.new("RGB", (2, 2), (0, 0, 255))
+    wide_red = image_module.new("RGB", (4, 1), (255, 0, 0))
+
+    assert mm.image_content_key(red) == mm.image_content_key(red_copy)
+    assert mm.image_content_key(red) != mm.image_content_key(blue)
+    assert mm.image_content_key(red) != mm.image_content_key(wide_red)
+
+
+def test_multimodal_prompt_key_and_index_distinguish_image_content():
+    from trl.data_utils import prepare_multimodal_messages
+
+    image_module = pytest.importorskip("PIL.Image")
+    placeholder = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what color?"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    red_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (255, 0, 0)), None)
+    blue_descriptor = mm.normalize_image_source(image_module.new("RGB", (2, 2), (0, 0, 255)), None)
+    red_example = {"answer": "red"}
+    blue_example = {"answer": "blue"}
+    prompts = [
+        {"prompt": placeholder, "images": [red_descriptor], "example": red_example},
+        {"prompt": placeholder, "images": [blue_descriptor], "example": blue_example},
+    ]
+
+    index = mm.build_multimodal_examples_index(prompts, None)
+    assert len(index) == 2
+    assert mm.multimodal_index_collisions(prompts, None) == 0
+
+    red_messages = prepare_multimodal_messages(
+        placeholder,
+        images=mm.decode_image_descriptors([red_descriptor], None),
+    )
+    blue_messages = prepare_multimodal_messages(
+        placeholder,
+        images=mm.decode_image_descriptors([blue_descriptor], None),
+    )
+    assert mm.multimodal_prompt_key(red_messages) != mm.multimodal_prompt_key(blue_messages)
+    assert mm.multimodal_prompt_key(copy.deepcopy(red_messages)) == mm.multimodal_prompt_key(
+        red_messages
+    )
+    assert index[mm.multimodal_prompt_key(red_messages)] is red_example
+    assert index[mm.multimodal_prompt_key(blue_messages)] is blue_example
+
+
+def test_multimodal_examples_index_reports_identical_prompt_image_collision():
+    image_module = pytest.importorskip("PIL.Image")
+    placeholder = [{"role": "user", "content": [{"type": "image"}]}]
+    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
+    prompts = [
+        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "first"}},
+        {"prompt": placeholder, "images": [descriptor], "example": {"answer": "last"}},
+    ]
+
+    index = mm.build_multimodal_examples_index(prompts, None)
+    assert mm.multimodal_index_collisions(prompts, None) == 1
+    assert len(index) == 1
+    assert next(iter(index.values())) == {"answer": "last"}
+
+
 def test_multimodal_algorithm_validation_rejects_unsupported_modes():
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=False)
-    with pytest.raises(ValueError, match="multi-turn"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=True)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=True)
     with pytest.raises(ValueError, match="opd"):
         mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
     with pytest.raises(ValueError, match="does not support"):

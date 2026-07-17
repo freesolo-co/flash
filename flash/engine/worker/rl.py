@@ -676,8 +676,17 @@ def run_rl():
 
         _rollout_request_timeout = resolve_rollout_request_timeout_seconds(vllm_max_len)
         _rollout_request_max_attempts = 2
-        examples_by_key = build_examples_index(train, env.prompt_messages)
-        ncol = index_collisions(train, env.prompt_messages)
+        if multimodal:
+            from flash.multimodal import (
+                build_multimodal_examples_index,
+                multimodal_index_collisions,
+            )
+
+            examples_by_key = build_multimodal_examples_index(prompts, package_root)
+            ncol = multimodal_index_collisions(prompts, package_root)
+        else:
+            examples_by_key = build_examples_index(train, env.prompt_messages)
+            ncol = index_collisions(train, env.prompt_messages)
         if ncol:
             print(
                 f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
@@ -687,6 +696,8 @@ def run_rl():
             active_env=env,
             tok=tok,
             examples_by_key=examples_by_key,
+            processor=processor,
+            multimodal=multimodal,
             max_completion=_max_completion,
             max_turns=getattr(env, "max_turns", 10),
             temperature=_temperature,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import http.client
 import io
 import ipaddress
@@ -545,6 +546,71 @@ def decode_image_descriptors(
     return [_decode_image_bytes(data) for data in prepared]
 
 
+def image_content_key(image) -> str:
+    """Return a stable content key for a PIL image."""
+    digest = hashlib.sha256()
+    digest.update(image.convert("RGB").tobytes())
+    digest.update(f"{image.width}x{image.height}".encode())
+    return digest.hexdigest()
+
+
+def multimodal_prompt_key(messages: list[dict]) -> str:
+    """Return a stable key for prompt messages carrying decoded PIL images."""
+    canonical = []
+    for message in messages:
+        parts = []
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(("t", content))
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    raise ValueError("multimodal prompt content parts must be objects")
+                part_type = part.get("type")
+                if part_type == "text":
+                    parts.append(("t", part.get("text")))
+                elif part_type in _IMAGE_BLOCK_TYPES:
+                    image = part.get("image")
+                    if not _is_pil_image(image):
+                        raise ValueError(
+                            "multimodal prompt image blocks must carry a PIL image at part['image']"
+                        )
+                    parts.append(("i", image_content_key(image)))
+                else:
+                    raise ValueError(f"unsupported multimodal prompt content type: {part_type!r}")
+        elif content is not None:
+            raise ValueError("multimodal prompt message content must be text or content parts")
+        canonical.append((message.get("role"), parts))
+    return json.dumps(canonical, sort_keys=True)
+
+
+def _multimodal_prompt_keys(prompts: list[dict], package_root: str | Path | None) -> list[str]:
+    from trl.data_utils import prepare_multimodal_messages
+
+    keys = []
+    for item in prompts:
+        images = decode_image_descriptors(list(item.get("images") or []), package_root)
+        pil_messages = prepare_multimodal_messages(item["prompt"], images=images)
+        keys.append(multimodal_prompt_key(pil_messages))
+    return keys
+
+
+def build_multimodal_examples_index(
+    prompts: list[dict], package_root: str | Path | None
+) -> dict[str, dict]:
+    """Map TRL-shaped multimodal prompt keys to examples, keeping the last collision."""
+    return {
+        key: item["example"]
+        for key, item in zip(_multimodal_prompt_keys(prompts, package_root), prompts, strict=True)
+    }
+
+
+def multimodal_index_collisions(prompts: list[dict], package_root: str | Path | None) -> int:
+    """Rows dropped by collisions in :func:`build_multimodal_examples_index`."""
+    keys = _multimodal_prompt_keys(prompts, package_root)
+    return len(keys) - len(set(keys))
+
+
 def decode_arrow_examples(examples: list[dict], package_root: str | Path | None) -> list[dict]:
     decoded = []
     for example in examples:
@@ -661,9 +727,7 @@ def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: b
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
     if algorithm == "opd":
-        raise ValueError("opd does not support image-bearing records; use sft or single-turn grpo")
-    if algorithm == "grpo" and multi_turn:
-        raise ValueError("multimodal multi-turn grpo is not supported; use single-turn grpo or image sft")
+        raise ValueError("opd does not support image-bearing records; use sft or grpo")
 
 
 def assistant_completion_text(completion: object) -> str:
@@ -755,5 +819,5 @@ def preflight_reject_image_opd(spec) -> None:
         if record_has_images(record, _record_messages(record)):
             raise ValueError(
                 f"opd does not support image-bearing records (found an image in dataset row {index}); "
-                "use sft or single-turn grpo"
+                "use sft or grpo"
             )
