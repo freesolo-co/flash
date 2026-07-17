@@ -7,6 +7,9 @@ the calls instead of touching the Hub).
 from __future__ import annotations
 
 import json
+import os
+import struct
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -22,6 +25,43 @@ def _install_fake_hub(monkeypatch, *, download, hf_api):
     fake.HfApi = hf_api
     fake.snapshot_download = download
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
+
+
+def _safetensors_bytes(header: dict, data: bytes) -> bytes:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    header_bytes += b" " * (-len(header_bytes) % 8)
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + data
+
+
+def _parse_safetensors_bytes(contents: bytes) -> tuple[dict, bytes]:
+    (header_length,) = struct.unpack("<Q", contents[:8])
+    data_start = 8 + header_length
+    return json.loads(contents[8:data_start]), contents[data_start:]
+
+
+def test_export_import_does_not_initialize_worker_package(tmp_path):
+    malformed_spec = tmp_path / "job-spec.json"
+    malformed_spec.write_text("not-json", encoding="utf-8")
+    env = os.environ.copy()
+    env["FLASH_JOB_SPEC_JSON"] = "not-json"
+    env["FLASH_JOB_SPEC_PATH"] = str(malformed_spec)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import flash.serve.export; "
+            "assert 'flash.engine.worker' not in sys.modules",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_token(monkeypatch):
@@ -127,6 +167,180 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["upload"]["delete_patterns"] == ["adapter_model*", "adapter_config.json"]
     # The commit is pinned to the repo's current head (concurrent-export guard).
     assert calls["upload"]["parent_commit"] == "parent-sha"
+
+
+def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch):
+    uploaded: dict = {}
+    infixed_a = (
+        "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_A.default.weight"
+    )
+    infixed_b = (
+        "base_model.model.model.language_model.layers.0.mlp.gate_proj.lora_B.default.weight"
+    )
+    plain = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+    double_infix = (
+        "base_model.model.model.language_model.layers.0.language_model.mlp.up_proj."
+        "lora_A.default.weight"
+    )
+    header = {
+        "__metadata__": {"format": "pt", "note": "preserve exactly"},
+        infixed_a: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+        plain: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        infixed_b: {"dtype": "F16", "shape": [1], "data_offsets": [4, 6]},
+        double_infix: {"dtype": "F16", "shape": [1], "data_offsets": [6, 8]},
+    }
+    data = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+    source_bytes = _safetensors_bytes(header, data)
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    uploaded_header, uploaded_data = _parse_safetensors_bytes(uploaded["weights"])
+    expected_a = infixed_a.replace(".language_model.", ".", 1)
+    expected_b = infixed_b.replace(".language_model.", ".", 1)
+    expected_double = double_infix.replace(".language_model.", ".", 1)
+    assert set(uploaded_header) == {
+        "__metadata__",
+        expected_a,
+        plain,
+        expected_b,
+        expected_double,
+    }
+    assert uploaded_header["__metadata__"] == header["__metadata__"]
+    assert uploaded_header[expected_a] == header[infixed_a]
+    assert uploaded_header[plain] == header[plain]
+    assert uploaded_header[expected_b] == header[infixed_b]
+    assert uploaded_header[expected_double] == header[double_infix]
+    assert ".language_model." in expected_double
+    assert uploaded_data == data
+
+
+def test_export_adapter_key_collision_leaves_safetensors_unchanged(monkeypatch):
+    uploaded: dict = {}
+    infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    plain = infixed.replace(".language_model.", ".", 1)
+    source_bytes = _safetensors_bytes(
+        {
+            infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            plain: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        },
+        b"\x01\x02\x03\x04",
+    )
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert uploaded["weights"] == source_bytes
+
+
+def test_export_adapter_without_safetensors_still_exports(monkeypatch):
+    uploaded: dict = {}
+    bin_weights = b"legacy-adapter-weights"
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.bin").write_bytes(bin_weights)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            folder = Path(folder_path)
+            uploaded["files"] = sorted(path.name for path in folder.iterdir())
+            uploaded["weights"] = (folder / "adapter_model.bin").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    url = export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert url == "https://huggingface.co/me/adapters"
+    assert uploaded["files"] == ["adapter_config.json", "adapter_model.bin"]
+    assert uploaded["weights"] == bin_weights
 
 
 def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
@@ -519,6 +733,75 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             base_model=BASE_MODEL,
             source_token="hf_operator",
         )
+
+
+def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch):
+    from flash.serve.deploy import ServingError
+
+    message = "You don't have the rights to download this repository"
+
+    class FakeHfHubHTTPError(OSError):
+        pass
+
+    def fake_snapshot_download(**kw):
+        raise FakeHfHubHTTPError(message)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ServingError) as exc_info:
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+
+    assert message in str(exc_info.value)
+
+
+def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypatch):
+    from flash.serve.deploy import ServingError
+
+    message = "You don't have the rights to create a model under the namespace me"
+
+    class FakeHfHubHTTPError(OSError):
+        pass
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            raise FakeHfHubHTTPError(message)
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ServingError) as exc_info:
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+
+    assert message in str(exc_info.value)
 
 
 def test_resolve_hf_token_priority_explicit_then_env_then_dotenv(tmp_path, monkeypatch):
