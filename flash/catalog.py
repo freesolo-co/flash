@@ -197,7 +197,7 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-0.8B": ModelInfo(
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",
-        params="0.9B (text-only fine-tune)",
+        params="0.9B",
         params_b=0.9,
         vocab_size=248_320,
         algos=ALGORITHMS,
@@ -216,7 +216,7 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-2B": ModelInfo(
         id="Qwen/Qwen3.5-2B",
         display_name="Qwen3.5 2B",
-        params="2.3B (text-only fine-tune)",
+        params="2.3B",
         params_b=2.3,
         vocab_size=248_320,
         algos=ALGORITHMS,
@@ -234,7 +234,7 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-4B": ModelInfo(
         id="Qwen/Qwen3.5-4B",
         display_name="Qwen3.5 4B",
-        params="4.7B (text-only fine-tune)",
+        params="4.7B",
         params_b=4.7,
         vocab_size=248_320,
         algos=ALGORITHMS,
@@ -256,7 +256,7 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-9B": ModelInfo(
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
-        params="9.7B (text-only fine-tune)",
+        params="9.7B",
         params_b=9.7,
         vocab_size=248_320,
         algos=ALGORITHMS,

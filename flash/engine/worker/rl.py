@@ -163,7 +163,18 @@ def run_rl():
                 for ex, messages in zip(train, message_prompts, strict=True)
             ]
         else:
-            prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for ex in train]
+            prompts = [
+                {
+                    "prompt": tok.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=_w.THINKING,
+                    ),
+                    "example": ex,
+                }
+                for ex, messages in zip(train, message_prompts, strict=True)
+            ]
         _max_completion = int(
             gcfg.get("max_tokens")
             or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
@@ -451,7 +462,7 @@ def run_rl():
     configure_trainer_save_schedule(grpo_kwargs, save_at_steps)
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
-    if "chat_template_kwargs" in _grpo_fields:
+    if multimodal and "chat_template_kwargs" in _grpo_fields:
         grpo_kwargs["chat_template_kwargs"] = {"enable_thinking": _w.THINKING}
     # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
     # the rollout can silently produce no completions (flash-attn PTX JIT failure).

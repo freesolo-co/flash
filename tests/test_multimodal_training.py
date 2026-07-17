@@ -231,23 +231,41 @@ def test_remote_images_are_opt_in_and_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(
         mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
     )
-    descriptor = mm.normalize_image_source(url, root)
-    data = _png_bytes()
-
     _install_http_response(
         monkeypatch,
         headers={"Content-Length": str(mm.MAX_IMAGE_SOURCE_BYTES + 1)},
     )
     with pytest.raises(ValueError, match="source exceeds"):
-        mm.decode_image_descriptor(descriptor, root)
+        mm.normalize_image_source(url, root)
 
+    data = _png_bytes()
     _install_http_response(
         monkeypatch,
         data=data,
         headers={"Content-Length": str(len(data))},
     )
+    descriptor = mm.normalize_image_source(url, root)
+    assert json.loads(descriptor)["kind"] == "bytes"
     image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, root)
     assert image.size == (2, 2)
+
+
+def test_remote_images_are_fetched_once_and_materialized_as_bytes(monkeypatch):
+    data = _png_bytes()
+    url = "https://images.example/red.png"
+    calls = []
+
+    monkeypatch.setenv(mm.REMOTE_IMAGE_ENV, "1")
+    monkeypatch.setattr(mm, "_read_remote", lambda value: calls.append(value) or data)
+
+    descriptor = mm.normalize_image_source(url, None)
+    parsed = json.loads(descriptor)
+
+    assert parsed["kind"] == "bytes"
+    assert base64.b64decode(parsed["value"], validate=True) == data
+    image, _encoded, _decoded = mm.decode_image_descriptor(descriptor, None)
+    assert image.size == (2, 2)
+    assert calls == [url]
 
 
 @pytest.mark.parametrize(
@@ -274,7 +292,6 @@ def test_remote_images_do_not_follow_redirects_to_private_hosts(monkeypatch):
     monkeypatch.setattr(
         mm.socket, "getaddrinfo", lambda *args, **kwargs: _addrinfo("93.184.216.34")
     )
-    descriptor = mm.normalize_image_source("http://images.example/red.png", None)
     _install_http_response(
         monkeypatch,
         status=302,
@@ -282,7 +299,7 @@ def test_remote_images_do_not_follow_redirects_to_private_hosts(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="redirects are not allowed"):
-        mm.decode_image_descriptor(descriptor, None)
+        mm.normalize_image_source("http://images.example/red.png", None)
 
 
 def test_malformed_blocks_fail_clearly(tmp_path):
@@ -482,6 +499,23 @@ def test_single_turn_conversational_completion_keeps_text_reward_semantics():
         {"role": "assistant", "content": [{"type": "text", "text": "red"}]}
     ]
     assert mm.assistant_completion_text(completion) == "red"
+
+
+def test_sft_rejects_image_completion_when_prompt_is_text_only():
+    from flash.engine.worker.sft import _reject_image_completion
+
+    completion = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "answer"},
+                {"type": "image_url", "image_url": {"url": "https://images.example/x.png"}},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="image-bearing SFT completions are not supported"):
+        _reject_image_completion(completion)
 
 
 def test_multimodal_algorithm_validation_rejects_unsupported_modes():

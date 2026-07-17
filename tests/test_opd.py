@@ -1051,17 +1051,24 @@ def test_opd_rejects_tool_environments(monkeypatch):
         opd_mod.run_opd()
 
 
-def test_opd_rejects_generated_image_prompts_before_credentials_or_gpu_setup(monkeypatch):
+def test_opd_rejects_generated_image_prompts_in_cached_filter_render(monkeypatch):
+    pytest.importorskip("torch")
     import flash.engine.worker.teacher as teacher_mod
+    from flash.engine.worker import hf as hf_mod
     from flash.engine.worker import opd as opd_mod
 
-    torch_module = types.ModuleType("torch")
-    transformers_module = types.ModuleType("transformers")
-    transformers_module.AutoTokenizer = object()
-    monkeypatch.setitem(sys.modules, "torch", torch_module)
-    monkeypatch.setitem(sys.modules, "transformers", transformers_module)
-
     events = []
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])
+
     env = SimpleNamespace(
         is_tool_env=False,
         multi_turn=False,
@@ -1079,28 +1086,53 @@ def test_opd_rejects_generated_image_prompts_before_credentials_or_gpu_setup(mon
     )
     fake_w = SimpleNamespace(
         require_active_env=lambda: events.append("require_active_env") or env,
-        JOB_SPEC=SimpleNamespace(train=SimpleNamespace(max_examples=1)),
-        SEED=0,
+        JOB_SPEC=SimpleNamespace(
+            train=SimpleNamespace(init_from_adapter="", max_examples=1),
+            model="fake/model",
+            model_revision="",
+            gpu=SimpleNamespace(type=None, exact_type=""),
+        ),
+        THINKING=False,
+        SEED=7,
+        heartbeat=lambda stage, **kwargs: events.append(stage),
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
-    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    monkeypatch.setattr(
+        opd_mod, "seed_training_rngs", lambda seed: events.append(f"seed:{seed}")
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_resolve_opd_knobs",
+        lambda: opd_mod.OpdKnobs(
+            teacher_model="teacher",
+            teacher_base_url="http://teacher.invalid",
+            epochs=1,
+            learning_rate=1e-4,
+            temperature=0.0,
+            top_p=1.0,
+            max_completion=8,
+            prompts_per_step=1,
+            group_size=1,
+        ),
+    )
+    monkeypatch.setattr(teacher_mod, "TeacherClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *args, **kwargs: None)
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda: None)
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda: None)
+    monkeypatch.setattr(hf_mod, "load_tokenizer", lambda *args, **kwargs: _Tok())
+    monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
 
-    def fail(stage):
-        def _fail(*args, **kwargs):
-            events.append(stage)
-            raise AssertionError(f"{stage} must not run before image prompt rejection")
+    def fail_student(*args, **kwargs):
+        raise AssertionError("student model must not load before image prompt rejection")
 
-        return _fail
-
-    monkeypatch.setattr(teacher_mod, "TeacherClient", fail("teacher_client"))
-    monkeypatch.setattr(opd_mod, "wait_for_gpu", fail("wait_for_gpu"))
-    monkeypatch.setattr(opd_mod, "setup_perf_backends", fail("setup_perf_backends"))
-    monkeypatch.setattr(opd_mod, "gpu_diagnostics", fail("gpu_diagnostics"))
+    monkeypatch.setattr(opd_mod, "_student_model", fail_student)
 
     with pytest.raises(ValueError, match="opd does not support image-bearing"):
         opd_mod.run_opd()
 
-    assert events == ["require_active_env", "dataset", "prompt_messages"]
+    assert events[:3] == ["require_active_env", "seed:7", "dataset"]
+    assert events.count("prompt_messages") == 1
 
 
 class _CharTok:

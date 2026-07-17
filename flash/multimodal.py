@@ -234,8 +234,9 @@ def normalize_image_source(source: object, package_root: str | Path | None) -> s
             raise ValueError(
                 f"remote image URLs are disabled; set {REMOTE_IMAGE_ENV}=1 only for a trusted dataset"
             )
-        _validate_remote_url(value)
-        return _descriptor("remote", value)
+        data = _read_remote(value)
+        _inspect_image_bytes(data)
+        return _descriptor("bytes", base64.b64encode(data).decode("ascii"))
     if scheme == "file":
         raise ValueError("file:// image URLs are not supported")
     if scheme:
@@ -415,8 +416,6 @@ def descriptor_source_size(descriptor: str, package_root: str | Path | None) -> 
         return len(_data_uri_bytes(value))
     if kind == "path":
         return _package_image_path(value, Path(package_root) if package_root else None).stat().st_size
-    if kind == "remote":
-        return 0
     raise ValueError("invalid internal image descriptor kind")
 
 
@@ -491,10 +490,6 @@ def _read_descriptor_source(descriptor: str, package_root: str | Path | None) ->
         data = _data_uri_bytes(value)
     elif kind == "path":
         data = _package_image_path(value, Path(package_root) if package_root else None).read_bytes()
-    elif kind == "remote":
-        if not _remote_enabled():
-            raise ValueError(f"remote image URLs require {REMOTE_IMAGE_ENV}=1 at decode time")
-        data = _read_remote(value)
     else:
         raise ValueError("invalid internal image descriptor kind")
     _check_source_size(len(data))
@@ -686,16 +681,6 @@ def assistant_completion_text(completion: object) -> str:
                     if isinstance(block, dict) and block.get("type") == "text"
                 )
     return ""
-
-
-def assert_records_are_text_only(records: list[dict], prompt_messages: Callable[[dict], list[dict]]) -> None:
-    for index, record in enumerate(records):
-        messages = prompt_messages(record)
-        if record_has_images(record, messages):
-            raise ValueError(
-                f"opd does not support image-bearing records (found an image in dataset row {index}); "
-                "use sft or single-turn grpo"
-            )
 
 
 def _record_messages(record: dict) -> list[dict]:

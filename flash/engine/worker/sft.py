@@ -163,6 +163,13 @@ def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
     return int(max_steps) > 0 and int(final_step) < int(update_horizon)
 
 
+def _reject_image_completion(completion) -> None:
+    from flash.multimodal import record_has_images
+
+    if record_has_images({}, completion):
+        raise ValueError("image-bearing SFT completions are not supported")
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoProcessor
@@ -228,9 +235,8 @@ def run_sft():
         for ex, prompt_messages, completion in prompt_rows:
             if len(completion) > 1:
                 multiturn_targets += 1
+            _reject_image_completion(completion)
             if multimodal:
-                if record_has_images({}, completion):
-                    raise ValueError("image-bearing SFT completions are not supported")
                 normalized = normalize_prompt_images(ex, prompt_messages, package_root)
                 prompt_messages = normalized.messages
                 vl_rows.append(

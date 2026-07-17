@@ -461,12 +461,8 @@ def run_opd():
     # single-turn env keeps the original one-generate-per-prompt path.
     multi_turn = bool(getattr(env, "multi_turn", False))
 
-    # validate generated prompts before credentials, provider clients, gpu setup, or model loading.
-    train = env.dataset()
-    from flash.multimodal import assert_records_are_text_only
-
-    assert_records_are_text_only(train, env.prompt_messages)
     seed_training_rngs(_w.SEED)
+    train = env.dataset()
 
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
@@ -516,8 +512,8 @@ def run_opd():
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
     # build the on-policy prompt pool before loading the student.
-    # the dataset was loaded and checked for image-bearing prompts before credentials, gpu setup,
-    # or model files. bound, shuffle, and pre-filter it here before loading the student.
+    # the dataset was loaded before credentials, gpu setup, or model files. bound, shuffle, and
+    # pre-filter it here before loading the student.
     if not train:
         raise RuntimeError(
             "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "
@@ -565,6 +561,8 @@ def run_opd():
     # model-load liveness starts. Pollers reset setup grace only on NON-liveness (progress) heartbeats,
     # so a healthy worker scanning a big split could exceed the grace and be reaped as stalled
     # (codex[bot]). Drive a real progress heartbeat off a monotonic scan counter while filtering.
+    from flash.multimodal import record_has_images
+
     _scanned = 0
     with liveness_heartbeat("opd_filtering_prompts", progress=lambda: _scanned):
         examples = []
@@ -575,6 +573,10 @@ def run_opd():
             # pool that PASSED this filter could still yield no usable samples after paying for GPU/model
             # setup. Reusing this exact render below guarantees every visited prompt fits (codex[bot]).
             msgs = env.prompt_messages(ex)
+            if record_has_images(ex, msgs):
+                raise ValueError(
+                    "opd does not support image-bearing records; use sft or single-turn grpo"
+                )
             ids = _render_prompt_ids(msgs)
             if len(ids) <= prompt_budget:
                 examples.append((ex, msgs, ids))
