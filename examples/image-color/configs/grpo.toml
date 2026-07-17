@@ -1,0 +1,15 @@
+model = "Qwen/Qwen3.5-4B"
+algorithm = "grpo"
+thinking = false
+
+[environment]
+id = ""
+
+[train]
+epochs = 1
+max_examples = 1
+max_context_tokens = 1024
+max_completion_tokens = 32
+batch_size = 1
+group_size = 2
+lora_rank = 32

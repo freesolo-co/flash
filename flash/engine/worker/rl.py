@@ -48,6 +48,7 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
 
 def run_rl():
     from datasets import Dataset
+    from transformers import AutoProcessor
     from trl import GRPOConfig, GRPOTrainer
 
     seed_training_rngs(_w.SEED)
@@ -110,9 +111,12 @@ def run_rl():
     # tokenizer + dataset download + per-prompt budget tokenization of the whole dataset can run
     # for minutes with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("rl_data_loading"):
-        tok = _w.load_tokenizer(model_id, revision=model_revision)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
+        from flash.multimodal import (
+            normalize_prompt_images,
+            processor_prompt_token_count,
+            record_has_images,
+            validate_multimodal_training,
+        )
 
         train = env.dataset()
         _max_examples = getattr(_t, "max_examples", None) if _t else None
@@ -121,8 +125,43 @@ def run_rl():
             train = train[:max_examples]
         rng = random.Random(_w.SEED)
         rng.shuffle(train)
-        if conversational:
-            prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
+        message_prompts = [env.prompt_messages(ex) for ex in train]
+        multimodal = any(
+            record_has_images(ex, messages)
+            for ex, messages in zip(train, message_prompts, strict=True)
+        )
+        processor = None
+        if multimodal:
+            validate_multimodal_training(model_id, "grpo", multi_turn=is_multi_turn)
+            conversational = True
+            processor = AutoProcessor.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **_w.model_revision_kwargs(model_revision),
+            )
+            tok = processor.tokenizer
+        else:
+            tok = _w.load_tokenizer(model_id, revision=model_revision)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        package_root = getattr(env, "package_root", None)
+        if multimodal:
+            prompts = []
+            for ex, messages in zip(train, message_prompts, strict=True):
+                normalized = normalize_prompt_images(ex, messages, package_root)
+                prompts.append(
+                    {
+                        "prompt": normalized.messages,
+                        "images": normalized.descriptors,
+                        "example": ex,
+                    }
+                )
+        elif conversational:
+            prompts = [
+                {"prompt": messages, "example": ex}
+                for ex, messages in zip(train, message_prompts, strict=True)
+            ]
         else:
             prompts = [{"prompt": _w.render_prompt(tok, ex), "example": ex} for ex in train]
         _max_completion = int(
@@ -164,6 +203,15 @@ def run_rl():
                 ) from exc
 
         def _prompt_tokens(p) -> int:
+            if multimodal:
+                return processor_prompt_token_count(
+                    processor,
+                    p["prompt"],
+                    p["images"],
+                    package_root,
+                    tools=_oai_tools,
+                    enable_thinking=_w.THINKING,
+                )
             return len(tok(_render_for_budget(p), add_special_tokens=False).input_ids)
 
         kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
@@ -189,6 +237,10 @@ def run_rl():
     # Carry a stable int index, not the rich record, so PyArrow can't crash on mixed-type info.
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
     ds = Dataset.from_list(ds_rows)
+    if multimodal:
+        from flash.multimodal import lazy_image_dataset_transform
+
+        ds = ds.with_transform(lazy_image_dataset_transform(package_root))
 
     # Derived from a real rendered prompt, NOT _w.THINKING: a template that ignores enable_thinking
     # must not have its tagless answers treated as unterminated reasoning (over-penalized).
@@ -226,11 +278,15 @@ def run_rl():
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             try:
-                if isinstance(comp, list):
-                    # Conversational transcript (list of messages): score the whole transcript.
+                if isinstance(comp, list) and is_multi_turn:
+                    # conversational multi-turn transcripts are scored as complete episodes.
                     r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue
+                if isinstance(comp, list):
+                    from flash.multimodal import assistant_completion_text
+
+                    comp = assistant_completion_text(comp)
                 graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
                 state = (
                     {
@@ -395,6 +451,8 @@ def run_rl():
     configure_trainer_save_schedule(grpo_kwargs, save_at_steps)
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
+    if "chat_template_kwargs" in _grpo_fields:
+        grpo_kwargs["chat_template_kwargs"] = {"enable_thinking": _w.THINKING}
     # sm120: pin a PTX-independent vLLM attention backend before TRL builds the engine, else
     # the rollout can silently produce no completions (flash-attn PTX JIT failure).
     _w.force_vllm_backend_for_sm120()
@@ -657,7 +715,7 @@ def run_rl():
             train_dataset=ds,
             reward_funcs=reward_fn,
             peft_config=init_peft,
-            processing_class=tok,
+            processing_class=processor if multimodal else tok,
             callbacks=[
                 hb_cb,
                 _w.make_checkpoint_upload_callback(save_at_steps),
@@ -746,7 +804,7 @@ def run_rl():
         adapter_dir = f"{out_dir}/adapter"
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
-        tok.save_pretrained(adapter_dir)
+        (processor if multimodal else tok).save_pretrained(adapter_dir)
         _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
         # Warm-start CONTINUES the one SFT adapter in place, so the saved adapter already carries
         # SFT+GRPO on the original catalog base and deploys as-is — no recombine step (fresh-LoRA runs

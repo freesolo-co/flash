@@ -447,7 +447,6 @@ def run_opd():
     from flash.engine.worker.hf import load_tokenizer, model_revision_kwargs
     from flash.engine.worker.teacher import TeacherClient
 
-    seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     if getattr(env, "is_tool_env", False):
         # Tool envs need TRL's native tool-call loop (rl.py hands the tool schemas + callables to the
@@ -461,6 +460,14 @@ def run_opd():
     # conditioned on the transcript so far (see _run_multi_turn_step / rollout_one_records). A
     # single-turn env keeps the original one-generate-per-prompt path.
     multi_turn = bool(getattr(env, "multi_turn", False))
+
+    # validate generated prompts before credentials, provider clients, gpu setup, or model loading.
+    train = env.dataset()
+    from flash.multimodal import assert_records_are_text_only
+
+    assert_records_are_text_only(train, env.prompt_messages)
+    seed_training_rngs(_w.SEED)
+
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
@@ -508,13 +515,9 @@ def run_opd():
     }
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
-    # --- Build the on-policy prompt pool BEFORE loading the student ------------------------------
-    # Fetch the dataset, seed the RNGs, and pre-filter to the prompts that fit the context budget
-    # HERE — ahead of _student_model, which for a VL warm-start downloads the base and MERGES the SFT
-    # into it. A dataset whose every prompt is over-budget is a deterministic failure; detecting it
-    # now fails fast, before a paid worker pays for the base download + SFT merge (only tok/env/knobs
-    # are needed, none of which depend on the loaded model).
-    train = env.dataset()
+    # build the on-policy prompt pool before loading the student.
+    # the dataset was loaded and checked for image-bearing prompts before credentials, gpu setup,
+    # or model files. bound, shuffle, and pre-filter it here before loading the student.
     if not train:
         raise RuntimeError(
             "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "

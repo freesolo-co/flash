@@ -1033,6 +1033,9 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
+    from flash.multimodal import preflight_reject_image_opd
+
+    preflight_reject_image_opd(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:

@@ -165,6 +165,7 @@ def sft_under_ran(final_step: int, update_horizon: int, max_steps: int) -> bool:
 
 def run_sft():
     from datasets import Dataset
+    from transformers import AutoProcessor
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
@@ -194,18 +195,52 @@ def run_sft():
     # tokenizer + dataset download + O(N) chat-template render can run for minutes on a big
     # dataset with no heartbeat in between; keep the channel visibly fresh.
     with liveness_heartbeat("sft_data_loading"):
-        tok = _w.load_tokenizer(model_id, revision=model_revision)
+        from flash.multimodal import (
+            normalize_prompt_images,
+            record_has_images,
+            validate_multimodal_training,
+        )
+
+        train = select_sft_examples(env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED)
+        prompt_rows = [(ex, env.prompt_messages(ex), env.sft_completion(ex)) for ex in train]
+        multimodal = any(
+            record_has_images(ex, prompt_messages)
+            for ex, prompt_messages, _completion in prompt_rows
+        )
+        processor = None
+        if multimodal:
+            validate_multimodal_training(model_id, "sft")
+            processor = AutoProcessor.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **_w.model_revision_kwargs(model_revision),
+            )
+            tok = processor.tokenizer
+        else:
+            tok = _w.load_tokenizer(model_id, revision=model_revision)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
-        train = select_sft_examples(env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED)
+        package_root = getattr(env, "package_root", None)
         texts = []
+        vl_rows = []
         multiturn_targets = 0
-        for ex in train:
-            completion = env.sft_completion(ex)
+        for ex, prompt_messages, completion in prompt_rows:
             if len(completion) > 1:
                 multiturn_targets += 1
-            prompt_messages = env.prompt_messages(ex)
+            if multimodal:
+                if record_has_images({}, completion):
+                    raise ValueError("image-bearing SFT completions are not supported")
+                normalized = normalize_prompt_images(ex, prompt_messages, package_root)
+                prompt_messages = normalized.messages
+                vl_rows.append(
+                    {
+                        "prompt": prompt_messages,
+                        "completion": completion,
+                        "images": normalized.descriptors,
+                        "chat_template_kwargs": {"enable_thinking": _w.THINKING},
+                    }
+                )
             msgs = [*prompt_messages, *completion]
             texts.append(
                 {
@@ -259,20 +294,31 @@ def run_sft():
         RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len,
     )
     with liveness_heartbeat("sft_pretokenizing"):
-        texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
+        if multimodal:
+            from flash.multimodal import ArrowSafeVisionCollator, filter_vlm_sft_rows
+
+            _vision_collator = ArrowSafeVisionCollator(processor, sft_max_len, package_root)
+            vl_rows, _dropped, _masked_tok, _total_tok = filter_vlm_sft_rows(
+                vl_rows,
+                _vision_collator,
+                set(getattr(tok, "all_special_ids", None) or []),
+            )
+            _pretok = []
+        else:
+            texts, _pretok, _dropped = _pretokenize_completion_only(texts, tok, sft_max_len)
+            _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
+            _total_tok = sum(len(r["input_ids"]) for r in _pretok)
     if _dropped:
         print(
             f"[sft] dropped {_dropped} rows with no real completion target "
             "(sft_max_len truncated away the whole completion, or an empty/content-free completion)"
         )
-    if not _pretok:
+    if not (vl_rows if multimodal else _pretok):
         raise ValueError(
             "every SFT example has an empty completion after sft_max_len truncation (nothing to "
             "train on); increase sft_max_len or shorten the prompts"
         )
-    ds = Dataset.from_list(_pretok)
-    _masked_tok = sum(m.count(0) for m in (r["completion_mask"] for r in _pretok))
-    _total_tok = sum(len(r["input_ids"]) for r in _pretok)
+    ds = Dataset.from_list(vl_rows) if multimodal else Dataset.from_list(_pretok)
     if _total_tok:
         print(
             f"[sft] completion-only loss: masking {_masked_tok}/{_total_tok} "
@@ -376,6 +422,11 @@ def run_sft():
     _gdn = model_is_gdn_hybrid(model_id, revision=model_revision)
     _bfd_block_count: int | None = None
     _fa_ok = _flash_attn_available()
+    if multimodal:
+        _pure_attn = False
+        _gdn = False
+        _fa_ok = False
+        print("[sft] packing disabled for vision-language batches")
     if _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
@@ -428,7 +479,7 @@ def run_sft():
     # 4D block-diagonal SDPA mask packing: for pure-attn models on plain SDPA (e.g. sm120 RTX 5090).
     # Flash varlen would silently IGNORE the 4D mask — so we downgrade to sdpa when using this path.
     # GDN hybrids need the next branch (mask alone can't reset their causal conv state).
-    _collator = None
+    _collator = _vision_collator if multimodal else None
     # Cap at 16384: dense [B,1,T,T] mask is O(T^2) memory; above this packing gains little anyway.
     _PACK_MASK_MAX_LEN = 16384
     _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
@@ -508,7 +559,7 @@ def run_sft():
             "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
             "efficient there, and long rows already fill a block)."
         )
-    elif not cfg_kwargs.get("packing") and not _pure_attn:
+    elif not multimodal and not cfg_kwargs.get("packing") and not _pure_attn:
         _why = (
             "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
             if _gdn
@@ -620,7 +671,7 @@ def run_sft():
             args=cfg,
             train_dataset=ds,
             peft_config=_w.make_lora(model_id),
-            processing_class=tok,
+            processing_class=processor if multimodal else tok,
             data_collator=_collator,
             callbacks=[
                 _w.make_sft_heartbeat_callback(),
@@ -676,7 +727,7 @@ def run_sft():
         adapter_dir = f"{out_dir}/adapter"
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
         trainer.model.save_pretrained(adapter_dir)
-        tok.save_pretrained(adapter_dir)
+        (processor if multimodal else tok).save_pretrained(adapter_dir)
         _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured.

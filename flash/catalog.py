@@ -13,6 +13,21 @@ ALGORITHMS = ("sft", "grpo", "opd")
 # the cost model, VRAM sizing and worker allocator branch on — import ``samples_on_policy`` instead
 # of hand-rolling the ("grpo", "opd") tuple at each site.
 _ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+_IMAGE_TRAINING_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
+
+
+def supports_image_training(model: str | ModelInfo | None) -> bool:
+    """Return whether a curated model supports image-bearing SFT and GRPO."""
+    model_id = model.id if isinstance(model, ModelInfo) else model
+    return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 
 
 def samples_on_policy(algorithm: str) -> bool:

@@ -786,7 +786,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=0,
@@ -903,11 +903,12 @@ def _opd_harness(
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=0,
         OPD_RESUME_REVISION="",
+        publish_opd_optimizer_start_marker=lambda: None,
         heartbeat=(
             (lambda stage, **kw: beats.append((stage, kw)))
             if beats is not None
@@ -1048,6 +1049,58 @@ def test_opd_rejects_tool_environments(monkeypatch):
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
     with pytest.raises(RuntimeError, match="tool-calling"):
         opd_mod.run_opd()
+
+
+def test_opd_rejects_generated_image_prompts_before_credentials_or_gpu_setup(monkeypatch):
+    import flash.engine.worker.teacher as teacher_mod
+    from flash.engine.worker import opd as opd_mod
+
+    torch_module = types.ModuleType("torch")
+    transformers_module = types.ModuleType("transformers")
+    transformers_module.AutoTokenizer = object()
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "transformers", transformers_module)
+
+    events = []
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        dataset=lambda: events.append("dataset") or [{"input": "describe"}],
+        prompt_messages=lambda _record: events.append("prompt_messages")
+        or [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "https://images.example/x.png"}},
+                ],
+            }
+        ],
+    )
+    fake_w = SimpleNamespace(
+        require_active_env=lambda: events.append("require_active_env") or env,
+        JOB_SPEC=SimpleNamespace(train=SimpleNamespace(max_examples=1)),
+        SEED=0,
+    )
+    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+
+    def fail(stage):
+        def _fail(*args, **kwargs):
+            events.append(stage)
+            raise AssertionError(f"{stage} must not run before image prompt rejection")
+
+        return _fail
+
+    monkeypatch.setattr(teacher_mod, "TeacherClient", fail("teacher_client"))
+    monkeypatch.setattr(opd_mod, "wait_for_gpu", fail("wait_for_gpu"))
+    monkeypatch.setattr(opd_mod, "setup_perf_backends", fail("setup_perf_backends"))
+    monkeypatch.setattr(opd_mod, "gpu_diagnostics", fail("gpu_diagnostics"))
+
+    with pytest.raises(ValueError, match="opd does not support image-bearing"):
+        opd_mod.run_opd()
+
+    assert events == ["require_active_env", "dataset", "prompt_messages"]
 
 
 class _CharTok:
@@ -1195,11 +1248,12 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=0,
         OPD_RESUME_REVISION="",
+        publish_opd_optimizer_start_marker=lambda: None,
         heartbeat=lambda stage, **kw: None,
         prefetch_model=lambda mid: 0.0,
         hf_resume_checkpoint=lambda **_kwargs: "",
@@ -1230,6 +1284,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         ),
     )
     monkeypatch.setattr(opd_mod, "_student_model", lambda *a, **k: (model, "fake/model"))
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda *a, **k: None)
@@ -2751,7 +2806,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=1234,
@@ -2863,7 +2918,7 @@ def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=1234,
@@ -2972,7 +3027,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=0,
