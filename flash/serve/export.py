@@ -217,8 +217,6 @@ def export_adapter(
                 local_dir=tmp,
                 token=read_token,
             )
-        except OSError:
-            raise
         except Exception as exc:
             raise ServingError(
                 f"could not download adapter {source_repo}:{source_subfolder}: {exc}"
@@ -254,8 +252,6 @@ def export_adapter(
             )
             if not private:
                 api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=False)
-        except OSError:
-            raise
         except Exception as exc:
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(

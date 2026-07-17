@@ -708,6 +708,75 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
         )
 
 
+def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch):
+    from flash.serve.deploy import ServingError
+
+    message = "You don't have the rights to download this repository"
+
+    class FakeHfHubHTTPError(OSError):
+        pass
+
+    def fake_snapshot_download(**kw):
+        raise FakeHfHubHTTPError(message)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ServingError) as exc_info:
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+
+    assert message in str(exc_info.value)
+
+
+def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypatch):
+    from flash.serve.deploy import ServingError
+
+    message = "You don't have the rights to create a model under the namespace me"
+
+    class FakeHfHubHTTPError(OSError):
+        pass
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            raise FakeHfHubHTTPError(message)
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(ServingError) as exc_info:
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+
+    assert message in str(exc_info.value)
+
+
 def test_resolve_hf_token_priority_explicit_then_env_then_dotenv(tmp_path, monkeypatch):
     from flash.client.runtime_secrets import resolve_hf_token
 
