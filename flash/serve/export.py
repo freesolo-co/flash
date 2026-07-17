@@ -6,13 +6,17 @@ the destination model repo, so the user never needs access to internal artifact 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import shutil
+import struct
 import tempfile
 from pathlib import Path
 
 from flash._logging import get_logger
+from flash.engine.worker.lora import strip_language_model_infix
 from flash.serve.deploy import ServingError
 
 logger = get_logger(__name__)
@@ -23,6 +27,94 @@ _STALE_ADAPTER_DELETE_PATTERNS = ["adapter_model*", "adapter_config.json"]
 _TEMP_MERGED_BASE_MODEL_RE = re.compile(
     r"(?:/[^\s\"'`,\]\){}]+)*/flash_sft_merged_[^\s\"'`,\]\){}]+"
 )
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate safetensors JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
+    path = adapter_dir / "adapter_model.safetensors"
+    if not path.is_file():
+        logger.warning("exported adapter has no safetensors weights; leaving weights unchanged")
+        return False
+
+    temp_path: Path | None = None
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as source:
+            length_bytes = source.read(8)
+            if len(length_bytes) != 8:
+                raise ValueError("file is too small to contain a safetensors header")
+            (header_length,) = struct.unpack("<Q", length_bytes)
+            if (
+                header_length > file_size - 8
+                or header_length > _MAX_SAFETENSORS_HEADER_BYTES
+            ):
+                raise ValueError(
+                    f"declared header length {header_length} is implausible for {file_size}-byte file"
+                )
+            header_bytes = source.read(header_length)
+            if len(header_bytes) != header_length:
+                raise ValueError("safetensors header is truncated")
+            header = json.loads(
+                header_bytes,
+                object_pairs_hook=_json_object_without_duplicate_keys,
+            )
+            if not isinstance(header, dict):
+                raise ValueError("safetensors header is not a JSON object")
+
+            normalized: dict[str, object] = {}
+            remapped = 0
+            for key, value in header.items():
+                normalized_key = (
+                    key if key == "__metadata__" else strip_language_model_infix(key)
+                )
+                if normalized_key in normalized:
+                    raise ValueError(
+                        f"key {key!r} collides after stripping the '.language_model.' infix"
+                    )
+                normalized[normalized_key] = value
+                remapped += int(normalized_key != key)
+            if remapped == 0:
+                return False
+
+            new_header = json.dumps(
+                normalized,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            new_header += b" " * (-len(new_header) % 8)
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as destination:
+                temp_path = Path(destination.name)
+                destination.write(struct.pack("<Q", len(new_header)))
+                destination.write(new_header)
+                shutil.copyfileobj(source, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    except Exception as exc:
+        logger.warning("could not normalize exported adapter keys; leaving weights unchanged: %s", exc)
+        return False
+    finally:
+        if temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+
+    logger.info("normalized %d exported adapter weight keys", remapped)
+    return True
 
 
 def _rewrite_adapter_config_base_model(
@@ -143,6 +235,7 @@ def export_adapter(
                 "(need adapter_config.json + an adapter_model* weight; nothing to export)"
             )
         _repair_export_metadata(adapter_dir, base_model, base_model_revision)
+        _normalize_export_adapter_keys(adapter_dir)
         api = HfApi(token=dest_token)
         try:
             # Always create private first so the repo is never transiently exposed empty/partial.

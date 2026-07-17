@@ -185,6 +185,14 @@ def disable_liger_grpo_torch_compile(trainer) -> bool:
 _LANGUAGE_MODEL_INFIX = ".language_model."
 
 
+def strip_language_model_infix(key: str) -> str:
+    """Strip the first ``.language_model.`` infix from a peft adapter weight key."""
+    index = key.find(_LANGUAGE_MODEL_INFIX)
+    if index == -1:
+        return key
+    return key[:index] + "." + key[index + len(_LANGUAGE_MODEL_INFIX) :]
+
+
 # Substrings that identify a peft LoRA weight key (vs a base-model param). The whole adapter file
 # is LoRA weights, but a wrong-arch / corrupt checkpoint can contain non-LoRA tensors, so we filter.
 _LORA_KEY_MARKERS = (".lora_A.", ".lora_B.", ".lora_embedding_A.", ".lora_embedding_B.", "lora_")
