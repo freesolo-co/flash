@@ -601,10 +601,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
     assert "vocab=_sft_vocab" in src
     assert "vocab_size_for(model_id)" not in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. The GC decision now runs through
-    # the SFT GC-off gate (grad_checkpointing_on(model_id, sft_max_len, allow_disable=True, ...)) and is
-    # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.
-    assert "grad_checkpointing_on(\n        model_id,\n        sft_max_len," in src
+    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
+    # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
+    assert "grad_checkpointing_on(\n        model_id,\n        _realized_max_len," in src
     assert '"gradient_checkpointing": _grad_ckpt' in src
     # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
     # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
@@ -618,32 +617,18 @@ def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
     the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
     inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
     already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
-    import ast
     import inspect
 
     from flash.engine.worker import sft
 
     src = inspect.getsource(sft.run_sft)
-    # The re-derivation is guarded on packing still being ON post-finalization and uses a bfd ex/block
-    # estimate (a separate pack_token_ids call from the two SDPA/GDN ones).
-    assert "pack_token_ids(_bfd_ids, sft_max_len)" in src
-    assert "[sft] bfd packing:" in src
-    tree = ast.parse(src)
-
-    # The bfd-rederive block assigns cfg_kwargs["gradient_accumulation_steps"] guarded by a
-    # cfg_kwargs.get("packing") test — assert such a guarded assignment exists.
-    def _stores_grad_accum(node):
-        return any(
-            isinstance(sub, ast.Subscript)
-            and isinstance(sub.ctx, ast.Store)
-            and "gradient_accumulation_steps" in ast.dump(sub)
-            for sub in ast.walk(node)
-        )
-
-    assert any(
-        isinstance(node, ast.If) and "packing" in ast.dump(node.test) and _stores_grad_accum(node)
-        for node in ast.walk(tree)
-    ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
+    # the shared packed-path re-derivation uses the bfd ex/block estimate after backend selection.
+    assert "_bfd_preview = pack_dataset(" in src
+    assert 'strategy="bfd"' in src
+    assert 'f"[sft] {_packing_kind} packing:' in src
+    assert "if _packed_examples_per_block is not None:" in src
+    assert "per_device_bs * _packed_examples_per_block" in src
+    assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
 
 
 def test_trl_collator_masks_prompt_from_pretokenized_rows():
