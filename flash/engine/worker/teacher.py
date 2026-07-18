@@ -13,11 +13,14 @@ All heavy work is inside methods; importing this module is CPU/offline-safe.
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import math
 import os
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from flash.engine.worker.tokenizer_align import TeacherToken
@@ -174,6 +177,112 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     return spans
 
 
+class _ReusableHttpsResponse:
+    def __init__(self, transport, connection, response) -> None:
+        self._transport = transport
+        self._connection = connection
+        self._response = response
+        self._read_complete = False
+
+    def read(self) -> bytes:
+        try:
+            body = self._response.read()
+        except http.client.IncompleteRead:
+            self._transport.discard(self._connection)
+            raise
+        self._read_complete = True
+        if self._response.will_close or self._connection.sock is None:
+            self._transport.discard(self._connection)
+        return body
+
+    def close(self) -> None:
+        self._response.close()
+        if not self._read_complete or self._response.will_close or self._connection.sock is None:
+            self._transport.discard(self._connection)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> bool:
+        self.close()
+        return False
+
+
+class _ThreadLocalHttpsTransport:
+    _stale_errors = (
+        http.client.RemoteDisconnected,
+        http.client.CannotSendRequest,
+        http.client.ResponseNotReady,
+        BrokenPipeError,
+        ConnectionResetError,
+    )
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def discard(self, connection) -> None:
+        if getattr(self._local, "connection", None) is connection:
+            self._local.connection = None
+            self._local.origin = None
+        connection.close()
+
+    def _connection(self, parsed, timeout: float):
+        origin = (parsed.hostname, parsed.port or 443)
+        connection = getattr(self._local, "connection", None)
+        if connection is not None and getattr(self._local, "origin", None) != origin:
+            self.discard(connection)
+            connection = None
+        if connection is None:
+            connection = http.client.HTTPSConnection(origin[0], origin[1], timeout=timeout)
+            self._local.connection = connection
+            self._local.origin = origin
+        else:
+            connection.timeout = timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(timeout)
+        return connection
+
+    def urlopen(self, req: urllib.request.Request, *, timeout: float):
+        parsed = urllib.parse.urlsplit(req.full_url)
+        if parsed.scheme != "https":
+            return urllib.request.urlopen(req, timeout=timeout)
+        connection = self._connection(parsed, timeout)
+        selector = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        try:
+            connection.request(
+                req.get_method(),
+                selector,
+                body=req.data,
+                headers=dict(req.header_items()),
+            )
+            response = connection.getresponse()
+        except self._stale_errors as exc:
+            self.discard(connection)
+            raise urllib.error.URLError(exc) from exc
+        except OSError:
+            self.discard(connection)
+            raise
+        except http.client.HTTPException as exc:
+            self.discard(connection)
+            raise urllib.error.URLError(exc) from exc
+        if response.status < 200 or response.status >= 300:
+            try:
+                body = response.read()
+            except http.client.IncompleteRead:
+                self.discard(connection)
+                raise
+            if response.will_close or connection.sock is None:
+                self.discard(connection)
+            raise urllib.error.HTTPError(
+                req.full_url,
+                response.status,
+                response.reason,
+                response.headers,
+                io.BytesIO(body),
+            )
+        return _ReusableHttpsResponse(self, connection, response)
+
+
 class TeacherClient:
     def __init__(
         self,
@@ -193,6 +302,7 @@ class TeacherClient:
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
+        self._transport = _ThreadLocalHttpsTransport()
 
     # -- transport -------------------------------------------------------------------------------
     def _post(self, path: str, body: dict) -> dict:
@@ -209,7 +319,7 @@ class TeacherClient:
             timeout = self.timeout if remaining is None else min(self.timeout, remaining)
             req = urllib.request.Request(self.base_url + path, data=data, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with self._transport.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
                 # HTTP response bodies may contain arbitrary private provider text. Classify only from
