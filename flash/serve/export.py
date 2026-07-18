@@ -14,6 +14,7 @@ import shutil
 import struct
 import tempfile
 from pathlib import Path
+from typing import BinaryIO
 
 from flash._logging import get_logger
 from flash.serve.deploy import ServingError
@@ -29,16 +30,52 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 # module-path segments outside the language model; mirrors _VL_EXCLUDE_SEGMENTS in
-# flash/engine/worker/lora.py. today's managed adapters never touch these (the worker
-# excludes them from lora), so their presence means a genuinely multimodal adapter whose
-# vision keys the text-only strip cannot represent. normalizing only the lm keys of such
-# an adapter would produce a mixed namespace that matches no transformers class, so the
-# normalization must skip the file entirely and export it as trained.
+# flash/engine/worker/lora.py. managed adapters can contain inert non-lm lora entries when
+# broad target-module names select vision or mtp modules, so key presence alone is not a
+# reason to preserve the mixed namespace. only a nonzero lora_b contribution, or an
+# unrecognized non-lm tensor, proves the adapter genuinely trains those modules and must
+# keep the file unchanged.
 _NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
 
 
 def _references_non_lm_modules(key: str) -> bool:
     return any(segment in key for segment in _NON_LM_KEY_SEGMENTS)
+
+
+def _non_lm_tensor_is_live(
+    source: BinaryIO,
+    key: str,
+    descriptor: object,
+    *,
+    data_start: int,
+    file_size: int,
+) -> bool:
+    is_lora_a = ".lora_A." in key
+    is_lora_b = ".lora_B." in key
+    if is_lora_a and not is_lora_b:
+        return False
+    if not is_lora_b or is_lora_a:
+        return True
+    if not isinstance(descriptor, dict):
+        raise ValueError(f"safetensors descriptor for {key!r} is not an object")
+    offsets = descriptor.get("data_offsets")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or any(not isinstance(offset, int) or isinstance(offset, bool) for offset in offsets)
+    ):
+        raise ValueError(f"safetensors data_offsets for {key!r} are invalid")
+    lo, hi = offsets
+    data_size = file_size - data_start
+    if lo < 0 or hi < lo or hi > data_size:
+        raise ValueError(
+            f"safetensors data_offsets for {key!r} are outside the {data_size}-byte data section"
+        )
+    source.seek(data_start + lo)
+    tensor_bytes = source.read(hi - lo)
+    if len(tensor_bytes) != hi - lo:
+        raise ValueError(f"safetensors tensor data for {key!r} is truncated")
+    return any(tensor_bytes)
 
 
 def _strip_language_model_infix(key: str) -> str:
@@ -90,18 +127,23 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
             if not isinstance(header, dict):
                 raise ValueError("safetensors header is not a JSON object")
 
-            non_lm = [
-                key
-                for key in header
-                if key != "__metadata__" and _references_non_lm_modules(key)
-            ]
-            if non_lm:
-                logger.info(
-                    "exported adapter touches non-lm modules (e.g. %s); keeping the "
-                    "multimodal key namespace unchanged",
-                    non_lm[0],
-                )
-                return False
+            data_start = 8 + header_length
+            for key, descriptor in header.items():
+                if key == "__metadata__" or not _references_non_lm_modules(key):
+                    continue
+                if _non_lm_tensor_is_live(
+                    source,
+                    key,
+                    descriptor,
+                    data_start=data_start,
+                    file_size=file_size,
+                ):
+                    logger.info(
+                        "exported adapter has live non-lm weights (e.g. %s); keeping the "
+                        "multimodal key namespace unchanged",
+                        key,
+                    )
+                    return False
 
             normalized: dict[str, object] = {}
             remapped = 0
@@ -124,6 +166,7 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
                 separators=(",", ":"),
             ).encode("utf-8")
             new_header += b" " * (-len(new_header) % 8)
+            source.seek(data_start)
             with tempfile.NamedTemporaryFile(
                 mode="wb",
                 dir=path.parent,
