@@ -158,34 +158,34 @@ flash export --adapter-id <run-id> --repository <you>/<repo>  # copy adapter wei
 
 Flash trains the Qwen3.5/3.6 family against the full multimodal module tree, so adapter
 weights saved by the worker carry a `language_model.` infix in their tensor keys
-(`base_model.model.model.language_model.layers.*`). `flash export` normalizes those keys
-to the text-only namespace (`base_model.model.model.layers.*`), which is what the default
-`AutoModelForCausalLM` load expects — so a freshly exported adapter loads with vanilla peft:
+(`base_model.model.model.language_model.layers.*`). During `flash export`, adapters that
+can be represented in the text-only namespace are normalized to
+`base_model.model.model.layers.*`. When an export retains non-LM tensors, it keeps the
+multimodal namespace instead. Do not infer the namespace solely from whether `flash export`
+was used: inspect the keys. For normalized keys, load with vanilla peft and
+`AutoModelForCausalLM`:
 
 ```python
 from peft import PeftModel
 from transformers import AutoModelForCausalLM
 
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B")   # Qwen3_5ForCausalLM
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B")  # qwen3.5 causal-lm class
 model = PeftModel.from_pretrained(base, "<you>/<repo>")
 ```
 
 **Before you trust any local eval, check the key namespace matches the model class you
 loaded.** peft does NOT error on mismatched keys — it emits a `UserWarning` about missing
 adapter keys and silently applies *nothing*, so you would benchmark the bare base model
-believing it is your adapter. If the adapter's keys carry the `language_model.` infix
-(adapters exported before key normalization existed, or weights pulled straight from the
-run's artifact repo instead of `flash export`), load the base with the multimodal class
-whose parameters live under that namespace instead:
+believing it is your adapter. If the inspected keys carry the `language_model.` infix,
+load the base with the multimodal class whose parameters live under that namespace instead:
 
 ```python
 # infixed keys (base_model.model.model.language_model.layers.*) need the multimodal class:
-from transformers import AutoModelForImageTextToText, Qwen3_5ForConditionalGeneration
+from transformers import AutoModelForImageTextToText
 
-base = Qwen3_5ForConditionalGeneration.from_pretrained("Qwen/Qwen3.5-0.8B")
-# Qwen3.5/3.6 dense -> Qwen3_5ForConditionalGeneration
-# Qwen3.6-35B-A3B (MoE) -> Qwen3_5MoeForConditionalGeneration
-# (AutoModelForImageTextToText resolves the right one from the config)
+base = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-0.8B")
+# qwen3.5/3.6 dense models resolve to Qwen3_5ForConditionalGeneration
+# qwen3.6-35b-a3b (moe) resolves to Qwen3_5MoeForConditionalGeneration
 model = PeftModel.from_pretrained(base, "<you>/<repo>")
 ```
 
