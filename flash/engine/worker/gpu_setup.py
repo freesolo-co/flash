@@ -114,6 +114,7 @@ def patch_trl_colocate_llm_kwargs(
     kv_cache_dtype: str | None = None,
     max_num_batched_tokens: int | None = None,
     enforce_eager: bool | None = None,
+    compilation_config: dict | None = None,
     attention_backend: str | None = None,
     mm_encoder_attn_backend: str | None = None,
     reasoning_parser: str | None = None,
@@ -144,6 +145,8 @@ def patch_trl_colocate_llm_kwargs(
     * ``enforce_eager=True``: run the rollout engine in pure eager mode (no torch.compile, no CUDA-graph
       capture) — the SUPPORTED replacement for the removed ``VLLM_TORCH_COMPILE_LEVEL=0`` env. Dodges
       the vLLM 0.19.1 aot_compile (Ampere sm86) + Triton slot-mapping (graph-capture) crashes off B200.
+    * ``compilation_config``: select a narrower vLLM compilation profile, such as decode-only CUDA
+      graphs with torch.compile/AOT disabled.
     * ``attention_backend="FLASHINFER"|"TRITON_ATTN"``: pin a PTX-independent decoder attention backend
       (consumer-Blackwell sm120) — the SUPPORTED replacement for the removed ``VLLM_ATTENTION_BACKEND``
       env. ``EngineArgs`` coerces the bare member name through ``AttentionConfig.validate_backend_before``.
@@ -171,6 +174,8 @@ def patch_trl_colocate_llm_kwargs(
         new_overrides["max_num_batched_tokens"] = int(max_num_batched_tokens)
     if enforce_eager is not None:
         new_overrides["enforce_eager"] = bool(enforce_eager)
+    if compilation_config is not None:
+        new_overrides["compilation_config"] = dict(compilation_config)
     if attention_backend is not None:
         new_overrides["attention_backend"] = attention_backend
     if mm_encoder_attn_backend is not None:

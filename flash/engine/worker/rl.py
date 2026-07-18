@@ -46,6 +46,22 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
     return int(steps_run) < int(steps)
 
 
+def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict:
+    decode_only_validated = cc in {(8, 0), (9, 0)} or cc[0] in (10, 12)
+    if decode_only_validated:
+        kwargs = {
+            "enforce_eager": False,
+            "compilation_config": {
+                "mode": 0,
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+            },
+        }
+    else:
+        kwargs = {"enforce_eager": True}
+    _w.patch_trl_colocate_llm_kwargs(**kwargs)
+    return kwargs
+
+
 def run_rl():
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
@@ -461,8 +477,8 @@ def run_rl():
         True,
         "vLLM chunked prefill",
     )
-    # vLLM > 0.19.0 regressed the Triton slot-mapping kernel into an illegal memory access on
-    # the first generation step (CUDA graph compilation triggers it); skip FULL_AND_PIECEWISE.
+    # vllm > 0.19.0 regressed the triton slot-mapping kernel into an illegal memory access on
+    # the first generation step under full compile-and-capture, so use the narrower decode profile.
     _cudagraph_safe = True
     try:
         import vllm as _vllm_mod
@@ -471,29 +487,23 @@ def run_rl():
         _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
         if _vllm_ver > (0, 19, 0):
             _cudagraph_safe = False
-            print(
-                f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
-                "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
-                "crash workaround; update vLLM to a TRL-supported version to re-enable)"
-            )
             try:
                 import torch as _t_cc
 
                 _cc = _t_cc.cuda.get_device_capability()
             except Exception:
                 _cc = (0, 0)
-            _is_b200 = _cc == (10, 0)  # sm100, the only arch validated for cudagraphs here
-            if not _is_b200:
-                _w.patch_trl_colocate_llm_kwargs(enforce_eager=True)
+            _rollout_compilation = _patch_colocate_rollout_compilation(_cc)
+            if _rollout_compilation["enforce_eager"]:
                 print(
                     f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
-                    "-> prevent 0.19.1 aot_compile/slot-mapping crash; the removed "
-                    "VLLM_TORCH_COMPILE_LEVEL env no longer applies on this vLLM)"
+                    "-> unvalidated for decode-only graphs; prevent 0.19.1 "
+                    "aot_compile/slot-mapping crashes)"
                 )
             else:
                 print(
-                    f"[rl] cc={_cc[0]}.{_cc[1]} (B200/sm100): keeping vLLM CUDA graphs for the "
-                    "rollout (validated; MoE-decode speedup)"
+                    f"[rl] cc={_cc[0]}.{_cc[1]}: using decode-only vLLM CUDA graphs for the "
+                    "colocate rollout (torch.compile disabled)"
                 )
     except Exception:
         pass
