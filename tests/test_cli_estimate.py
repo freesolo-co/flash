@@ -321,16 +321,13 @@ def test_sft_positive_max_steps_is_authoritative():
     assert _spec_steps(above_derived) == 9
 
 
-def test_sft_steps_honor_big_vocab_per_device_cap():
-    # For a sub-3B short-ctx SFT the worker vocab-sizes the per-device micro-batch (the big-vocab
-    # logits cap), which with CEIL'd grad-accum changes the REALIZED global batch -- so the priced
-    # step count must mirror the capped batch, not the fixed pd=4 one. Qwen3.5-0.8B (0.9B, ~248k
-    # vocab) at a 1024 ctx leaves CE un-fused -> per_device caps 4->1, so batch 6 realizes 1x6=6
-    # (not 4x2=8): steps = epochs(2) x ceil(320/6) = 108, NOT the uncapped ceil(320/8)*2 = 80.
+def test_sft_steps_use_chunked_nll_realized_batch():
+    # qwen chunked nll removes the dense vocab-logits cap, so pricing must mirror the worker's
+    # per-device batch of four and the resulting realized global batch of eight.
     import math
 
     from flash.catalog import vocab_size_for
-    from flash.engine.vram import sft_logits_fused, sft_per_device, sft_realized_batch
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_per_device, sft_realized_batch
 
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
@@ -347,12 +344,11 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
     }
     spec = spec_from_dict(raw)
     v = vocab_size_for("Qwen/Qwen3.5-0.8B")
-    fused = sft_logits_fused(0.9, 1024)
-    assert fused is False
-    assert sft_per_device(6, seq_len=1024, vocab=v, fused=fused) == 1
-    assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=fused) == 6
-    assert _spec_steps(spec) == math.ceil(320 / 6) * 2 == 108
-    assert _spec_steps(spec) != 80  # the pre-fix uncapped (pd=4 -> realized 8) step count
+    chunked = sft_chunked_nll_enabled(spec.model)
+    assert chunked is True
+    assert sft_per_device(6, seq_len=1024, vocab=v, fused=chunked) == 4
+    assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=chunked) == 8
+    assert _spec_steps(spec) == math.ceil(320 / 8) * 2 == 80
 
 
 def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):

@@ -13,7 +13,7 @@ def test_required_vram_catalog_and_open(monkeypatch):
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
     assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
-    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 21  # 4B SFT seq1k still down-routes below 24 GB
+    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 19  # chunked nll bounds the vocab projection to 256 tokens
     # open model: sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
@@ -364,8 +364,7 @@ def test_estimator_matches_measured_seq_boundaries():
     assert e(0.9, "grpo", seq_len=4096) <= 24
     assert e(0.9, "grpo", seq_len=32768) <= 24
     assert e(0.9, "sft", seq_len=4096) <= 24
-    # SFT's TRL path disables fused CE, so long-context Qwen SFT materializes dense logits and must
-    # not look like it fits a consumer card.
+    # the direct estimator defaults to conservative plain nll when no model identity is available.
     assert e(4.7, "sft", seq_len=8192, vocab=248_320) > 32
     # 4B GRPO: default + seq 16k fit a 32 GB card, seq 32k steps OVER it (measured boundary)
     assert e(4.7, "grpo", seq_len=1024, max_tokens=256) <= 32
@@ -522,10 +521,9 @@ def test_allocate_never_selects_below_matrix_need():
     grid = [
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 16}),
-        # un-fused big-vocab SFT (the documented OOM case): a <3B model at a <2048-token ctx, where
-        # the lm_head materializes the [per_device, seq, ~248k] fp32 logits the SFT branch once ignored.
+        # chunked-nll qwen sft cases across short and long contexts.
         ("Qwen/Qwen3.5-0.8B", "sft", {"max_context_tokens": 1024}),
-        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),  # near the Liger threshold
+        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),
         ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 8192}),
         ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
         ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8}),
@@ -1005,30 +1003,23 @@ def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(mon
 
 
 def test_sft_big_vocab_logits_term_present_and_bounded():
-    """SFT must reserve the [per_device, seq, vocab] fp32-logits VRAM whenever the worker's fused CE
-    is OFF -- the big-vocab SFT OOM driver the SFT branch previously ignored entirely. The term is
-    bounded by the logits budget when the per-device cap can reduce the micro-batch. It vanishes only
-    in the explicit theoretical fused-CE estimate; the real SFT worker keeps fused CE off."""
+    """plain nll reserves dense logits while chunked nll reserves one bounded projection chunk."""
     from flash.engine import vram
     from flash.engine.vram import estimate_vram_gb as e
 
     V = 248_320  # Qwen3.5's padded vocab
-    # un-fused (0.9B, seq 1024): a big-vocab run reserves real logits vs a ~zero-vocab run ...
     with_logits = e(0.9, "sft", seq_len=1024, vocab=V, batch_size=4)
     no_logits = e(0.9, "sft", seq_len=1024, vocab=1, batch_size=4)
     assert with_logits > no_logits
-    # ... but never by more than the budget (the per-device cap bounds the term, like GRPO)
     assert with_logits - no_logits <= vram._LOGITS_BUDGET_GB + 1e-6
-    # Real SFT keeps fused CE off, so long context and >=3B models still carry vocab-sized logits.
-    assert e(0.9, "sft", seq_len=2048, vocab=V) > e(0.9, "sft", seq_len=2048, vocab=1)
-    assert e(4.7, "sft", seq_len=1024, vocab=V) > e(4.7, "sft", seq_len=1024, vocab=1)
-    # The theoretical fused path is still available for comparison and is vocab-independent.
-    assert e(0.9, "sft", seq_len=2048, vocab=V, sft_fused_ce=True) == e(
-        0.9, "sft", seq_len=2048, vocab=1, sft_fused_ce=True
+
+    chunked_big = e(0.9, "sft", seq_len=2048, vocab=V, sft_fused_ce=True)
+    chunked_small = e(0.9, "sft", seq_len=2048, vocab=1, sft_fused_ce=True)
+    assert chunked_big > chunked_small
+    assert chunked_big - chunked_small <= (
+        vram._SFT_CHUNKED_NLL_TOKENS * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
     )
-    assert e(4.7, "sft", seq_len=1024, vocab=V, sft_fused_ce=True) == e(
-        4.7, "sft", seq_len=1024, vocab=1, sft_fused_ce=True
-    )
+    assert chunked_big < e(0.9, "sft", seq_len=2048, vocab=V, sft_fused_ce=False)
 
 
 def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
@@ -1051,25 +1042,34 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
     assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
 
 
-def test_required_vram_sft_small_model_includes_big_vocab_logits():
-    """REGRESSION (big-vocab SFT OOM): a sub-3B short-ctx SFT on a ~248k-vocab model must size for
-    its lm_head logits. Pre-fix the SFT branch ignored them (need ~8 GB for a ~17 GB real peak that
-    OOMs a 24 GB card near the Liger threshold); now the equation reserves the logits-inclusive need
-    so the allocator can't under-provision. TRL SFT keeps fused CE disabled even above 2048 ctx, so
-    the term remains present at longer context too."""
+def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
+    """validated qwen sft sizing bounds vocab logits while retaining activation growth."""
+    import math
+
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine.vram import estimate_vram_gb
     from flash.providers.allocator import required_vram_gb
 
-    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 1024})
-    assert n_short >= 12  # base+act (~7) + capped logits (~4), x1.1 -- well above the pre-fix ~8
-    n_long = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_context_tokens": 2048})
-    assert n_long >= n_short  # no long-context fused-CE shortcut in the real SFT worker
+    model_id = "Qwen/Qwen3.5-0.8B"
+    info = MODELS[model_id]
+    n_short = required_vram_gb(model_id, "sft", train={"max_context_tokens": 1024})
+    expected = math.ceil(
+        estimate_vram_gb(
+            info.params_b,
+            "sft",
+            seq_len=1024,
+            vocab=vocab_size_for(model_id),
+            sft_fused_ce=True,
+        )
+        * 1.1
+    )
+    assert n_short == expected == 9
+    n_long = required_vram_gb(model_id, "sft", train={"max_context_tokens": 2048})
+    assert n_long >= n_short
 
 
-def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
-    """Regression: Qwen3.5-4B SFT at max_context_tokens=8192 failed first backward on RTX 5090.
-
-    TRL SFT runs with fused CE disabled, so the allocator must reserve dense logits even at long
-    context and route this shape to an 80 GB class instead of a 32 GB consumer GPU."""
+def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
+    """chunked nll removes the dense-logit term that previously forced this shape onto 80 gb."""
     from flash.cost import RunConfig, estimate_cost
     from flash.providers import allocator
     from flash.providers.allocator import required_vram_gb
@@ -1079,7 +1079,7 @@ def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
     train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=train)
-    assert need > 40
+    assert need == 27
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "sft", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=train)
@@ -1094,7 +1094,7 @@ def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
         )
     )
 
-    assert preview_gpu == "A100 PCIe"
+    assert preview_gpu == "RTX 5090"
     assert alloc.gpu == preview_gpu
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need
@@ -1102,7 +1102,7 @@ def test_observed_qwen4b_sft_8192_routes_off_32gb_cards(monkeypatch):
     assert get_gpu_info(preview_gpu).vram_gb >= need
 
 
-def test_required_vram_sft_uses_chalk_model_support_gate():
+def test_required_vram_sft_plain_nll_fallback_keeps_logits_term():
     import math
 
     from flash.catalog import MODELS, vocab_size_for
@@ -1138,31 +1138,28 @@ def test_required_vram_sft_uses_chalk_model_support_gate():
 
 
 def test_sft_equation_covers_honest_peak_across_seq_boundary():
-    """Boundary regression: for EVERY catalog SFT model across the seq grid x batch x rank, the
-    equation must reserve >= the INDEPENDENT worker peak with fused CE disabled (incl. the capped
-    big-vocab logits), and a validated card must fit."""
+    """the allocator must mirror chunked qwen and plain-nll fallback peaks across the catalog."""
     import math
 
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine import vram
-    from flash.engine.vram import sft_per_device
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_per_device
     from flash.providers.allocator import required_vram_gb
     from flash.providers.base import GPU_INFO
 
     validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
 
-    def honest_peak(pb, seq, vocab, quant, rank, bs, active_b=None):
-        # MoE: the activations + rank-linear LoRA optimizer scale with the ACTIVE backbone width
-        # (a token routes through ~active_b params), while the resident ``weights`` term stays on the
-        # full ``pb``. Mirrors engine.vram.estimate_vram_gb's eff_b. Dense -> active_b == pb.
+    def honest_peak(mid, pb, seq, vocab, quant, rank, bs, active_b=None):
+        # moe activations and optimizer scale with the active backbone while weights stay on total params.
         bpp = vram._BYTES_PER_PARAM.get(quant, 2.0)
         eff = float(active_b) if active_b else pb
         width = math.sqrt(max(eff, 0.1))
         base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * eff)
-        fused = False  # worker/sft.py passes fused_ce=False to chalk for TRL SFT
+        fused = sft_chunked_nll_enabled(mid)
         pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
         act = vram._ACT_COEF * pd * (seq / 1024.0) * width
-        logits = 0.0 if fused else pd * seq * vocab * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
+        projected = min(pd * seq, vram._SFT_CHUNKED_NLL_TOKENS) if fused else pd * seq
+        logits = projected * vocab * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
         return base + act + logits
 
     for mid, info in MODELS.items():
@@ -1176,7 +1173,9 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
                 for rank in (8, 32, 128):
                     tr = {"max_context_tokens": seq, "batch_size": bs, "lora_rank": rank}
                     need = required_vram_gb(mid, "sft", train=tr)
-                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs, active_b) * 1.1)
+                    peak = math.ceil(
+                        honest_peak(mid, pb, seq, vocab, quant, rank, bs, active_b) * 1.1
+                    )
                     # The conservative estimate must always cover the honest peak (universal).
                     assert need >= peak, (mid, seq, bs, rank, need, peak)
                     # Fitting configs must have a validated target; configs above every managed
@@ -1217,6 +1216,31 @@ def test_sft_logits_cap_shrinks_per_device_for_big_vocab():
     assert pd == sft_logits_per_device_cap(seq, vocab) or pd == 4
 
 
+def test_sft_chunked_nll_restores_qwen_microbatch_and_gc_gate():
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
+    from flash.engine.worker.perf import grad_checkpointing_on
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    chunked = sft_chunked_nll_enabled(model_id)
+    assert sft_grad_accum(8, seq_len=1024, vocab=248_320, fused=chunked) == (4, 2)
+    assert (
+        grad_checkpointing_on(
+            model_id,
+            1024,
+            allow_disable=True,
+            card_vram_gb=80,
+            capability=(9, 0),
+            active_params_b=0.9,
+            hidden=1024,
+            num_layers=24,
+            fused_ce=chunked,
+            per_device_bs=4,
+            lora_rank=32,
+        )
+        is False
+    )
+
+
 def test_sft_logits_cap_no_regression_small_vocab_or_fused():
     """The cap must NOT shrink the micro-batch for a small-vocab model, nor when the fused CE is
     on (Liger fuses the logits away) — those keep the fixed per-device 4."""
@@ -1230,21 +1254,18 @@ def test_sft_logits_cap_no_regression_small_vocab_or_fused():
     assert sft_grad_accum(8) == (4, 2)
 
 
-def test_sft_logits_fused_gate_mirrors_worker():
-    """sft_logits_fused captures the theoretical fused-CE eligibility heuristic; real TRL SFT keeps
-    fused CE disabled, but the helper is still used for explicit comparison paths."""
-    from flash.engine.vram import sft_logits_fused
+def test_sft_chunked_nll_model_gate_mirrors_worker():
+    from flash.engine.vram import sft_chunked_nll_enabled
 
-    assert sft_logits_fused(0.8, 1024) is False  # small + short -> not fused -> cap applies
-    assert sft_logits_fused(4.0, 1024) is True  # >=3B -> fused
-    assert sft_logits_fused(0.8, 2048) is True  # long ctx -> fused
-    assert sft_logits_fused(None, 1024) is False  # unknown size -> memory-safe (cap applies)
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-0.8B") is True
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.6-35B-A3B") is True
+    assert sft_chunked_nll_enabled("openbmb/MiniCPM5-1B") is False
+    assert sft_chunked_nll_enabled("org/unknown") is False
 
 
 def test_sft_estimate_includes_capped_logits_term():
-    """The SFT VRAM estimate must include the big-vocab logits term (previously ignored), but
-    bounded by the per-device logits cap so it never over-reserves. Real TRL SFT keeps fused CE
-    disabled at long context too; only the explicit theoretical fused estimate drops the term."""
+    """the direct conservative estimate keeps dense logits; chunked mode uses a smaller fixed term."""
     from flash.engine.vram import _LOGITS_BUDGET_GB
     from flash.engine.vram import estimate_vram_gb as e
 
@@ -1257,10 +1278,9 @@ def test_sft_estimate_includes_capped_logits_term():
     long_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
     long_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
     assert long_big > long_small
-    # Explicit theoretical fused-CE comparison remains vocab-independent.
-    fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8, sft_fused_ce=True)
-    fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8, sft_fused_ce=True)
-    assert abs(fused_big - fused_small) < 1e-6
+    # chunked mode still accounts for one vocab projection chunk, but stays far below plain nll.
+    chunked_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8, sft_fused_ce=True)
+    assert chunked_big < long_big
 
 
 def test_vast_candidates_searches_at_effective_disk(monkeypatch):

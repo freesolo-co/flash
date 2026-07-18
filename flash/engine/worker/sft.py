@@ -120,6 +120,49 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         return c_hidden, c_layers
 
 
+_CHUNKED_NLL_TEXT_CONFIG_FIELDS = (
+    "final_logit_softcapping",
+    "logit_scale",
+    "num_experts",
+    "num_experts_per_tok",
+    "output_router_logits",
+    "router_aux_loss_coef",
+)
+
+
+def _prepare_chunked_nll_model(model, processing_class, peft_config) -> None:
+    """validate trl's chunked-nll traversal and expose nested text-loss config on vl qwen models."""
+    from transformers import PreTrainedTokenizerBase
+
+    if isinstance(model, str):
+        raise RuntimeError("chunked_nll requires a preloaded model so its lm head can be validated")
+    if not isinstance(processing_class, PreTrainedTokenizerBase):
+        raise RuntimeError("chunked_nll expects flash's text tokenizer processing path")
+
+    output_head = model.get_output_embeddings()
+    if output_head is None or not hasattr(output_head, "weight"):
+        raise RuntimeError("chunked_nll requires a directly accessible output embedding weight")
+    if model.base_model is model:
+        raise RuntimeError("chunked_nll requires a distinct backbone that bypasses the lm head")
+
+    targets = getattr(peft_config, "target_modules", None)
+    modules_to_save = set(getattr(peft_config, "modules_to_save", None) or ())
+    if targets != "all-linear" or "lm_head" in modules_to_save:
+        raise RuntimeError(
+            "chunked_nll requires PEFT all-linear targeting with the output layer excluded"
+        )
+
+    # flash intentionally passes an autotokenizer for text-only qwen training, so trl classifies the
+    # full multimodal checkpoint as a text model. transformers 5 still traverses model.base_model
+    # correctly, but trl reads loss and router fields from the top-level config in that classification.
+    # mirror the nested text fields there so chunked nll preserves scaling and moe auxiliary loss.
+    text_config = getattr(model.config, "text_config", None)
+    if text_config is not None:
+        for name in _CHUNKED_NLL_TEXT_CONFIG_FIELDS:
+            if hasattr(text_config, name):
+                setattr(model.config, name, getattr(text_config, name))
+
+
 def select_sft_examples(train, max_examples, seed):
     """Pick the SFT sample: the first ``max_examples`` rows of the dataset (file order), shuffled.
 
@@ -248,7 +291,7 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     from flash.catalog import MODELS, resolve_vocab_size
-    from flash.engine.vram import sft_grad_accum
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
     # Total SFT sequence budget (prompt + completion), honoring [train] max_context_tokens like the
@@ -279,20 +322,16 @@ def run_sft():
             f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
         )
     effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
-    # Large-vocab logits sizing: the trl SFT path DISABLES chalk fused CE (install_chalk_kernels(
-    # fused_ce=False) below — the #421/#431 logits=None fix) and Liger is off, so SFTTrainer ALWAYS
-    # materialises [micro_batch, seq, vocab] fp32 logits. Size the micro-batch / grad-accum / grad-
-    # checkpointing (and the allocator, vram.py) for that UNFUSED path UP FRONT — cap the micro-batch and
-    # raise grad-accum to hold the effective batch — instead of sizing fused and fixing it up AFTER the
-    # trainer's Accelerator is built (which left the accelerator's grad-accum stale; codex[bot]).
-    # revision-aware vocab so the worker sizes the same batch the cost quote priced
-    # (cost/spec.py _sft_realized_batch uses resolve_vocab_size on the same (model, revision)).
+    # validated qwen models use trl 1.6 chunked_nll: ignored prompt positions are removed before
+    # the lm head and valid tokens are projected in bounded chunks, so no dense [batch, seq, vocab]
+    # tensor is materialized. unsupported model structures keep plain nll and the conservative
+    # vocab-sized micro-batch cap. resolve vocab once so worker and cost quote use the same revision.
     _sft_vocab = resolve_vocab_size(model_id, model_revision)
-    _sft_fused = False
+    _sft_chunked = sft_chunked_nll_enabled(model_id)
     per_device_bs, grad_accum = sft_grad_accum(
-        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
+        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_chunked
     )
-    if not _sft_fused and per_device_bs < min(effective_batch, 4):
+    if not _sft_chunked and per_device_bs < min(effective_batch, 4):
         print(
             f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
             f"(seq={sft_max_len}, vocab={_sft_vocab}; realized batch "
@@ -323,7 +362,7 @@ def run_sft():
         active_params_b=_gc_active_b,
         hidden=_gc_hidden,
         num_layers=_gc_layers,
-        fused_ce=_sft_fused,
+        fused_ce=_sft_chunked,
         per_device_bs=per_device_bs,
         lora_rank=_gc_lora_rank,
         revision=model_revision,
@@ -359,6 +398,7 @@ def run_sft():
         # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
         "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
         "completion_only_loss": True,
+        "loss_type": "chunked_nll" if _sft_chunked else "nll",
         # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before
         # collation, silently reverting all paths to full-transcript loss.
         "remove_unused_columns": False,
@@ -452,7 +492,7 @@ def run_sft():
             effective_batch,
             seq_len=sft_max_len,
             vocab=_sft_vocab,  # reuse the revision-aware vocab resolved above (single source of truth)
-            fused=_sft_fused,
+            fused=_sft_chunked,
         )
         # Cap pd so the dense [pd,1,T,T] mask stays <=512MB (only bites past ~12k tokens).
         _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
@@ -615,11 +655,14 @@ def run_sft():
         )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
+        _lora_config = _w.make_lora(model_id)
+        if _sft_chunked:
+            _prepare_chunked_nll_model(sft_model, tok, _lora_config)
         trainer = _SFT(
             model=sft_model,
             args=cfg,
             train_dataset=ds,
-            peft_config=_w.make_lora(model_id),
+            peft_config=_lora_config,
             processing_class=tok,
             data_collator=_collator,
             callbacks=[
@@ -627,16 +670,10 @@ def run_sft():
                 _w.make_checkpoint_upload_callback(save_at_steps),
             ],
         )
-        # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
-        # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
-        # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
-        # otherwise every large-vocab Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once
-        # chalk actually applies flce (#421). Because flce is ALWAYS off here, _sft_fused is False above and
-        # the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were already sized
-        # for the materialised-logits path UP FRONT — no post-init batch/grad-accum fixup is needed, which
-        # would otherwise mutate grad_accum after the trainer's Accelerator was built from the old value
-        # (codex[bot]). The custom GRPO/opd loops read the fused loss directly, so they keep flce on.
-        # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
+        # chalk flce stays off because trl chunked_nll owns the output-head loss and metrics. chunked_nll
+        # returns logits=None through trl's supported path, while plain-nll fallbacks still require logits.
+        # standalone chalk kernels remain enabled for both paths. keep installation inside the liveness
+        # wrap because kernel compilation can be silent for minutes.
         _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
     _chalk_active = active_kernels(_chalk_report)
 

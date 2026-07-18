@@ -203,9 +203,8 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B is bf16 (QLoRA dropped), and real TRL SFT materializes dense logits, so the cheapest
-    # validated class that fits is now the 80 GB A100 tier.
-    assert spec.gpu.type == "A100 PCIe"
+    # chunked nll bounds the 248k-vocab projection, so the default 9b sft fits the 32 gb tier.
+    assert spec.gpu.type == "RTX 5090"
 
 
 def test_build_worker_env():

@@ -548,9 +548,7 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
 
 
 def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
-    """Guard: completion-only loss is ON and every prior SFT optimization is still wired. The
-    completion-only change only touched the data representation + label masking — packing, chalk,
-    LoRA+, the large-vocab logits cap, grad-checkpointing, and the 8-bit optimizer must all survive."""
+    """guard completion-only masking, chunked nll, and the existing sft optimizations together."""
     import inspect
 
     from flash.engine.worker import sft
@@ -573,20 +571,19 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # both flash custom-packing paths thread the completion mask through the packer
     assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
 
-    # --- every prior optimization still present ---
-    # example packing (all three backends: TRL bfd, SDPA 4D-mask, GDN varlen)
+    # example packing (all three backends: trl bfd, sdpa 4d-mask, gdn varlen)
     assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
     assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
     assert "emit_varlen=True" in src  # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
     # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
-    # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None, which
-    # trl's SFTTrainer.compute_loss can't consume) — so SFT materialises logits and is sized UNFUSED
-    # (_sft_fused = False) up front, no post-init batch/grad-accum fixup.
+    # trl chunked nll owns the output-head loss while standalone chalk kernels stay enabled.
     assert "install_chalk_kernels(" in src
     assert "fused_ce=False" in src
-    assert "_sft_fused = False" in src
+    assert "_sft_chunked = sft_chunked_nll_enabled(model_id)" in src
+    assert '"loss_type": "chunked_nll" if _sft_chunked else "nll"' in src
+    assert "_prepare_chunked_nll_model(sft_model, tok, _lora_config)" in src
     assert 'cfg_kwargs["use_liger_kernel"] = False' in src
     assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
     # LoRA+ (B-matrix LR ratio)
