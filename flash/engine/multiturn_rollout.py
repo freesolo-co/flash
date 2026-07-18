@@ -11,6 +11,7 @@ import contextlib
 import copy
 import itertools
 import json
+import math
 import queue
 import threading
 import time
@@ -29,6 +30,8 @@ class RolloutResult(TypedDict):
     logprobs: list[float]
     env_mask: list[int]
     reward: float
+    turn_spans: list[tuple[int, int]]
+    turn_rewards: list[float] | None
 
 
 RolloutCompletion = tuple[str, list[int], list[float], str]
@@ -71,6 +74,8 @@ _ROLLOUT_FIELDS: tuple[str, ...] = (
     "logprobs",
     "env_mask",
     "reward",
+    "turn_spans",
+    "turn_rewards",
 )
 
 
@@ -151,6 +156,89 @@ def _dedup_seam_terminator(prev_completion_ids: list[int], glue: list[int]) -> l
     return glue
 
 
+_NO_REWARD_RESULT = object()
+
+
+def _turn_reward_scorer(active_env):
+    from flash.envs.base import BaseEnvironment
+
+    scorer = getattr(active_env, "turn_rewards", None)
+    implementation = getattr(type(active_env), "turn_rewards", None)
+    if not callable(scorer) or implementation is BaseEnvironment.turn_rewards:
+        return None
+    return scorer
+
+
+def _get_turn_rewards(
+    active_env,
+    example: dict,
+    state: dict,
+    turn_spans,
+    episode_reward: float,
+    *,
+    reward_result=_NO_REWARD_RESULT,
+) -> list[float] | None:
+    scorer = _turn_reward_scorer(active_env)
+    if scorer is None:
+        return None
+
+    reason: str | None = None
+    values: list[float] | None = None
+    if not math.isfinite(episode_reward):
+        reason = "episode reward is non-finite"
+    else:
+        try:
+            if reward_result is _NO_REWARD_RESULT:
+                rewards = scorer(example, state)
+            else:
+                metadata = getattr(reward_result, "metadata", None) or {}
+                rewards = metadata.get("per_turn_rewards")
+            if rewards is None:
+                reason = "terminal score has no per_turn_rewards"
+            elif not isinstance(rewards, list):
+                reason = "per_turn_rewards is not a list"
+            else:
+                values = [float(reward) for reward in rewards]
+                if len(values) != len(turn_spans):
+                    reason = (
+                        f"received {len(values)} reward(s) for {len(turn_spans)} assistant turn(s)"
+                    )
+                elif not all(math.isfinite(value) for value in values):
+                    reason = "per_turn_rewards contains a non-finite value"
+        except Exception as exc:
+            reason = f"per-turn scoring failed: {type(exc).__name__}"
+
+    if reason is not None:
+        print(f"[grpo][warn] per-turn rewards unavailable ({reason}); using episode reward")
+        return None
+    return values
+
+
+def _score_rollout_once(active_env, example: dict, state: dict, turn_spans):
+    reward_results_many = getattr(active_env, "reward_results_many", None)
+    if (
+        bool(getattr(active_env, "multi_turn", False))
+        and _turn_reward_scorer(active_env) is not None
+        and callable(reward_results_many)
+    ):
+        results = reward_results_many([(example, state)])
+        if len(results) != 1:
+            raise RuntimeError("env.reward_results_many returned the wrong number of rewards")
+        result = results[0]
+        reward = float(getattr(result, "score", 0.0))
+        return reward, _get_turn_rewards(
+            active_env,
+            example,
+            state,
+            turn_spans,
+            reward,
+            reward_result=result,
+        )
+
+    reward = float(active_env.reward("", example, state))
+    return reward, _get_turn_rewards(active_env, example, state, turn_spans, reward)
+
+
 def rollout_one(
     *,
     example: dict,
@@ -174,6 +262,7 @@ def rollout_one(
     completion_ids: list[int] = []
     logprobs: list[float] = []
     env_mask: list[int] = []
+    turn_spans: list[tuple[int, int]] = []
 
     turns = 0
     while True:
@@ -184,7 +273,9 @@ def rollout_one(
                 break
             max_new = min(max_new, remaining)
         asst_ids, asst_lp, text = generate(cur_ids, max_new)
+        turn_start = len(completion_ids)
         completion_ids.extend(asst_ids)
+        turn_spans.append((turn_start, len(completion_ids)))
         logprobs.extend(asst_lp)
         env_mask.extend([1] * len(asst_ids))
         cur_ids.extend(asst_ids)
@@ -212,13 +303,15 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
-    reward = active_env.reward("", example, state)
+    reward, turn_rewards = _score_rollout_once(active_env, example, state, turn_spans)
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
         "logprobs": logprobs,
         "env_mask": env_mask,
         "reward": float(reward),
+        "turn_spans": turn_spans,
+        "turn_rewards": turn_rewards,
     }
 
 
@@ -330,6 +423,7 @@ class _RolloutState:
         "messages",
         "prompt_ids",
         "state",
+        "turn_spans",
         "turns",
     )
 
@@ -341,18 +435,21 @@ class _RolloutState:
         self.completion_ids: list[int] = []
         self.logprobs: list[float] = []
         self.env_mask: list[int] = []
+        self.turn_spans: list[tuple[int, int]] = []
         self.state = state
         self.turns = 0
         self.budget = budget
         self.done = False
 
-    def result(self, reward: float) -> RolloutResult:
+    def result(self, reward: float, turn_rewards: list[float] | None) -> RolloutResult:
         return {
             "prompt_ids": self.prompt_ids,
             "completion_ids": self.completion_ids,
             "logprobs": self.logprobs,
             "env_mask": self.env_mask,
             "reward": float(reward),
+            "turn_spans": self.turn_spans,
+            "turn_rewards": turn_rewards,
         }
 
 
@@ -367,7 +464,9 @@ def _advance_after_turn(
     max_turns: int,
 ) -> None:
     """Fold one assistant turn into ``r`` and run its env step. Sets ``r.done`` when finished."""
+    turn_start = len(r.completion_ids)
     r.completion_ids.extend(asst_ids)
+    r.turn_spans.append((turn_start, len(r.completion_ids)))
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
     r.cur_ids.extend(asst_ids)
@@ -430,29 +529,68 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
     return max(1, max_new)
 
 
-def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
-    """Reward each rollout in input order, using reward_many, concurrent, or serial scoring."""
+def _score_rollouts(
+    active_env, rollouts: list[_RolloutState]
+) -> tuple[list[float], list[list[float] | None]]:
+    """Reward each rollout in input order and collect optional per-turn rewards."""
+    items = [(rollout.example, rollout.state) for rollout in rollouts]
+    reward_results_many = getattr(active_env, "reward_results_many", None)
+    if (
+        bool(getattr(active_env, "multi_turn", False))
+        and _turn_reward_scorer(active_env) is not None
+        and callable(reward_results_many)
+    ):
+        results = reward_results_many(items)
+        if len(results) != len(rollouts):
+            raise RuntimeError("env.reward_results_many returned the wrong number of rewards")
+        scores = [float(getattr(result, "score", 0.0)) for result in results]
+        turn_rewards = [
+            _get_turn_rewards(
+                active_env,
+                rollout.example,
+                rollout.state,
+                rollout.turn_spans,
+                score,
+                reward_result=result,
+            )
+            for rollout, score, result in zip(rollouts, scores, results, strict=True)
+        ]
+        return scores, turn_rewards
+
     reward_many = getattr(active_env, "reward_many", None)
     if callable(reward_many):
-        rewards = reward_many([(r.example, r.state) for r in rollouts])
+        rewards = reward_many(items)
         if len(rewards) != len(rollouts):
             raise RuntimeError("env.reward_many returned the wrong number of rewards")
-        return [float(x) for x in rewards]
+        scores = [float(reward) for reward in rewards]
+    else:
 
-    def _score(r: _RolloutState) -> float:
-        return float(active_env.reward("", r.example, r.state))
+        def _score(rollout: _RolloutState) -> float:
+            return float(active_env.reward("", rollout.example, rollout.state))
 
-    if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
-        return [_score(r) for r in rollouts]
-    pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
-    try:
-        futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
-        scores: list[float] = [0.0] * len(rollouts)
-        for fut in as_completed(futures):
-            scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-    return scores
+        if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
+            scores = [_score(rollout) for rollout in rollouts]
+        else:
+            pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
+            try:
+                futures = {pool.submit(_score, rollout): i for i, rollout in enumerate(rollouts)}
+                scores = [0.0] * len(rollouts)
+                for future in as_completed(futures):
+                    scores[futures[future]] = future.result()
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+
+    turn_rewards = [
+        _get_turn_rewards(
+            active_env,
+            rollout.example,
+            rollout.state,
+            rollout.turn_spans,
+            score,
+        )
+        for rollout, score in zip(rollouts, scores, strict=True)
+    ]
+    return scores, turn_rewards
 
 
 _PHYSICAL_REQUEST_COUNTER = itertools.count()
@@ -638,8 +776,11 @@ def rollout_async(
         to_env.put(None)
         worker.join()
 
-    rewards = _score_rollouts(active_env, rollouts)
-    return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
+    rewards, turn_rewards = _score_rollouts(active_env, rollouts)
+    return [
+        r.result(reward, per_turn)
+        for r, reward, per_turn in zip(rollouts, rewards, turn_rewards, strict=True)
+    ]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
@@ -856,10 +997,15 @@ def build_rollout_func(
                 monotonic=monotonic,
                 request_id_factory=request_id_factory,
             )
-            out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
-            for r in rollouts:
-                for k in out:
-                    out[k].append(r[k])
+            fields = (
+                _ROLLOUT_FIELDS
+                if any(r["turn_rewards"] is not None for r in rollouts)
+                else _ROLLOUT_FIELDS[:5]
+            )
+            out: dict[str, list] = {key: [] for key in fields}
+            for rollout in rollouts:
+                for key in out:
+                    out[key].append(rollout[key])
             return out
         finally:
             # Abort in-flight requests on error so they don't corrupt the next GRPO step.

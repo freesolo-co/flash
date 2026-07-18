@@ -593,6 +593,17 @@ def run_rl():
     if is_tool_env and not tools:
         print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
     use_rollout_func = is_multi_turn and not (is_tool_env and tools)
+    trainer_class = GRPOTrainer
+    if use_rollout_func:
+        from flash.envs.base import BaseEnvironment
+
+        turn_rewards = getattr(env, "turn_rewards", None)
+        turn_rewards_impl = getattr(type(env), "turn_rewards", None)
+        if callable(turn_rewards) and turn_rewards_impl is not BaseEnvironment.turn_rewards:
+            from flash.engine.worker.grpo_perturn_trainer import GRPOPerTurnTrainer
+
+            trainer_class = GRPOPerTurnTrainer
+            print("[rl] multi-turn per-turn group-relative credit is active")
     _w.require_vllm_for_rollout_func(use_rollout_func, True, model_id)
     if is_tool_env and tools:
         extra_trainer_kwargs["tools"] = tools
@@ -651,7 +662,7 @@ def run_rl():
             )
             if not isinstance(trainer_model, str):
                 cfg.model_init_kwargs = None
-        trainer = GRPOTrainer(
+        trainer = trainer_class(
             model=trainer_model,
             args=cfg,
             train_dataset=ds,

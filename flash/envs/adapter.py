@@ -234,10 +234,25 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
-    def _grouped_score(self, items, *, task_of, payload_of, scorer, method: str) -> list[float]:
-        """Group rollouts that share an example (input order preserved), score each group with ONE
-        concurrent ``scorer(task, payloads)`` call, then scatter rewards back to per-item order.
-        ``task_of(ex, st)`` builds a group's task; ``payload_of(st)`` its per-rollout payload."""
+    @staticmethod
+    def _turn_rewards_from_result(result) -> list[float] | None:
+        metadata = getattr(result, "metadata", None) or {}
+        values = metadata.get("per_turn_rewards")
+        if values is None:
+            return None
+        if not isinstance(values, list):
+            raise ValueError("per_turn_rewards metadata must be a list")
+        try:
+            return [float(value) for value in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("per_turn_rewards metadata must contain only numbers") from exc
+
+    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
+        """Score the terminal episode and return its documented per-turn rewards."""
+        return self._turn_rewards_from_result(self._score_episode(example, state))
+
+    def _grouped_results(self, items, *, task_of, payload_of, scorer, method: str) -> list:
+        """Group rollouts that share an example and scatter full reward results in input order."""
         groups: dict[str, dict] = {}
         order: list[str] = []
         for i, (ex, st) in enumerate(items):
@@ -248,15 +263,28 @@ class FreesoloEnvironment(BaseEnvironment):
                 order.append(key)
             grp["idxs"].append(i)
             grp["payloads"].append(payload_of(st))
-        out: list[float] = [0.0] * len(items)
+        out: list = [None] * len(items)
         for key in order:
             grp = groups[key]
             rewards = scorer(grp["task"], grp["payloads"])
             if len(rewards) != len(grp["payloads"]):
                 raise RuntimeError(f"Freesolo environment {method} returned the wrong length")
-            for idx, rw in zip(grp["idxs"], rewards, strict=True):
-                out[idx] = float(rw.score)
+            for idx, reward in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = reward
         return out
+
+    def _grouped_score(self, items, *, task_of, payload_of, scorer, method: str) -> list[float]:
+        """Group rollouts that share an example and scatter scalar scores in input order."""
+        return [
+            float(result.score)
+            for result in self._grouped_results(
+                items,
+                task_of=task_of,
+                payload_of=payload_of,
+                scorer=scorer,
+                method=method,
+            )
+        ]
 
     def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
         """Reward for many ``(example, state)`` rollouts at once, in input order.
@@ -295,6 +323,20 @@ class FreesoloEnvironment(BaseEnvironment):
                 method="score_responses",
             )
         return self._grouped_score(
+            items,
+            task_of=lambda ex, st: st.get("task") or self._task_example(ex),
+            payload_of=self._episode_from_state,
+            scorer=self._env.score_episodes,
+            method="score_episodes",
+        )
+
+    def reward_results_many(self, items: list[tuple[dict, dict]]) -> list:
+        """Return terminal multi-turn reward results without discarding their metadata."""
+        if not self.multi_turn:
+            raise RuntimeError("reward_results_many is only available for multi-turn environments")
+        if not self.reward_thread_safe:
+            return [self._score_episode(example, state) for example, state in items]
+        return self._grouped_results(
             items,
             task_of=lambda ex, st: st.get("task") or self._task_example(ex),
             payload_of=self._episode_from_state,
@@ -411,6 +453,7 @@ class FreesoloEnvironment(BaseEnvironment):
         )
         rewards = self._env.score_episodes(self._task_example(example), [episode])
         return float(self._single(rewards, "score_episodes").score)
+
 
 __all__ = [
     "FreesoloEnvironment",

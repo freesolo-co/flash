@@ -21,6 +21,9 @@ class Environment(Protocol):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         """Scalar RL reward for a completion."""
 
+    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
+        """Return one reward per assistant turn, or None when unavailable."""
+
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         """Boolean correctness scorer the reward can build on."""
 
@@ -40,6 +43,9 @@ class BaseEnvironment:
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
+
+    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
+        return None
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         gold = str(example.get("output") or "").strip()
