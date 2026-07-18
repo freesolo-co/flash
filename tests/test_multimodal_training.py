@@ -600,54 +600,96 @@ def test_multimodal_examples_index_reports_identical_prompt_image_collision():
     assert next(iter(index.values())) == {"answer": "last"}
 
 
+def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
+    image_module = pytest.importorskip("PIL.Image")
+    pil = image_module.new("RGB", (1, 1), "red")
+    messages = [
+        {"role": "system", "content": "rules"},
+        {
+            "role": "user",
+            "name": "viewer",
+            "content": [
+                {"type": "text", "text": "first "},
+                {"type": "image", "image": pil},
+                {"type": "image_url", "image_url": {"url": "dataset/red.png"}},
+                {"type": "text", "text": "second"},
+                {"type": "input_image", "image_url": "dataset/blue.png"},
+            ],
+        },
+        {"role": "user", "content": [{"type": "image", "image": "dataset/only.png"}]},
+    ]
+
+    stripped = mm.text_only_prompt_messages(messages)
+
+    assert stripped == [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "name": "viewer", "content": "first second"},
+        {"role": "user", "content": ""},
+    ]
+    assert messages[1]["content"][1]["image"] is pil
+
+
 def test_multimodal_algorithm_validation_rejects_unsupported_modes():
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft")
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=False)
     mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", multi_turn=True)
-    with pytest.raises(ValueError, match="opd"):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd")
+    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=False)
+    with pytest.raises(ValueError, match="single-turn"):
+        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=True)
     with pytest.raises(ValueError, match="does not support"):
-        mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "sft")
+        mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "opd")
 
 
-def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path):
+def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
     (root / "dataset" / "train.jsonl").write_text(
         json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
     )
-    spec = SimpleNamespace(
+    supported = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}),
     )
+    mm.preflight_validate_image_opd(supported)
 
-    with pytest.raises(ValueError, match="opd does not support image-bearing"):
-        mm.preflight_reject_image_opd(spec)
+    unsupported = SimpleNamespace(
+        model="openbmb/MiniCPM5-1B",
+        algorithm="opd",
+        environment=supported.environment,
+    )
+    with pytest.raises(ValueError, match="does not support image-bearing"):
+        mm.preflight_validate_image_opd(unsupported)
 
-    from flash.runner.lifecycle import _run_job
-
-    with pytest.raises(ValueError, match="opd does not support image-bearing"):
-        _run_job(spec)
+    multi_turn = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(
+            id=str(env_file), resolved_sha="", params={}, multi_turn=True
+        ),
+    )
+    with pytest.raises(ValueError, match="single-turn"):
+        mm.preflight_validate_image_opd(multi_turn)
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_image_opd_submit_preflight_rejects_before_status_or_provider_paths(
+def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
     monkeypatch, tmp_path, background
 ):
     from flash import runner
     from flash.spec import JobSpec
 
+    class _ReachedSubmitBoundary(RuntimeError):
+        pass
+
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    def fail(*args, **kwargs):
-        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
+    def reached_submit_boundary(*args, **kwargs):
+        raise _ReachedSubmitBoundary
 
-    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
-    monkeypatch.setattr(runner, "_run_job", fail)
-    monkeypatch.setattr(runner, "_run_job_background", fail)
-    monkeypatch.setattr(runner.threading, "Thread", fail)
+    monkeypatch.setattr(runner, "_mark_warmstart_source", reached_submit_boundary)
 
     spec = JobSpec.from_dict(
         {
@@ -666,8 +708,51 @@ def test_image_opd_submit_preflight_rejects_before_status_or_provider_paths(
         }
     )
 
-    with pytest.raises(ValueError, match="opd does not support image-bearing"):
+    with pytest.raises(_ReachedSubmitBoundary):
         runner.submit_job(spec, background=background)
+    with pytest.raises(FileNotFoundError):
+        runner.get_status(spec.run_id)
+
+
+@pytest.mark.parametrize(
+    ("model", "extra_params", "message"),
+    [
+        ("openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
+        ("Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
+    ],
+)
+def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
+    monkeypatch, tmp_path, model, extra_params, message
+):
+    from flash import runner
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
+
+    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner, "_run_job", fail)
+    monkeypatch.setattr(runner, "_run_job_background", fail)
+    monkeypatch.setattr(runner.threading, "Thread", fail)
+    params = {
+        "records": [{"input": "color?", "output": "red", "image": "dataset/red.png"}],
+        **extra_params,
+    }
+    spec = JobSpec.from_dict(
+        {
+            "run_id": f"image-opd-reject-{model.rsplit('/', 1)[-1]}",
+            "model": model,
+            "algorithm": "opd",
+            "environment": {"id": "local", "params": params},
+            "train": {"epochs": 1, "max_examples": 1},
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner.submit_job(spec)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
 

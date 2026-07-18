@@ -25,7 +25,7 @@ _IMAGE_TRAINING_MODELS = frozenset(
 
 
 def supports_image_training(model: str | ModelInfo | None) -> bool:
-    """Return whether a curated model supports image-bearing SFT and GRPO."""
+    """Return whether a curated model supports image-bearing SFT, GRPO, and OPD."""
     model_id = model.id if isinstance(model, ModelInfo) else model
     return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 

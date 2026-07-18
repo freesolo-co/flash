@@ -301,6 +301,24 @@ def record_has_images(record: dict, messages: list[dict] | None = None) -> bool:
     return False
 
 
+def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
+    """Drop image content blocks while preserving the teacher's message order and text."""
+    stripped: list[dict] = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            copied["content"] = "".join(
+                block["text"]
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+        stripped.append(copied)
+    return stripped
+
+
 def normalize_prompt_images(
     record: dict,
     messages: list[dict],
@@ -772,8 +790,8 @@ def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: b
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
-    if algorithm == "opd":
-        raise ValueError("opd does not support image-bearing records; use sft or grpo")
+    if algorithm == "opd" and multi_turn:
+        raise ValueError("opd supports image-bearing records only for single-turn environments")
 
 
 def assistant_completion_text(completion: object) -> str:
@@ -828,11 +846,12 @@ def _read_json_records(path: Path) -> list[dict]:
     return value
 
 
-def preflight_reject_image_opd(spec) -> None:
-    """Reject statically discoverable image OPD datasets before GPU allocation."""
+def preflight_validate_image_opd(spec) -> None:
+    """Validate statically discoverable image OPD datasets before GPU allocation."""
     if getattr(spec, "algorithm", "") != "opd":
         return
-    params = dict(getattr(getattr(spec, "environment", None), "params", None) or {})
+    environment = getattr(spec, "environment", None)
+    params = dict(getattr(environment, "params", None) or {})
     records = params.get("records")
     if records is not None:
         if not isinstance(records, list) or not all(isinstance(row, dict) for row in records):
@@ -861,9 +880,12 @@ def preflight_reject_image_opd(spec) -> None:
         if path is None or not path.is_file() or path.suffix.lower() not in {".json", ".jsonl"}:
             return
         records = _read_json_records(path)
-    for index, record in enumerate(records):
+    for record in records:
         if record_has_images(record, _record_messages(record)):
-            raise ValueError(
-                f"opd does not support image-bearing records (found an image in dataset row {index}); "
-                "use sft or grpo"
+            multi_turn = bool(
+                getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
             )
+            validate_multimodal_training(
+                str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
+            )
+            return

@@ -276,6 +276,7 @@ class OpdVllmRolloutEngine:
     rollout_batch_size: int | None = None
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
+    enable_tower_connector_lora: bool = False
     enforce_eager: bool | None = None
     compilation_config: dict[str, Any] | None = None
     seed: int | None = None
@@ -328,6 +329,8 @@ class OpdVllmRolloutEngine:
             kwargs["attention_backend"] = self.attention_backend
         if self.mm_encoder_attn_backend:
             kwargs["mm_encoder_attn_backend"] = self.mm_encoder_attn_backend
+        if self.enable_tower_connector_lora:
+            kwargs["enable_tower_connector_lora"] = True
         if self.enforce_eager is not None:
             kwargs["enforce_eager"] = bool(self.enforce_eager)
         if self.compilation_config:
@@ -448,20 +451,33 @@ class OpdVllmRolloutEngine:
         *,
         max_tokens: int,
         request_seeds: list[int] | None = None,
+        multi_modal_data_batch: list[object | None] | None = None,
     ) -> list[OpdVllmOutput]:
         if not prompt_ids_batch:
             return []
         if request_seeds is not None and len(request_seeds) != len(prompt_ids_batch):
             raise ValueError("opd rollout request seed count must match prompt count")
+        if multi_modal_data_batch is not None and len(multi_modal_data_batch) != len(
+            prompt_ids_batch
+        ):
+            raise ValueError("opd rollout multimodal data count must match prompt count")
         if self._lora_request is None:
             raise RuntimeError("opd vLLM rollout used before sync_from_model()")
         limit = max(1, int(self.rollout_batch_size or len(prompt_ids_batch)))
         out: list[OpdVllmOutput] = []
         for start in range(0, len(prompt_ids_batch), limit):
-            prompts = [
-                {"prompt_token_ids": [int(t) for t in ids]}
-                for ids in prompt_ids_batch[start : start + limit]
-            ]
+            prompt_ids_chunk = prompt_ids_batch[start : start + limit]
+            multimodal_chunk = (
+                multi_modal_data_batch[start : start + limit]
+                if multi_modal_data_batch is not None
+                else None
+            )
+            prompts = []
+            for index, ids in enumerate(prompt_ids_chunk):
+                prompt = {"prompt_token_ids": [int(t) for t in ids]}
+                if multimodal_chunk is not None and multimodal_chunk[index] is not None:
+                    prompt["multi_modal_data"] = multimodal_chunk[index]
+                prompts.append(prompt)
             seeds = request_seeds[start : start + limit] if request_seeds is not None else None
             # vLLM's structured-output processor stamps per-request backend state onto the
             # StructuredOutputsParams instance, so a single shared constrained params corrupts

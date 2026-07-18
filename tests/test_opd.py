@@ -1051,17 +1051,21 @@ def test_opd_rejects_tool_environments(monkeypatch):
         opd_mod.run_opd()
 
 
-def test_opd_rejects_generated_image_prompts_in_cached_filter_render(monkeypatch):
-    pytest.importorskip("torch")
+def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypatch):
+    torch = pytest.importorskip("torch")
+    image_module = pytest.importorskip("PIL.Image")
+    transformers = pytest.importorskip("transformers")
     import flash.engine.worker.teacher as teacher_mod
-    from flash.engine.worker import hf as hf_mod
     from flash.engine.worker import opd as opd_mod
 
     events = []
+    processor_calls = []
+    captured_examples = []
 
     class _Tok:
         pad_token = "<pad>"
         eos_token = "<eos>"
+        pad_token_id = 0
 
         def apply_chat_template(self, messages, **kwargs):
             return "PROMPT"
@@ -1069,17 +1073,37 @@ def test_opd_rejects_generated_image_prompts_in_cached_filter_render(monkeypatch
         def __call__(self, text, add_special_tokens=False):
             return SimpleNamespace(input_ids=[1, 2])
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<|image_pad|>"
+            return 99
+
+    class _Processor:
+        tokenizer = _Tok()
+
+        def apply_chat_template(self, **kwargs):
+            processor_calls.append(kwargs)
+            return {
+                "input_ids": torch.tensor([[1, 99, 99, 2]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "pixel_values": torch.ones((4, 3)),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+            }
+
+    image = image_module.new("RGB", (2, 2), "red")
     env = SimpleNamespace(
         is_tool_env=False,
         multi_turn=False,
-        dataset=lambda: events.append("dataset") or [{"input": "describe"}],
+        package_root=None,
+        dataset=lambda: events.append("dataset")
+        or [{"input": "describe", "image": image}],
         prompt_messages=lambda _record: events.append("prompt_messages")
         or [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": "https://images.example/x.png"}},
+                    {"type": "image"},
                 ],
             }
         ],
@@ -1088,13 +1112,14 @@ def test_opd_rejects_generated_image_prompts_in_cached_filter_render(monkeypatch
         require_active_env=lambda: events.append("require_active_env") or env,
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter="", max_examples=1),
-            model="fake/model",
+            model="Qwen/Qwen3.5-4B",
             model_revision="",
             gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=7,
         heartbeat=lambda stage, **kwargs: events.append(stage),
+        prefetch_model=lambda *args, **kwargs: events.append("prefetch_model") or 0.0,
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
     monkeypatch.setattr(
@@ -1120,19 +1145,82 @@ def test_opd_rejects_generated_image_prompts_in_cached_filter_render(monkeypatch
     monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda: None)
     monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda: {})
     monkeypatch.setattr(opd_mod, "optimal_attn_impl", lambda: None)
-    monkeypatch.setattr(hf_mod, "load_tokenizer", lambda *args, **kwargs: _Tok())
+    monkeypatch.setattr(
+        opd_mod,
+        "_opd_prompt_pool_fingerprint",
+        lambda examples: captured_examples.extend(examples) or "fingerprint",
+    )
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: _Processor(),
+    )
     monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
 
     def fail_student(*args, **kwargs):
-        raise AssertionError("student model must not load before image prompt rejection")
+        raise AssertionError("image prompt reached student model loading")
 
     monkeypatch.setattr(opd_mod, "_student_model", fail_student)
 
-    with pytest.raises(ValueError, match="opd does not support image-bearing"):
+    with pytest.raises(AssertionError, match="reached student model loading"):
         opd_mod.run_opd()
 
     assert events[:3] == ["require_active_env", "seed:7", "dataset"]
     assert events.count("prompt_messages") == 1
+    assert events.count("prefetch_model") == 1
+    assert len(processor_calls) == 1
+    assert processor_calls[0]["return_tensors"] == "pt"
+    assert len(captured_examples) == 1
+    prompt = captured_examples[0]
+    assert prompt.prompt_ids == [1, 99, 99, 2]
+    assert prompt.rollout_prompt_ids == [1, 99, 2]
+    assert prompt.teacher_messages == [{"role": "user", "content": "describe"}]
+    assert prompt.teacher_prompt_tokens == 2
+    assert prompt.multi_modal_data["image"].size == (2, 2)
+    assert set(prompt.vision_inputs) == {
+        "pixel_values",
+        "image_grid_thw",
+        "mm_token_type_ids",
+    }
+
+
+def test_opd_image_prompt_fingerprint_uses_descriptors_and_teacher_messages():
+    from flash.engine.worker import opd as opd_mod
+
+    base = {
+        "example": {"id": 1},
+        "student_messages": [{"role": "user", "content": [{"type": "image"}]}],
+        "teacher_messages": [{"role": "user", "content": "describe"}],
+        "prompt_ids": [1, 99, 99, 2],
+        "rollout_prompt_ids": [1, 99, 2],
+        "teacher_prompt_tokens": 2,
+        "descriptors": ("descriptor-a",),
+        "multi_modal_data": {"image": object()},
+        "vision_inputs": {"pixel_values": object()},
+    }
+    first = opd_mod._PromptRecord(**base)
+    same_content = opd_mod._PromptRecord(
+        **{
+            **base,
+            "multi_modal_data": {"image": object()},
+            "vision_inputs": {"pixel_values": object()},
+        }
+    )
+    changed_descriptor = opd_mod._PromptRecord(
+        **{**base, "descriptors": ("descriptor-b",)}
+    )
+    changed_teacher = opd_mod._PromptRecord(
+        **{
+            **base,
+            "teacher_messages": [{"role": "user", "content": "different"}],
+        }
+    )
+
+    fingerprint = opd_mod._opd_prompt_pool_fingerprint([first])
+
+    assert fingerprint == opd_mod._opd_prompt_pool_fingerprint([same_content])
+    assert fingerprint != opd_mod._opd_prompt_pool_fingerprint([changed_descriptor])
+    assert fingerprint != opd_mod._opd_prompt_pool_fingerprint([changed_teacher])
 
 
 class _CharTok:
@@ -4542,6 +4630,69 @@ def test_resolve_samples_batched_mixes_distillation_and_truncated_no_loss():
     assert model.w.grad[0].abs().sum() > 0
     assert model.w.grad[1].abs().sum() == 0
     assert model.w.grad[2].abs().sum() == 0
+
+
+def test_resolve_image_sample_forwards_vision_inputs_and_extends_token_types():
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join({3: "a"}.get(int(i), "x") for i in ids)
+
+    class _VisionLM:
+        def __init__(self):
+            self.w = torch.nn.Parameter(torch.randn(5, 8))
+            self.config = SimpleNamespace(use_cache=False)
+            self.calls = []
+
+        def train(self):
+            return self
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids.detach().clone(), kwargs))
+            return SimpleNamespace(logits=self.w.unsqueeze(0))
+
+        def parameters(self):
+            return [self.w]
+
+    model = _VisionLM()
+    sample = opd_mod._ImageLossSample(
+        gen=opd_mod._GenResult(completion_ids=[3], completion_text="a", gen_tokens=1),
+        score=opd_mod._ScoreResult(
+            teacher_toks=[TeacherToken("a", -0.5, 0, 1)], status="ok"
+        ),
+        prompt_ids=[1, 99, 99, 2],
+        vision_inputs={
+            "pixel_values": torch.ones((4, 3)),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+        },
+        teacher_prompt_tokens=2,
+    )
+
+    result = opd_mod._resolve_samples_batched(
+        model,
+        _Tok(),
+        "cpu",
+        [sample],
+        SimpleNamespace(kl_coef=1.0),
+        microbatch=8,
+        backward_scale=1.0,
+    )[0]
+
+    assert result.loss is not None
+    assert result.teacher_tokens == 3
+    assert len(model.calls) == 1
+    input_ids, kwargs = model.calls[0]
+    assert input_ids.tolist() == [[1, 99, 99, 2, 3]]
+    assert kwargs["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert kwargs["mm_token_type_ids"].tolist() == [[0, 1, 1, 0, 0]]
+    assert kwargs["pixel_values"].shape == (4, 3)
+    assert kwargs["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert model.w.grad is not None
 
 
 def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
