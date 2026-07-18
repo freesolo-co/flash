@@ -27,6 +27,7 @@ _BYTES_PER_PARAM = {
 _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
+_VOCAB_DEFAULT = 248_320
 
 
 def _sft_per_device_bs() -> int:
@@ -122,6 +123,28 @@ def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: 
     params = float(params_b or 0.0)
     default = 4 if params and params <= 10.0 else 1
     return max(1, min(total, default))
+
+
+def opd_training_peak_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
+) -> float:
+    """Additional OPD loss-forward/backward memory above the resident student model."""
+    eff_b = float(active_params_b) if active_params_b else float(params_b)
+    width = math.sqrt(max(eff_b, 0.1))
+    loss_mb = opd_loss_microbatch(params_b, prompts_per_step, group_size)
+    activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
+    completion = opd_completion_len(max_tokens, thinking)
+    # the backward peak holds both full-sequence bf16 logits and fp32 completion rows plus gradients.
+    dense_logits = 2 * loss_mb * (seq_len * 2 + completion * 4) * vocab / 1e9
+    return activations + dense_logits
 
 
 def _resident_kv_gb(
@@ -222,7 +245,6 @@ _VLLM_COLOCATE_FLOOR_GB = 28.0
 # init time. Keep 2B+ OPD off <=40 GB classes so the allocator picks an 80 GB-class card instead of a
 # consumer GPU that passes the aggregate estimate but fails the vLLM free-memory preflight.
 _OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
-_VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
@@ -379,27 +401,18 @@ def estimate_vram_gb(
         # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
         # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
         # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
-        completion = opd_completion_len(max_tokens, thinking)
-        # run_opd backprops a small loss microbatch. Budget that actual dense-logit microbatch, not
-        # the full rollout/teacher batch and not a single sequence.
-        loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
-        activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (OPD has no fused CE):
-        #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
-        #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
-        #                                                             (completion * 4)
-        #   - backward: fp32 gradient of those completion rows [completion, vocab]
-        #                                                             (completion * 4)
-        #               bf16 gradient scattered back into the full logits [seq, vocab] to reach lm_head
-        #                                                             (seq * 2)
-        # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
-        # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
-        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in OPD loss backward
-        # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
-        logits_fwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits_bwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits = (logits_fwd + logits_bwd) / 1e9
-        return base + rollout + activations + logits
+        # keep the runtime reserve and the allocator's total estimate on the same loss-peak model.
+        training_peak = opd_training_peak_gb(
+            params_b,
+            seq_len,
+            max_tokens=max_tokens,
+            prompts_per_step=batch_size,
+            group_size=group_size,
+            thinking=thinking,
+            vocab=vocab,
+            active_params_b=active_params_b,
+        )
+        return base + rollout + training_peak
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
     # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
     # comparisons; the default must mirror the worker.

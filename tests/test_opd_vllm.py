@@ -316,7 +316,7 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
     assert stop_over_eos_over_length.terminal_eos_id == 99
 
 
-def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80):
+def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80, free_gb=None):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
 
@@ -328,6 +328,11 @@ def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80):
         @staticmethod
         def get_device_properties(_idx):
             return SimpleNamespace(total_memory=card_gb * 1024**3)
+
+    if free_gb is not None:
+        _Cuda.mem_get_info = staticmethod(
+            lambda: (int(free_gb * 1024**3), int(card_gb * 1024**3))
+        )
 
     torch_mod = types.ModuleType("torch")
     torch_mod.cuda = _Cuda
@@ -417,6 +422,65 @@ def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
     assert out["gpu_memory_utilization"] == 0.37
 
 
+@pytest.mark.parametrize(("card_gb", "free_gb"), [(80.0, 68.0), (141.0, 125.0)])
+def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
+    monkeypatch, card_gb, free_gb
+):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=card_gb, free_gb=free_gb)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512),
+        1536,
+    )
+
+    training_reserve_gb = (
+        vram.opd_training_peak_gb(
+            4.0,
+            1536,
+            max_tokens=512,
+            prompts_per_step=8,
+            group_size=1,
+            vocab=248_320,
+        )
+        * 1.15
+    )
+    allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
+    expected = min(0.80, (free_gb - training_reserve_gb - allocator_margin_gb) / card_gb)
+    assert out["gpu_memory_utilization"] == pytest.approx(expected)
+    assert out["gpu_memory_utilization"] > 0.45
+    assert (
+        out["gpu_memory_utilization"] * card_gb
+        + training_reserve_gb
+        + allocator_margin_gb
+        <= free_gb
+    )
+
+
+def test_opd_vllm_kwargs_keeps_010_fallback_when_budget_sizing_fails(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80, free_gb=68)
+
+    def _fail(_model_id):
+        raise RuntimeError("geometry unavailable")
+
+    monkeypatch.setattr(vram, "resolve_params_b", _fail)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512),
+        1536,
+    )
+
+    assert out["gpu_memory_utilization"] == 0.10
+
+
 def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monkeypatch):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
@@ -433,7 +497,7 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
 
         @staticmethod
         def mem_get_info():
-            return 23 * 1024**3, 80 * 1024**3
+            return 28 * 1024**3, 80 * 1024**3
 
     torch_mod = types.ModuleType("torch")
     torch_mod.cuda = _Cuda
@@ -446,10 +510,11 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
         return {8: 0.40, 7: 0.36, 6: 0.32, 5: 0.28, 4: 0.22}[num_generations]
 
     monkeypatch.setattr(vram, "colocate_kv_util", _util_for)
+    monkeypatch.setattr(vram, "opd_training_peak_gb", lambda *args, **kwargs: 4.0)
 
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
-    assert out["gpu_memory_utilization"] == 0.22
+    assert out["gpu_memory_utilization"] == pytest.approx((28.0 - 4.0 * 1.15 - 4.0) / 80.0)
     assert out["max_num_seqs"] == 4
     assert out["rollout_batch_size"] == 4
 

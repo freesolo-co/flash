@@ -69,7 +69,7 @@ def _startup_oom_error(
     free_gb: float,
     total_gb: float,
     requested_util: float,
-    margin_gb: float,
+    reserve_gb: float,
     rollout_batch_size: int,
 ) -> BaseException:
     requested_gb = float(requested_util) * float(total_gb)
@@ -77,8 +77,8 @@ def _startup_oom_error(
         "Free memory on device cuda:0 "
         f"({free_gb:.2f}/{total_gb:.2f} GiB) on startup is less than desired GPU "
         f"memory utilization ({requested_util:.6f} -> {requested_gb:.2f} GiB) "
-        f"with {margin_gb:.2f} GiB startup margin after reducing OPD rollout_batch_size "
-        f"to {rollout_batch_size}. Retry on a larger GPU."
+        f"with {reserve_gb:.2f} GiB reserved for the OPD training peak and allocator "
+        f"after reducing OPD rollout_batch_size to {rollout_batch_size}. Retry on a larger GPU."
     )
     try:
         import torch
@@ -132,10 +132,11 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
     if card_gb > 0:
         try:
-            from flash.catalog import MODELS
+            from flash.catalog import MODELS, vocab_size_for
             from flash.engine.vram import (
                 colocate_kv_util,
                 opd_rollout_concurrency,
+                opd_training_peak_gb,
                 resolve_params_b,
             )
 
@@ -161,12 +162,23 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
             util = _util_for(rollout_concurrency)
             if free_gb > 0:
-                # vLLM rejects startup unless its whole executor budget is free right now. OPD builds
-                # the rollout engine after the student + warm-start adapter are resident, so choose the
-                # largest rollout chunk that fits the observed residual memory instead of reserving for
-                # every prompt in the optimizer step.
-                startup_margin_gb = max(1.0, min(4.0, card_gb * 0.03))
-                max_startup_util = max(0.0, (free_gb - startup_margin_gb) / max(1.0, card_gb))
+                # free memory is measured after the student and adapter are resident. protect the
+                # modeled loss forward/backward peak plus allocator slack, then give the remaining
+                # memory to the rollout executor instead of leaving it idle behind the generic cap.
+                training_peak_gb = opd_training_peak_gb(
+                    params_b,
+                    int(seq_cap),
+                    max_tokens=getattr(knobs, "max_completion", None),
+                    prompts_per_step=getattr(knobs, "prompts_per_step", 1),
+                    group_size=getattr(knobs, "group_size", 1),
+                    vocab=vocab_size_for(model_id),
+                    active_params_b=active_b,
+                )
+                training_reserve_gb = training_peak_gb * 1.15
+                allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
+                protected_gb = training_reserve_gb + allocator_margin_gb
+                rollout_budget_gb = max(0.0, free_gb - protected_gb)
+                max_startup_util = rollout_budget_gb / max(1.0, card_gb)
                 while rollout_concurrency > 1 and util > max_startup_util:
                     rollout_concurrency -= 1
                     util = _util_for(rollout_concurrency)
@@ -175,16 +187,28 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                         "[opd] reduced vLLM rollout batch "
                         f"{target_concurrency}->{rollout_concurrency} to fit startup memory "
                         f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB, "
-                        f"margin={startup_margin_gb:.1f} GiB)"
+                        f"protected={protected_gb:.1f} GiB)"
                     )
                 if util > max_startup_util:
                     startup_oom = _startup_oom_error(
                         free_gb=free_gb,
                         total_gb=card_gb,
                         requested_util=util,
-                        margin_gb=startup_margin_gb,
+                        reserve_gb=protected_gb,
                         rollout_batch_size=rollout_concurrency,
                     )
+                else:
+                    # 0.80 is a final ceiling for large cards; the measured free-minus-reserve
+                    # budget is normally tighter and keeps the training peak available.
+                    util = max(util, min(0.80, max_startup_util))
+                print(
+                    "[opd] vLLM memory budget "
+                    f"free={free_gb:.1f}/{card_gb:.1f} GiB "
+                    f"training_peak={training_peak_gb:.1f} GiB "
+                    f"training_reserve={training_reserve_gb:.1f} GiB "
+                    f"allocator_margin={allocator_margin_gb:.1f} GiB "
+                    f"rollout={util * card_gb:.1f} GiB util={util:.3f}"
+                )
             kwargs["gpu_memory_utilization"] = util
             kwargs["max_num_seqs"] = rollout_concurrency
             kwargs["rollout_batch_size"] = rollout_concurrency
