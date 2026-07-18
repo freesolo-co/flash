@@ -870,10 +870,8 @@ def test_run_rl_threads_prompt_opened_thinking_to_grading_and_penalty() -> None:
         )
 
 
-def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
-    """Chalk standalone replaces the model-layer/SFT kernels, but it does not yet ship a GRPO
-    fused-logprob loss. run_rl must therefore pass fused_logits=False so per-device sizing keeps the
-    6 GB full-logits cap instead of inheriting the old Liger fused-loss assumption."""
+def test_run_rl_sizes_from_the_chalk_grpo_feature_gate() -> None:
+    """run_rl may lift the full-logits cap only when the Chalk selected-token probe succeeds."""
     import ast
     import inspect
 
@@ -891,13 +889,8 @@ def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
     assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
     fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
     assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
-    # Merge note (chalk-standalone x dev): the merged run_rl keeps fused_logits a constant False
-    # (chalk ships no GRPO fused-logprob loss yet), which is strictly MORE conservative than dev's
-    # `_vllm_is_logprob_forward` gate — it always keeps the 6 GB cap, so the gate's protection is
-    # subsumed. Assert the conservative constant + that Liger is disabled (chalk-standalone). When
-    # chalk's GRPO fused-logprob path lands and fused_logits is re-enabled, restore dev's TIS gate.
-    assert isinstance(fused_kw.value, ast.Constant)
-    assert fused_kw.value.value is False
+    assert isinstance(fused_kw.value, ast.Name)
+    assert fused_kw.value.id == "_chalk_grpo_fused"
     assert 'grpo_kwargs["use_liger_kernel"] = False' in src
     assert '"use_liger_kernel": True' not in src
 

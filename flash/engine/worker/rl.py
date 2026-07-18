@@ -22,6 +22,7 @@ from flash.engine.structured_outputs import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.grpo import resolve_grpo_sleep_mode
+from flash.engine.worker.grpo_fused import resolve_chalk_grpo_trainer
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import (
     _GpuPeakSampler,
@@ -74,6 +75,11 @@ def run_rl():
         exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
+    GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(GRPOTrainer)
+    if _chalk_grpo_fused:
+        print("[rl] Chalk GRPO selected-token log-probabilities active (eager, no full logits)")
+    else:
+        print("[rl] Chalk GRPO unavailable or failed its probe; using TRL full-logits fallback")
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     download_seconds = (
@@ -293,12 +299,10 @@ def run_rl():
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
     # cap against the worst-case (engine context), not the per-turn _max_completion, or it OOMs.
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
-    # chalk 0.5.0 ships a GRPO fused-logprob op (chalk.ops.grpo) that streams selected-token logprobs
-    # without materializing [B,T,V]; WIRING it to flip fused_logits=True is a tracked follow-up (needs a
-    # GRPO end-to-end A/B first). Until then every GRPO path keeps the conservative full-logits budget
-    # cap (fused_logits=False below), so long completions are BUDGETED to fit — slower than the old Liger
-    # fused loss, but not an OOM. Feature-detect GRPOConfig fields once here; the TIS and num_iterations
-    # knobs are set later, so this must stay outside the vLLM engine-kwargs block.
+    # the validated chalk path streams selected-token log-probabilities and entropy reductions without
+    # materializing [b,t,v]. when its import or functional probe fails, sizing keeps the conservative
+    # full-logits cap for the unchanged trl fallback. feature-detect grpoconfig fields once here; the tis
+    # and num_iterations knobs are set later, so this must stay outside the vLLM engine-kwargs block.
     _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
     _grpo_has_num_iter = "num_iterations" in _grpo_fields
     per_device_comps = _w.rl_per_device_comps(
@@ -308,9 +312,7 @@ def run_rl():
         params_b=_params_b,
         active_params_b=(float(getattr(_info, "active_params_b", 0.0) or 0.0) or None),
         seq_len=vllm_max_len,
-        # Conservative until chalk's GRPO fused-logprob op (chalk 0.5.0, chalk.ops.grpo) is wired in:
-        # keep the full-logits budget cap so the unfused path is BUDGETED to fit, never OOMs.
-        fused_logits=False,
+        fused_logits=_chalk_grpo_fused,
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
         print(
