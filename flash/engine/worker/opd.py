@@ -141,8 +141,29 @@ class _PromptRecord:
     rollout_prompt_ids: list[int]
     teacher_prompt_tokens: int
     descriptors: tuple[str, ...] = ()
-    multi_modal_data: object = None
-    vision_inputs: object = None
+
+
+def _json_safe_image_example(value, descriptors: tuple[str, ...], *, image_payload=False):
+    """replace raw image payloads with normalized descriptors while preserving other fields."""
+    if image_payload:
+        return list(descriptors)
+    if isinstance(value, dict):
+        block_type = value.get("type")
+        image_block = block_type in {"image", "image_url", "input_image"}
+        return {
+            key: _json_safe_image_example(
+                item,
+                descriptors,
+                image_payload=(
+                    key in {"image", "images", "image_url"}
+                    or (image_block and key in {"source", "url"})
+                ),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_image_example(item, descriptors) for item in value]
+    return value
 
 
 def _opd_prompt_pool_fingerprint(examples) -> str:
@@ -152,7 +173,7 @@ def _opd_prompt_pool_fingerprint(examples) -> str:
         if isinstance(item, _PromptRecord):
             if item.descriptors:
                 payload = [
-                    item.example,
+                    _json_safe_image_example(item.example, item.descriptors),
                     list(item.descriptors),
                     item.teacher_messages,
                     [int(token) for token in item.prompt_ids],
@@ -175,6 +196,42 @@ def _opd_prompt_pool_fingerprint(examples) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _materialize_image_prompt(processor, student_messages, descriptors, package_root):
+    """decode and process one image prompt without retaining its images or tensors in the pool."""
+    from trl.data_utils import prepare_multimodal_messages
+
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(descriptors), package_root)
+    pil_messages = prepare_multimodal_messages(student_messages, images=images)
+    processed = processor.apply_chat_template(
+        conversation=[pil_messages],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        enable_thinking=_w.THINKING,
+    )
+    input_ids = processed["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        input_ids = input_ids[0]
+    prompt_ids = [int(token_id) for token_id in input_ids]
+    vision_inputs = {
+        key: value for key, value in processed.items() if key not in {"input_ids", "attention_mask"}
+    }
+    return prompt_ids, vision_inputs
+
+
+def _decode_opd_rollout_images(descriptors, package_root):
+    """decode one retained descriptor set for the current vllm rollout chunk only."""
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(descriptors), package_root)
+    return {"image": images if len(images) > 1 else images[0]}
 
 
 def _apply_opd_optimizer_update(
@@ -536,6 +593,7 @@ def run_opd():
         train = train[:max_examples]
     rng = random.Random(_w.SEED)
     rng.shuffle(train)
+    train_count = len(train)
 
     from flash.multimodal import record_has_images, validate_multimodal_training
 
@@ -623,54 +681,31 @@ def run_opd():
         examples = []
         for ex, messages, has_images in message_rows:
             if has_images:
-                from trl.data_utils import prepare_multimodal_messages
-
                 from flash.multimodal import (
                     collapse_image_pad_runs,
-                    decode_image_descriptors,
                     normalize_prompt_images,
                     text_only_prompt_messages,
                 )
 
                 normalized = normalize_prompt_images(ex, messages, package_root)
-                images = decode_image_descriptors(normalized.descriptors, package_root)
                 student_messages = normalized.messages
                 teacher_messages = text_only_prompt_messages(student_messages)
-                pil_messages = prepare_multimodal_messages(student_messages, images=images)
-                processed = processor.apply_chat_template(
-                    conversation=[pil_messages],
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    enable_thinking=_w.THINKING,
-                )
-                input_ids = processed["input_ids"]
-                if hasattr(input_ids, "tolist"):
-                    input_ids = input_ids.tolist()
-                if input_ids and isinstance(input_ids[0], (list, tuple)):
-                    input_ids = input_ids[0]
-                prompt_ids = [int(token_id) for token_id in input_ids]
+                descriptors = tuple(normalized.descriptors)
+                prompt_ids = _materialize_image_prompt(
+                    processor, student_messages, descriptors, package_root
+                )[0]
                 rollout_prompt_ids = collapse_image_pad_runs(
-                    prompt_ids, image_pad_id, len(images)
+                    prompt_ids, image_pad_id, len(descriptors)
                 )
-                vision_inputs = {
-                    key: value
-                    for key, value in processed.items()
-                    if key not in {"input_ids", "attention_mask"}
-                }
                 teacher_prompt_tokens = len(_render_prompt_ids(teacher_messages))
-                multi_modal_data = {"image": images if len(images) > 1 else images[0]}
                 record = _PromptRecord(
-                    example=ex,
+                    example=_json_safe_image_example(ex, descriptors),
                     student_messages=student_messages,
                     teacher_messages=teacher_messages,
                     prompt_ids=prompt_ids,
                     rollout_prompt_ids=rollout_prompt_ids,
                     teacher_prompt_tokens=teacher_prompt_tokens,
-                    descriptors=tuple(normalized.descriptors),
-                    multi_modal_data=multi_modal_data,
-                    vision_inputs=vision_inputs,
+                    descriptors=descriptors,
                 )
             else:
                 prompt_ids = _render_prompt_ids(messages)
@@ -685,7 +720,8 @@ def run_opd():
             if len(record.prompt_ids) <= prompt_budget:
                 examples.append(record)
             _scanned += 1
-    n_over_budget = len(train) - len(examples)
+    n_over_budget = train_count - len(examples)
+    del ex, has_images, message_rows, messages, train
     if not examples:
         raise RuntimeError(
             f"opd: every prompt exceeds the {prompt_budget}-token budget "
@@ -697,7 +733,7 @@ def run_opd():
     prompt_pool_fingerprint = _opd_prompt_pool_fingerprint(examples)
     if n_over_budget:
         print(
-            f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
+            f"[opd] filtered {n_over_budget}/{train_count} prompts over the "
             f"{prompt_budget}-token budget; pool = {len(examples)}"
         )
     if prompts_per_step > len(examples):
@@ -1123,7 +1159,7 @@ def run_opd():
                     scored_samples = []
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
-                        if p.vision_inputs is None:
+                        if p.image_record is None:
                             scored_samples.append((p.gen, score, p.prompt_ids))
                         else:
                             scored_samples.append(
@@ -1131,7 +1167,10 @@ def run_opd():
                                     gen=p.gen,
                                     score=score,
                                     prompt_ids=p.prompt_ids,
-                                    vision_inputs=p.vision_inputs,
+                                    student_messages=p.image_record.student_messages,
+                                    descriptors=p.image_record.descriptors,
+                                    processor=processor,
+                                    package_root=package_root,
                                     teacher_prompt_tokens=int(p.teacher_prompt_tokens or 0),
                                 )
                             )
@@ -1190,18 +1229,29 @@ def run_opd():
                 else:
                     contexts: list[_PromptRecord] = []
                     prompts: list[list[int]] = []
-                    multimodal_data: list[object | None] = []
                     for prompt_record in batch:
                         for _g in range(group):
                             contexts.append(prompt_record)
                             prompts.append(prompt_record.rollout_prompt_ids)
-                            multimodal_data.append(prompt_record.multi_modal_data)
                     chunk_size = _opd_rollout_chunk_size(len(prompts))
                     for start in range(0, len(prompts), chunk_size):
                         end = start + chunk_size
                         chunk_prompts = prompts[start:end]
                         chunk_contexts = contexts[start:end]
-                        chunk_multimodal_data = multimodal_data[start:end] if multimodal else None
+                        chunk_multimodal_data = None
+                        if multimodal:
+                            decoded_by_record: dict[int, object] = {}
+                            chunk_multimodal_data = []
+                            for prompt_record in chunk_contexts:
+                                if not prompt_record.descriptors:
+                                    chunk_multimodal_data.append(None)
+                                    continue
+                                record_key = id(prompt_record)
+                                if record_key not in decoded_by_record:
+                                    decoded_by_record[record_key] = _decode_opd_rollout_images(
+                                        prompt_record.descriptors, package_root
+                                    )
+                                chunk_multimodal_data.append(decoded_by_record[record_key])
                         with liveness_heartbeat(
                             "opd_step",
                             progress=_samples_progress,
@@ -1214,6 +1264,9 @@ def run_opd():
                                 max_tokens=knobs.max_completion,
                                 multi_modal_data_batch=chunk_multimodal_data,
                             )
+                            if multimodal:
+                                decoded_by_record.clear()
+                                chunk_multimodal_data.clear()
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
                             )
@@ -1224,7 +1277,7 @@ def run_opd():
                                 gen=gen,
                                 prompt_ids=prompt_record.prompt_ids,
                                 prompt_messages=prompt_record.teacher_messages,
-                                vision_inputs=prompt_record.vision_inputs,
+                                image_record=prompt_record if prompt_record.descriptors else None,
                                 teacher_prompt_tokens=prompt_record.teacher_prompt_tokens,
                             )
                             if gen.skip or gen.truncated:
@@ -1655,7 +1708,7 @@ class _Pending:
     gen: _GenResult
     prompt_ids: object
     prompt_messages: object
-    vision_inputs: object = None
+    image_record: _PromptRecord | None = None
     teacher_prompt_tokens: int | None = None
     score: object = None
 
@@ -1665,7 +1718,10 @@ class _ImageLossSample:
     gen: _GenResult
     score: _ScoreResult | None
     prompt_ids: object
-    vision_inputs: object
+    student_messages: object
+    descriptors: tuple[str, ...]
+    processor: object
+    package_root: object
     teacher_prompt_tokens: int
 
 
@@ -1925,7 +1981,7 @@ class _PreparedLoss:
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
-    vision_inputs: object = None
+    image_sample: _ImageLossSample | None = None
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -2020,11 +2076,11 @@ def _resolve_samples_batched(
             gen = sample.gen
             score = sample.score
             prompt_ids = sample.prompt_ids
-            vision_inputs = sample.vision_inputs
+            image_sample = sample
             teacher_prompt_tokens = sample.teacher_prompt_tokens
         else:
             gen, score, prompt_ids = sample
-            vision_inputs = None
+            image_sample = None
             teacher_prompt_tokens = len(prompt_ids)
         if gen.truncated:
             results[idx] = _resolve_no_loss_sample(gen, score)
@@ -2074,7 +2130,7 @@ def _resolve_samples_batched(
                 gen_tokens=gen.gen_tokens,
                 teacher_tokens=teacher_tokens,
                 group_granularity=group_granularity,
-                vision_inputs=vision_inputs,
+                image_sample=image_sample,
             )
         )
 
@@ -2082,8 +2138,8 @@ def _resolve_samples_batched(
         model.train()
         model.config.use_cache = False
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
-        text_prepared = [p for p in prepared if p.vision_inputs is None]
-        image_prepared = [p for p in prepared if p.vision_inputs is not None]
+        text_prepared = [p for p in prepared if p.image_sample is None]
+        image_prepared = [p for p in prepared if p.image_sample is not None]
         mb = max(1, int(microbatch))
         for start in range(0, len(text_prepared), mb):
             chunk = text_prepared[start : start + mb]
@@ -2131,13 +2187,24 @@ def _resolve_samples_batched(
 
         for p in image_prepared:
             _bump_model_counter(model, "_flash_opd_full_logits_batches")
+            image_sample = p.image_sample
+            materialized_prompt_ids, vision_inputs = _materialize_image_prompt(
+                image_sample.processor,
+                image_sample.student_messages,
+                image_sample.descriptors,
+                image_sample.package_root,
+            )
+            if materialized_prompt_ids != list(p.prompt_ids):
+                raise RuntimeError(
+                    "opd image prompt tokenization changed between pool filtering and loss forward"
+                )
             prompt_len = len(p.prompt_ids)
             comp_len = len(p.student_ids)
             seq = list(p.prompt_ids) + list(p.student_ids)
             input_ids = torch.tensor([seq], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
             model_kwargs = {}
-            for key, value in p.vision_inputs.items():
+            for key, value in vision_inputs.items():
                 moved = value.to(device) if hasattr(value, "to") else value
                 if key in {"mm_token_type_ids", "token_type_ids"}:
                     shape = (*moved.shape[:-1], comp_len)
