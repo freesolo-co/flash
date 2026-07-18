@@ -42,6 +42,7 @@ from flash.engine.worker.perf import (
     grad_checkpointing_on,
     grpo_use_reentrant,
     loraplus_optimizer_cls,
+    make_multimodal_input_require_grads_callback,
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -658,6 +659,13 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
+    trainer_callbacks = [
+        _w.make_sft_heartbeat_callback(),
+        _w.make_checkpoint_upload_callback(save_at_steps),
+    ]
+    if multimodal:
+        trainer_callbacks.append(make_multimodal_input_require_grads_callback())
+
     # SFTTrainer.__init__ can block 10-15 min (FA2 JIT). liveness_heartbeat keeps the control plane
     # from recycling the worker. include_torch=False: side-thread torch.cuda telemetry serializes on
     # the CUDA/allocator lock held by the init thread and can freeze the heartbeat itself.
@@ -679,10 +687,7 @@ def run_sft():
             peft_config=_w.make_lora(model_id),
             processing_class=processor if multimodal else tok,
             data_collator=_collator,
-            callbacks=[
-                _w.make_sft_heartbeat_callback(),
-                _w.make_checkpoint_upload_callback(save_at_steps),
-            ],
+            callbacks=trainer_callbacks,
         )
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
         # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
