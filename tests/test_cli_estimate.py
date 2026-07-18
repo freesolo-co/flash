@@ -398,7 +398,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 8\n"
-        "max_context_tokens = 9000\n"
+        "max_context_tokens = 33000\n"
         'hf_repo = "owner/runs"\n'
     )
     args = types.SimpleNamespace(
@@ -407,7 +407,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match=r"train\.max_context_tokens=9000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=8192",
+        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=32768",
     ):
         cmd_train(args)
 
