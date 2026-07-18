@@ -70,6 +70,7 @@ from flash.engine.worker.opd_vllm import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _sdpa_cudnn_ctx,
+    enable_multimodal_input_require_grads,
     free_gpu,
     gpu_diagnostics,
     grad_checkpointing_on,
@@ -794,6 +795,8 @@ def run_opd():
                 gradient_checkpointing_kwargs={"use_reentrant": _reentrant}
             )
             model.enable_input_require_grads()
+            if multimodal:
+                enable_multimodal_input_require_grads(model)
             print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
     # The HF/PEFT model only handles differentiable loss forwards; the colocated vLLM engine owns
     # KV-cached student rollout generation.
