@@ -305,6 +305,58 @@ def test_export_adapter_key_collision_leaves_safetensors_unchanged(monkeypatch):
     assert uploaded["weights"] == source_bytes
 
 
+def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatch):
+    # a genuinely multimodal adapter (lora on the vision tower) must not be normalized:
+    # stripping only its lm keys would leave a mixed namespace no transformers class loads.
+    uploaded: dict = {}
+    lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    vision_key = "base_model.model.model.visual.blocks.0.attn.proj.lora_A.default.weight"
+    source_bytes = _safetensors_bytes(
+        {
+            lm_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            vision_key: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        },
+        b"\x01\x02\x03\x04",
+    )
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert uploaded["weights"] == source_bytes
+
+
 def test_export_adapter_without_safetensors_still_exports(monkeypatch):
     uploaded: dict = {}
     bin_weights = b"legacy-adapter-weights"
