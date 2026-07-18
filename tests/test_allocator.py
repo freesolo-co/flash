@@ -458,6 +458,55 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(2.0, "sft", seq_len=4096, max_tokens=8192)
 
 
+def test_opd_vram_estimate_budgets_one_chunked_ce_vocab_buffer():
+    from flash.engine import vram
+    from flash.engine.vram import estimate_vram_gb as e
+
+    vocab = 248_320
+    with_vocab = e(
+        2.0,
+        "opd",
+        seq_len=4096,
+        max_tokens=512,
+        vocab=vocab,
+        batch_size=4,
+        group_size=4,
+    )
+    without_vocab = e(
+        2.0,
+        "opd",
+        seq_len=4096,
+        max_tokens=512,
+        vocab=0,
+        batch_size=4,
+        group_size=4,
+    )
+    expected = vram.OPD_CE_CHUNK_SIZE * vocab * vram._OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+    assert with_vocab - without_vocab == pytest.approx(expected)
+    assert expected < 0.3
+
+    # once one ce chunk is full, longer completions do not grow the vocab-sized peak.
+    short = e(
+        2.0,
+        "opd",
+        seq_len=4096,
+        max_tokens=128,
+        vocab=vocab,
+        batch_size=4,
+        group_size=4,
+    )
+    long = e(
+        2.0,
+        "opd",
+        seq_len=4096,
+        max_tokens=2048,
+        vocab=vocab,
+        batch_size=4,
+        group_size=4,
+    )
+    assert long == short
+
+
 def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
     """Regression (codex[bot], vram.py): for an uncataloged (model_policy='allow') model the open-model
     fallback hardcoded ``_need(params_b, 'grpo', ...)``, so an OPD run was sized as a colocated-vLLM GRPO
@@ -619,11 +668,11 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "RTX Pro 6000",
+            "A100 PCIe",
         ),
         (
-            # fp8 KV (cc >= 8.9) halves the resident rollout KV, so this fits the 141 GB H200 and no
-            # longer needs the 180 GB B200 — still far off the 32/40 GB consumer classes this guards.
+            # completion-only chunked ce removes the dense-logit peak; the resident rollout kv now
+            # determines this route, which remains safely above the 32/40 gb consumer classes.
             "max_context_16384",
             {
                 "epochs": 1,
@@ -632,7 +681,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "H200",
+            "RTX Pro 6000",
         ),
         (
             "max_context_24576",
@@ -643,7 +692,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            None,
+            "H200",
         ),
         (
             "group_size_8",
@@ -738,10 +787,9 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    # Off the 40 GB class, but no longer forced onto the 141 GB H200: the colocated OPD rollout uses an
-    # fp8 KV cache on cc >= 8.9 hardware, and a run this size can only land on a modern (cc >= 8.9)
-    # card, so its KV pool is fp8-sized — it fits the cheaper 96 GB RTX Pro 6000 (Blackwell).
-    assert 80 < need <= 96
+    # completion-only chunked ce removes the old dense-logit peak while the resident rollout still
+    # keeps this run above the 40 gb class; it now fits the 80 gb a100 pcie.
+    assert 40 < need <= 80
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
@@ -757,7 +805,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
         )
     )
 
-    assert preview_gpu == "RTX Pro 6000"
+    assert preview_gpu == "A100 PCIe"
     assert alloc.gpu == preview_gpu
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need

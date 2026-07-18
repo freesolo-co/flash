@@ -46,7 +46,7 @@ from flash.engine.structured_outputs import (
     parse_structured_outputs,
     reasoning_parser_for,
 )
-from flash.engine.vram import opd_completion_len
+from flash.engine.vram import OPD_CE_CHUNK_SIZE, opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.hf import RequiredSaveError, _deployable_adapter_on_hf
@@ -1421,7 +1421,9 @@ def run_opd():
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
             "opd_loss_microbatch_size": loss_microbatch_size,
-            "opd_full_logits_batches": getattr(model, "_flash_opd_full_logits_batches", 0),
+            "opd_completion_only_batches": getattr(
+                model, "_flash_opd_completion_only_batches", 0
+            ),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -1836,6 +1838,88 @@ def _forward_logits(
         raise
 
 
+class _LmHeadBypass(Exception):
+    pass
+
+
+def _forward_completion_hidden_states(
+    model, input_ids, attention_mask, position_ids, *, logits_to_keep: int
+):
+    """Run the causal body through the normal model boundary but stop before the LM-head matmul."""
+    output_embeddings = model.get_output_embeddings()
+    input_embeddings = model.get_input_embeddings()
+    if output_embeddings is None or output_embeddings is input_embeddings:
+        raise RuntimeError("opd chunked ce requires a distinct output embedding module")
+
+    captured = {}
+    marker = object()
+
+    def _capture_hidden(_module, args):
+        if not args:
+            raise RuntimeError("opd lm head received no hidden states")
+        captured["hidden_states"] = args[0]
+        raise _LmHeadBypass(marker)
+
+    handle = output_embeddings.register_forward_pre_hook(_capture_hidden)
+    try:
+        _forward_logits(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids=position_ids,
+            logits_to_keep=logits_to_keep,
+        )
+    except _LmHeadBypass as exc:
+        if not exc.args or exc.args[0] is not marker:
+            raise
+    else:
+        raise RuntimeError("opd could not intercept the lm head for chunked ce")
+    finally:
+        handle.remove()
+
+    hidden_states = captured.get("hidden_states")
+    if hidden_states is None or hidden_states.shape[1] != logits_to_keep:
+        raise RuntimeError("opd model did not honor completion-only logits_to_keep")
+    return hidden_states, output_embeddings
+
+
+def _chunked_token_logps(lm_head, hidden_states, token_ids, *, chunk_size=OPD_CE_CHUNK_SIZE):
+    """Compute exact realized-token logprobs with checkpointed vocabulary chunks."""
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
+
+    if hidden_states.ndim != 2 or token_ids.ndim != 1:
+        raise ValueError("opd chunked ce expects [tokens, hidden] states and [tokens] ids")
+    if hidden_states.shape[0] != token_ids.shape[0]:
+        raise ValueError("opd chunked ce hidden-state and token counts differ")
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty((0,), dtype=torch.float32)
+
+    size = max(1, int(chunk_size))
+
+    def _logps(hidden_chunk, ids_chunk):
+        logits = lm_head(hidden_chunk).float()
+        return -F.cross_entropy(logits, ids_chunk, reduction="none")
+
+    chunks = []
+    for start in range(0, hidden_states.shape[0], size):
+        hidden_chunk = hidden_states[start : start + size]
+        ids_chunk = token_ids[start : start + size]
+        if torch.is_grad_enabled():
+            chunks.append(
+                checkpoint(
+                    _logps,
+                    hidden_chunk,
+                    ids_chunk,
+                    use_reentrant=False,
+                )
+            )
+        else:
+            chunks.append(_logps(hidden_chunk, ids_chunk))
+    return torch.cat(chunks)
+
+
 def _bump_model_counter(model, name: str, inc: int = 1) -> None:
     with contextlib.suppress(Exception):
         setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
@@ -1916,23 +2000,46 @@ def _resolve_samples_batched(
         mb = max(1, int(microbatch))
         for start in range(0, len(prepared), mb):
             chunk = prepared[start : start + mb]
-            _bump_model_counter(model, "_flash_opd_full_logits_batches")
+            _bump_model_counter(model, "_flash_opd_completion_only_batches")
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
+            max_completion = max(len(p.student_ids) for p in chunk)
+            logits_to_keep = max_completion + 1
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
             attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                attention_mask[row, : len(seq)] = 1
-            logits = _forward_logits(model, input_ids, attention_mask)
-            losses = []
+                offset = max_len - len(seq)
+                input_ids[row, offset:] = torch.tensor(seq, dtype=torch.long, device=device)
+                attention_mask[row, offset:] = 1
+            position_ids = attention_mask.cumsum(dim=-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            hidden_tail, lm_head = _forward_completion_hidden_states(
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                logits_to_keep=logits_to_keep,
+            )
+            selected_hidden = []
+            selected_ids = []
             for row, p in enumerate(chunk):
-                prompt_len = len(p.prompt_ids)
                 comp_len = len(p.student_ids)
-                rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                loss = _gkd_loss_from_logits_rows(
-                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                selected_hidden.append(
+                    hidden_tail[row, logits_to_keep - comp_len - 1 : logits_to_keep - 1]
                 )
+                selected_ids.extend(int(token_id) for token_id in p.student_ids)
+            flat_logps = _chunked_token_logps(
+                lm_head,
+                torch.cat(selected_hidden, dim=0),
+                torch.tensor(selected_ids, dtype=torch.long, device=device),
+            )
+            losses = []
+            token_offset = 0
+            for p in chunk:
+                comp_len = len(p.student_ids)
+                sp_t = flat_logps[token_offset : token_offset + comp_len]
+                token_offset += comp_len
+                loss = _gkd_loss_from_logps(sp_t, p.groups, kl_coef=knobs.kl_coef)
                 if loss is None:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",

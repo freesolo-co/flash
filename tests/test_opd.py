@@ -3176,12 +3176,8 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     assert 141 < need <= 180
 
 
-def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
-    """L5 regression: OPD's colocated vLLM rollout reserves an fp8 KV cache on cc >= 8.9 hardware
-    (worker/opd_vllm.py), but model_required_vram_gb sized that KV as bf16 — DOUBLE the real bytes —
-    so a full-context (4096) group_size=1 35B OPD run that actually fits a 180 GB B200 was rejected
-    ('no validated GPU has >= 185 GB VRAM'). Size the KV fp8 once the run is provably modern-card-only,
-    so the B200-fitting config is admitted."""
+def test_opd_35b_full_context_group1_fits_b200():
+    """a full-context group-1 35b opd run fits the b200 with conservative kv sizing."""
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
     from flash.providers.allocator import vram_headroom
@@ -3199,8 +3195,7 @@ def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
     need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
     assert need <= 180
     assert cheapest_gpu(need) == "B200"
-    # Prove the fp8 KV sizing is what flips it: the bf16-KV estimate * headroom overflows the B200,
-    # the fp8-KV estimate clears it (same shape as the GRPO resident-fit fp8 test).
+    # fp8 kv remains cheaper, but chunked ce now lets the conservative bf16 kv estimate fit too.
     kw = {
         "seq_len": 4096,
         "max_tokens": 2048,
@@ -3214,7 +3209,7 @@ def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
     bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
     assert fp8 < bf16
     hr = vram_headroom()
-    assert fp8 * hr <= 180 < bf16 * hr
+    assert fp8 * hr < bf16 * hr <= 180
 
 
 def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
@@ -3251,19 +3246,17 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
     assert "max_completion_tokens" in msg
 
 
-def test_opd_vram_budgets_dense_logit_backward_buffers():
-    """Regression (codex[bot], vram.py): OPD's loss has no fused CE and, at the loss BACKWARD peak, holds
-    the fp32 completion rows + their fp32 gradient AND the bf16 full-sequence logits + their bf16
-    gradient. The estimate must budget the backward buffers too, not only the two forward ones — else a
-    long-completion / large-vocab (248k) opd job under-budgets OPD loss backward and routes to a GPU
-    that OOMs. Isolate the logit term via a vocab delta (base + activations are vocab-independent): it
-    must equal the FORWARD+BACKWARD size, i.e. 2x the forward-only (seq*2 + completion*4)*vocab."""
-    from flash.engine.vram import estimate_vram_gb
+def test_opd_vram_budgets_one_chunked_ce_buffer():
+    """opd budgets one live checkpointed ce chunk instead of full-sequence logits."""
+    from flash.engine.vram import (
+        OPD_CE_CHUNK_SIZE,
+        _OPD_CE_PEAK_BYTES_PER_LOGIT,
+        estimate_vram_gb,
+    )
 
-    seq, comp = 9216, 8192
     kw = {
-        "seq_len": seq,
-        "max_tokens": comp,
+        "seq_len": 9216,
+        "max_tokens": 8192,
         "lora_rank": 16,
         "batch_size": 1,
         "group_size": 1,
@@ -3272,25 +3265,18 @@ def test_opd_vram_budgets_dense_logit_backward_buffers():
     delta = estimate_vram_gb(4.0, "opd", "bf16", vocab=v2, **kw) - estimate_vram_gb(
         4.0, "opd", "bf16", vocab=v1, **kw
     )
-    forward_only = (
-        (seq * 2 + comp * 4) * (v2 - v1) / 1e9
-    )  # what the old fwd-only formula would grow by
-    assert delta == pytest.approx(2 * forward_only, rel=1e-9), (
-        "opd dense-logit budget must include the backward buffers (2x the forward-only reservation); "
-        f"got delta={delta} GB, forward-only would be {forward_only} GB"
-    )
+    expected = OPD_CE_CHUNK_SIZE * (v2 - v1) * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+    assert delta == pytest.approx(expected, rel=1e-9)
 
 
-def test_opd_vram_thinking_completion_default_not_underbudgeted():
-    """With max_tokens unset, opd's logits term must use the OPD recipe completion default (thinking
-    = max_completion_len_thinking, 1536), not the GRPO-style min(seq_len, 1024) fallback — else a
-    thinking opd job is under-budgeted and can OOM."""
+def test_opd_vram_ce_peak_is_bounded_after_chunk_fills():
+    """completion length does not grow the vocabulary peak after one ce chunk is full."""
     from flash.engine.vram import estimate_vram_gb
 
-    kw = {"seq_len": 4096, "vocab": 248_320, "lora_rank": 16}  # seq high so min(seq,1024)=1024
-    non_think = estimate_vram_gb(4.0, "opd", "bf16", thinking=False, **kw)  # completion=512
-    think = estimate_vram_gb(4.0, "opd", "bf16", thinking=True, **kw)  # completion=1536, not 1024
-    assert think > non_think  # thinking's longer completion budgets strictly more logits
+    kw = {"seq_len": 4096, "vocab": 248_320, "lora_rank": 16}
+    non_think = estimate_vram_gb(4.0, "opd", "bf16", thinking=False, **kw)
+    think = estimate_vram_gb(4.0, "opd", "bf16", thinking=True, **kw)
+    assert think == non_think
 
 
 def test_opd_vram_scales_to_loss_microbatch_not_full_batch():
@@ -4190,11 +4176,28 @@ class _TinyLM:
     def __init__(self, torch, T, V):
         self.w = torch.zeros(T, V, requires_grad=True)
         self.config = SimpleNamespace(use_cache=True)
+        self.lm_head = torch.nn.Identity()
+        self.input_embeddings = torch.nn.Identity()
 
-    def __call__(self, input_ids):
+    def __call__(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        logits_to_keep=0,
+    ):
         B = input_ids.shape[0]
         T = input_ids.shape[1]
-        return SimpleNamespace(logits=self.w[:T].unsqueeze(0).expand(B, -1, -1))
+        hidden = self.w[:T].unsqueeze(0).expand(B, -1, -1)
+        if logits_to_keep:
+            hidden = hidden[:, -logits_to_keep:]
+        return SimpleNamespace(logits=self.lm_head(hidden))
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_input_embeddings(self):
+        return self.input_embeddings
 
     def parameters(self):
         return [self.w]
@@ -4268,11 +4271,11 @@ def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
             super().__init__(torch, T=3, V=8)
             self.grad_seen_before_forward = []
 
-        def __call__(self, input_ids):
+        def __call__(self, input_ids, **kwargs):
             self.grad_seen_before_forward.append(
                 bool(self.w.grad is not None and self.w.grad.abs().sum() > 0)
             )
-            return super().__call__(input_ids)
+            return super().__call__(input_ids, **kwargs)
 
     model = _GradObservedLM()
     knobs = SimpleNamespace(kl_coef=1.0)
@@ -4299,7 +4302,7 @@ def test_resolve_samples_batched_backprops_before_next_loss_microbatch():
     assert model.w.grad.abs().sum() > 0
 
 
-def test_resolve_samples_batched_uses_full_logits():
+def test_resolve_samples_batched_uses_completion_only_projection():
     torch = pytest.importorskip("torch")
     from flash.engine.worker import opd as opd_mod
 
@@ -4320,7 +4323,7 @@ def test_resolve_samples_batched_uses_full_logits():
 
         def __call__(self, input_ids, **kwargs):
             self.calls.append(dict(kwargs))
-            return super().__call__(input_ids)
+            return super().__call__(input_ids, **kwargs)
 
     model = _FullLM()
     samples = [
@@ -4336,8 +4339,184 @@ def test_resolve_samples_batched_uses_full_logits():
     )
 
     assert out[0].loss is not None
-    assert "logits_to_keep" not in model.calls[0]
-    assert model._flash_opd_full_logits_batches == 1
+    assert model.calls[0]["logits_to_keep"] == 2
+    assert model.calls[0]["position_ids"].tolist() == [[0, 1]]
+    assert model._flash_opd_completion_only_batches == 1
+
+
+def test_completion_only_projection_matches_full_logits_for_left_padded_batch():
+    import copy
+
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    class _RecurrentTinyLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(use_cache=True)
+            self.embed = torch.nn.Embedding(17, 6)
+            self.position_embed = torch.nn.Embedding(16, 6)
+            self.lm_head = torch.nn.Linear(6, 11, bias=False)
+            self.last_attention_mask = None
+            self.last_position_ids = None
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(
+            self,
+            input_ids,
+            attention_mask=None,
+            position_ids=None,
+            logits_to_keep=0,
+        ):
+            self.last_attention_mask = attention_mask.detach().clone()
+            self.last_position_ids = position_ids.detach().clone()
+            embedded = self.embed(input_ids) + self.position_embed(position_ids)
+            state = embedded.new_zeros((embedded.shape[0], embedded.shape[-1]))
+            hidden = []
+            for token_idx in range(embedded.shape[1]):
+                candidate = torch.tanh(state + embedded[:, token_idx])
+                keep = attention_mask[:, token_idx].bool().unsqueeze(-1)
+                state = torch.where(keep, candidate, state)
+                hidden.append(state)
+            hidden_states = torch.stack(hidden, dim=1)
+            if logits_to_keep:
+                hidden_states = hidden_states[:, -logits_to_keep:]
+            return SimpleNamespace(logits=self.lm_head(hidden_states))
+
+    torch.manual_seed(7)
+    control = _RecurrentTinyLM()
+    treatment = copy.deepcopy(control)
+    prompts = [[4, 5, 6, 7], [8]]
+    completions = [[2, 3, 4], [5, 6]]
+    raw_groups = [
+        [([0, 1], -1.2), ([2], -0.4)],
+        [([0], -0.8), ([1], -0.3)],
+    ]
+    forced = [[False, False, True], [True, False]]
+    groups = [
+        opd_mod._prepare_gkd_groups(opd_mod._drop_fully_forced_groups(g, f))
+        for g, f in zip(raw_groups, forced, strict=True)
+    ]
+
+    control_logps = []
+    control_losses = []
+    for prompt, completion, prepared in zip(prompts, completions, groups, strict=True):
+        seq = torch.tensor([prompt + completion], dtype=torch.long)
+        mask = torch.ones_like(seq)
+        positions = torch.arange(seq.shape[1], dtype=torch.long).unsqueeze(0)
+        logits = control(seq, attention_mask=mask, position_ids=positions).logits[0]
+        rows = logits[len(prompt) - 1 : len(prompt) - 1 + len(completion)]
+        ids = torch.tensor(completion, dtype=torch.long)
+        logps = -torch.nn.functional.cross_entropy(rows.float(), ids, reduction="none")
+        control_logps.append(logps)
+        control_losses.append(opd_mod._gkd_loss_from_logps(logps, prepared, kl_coef=0.7))
+    control_loss = sum(control_losses)
+    control_loss.backward()
+
+    seqs = [prompt + completion for prompt, completion in zip(prompts, completions, strict=True)]
+    max_len = max(len(seq) for seq in seqs)
+    max_completion = max(len(completion) for completion in completions)
+    keep = max_completion + 1
+    input_ids = torch.zeros((len(seqs), max_len), dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    for row, seq in enumerate(seqs):
+        input_ids[row, -len(seq) :] = torch.tensor(seq, dtype=torch.long)
+        attention_mask[row, -len(seq) :] = 1
+    position_ids = attention_mask.cumsum(dim=-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    hidden_tail, lm_head = opd_mod._forward_completion_hidden_states(
+        treatment,
+        input_ids,
+        attention_mask,
+        position_ids,
+        logits_to_keep=keep,
+    )
+    hidden_rows = []
+    flat_ids = []
+    for row, completion in enumerate(completions):
+        hidden_rows.append(hidden_tail[row, keep - len(completion) - 1 : keep - 1])
+        flat_ids.extend(completion)
+    treatment_logps_flat = opd_mod._chunked_token_logps(
+        lm_head,
+        torch.cat(hidden_rows),
+        torch.tensor(flat_ids, dtype=torch.long),
+        chunk_size=2,
+    )
+    treatment_logps = []
+    treatment_losses = []
+    offset = 0
+    for completion, prepared in zip(completions, groups, strict=True):
+        logps = treatment_logps_flat[offset : offset + len(completion)]
+        offset += len(completion)
+        treatment_logps.append(logps)
+        treatment_losses.append(opd_mod._gkd_loss_from_logps(logps, prepared, kl_coef=0.7))
+    treatment_loss = sum(treatment_losses)
+    treatment_loss.backward()
+
+    for actual, expected in zip(treatment_logps, control_logps, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(treatment_loss, control_loss, rtol=1e-6, atol=1e-6)
+    for actual, expected in zip(treatment.parameters(), control.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=2e-6, atol=2e-6)
+    assert treatment.last_attention_mask.tolist() == [
+        [1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1],
+    ]
+    assert treatment.last_position_ids.tolist() == [
+        [0, 1, 2, 3, 4, 5, 6],
+        [0, 0, 0, 0, 0, 1, 2],
+    ]
+    assert groups[0].group_lengths == (2,)
+    assert groups[1].group_lengths == (1,)
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "bfloat16"])
+def test_chunked_ce_matches_dense_loss_and_gradients(dtype_name):
+    import copy
+
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker import opd as opd_mod
+
+    torch.manual_seed(11)
+    dtype = getattr(torch, dtype_name)
+    reference_head = torch.nn.Linear(7, 13, bias=False, dtype=dtype)
+    reference_head.requires_grad_(dtype == torch.float32)
+    chunked_head = copy.deepcopy(reference_head)
+    reference_hidden = torch.randn(9, 7, dtype=dtype, requires_grad=True)
+    chunked_hidden = reference_hidden.detach().clone().requires_grad_(True)
+    token_ids = torch.tensor([0, 4, 12, 3, 8, 1, 6, 10, 2], dtype=torch.long)
+    weights = torch.linspace(0.2, 1.0, token_ids.numel())
+
+    reference_logps = -torch.nn.functional.cross_entropy(
+        reference_head(reference_hidden).float(), token_ids, reduction="none"
+    )
+    reference_loss = (reference_logps * weights).sum()
+    reference_loss.backward()
+
+    chunked_logps = opd_mod._chunked_token_logps(
+        chunked_head, chunked_hidden, token_ids, chunk_size=3
+    )
+    chunked_loss = (chunked_logps * weights).sum()
+    chunked_loss.backward()
+
+    tolerance = 1e-6 if dtype == torch.float32 else 2e-3
+    torch.testing.assert_close(chunked_logps, reference_logps, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(chunked_loss, reference_loss, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(
+        chunked_hidden.grad, reference_hidden.grad, rtol=tolerance, atol=tolerance
+    )
+    if dtype == torch.float32:
+        torch.testing.assert_close(
+            chunked_head.weight.grad,
+            reference_head.weight.grad,
+            rtol=tolerance,
+            atol=tolerance,
+        )
 
 
 def test_resolve_samples_batched_truncated_sample_has_no_forward_or_gradients():
@@ -4408,11 +4587,7 @@ def test_resolve_samples_batched_mixes_distillation_and_truncated_no_loss():
 
         def __call__(self, input_ids, **kwargs):
             self.calls += 1
-            return SimpleNamespace(
-                logits=self.w[: input_ids.shape[1]]
-                .unsqueeze(0)
-                .expand(input_ids.shape[0], -1, -1)
-            )
+            return super().__call__(input_ids, **kwargs)
 
     model = _CountingLM()
     samples = [
