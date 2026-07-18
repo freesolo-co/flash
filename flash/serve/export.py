@@ -28,6 +28,18 @@ _TEMP_MERGED_BASE_MODEL_RE = re.compile(
 )
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
+# module-path segments outside the language model; mirrors _VL_EXCLUDE_SEGMENTS in
+# flash/engine/worker/lora.py. today's managed adapters never touch these (the worker
+# excludes them from lora), so their presence means a genuinely multimodal adapter whose
+# vision keys the text-only strip cannot represent. normalizing only the lm keys of such
+# an adapter would produce a mixed namespace that matches no transformers class, so the
+# normalization must skip the file entirely and export it as trained.
+_NON_LM_KEY_SEGMENTS = (".visual.", ".vision_tower.", ".multi_modal_projector.", ".mtp.")
+
+
+def _references_non_lm_modules(key: str) -> bool:
+    return any(segment in key for segment in _NON_LM_KEY_SEGMENTS)
+
 
 def _strip_language_model_infix(key: str) -> str:
     # mirrors _LANGUAGE_MODEL_INFIX namespace semantics in flash/engine/worker/lora.py
@@ -77,6 +89,19 @@ def _normalize_export_adapter_keys(adapter_dir: Path) -> bool:
             )
             if not isinstance(header, dict):
                 raise ValueError("safetensors header is not a JSON object")
+
+            non_lm = [
+                key
+                for key in header
+                if key != "__metadata__" and _references_non_lm_modules(key)
+            ]
+            if non_lm:
+                logger.info(
+                    "exported adapter touches non-lm modules (e.g. %s); keeping the "
+                    "multimodal key namespace unchanged",
+                    non_lm[0],
+                )
+                return False
 
             normalized: dict[str, object] = {}
             remapped = 0
@@ -194,6 +219,23 @@ def _hf_api():
     return HfApi, snapshot_download
 
 
+def _hub_error_types() -> tuple[type[BaseException], ...]:
+    error_types: list[type[BaseException]] = []
+    try:
+        from huggingface_hub.errors import HfHubHTTPError
+    except ImportError:
+        pass
+    else:
+        error_types.append(HfHubHTTPError)
+    try:
+        from requests import RequestException
+    except ImportError:
+        pass
+    else:
+        error_types.append(RequestException)
+    return tuple(error_types)
+
+
 def export_adapter(
     *,
     source_repo: str,
@@ -226,6 +268,8 @@ def export_adapter(
                 token=read_token,
             )
         except Exception as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, _hub_error_types()):
+                raise
             raise ServingError(
                 f"could not download adapter {source_repo}:{source_subfolder}: {exc}"
             ) from exc
@@ -261,6 +305,8 @@ def export_adapter(
             if not private:
                 api.update_repo_settings(repo_id=dest_repo, repo_type="model", private=False)
         except Exception as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, _hub_error_types()):
+                raise
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
         "exported %s:%s -> %s (%d files)", source_repo, source_subfolder, dest_repo, len(files)
