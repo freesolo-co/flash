@@ -34,6 +34,7 @@ from flash.engine.worker.perf import (
     gpu_diagnostics,
     grad_checkpointing_on,
     grpo_use_reentrant,
+    make_multimodal_input_require_grads_callback,
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -655,6 +656,12 @@ def run_rl():
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback()
+    trainer_callbacks = [
+        hb_cb,
+        _w.make_checkpoint_upload_callback(save_at_steps),
+    ]
+    if multimodal:
+        trainer_callbacks.append(make_multimodal_input_require_grads_callback())
     # Tool envs hand TRL the tool callables; pure multi-turn envs hand TRL a rollout_func.
     extra_trainer_kwargs: dict = {}
     tools = env.tools() if is_tool_env else []
@@ -734,10 +741,7 @@ def run_rl():
             reward_funcs=reward_fn,
             peft_config=init_peft,
             processing_class=processor if multimodal else tok,
-            callbacks=[
-                hb_cb,
-                _w.make_checkpoint_upload_callback(save_at_steps),
-            ],
+            callbacks=trainer_callbacks,
             **extra_trainer_kwargs,
         )
         # Apply chalk's standalone kernels on trainer.model (the authoritative target).
