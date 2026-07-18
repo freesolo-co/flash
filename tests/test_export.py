@@ -19,12 +19,20 @@ import pytest
 BASE_MODEL = "Qwen/Qwen3.5-0.8B"
 
 
+class _FakeHfHubHTTPError(OSError):
+    pass
+
+
 def _install_fake_hub(monkeypatch, *, download, hf_api):
     """Inject a fake ``huggingface_hub`` module exposing HfApi + snapshot_download."""
     fake = types.ModuleType("huggingface_hub")
+    fake_errors = types.ModuleType("huggingface_hub.errors")
+    fake_errors.HfHubHTTPError = _FakeHfHubHTTPError
     fake.HfApi = hf_api
     fake.snapshot_download = download
+    fake.errors = fake_errors
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.errors", fake_errors)
 
 
 def _safetensors_bytes(header: dict, data: bytes) -> bytes:
@@ -255,6 +263,58 @@ def test_export_adapter_key_collision_leaves_safetensors_unchanged(monkeypatch):
         {
             infixed: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
             plain: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        },
+        b"\x01\x02\x03\x04",
+    )
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert uploaded["weights"] == source_bytes
+
+
+def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatch):
+    # a genuinely multimodal adapter (lora on the vision tower) must not be normalized:
+    # stripping only its lm keys would leave a mixed namespace no transformers class loads.
+    uploaded: dict = {}
+    lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    vision_key = "base_model.model.model.visual.blocks.0.attn.proj.lora_A.default.weight"
+    source_bytes = _safetensors_bytes(
+        {
+            lm_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            vision_key: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
         },
         b"\x01\x02\x03\x04",
     )
@@ -740,11 +800,8 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
 
     message = "You don't have the rights to download this repository"
 
-    class FakeHfHubHTTPError(OSError):
-        pass
-
     def fake_snapshot_download(**kw):
-        raise FakeHfHubHTTPError(message)
+        raise _FakeHfHubHTTPError(message)
 
     class FakeHfApi:
         def __init__(self, token=None):
@@ -766,13 +823,36 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
     assert message in str(exc_info.value)
 
 
+def test_export_adapter_propagates_local_download_oserror(monkeypatch):
+    from flash.serve.deploy import ServingError
+
+    def fake_snapshot_download(**kw):
+        raise PermissionError("local export directory is not writable")
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    with pytest.raises(PermissionError) as exc_info:
+        export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+            source_token="hf_operator",
+        )
+
+    assert not isinstance(exc_info.value, ServingError)
+
+
 def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypatch):
     from flash.serve.deploy import ServingError
 
     message = "You don't have the rights to create a model under the namespace me"
-
-    class FakeHfHubHTTPError(OSError):
-        pass
 
     def fake_snapshot_download(*, local_dir, **kw):
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
@@ -786,7 +866,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
             pass
 
         def create_repo(self, **kw):
-            raise FakeHfHubHTTPError(message)
+            raise _FakeHfHubHTTPError(message)
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
     from flash.serve.export import export_adapter
