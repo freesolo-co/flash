@@ -7,11 +7,15 @@ monkeypatch.setattr(worker, ...) takes effect in tests.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import shutil
+import tempfile
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.diagnostics import sanitize_diagnostic
@@ -163,11 +167,140 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
     )
 
 
+_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S = 300.0
+_OPTIONAL_UPLOAD_STAGE_ROOT = "/tmp/flash-optional-uploads"
+_FICLONE = 0x40049409
+
+
+@dataclass(frozen=True)
+class _OptionalUpload:
+    sequence: int
+    label: str
+    staged_dir: str
+    run: Callable[[], None]
+
+
+class _SingleSlotUploader:
+    """run one optional upload at a time with one newest-wins pending slot."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._in_flight: _OptionalUpload | None = None
+        self._pending: _OptionalUpload | None = None
+        self._next_sequence = 0
+        self._thread: threading.Thread | None = None
+
+    def enqueue(self, label: str, staged_dir: str, run: Callable[[], None]) -> None:
+        replaced: _OptionalUpload | None = None
+        thread: threading.Thread | None = None
+        with self._condition:
+            self._next_sequence += 1
+            task = _OptionalUpload(self._next_sequence, label, staged_dir, run)
+            replaced, self._pending = self._pending, task
+            if self._thread is None:
+                thread = threading.Thread(
+                    target=self._drain,
+                    name="flash-optional-uploader",
+                    daemon=True,
+                )
+                self._thread = thread
+            self._condition.notify_all()
+        if replaced is not None:
+            print(
+                f"[upload] coalesced optional {replaced.label} into newer {label} "
+                f"(sequence {task.sequence})"
+            )
+            shutil.rmtree(replaced.staged_dir, ignore_errors=True)
+        if thread is not None:
+            thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            with self._condition:
+                if self._pending is None:
+                    self._thread = None
+                    self._condition.notify_all()
+                    return
+                task, self._pending = self._pending, None
+                self._in_flight = task
+            try:
+                task.run()
+            except Exception as e:
+                print(f"optional upload warn ({task.label}): {sanitize_diagnostic(e, limit=500)}")
+            finally:
+                shutil.rmtree(task.staged_dir, ignore_errors=True)
+                with self._condition:
+                    self._in_flight = None
+                    self._condition.notify_all()
+
+    def flush(self, timeout_s: float) -> bool:
+        """wait for the in-flight and newest pending optional uploads to finish."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._condition:
+            while self._in_flight is not None or self._pending is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
+_OPTIONAL_UPLOADER = _SingleSlotUploader()
 _DEBUG_UPLOAD_LOCK = threading.Lock()
 
 
+def _copy_snapshot_file(source: str, destination: str) -> str:
+    """reflink a file when supported, otherwise make an independent copy."""
+    try:
+        with open(source, "rb") as src, open(destination, "wb") as dst:
+            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+        shutil.copystat(source, destination, follow_symlinks=False)
+    except OSError:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(destination)
+        shutil.copy2(source, destination, follow_symlinks=False)
+    return destination
+
+
+def _stage_optional_file(source: str, label: str) -> tuple[str, str]:
+    os.makedirs(_OPTIONAL_UPLOAD_STAGE_ROOT, exist_ok=True)
+    staged_dir = tempfile.mkdtemp(prefix=f"{label}-", dir=_OPTIONAL_UPLOAD_STAGE_ROOT)
+    staged_path = os.path.join(staged_dir, os.path.basename(source))
+    try:
+        _copy_snapshot_file(source, staged_path)
+    except Exception:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+    return staged_dir, staged_path
+
+
+def _stage_optional_directory(source: str, label: str) -> tuple[str, str]:
+    os.makedirs(_OPTIONAL_UPLOAD_STAGE_ROOT, exist_ok=True)
+    staged_dir = tempfile.mkdtemp(prefix=f"{label}-", dir=_OPTIONAL_UPLOAD_STAGE_ROOT)
+    staged_path = os.path.join(staged_dir, "artifact")
+    try:
+        shutil.copytree(
+            source,
+            staged_path,
+            copy_function=_copy_snapshot_file,
+        )
+    except Exception:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+    return staged_dir, staged_path
+
+
+def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) -> bool:
+    """bounded flush for clean train-end, final publication, and error paths.
+
+    abrupt preemption can lose only the newest pending optional snapshot. Clean exits drain that
+    snapshot after the current upload, in deterministic sequence order.
+    """
+    return _OPTIONAL_UPLOADER.flush(timeout_s)
+
+
 def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
-    """Append bounded JSONL debug rows and upload as an optional artifact (best-effort)."""
+    """append bounded debug rows and enqueue an immutable optional upload snapshot."""
     if not rows or not _w.HF_REPO:
         return
     repo_name = os.path.basename(name if name.endswith(".jsonl") else f"{name}.jsonl")
@@ -175,7 +308,7 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
     try:
         with _DEBUG_UPLOAD_LOCK:
             existing: list[str] = []
-            # open() is evaluated before suppress() context enters — use try/except, not suppress.
+            # open() is evaluated before suppress() enters, so handle absence explicitly.
             try:
                 with open(path) as f:
                     existing = f.readlines()[-keep_last:]
@@ -185,9 +318,14 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
                 f.writelines(existing)
                 for row in rows:
                     f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
-            _w.hf_upload_file(path, repo_name)
+            staged_dir, staged_path = _stage_optional_file(path, "debug-jsonl")
+        _OPTIONAL_UPLOADER.enqueue(
+            f"debug {repo_name}",
+            staged_dir,
+            lambda: _w.hf_upload_file(staged_path, repo_name),
+        )
     except Exception as e:
-        print(f"debug upload warn ({repo_name}): {e}")
+        print(f"debug upload warn ({repo_name}): {sanitize_diagnostic(e, limit=500)}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
@@ -511,6 +649,12 @@ def _has_deployable_adapter(ckpt_dir: str) -> bool:
     )
 
 
+def _write_deployable_provenance(ckpt_dir: str) -> None:
+    spec = getattr(_w, "JOB_SPEC", None)
+    if spec is not None and spec.model:
+        write_base_model_provenance(ckpt_dir, spec.model, getattr(spec, "model_revision", "") or "")
+
+
 def publish_deployable_checkpoint(
     ckpt_dir: str,
     step: int,
@@ -518,6 +662,7 @@ def publish_deployable_checkpoint(
     retries: int = 1,
     backoff_s: float = 0.0,
     required: bool = False,
+    _provenance_ready: bool = False,
 ) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable per-step path.
 
@@ -534,17 +679,9 @@ def publish_deployable_checkpoint(
                 f"required save step {step} has no deployable adapter in {ckpt_dir}"
             )
         return None
-    # a published deployable is a servable adapter, so it carries the same base-weight provenance
-    # sidecar as the final adapter and opd saves. companions published straight from a trainer dir
-    # (per-step saves, opd resume reconcile) never passed through the final _save_adapter path, so
-    # write the sidecar here from the job spec's base model. written into ckpt_dir before upload so
-    # it lands inside the same atomic upload_folder commit as the adapter it describes. guard on a
-    # non-empty base model so an unspecified base never stamps a misleading empty-model_id sidecar.
-    _spec = getattr(_w, "JOB_SPEC", None)
-    if _spec is not None and _spec.model:
-        write_base_model_provenance(
-            ckpt_dir, _spec.model, getattr(_spec, "model_revision", "") or ""
-        )
+    # staged optional checkpoints already carry provenance and must remain immutable during upload.
+    if not _provenance_ready:
+        _write_deployable_provenance(ckpt_dir)
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
     attempts = max(1, int(retries))
     last_error: Exception | None = None
@@ -730,42 +867,49 @@ def upload_resume_checkpoint(
 
 
 def make_checkpoint_upload_callback(save_at_steps=()):
-    """Return a TrainerCallback that streams each save to HF and publishes deployable per-step adapters.
-
-    Uploads are SYNCHRONOUS: on_save blocks the training loop until the checkpoint is durably on
-    HF. A save therefore never returns while its upload is still running, so there is never a
-    second upload in flight when the next save fires — the "upload busy" contention (and the
-    coalescing/dropping it used to cause) cannot happen by construction. Every `save_every` step is
-    guaranteed to upload, retrying transient HF errors instead of skipping.
-    """
+    """stream optional saves in the background while keeping required saves synchronous."""
     from transformers import TrainerCallback
 
     required_steps = frozenset(int(step) for step in save_at_steps)
     deployable_steps: set[int] = set()
+    uploaded_steps: set[int] = set()
 
-    def _publish_deployable(ckpt_dir: str, step: int) -> None:
-        """Publish a step's deployable adapter directly from the trainer checkpoint.
-
-        Warm-start CONTINUES the one adapter in place (VL and non-VL) and fresh runs train a single
-        adapter, so the trainer checkpoint's adapter IS the deployable — it carries the full policy on
-        the catalog base and serves as-is (no merge, no SFT rank-stack recombine).
-        """
-        publish_deployable_checkpoint(ckpt_dir, step, required=step in required_steps)
+    def _publish_deployable(ckpt_dir: str, step: int, *, provenance_ready: bool = False) -> None:
+        """publish the trainer checkpoint's adapter without changing its contents."""
+        publish_deployable_checkpoint(
+            ckpt_dir,
+            step,
+            required=step in required_steps,
+            _provenance_ready=provenance_ready,
+        )
         if step in required_steps:
             deployable_steps.add(step)
 
-    uploaded_steps: set[int] = set()
-
-    def _upload(step: int, ckpt_dir: str) -> bool:
-        # publish the small durable deployable first, inside the shared upload keepalive.
+    def _upload(step: int, ckpt_dir: str, *, provenance_ready: bool = False) -> bool:
+        # publish the small durable deployable before the latest-only resume checkpoint.
         def _prepare() -> None:
             if step not in deployable_steps:
-                _publish_deployable(ckpt_dir, step)
+                _publish_deployable(ckpt_dir, step, provenance_ready=provenance_ready)
 
         if not upload_resume_checkpoint(step, ckpt_dir, before_upload=_prepare):
             return False
         uploaded_steps.add(step)
         return True
+
+    def _enqueue_optional(step: int, ckpt_dir: str) -> None:
+        try:
+            _write_deployable_provenance(ckpt_dir)
+            staged_dir, staged_checkpoint = _stage_optional_directory(
+                ckpt_dir, f"checkpoint-{step}"
+            )
+        except Exception as e:
+            print(f"[ckpt] step {step} snapshot warn: {sanitize_diagnostic(e, limit=500)}")
+            return
+        _OPTIONAL_UPLOADER.enqueue(
+            f"checkpoint step {step}",
+            staged_dir,
+            lambda: _upload(step, staged_checkpoint, provenance_ready=True),
+        )
 
     class _CheckpointUpload(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
@@ -775,8 +919,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
 
         def on_train_begin(self, args, state, control, **kwargs):
             # resume credits a required save only when its deployable adapter is verified on hf.
-            # crediting straight from the restored step counter would let on_train_end report a
-            # required save as satisfied even if the pre-resume worker never durably uploaded it.
+            # crediting the restored step alone could accept a save that never reached hf.
             resumed_step = int(getattr(state, "global_step", 0) or 0)
             for step in required_steps:
                 if step <= resumed_step and _deployable_adapter_on_hf(step):
@@ -785,12 +928,6 @@ def make_checkpoint_upload_callback(save_at_steps=()):
             return control
 
         def on_save(self, args, state, control, **kwargs):
-            # SYNCHRONOUS on the training thread: the trainer blocks here until this checkpoint is
-            # uploaded. `save_total_limit=1` rotation (which runs earlier, inside this same save's
-            # `_save_checkpoint`) deletes the PREVIOUS checkpoint, never the current one — and the
-            # next save can't begin until we return — so the dir is stable for the whole upload and
-            # no snapshot/queue is needed. Because the upload finishes before the save returns,
-            # there is never a concurrent upload for a later save to be "busy" against.
             step = int(state.global_step)
             if not _w.HF_REPO:
                 if step in required_steps:
@@ -803,34 +940,33 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                         f"required save step {step} has no trainer checkpoint directory"
                     )
                 return
+            if step not in required_steps:
+                _enqueue_optional(step, ckpt_dir)
+                return
+            if not flush_optional_uploads():
+                raise RetriableInfraError(
+                    f"required save step {step} timed out waiting for optional uploads"
+                )
             if not _upload(step, ckpt_dir):
-                if step in required_steps:
-                    raise RetriableInfraError(
-                        f"required save step {step} full-state checkpoint was not durably published"
-                    )
-                print(
-                    f"[ckpt] step {step} resume checkpoint not durable on HF after retries; "
-                    "the deployable adapter save is preserved and on_train_end will re-flush the latest "
-                    "checkpoint."
+                raise RetriableInfraError(
+                    f"required save step {step} full-state checkpoint was not durably published"
                 )
 
         def on_train_end(self, args, state, control, **kwargs):
-            # Safety net for a final checkpoint the trainer wrote without an on_save (e.g. a
-            # load_best_model_at_end / end-of-training save). Synchronous on_save already uploaded
-            # every step it saw, so this only publishes an as-yet-unuploaded latest step.
             if not _w.HF_REPO:
                 if required_steps:
                     raise RuntimeError("required saves have no artifact repository")
                 return
+            if not flush_optional_uploads():
+                print(
+                    f"[ckpt] optional upload flush exceeded "
+                    f"{_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S:.0f}s; the newest optional snapshot may be lost"
+                )
             latest = _latest_checkpoint_dir(args.output_dir)
             if latest is not None:
                 step, ckpt_dir = latest
                 should_flush = not required_steps or step in required_steps
-                if (
-                    should_flush
-                    and step not in uploaded_steps
-                    and not _upload(step, ckpt_dir)
-                ):
+                if should_flush and step not in uploaded_steps and not _upload(step, ckpt_dir):
                     if step in required_steps:
                         raise RetriableInfraError(
                             f"required save step {step} full-state checkpoint was not durably published"

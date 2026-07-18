@@ -322,12 +322,10 @@ def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer
     assert rec.uploads == []
 
 
-def test_on_save_uploads_synchronously_before_returning(
+def test_on_save_uploads_optional_checkpoint_after_flush(
     tmp_path, monkeypatch, fake_trainer_callback
 ):
-    """Uploads are synchronous: by the time on_save returns, the checkpoint is fully on HF — no
-    background thread is left running. This is what makes "upload busy" impossible by construction:
-    a later save can never find this one still in flight."""
+    """optional saves return after local staging and finish through the bounded uploader."""
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -337,7 +335,7 @@ def test_on_save_uploads_synchronously_before_returning(
     _make_ckpt_dir(out, 4)
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-    # Fully uploaded the moment on_save returns — no polling, no thread join needed.
+    assert worker.flush_optional_uploads()
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert "rl/flash-ckpt-1/checkpoints/step-4/adapter" in paths
     assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
@@ -355,6 +353,7 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     _make_ckpt_dir(out, 4)
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert worker.flush_optional_uploads()
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert paths == [
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
@@ -362,10 +361,10 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     ]
 
 
-def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake_trainer_callback):
-    """Every save uploads its own step. Synchronous uploads make "upload busy" coalescing
-    impossible: back-to-back saves each publish their deployable, so the registered step list is
-    never thinned under contention (the old newest-wins slot dropped intermediate steps)."""
+def test_consecutive_saves_each_upload_when_uploader_keeps_up(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """each optional save uploads unchanged when the single uploader is available."""
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -376,6 +375,7 @@ def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake
     for step in (4, 8, 12):
         _make_ckpt_dir(out, step)
         cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=step), None)
+        assert worker.flush_optional_uploads()
     deployables = sorted(
         p["path_in_repo"] for p in rec.uploads if p["path_in_repo"].endswith("/adapter")
     )
@@ -413,6 +413,7 @@ def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trai
 
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert worker.flush_optional_uploads()
     assert resume_calls["n"] == 2, "the resume upload must be retried after a transient failure"
     assert any(u["path_in_repo"].endswith("checkpoint/checkpoint-4") for u in rec.uploads), (
         "the checkpoint must land on retry, not be skipped"
