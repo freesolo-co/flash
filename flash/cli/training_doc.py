@@ -154,6 +154,47 @@ flash undeploy <run-id>          # tear the endpoint down
 flash export --adapter-id <run-id> --repository <you>/<repo>  # copy adapter weights to your HF repo
 ```
 
+### Loading an exported adapter locally (transformers + peft)
+
+Flash trains the Qwen3.5/3.6 family against the full multimodal module tree, so adapter
+weights saved by the worker carry a `language_model.` infix in their tensor keys
+(`base_model.model.model.language_model.layers.*`). During `flash export`, adapters that
+can be represented in the text-only namespace are normalized to
+`base_model.model.model.layers.*`. When an export retains non-LM tensors, it keeps the
+multimodal namespace instead. Do not infer the namespace solely from whether `flash export`
+was used: inspect the keys. For normalized keys, load with vanilla peft and
+`AutoModelForCausalLM`:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B")  # qwen3.5 causal-lm class
+model = PeftModel.from_pretrained(base, "<you>/<repo>")
+```
+
+**Before you trust any local eval, check the key namespace matches the model class you
+loaded.** peft does NOT error on mismatched keys — it emits a `UserWarning` about missing
+adapter keys and silently applies *nothing*, so you would benchmark the bare base model
+believing it is your adapter. If the inspected keys carry the `language_model.` infix,
+load the base with the multimodal class whose parameters live under that namespace instead:
+
+```python
+# infixed keys (base_model.model.model.language_model.layers.*) need the multimodal class:
+from transformers import AutoModelForImageTextToText
+
+base = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-0.8B")
+# qwen3.5/3.6 dense models resolve to Qwen3_5ForConditionalGeneration
+# qwen3.6-35b-a3b (moe) resolves to Qwen3_5MoeForConditionalGeneration
+model = PeftModel.from_pretrained(base, "<you>/<repo>")
+```
+
+To check which form you have, read the safetensors key names (stdlib, no torch needed):
+the JSON header of `adapter_model.safetensors` lists every tensor key. Rule of thumb:
+`model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*`
+keys pair with the `*ForConditionalGeneration` class. After loading, confirm the adapter
+actually applied: outputs (or a probe metric) must differ from the bare base model.
+
 The rest of this file is about doing the above *well* — designing a reward that teaches,
 and deciding honestly whether a run improved.
 
@@ -221,6 +262,7 @@ spending another GPU run:
 | Run looks stuck after disconnecting | Terminal stopped streaming but the job may still be alive | Ctrl-C detaches. Use `flash log <run-id> --follow` to reattach, `flash log <run-id>` for the console/error output, or `flash cancel <run-id>` if you intentionally want to stop it. |
 | Final checkpoint regresses | Last step is worse than an earlier checkpoint | Run `flash checkpoints <run-id>`, deploy a specific step with `flash deploy <run-id>/step-N`, and compare with held-out probes before exporting or relying on the final adapter. |
 | Export fails before upload | CLI says no HuggingFace token | Pass `flash export --api-key hf_...`, or set `HF_TOKEN` in your shell, `.env`, or `.env.local`. Exports are private unless you pass `--public`. |
+| Exported adapter is a silent no-op locally | peft warns about missing adapter keys and local eval matches the bare base model | The adapter's key namespace does not match the loaded model class. `model.layers.*` keys pair with `AutoModelForCausalLM`; `model.language_model.layers.*` keys pair with `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` (via `AutoModelForImageTextToText`). See "Loading an exported adapter locally". |
 | SFT loss improves but quality does not | Train loss falls while held-out behavior stalls or degrades | Keep a held-out split outside training. Deploy and score that split; if quality drops, reduce epochs or improve data instead of adding more passes. |
 | Cost surprises | A quick experiment uses more GPU time than intended | Start with `--dry-run` and `--cost`, keep `epochs` and `max_examples` small for smoke tests, and scale only after reward/data wiring is proven. Setup time is reported for observability; customer cost is based on training-loop GPU time. |
 
