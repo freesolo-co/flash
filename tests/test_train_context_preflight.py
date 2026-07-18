@@ -30,17 +30,17 @@ def _spec(
 
 
 def test_sft_max_context_tokens_above_serving_cap_rejected():
-    # 4B serves at max_model_len=8192; a 16384 SFT context is longer than it is ever served.
-    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=16384)
+    # 4b serves at max_model_len=32768; a 40000-token sft context exceeds that boundary.
+    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=40000)
     with pytest.raises(
-        ValueError, match=r"train\.max_context_tokens=16384 exceeds .*max_model_len=8192"
+        ValueError, match=r"train\.max_context_tokens=40000 exceeds .*max_model_len=32768"
     ):
         preflight_train_context_within_serving(spec)
 
 
 def test_sft_max_context_tokens_at_cap_allowed():
     preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=8192)
+        _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=32768)
     )
 
 
@@ -71,8 +71,8 @@ def test_grpo_unset_rollout_within_35b_cap_allowed():
 
 def test_grpo_big_max_completion_tokens_pushes_rollout_over_cap_rejected():
     # A large completion budget makes prompt+completion (grpo_rollout_seq_len) exceed the served ctx.
-    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="grpo", max_completion_tokens=8192)
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=8192"):
+    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="grpo", max_completion_tokens=40000)
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
         preflight_train_context_within_serving(spec)
 
 
