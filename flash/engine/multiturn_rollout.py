@@ -11,15 +11,15 @@ import contextlib
 import copy
 import itertools
 import json
-import math
 import queue
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TypedDict
+
+from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 
 
 class RolloutResult(TypedDict):
@@ -156,89 +156,6 @@ def _dedup_seam_terminator(prev_completion_ids: list[int], glue: list[int]) -> l
     return glue
 
 
-_NO_REWARD_RESULT = object()
-
-
-def _turn_reward_scorer(active_env):
-    from flash.envs.base import BaseEnvironment
-
-    scorer = getattr(active_env, "turn_rewards", None)
-    implementation = getattr(type(active_env), "turn_rewards", None)
-    if not callable(scorer) or implementation is BaseEnvironment.turn_rewards:
-        return None
-    return scorer
-
-
-def _get_turn_rewards(
-    active_env,
-    example: dict,
-    state: dict,
-    turn_spans,
-    episode_reward: float,
-    *,
-    reward_result=_NO_REWARD_RESULT,
-) -> list[float] | None:
-    scorer = _turn_reward_scorer(active_env)
-    if scorer is None:
-        return None
-
-    reason: str | None = None
-    values: list[float] | None = None
-    if not math.isfinite(episode_reward):
-        reason = "episode reward is non-finite"
-    else:
-        try:
-            if reward_result is _NO_REWARD_RESULT:
-                rewards = scorer(example, state)
-            else:
-                metadata = getattr(reward_result, "metadata", None) or {}
-                rewards = metadata.get("per_turn_rewards")
-            if rewards is None:
-                reason = "terminal score has no per_turn_rewards"
-            elif not isinstance(rewards, list):
-                reason = "per_turn_rewards is not a list"
-            else:
-                values = [float(reward) for reward in rewards]
-                if len(values) != len(turn_spans):
-                    reason = (
-                        f"received {len(values)} reward(s) for {len(turn_spans)} assistant turn(s)"
-                    )
-                elif not all(math.isfinite(value) for value in values):
-                    reason = "per_turn_rewards contains a non-finite value"
-        except Exception as exc:
-            reason = f"per-turn scoring failed: {type(exc).__name__}"
-
-    if reason is not None:
-        print(f"[grpo][warn] per-turn rewards unavailable ({reason}); using episode reward")
-        return None
-    return values
-
-
-def _score_rollout_once(active_env, example: dict, state: dict, turn_spans):
-    reward_results_many = getattr(active_env, "reward_results_many", None)
-    if (
-        bool(getattr(active_env, "multi_turn", False))
-        and _turn_reward_scorer(active_env) is not None
-        and callable(reward_results_many)
-    ):
-        results = reward_results_many([(example, state)])
-        if len(results) != 1:
-            raise RuntimeError("env.reward_results_many returned the wrong number of rewards")
-        result = results[0]
-        reward = float(getattr(result, "score", 0.0))
-        return reward, _get_turn_rewards(
-            active_env,
-            example,
-            state,
-            turn_spans,
-            reward,
-            reward_result=result,
-        )
-
-    reward = float(active_env.reward("", example, state))
-    return reward, _get_turn_rewards(active_env, example, state, turn_spans, reward)
-
-
 def rollout_one(
     *,
     example: dict,
@@ -303,15 +220,18 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
-    reward, turn_rewards = _score_rollout_once(active_env, example, state, turn_spans)
+    score = score_rollouts(
+        active_env,
+        [RolloutScoreRequest(example=example, state=state, turn_count=len(turn_spans))],
+    )[0]
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
         "logprobs": logprobs,
         "env_mask": env_mask,
-        "reward": float(reward),
+        "reward": score.episode,
         "turn_spans": turn_spans,
-        "turn_rewards": turn_rewards,
+        "turn_rewards": list(score.turns) if score.turns else None,
     }
 
 
@@ -529,70 +449,6 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
     return max(1, max_new)
 
 
-def _score_rollouts(
-    active_env, rollouts: list[_RolloutState]
-) -> tuple[list[float], list[list[float] | None]]:
-    """Reward each rollout in input order and collect optional per-turn rewards."""
-    items = [(rollout.example, rollout.state) for rollout in rollouts]
-    reward_results_many = getattr(active_env, "reward_results_many", None)
-    if (
-        bool(getattr(active_env, "multi_turn", False))
-        and _turn_reward_scorer(active_env) is not None
-        and callable(reward_results_many)
-    ):
-        results = reward_results_many(items)
-        if len(results) != len(rollouts):
-            raise RuntimeError("env.reward_results_many returned the wrong number of rewards")
-        scores = [float(getattr(result, "score", 0.0)) for result in results]
-        turn_rewards = [
-            _get_turn_rewards(
-                active_env,
-                rollout.example,
-                rollout.state,
-                rollout.turn_spans,
-                score,
-                reward_result=result,
-            )
-            for rollout, score, result in zip(rollouts, scores, results, strict=True)
-        ]
-        return scores, turn_rewards
-
-    reward_many = getattr(active_env, "reward_many", None)
-    if callable(reward_many):
-        rewards = reward_many(items)
-        if len(rewards) != len(rollouts):
-            raise RuntimeError("env.reward_many returned the wrong number of rewards")
-        scores = [float(reward) for reward in rewards]
-    else:
-
-        def _score(rollout: _RolloutState) -> float:
-            return float(active_env.reward("", rollout.example, rollout.state))
-
-        if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
-            scores = [_score(rollout) for rollout in rollouts]
-        else:
-            pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
-            try:
-                futures = {pool.submit(_score, rollout): i for i, rollout in enumerate(rollouts)}
-                scores = [0.0] * len(rollouts)
-                for future in as_completed(futures):
-                    scores[futures[future]] = future.result()
-            finally:
-                pool.shutdown(wait=True, cancel_futures=True)
-
-    turn_rewards = [
-        _get_turn_rewards(
-            active_env,
-            rollout.example,
-            rollout.state,
-            rollout.turn_spans,
-            score,
-        )
-        for rollout, score in zip(rollouts, scores, strict=True)
-    ]
-    return scores, turn_rewards
-
-
 _PHYSICAL_REQUEST_COUNTER = itertools.count()
 _PHYSICAL_REQUEST_COUNTER_LOCK = threading.Lock()
 _ROLLOUT_REQUEST_TIMEOUT_MIN_SECONDS = 600.0
@@ -776,10 +632,21 @@ def rollout_async(
         to_env.put(None)
         worker.join()
 
-    rewards, turn_rewards = _score_rollouts(active_env, rollouts)
+    requests = [
+        RolloutScoreRequest(
+            example=rollout.example,
+            state=rollout.state,
+            turn_count=len(rollout.turn_spans),
+        )
+        for rollout in rollouts
+    ]
+    scores = score_rollouts(active_env, requests)
     return [
-        r.result(reward, per_turn)
-        for r, reward, per_turn in zip(rollouts, rewards, turn_rewards, strict=True)
+        rollout.result(
+            score.episode,
+            list(score.turns) if score.turns else None,
+        )
+        for rollout, score in zip(rollouts, scores, strict=True)
     ]
 
 
@@ -997,12 +864,7 @@ def build_rollout_func(
                 monotonic=monotonic,
                 request_id_factory=request_id_factory,
             )
-            fields = (
-                _ROLLOUT_FIELDS
-                if any(r["turn_rewards"] is not None for r in rollouts)
-                else _ROLLOUT_FIELDS[:5]
-            )
-            out: dict[str, list] = {key: [] for key in fields}
+            out: dict[str, list] = {key: [] for key in _ROLLOUT_FIELDS}
             for rollout in rollouts:
                 for key in out:
                     out[key].append(rollout[key])

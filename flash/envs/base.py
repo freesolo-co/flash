@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+@dataclass(frozen=True)
+class RolloutReward:
+    episode: float
+    turns: tuple[float, ...] | None = None
+
+
 class Environment(Protocol):
     id: str
 
@@ -21,8 +27,8 @@ class Environment(Protocol):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         """Scalar RL reward for a completion."""
 
-    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
-        """Return one reward per assistant turn, or None when unavailable."""
+    def rollout_rewards_many(self, items: list[tuple[dict, dict]]) -> list[RolloutReward]:
+        """Return typed episode and optional per-turn rewards in input order."""
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         """Boolean correctness scorer the reward can build on."""
@@ -43,9 +49,6 @@ class BaseEnvironment:
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
-
-    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
-        return None
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         gold = str(example.get("output") or "").strip()

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from flash.envs.base import BaseEnvironment
+from flash.envs.base import BaseEnvironment, RolloutReward
 from flash.envs.loader import (
     GitHubEnvironmentRef,
     GitHubRateLimitError,
@@ -235,7 +235,7 @@ class FreesoloEnvironment(BaseEnvironment):
         return float(getattr(self._score_one(completion, example, state), "score", 0.0))
 
     @staticmethod
-    def _turn_rewards_from_result(result) -> list[float] | None:
+    def _turn_rewards_from_result(result) -> tuple[float, ...] | None:
         metadata = getattr(result, "metadata", None) or {}
         values = metadata.get("per_turn_rewards")
         if values is None:
@@ -243,13 +243,9 @@ class FreesoloEnvironment(BaseEnvironment):
         if not isinstance(values, list):
             raise ValueError("per_turn_rewards metadata must be a list")
         try:
-            return [float(value) for value in values]
+            return tuple(float(value) for value in values)
         except (TypeError, ValueError) as exc:
             raise ValueError("per_turn_rewards metadata must contain only numbers") from exc
-
-    def turn_rewards(self, example: dict, state: dict) -> list[float] | None:
-        """Score the terminal episode and return its documented per-turn rewards."""
-        return self._turn_rewards_from_result(self._score_episode(example, state))
 
     def _grouped_results(self, items, *, task_of, payload_of, scorer, method: str) -> list:
         """Group rollouts that share an example and scatter full reward results in input order."""
@@ -330,19 +326,36 @@ class FreesoloEnvironment(BaseEnvironment):
             method="score_episodes",
         )
 
-    def reward_results_many(self, items: list[tuple[dict, dict]]) -> list:
-        """Return terminal multi-turn reward results without discarding their metadata."""
+    def rollout_rewards_many(self, items: list[tuple[dict, dict]]) -> list[RolloutReward]:
+        """Score terminal episodes once and return typed rewards in input order."""
         if not self.multi_turn:
-            raise RuntimeError("reward_results_many is only available for multi-turn environments")
+            raise RuntimeError("rollout_rewards_many is only available for multi-turn environments")
+
+        score_episodes = self._env.score_episodes
         if not self.reward_thread_safe:
-            return [self._score_episode(example, state) for example, state in items]
-        return self._grouped_results(
+
+            def _serial_score_episodes(task, episodes):
+                return [
+                    self._single(self._env.score_episodes(task, [episode]), "score_episodes")
+                    for episode in episodes
+                ]
+
+            score_episodes = _serial_score_episodes
+
+        results = self._grouped_results(
             items,
             task_of=lambda ex, st: st.get("task") or self._task_example(ex),
             payload_of=self._episode_from_state,
-            scorer=self._env.score_episodes,
+            scorer=score_episodes,
             method="score_episodes",
         )
+        return [
+            RolloutReward(
+                episode=float(result.score),
+                turns=self._turn_rewards_from_result(result),
+            )
+            for result in results
+        ]
 
     @property
     def reward_thread_safe(self) -> bool:
