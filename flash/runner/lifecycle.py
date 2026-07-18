@@ -271,14 +271,16 @@ def _submit_seed_supervised(
             if lock is not None:
                 lock.release()
 
-    def _gc_seen_endpoints() -> None:
+    def _gc_seen_endpoints(*, preserve_endpoint_id: str | None = None) -> None:
         if not seen_endpoints:
             return
         from flash.providers import get_provider
         from flash.providers.base import JobHandle
 
         rp = get_provider("runpod")
-        for remote in seen_endpoints.values():
+        for endpoint_id, remote in seen_endpoints.items():
+            if endpoint_id == preserve_endpoint_id:
+                continue
             with contextlib.suppress(Exception):
                 rp.destroy(JobHandle.from_dict(remote))
 
@@ -521,7 +523,9 @@ def _submit_seed_supervised(
                     raise _cancel()
             except FileNotFoundError:
                 pass
-            _gc_seen_endpoints()
+            # prior retry endpoints must still be reaped, but the successful RunPod endpoint remains
+            # reachable through status.remote so terminal cleanup can release it into the warm pool.
+            _gc_seen_endpoints(preserve_endpoint_id=last_handle.get("endpoint_id"))
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
@@ -782,6 +786,32 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     )
 
 
+def _register_warm_runpod_endpoint(status, spec: JobSpec) -> bool:
+    if status.state != "done" or not isinstance(status.remote, dict):
+        return False
+    if status.remote.get("provider") != "runpod":
+        return False
+
+    from flash.providers.base import canonical_gpu
+    from flash.providers.runpod import warm_pool
+    from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+    handle = RunpodJobHandle.from_dict(status.remote)
+    execution_timeout_ms = handle.execution_timeout_ms
+    if execution_timeout_ms is None:
+        execution_timeout_ms = int(spec.gpu.max_wall_seconds * 1000)
+    record = warm_pool.WarmEndpoint(
+        endpoint_id=handle.endpoint_id,
+        name=handle.endpoint_name,
+        key_fingerprint=handle.key_fingerprint,
+        signature=warm_pool.reuse_signature(spec, handle.key_fingerprint),
+        gpu_type=canonical_gpu(spec.gpu.type),
+        execution_timeout_ms=execution_timeout_ms,
+        released_at=time.time(),
+    )
+    return warm_pool.register(record)
+
+
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
     from flash.runner import (
@@ -800,20 +830,25 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     if status is not None:
         with contextlib.suppress(Exception):
             spec = effective_spec_from_status(status)
+    warmed_runpod_endpoint = False
     if (
         status is not None
         and status.remote
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
         with contextlib.suppress(Exception):
-            _strict_teardown_handle(status.remote)
-    try:
-        # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
-        from flash.providers import get_provider
+            warmed_runpod_endpoint = _register_warm_runpod_endpoint(status, spec)
+        if not warmed_runpod_endpoint:
+            with contextlib.suppress(Exception):
+                _strict_teardown_handle(status.remote)
+    if not warmed_runpod_endpoint:
+        try:
+            # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
+            from flash.providers import get_provider
 
-        get_provider("runpod").gc(spec)
-    except Exception:
-        pass
+            get_provider("runpod").gc(spec)
+        except Exception:
+            pass
     from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
 
     _avail = available_providers()
