@@ -13,6 +13,7 @@ from flash.engine.worker.sft import (
     _prepare_sft_examples,
     _pretokenize_completion_only,
     _sft_prep_fingerprint,
+    _tokenizer_identity,
 )
 
 
@@ -20,11 +21,15 @@ class _TestTokenizer:
     name_or_path = "test/tokenizer"
     chat_template = "test-template-v1"
     eos_token = "<eos>"
+    truncation_side = "right"
+    add_bos_token = False
+    add_eos_token = False
 
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail=False, require_rayon_disabled=False):
         self.all_special_ids = [0]
         self.special_tokens_map = {"eos_token": "<eos>"}
         self.fail = fail
+        self.require_rayon_disabled = require_rayon_disabled
 
     def get_vocab(self):
         return {"<eos>": 0, "text": 1}
@@ -38,6 +43,8 @@ class _TestTokenizer:
         enable_thinking,
     ):
         assert tokenize is False
+        if self.require_rayon_disabled:
+            assert os.environ.get("TOKENIZERS_PARALLELISM") == "false"
         if self.fail:
             raise RuntimeError("intentional render failure")
         rendered = "".join(
@@ -124,6 +131,8 @@ def test_parallel_map_matches_serial_input_ids_and_reuses_complete_cache(tmp_pat
     _, expected, expected_dropped = _serial_rows(
         env, examples, tokenizer, thinking=thinking, max_length=max_length
     )
+    tokenizer.require_rayon_disabled = True
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
 
     _, actual, dropped, multiturn, cache_hit = _prepare_sft_examples(
         env,
@@ -143,6 +152,8 @@ def test_parallel_map_matches_serial_input_ids_and_reuses_complete_cache(tmp_pat
     assert dropped == expected_dropped
     assert multiturn == 1
     assert cache_hit is False
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
+    assert not list(tmp_path.glob("*/map*.arrow"))
 
     _, cached, cached_dropped, cached_multiturn, cache_hit = _prepare_sft_examples(
         env,
@@ -159,6 +170,32 @@ def test_parallel_map_matches_serial_input_ids_and_reuses_complete_cache(tmp_pat
     assert cached_dropped == dropped
     assert cached_multiturn == multiturn
     assert cache_hit is True
+
+
+def test_single_process_map_preserves_parent_tokenizer_parallelism(tmp_path, monkeypatch):
+    monkeypatch.setattr(sft_mod, "_sft_tokenize_num_proc", lambda _row_count: None)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    env = _ParentOnlyEnv()
+    examples = [
+        {
+            "input": "alpha",
+            "completion": [{"role": "assistant", "content": "one"}],
+        }
+    ]
+
+    _prepare_sft_examples(
+        env,
+        examples,
+        _TestTokenizer(),
+        env_resolved_sha="a" * 40,
+        seed=7,
+        model_revision="b" * 40,
+        thinking=False,
+        max_length=256,
+        cache_root=tmp_path,
+    )
+
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
 
 
 def test_interrupted_map_never_publishes_a_partial_cache(tmp_path):
@@ -204,6 +241,17 @@ def test_tokenizer_process_count_is_amortized_and_bounded(monkeypatch):
 
     monkeypatch.setattr(sft_mod.os, "cpu_count", lambda: 4)
     assert sft_mod._sft_tokenize_num_proc(100_000) == 2
+
+
+def test_tokenizer_identity_covers_behavior_affecting_runtime_settings():
+    baseline = _TestTokenizer()
+    changed = _TestTokenizer()
+    changed.truncation_side = "left"
+    assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
+
+    changed.truncation_side = "right"
+    changed.add_eos_token = True
+    assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
 
 
 @pytest.mark.parametrize(

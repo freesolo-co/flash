@@ -87,6 +87,8 @@ def _sft_prep_fingerprint(**fields) -> str:
 
 
 def _tokenizer_identity(tokenizer) -> str:
+    import transformers
+
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is not None and callable(getattr(backend, "to_str", None)):
         vocabulary = backend.to_str()
@@ -97,6 +99,10 @@ def _tokenizer_identity(tokenizer) -> str:
         "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
         "name_or_path": str(getattr(tokenizer, "name_or_path", "") or ""),
         "special_tokens_map": getattr(tokenizer, "special_tokens_map", {}) or {},
+        "transformers_version": transformers.__version__,
+        "truncation_side": str(getattr(tokenizer, "truncation_side", "right") or "right"),
+        "add_bos_token": bool(getattr(tokenizer, "add_bos_token", False)),
+        "add_eos_token": bool(getattr(tokenizer, "add_eos_token", False)),
         "vocabulary_sha256": hashlib.sha256(vocabulary.encode()).hexdigest(),
     }
     return hashlib.sha256(_stable_json(identity).encode()).hexdigest()
@@ -153,7 +159,6 @@ def _sft_tokenize_num_proc(row_count: int) -> int | None:
 
 
 def _render_tokenize_sft_batch(batch, *, tokenizer, max_length: int, thinking: bool):
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     prompt_messages = [pickle.loads(value) for value in batch["prompt_messages"]]
     completion_messages = [pickle.loads(value) for value in batch["completion_messages"]]
     texts = [
@@ -236,22 +241,33 @@ def _load_or_prepare_sft_dataset(
                 # spawn keeps heartbeat threads and accelerator state out of tokenizer workers.
                 multiprocess.set_start_method("spawn", force=True)
             source = Dataset.from_list(records)
-            mapped = source.map(
-                _render_tokenize_sft_batch,
-                batched=True,
-                batch_size=256,
-                remove_columns=source.column_names,
-                fn_kwargs={
-                    "tokenizer": tokenizer,
-                    "max_length": max_length,
-                    "thinking": thinking,
-                },
-                num_proc=num_proc,
-                cache_file_name=str(temp_dir / "map.arrow"),
-                new_fingerprint=fingerprint[:40],
-                desc="rendering and tokenizing SFT dataset",
-            )
+            previous_tokenizer_parallelism = os.environ.get("TOKENIZERS_PARALLELISM")
+            if num_proc is not None:
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            try:
+                mapped = source.map(
+                    _render_tokenize_sft_batch,
+                    batched=True,
+                    batch_size=256,
+                    remove_columns=source.column_names,
+                    fn_kwargs={
+                        "tokenizer": tokenizer,
+                        "max_length": max_length,
+                        "thinking": thinking,
+                    },
+                    num_proc=num_proc,
+                    cache_file_name=str(temp_dir / "map.arrow"),
+                    new_fingerprint=fingerprint[:40],
+                    desc="rendering and tokenizing SFT dataset",
+                )
+            finally:
+                if previous_tokenizer_parallelism is None:
+                    os.environ.pop("TOKENIZERS_PARALLELISM", None)
+                else:
+                    os.environ["TOKENIZERS_PARALLELISM"] = previous_tokenizer_parallelism
             mapped.save_to_disk(str(temp_dir / "dataset"))
+            for map_shard in temp_dir.glob("map*.arrow"):
+                map_shard.unlink()
             marker = temp_dir / "_SUCCESS"
             with marker.open("x") as marker_file:
                 marker_file.write(f"{fingerprint}\n")
