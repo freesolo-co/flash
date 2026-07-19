@@ -1035,7 +1035,14 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
     except Exception as exc:
         try:
-            _compare_and_fail_remote(run_id, persisted_remote, str(exc))
+            if get_status(run_id).state not in TERMINAL_STATES:
+                try:
+                    clear_remote = _preserve_cleanup_remote(run_id, persisted_remote)
+                except Exception:
+                    clear_remote = False
+                _compare_and_fail_remote(
+                    run_id, persisted_remote, str(exc), clear_remote=clear_remote
+                )
         except Exception:
             if next_attempt > 0:
                 _schedule_attach_reconciliation(

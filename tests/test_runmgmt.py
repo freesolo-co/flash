@@ -1554,7 +1554,14 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
-def test_completed_attempt_metrics_accepts_marker_just_after_wall(monkeypatch):
+@pytest.mark.parametrize(
+    ("marker_ts", "expected"),
+    [
+        (280.0, {"wall_seconds": 5.0}),
+        (7420.0, None),
+    ],
+)
+def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, marker_ts, expected):
     import flash.providers._hf_artifacts as hf_artifacts
     import flash.runner.lifecycle as lifecycle
     from flash.spec import JobSpec, TrainSpec
@@ -1565,14 +1572,14 @@ def test_completed_attempt_metrics_accepts_marker_just_after_wall(monkeypatch):
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
     )
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 221.0)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 8000.0)
 
     def artifact_reader(_repo, path):
         def read(force=False):
             if path.endswith("/vast_attempt0.json"):
                 return (
                     '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    '"run_id":"late-marker-complete","ts":220.5}'
+                    f'"run_id":"late-marker-complete","ts":{marker_ts}}}'
                 )
             if path.endswith("/metrics.json"):
                 return '{"wall_seconds":5.0}'
@@ -1590,7 +1597,7 @@ def test_completed_attempt_metrics_accepts_marker_just_after_wall(monkeypatch):
         deadline_at=220.0,
     )
 
-    assert metrics == {"wall_seconds": 5.0}
+    assert metrics == expected
 
 
 def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
@@ -1878,6 +1885,8 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
     monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", sleeps.append)
     attempts = []
 
     def start_resubmit(*args, **kwargs):
@@ -1889,6 +1898,7 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     runtime._deferred_resubmit_loop(spec)
 
     assert len(attempts) == 2
+    assert sleeps == [runtime._DEFERRED_RECOVERY_RETRY_S]
     assert (
         attempts[0][1]
         == attempts[1][1]

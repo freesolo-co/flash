@@ -2394,20 +2394,21 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
         orch._save_status(
             orch.RunStatus(
                 run_id="warm-recover",
                 state="running",
                 spec=spec.to_dict(),
-                remote={
-                    "provider": "runpod",
-                    "endpoint_id": "ep",
-                    "endpoint_name": "n",
-                    "key_fingerprint": _RUNPOD_FINGERPRINT,
-                    "job_id": "job",
-                    "attempt": 0,
-                    "started_ts": 1.0,
-                },
+                remote=remote,
             )
         )
         monkeypatch.setattr(
@@ -2420,8 +2421,10 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
         assert status.state == "failed"
+        assert status.remote is None
         assert "original preparation snapshot is unavailable" in (status.error or "")
         assert "source-run/step-40" in (status.error or "")
+        assert orch._load_status_json("warm-recover")[orch._CLEANUP_REMOTES_KEY] == [remote]
 
 
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):

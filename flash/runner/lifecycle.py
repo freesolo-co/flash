@@ -21,6 +21,7 @@ from flash.spec import JobSpec, require_matching_seed
 INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
+_RECOVERY_MARKER_GRACE_S = 120.0
 
 
 @dataclass
@@ -253,6 +254,7 @@ def _completed_attempt_metrics(
             run_id=spec.run_id,
             attempt=attempt,
             launch_floor=launch_floor,
+            deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
         )
     except (TypeError, ValueError):
         return None

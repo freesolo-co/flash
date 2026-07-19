@@ -424,7 +424,8 @@ def _deferred_resubmit_loop(spec) -> None:
                 if get_status(spec.run_id).state in TERMINAL_STATES:
                     return
             except Exception:
-                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                pass
+            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
             continue
         delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
