@@ -148,6 +148,12 @@ def _safe_realized_sft_max_length(rows: list[dict], configured_max: int) -> int:
     return realized_max
 
 
+def _sft_runtime_max_length(realized_max: int, *, pad_to_multiple_of: int = 1) -> int:
+    """include collator padding in the sequence width used for memory decisions."""
+    multiple = max(1, int(pad_to_multiple_of))
+    return math.ceil(realized_max / multiple) * multiple
+
+
 def _configure_unpacked_length_sampling(cfg_kwargs: dict, dataset, *, packed: bool):
     """attach exact row lengths and enable length grouping only for unpacked training."""
     if packed:
@@ -533,17 +539,21 @@ def run_sft():
 
     _sizing_rows = _bfd_rows if _packing_kind == "bfd" else _packed_rows or _pretok
     _realized_max_len = _safe_realized_sft_max_length(_sizing_rows, sft_max_len)
+    _runtime_max_len = _sft_runtime_max_length(
+        _realized_max_len,
+        pad_to_multiple_of=8 if _packing_kind == "sdpa" else 1,
+    )
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch,
-        seq_len=_realized_max_len,
+        seq_len=_runtime_max_len,
         vocab=_sft_vocab,
         fused=_sft_fused,
     )
     if _packing_kind == "sdpa":
         # cap the real dense mask allocation at 512 mb using its padded runtime width.
-        _mask_width = math.ceil(_realized_max_len / 8) * 8
         per_device_bs = max(
-            1, min(per_device_bs, (512 * 1024 * 1024) // (_mask_width * _mask_width))
+            1,
+            min(per_device_bs, (512 * 1024 * 1024) // (_runtime_max_len * _runtime_max_len)),
         )
     elif _packing_kind == "gdn":
         # the varlen recurrence metadata spans one block and requires a single block per microbatch.
@@ -595,7 +605,7 @@ def run_sft():
     _gc_lora_rank = int(_t.lora_rank if _t and _t.lora_rank else RECIPE.lora.rank)
     _grad_ckpt = grad_checkpointing_on(
         model_id,
-        _realized_max_len,
+        _runtime_max_len,
         allow_disable=True,
         card_vram_gb=_gc_card_gb,
         capability=_gc_cap,
@@ -881,6 +891,7 @@ def run_sft():
             "gradient_checkpointing": _grad_ckpt,
             "configured_max_length": sft_max_len,
             "realized_max_length": _realized_max_len,
+            "runtime_max_length": _runtime_max_len,
             "per_device_train_batch_size": per_device_bs,
             "gradient_accumulation_steps": grad_accum,
             "packing": _packing_kind,

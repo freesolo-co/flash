@@ -15,6 +15,7 @@ from flash.engine.worker.sft import (
     _safe_realized_sft_max_length,
     _sft_local_token_count,
     _sft_quality_metrics_due,
+    _sft_runtime_max_length,
     _SFTTokenCountingCollator,
 )
 
@@ -40,6 +41,17 @@ def test_realized_length_rejects_rows_past_configured_cap():
     rows = [{"input_ids": list(range(513))}]
     with pytest.raises(ValueError, match="exceeds configured max"):
         _safe_realized_sft_max_length(rows, 512)
+
+
+def test_sdpa_runtime_sizing_includes_collator_padding():
+    realized_max = 625
+    runtime_max = _sft_runtime_max_length(realized_max, pad_to_multiple_of=8)
+
+    assert runtime_max == 632
+    raw = sft_grad_accum(4, seq_len=realized_max, vocab=150_000, fused=False)
+    padded = sft_grad_accum(4, seq_len=runtime_max, vocab=150_000, fused=False)
+    assert raw == (4, 1)
+    assert padded == (3, 2)
 
 
 def test_packed_token_count_is_linear_and_not_attention_edge_count():

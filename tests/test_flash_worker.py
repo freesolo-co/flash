@@ -603,7 +603,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "vocab_size_for(model_id)" not in src
     # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
     # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
-    assert "grad_checkpointing_on(\n        model_id,\n        _realized_max_len," in src
+    assert "grad_checkpointing_on(\n        model_id,\n        _runtime_max_len," in src
     assert '"gradient_checkpointing": _grad_ckpt' in src
     # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
     # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
