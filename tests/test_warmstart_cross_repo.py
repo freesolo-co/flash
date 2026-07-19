@@ -144,7 +144,21 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
     )  # dry/local child
 
 
-def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch):
+@pytest.mark.parametrize(
+    "deployment",
+    [
+        pytest.param(None, id="never-deployed"),
+        pytest.param(
+            {
+                "state": "undeployed",
+                "adapter_revision": "source-run@final." + _REVISION,
+                "endpoint_name": "https://serve.example",
+            },
+            id="post-undeploy",
+        ),
+    ],
+)
+def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch, deployment):
     import flash.lora_rank as rank_mod
     import flash.runner as R
     import flash.runner.checkpoints as checkpoints
@@ -158,7 +172,12 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = R.RunStatus(run_id="source-run", state="done", spec=source.to_dict())
+    source_status = R.RunStatus(
+        run_id="source-run",
+        state="done",
+        spec=source.to_dict(),
+        deployment=deployment,
+    )
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -217,7 +236,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
 
 _DEPLOYED_WARMSTART_ERROR = (
     "warm-start source 'source-run' is currently deployed; run 'flash undeploy source-run' first, "
-    "then resubmit (serving locks the adapter files during a deploy)"
+    "then resubmit (serving holds the adapter files while it is deployed)"
 )
 
 

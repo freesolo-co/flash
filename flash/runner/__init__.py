@@ -717,6 +717,7 @@ def _prepare_init_from_adapter(
         resolve_hf_dataset_revision,
     )
     from flash.runner.checkpoints import CheckpointListingError, adapter_artifact_exists
+    from flash.runner.deploy import _RESTORABLE_DEPLOYMENT_STATES
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
@@ -742,11 +743,14 @@ def _prepare_init_from_adapter(
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
-    if src_status.state == "deployed" or src_status.deployment:
+    if src_status.state == "deployed" or (
+        isinstance(src_status.deployment, dict)
+        and src_status.deployment.get("state") in _RESTORABLE_DEPLOYMENT_STATES
+    ):
         raise WarmStartSourceDeployedError(
             f"warm-start source {src_run_id!r} is currently deployed; run "
             f"'flash undeploy {src_run_id}' first, then resubmit "
-            "(serving locks the adapter files during a deploy)"
+            "(serving holds the adapter files while it is deployed)"
         )
     src_spec = JobSpec.from_dict(src_status.spec)
     if src_spec.model != spec.model:
