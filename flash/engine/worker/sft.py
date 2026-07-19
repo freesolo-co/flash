@@ -123,10 +123,6 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
 _CHUNKED_NLL_TEXT_CONFIG_FIELDS = (
     "final_logit_softcapping",
     "logit_scale",
-    "num_experts",
-    "num_experts_per_tok",
-    "output_router_logits",
-    "router_aux_loss_coef",
 )
 
 
@@ -154,8 +150,9 @@ def _prepare_chunked_nll_model(model, processing_class, peft_config) -> None:
 
     # flash intentionally passes an autotokenizer for text-only qwen training, so trl classifies the
     # full multimodal checkpoint as a text model. transformers 5 still traverses model.base_model
-    # correctly, but trl reads loss and router fields from the top-level config in that classification.
-    # mirror the nested text fields there so chunked nll preserves scaling and moe auxiliary loss.
+    # correctly, but trl reads logit transforms from the top-level config in that classification.
+    # mirror only those transforms. the full qwen moe wrapper does not add router auxiliary loss on
+    # the plain-nll path, so copying its nested router flag would change the training objective.
     text_config = getattr(model.config, "text_config", None)
     if text_config is not None:
         for name in _CHUNKED_NLL_TEXT_CONFIG_FIELDS:

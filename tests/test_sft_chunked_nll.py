@@ -219,8 +219,47 @@ def test_qwen_structures_keep_text_classification_and_safe_output_head():
         assert "lm_head" not in peft_config.target_modules
 
     moe_config = models[1].config
-    assert moe_config.output_router_logits is True
-    assert moe_config.num_experts == moe_config.text_config.num_experts
+    assert getattr(moe_config, "output_router_logits", None) is None
+    assert moe_config.text_config.output_router_logits is True
+
+
+def test_qwen35_moe_chunked_nll_preserves_plain_objective():
+    torch = pytest.importorskip("torch")
+    from peft import LoraConfig, get_peft_model
+    from transformers import (
+        PreTrainedTokenizerBase,
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeForConditionalGeneration,
+    )
+    from trl.trainer.sft_trainer import _patch_chunked_ce_lm_head
+
+    from flash.engine.worker.sft import _prepare_chunked_nll_model
+
+    torch.manual_seed(0)
+    plain = Qwen3_5MoeForConditionalGeneration(_vl_config(Qwen3_5MoeConfig, moe=True)).eval()
+    chunked = copy.deepcopy(plain)
+    peft_config = LoraConfig(
+        r=2,
+        lora_alpha=4,
+        target_modules="all-linear",
+        task_type="CAUSAL_LM",
+    )
+    _prepare_chunked_nll_model(chunked, PreTrainedTokenizerBase(), peft_config)
+    chunked = get_peft_model(chunked, peft_config).eval()
+    _patch_chunked_ce_lm_head(chunked.get_base_model(), chunk_size=2, is_vlm=False)
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    labels = input_ids.clone()
+    labels[0, :2] = -100
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        plain_out = plain(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        chunked_out = chunked(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+    assert chunked_out.loss.item() == pytest.approx(plain_out.loss.item(), abs=1e-6)
+    assert chunked_out.aux_loss is None
+    assert chunked_out.logits is None
 
 
 def test_chunked_nll_rejects_trainable_output_head():
