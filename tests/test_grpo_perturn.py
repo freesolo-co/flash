@@ -20,6 +20,34 @@ from tests.test_multiturn_per_turn_reward import (
 )
 
 
+def _tiny_gpt2_and_tokenizer():
+    """a tiny word-level gpt2 + tokenizer for driving a real trl train() step on cpu."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(
+            vocab={"<pad>": 0, "<eos>": 1, "<unk>": 2, **_TOKEN_IDS}, unk_token="<unk>"
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
+    )
+    model = transformers.GPT2LMHeadModel(
+        transformers.GPT2Config(
+            vocab_size=len(tokenizer),
+            n_positions=32,
+            n_ctx=32,
+            n_embd=16,
+            n_layer=1,
+            n_head=1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    )
+    return model, tokenizer
+
+
 @pytest.mark.parametrize(
     ("credit_assignment", "is_multi_turn", "use_rollout_func", "expects_per_turn_trainer"),
     [
@@ -238,35 +266,9 @@ def test_trainer_rejects_distributed_per_turn_credit(monkeypatch):
 
 def test_cpu_trainer_step_uses_two_dimensional_advantages(tmp_path):
     datasets = pytest.importorskip("datasets")
-    tokenizers = pytest.importorskip("tokenizers")
-    transformers = pytest.importorskip("transformers")
     from trl import GRPOConfig
 
-    tokenizer_backend = tokenizers.Tokenizer(
-        tokenizers.models.WordLevel(
-            vocab={"<pad>": 0, "<eos>": 1, "<unk>": 2, **_TOKEN_IDS},
-            unk_token="<unk>",
-        )
-    )
-    tokenizer_backend.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
-    tokenizer = transformers.PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer_backend,
-        pad_token="<pad>",
-        eos_token="<eos>",
-        unk_token="<unk>",
-    )
-    model = transformers.GPT2LMHeadModel(
-        transformers.GPT2Config(
-            vocab_size=len(tokenizer),
-            n_positions=32,
-            n_ctx=32,
-            n_embd=16,
-            n_layer=1,
-            n_head=1,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    )
+    model, tokenizer = _tiny_gpt2_and_tokenizer()
     observed_shapes = []
 
     class RecordingTrainer(GRPOPerTurnTrainer):
@@ -328,3 +330,102 @@ def test_cpu_trainer_step_uses_two_dimensional_advantages(tmp_path):
     assert observed_shapes
     assert all(len(shape) == 2 for shape in observed_shapes)
     assert observed_shapes[0][0] == 2
+
+
+def test_per_turn_extracts_signal_that_per_episode_discards(tmp_path):
+    """decisive end-to-end proof through the REAL trainer: two rollouts with EQUAL episode reward but
+    OPPOSITE per-turn rewards. per-turn assigns exact turn-differentiated [B,T] advantages (each turn
+    = reward - group-mean over that turn index), while stock per-episode gives a uniform ZERO advantage
+    because both episodes are equal -- so per-turn extracts turn-level signal that per-episode discards.
+    """
+    datasets = pytest.importorskip("datasets")
+    from trl import GRPOConfig, GRPOTrainer
+
+    # completion tokens [miss, next(glue), hit]: turn0 span [0,1), glue [1,2), turn1 span [2,3)
+    completion = [_TOKEN_IDS["miss"], _TOKEN_IDS["next"], _TOKEN_IDS["hit"]]
+    rollouts = [
+        {
+            "prompt_ids": [_TOKEN_IDS["prompt"]],
+            "completion_ids": completion,
+            "logprobs": [-0.1, -0.1, -0.1],
+            "env_mask": [1, 0, 1],
+            "reward": 1.0,
+            "turn_spans": [(0, 1), (2, 3)],
+            "turn_rewards": [1.0, 0.0],
+        },
+        {
+            "prompt_ids": [_TOKEN_IDS["prompt"]],
+            "completion_ids": completion,
+            "logprobs": [-0.1, -0.1, -0.1],
+            "env_mask": [1, 0, 1],
+            "reward": 1.0,
+            "turn_spans": [(0, 1), (2, 3)],
+            "turn_rewards": [0.0, 1.0],
+        },
+    ]
+    fields = (
+        "prompt_ids",
+        "completion_ids",
+        "logprobs",
+        "env_mask",
+        "reward",
+        "turn_spans",
+        "turn_rewards",
+    )
+
+    def _captured_advantages(trainer_cls, emitted_fields):
+        captured = {}
+
+        class _Recording(trainer_cls):
+            def _generate_and_score_completions(self, inputs):
+                output = super()._generate_and_score_completions(inputs)
+                captured["advantages"] = output["advantages"].detach().float().cpu().clone()
+                return output
+
+        model, tokenizer = _tiny_gpt2_and_tokenizer()
+        config = GRPOConfig(
+            output_dir=str(tmp_path),
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=1,
+            num_generations=2,
+            max_completion_length=8,
+            max_steps=1,
+            learning_rate=1e-4,
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            use_vllm=False,
+            bf16=False,
+            fp16=False,
+            scale_rewards="none",
+            loss_type="dr_grpo",
+        )
+        trainer = _Recording(
+            model=model,
+            args=config,
+            train_dataset=datasets.Dataset.from_list([{"prompt": "prompt"}]),
+            reward_funcs=lambda completions, **kwargs: kwargs["reward"],
+            processing_class=tokenizer,
+            rollout_func=lambda prompts, trainer: {
+                k: [r[k] for r in rollouts] for k in emitted_fields
+            },
+        )
+        trainer.train()
+        return captured["advantages"]
+
+    per_turn = _captured_advantages(GRPOPerTurnTrainer, fields)[:, :3]
+    # stock GRPOTrainer (per-episode): emit only the base fields, no per-turn metadata
+    per_episode = _captured_advantages(GRPOTrainer, fields[:5])
+    if per_episode.dim() == 1:
+        per_episode = per_episode.unsqueeze(1)
+
+    # turn0 rewards [1,0] mean 0.5 -> +0.5/-0.5 ; turn1 rewards [0,1] mean 0.5 -> -0.5/+0.5
+    torch.testing.assert_close(
+        per_turn, torch.tensor([[0.5, 0.0, -0.5], [-0.5, 0.0, 0.5]]), atol=1e-4, rtol=0
+    )
+    # within a rollout, the two turns get different advantages (turn-differentiated credit)
+    assert per_turn[0, 0] != per_turn[0, 2]
+    # equal episodes -> per-episode advantage is uniformly zero: no learning signal
+    assert float(per_episode.abs().max()) < 1e-4
+    # the +/-0.5 per-turn magnitude is exactly the turn-level signal per-episode discards
+    assert float(per_turn.abs().max()) > 0.4
