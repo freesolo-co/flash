@@ -131,7 +131,7 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _worker_provably_gone(run_id: str | None, handle) -> bool:
+def _worker_provably_gone(run_id: str, handle) -> bool:
     """Return true only when the captured attempt cannot still have a live worker."""
     from flash.providers import INSTANCE_PROVIDERS, get_provider
 
@@ -157,8 +157,6 @@ def _worker_provably_gone(run_id: str | None, handle) -> bool:
         except Exception:
             return False
     if handle.provider in INSTANCE_PROVIDERS:
-        if not run_id:
-            return False
         try:
             check = getattr(get_provider(handle.provider), "run_instances_remaining", None)
             return check is not None and check(run_id) == []
@@ -167,7 +165,7 @@ def _worker_provably_gone(run_id: str | None, handle) -> bool:
     return False
 
 
-def _strict_teardown_handle(handle, run_id: str | None = None) -> bool:
+def _strict_teardown_handle(handle, run_id: str) -> bool:
     """Request exact teardown, then prove the captured attempt's worker is gone.
 
     Returns true when the billable resource deletion itself was confirmed. Returns false only for a
@@ -186,7 +184,7 @@ def _strict_teardown_handle(handle, run_id: str | None = None) -> bool:
         try:
             provider.destroy(handle)
         except Exception as exc:
-            if run_id and _worker_provably_gone(run_id, handle):
+            if _worker_provably_gone(run_id, handle):
                 return False
             raise RuntimeError(
                 "runpod endpoint deletion could not be confirmed and its worker may still be live"
@@ -198,10 +196,6 @@ def _strict_teardown_handle(handle, run_id: str | None = None) -> bool:
             provider.destroy(handle)
         except Exception as exc:
             destroy_error = exc
-        if run_id is None:
-            if destroy_error is not None:
-                raise RuntimeError("instance teardown could not be confirmed") from destroy_error
-            return True
         if _worker_provably_gone(run_id, handle):
             return True
         raise RuntimeError(
@@ -402,10 +396,10 @@ def _submit_seed_supervised(
             }
             if _update(spec.run_id, "running", remote=persisted_handle):
                 return
-            cleanup_confirmed = False
+            resource_deleted = False
             with contextlib.suppress(Exception):
-                cleanup_confirmed = _strict_teardown_handle(canonical_handle, spec.run_id)
-            if cleanup_confirmed:
+                resource_deleted = _strict_teardown_handle(canonical_handle, spec.run_id)
+            if resource_deleted:
                 last_handle.clear()
             else:
                 _preserve_cleanup_remote(spec.run_id, persisted_handle)

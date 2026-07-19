@@ -289,7 +289,10 @@ def _start_resubmit(
     ):
         return False
     with contextlib.suppress(Exception):
-        _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
+        _append_run_log(
+            spec.run_id,
+            "control plane restarted without a durable handle; resubmitting",
+        )
     threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
     return True
 
@@ -518,8 +521,9 @@ def recover_runs() -> None:
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         else:
-            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
-            # A spec that won't parse can never be resubmitted -> mark it terminally failed
+            # No durable handle exists, but a worker may still exist if a non-idempotent create was
+            # accepted while its response or handle was lost. A spec that won't parse can never be
+            # resubmitted -> mark it terminally failed
             # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
             # otherwise GC any half-made endpoint and resubmit from scratch.
             try:
@@ -609,9 +613,8 @@ def recover_runs() -> None:
         if prior_state == "queued" or _confirm_run_clear(spec):
             _start_resubmit(spec, expected_remote=None, expected_state=prior_state)
             continue
-        # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer, and
-        # schedule a bounded background retry so the run resubmits as soon as the phantom is gone / the
-        # listing recovers — rather than stranding it until the next control-plane restart.
+        # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer with
+        # observation bounded by the run wall deadline, then durably persist terminal success or failure.
         _log.warning(
             "deferring resubmit of %s: instance teardown unconfirmed; scheduling background retry",
             spec.run_id,

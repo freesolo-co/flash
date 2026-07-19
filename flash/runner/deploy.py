@@ -336,7 +336,7 @@ def cancel_run(run_id: str) -> RunStatus:
         from flash.providers.base import JobHandle
         from flash.runner.lifecycle import _strict_teardown_handle
 
-        def _teardown_remote(remote: dict) -> bool:
+        def _teardown_or_preserve_remote(remote: dict) -> bool:
             try:
                 resource_deleted = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)
             except Exception:
@@ -363,8 +363,8 @@ def cancel_run(run_id: str) -> RunStatus:
             if identity in confirmed_cleanup_identities:
                 _clear_exact_remote(remote)
                 continue
-            teardown_confirmed = _teardown_remote(remote)
-            if teardown_confirmed:
+            remote_safe_to_clear = _teardown_or_preserve_remote(remote)
+            if remote_safe_to_clear:
                 _clear_exact_remote(remote)
                 continue
             latest_remote = get_status(run_id).remote or {}
@@ -770,8 +770,6 @@ def _reconcile_attached_remote(
         if not worker_gone:
             continue
         if handle.provider == "runpod" and not resource_deleted:
-            from flash.runner import _preserve_cleanup_remote
-
             try:
                 cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
             except Exception:
