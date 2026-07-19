@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from flash.cli.commands import cmd_train
+from flash.cli.commands import _cmd_train_cost, cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
@@ -386,6 +386,36 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "TOTAL" in out
     assert "$" in out
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
+
+
+@pytest.mark.parametrize(("gpu_type", "expects_warning"), [("B200", True), ("H200", False)])
+def test_cmd_train_cost_warns_only_for_b200(tmp_path, capsys, gpu_type, expects_warning):
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(
+        'model = "Qwen/Qwen3.5-9B"\n'
+        'algorithm = "grpo"\n'
+        "[environment]\n"
+        'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+        "[train]\n"
+        "epochs = 1\n"
+        "max_examples = 800\n"
+        "batch_size = 16\n"
+        'hf_repo = "owner/runs"\n'
+        "[gpu]\n"
+        f'exact_type = "{gpu_type}"\n'
+    )
+    args = types.SimpleNamespace(config=str(cfg), overrides=[], extra_configs=[])
+
+    rc = _cmd_train_cost(args)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "TOTAL" in captured.out
+    assert gpu_type in captured.out
+    warning = "warning: this estimate assumes peak-flops throughput; B200 (sm100) kernels"
+    assert (warning in captured.err) is expects_warning
+    if not expects_warning:
+        assert captured.err == ""
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):

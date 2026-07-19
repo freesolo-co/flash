@@ -235,6 +235,13 @@ def _cmd_train_cost(args) -> int:
             file=sys.stderr,
         )
     estimate = estimate_cost(runconfig_from_spec(spec))
+    if estimate.gpu == "B200":
+        print(
+            "warning: this estimate assumes peak-flops throughput; B200 (sm100) kernels are "
+            "unoptimized for RL/GRPO training and typically run several times slower and pricier "
+            'than H200 in practice. to compare, pin [gpu] exact_type = "H200".',
+            file=sys.stderr,
+        )
     if render.styled():
         print(render.cost_panel(estimate))
     else:
