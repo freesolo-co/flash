@@ -329,14 +329,15 @@ def test_prepare_rejects_deployed_warmstart_before_hf_access(
 def test_create_run_preserves_deployed_warmstart_message(monkeypatch):
     from fastapi import HTTPException
 
-    import flash.runner as R
     import flash.server.routes.runs as runs_route
 
     _source, child = _warmstart_specs("source-run")
     deleted = []
 
     def reject_deployed_source(*_args, **_kwargs):
-        raise R.WarmStartSourceDeployedError(_DEPLOYED_WARMSTART_ERROR)
+        # raise the class the route imported (identity-stable across module reloads elsewhere in
+        # the full suite) so the specific handler matches instead of the generic wrapper.
+        raise runs_route.WarmStartSourceDeployedError(_DEPLOYED_WARMSTART_ERROR)
 
     monkeypatch.setattr(runs_route, "_parse_spec", lambda _payload, *, run_id: child)
     monkeypatch.setattr(runs_route, "_runtime_secrets", lambda _payload, _spec: {})
