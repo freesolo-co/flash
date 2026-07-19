@@ -100,6 +100,37 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     assert "flash_arm" not in status.lower()
 
 
+def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    allocated_run = {
+        "run_id": "flash-allocated",
+        "state": "done",
+        "spec": {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX Pro 6000"},
+        },
+        "remote": {"allocated_gpu": "B200"},
+    }
+    runs = render.runs_table([allocated_run])
+    status = render.run_status(allocated_run)
+    status_panel = status.split("details", 1)[0]
+    assert "B200" in runs
+    assert "B200" in status_panel
+    assert "RTX Pro 6000" not in runs
+    assert "RTX Pro 6000" not in status_panel
+
+    spec_only_run = {
+        "run_id": "flash-spec-only",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+    }
+    assert "RTX Pro 6000" in render.runs_table([spec_only_run])
+    assert "RTX Pro 6000" in render.run_status(spec_only_run)
+
+
 def test_color_respects_no_color(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("TERM", "xterm-256color")

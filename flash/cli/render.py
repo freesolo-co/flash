@@ -440,7 +440,11 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
 
 def gpu_label(spec: dict, remote: dict) -> str:
     """Human-facing GPU label. Provider metadata stays internal."""
-    return remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
+    return (
+        remote.get("allocated_gpu")
+        or remote.get("gpu")
+        or (spec.get("gpu") or {}).get("type", "")
+    )
 
 
 def runs_table(runs: list[dict]) -> str:
