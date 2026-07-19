@@ -781,3 +781,31 @@ def test_fresh_submit_persists_deploy_time_signature_and_timeout(monkeypatch, wa
         has_volume=True,
     )
     assert handles[-1]["execution_timeout_ms"] == deployed["execution_timeout_ms"]
+
+
+def test_strict_teardown_frees_slot_for_reused_endpoint_name(monkeypatch):
+    # a reused endpoint carries the original run's name; tearing it down on failure must free the slot
+    # under that borrowed name, not the reusing run's name (which never held a slot).
+    from flash.providers import get_provider
+    from flash.providers.runpod.train import endpoints as rp_ep
+    from flash.runner.lifecycle import _strict_teardown_handle
+
+    borrowed = "flash-original-run-abc"
+    rp_ep._LOCAL_SLOTS.acquire()
+    with rp_ep._ACQUIRED_LOCK:
+        rp_ep._ACQUIRED[borrowed] = "local"
+    monkeypatch.setattr(get_provider("runpod"), "destroy", lambda *_a, **_k: None)
+
+    _strict_teardown_handle(
+        {
+            "provider": "runpod",
+            "endpoint_id": "e-borrowed",
+            "endpoint_name": borrowed,
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+
+    with rp_ep._ACQUIRED_LOCK:
+        assert borrowed not in rp_ep._ACQUIRED

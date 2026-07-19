@@ -149,6 +149,14 @@ def _strict_teardown_handle(handle) -> None:
             provider.destroy(handle)
         except Exception as exc:
             raise RuntimeError("runpod endpoint deletion could not be confirmed") from exc
+        # free the quota slot under the endpoint's actual name. a reused endpoint carries the original
+        # run's name, which the run-id-keyed release in terminate_endpoint would otherwise miss.
+        endpoint_name = data.get("endpoint_name")
+        if endpoint_name:
+            from flash.providers.runpod.train.endpoints import _release_endpoint_slot
+
+            with contextlib.suppress(Exception):
+                _release_endpoint_slot(endpoint_name)
         return
     if handle.provider in INSTANCE_PROVIDERS:
         provider.destroy(handle)
