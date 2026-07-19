@@ -55,6 +55,7 @@ def test_sdpa_runtime_sizing_includes_collator_padding():
 
 
 def test_packed_token_count_is_linear_and_not_attention_edge_count():
+    pytest.importorskip("torch")
     rows = pack_token_ids([list(range(4)), list(range(10, 13))], max_length=8)
     collator = _SFTTokenCountingCollator(
         BlockDiagonalCollator(pad_token_id=99, pad_to_multiple_of=8)
@@ -101,13 +102,13 @@ def test_quality_metrics_run_only_on_logging_microbatch():
 
 
 def test_non_blocking_h2d_is_passed_to_sft_config():
-    from trl import SFTConfig
-
     from flash.engine.worker import sft
 
     source = inspect.getsource(sft.run_sft)
     assert '"accelerator_config": {"non_blocking": True}' in source
-    cfg = SFTConfig(
+
+    trl = pytest.importorskip("trl")
+    cfg = trl.SFTConfig(
         output_dir="/tmp/sft-activation-shaping-test",
         use_cpu=True,
         bf16=False,
