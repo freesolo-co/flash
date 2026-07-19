@@ -7,6 +7,7 @@ and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a s
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -130,8 +131,49 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _strict_teardown_handle(handle) -> None:
-    """Synchronously confirm provider teardown before any replacement provisioning."""
+def _worker_provably_gone(run_id: str | None, handle) -> bool:
+    """Return true only when the captured attempt cannot still have a live worker."""
+    from flash.providers import INSTANCE_PROVIDERS, get_provider
+
+    try:
+        handle = _canonical_provider_handle(handle)
+        data = handle.to_dict()
+    except Exception:
+        return False
+    if handle.provider == "runpod":
+        job_id = data.get("job_id")
+        if not job_id:
+            return False
+        try:
+            from flash.providers.runpod import api as runpod_api
+            from flash.providers.runpod.jobs import TERMINAL_FAIL, TERMINAL_OK
+
+            job = runpod_api.job_status(
+                data["endpoint_id"],
+                job_id,
+                key_fingerprint=data["key_fingerprint"],
+            )
+            return isinstance(job, dict) and job.get("status") in TERMINAL_OK | TERMINAL_FAIL
+        except Exception:
+            return False
+    if handle.provider in INSTANCE_PROVIDERS:
+        if not run_id:
+            return False
+        try:
+            check = getattr(get_provider(handle.provider), "run_instances_remaining", None)
+            return check is not None and check(run_id) == []
+        except Exception:
+            return False
+    return False
+
+
+def _strict_teardown_handle(handle, run_id: str | None = None) -> bool:
+    """Request exact teardown, then prove the captured attempt's worker is gone.
+
+    Returns true when the billable resource deletion itself was confirmed. Returns false only for a
+    RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
+    that exact endpoint in cleanup_remotes before clearing the active remote.
+    """
     from flash.providers import INSTANCE_PROVIDERS, get_provider
 
     handle = _canonical_provider_handle(handle)
@@ -144,13 +186,121 @@ def _strict_teardown_handle(handle) -> None:
         try:
             provider.destroy(handle)
         except Exception as exc:
-            raise RuntimeError("runpod endpoint deletion could not be confirmed") from exc
-        return
+            if run_id and _worker_provably_gone(run_id, handle):
+                return False
+            raise RuntimeError(
+                "runpod endpoint deletion could not be confirmed and its worker may still be live"
+            ) from exc
+        return True
     if handle.provider in INSTANCE_PROVIDERS:
-        provider.destroy(handle)
-        return
+        destroy_error: Exception | None = None
+        try:
+            provider.destroy(handle)
+        except Exception as exc:
+            destroy_error = exc
+        if run_id is None:
+            if destroy_error is not None:
+                raise RuntimeError("instance teardown could not be confirmed") from destroy_error
+            return True
+        if _worker_provably_gone(run_id, handle):
+            return True
+        raise RuntimeError(
+            "instance teardown could not be confirmed absent; its worker may still be live"
+        ) from destroy_error
     provider.cancel(handle)
     provider.destroy(handle)
+    return True
+
+
+def _completed_attempt_metrics(
+    spec: JobSpec,
+    *,
+    provider: str,
+    attempt: int,
+    launch_floor: float,
+    deadline_at: float,
+    log=None,
+) -> dict | None:
+    """Read a strict successful instance marker plus its run-scoped metrics."""
+    if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
+        return None
+    from flash.providers._hf_artifacts import make_hf_text_reader
+    from flash.providers._instance_poll import (
+        _METRICS_AFTER_SUCCESS_RETRIES,
+        _METRICS_AFTER_SUCCESS_WAIT_S,
+        _TERMINAL_REREAD_RETRIES,
+        _TERMINAL_REREAD_WAIT_S,
+        _read_with_retries,
+        decode_terminal_marker,
+    )
+    from flash.providers._poll import make_say
+
+    prefix = f"{spec.phase}/{spec.run_id}"
+    marker_reader = make_hf_text_reader(
+        spec.train.hf_repo,
+        f"{prefix}/{provider}_attempt{attempt}.json",
+    )
+    metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
+    say = make_say(log)
+    observation_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
+    marker_raw = _read_with_retries(
+        lambda: marker_reader(force=True),
+        tries=_TERMINAL_REREAD_RETRIES,
+        wait_s=_TERMINAL_REREAD_WAIT_S,
+        say=say,
+        message="recovery deadline reached; waiting for the terminal attempt marker",
+        deadline_at=observation_deadline,
+    )
+    if marker_raw is None:
+        return None
+    try:
+        marker = decode_terminal_marker(
+            marker_raw,
+            run_id=spec.run_id,
+            attempt=attempt,
+            launch_floor=launch_floor,
+            deadline_at=deadline_at,
+        )
+    except (TypeError, ValueError):
+        return None
+    if not marker["ok"]:
+        return None
+    metrics_observation_deadline = time.time() + (
+        _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S
+    )
+    metrics_raw = _read_with_retries(
+        lambda: metrics_reader(force=True),
+        tries=_METRICS_AFTER_SUCCESS_RETRIES,
+        wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
+        say=say,
+        message="successful recovery marker seen; waiting for metrics.json",
+        deadline_at=metrics_observation_deadline,
+    )
+    if metrics_raw is None:
+        return None
+    try:
+        metrics = json.loads(metrics_raw)
+    except (TypeError, ValueError):
+        return None
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _adopt_completed_attempt(
+    run_id: str,
+    spec: JobSpec,
+    expected_remote: dict | None,
+    metrics: dict,
+    *,
+    log,
+) -> bool:
+    """Finalize a phantom-completed attempt through the expected-remote CAS."""
+    from flash.runner import _compare_and_complete_remote
+
+    applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
+    if applied:
+        _charge_completed_run_best_effort(spec, log)
+        _register_checkpoints_best_effort(spec, log)
+    return applied
 
 
 def _select_candidate(candidates, failed_providers: set[str], tried_classes: set[tuple[str, str]]):
@@ -253,11 +403,8 @@ def _submit_seed_supervised(
             if _update(spec.run_id, "running", remote=persisted_handle):
                 return
             cleanup_confirmed = False
-            try:
-                _strict_teardown_handle(canonical_handle)
-                cleanup_confirmed = True
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                cleanup_confirmed = _strict_teardown_handle(canonical_handle, spec.run_id)
             if cleanup_confirmed:
                 last_handle.clear()
             else:
@@ -313,24 +460,43 @@ def _submit_seed_supervised(
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            teardown_confirmed = True
+            resource_deleted = False
             teardown_error: Exception | None = None
             try:
-                _strict_teardown_handle(JobHandle.from_dict(last_handle))
+                resource_deleted = _strict_teardown_handle(
+                    JobHandle.from_dict(last_handle), spec.run_id
+                )
             except Exception as exc:
-                teardown_confirmed = False
                 teardown_error = exc
             resource_kind = "endpoint" if last_handle.get("endpoint_id") else "instance"
             resource_id = last_handle.get("endpoint_id") or last_handle.get("instance_id")
-            if teardown_confirmed:
+            worker_gone = teardown_error is None or _worker_provably_gone(spec.run_id, last_handle)
+            if (
+                worker_gone
+                and last_handle.get("provider") == "runpod"
+                and not resource_deleted
+                and not _preserve_cleanup_remote(spec.run_id, last_handle)
+            ):
+                raise RuntimeError(
+                    f"seed {seed}: terminal worker's leaked endpoint cleanup target "
+                    "could not be persisted"
+                )
+            if worker_gone:
                 if not _compare_and_clear_remote(spec.run_id, last_handle):
                     raise RuntimeError(
                         f"seed {seed}: previous attempt's persisted remote changed before clear; "
                         "aborting replacement to avoid double-provisioning"
                     )
+                if resource_deleted:
+                    message = "terminated"
+                else:
+                    message = (
+                        "teardown unconfirmed but worker terminal; proceeding, leaked resource "
+                        "persisted for cleanup"
+                    )
                 print(
-                    f"retry {attempt}: terminated {last_handle.get('provider')} {resource_kind} "
-                    f"{resource_id} (escaping sick host)",
+                    f"retry {attempt}: {last_handle.get('provider')} {resource_kind} "
+                    f"{resource_id} {message}",
                     file=log,
                     flush=True,
                 )
@@ -805,8 +971,14 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         and status.remote
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
-        with contextlib.suppress(Exception):
-            _strict_teardown_handle(status.remote)
+        try:
+            resource_deleted = _strict_teardown_handle(status.remote, spec.run_id)
+            if status.remote.get("provider") == "runpod" and not resource_deleted:
+                from flash.runner import _preserve_cleanup_remote
+
+                _preserve_cleanup_remote(spec.run_id, status.remote)
+        except Exception:
+            pass
     try:
         # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
         from flash.providers import get_provider

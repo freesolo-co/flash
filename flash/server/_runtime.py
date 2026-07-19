@@ -157,12 +157,9 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
-# A handle-less recovery resubmit is DEFERRED when this run's instance teardown can't be confirmed (a
-# possibly-live Vast box that must not be raced by a second worker). The defer must not strand the run
-# until the next control-plane restart — schedule a bounded background retry so it resubmits as soon as
-# the phantom is gone / the listing recovers. After the budget it's left for the next restart.
+# a handle-less recovery resubmit remains deferred until strict absence is proven. observation is bounded
+# by the run wall deadline; after it passes, terminal persistence keeps retrying until durably confirmed.
 _DEFERRED_RECOVERY_RETRY_S = 120.0
-_DEFERRED_RECOVERY_MAX_RETRIES = 10
 
 
 def _confirm_run_clear(spec) -> bool:
@@ -175,11 +172,9 @@ def _confirm_run_clear(spec) -> bool:
     yield ``False`` — the caller must not resubmit a second worker over a possibly-live box (Codex;
     mirrors the retry-loop MtzrH guard).
 
-    A provider that does NOT implement ``run_instances_remaining`` (RunPod serverless self-reaps; Lambda
-    today) is NOT a "can't confirm -> False" case: it has no standing-billing label to enumerate, so it
-    is skipped and the run stays eligible to resubmit on the other providers' verdicts. This guard is
-    therefore scoped to instance providers that DO expose the capability (Vast); only a provider that
-    HAS the method and can't return a clean ``[]`` blocks the resubmit.
+    A provider that does not implement ``run_instances_remaining`` is skipped. Current standing-instance
+    providers expose the strict capability, so Vast and Lambda both require a clean ``[]`` before resubmit;
+    RunPod serverless has no instance label to enumerate here.
 
     BILLING-SAFETY: a provider that COULD have owned this run's lost create but is now
     UNCONFIGURABLE must also block the resubmit. A handle-less run's pre-handle non-idempotent create
@@ -219,8 +214,8 @@ def _confirm_run_clear(spec) -> bool:
             clear = False  # couldn't list -> can't prove clear -> don't race
     # An instance provider that WAS available at submit (so it could have taken the lost create) but is
     # NOT configurable now and owns the standing-instance capability can't be enumerated -> can't prove
-    # clear -> fail closed. Already-configured providers were handled above; non-capability ones (Lambda)
-    # have no standing label to leak. CRITICAL: do NOT wrap this in a broad ``suppress(Exception)`` — an
+    # clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT wrap this in
+    # a broad ``suppress(Exception)`` — an
     # error loading the status, resolving a recorded provider, or reading the capability would otherwise
     # be swallowed and leave ``clear`` True, defeating the fail-closed intent (cursor). Every failure
     # inspecting the recorded set must instead make the guard CONSERVATIVE (block/defer the resubmit).
@@ -250,56 +245,156 @@ def _recovery_block_reason(spec) -> str | None:
     return None
 
 
-def _fail_blocked_recovery(spec, reason: str) -> None:
-    from flash.runner import _update
+def _fail_blocked_recovery(
+    spec,
+    reason: str,
+    *,
+    expected_remote: dict | None = None,
+) -> bool:
+    from flash.runner import _compare_and_fail_remote
 
-    with contextlib.suppress(Exception):
-        _update(spec.run_id, "failed", remote=None, error=reason)
-    with contextlib.suppress(Exception):
-        _append_run_log(spec.run_id, reason)
+    applied = _compare_and_fail_remote(spec.run_id, expected_remote, reason)
+    if applied:
+        with contextlib.suppress(Exception):
+            _append_run_log(spec.run_id, reason)
+    return applied
 
 
-def _start_resubmit(spec) -> bool:
-    from flash.runner import _run_job_background, _verified_opd_next_attempt
+def _start_resubmit(
+    spec,
+    *,
+    expected_remote: dict | None = None,
+    expected_state: str | None = None,
+) -> bool:
+    from flash.runner import (
+        _compare_and_prepare_resubmit,
+        _run_job_background,
+        _verified_opd_next_attempt,
+    )
 
     reason = _recovery_block_reason(spec)
     if reason is not None:
-        _fail_blocked_recovery(spec, reason)
+        _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
         return False
     if spec.algorithm == "opd":
         try:
             _verified_opd_next_attempt(spec.run_id)
         except Exception as exc:
-            _fail_blocked_recovery(spec, str(exc))
+            _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
             return False
+    if not _compare_and_prepare_resubmit(
+        spec.run_id,
+        expected_remote,
+        expected_state=expected_state,
+    ):
+        return False
     with contextlib.suppress(Exception):
         _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
     threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
     return True
 
 
+def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
+    from flash.runner import _latest_reserved_attempt
+    from flash.runner.lifecycle import _completed_attempt_metrics
+
+    attempt = _latest_reserved_attempt(spec.run_id)
+    if attempt is None:
+        return None
+    providers = {
+        str(name)
+        for name in (getattr(status, "submitted_instance_providers", None) or [])
+        if name in {"vast", "lambda"}
+    }
+    for provider in sorted(providers):
+        metrics = _completed_attempt_metrics(
+            spec,
+            provider=provider,
+            attempt=attempt,
+            launch_floor=float(status.created_at),
+            deadline_at=deadline_at,
+        )
+        if metrics is not None:
+            return metrics
+    return None
+
+
 def _deferred_resubmit_loop(spec) -> None:
-    """Background retry for a DEFERRED handle-less resubmit: re-confirm the reap on a bounded schedule
-    and resubmit once it's clear, so a transient Vast listing failure / a phantom reaped by a later
-    sweep doesn't leave the run stranded until the next control-plane restart."""
+    """Reconcile a handle-less maybe-live instance through the run wall deadline."""
     import time
 
-    from flash.runner import TERMINAL_STATES
-
-    for _ in range(_DEFERRED_RECOVERY_MAX_RETRIES):
-        time.sleep(_DEFERRED_RECOVERY_RETRY_S)
-        with contextlib.suppress(Exception):
-            st = get_status(spec.run_id)
-            if st is not None and st.state in TERMINAL_STATES:
-                return  # cancelled / failed / done meanwhile -> nothing to resubmit
-        if _confirm_run_clear(spec):
-            _start_resubmit(spec)
-            return
-    _log.warning(
-        "giving up deferred resubmit of %s after %d retries; the next control-plane restart will retry",
-        spec.run_id,
-        _DEFERRED_RECOVERY_MAX_RETRIES,
+    from flash.runner import (
+        TERMINAL_STATES,
+        _compare_and_fail_remote,
+        _load_run_deadline_at,
     )
+    from flash.runner.lifecycle import _adopt_completed_attempt
+
+    while True:
+        try:
+            status = get_status(spec.run_id)
+        except Exception:
+            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            continue
+        if status.state in TERMINAL_STATES or status.remote is not None:
+            return
+        try:
+            deadline_at = _load_run_deadline_at(spec.run_id)
+        except Exception as exc:
+            try:
+                if _compare_and_fail_remote(spec.run_id, None, str(exc)):
+                    return
+            except Exception:
+                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                continue
+            return
+        if time.time() >= deadline_at:
+            try:
+                metrics = _handleless_completed_metrics(spec, status, deadline_at)
+            except Exception:
+                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                continue
+            if metrics is not None:
+                try:
+                    _adopt_completed_attempt(
+                        spec.run_id,
+                        spec,
+                        None,
+                        metrics,
+                        log=None,
+                    )
+                except Exception:
+                    time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                    continue
+                return
+            reason = "run wall deadline exhausted while provider teardown remained unconfirmed"
+            try:
+                if _compare_and_fail_remote(spec.run_id, None, reason):
+                    with contextlib.suppress(Exception):
+                        _append_run_log(spec.run_id, reason)
+                    return
+            except Exception:
+                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                continue
+            return
+        try:
+            clear = _confirm_run_clear(spec)
+        except Exception:
+            clear = False
+        if clear:
+            try:
+                _start_resubmit(
+                    spec,
+                    expected_remote=None,
+                    expected_state=status.state,
+                )
+            except Exception:
+                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                continue
+            return
+        delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
+        if delay > 0:
+            time.sleep(delay)
 
 
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
@@ -488,7 +583,14 @@ def recover_runs() -> None:
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)
         if reason is not None:
-            _fail_blocked_recovery(spec, reason)
+            try:
+                _fail_blocked_recovery(spec, reason)
+            except Exception:
+                threading.Thread(
+                    target=_deferred_resubmit_loop,
+                    args=(spec,),
+                    daemon=True,
+                ).start()
             continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
@@ -505,7 +607,7 @@ def recover_runs() -> None:
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            _start_resubmit(spec)
+            _start_resubmit(spec, expected_remote=None, expected_state=prior_state)
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer, and
         # schedule a bounded background retry so the run resubmits as soon as the phantom is gone / the

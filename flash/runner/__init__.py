@@ -249,11 +249,11 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
         try:
-            contract_version = require_opd_retry_contract_version(
-                raw.get(_OPD_RETRY_CONTRACT_KEY)
-            )
+            contract_version = require_opd_retry_contract_version(raw.get(_OPD_RETRY_CONTRACT_KEY))
         except ValueError as exc:
-            raise RuntimeError("opd retry contract is missing or invalid; replacement is blocked") from exc
+            raise RuntimeError(
+                "opd retry contract is missing or invalid; replacement is blocked"
+            ) from exc
         next_attempt = _infer_next_attempt(raw)
         hf_repo = spec.train.hf_repo
         # phase is the hf-prefix component the worker uploads under ({phase}/{run_id}/...), so it locates
@@ -318,6 +318,13 @@ def _reserve_attempt(
             raise RuntimeError("run attempt identity is exhausted")
         _save_status_unlocked(status, _next_attempt=attempt + 1)
         return attempt
+
+
+def _latest_reserved_attempt(run_id: str) -> int | None:
+    """Return the newest durably reserved attempt, or none before any reservation."""
+    raw = _load_status_json(run_id)
+    next_attempt = _infer_next_attempt(raw)
+    return next_attempt - 1 if next_attempt > 0 else None
 
 
 @dataclass
@@ -1067,9 +1074,7 @@ def submit_job(
         _run_deadline_at=status.created_at + float(public_spec.gpu.max_wall_seconds),
         _next_attempt=0,
         _opd_retry_contract_version=(
-            OPD_RETRY_CONTRACT_VERSION
-            if public_spec.algorithm == "opd"
-            else _PRIVATE_VALUE_UNSET
+            OPD_RETRY_CONTRACT_VERSION if public_spec.algorithm == "opd" else _PRIVATE_VALUE_UNSET
         ),
     )
     _report_status(status)
@@ -1341,22 +1346,131 @@ def _remote_resource_identity(remote: object) -> tuple | None:
     return None
 
 
+def _expected_remote_matches(current: object, expected: dict | None) -> bool:
+    if expected is None:
+        return current is None
+    expected_identity = _remote_resource_identity(expected)
+    return expected_identity is not None and _remote_resource_identity(current) == expected_identity
+
+
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     """Clear only the nonterminal remote that still names the destroyed resource."""
-    expected_identity = _remote_resource_identity(expected_remote)
-    if expected_identity is None:
+    if _remote_resource_identity(expected_remote) is None:
         return False
     report_status: RunStatus | None = None
     with _status_guard(run_id):
         status = get_status(run_id)
         if status.state in TERMINAL_STATES:
             return False
-        if _remote_resource_identity(status.remote) != expected_identity:
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
         status.remote = None
         status.updated_at = time.time()
         _save_status_unlocked(status)
         report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
+def _compare_and_prepare_resubmit(
+    run_id: str,
+    expected_remote: dict | None,
+    *,
+    expected_state: str | None = None,
+) -> bool:
+    """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if expected_state is not None and status.state != expected_state:
+            return False
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        status.state = "provisioning"
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
+def _compare_and_fail_remote(
+    run_id: str,
+    expected_remote: dict | None,
+    error: str,
+    *,
+    clear_remote: bool = True,
+) -> bool:
+    """CAS a nonterminal expected remote to failed and confirm the durable write."""
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        previous_updated_at = status.updated_at
+        status.state = "failed"
+        if clear_remote:
+            status.remote = None
+        status.error = error
+        status.updated_at = time.time()
+        if status.finished_at is None:
+            status.finished_at = status.updated_at or previous_updated_at
+        _save_status_unlocked(status)
+        report_status = status
+    confirmed = get_status(run_id)
+    expected_after = None if clear_remote else expected_remote
+    if (
+        confirmed.state != "failed"
+        or not _expected_remote_matches(confirmed.remote, expected_after)
+        or confirmed.error != error
+    ):
+        raise RuntimeError("terminal recovery failure was not durably confirmed")
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
+def _compare_and_complete_remote(
+    run_id: str,
+    expected_remote: dict | None,
+    spec: JobSpec,
+    metrics: dict,
+) -> bool:
+    """Adopt strict completed artifacts only while the captured remote still owns the run."""
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+    recovered_cost = _persist_metrics(spec, metrics)
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return False
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        measured = float(status.cost_usd or 0.0) + recovered_cost
+        charge_usd = _status_estimated_charge(status, spec, fallback=measured)
+        status.state = "done"
+        status.remote = None
+        status.cost_usd = charge_usd
+        status.artifacts_dir = artifacts_dir(spec)
+        status.updated_at = time.time()
+        if status.finished_at is None:
+            status.finished_at = status.updated_at
+        _save_status_unlocked(status)
+        report_status = status
+    confirmed = get_status(run_id)
+    if confirmed.state != "done" or confirmed.remote is not None:
+        raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         _report_status(report_status)
     return True
@@ -1446,11 +1560,12 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
             continue
         attempted.add(identity)
         try:
-            _strict_teardown_handle(JobHandle.from_dict(record))
+            resource_deleted = _strict_teardown_handle(JobHandle.from_dict(record), run_id)
         except Exception:
             continue
-        with contextlib.suppress(Exception):
-            _compare_and_remove_cleanup_remote(run_id, record)
+        if resource_deleted:
+            with contextlib.suppress(Exception):
+                _compare_and_remove_cleanup_remote(run_id, record)
     return attempted
 
 
