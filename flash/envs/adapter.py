@@ -241,11 +241,13 @@ class FreesoloEnvironment(BaseEnvironment):
         if values is None:
             return None
         if not isinstance(values, list):
-            raise ValueError("per_turn_rewards metadata must be a list")
+            print("[grpo][warn] malformed per_turn_rewards metadata; using episode reward")
+            return None
         try:
             return tuple(float(value) for value in values)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("per_turn_rewards metadata must contain only numbers") from exc
+        except (TypeError, ValueError):
+            print("[grpo][warn] malformed per_turn_rewards metadata; using episode reward")
+            return None
 
     def _grouped_results(self, items, *, task_of, payload_of, scorer, method: str) -> list:
         """Group rollouts that share an example and scatter full reward results in input order."""

@@ -1,97 +1,22 @@
-"""CPU coverage for multi-turn GRPO per-turn credit assignment."""
+"""Torch-dependent coverage for multi-turn GRPO per-turn credit assignment."""
 
 from __future__ import annotations
 
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from flash.engine.multiturn_rollout import rollout_one
 from flash.engine.worker.grpo_perturn_trainer import (
     GRPOPerTurnTrainer,
     build_per_turn_advantages,
 )
-from flash.envs.base import BaseEnvironment, RolloutReward
-
-
-class SyntheticPerTurnEnv(BaseEnvironment):
-    """Two-turn environment with deterministic target-token rewards."""
-
-    multi_turn = True
-
-    def __init__(self):
-        super().__init__(id="synthetic-per-turn")
-        self.rollout_reward_calls = 0
-
-    def dataset(self):
-        return [{"input": "prompt", "targets": ["hit", "hit"]}]
-
-    def prompt_messages(self, example):
-        return [{"role": "user", "content": str(example["input"])}]
-
-    def new_rollout_state(self, example):
-        return {
-            "prompt": self.prompt_messages(example),
-            "assistant_turns": [],
-            "targets": list(example["targets"]),
-        }
-
-    def record_model_turn(self, state, content):
-        state["assistant_turns"].append(content)
-
-    def rollout_done(self, state, max_turns):
-        return len(state["assistant_turns"]) >= min(2, max_turns)
-
-    def env_reply(self, messages, state):
-        return [{"role": "user", "content": "next"}]
-
-    def reward(self, completion, example, state=None):
-        state = state or {}
-        targets = state.get("targets") or example["targets"]
-        return float(
-            sum(
-                target in text
-                for text, target in zip(state.get("assistant_turns", []), targets, strict=True)
-            )
-        )
-
-    def rollout_rewards_many(self, items):
-        self.rollout_reward_calls += 1
-        rewards = []
-        for example, state in items:
-            targets = state.get("targets") or example["targets"]
-            turns = tuple(
-                1.0 if target in text else 0.0
-                for text, target in zip(state.get("assistant_turns", []), targets, strict=True)
-            )
-            rewards.append(RolloutReward(episode=sum(turns), turns=turns))
-        return rewards
-
-
-_TOKEN_IDS = {"prompt": 3, "miss": 4, "hit": 5, "next": 6}
-
-
-def _rollout(env, turn_texts):
-    generated = iter(turn_texts)
-
-    def generate(prefix_ids, max_tokens):
-        _ = prefix_ids, max_tokens
-        text = next(generated)
-        return [_TOKEN_IDS[text]], [-0.1], text
-
-    return rollout_one(
-        example={"input": "prompt", "targets": ["hit", "hit"]},
-        active_env=env,
-        render=lambda messages, add_generation_prompt: [_TOKEN_IDS["prompt"]],
-        generate=generate,
-        env_glue=lambda messages: [_TOKEN_IDS["next"]],
-        max_turns=2,
-        per_turn_max_tokens=4,
-    )
+from tests.test_multiturn_per_turn_reward import (
+    _TOKEN_IDS,
+    SyntheticPerTurnEnv,
+    _rollout,
+)
 
 
 def test_build_per_turn_advantages_centers_by_turn_and_assigns_spans():
@@ -158,40 +83,13 @@ def test_build_per_turn_advantages_handles_variable_turns_and_mixed_fallback():
     assert actual.dtype == scalar.dtype
 
 
-def test_rollout_records_turn_spans_and_scores_terminal_episode_once():
-    env = SyntheticPerTurnEnv()
-
-    result = _rollout(env, ["miss", "hit"])
-
-    assert result["completion_ids"] == [4, 6, 5]
-    assert result["env_mask"] == [1, 0, 1]
-    assert result["turn_spans"] == [(0, 1), (2, 3)]
-    assert result["turn_rewards"] == [0.0, 1.0]
-    assert result["reward"] == 1.0
-    assert env.rollout_reward_calls == 1
-
-
-@pytest.mark.parametrize(
-    "invalid_turns",
-    [(float("nan"), 1.0), (1.0,)],
-    ids=["non-finite", "wrong-length"],
-)
-def test_invalid_turn_rewards_degrade_group_to_scalar(capsys, invalid_turns):
-    class InvalidTurnEnv(SyntheticPerTurnEnv):
-        def rollout_rewards_many(self, items):
-            self.rollout_reward_calls += 1
-            assert len(items) == 1
-            return [RolloutReward(episode=1.0, turns=invalid_turns)]
-
-    invalid = _rollout(InvalidTurnEnv(), ["miss", "hit"])
-    assert invalid["turn_rewards"] is None
-    assert capsys.readouterr().out.count("using episode reward") == 1
-
-    spans = [invalid["turn_spans"], [(0, 1), (2, 3)]]
+def test_invalid_turn_rewards_degrade_group_to_scalar_advantages():
+    spans = [[(0, 1), (2, 3)], [(0, 1), (2, 3)]]
     scalar = torch.tensor([1.0, -1.0])
+
     actual = build_per_turn_advantages(
         spans,
-        [invalid["turn_rewards"], [1.0, 0.0]],
+        [None, [1.0, 0.0]],
         num_generations=2,
         completion_len=3,
         episode_advantages=scalar,
@@ -202,128 +100,6 @@ def test_invalid_turn_rewards_degrade_group_to_scalar(capsys, invalid_turns):
         torch.tensor([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]]),
     )
     assert bool(torch.isfinite(actual).all())
-
-
-def test_non_finite_episode_reward_disables_per_turn_credit(capsys):
-    class NonFiniteEpisodeEnv(SyntheticPerTurnEnv):
-        def rollout_rewards_many(self, items):
-            self.rollout_reward_calls += 1
-            assert len(items) == 1
-            return [RolloutReward(episode=float("nan"), turns=(0.0, 1.0))]
-
-    env = NonFiniteEpisodeEnv()
-    result = _rollout(env, ["miss", "hit"])
-
-    assert result["turn_rewards"] is None
-    assert env.rollout_reward_calls == 1
-    assert capsys.readouterr().out.count("using episode reward") == 1
-
-
-def test_rollout_uses_one_typed_scoring_pass():
-    class TypedRewardEnv(SyntheticPerTurnEnv):
-        def __init__(self):
-            super().__init__()
-            self.score_calls = 0
-
-        def reward(self, completion, example, state=None):
-            raise AssertionError("scalar reward must not run after typed terminal scoring")
-
-        def turn_rewards(self, example, state):
-            raise AssertionError("legacy per-turn scoring must not run")
-
-        def rollout_rewards_many(self, items):
-            self.score_calls += 1
-            assert len(items) == 1
-            return [RolloutReward(episode=1.0, turns=(0.0, 1.0))]
-
-    env = TypedRewardEnv()
-    result = _rollout(env, ["miss", "hit"])
-
-    assert result["reward"] == 1.0
-    assert result["turn_rewards"] == [0.0, 1.0]
-    assert env.score_calls == 1
-
-
-def test_base_environment_has_no_per_turn_capability_default():
-    env = BaseEnvironment(id="episode-only")
-    assert not hasattr(env, "rollout_rewards_many")
-    assert not hasattr(env, "turn_rewards")
-
-
-def test_freesolo_adapter_uses_complete_terminal_per_turn_metadata(monkeypatch):
-    from freesolo.environments.types import RewardResult
-
-    from flash.envs.adapter import FreesoloEnvironment
-
-    env = object.__new__(FreesoloEnvironment)
-    env.multi_turn = True
-    state = {
-        "turns": ["first", "second"],
-        "step_metadata": [{"per_turn_rewards": [0.25]}],
-    }
-    score_calls = []
-
-    def score_episodes(task, episodes):
-        score_calls.append((task, episodes))
-        return [RewardResult(score=1.0, metadata={"per_turn_rewards": [0.25, 0.75]})]
-
-    env._env = SimpleNamespace(reward_thread_safe=True, score_episodes=score_episodes)
-    monkeypatch.setattr(env, "_task_example", lambda example: example)
-    monkeypatch.setattr(env, "_episode_from_state", lambda terminal_state: terminal_state)
-
-    rewards = env.rollout_rewards_many([({"input": "prompt"}, state)])
-
-    assert rewards == [RolloutReward(episode=1.0, turns=(0.25, 0.75))]
-    assert score_calls == [({"input": "prompt"}, [state])]
-
-
-def test_build_rollout_func_always_emits_per_turn_fields(monkeypatch):
-    from flash.engine import multiturn_rollout
-
-    vllm = types.ModuleType("vllm")
-    vllm.SamplingParams = lambda **kwargs: SimpleNamespace(**kwargs)
-    sampling_params = types.ModuleType("vllm.sampling_params")
-    sampling_params.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final_only")
-    vllm.sampling_params = sampling_params
-    monkeypatch.setitem(sys.modules, "vllm", vllm)
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
-
-    rollout = {
-        "prompt_ids": [1],
-        "completion_ids": [2],
-        "logprobs": [-0.1],
-        "env_mask": [1],
-        "reward": 0.5,
-        "turn_spans": [(0, 1)],
-        "turn_rewards": None,
-    }
-    monkeypatch.setattr(multiturn_rollout, "rollout_async", lambda **kwargs: [rollout])
-    engine = SimpleNamespace(
-        llm_engine=SimpleNamespace(
-            model_config=SimpleNamespace(get_vocab_size=lambda: 32),
-        )
-    )
-    trainer = SimpleNamespace(
-        vllm_generation=SimpleNamespace(llm=engine),
-        args=SimpleNamespace(vllm_enable_sleep_mode=False),
-    )
-    rollout_func = multiturn_rollout.build_rollout_func(
-        active_env=BaseEnvironment(id="episode-only"),
-        tok=SimpleNamespace(),
-        examples_by_key={},
-        max_completion=4,
-        max_turns=1,
-        temperature=0.7,
-        top_p=1.0,
-        stop=None,
-        thinking=False,
-    )
-
-    output = rollout_func([[{"role": "user", "content": "prompt"}]], trainer)
-
-    assert output["turn_spans"] == [[(0, 1)]]
-    assert output["turn_rewards"] == [None]
-    assert set(output) == set(rollout)
 
 
 def test_trainer_noops_when_all_turn_rewards_are_none(monkeypatch):
