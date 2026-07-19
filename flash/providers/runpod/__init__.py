@@ -204,17 +204,10 @@ class RunpodProvider:
                 f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"
             )
 
-    def gc(self, spec, *, exclude_endpoint_id: str | None = None) -> None:
+    def gc(self, spec) -> None:
         from flash.providers.runpod.train import terminate_endpoint
 
-        if exclude_endpoint_id is None:
-            terminate_endpoint(spec.gpu.type, spec.run_id)
-            return
-        terminate_endpoint(
-            spec.gpu.type,
-            spec.run_id,
-            exclude_endpoint_id=exclude_endpoint_id,
-        )
+        terminate_endpoint(spec.gpu.type, spec.run_id)
 
     def sweep_orphans(
         self,

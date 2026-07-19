@@ -821,13 +821,20 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         if released_endpoint_id is None:
             with contextlib.suppress(Exception):
                 _strict_teardown_handle(status.remote)
-    try:
-        # RunPod gc still reaps rN siblings after a warm release, excluding only the pooled endpoint.
-        from flash.providers import get_provider
+    if released_endpoint_id is not None:
+        # warm release: reap rN retry siblings but keep the pooled endpoint alive.
+        with contextlib.suppress(Exception):
+            from flash.providers.runpod.train import terminate_endpoint
 
-        get_provider("runpod").gc(spec, exclude_endpoint_id=released_endpoint_id)
-    except Exception:
-        pass
+            terminate_endpoint(spec.gpu.type, spec.run_id, exclude_endpoint_id=released_endpoint_id)
+    else:
+        try:
+            # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
+            from flash.providers import get_provider
+
+            get_provider("runpod").gc(spec)
+        except Exception:
+            pass
     from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
 
     _avail = available_providers()
