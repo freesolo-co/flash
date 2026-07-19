@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
+    WarmStartSourceDeployedError,
     cancel_run,
     new_run_id,
     runs_file_path,
@@ -166,6 +167,8 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                 platform_context=platform_context or None,
                 owner_key_id=key["id"],
             )
+        except WarmStartSourceDeployedError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             source_ref = spec.train.init_from_adapter
             if source_ref:

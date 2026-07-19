@@ -447,6 +447,10 @@ def _status_storage_dict(status: RunStatus) -> dict:
     return data
 
 
+class WarmStartSourceDeployedError(ValueError):
+    """warm-start source artifacts are locked by an active deployment."""
+
+
 class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
 
@@ -738,6 +742,12 @@ def _prepare_init_from_adapter(
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
+    if src_status.state == "deployed" or src_status.deployment:
+        raise WarmStartSourceDeployedError(
+            f"warm-start source {src_run_id!r} is currently deployed; run "
+            f"'flash undeploy {src_run_id}' first, then resubmit "
+            "(serving locks the adapter files during a deploy)"
+        )
     src_spec = JobSpec.from_dict(src_status.spec)
     if src_spec.model != spec.model:
         raise ValueError(

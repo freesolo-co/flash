@@ -215,6 +215,126 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     }
 
 
+_DEPLOYED_WARMSTART_ERROR = (
+    "warm-start source 'source-run' is currently deployed; run 'flash undeploy source-run' first, "
+    "then resubmit (serving locks the adapter files during a deploy)"
+)
+
+
+def _warmstart_specs(init_ref):
+    from flash.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": init_ref},
+        }
+    )
+    return source, child
+
+
+@pytest.mark.parametrize(
+    ("source_state", "deployment", "init_ref"),
+    [
+        pytest.param("deployed", None, "source-run", id="final-adapter"),
+        pytest.param(
+            "running",
+            {"state": "deployed", "adapter_revision": "source-run/step-20"},
+            "source-run/step-20",
+            id="concrete-checkpoint",
+        ),
+    ],
+)
+def test_prepare_rejects_deployed_warmstart_before_hf_access(
+    monkeypatch, source_state, deployment, init_ref
+):
+    import flash.lora_rank as rank_mod
+    import flash.runner as R
+    import flash.runner.checkpoints as checkpoints
+
+    source, child = _warmstart_specs(init_ref)
+    source_status = R.RunStatus(
+        run_id="source-run",
+        state=source_state,
+        spec=source.to_dict(),
+        deployment=deployment,
+    )
+    hf_calls = []
+
+    def unexpected_hf_call(name):
+        def fail(*_args, **_kwargs):
+            hf_calls.append(name)
+            raise AssertionError(f"{name} must not run for a deployed warm-start source")
+
+        return fail
+
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(
+        rank_mod,
+        "resolve_hf_dataset_revision",
+        unexpected_hf_call("resolve_hf_dataset_revision"),
+    )
+    monkeypatch.setattr(
+        checkpoints,
+        "adapter_artifact_exists",
+        unexpected_hf_call("adapter_artifact_exists"),
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        unexpected_hf_call("load_hf_adapter_config"),
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        unexpected_hf_call("adapter_artifact_identity"),
+    )
+
+    with pytest.raises(R.WarmStartSourceDeployedError) as exc_info:
+        R._prepare_init_from_adapter(child, token="token")
+
+    assert str(exc_info.value) == _DEPLOYED_WARMSTART_ERROR
+    assert hf_calls == []
+
+
+def test_create_run_preserves_deployed_warmstart_message(monkeypatch):
+    import flash.runner as R
+    import flash.server.routes.runs as runs_route
+    from fastapi import HTTPException
+
+    _source, child = _warmstart_specs("source-run")
+    deleted = []
+
+    def reject_deployed_source(*_args, **_kwargs):
+        raise R.WarmStartSourceDeployedError(_DEPLOYED_WARMSTART_ERROR)
+
+    monkeypatch.setattr(runs_route, "_parse_spec", lambda _payload, *, run_id: child)
+    monkeypatch.setattr(runs_route, "_runtime_secrets", lambda _payload, _spec: {})
+    monkeypatch.setattr(runs_route._app, "prepare_job", reject_deployed_source)
+    monkeypatch.setattr(runs_route.db, "delete_run", deleted.append)
+
+    with pytest.raises(HTTPException) as exc_info:
+        runs_route.create_run(
+            {"spec": child.to_dict()},
+            {"id": 1, "auth_kind": "internal"},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == _DEPLOYED_WARMSTART_ERROR
+    assert "could not be prepared" not in exc_info.value.detail
+    assert deleted == ["child-run"]
+
+
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
     import flash.runner as R
     from flash.spec import JobSpec
