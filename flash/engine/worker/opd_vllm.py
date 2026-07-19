@@ -157,6 +157,8 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                     num_generations=num_generations,
                     active_params_b=active_b,
                     fp8_kv=fp8_kv,
+                    model_info=info,
+                    preserve_legacy_floor=True,
                 )
 
             util = _util_for(rollout_concurrency)

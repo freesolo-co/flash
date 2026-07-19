@@ -177,7 +177,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
             {
                 "vocab_size": 248320,
                 "hidden_size": 1024,
-                "num_hidden_layers": 28,
+                "num_hidden_layers": 24,
             }
         )
     )
@@ -219,7 +219,7 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
 
     config = tmp_path / "config.json"
     config.write_text(
-        json.dumps({"vocab_size": 248320, "hidden_size": 1024, "num_hidden_layers": 28})
+        json.dumps({"vocab_size": 248320, "hidden_size": 1024, "num_hidden_layers": 24})
     )
     monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
 
