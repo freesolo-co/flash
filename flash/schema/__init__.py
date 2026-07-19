@@ -399,7 +399,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                 )
             except UnsupportedGpuError:
                 authored_type = None
-            if authored_type != gpu_type:
+            if authored_type is None:
+                print(
+                    f"note: [gpu] type={authored_type_raw!r} is not a recognized GPU class and "
+                    "was ignored; the allocator will pick the cheapest validated class that fits "
+                    f"(selected: {gpu_type!r}). run `flash gpus` to list valid classes; to pin one, "
+                    "set [gpu] exact_type.",
+                    file=sys.stderr,
+                )
+            elif authored_type != gpu_type:
                 print(
                     f"note: [gpu] type={authored_type_raw!r} is a non-pinning hint and was not "
                     "applied; the allocator will pick the cheapest validated class that fits "

@@ -678,11 +678,18 @@ def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
 
     spec_from_dict(_raw(**{"gpu.type": "H10O"}))
     invalid_warning = capsys.readouterr().err
-    assert "[gpu] type='H10O' is a non-pinning hint and was not applied" in invalid_warning
+    assert "[gpu] type='H10O' is not a recognized GPU class and was ignored" in invalid_warning
+    assert "`flash gpus` to list valid classes" in invalid_warning
+    assert "set [gpu] exact_type='H10O'" not in invalid_warning
 
     automatic_raw = _raw()
     automatic_raw["gpu"].pop("type")
     spec_from_dict(automatic_raw)
+    assert capsys.readouterr().err == ""
+
+    selected = spec_from_dict(automatic_raw).gpu.type
+    capsys.readouterr()
+    spec_from_dict(_raw(**{"gpu.type": selected}))
     assert capsys.readouterr().err == ""
 
 
