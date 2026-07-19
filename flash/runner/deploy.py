@@ -1035,14 +1035,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
     except Exception as exc:
         try:
-            if get_status(run_id).state not in TERMINAL_STATES:
-                try:
-                    clear_remote = _preserve_cleanup_remote(run_id, persisted_remote)
-                except Exception:
-                    clear_remote = False
-                _compare_and_fail_remote(
-                    run_id, persisted_remote, str(exc), clear_remote=clear_remote
-                )
+            # cas-only fail: no-ops if a concurrent cancel already cleared this remote (so a user
+            # cancel is never overwritten as failed); the terminal gc below reaps the run's box by
+            # run label if it was still live.
+            _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         except Exception:
             if next_attempt > 0:
                 _schedule_attach_reconciliation(

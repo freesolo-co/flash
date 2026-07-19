@@ -2424,7 +2424,6 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         assert status.remote is None
         assert "original preparation snapshot is unavailable" in (status.error or "")
         assert "source-run/step-40" in (status.error or "")
-        assert orch._load_status_json("warm-recover")[orch._CLEANUP_REMOTES_KEY] == [remote]
 
 
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
