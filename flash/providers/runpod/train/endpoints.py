@@ -311,8 +311,6 @@ def _train_body(input_data: dict) -> dict:
 
     def _deadline_exit() -> None:
         print("run wall deadline exceeded; terminating worker", flush=True)
-        if job_venv:
-            shutil.rmtree(job_venv, ignore_errors=True)
         os._exit(124)
 
     deadline_timer = threading.Timer(remaining, _deadline_exit)
@@ -346,10 +344,41 @@ def _train_body(input_data: dict) -> dict:
             check=True,
         )
         job_python = os.path.join(job_venv, "bin", "python")
+        site_result = subprocess.run(
+            [
+                job_python,
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        job_site_packages = site_result.stdout.strip()
+        job_venv_real = os.path.realpath(job_venv)
+        job_site_real = os.path.realpath(job_site_packages)
+        if (
+            not job_site_packages
+            or not os.path.isabs(job_site_packages)
+            or os.path.commonpath((job_venv_real, job_site_real)) != job_venv_real
+        ):
+            raise RuntimeError("per-job venv site-packages path is invalid")
 
         def _extra_pip_env() -> tuple[dict[str, str], str | None]:
             env = dict(os.environ)
             env.update(overrides)
+            blocked = {
+                "PIP_TARGET",
+                "PIP_PREFIX",
+                "PIP_ROOT",
+                "PIP_USER",
+                "PYTHONUSERBASE",
+                "PIP_CONFIG_FILE",
+            }
+            for key in list(env):
+                if key.upper() in blocked:
+                    env.pop(key)
+            env["PIP_USER"] = "0"
             env["GIT_TERMINAL_PROMPT"] = "0"
             askpass = None
             if env.get("GITHUB_TOKEN"):
@@ -367,6 +396,15 @@ def _train_body(input_data: dict) -> dict:
             return env, askpass
 
         extra_pip = input_data.get("extra_pip") or []
+        location_options = ("--target", "--prefix", "--root", "--user")
+        for argument in extra_pip:
+            if (
+                argument in (*location_options, "-t")
+                or any(argument.startswith(f"{option}=") for option in location_options)
+                or argument.startswith(("--tar", "--prefi"))
+                or re.match(r"^-[qvUI]*t", argument)
+            ):
+                raise ValueError(f"extra_pip location option is not allowed: {argument!r}")
         if extra_pip:
             extra_env, askpass = _extra_pip_env()
             try:
@@ -511,8 +549,9 @@ def _train_body(input_data: dict) -> dict:
         env.pop("FLASH_JOB_SPEC_JSON", None)
         env["PHASE"] = input_data["phase"]
         env["SEED"] = str(input_data["seed"])
-        env["PYTHONPATH"] = code_dir + (
-            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        existing_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (job_site_packages, code_dir, existing_pythonpath) if path
         )
 
         def _upload_console(mode: str) -> None:
@@ -563,7 +602,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [job_python, "-m", "flash.engine.worker_entrypoint"],
+                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,
@@ -726,6 +765,8 @@ def get_train_endpoint(
                 "min_cuda_version": min_cuda_for(friendly),
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
+                # process-global stale-venv cleanup requires one job per worker container.
+                "max_concurrency": 1,
             }
             image = worker_image_for_gpu(friendly, allow_default=False)
             if image:

@@ -466,6 +466,7 @@ def test_train_body_has_no_prime_install_path():
 def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     import os
     import sys
+    import types
     from pathlib import Path
 
     from flash.providers.runpod.train import endpoints
@@ -473,15 +474,19 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     calls = []
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_run(cmd, *, check, env=None, capture_output=False, text=False):
         if cmd[1:4] == ["-m", "venv", "--system-site-packages"]:
-            return
+            return None
+        if cmd[1] == "-c":
+            site_packages = Path(cmd[0]).parent.parent / "lib/python/site-packages"
+            return types.SimpleNamespace(stdout=f"{site_packages}\n")
         askpass = Path(env["GIT_ASKPASS"])
         assert askpass.exists()
         assert os.access(askpass, os.X_OK)
         assert "ghp-secret" not in askpass.read_text()
         askpass_paths.append(askpass)
         calls.append({"cmd": cmd, "check": check, "env": env})
+        return None
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
@@ -511,16 +516,21 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
 
 def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     import os
+    import types
     from pathlib import Path
 
     from flash.providers.runpod.train import endpoints
 
     askpass_paths = []
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_run(cmd, *, check, env=None, capture_output=False, text=False):
         if cmd[1:4] == ["-m", "venv", "--system-site-packages"]:
-            return
+            return None
+        if cmd[1] == "-c":
+            site_packages = Path(cmd[0]).parent.parent / "lib/python/site-packages"
+            return types.SimpleNamespace(stdout=f"{site_packages}\n")
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
+        return None
 
     original_remove = os.remove
 
@@ -689,6 +699,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     import os
     import subprocess
     import types
+    from pathlib import Path
 
     import huggingface_hub
 
@@ -739,10 +750,14 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
-    def fake_run(cmd, *, check, env=None):
+    def fake_run(cmd, *, check, env=None, capture_output=False, text=False):
         assert check is True
         assert env is None
-        assert cmd[1:4] == ["-m", "venv", "--system-site-packages"]
+        if cmd[1:4] == ["-m", "venv", "--system-site-packages"]:
+            return None
+        assert cmd[1] == "-c"
+        site_packages = Path(cmd[0]).parent.parent / "lib/python/site-packages"
+        return types.SimpleNamespace(stdout=f"{site_packages}\n")
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
