@@ -53,8 +53,9 @@ def readable_run(run_id: str, key: dict, org_id: str | None = None):
       * internal/service key + matching ``X-Freesolo-Org-Id`` -- the platform web proxy. The
         browser has no per-run API key, so the platform authenticates the user, checks org
         membership on the mirror row, then calls with the internal key and the run's org here.
-        We additionally require the header to match the run's PERSISTED org so a proxy bug can
-        never cross orgs; a user key never reaches this branch (it took the owner path above).
+        The header is honored only for the internal key and only when it matches the run's
+        PERSISTED org, so a proxy bug can never cross orgs. A non-owner user key does reach this
+        check but fails the ``auth_kind == "internal"`` gate, so its org header is never honored.
     404 (never 403) on every failure so we never leak whether a run exists.
     """
     if db.run_owner(run_id) == key["id"]:
@@ -88,7 +89,9 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     if env_raw is None:
         env_raw = {}
     if not isinstance(env_raw, dict):
-        raise HTTPException(status_code=400, detail="spec.environment must be a JSON object")
+        raise HTTPException(
+            status_code=400, detail="spec.environment must be a JSON object"
+        )
     if env_raw.get("path"):
         raise HTTPException(
             status_code=400,
