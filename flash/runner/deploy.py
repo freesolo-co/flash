@@ -585,6 +585,7 @@ def _resume_after_confirmed_teardown(
         _compare_and_clear_remote,
         _compare_and_fail_remote,
         _load_run_deadline_at,
+        _preserve_cleanup_remote,
         _run_training,
         _RunCancelled,
         _spec_with_remaining_wall,
@@ -665,7 +666,18 @@ def _resume_after_confirmed_teardown(
         if current_remote is None or (
             current_attempt is not None and current_attempt >= next_attempt
         ):
-            _compare_and_fail_remote(run_id, current_remote, str(exc))
+            clear_remote = current_remote is None
+            if current_remote is not None:
+                try:
+                    clear_remote = _preserve_cleanup_remote(run_id, current_remote)
+                except Exception:
+                    clear_remote = False
+            _compare_and_fail_remote(
+                run_id,
+                current_remote,
+                str(exc),
+                clear_remote=clear_remote,
+            )
         raise
     return get_status(run_id)
 
@@ -733,7 +745,8 @@ def _reconcile_attached_remote(
                 continue
             if metrics is not None:
                 try:
-                    _adopt_completed_attempt(
+                    cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
+                    adopted = cleanup_preserved and _adopt_completed_attempt(
                         run_id,
                         worker_spec,
                         expected_remote,
@@ -743,7 +756,10 @@ def _reconcile_attached_remote(
                 except Exception:
                     time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                     continue
-                return
+                if adopted:
+                    return
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
             try:
                 cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
             except Exception:

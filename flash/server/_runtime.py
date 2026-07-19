@@ -251,7 +251,31 @@ def _fail_blocked_recovery(
     *,
     expected_remote: dict | None = None,
 ) -> bool:
-    from flash.runner import _compare_and_fail_remote
+    from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
+    from flash.runner.lifecycle import _adopt_completed_attempt
+
+    status = get_status(spec.run_id)
+    if status.remote is None:
+        try:
+            deadline_at = _load_run_deadline_at(spec.run_id)
+        except RuntimeError:
+            deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
+        metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        if metrics is not None:
+            applied = _adopt_completed_attempt(
+                spec.run_id,
+                spec,
+                None,
+                metrics,
+                log=None,
+            )
+            if applied:
+                with contextlib.suppress(Exception):
+                    _append_run_log(
+                        spec.run_id,
+                        "adopted a completed attempt before failing blocked recovery",
+                    )
+            return applied
 
     applied = _compare_and_fail_remote(spec.run_id, expected_remote, reason)
     if applied:
@@ -386,7 +410,7 @@ def _deferred_resubmit_loop(spec) -> None:
             clear = False
         if clear:
             try:
-                _start_resubmit(
+                started = _start_resubmit(
                     spec,
                     expected_remote=None,
                     expected_state=status.state,
@@ -394,7 +418,14 @@ def _deferred_resubmit_loop(spec) -> None:
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
-            return
+            if started:
+                return
+            try:
+                if get_status(spec.run_id).state in TERMINAL_STATES:
+                    return
+            except Exception:
+                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            continue
         delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
             time.sleep(delay)
@@ -588,13 +619,20 @@ def recover_runs() -> None:
         reason = _recovery_block_reason(spec)
         if reason is not None:
             try:
-                _fail_blocked_recovery(spec, reason)
+                applied = _fail_blocked_recovery(spec, reason)
             except Exception:
-                threading.Thread(
-                    target=_deferred_resubmit_loop,
-                    args=(spec,),
-                    daemon=True,
-                ).start()
+                applied = False
+            if not applied:
+                try:
+                    current = get_status(spec.run_id)
+                except Exception:
+                    current = None
+                if current is None or (current.state in _RECOVERABLE and current.remote is None):
+                    threading.Thread(
+                        target=_deferred_resubmit_loop,
+                        args=(spec,),
+                        daemon=True,
+                    ).start()
             continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance

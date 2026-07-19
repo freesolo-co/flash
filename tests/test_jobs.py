@@ -3670,7 +3670,18 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         monkeypatch.setattr(
             "flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo
         )
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
         resumed = {"called": False}
+        replacement_remote = {
+            "provider": "runpod",
+            "endpoint_id": "epB",
+            "endpoint_name": "replacement",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "jB",
+            "on_last_gpu": False,
+            "attempt": 1,
+            "started_ts": 2.0,
+        }
 
         def fake_training(
             spec,
@@ -3685,6 +3696,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
             resumed["attempt_start"] = attempt_start
+            orch._update(spec.run_id, "running", remote=replacement_remote)
             raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -3695,7 +3707,11 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             "attach must attempt a checkpoint resume on any non-ok poll"
         )
         assert st.state == "failed", "a resume that fails again must terminate the run"
+        assert st.remote is None
         assert "bad reward fn" in (st.error or "")
+        assert orch._load_status_json("g1")[orch._CLEANUP_REMOTES_KEY] == [
+            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"}
+        ]
 
 
 @pytest.mark.parametrize(
@@ -4141,6 +4157,9 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         assert status.state == "done"
         assert status.remote is None
         assert status.error is None
+        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
+            {key: value for key, value in remote.items() if key != "code_prefix"}
+        ]
 
 
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):

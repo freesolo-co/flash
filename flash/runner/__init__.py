@@ -1450,6 +1450,8 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+    if expected_remote is not None and not _preserve_cleanup_remote(run_id, expected_remote):
+        return False
     recovered_cost = _persist_metrics(spec, metrics)
     with _status_guard(run_id):
         status = get_status(run_id)

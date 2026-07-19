@@ -253,7 +253,6 @@ def _completed_attempt_metrics(
             run_id=spec.run_id,
             attempt=attempt,
             launch_floor=launch_floor,
-            deadline_at=deadline_at,
         )
     except (TypeError, ValueError):
         return None
