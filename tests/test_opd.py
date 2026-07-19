@@ -3249,8 +3249,8 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
 def test_opd_vram_budgets_one_chunked_ce_buffer():
     """opd budgets one live checkpointed ce chunk instead of full-sequence logits."""
     from flash.engine.vram import (
-        OPD_CE_CHUNK_SIZE,
         _OPD_CE_PEAK_BYTES_PER_LOGIT,
+        OPD_CE_CHUNK_SIZE,
         estimate_vram_gb,
     )
 
@@ -4081,14 +4081,34 @@ def test_resolve_opd_knobs_resolves_teacher_from_train(monkeypatch):
         _knobs("gpt-5.5")
 
 
+def _dense_gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
+    import torch
+    import torch.nn.functional as F
+
+    from flash.engine.worker import opd as opd_mod
+
+    if not student_ids or not groups:
+        return None
+    prepared = (
+        groups
+        if isinstance(groups, opd_mod._PreparedGkdGroups)
+        else opd_mod._prepare_gkd_groups(groups)
+    )
+    if prepared is None:
+        return None
+    rows = rows.float()
+    token_ids = torch.tensor(student_ids, device=rows.device)
+    logps = -F.cross_entropy(rows, token_ids, reduction="none")
+    return opd_mod._gkd_loss_from_logps(logps, prepared, kl_coef=kl_coef)
+
+
 def test_opd_loss_skips_empty_student_group_without_crashing():
     # A group with an empty student-index list (a teacher-only span) must be skipped, not divide by
     # zero in the per-span coefficient (len(s_idx) == 0).
     torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
 
     rows = torch.zeros(1, 8, requires_grad=True)
-    loss = opd_mod._gkd_loss_from_logits_rows(
+    loss = _dense_gkd_loss_from_logits_rows(
         rows, [2], [([], -1.0), ([0], -2.0)], kl_coef=1.0
     )
     assert loss is not None  # the empty group is ignored; the real group still trains
@@ -4208,14 +4228,13 @@ class _TinyLM:
 
 def test_opd_loss_backpropagates_over_grouped_spans():
     torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
 
     V = 8
     student_ids = [2, 3]  # 2 completion tokens
     rows = torch.zeros(len(student_ids), V, requires_grad=True)
     # One group covering both completion tokens (as when the teacher tokenizes them as one span).
     groups = [([0, 1], -1.5)]
-    loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0)
+    loss = _dense_gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0)
     assert loss is not None
     assert loss.requires_grad
     loss.backward()
@@ -4644,7 +4663,7 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
     student_ids = [2, 1, 0]
     groups = [([0, 1], -0.75), ([2], -0.25)]
 
-    loss = opd_mod._gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
+    loss = _dense_gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=0.5)
     manual_logps = rows.gather(1, torch.tensor(student_ids).unsqueeze(1)).squeeze(1) - torch.logsumexp(
         rows, dim=-1
     )
@@ -4660,34 +4679,32 @@ def test_gkd_loss_from_logits_rows_matches_manual_logprob_math():
 
     rows2 = rows.detach().clone().requires_grad_(True)
     prepared = opd_mod._prepare_gkd_groups(groups)
-    prepared_loss = opd_mod._gkd_loss_from_logits_rows(rows2, student_ids, prepared, kl_coef=0.5)
+    prepared_loss = _dense_gkd_loss_from_logits_rows(rows2, student_ids, prepared, kl_coef=0.5)
     assert prepared_loss is not None
     torch.testing.assert_close(prepared_loss, expected.detach())
 
 
 def test_opd_loss_none_without_groups_or_tokens():
     torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
 
     rows = torch.zeros(2, 4, requires_grad=True)
-    assert opd_mod._gkd_loss_from_logits_rows(rows, [2, 3], [], kl_coef=1.0) is None
-    assert opd_mod._gkd_loss_from_logits_rows(rows[:0], [], [([0], -1.0)], kl_coef=1.0) is None
+    assert _dense_gkd_loss_from_logits_rows(rows, [2, 3], [], kl_coef=1.0) is None
+    assert _dense_gkd_loss_from_logits_rows(rows[:0], [], [([0], -1.0)], kl_coef=1.0) is None
 
 
 def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     # The per-span coefficient is (student_logsum.detach() - teacher_logsum)/|span|; a more
     # confident teacher (lower/more-negative teacher_logsum) makes the coefficient larger.
     torch = pytest.importorskip("torch")
-    from flash.engine.worker import opd as opd_mod
 
     V = 8
     student_ids = [2]
     rows_hi = torch.zeros(1, V, requires_grad=True)  # uniform logits -> student logprob = -log V
     rows_lo = torch.zeros(1, V, requires_grad=True)
-    hi = opd_mod._gkd_loss_from_logits_rows(
+    hi = _dense_gkd_loss_from_logits_rows(
         rows_hi, student_ids, [([0], -5.0)], kl_coef=1.0
     )
-    lo = opd_mod._gkd_loss_from_logits_rows(
+    lo = _dense_gkd_loss_from_logits_rows(
         rows_lo, student_ids, [([0], -0.5)], kl_coef=1.0
     )
     # loss = coeff * student_logprob, student_logprob < 0, and coeff = (s_det - teacher)/1.

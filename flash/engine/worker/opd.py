@@ -1778,21 +1778,6 @@ class _PreparedLoss:
     group_granularity: float
 
 
-def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
-    import torch
-    import torch.nn.functional as F
-
-    if not student_ids or not groups:
-        return None
-    prepared = groups if isinstance(groups, _PreparedGkdGroups) else _prepare_gkd_groups(groups)
-    if prepared is None:
-        return None
-    rows = rows.float()
-    ids_t = torch.tensor(student_ids, device=rows.device)
-    sp_t = -F.cross_entropy(rows, ids_t, reduction="none")
-    return _gkd_loss_from_logps(sp_t, prepared, kl_coef=kl_coef)
-
-
 def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
     import torch
 
