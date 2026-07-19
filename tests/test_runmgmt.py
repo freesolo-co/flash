@@ -1239,6 +1239,60 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     assert reloaded[runner._CLEANUP_REMOTES_KEY] == [cleanup_remote]
 
 
+def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-record", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    remote = _runpod_remote("endpoint-cleanup", "job-cleanup", attempt=1)
+    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+
+    assert runner._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner._record_cleanup_remote(spec.run_id, remote) is True
+
+    status = runner.get_status(spec.run_id)
+    assert status.remote is None
+    assert runner._load_status_json(spec.run_id)[runner._CLEANUP_REMOTES_KEY] == [remote]
+
+
+def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="completion-cancel", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    remote = _runpod_remote("endpoint-active", "job-active", attempt=0)
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+    real_record = runner._record_cleanup_remote
+
+    def clear_then_record(run_id, cleanup_remote):
+        with runner._status_guard(run_id):
+            status = runner.get_status(run_id)
+            status.remote = None
+            runner._save_status_unlocked(status)
+        return real_record(run_id, cleanup_remote)
+
+    monkeypatch.setattr(runner, "_record_cleanup_remote", clear_then_record)
+    monkeypatch.setattr(runner, "_persist_metrics", lambda *_args, **_kwargs: 0.0)
+
+    assert runner._compare_and_complete_remote(spec.run_id, remote, spec, {}) is False
+    assert runner.get_status(spec.run_id).state == "running"
+    assert runner._update(spec.run_id, "cancelled")
+
+    status = runner.get_status(spec.run_id)
+    assert status.state == "cancelled"
+    assert status.remote is None
+    assert runner._load_status_json(spec.run_id)[runner._CLEANUP_REMOTES_KEY] == [remote]
+
+
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
@@ -1947,6 +2001,46 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
 
     status = runner.get_status(spec.run_id)
     assert len(attempts) == 2
+    assert status.state == "failed"
+    assert status.remote is None
+    assert "deadline exhausted" in (status.error or "")
+
+
+def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadline(
+    monkeypatch, tmp_path
+):
+    import time as time_mod
+
+    import flash.runner as runner
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=86500.0,
+    )
+    raw = runner._load_status_json(spec.run_id)
+    raw.pop(runner._NEXT_ATTEMPT_KEY, None)
+    with open(runner.runs_file_path(spec.run_id, ".json"), "w") as file:
+        json.dump(raw, file)
+
+    monkeypatch.setattr(time_mod, "time", lambda: 86501.0)
+    monkeypatch.setattr(
+        time_mod,
+        "sleep",
+        lambda _seconds: pytest.fail("legacy recovery must converge without retrying"),
+    )
+
+    runtime._deferred_resubmit_loop(spec)
+
+    status = runner.get_status(spec.run_id)
     assert status.state == "failed"
     assert status.remote is None
     assert "deadline exhausted" in (status.error or "")

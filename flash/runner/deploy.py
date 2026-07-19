@@ -163,7 +163,7 @@ def cancel_run(run_id: str) -> RunStatus:
         _cleanup_remote_key,
         _drain_cleanup_remotes,
         _gc_run_endpoints,
-        _preserve_cleanup_remote,
+        _record_cleanup_remote,
         _remote_resource_identity,
         _report_status,
         _save_status_unlocked,
@@ -340,13 +340,13 @@ def cancel_run(run_id: str) -> RunStatus:
             try:
                 resource_deleted = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)
             except Exception:
-                if not _preserve_cleanup_remote(run_id, remote):
+                if not _record_cleanup_remote(run_id, remote):
                     raise RuntimeError(
                         f"run {run_id} teardown was unconfirmed and its exact cleanup target "
                         "could not be preserved"
                     ) from None
                 return False
-            if not resource_deleted and not _preserve_cleanup_remote(run_id, remote):
+            if not resource_deleted and not _record_cleanup_remote(run_id, remote):
                 raise RuntimeError(
                     f"run {run_id} leaked endpoint cleanup target could not be preserved"
                 )
@@ -585,7 +585,7 @@ def _resume_after_confirmed_teardown(
         _compare_and_clear_remote,
         _compare_and_fail_remote,
         _load_run_deadline_at,
-        _preserve_cleanup_remote,
+        _record_cleanup_remote,
         _run_training,
         _RunCancelled,
         _spec_with_remaining_wall,
@@ -669,7 +669,7 @@ def _resume_after_confirmed_teardown(
             clear_remote = current_remote is None
             if current_remote is not None:
                 try:
-                    clear_remote = _preserve_cleanup_remote(run_id, current_remote)
+                    clear_remote = _record_cleanup_remote(run_id, current_remote)
                 except Exception:
                     clear_remote = False
             _compare_and_fail_remote(
@@ -697,7 +697,7 @@ def _reconcile_attached_remote(
         TERMINAL_STATES,
         _compare_and_fail_remote,
         _load_run_deadline_at,
-        _preserve_cleanup_remote,
+        _record_cleanup_remote,
         _remote_resource_identity,
         get_status,
     )
@@ -745,7 +745,7 @@ def _reconcile_attached_remote(
                 continue
             if metrics is not None:
                 try:
-                    cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
+                    cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
                     adopted = cleanup_preserved and _adopt_completed_attempt(
                         run_id,
                         worker_spec,
@@ -761,7 +761,7 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             try:
-                cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
+                cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
             except Exception:
                 cleanup_preserved = False
             if not cleanup_preserved:
@@ -787,7 +787,7 @@ def _reconcile_attached_remote(
             continue
         if handle.provider == "runpod" and not resource_deleted:
             try:
-                cleanup_preserved = _preserve_cleanup_remote(run_id, expected_remote)
+                cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
             except Exception:
                 cleanup_preserved = False
             if not cleanup_preserved:
@@ -873,9 +873,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _compare_and_fail_remote,
         _gc_run_endpoints,
         _load_run_deadline_at,
-        _preserve_cleanup_remote,
+        _record_cleanup_remote,
         _RunCancelled,
         _spec_with_remaining_wall,
+        _update,
         effective_spec_from_status,
         get_status,
     )
@@ -956,7 +957,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             except Exception:
                 resource_deleted = False
             if not resource_deleted:
-                _preserve_cleanup_remote(run_id, persisted_remote)
+                _record_cleanup_remote(run_id, persisted_remote)
             _compare_and_fail_remote(
                 run_id,
                 persisted_remote,
@@ -988,7 +989,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 worker_gone
                 and handle.provider == "runpod"
                 and not resource_deleted
-                and not _preserve_cleanup_remote(run_id, persisted_remote)
+                and not _record_cleanup_remote(run_id, persisted_remote)
             ):
                 raise RuntimeError("leaked endpoint cleanup target could not be persisted")
             if worker_gone:
@@ -1035,10 +1036,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
     except Exception as exc:
         try:
-            # cas-only fail: no-ops if a concurrent cancel already cleared this remote (so a user
-            # cancel is never overwritten as failed); the terminal gc below reaps the run's box by
-            # run label if it was still live.
-            _compare_and_fail_remote(run_id, persisted_remote, str(exc))
+            _record_cleanup_remote(run_id, persisted_remote)
+            failed = _compare_and_fail_remote(run_id, persisted_remote, str(exc))
+            if not failed and get_status(run_id).state not in TERMINAL_STATES:
+                _update(run_id, "failed", error=str(exc))
         except Exception:
             if next_attempt > 0:
                 _schedule_attach_reconciliation(

@@ -2426,6 +2426,74 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         assert "source-run/step-40" in (status.error or "")
 
 
+def test_attach_malformed_remote_identity_converges_to_failed(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "name",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="malformed-attach",
+                state="running",
+                spec=_spec("malformed-attach").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
+
+        status = orch.attach_run("malformed-attach", log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert "launch timestamp" in (status.error or "")
+
+
+def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "name",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="cancelled-attach",
+                state="running",
+                spec=_spec("cancelled-attach").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(
+            orch,
+            "effective_spec_from_status",
+            lambda _status: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+        real_record = orch._record_cleanup_remote
+
+        def cancel_then_record(run_id, cleanup_remote):
+            assert orch._update(run_id, "cancelled", remote=None)
+            return real_record(run_id, cleanup_remote)
+
+        monkeypatch.setattr(orch, "_record_cleanup_remote", cancel_then_record)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
+
+        status = orch.attach_run("cancelled-attach", log_stream=sys.stderr)
+
+        assert status.state == "cancelled"
+        assert status.remote is None
+        assert orch._load_status_json("cancelled-attach")[orch._CLEANUP_REMOTES_KEY] == [remote]
+
+
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
     """A cancel landing mid-attempt raised _RunCancelled straight out of the retry loop, skipping
     _gc_seen_endpoints — leaking a walk-provisioned endpoint (one _gc_run_endpoints can't name, whose
@@ -3712,7 +3780,16 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         assert st.remote is None
         assert "bad reward fn" in (st.error or "")
         assert orch._load_status_json("g1")[orch._CLEANUP_REMOTES_KEY] == [
-            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"}
+            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
+            {
+                "provider": "runpod",
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "key_fingerprint": _RUNPOD_FINGERPRINT,
+                "job_id": "jA",
+                "attempt": 0,
+                "started_ts": 1.0,
+            },
         ]
 
 

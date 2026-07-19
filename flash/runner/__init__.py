@@ -322,8 +322,11 @@ def _reserve_attempt(
 
 def _latest_reserved_attempt(run_id: str) -> int | None:
     """Return the newest durably reserved attempt, or none before any reservation."""
-    raw = _load_status_json(run_id)
-    next_attempt = _infer_next_attempt(raw)
+    try:
+        raw = _load_status_json(run_id)
+        next_attempt = _infer_next_attempt(raw)
+    except Exception:
+        return None
     return next_attempt - 1 if next_attempt > 0 else None
 
 
@@ -1450,7 +1453,7 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
-    if expected_remote is not None and not _preserve_cleanup_remote(run_id, expected_remote):
+    if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
         return False
     recovered_cost = _persist_metrics(spec, metrics)
     with _status_guard(run_id):
@@ -1569,6 +1572,27 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
             with contextlib.suppress(Exception):
                 _compare_and_remove_cleanup_remote(run_id, record)
     return attempted
+
+
+def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
+    """Persist one exact cleanup identity without changing the active remote."""
+    record = _canonical_cleanup_remote(remote)
+    key = _cleanup_remote_key(record)
+    if record is None or key is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        records = _cleanup_remotes_from_raw(raw)
+        if all(_cleanup_remote_key(existing) != key for existing in records):
+            records.append(record)
+        status.updated_at = time.time()
+        _save_status_unlocked(status, _cleanup_remotes=records)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
 
 
 def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:

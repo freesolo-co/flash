@@ -347,6 +347,7 @@ def _submit_seed_supervised(
         _load_run_deadline_at,
         _persist_effective_worker_spec,
         _preserve_cleanup_remote,
+        _record_cleanup_remote,
         _reserve_attempt,
         _RunCancelled,
         _spec_with_gpu,
@@ -470,7 +471,7 @@ def _submit_seed_supervised(
                 worker_gone
                 and last_handle.get("provider") == "runpod"
                 and not resource_deleted
-                and not _preserve_cleanup_remote(spec.run_id, last_handle)
+                and not _record_cleanup_remote(spec.run_id, last_handle)
             ):
                 raise RuntimeError(
                     f"seed {seed}: terminal worker's leaked endpoint cleanup target "
@@ -969,9 +970,9 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         try:
             resource_deleted = _strict_teardown_handle(status.remote, spec.run_id)
             if status.remote.get("provider") == "runpod" and not resource_deleted:
-                from flash.runner import _preserve_cleanup_remote
+                from flash.runner import _record_cleanup_remote
 
-                _preserve_cleanup_remote(spec.run_id, status.remote)
+                _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
     try:
