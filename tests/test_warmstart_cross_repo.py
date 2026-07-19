@@ -327,9 +327,10 @@ def test_prepare_rejects_deployed_warmstart_before_hf_access(
 
 
 def test_create_run_preserves_deployed_warmstart_message(monkeypatch):
+    from fastapi import HTTPException
+
     import flash.runner as R
     import flash.server.routes.runs as runs_route
-    from fastapi import HTTPException
 
     _source, child = _warmstart_specs("source-run")
     deleted = []
