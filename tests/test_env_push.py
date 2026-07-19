@@ -116,7 +116,29 @@ def test_push_single_py_ships_sibling_dataset(monkeypatch, tmp_path):
     assert "dataset/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
+def test_push_recursively_ships_packages_and_dataset_directories(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("from exploit_env import verifier\n")
+    package = tmp_path / "exploit_env"
+    package.mkdir()
+    (package / "__init__.py").write_text("from .verifier import verify\n")
+    (package / "verifier.py").write_text("def verify():\n    return True\n")
+    (tmp_path / "dataset").mkdir()
+    (tmp_path / "dataset" / "train.jsonl").write_text('{"x": 1}\n')
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "eval.parquet").write_bytes(b"parquet bytes")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    files = _members(cap["package_b64"])
+    assert "exploit_env/__init__.py" in files
+    assert "exploit_env/verifier.py" in files
+    assert "dataset/train.jsonl" in files
+    assert "datasets/eval.parquet" in files
+
+
+def test_push_single_py_ships_full_environment_tree(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
@@ -132,11 +154,11 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
 
     assert cli.cmd_env_push(_args(env_file)) == 0
     files = _members(cap["package_b64"])
-    assert "state.sqlite" not in files
-    assert "db/state.sqlite" not in files
-    assert "configs/env.toml" not in files
-    assert "rl.toml" not in files
-    assert "assets/labels.json" not in files
+    assert "state.sqlite" in files
+    assert "db/state.sqlite" in files
+    assert "configs/env.toml" in files
+    assert "rl.toml" in files
+    assert "assets/labels.json" in files
 
 
 def test_push_ships_training_md_and_keeps_user_readme(monkeypatch, tmp_path):
@@ -190,6 +212,7 @@ def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
     files = _members(cap["package_b64"])
     assert "return 'custom'" in files["environment.py"]
     assert "return 'sibling'" not in files["environment.py"]
+    assert "custom_env.py" not in files
 
 
 def test_push_requires_explicit_name(tmp_path, capsys):
@@ -247,23 +270,63 @@ def test_push_nonexistent_path(tmp_path, capsys):
     assert "no such path" in capsys.readouterr().err
 
 
-def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
+def test_push_rejects_symlink_entrypoints(tmp_path, capsys):
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = True\n")
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").symlink_to(outside)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert "symlinks are not allowed" in capsys.readouterr().err
+
+
+def test_push_excludes_secrets_metadata_caches_and_symlinks_at_all_depths(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
     (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / ".env").write_text("TOKEN=secret\n")
     (env_dir / ".prime").mkdir()
     (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
-    (env_dir / "__pycache__").mkdir()
-    (env_dir / "__pycache__" / "x.pyc").write_text("junk")
+    nested = env_dir / "helpers" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "safe.py").write_text("VALUE = 1\n")
+    (nested / "pyproject.toml").write_text("[project]\n")
+    (nested / "source").mkdir()
+    (nested / "source" / "index.py").write_text("SECRET = True\n")
+    (nested / "secrets").mkdir()
+    (nested / "secrets" / "api.key").write_text("secret\n")
+    (nested / "__pycache__").mkdir()
+    (nested / "__pycache__" / "safe.pyc").write_bytes(b"junk")
+    (nested / ".venv").mkdir()
+    (nested / ".venv" / "activate.py").write_text("secret\n")
+    (nested / ".git").mkdir()
+    (nested / ".git" / "config").write_text("secret\n")
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_text("SECRET = True\n")
+    outside_dir = tmp_path / "outside-data"
+    outside_dir.mkdir()
+    (outside_dir / "secret.json").write_text('{"secret": true}\n')
+    (nested / "linked.py").symlink_to(outside_file)
+    (nested / "linked-data").symlink_to(outside_dir, target_is_directory=True)
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_dir, name="clean-env")) == 0
     names = set(_members(cap["package_b64"]))
     assert "environment.py" in names
-    assert not any(n.startswith(".prime") for n in names)
-    assert not any("__pycache__" in n for n in names)
+    assert "helpers/nested/safe.py" in names
+    assert ".env" not in names
+    assert not any(name.startswith(".prime") for name in names)
+    assert not any("__pycache__" in name for name in names)
+    assert not any("/.venv/" in f"/{name}/" for name in names)
+    assert not any("/.git/" in f"/{name}/" for name in names)
+    assert "helpers/nested/secrets/api.key" not in names
+    assert "helpers/nested/source/index.py" not in names
+    assert "helpers/nested/pyproject.toml" not in names
+    assert "helpers/nested/linked.py" not in names
+    assert "helpers/nested/linked-data/secret.json" not in names
 
 
 class _FakeTTY(io.StringIO):

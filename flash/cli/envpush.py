@@ -183,26 +183,23 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         ".venv",
         ".mypy_cache",
         ".pytest_cache",
+        ".ruff_cache",
+        ".idea",
+        ".vscode",
+        ".DS_Store",
+        ".git-worktrees",
+        ".env",
+        ".netrc",
+        ".aws",
+        ".ssh",
+        "venv",
+        "node_modules",
+        "credentials",
         "pyproject.toml",
         "source",
     }
 )
-# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
-# user-authored README/NOTES) travels with the env into the hub and back out through
-# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
-_ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
-    {
-        ".csv",
-        ".json",
-        ".jsonl",
-        ".md",
-        ".parquet",
-        ".tsv",
-        ".txt",
-        ".yaml",
-        ".yml",
-    }
-)
+_ENV_PUSH_SECRET_PATTERNS = (".env.*", "*.pem", "*.key", "*.pfx", "id_rsa*")
 
 
 def _normalize_env_name(raw: str) -> str | None:
@@ -276,34 +273,42 @@ def _tar_b64(directory: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bool:
+    """Return whether a source path must not be included in an env package."""
+    import fnmatch
+
+    name = path.name
+    lowered_name = name.lower()
+    if path.is_symlink():
+        return True
+    if path == entrypoint or (path.parent == env_root and name == _ENV_ENTRYPOINT):
+        return True
+    if name.startswith(".") or name in _ENV_PUSH_IGNORED_NAMES:
+        return True
+    if any(fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS):
+        return True
+    return not (path.is_dir() or path.is_file())
+
+
 def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
-    """Copy helper code and data sidecars beside environment.py."""
+    """Recursively copy the publishable env tree beside environment.py."""
+    import os
     import shutil
 
-    for child in sorted(env_root.iterdir()):
-        if (
-            child == entrypoint
-            or child.name == _ENV_ENTRYPOINT
-            or child.name in _ENV_PUSH_IGNORED_NAMES
-        ):
-            continue
-        if child.name.startswith("."):
-            continue
-        target = dest / child.name
-        if child.is_dir():
-            if child.name == "dataset":
-                shutil.copytree(
-                    child,
-                    target,
-                    ignore=shutil.ignore_patterns(*_ENV_PUSH_IGNORED_NAMES),
-                )
-            continue
-        if not child.is_file():
-            continue
-        if (
-            child.suffix == ".py" and not child.name.startswith("__")
-        ) or child.suffix.lower() in _ENV_PUSH_SIDECAR_SUFFIXES:
-            shutil.copy2(child, target)
+    for root, dirs, files in os.walk(env_root, topdown=True, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if not _ignore_env_push_path(root_path / name, env_root=env_root, entrypoint=entrypoint)
+        )
+        target_root = dest / root_path.relative_to(env_root)
+        target_root.mkdir(parents=True, exist_ok=True)
+        for name in sorted(files):
+            child = root_path / name
+            if _ignore_env_push_path(child, env_root=env_root, entrypoint=entrypoint):
+                continue
+            shutil.copy2(child, target_root / name)
 
 
 def _human_bytes(n: int) -> str:
@@ -385,6 +390,8 @@ def cmd_env_push(args) -> int:
     src = Path(args.path)
     if not src.exists():
         return _err(f"no such path: {src}")
+    if src.is_symlink():
+        return _err(f"cannot publish {src}: symlinks are not allowed")
 
     if src.is_dir():
         canonical_entrypoint = src / _ENV_ENTRYPOINT
@@ -409,6 +416,9 @@ def cmd_env_push(args) -> int:
         entrypoint = src
     else:
         return _err(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
+
+    if entrypoint.is_symlink():
+        return _err(f"cannot publish {entrypoint}: symlinks are not allowed")
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
