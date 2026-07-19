@@ -171,6 +171,9 @@ def test_deployments_plain_path_handles_final_and_detailed_rows(monkeypatch, cap
     assert "final" in output
     assert "model-1" in output
     assert "broken" in output
+    # the verified_at epoch is rendered as an explicit UTC timestamp, not a raw number
+    assert "1970-01-01 00:02 UTC" in output
+    assert "123" not in output
 
 
 def test_chat_rejects_invalid_target_without_constructing_a_client(monkeypatch, capsys) -> None:
