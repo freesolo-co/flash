@@ -2494,6 +2494,49 @@ def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
         assert orch._load_status_json("cancelled-attach")[orch._CLEANUP_REMOTES_KEY] == [remote]
 
 
+def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
+    # a cancel that has cleared status.remote but not yet flipped state to terminal must win: the
+    # attach-setup-failure cas no-ops (the identifiable remote no longer matches) and must NOT
+    # force-fail the run, else a user cancel gets recorded as failed.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "name",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="precancel-attach",
+                state="running",
+                spec=_spec("precancel-attach").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(
+            orch,
+            "effective_spec_from_status",
+            lambda _status: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+        real_record = orch._record_cleanup_remote
+
+        def clear_remote_then_record(run_id, cleanup_remote):
+            # a concurrent cancel cleared the remote but has NOT yet flipped state to cancelled
+            assert orch._compare_and_clear_remote(run_id, remote)
+            return real_record(run_id, cleanup_remote)
+
+        monkeypatch.setattr(orch, "_record_cleanup_remote", clear_remote_then_record)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
+
+        status = orch.attach_run("precancel-attach", log_stream=sys.stderr)
+
+        assert status.state != "failed", "attach-setup-failure stole a pre-commit cancel"
+
+
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
     """A cancel landing mid-attempt raised _RunCancelled straight out of the retry loop, skipping
     _gc_seen_endpoints — leaking a walk-provisioned endpoint (one _gc_run_endpoints can't name, whose
