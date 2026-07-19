@@ -1145,6 +1145,61 @@ def test_worker_output_route(api, monkeypatch):
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
 
 
+def test_internal_key_reads_logs_and_worker_with_matching_org(api, monkeypatch):
+    # The platform web proxy has no per-run API key, so it reads a user's run logs with the shared
+    # internal key plus the run's org in X-Freesolo-Org-Id. The header is honored ONLY for the
+    # internal key and ONLY when it matches the run's persisted org, so a proxy bug can't cross
+    # tenants. All failures are 404 so we never leak whether a run exists.
+    import flash.server.app as app_mod
+
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+    with open(os.path.join(_orch.RUNS_DIR, f"{run_id}.log"), "w") as f:
+        f.write("orchestrator line\n")
+    monkeypatch.setattr(
+        app_mod, "_worker_artifacts", lambda spec: {"console_sft.txt": "worker stdout\n"}
+    )
+
+    internal = _bearer("fslo-internal-test")
+    matched = {**internal, "X-Freesolo-Org-Id": org}
+
+    logs = api.get(f"/v1/runs/{run_id}/logs", headers=matched)
+    assert logs.status_code == 200, logs.text
+    assert logs.json()["logs"] == "orchestrator line\n"
+    worker = api.get(f"/v1/runs/{run_id}/worker", headers=matched)
+    assert worker.status_code == 200, worker.text
+    assert worker.json()["worker"] == {"console_sft.txt": "worker stdout\n"}
+
+    # wrong org, or no org header at all, is a 404 for the internal key (the worker fetch is never
+    # reached, so no HF download happens on the rejected path).
+    wrong = {**internal, "X-Freesolo-Org-Id": "org-someone-else"}
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=wrong).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=wrong).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=internal).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=internal).status_code == 404
+
+
+def test_org_header_is_ignored_for_non_internal_keys(api):
+    # A non-owner user key can't read another tenant's logs even if it forges the org header: the
+    # header is consulted only for the internal service key, so the owner check still governs users.
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+
+    intruder = _login()
+    forged = {**_bearer(intruder), "X-Freesolo-Org-Id": org}
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=forged).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=forged).status_code == 404
+
+    # the real owner still reads its own run with no org header (unchanged CLI path).
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(owner)).status_code == 200
+
+
 def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
     """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
     surfaces the FINAL attempt's traceback, not attempt0's stale one."""
@@ -3736,7 +3791,6 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     app_mod.recover_runs()
 
     assert drained == [run_id]
-
 
 
 def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):

@@ -29,14 +29,44 @@ def require_key(authorization: str | None = Header(default=None)) -> dict:
     return key
 
 
-def owned_run(run_id: str, key: dict):
-    """Load a run's status iff `key` owns it; 404 otherwise (don't leak existence)."""
-    if db.run_owner(run_id) != key["id"]:
-        raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
+def _load_status(run_id: str):
+    """Resolve `run_id` to its status via the module (so `app.get_status` patches are honored)."""
     try:
         return _app.get_status(run_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def owned_run(run_id: str, key: dict):
+    """Load a run's status iff `key` owns it; 404 otherwise (don't leak existence)."""
+    if db.run_owner(run_id) != key["id"]:
+        raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
+    return _load_status(run_id)
+
+
+def readable_run(run_id: str, key: dict, org_id: str | None = None):
+    """Load a run's status for READ-only endpoints (`/logs`, `/worker`) via one of two paths.
+
+    Mirrors the env-delete posture (a user key carries its own identity; the org-agnostic
+    internal key is the trusted platform caller):
+      * exact-key owner -- the API key that created the run. This is the `flash log` CLI path.
+      * internal/service key + matching ``X-Freesolo-Org-Id`` -- the platform web proxy. The
+        browser has no per-run API key, so the platform authenticates the user, checks org
+        membership on the mirror row, then calls with the internal key and the run's org here.
+        We additionally require the header to match the run's PERSISTED org so a proxy bug can
+        never cross orgs; a user key never reaches this branch (it took the owner path above).
+    404 (never 403) on every failure so we never leak whether a run exists.
+    """
+    if db.run_owner(run_id) == key["id"]:
+        return _load_status(run_id)
+    org = (org_id or "").strip()
+    if key.get("auth_kind") == "internal" and org:
+        from flash.runner import _status_org_id
+
+        status = _load_status(run_id)
+        if _status_org_id(status) == org:
+            return status
+    raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
 
 
 def _require_bool(payload: dict, field: str, default: bool) -> bool:
@@ -58,9 +88,7 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
     if env_raw is None:
         env_raw = {}
     if not isinstance(env_raw, dict):
-        raise HTTPException(
-            status_code=400, detail="spec.environment must be a JSON object"
-        )
+        raise HTTPException(status_code=400, detail="spec.environment must be a JSON object")
     if env_raw.get("path"):
         raise HTTPException(
             status_code=400,
