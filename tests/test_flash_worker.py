@@ -448,7 +448,7 @@ def test_train_body_imports_every_name_it_uses():
     }
     # Names that must be locally imported (regression: contextlib was missing; threading is used by
     # the always-on console uploader).
-    for name in ("contextlib", "json", "os", "subprocess", "sys", "threading"):
+    for name in ("contextlib", "json", "os", "shutil", "subprocess", "sys", "threading"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
     assert "_CONSOLE_UPLOAD_INTERVAL_S" not in inspect.getsource(train._train_body)
 
@@ -465,6 +465,7 @@ def test_train_body_has_no_prime_install_path():
 
 def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     import os
+    import sys
     from pathlib import Path
 
     from flash.providers.runpod.train import endpoints
@@ -473,6 +474,8 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
     askpass_paths = []
 
     def fake_run(cmd, *, check, env=None):
+        if cmd[1:4] == ["-m", "venv", "--system-site-packages"]:
+            return
         askpass = Path(env["GIT_ASKPASS"])
         assert askpass.exists()
         assert os.access(askpass, os.X_OK)
@@ -497,6 +500,8 @@ def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
         )
 
     assert len(calls) == 1
+    assert calls[0]["cmd"][0] != sys.executable
+    assert calls[0]["cmd"][1:4] == ["-m", "pip", "install"]
     env = calls[0]["env"]
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
@@ -513,6 +518,8 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     askpass_paths = []
 
     def fake_run(cmd, *, check, env=None):
+        if cmd[1:4] == ["-m", "venv", "--system-site-packages"]:
+            return
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
 
     original_remove = os.remove
@@ -732,6 +739,11 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
 
+    def fake_run(cmd, *, check, env=None):
+        assert check is True
+        assert env is None
+        assert cmd[1:4] == ["-m", "venv", "--system-site-packages"]
+
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
@@ -748,6 +760,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         def wait(self):
             return 0
 
+    monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(subprocess, "Popen", _FakeProc)
 
     job_spec = '{"algorithm": "sft", "run_id": "flash-test-run"}'
