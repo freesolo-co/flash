@@ -413,7 +413,11 @@ def test_cmd_train_cost_warns_only_for_b200(tmp_path, capsys, gpu_type, expects_
     assert "TOTAL" in captured.out
     assert gpu_type in captured.out
     warning = "warning: this estimate assumes peak-flops throughput; B200 (sm100) kernels"
+    h200_comparison = (
+        'if your configuration also fits H200, pin [gpu] exact_type = "H200" to compare.'
+    )
     assert (warning in captured.err) is expects_warning
+    assert (h200_comparison in captured.err) is expects_warning
     if not expects_warning:
         assert captured.err == ""
 
