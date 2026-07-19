@@ -372,6 +372,7 @@ def _train_body(input_data: dict) -> dict:
                 "PIP_PREFIX",
                 "PIP_ROOT",
                 "PIP_USER",
+                "PIP_SRC",
                 "PYTHONUSERBASE",
                 "PIP_CONFIG_FILE",
             }
@@ -402,6 +403,7 @@ def _train_body(input_data: dict) -> dict:
                 argument in (*location_options, "-t")
                 or any(argument.startswith(f"{option}=") for option in location_options)
                 or argument.startswith(("--tar", "--prefi"))
+                or re.match(r"^--src?(?:=.*)?$", argument)
                 or re.match(r"^-[qvUI]*t", argument)
             ):
                 raise ValueError(f"extra_pip location option is not allowed: {argument!r}")
@@ -553,6 +555,12 @@ def _train_body(input_data: dict) -> dict:
         env["PYTHONPATH"] = os.pathsep.join(
             path for path in (job_site_packages, code_dir, existing_pythonpath) if path
         )
+        env["_FLASH_JOB_SITE_PACKAGES"] = job_site_packages
+        worker_bootstrap = (
+            "import os,runpy,site;"
+            "site.addsitedir(os.environ['_FLASH_JOB_SITE_PACKAGES']);"
+            "runpy.run_module('flash.engine.worker_entrypoint',run_name='__main__')"
+        )
 
         def _upload_console(mode: str) -> None:
             """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
@@ -602,7 +610,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+                    [sys.executable, "-c", worker_bootstrap],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,

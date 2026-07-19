@@ -698,6 +698,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     import contextlib
     import os
     import subprocess
+    import sys
     import types
     from pathlib import Path
 
@@ -762,6 +763,9 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
         def __init__(self, *a, **k):
+            assert a[0][:2] == [sys.executable, "-c"]
+            assert "site.addsitedir" in a[0][2]
+            assert "flash.engine.worker_entrypoint" in a[0][2]
             assert k["cwd"] == "/runcode/code/0123456789abcdef0123456789abcdef"
             self.stdout = iter(
                 [

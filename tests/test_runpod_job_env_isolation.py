@@ -16,6 +16,12 @@ from pathlib import Path
 
 import pytest
 
+_WORKER_BOOTSTRAP = (
+    "import os,runpy,site;"
+    "site.addsitedir(os.environ['_FLASH_JOB_SITE_PACKAGES']);"
+    "runpy.run_module('flash.engine.worker_entrypoint',run_name='__main__')"
+)
+
 
 def _deadline_fields() -> dict[str, float]:
     now = time.time()
@@ -68,6 +74,39 @@ def _build_wheel(tmp_path: Path) -> tuple[Path, str]:
         f"{dist_info}/METADATA": (
             "Metadata-Version: 2.1\n"
             f"Name: {module_name}\n"
+            f"Version: {version}\n"
+        ),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\n"
+            "Generator: flash-test\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    record_path = f"{dist_info}/RECORD"
+    files[record_path] = "".join(f"{path},,\n" for path in (*files, record_path))
+    with zipfile.ZipFile(wheel_path, "w") as wheel:
+        for path, content in files.items():
+            wheel.writestr(path, content)
+    return wheel_path, module_name
+
+
+def _build_pth_wheel(tmp_path: Path) -> tuple[Path, str]:
+    suffix = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    module_name = f"flash_pth_probe_{suffix}"
+    dist_name = f"{module_name}_loader"
+    version = "1.0.0"
+    source_root = tmp_path / f"{module_name}-source"
+    source_root.mkdir()
+    (source_root / f"{module_name}.py").write_text('VALUE = "pth-loaded"\n', encoding="utf-8")
+
+    dist_info = f"{dist_name}-{version}.dist-info"
+    wheel_path = tmp_path / f"{dist_name}-{version}-py3-none-any.whl"
+    files = {
+        f"{dist_name}.pth": f"{source_root}\n",
+        f"{dist_info}/METADATA": (
+            "Metadata-Version: 2.1\n"
+            f"Name: {dist_name}\n"
             f"Version: {version}\n"
         ),
         f"{dist_info}/WHEEL": (
@@ -195,10 +234,11 @@ def test_extra_pip_is_installed_only_in_job_venv_and_base_worker_sees_it(
     assert any(call["cmd"][1:4] == ["-m", "pip", "install"] for call in run_calls)
 
     launch = launch_calls[0]
-    assert launch["cmd"] == [sys.executable, "-m", "flash.engine.worker_entrypoint"]
+    assert launch["cmd"] == [sys.executable, "-c", _WORKER_BOOTSTRAP]
     assert launch["cwd"] == f"/runcode/{os.path.dirname(code_prefix)}"
     assert launch["env"]["RUN_MODE"] == "sft"
     assert launch["env"]["HF_TOKEN"] == "tok"
+    assert launch["env"]["_FLASH_JOB_SITE_PACKAGES"] == str(observed["job_site_packages"])
     pythonpath = launch["env"]["PYTHONPATH"].split(os.pathsep)
     assert pythonpath == [
         str(observed["job_site_packages"]),
@@ -206,6 +246,107 @@ def test_extra_pip_is_installed_only_in_job_venv_and_base_worker_sees_it(
         "base-pythonpath",
     ]
     assert not observed["job_venv"].exists()
+    assert not base_package.exists()
+
+
+def test_worker_bootstrap_processes_job_pth_and_preserves_import_precedence(
+    monkeypatch, tmp_path
+):
+    wheel_path, module_name = _build_wheel(tmp_path)
+    pth_wheel_path, pth_module_name = _build_pth_wheel(tmp_path)
+    base_package = Path(sysconfig.get_path("purelib")) / module_name
+    assert not base_package.exists()
+
+    code_dir = tmp_path / "downloaded-code"
+    engine_dir = code_dir / "flash" / "engine"
+    engine_dir.mkdir(parents=True)
+    flash_init = code_dir / "flash" / "__init__.py"
+    flash_init.write_text('ORIGIN = "code-dir"\n', encoding="utf-8")
+    (engine_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    base_dir = tmp_path / "base-site"
+    base_module = base_dir / module_name
+    base_module.mkdir(parents=True)
+    (base_module / "__init__.py").write_text('VALUE = "base"\n', encoding="utf-8")
+
+    output_path = tmp_path / "worker-imports.json"
+    entrypoint_source = (
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import flash\n"
+        f"import {module_name} as normal_package\n"
+        f"import {pth_module_name} as pth_package\n"
+        "Path(os.environ['PROBE_OUTPUT']).write_text(json.dumps({\n"
+        "    'flash_file': flash.__file__,\n"
+        "    'normal_value': normal_package.VALUE,\n"
+        "    'pth_value': pth_package.VALUE,\n"
+        "}), encoding='utf-8')\n"
+    )
+    (engine_dir / "worker_entrypoint.py").write_text(entrypoint_source, encoding="utf-8")
+
+    real_popen = subprocess.Popen
+    observed: dict[str, object] = {}
+
+    def run_process(cmd, *, cwd, env):
+        proc = real_popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = proc.communicate()
+        return proc.returncode, stdout, stderr
+
+    def before_worker(launch):
+        assert launch["cmd"] == [sys.executable, "-c", _WORKER_BOOTSTRAP]
+        job_site_packages = Path(launch["env"]["_FLASH_JOB_SITE_PACKAGES"])
+        assert (job_site_packages / module_name / "__init__.py").is_file()
+        assert any(job_site_packages.glob("*.pth"))
+
+        worker_env = dict(launch["env"])
+        worker_env["PYTHONPATH"] = os.pathsep.join(
+            (str(job_site_packages), str(code_dir), str(base_dir))
+        )
+        worker_env["PROBE_OUTPUT"] = str(output_path)
+
+        plain_cmd = [sys.executable, "-c", f"import {pth_module_name}"]
+        plain_returncode, _, plain_stderr = run_process(
+            plain_cmd,
+            cwd=str(code_dir),
+            env=worker_env,
+        )
+        assert plain_returncode != 0
+        assert "ModuleNotFoundError" in plain_stderr
+        observed["plain_stderr"] = plain_stderr
+
+        returncode, stdout, stderr = run_process(
+            launch["cmd"],
+            cwd=str(code_dir),
+            env=worker_env,
+        )
+        assert returncode == 0, f"stdout={stdout!r} stderr={stderr!r}"
+        observed.update(json.loads(output_path.read_text(encoding="utf-8")))
+
+    try:
+        result, _, _, _ = _run_successful_job(
+            monkeypatch,
+            tmp_path,
+            extra_pip=[str(wheel_path), str(pth_wheel_path)],
+            before_worker=before_worker,
+        )
+    except subprocess.CalledProcessError as exc:
+        if list(exc.cmd)[1:4] == ["-m", "venv", "--system-site-packages"]:
+            pytest.skip(f"venv creation unavailable: {exc}")
+        raise
+
+    assert result == {"score": 1.0}
+    assert observed["pth_value"] == "pth-loaded"
+    assert observed["normal_value"] == "isolated"
+    assert Path(str(observed["flash_file"])).resolve() == flash_init.resolve()
+    assert "ModuleNotFoundError" in str(observed["plain_stderr"])
     assert not base_package.exists()
 
 
@@ -229,6 +370,8 @@ def test_job_pip_env_cannot_redirect_install_outside_venv(monkeypatch, tmp_path)
             "PIP_PREFIX": str(tmp_path / "redirected-prefix"),
             "PIP_ROOT": str(tmp_path / "redirected-root"),
             "PIP_USER": "1",
+            "PIP_SRC": str(tmp_path / "redirected-src"),
+            "pip_src": str(tmp_path / "redirected-src-lowercase"),
             "PYTHONUSERBASE": str(tmp_path / "redirected-userbase"),
             "PIP_CONFIG_FILE": str(tmp_path / "redirected-pip.conf"),
         },
@@ -238,7 +381,15 @@ def test_job_pip_env_cannot_redirect_install_outside_venv(monkeypatch, tmp_path)
     pip_call = next(call for call in run_calls if call["cmd"][1:4] == ["-m", "pip", "install"])
     pip_env = pip_call["env"]
     assert pip_env["PIP_USER"] == "0"
-    for key in ("PIP_TARGET", "PIP_PREFIX", "PIP_ROOT", "PYTHONUSERBASE", "PIP_CONFIG_FILE"):
+    for key in (
+        "PIP_TARGET",
+        "PIP_PREFIX",
+        "PIP_ROOT",
+        "PIP_SRC",
+        "pip_src",
+        "PYTHONUSERBASE",
+        "PIP_CONFIG_FILE",
+    ):
         assert key not in pip_env
     assert not redirected_target.exists()
     assert not observed["job_site_packages"].parents[2].exists()
@@ -279,6 +430,10 @@ def test_job_pip_rejects_location_changing_arguments(monkeypatch, tmp_path):
         "--root=/tmp/x",
         "--user",
         "--user=1",
+        "--src",
+        "--src=/tmp/x",
+        "--sr",
+        "--sr=/tmp/x",
     ],
 )
 def test_all_pip_location_option_forms_are_rejected(monkeypatch, tmp_path, argument):
@@ -299,7 +454,7 @@ def test_empty_extra_pip_runs_base_worker_with_clean_pythonpath(monkeypatch, tmp
     assert result == {"score": 1.0}
     assert not any(call["cmd"][1:4] == ["-m", "pip", "install"] for call in run_calls)
     launch = launch_calls[0]
-    assert launch["cmd"] == [sys.executable, "-m", "flash.engine.worker_entrypoint"]
+    assert launch["cmd"] == [sys.executable, "-c", _WORKER_BOOTSTRAP]
     pythonpath = launch["env"]["PYTHONPATH"].split(os.pathsep)
     assert Path(pythonpath[0]).name == "site-packages"
     assert pythonpath[1:] == [f"/runcode/{os.path.dirname(code_prefix)}", "base-pythonpath"]
