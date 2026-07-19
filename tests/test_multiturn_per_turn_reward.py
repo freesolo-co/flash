@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import types
 from types import SimpleNamespace
@@ -135,7 +136,23 @@ def test_non_finite_episode_reward_disables_per_turn_credit(capsys):
 
     assert result["turn_rewards"] is None
     assert env.rollout_reward_calls == 1
-    assert capsys.readouterr().out.count("using episode reward") == 1
+    assert capsys.readouterr().out.count("rollout unscorable") == 1
+
+
+@pytest.mark.parametrize("bad_episode", [float("nan"), float("inf"), float("-inf")])
+def test_score_rollouts_canonicalizes_non_finite_episode_to_nan(bad_episode, capsys):
+    class _NonFiniteEnv(BaseEnvironment):
+        def rollout_rewards_many(self, items):
+            return [RolloutReward(episode=bad_episode, turns=(0.0, 1.0)) for _ in items]
+
+    [reward] = score_rollouts(
+        _NonFiniteEnv(id="non-finite"),
+        [RolloutScoreRequest(example={}, state={}, turn_count=2)],
+    )
+    # nan and inf both canonicalize to nan, trl's only unscorable marker (isnan(inf) is false)
+    assert math.isnan(reward.episode)
+    assert reward.turns is None
+    assert capsys.readouterr().out.count("rollout unscorable") == 1
 
 
 def test_score_rollouts_uses_one_typed_scoring_pass():
@@ -262,6 +279,24 @@ def test_freesolo_malformed_per_turn_metadata_degrades_to_episode_reward(
     rewards = env.rollout_rewards_many([({"input": "prompt"}, state)])
 
     assert rewards == [RolloutReward(episode=1.5, turns=None)]
+    assert capsys.readouterr().out.count("[grpo][warn]") == 1
+
+
+@pytest.mark.parametrize(
+    "metadata_value",
+    ["bad-string", [0.0, 1.0], ""],
+    ids=["str", "list", "empty-str"],
+)
+def test_freesolo_non_mapping_metadata_degrades_to_episode_reward(
+    monkeypatch, capsys, metadata_value
+):
+    # a non-mapping metadata container (env bug) must degrade to episode credit, not raise.
+    result = RewardResult(score=2.0, metadata=metadata_value)
+    env, state, _score_calls = _freesolo_env(monkeypatch, result)
+
+    rewards = env.rollout_rewards_many([({"input": "prompt"}, state)])
+
+    assert rewards == [RolloutReward(episode=2.0, turns=None)]
     assert capsys.readouterr().out.count("[grpo][warn]") == 1
 
 

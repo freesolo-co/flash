@@ -7,6 +7,7 @@ public names are re-exported here so existing ``flash.envs.adapter`` import path
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from flash.envs.base import BaseEnvironment, RolloutReward
@@ -236,7 +237,12 @@ class FreesoloEnvironment(BaseEnvironment):
 
     @staticmethod
     def _turn_rewards_from_result(result) -> tuple[float, ...] | None:
-        metadata = getattr(result, "metadata", None) or {}
+        metadata = getattr(result, "metadata", None)
+        if metadata is None:
+            return None
+        if not isinstance(metadata, Mapping):
+            print("[grpo][warn] malformed per_turn_rewards metadata; using episode reward")
+            return None
         values = metadata.get("per_turn_rewards")
         if values is None:
             return None

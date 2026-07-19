@@ -17,28 +17,35 @@ class RolloutScoreRequest:
 
 def _validated_reward(reward: RolloutReward, request: RolloutScoreRequest) -> RolloutReward:
     episode = float(reward.episode)
-    reason: str | None = None
-    turns: tuple[float, ...] | None = None
-
+    # a non-finite episode reward is unscorable and has no valid scalar fallback. canonicalize it to
+    # nan, which is trl's ONLY unscorable marker (trl uses torch.isnan to exclude the row from the
+    # group baseline and then nan_to_num zeros its advantage, matching stock grpo). forwarding a raw
+    # inf instead would NOT be recognized as unscorable and would contaminate the whole group with
+    # huge advantages. per-turn credit is disabled so the unscorable row is never revived.
     if not math.isfinite(episode):
-        reason = "episode reward is non-finite"
-    elif reward.turns is not None:
-        try:
-            turns = tuple(float(value) for value in reward.turns)
-        except (TypeError, ValueError):
-            reason = "per-turn rewards contain a non-number"
-        else:
-            if len(turns) != request.turn_count:
-                reason = (
-                    f"received {len(turns)} reward(s) for {request.turn_count} assistant turn(s)"
-                )
-            elif not all(math.isfinite(value) for value in turns):
-                reason = "per-turn rewards contain a non-finite value"
+        print(
+            "[grpo][warn] episode reward non-finite; rollout unscorable, per-turn credit disabled"
+        )
+        return RolloutReward(episode=float("nan"), turns=None)
+    if reward.turns is None:
+        return RolloutReward(episode=episode, turns=None)
+
+    reason: str | None = None
+    coerced: tuple[float, ...] | None = None
+    try:
+        coerced = tuple(float(value) for value in reward.turns)
+    except (TypeError, ValueError):
+        reason = "per-turn rewards contain a non-number"
+    else:
+        if len(coerced) != request.turn_count:
+            reason = f"received {len(coerced)} reward(s) for {request.turn_count} assistant turn(s)"
+        elif not all(math.isfinite(value) for value in coerced):
+            reason = "per-turn rewards contain a non-finite value"
 
     if reason is not None:
         print(f"[grpo][warn] per-turn rewards unavailable ({reason}); using episode reward")
-        turns = None
-    return RolloutReward(episode=episode, turns=turns)
+        return RolloutReward(episode=episode, turns=None)
+    return RolloutReward(episode=episode, turns=coerced)
 
 
 def score_rollouts(active_env, requests: list[RolloutScoreRequest]) -> list[RolloutReward]:
