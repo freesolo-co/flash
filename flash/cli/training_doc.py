@@ -109,6 +109,8 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
+# multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
+# credit_assignment = "per_episode"
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.

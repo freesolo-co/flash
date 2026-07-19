@@ -39,11 +39,38 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.spec import (
+    DEFAULT_CREDIT_ASSIGNMENT,
+    PER_TURN_CREDIT_ASSIGNMENT,
+    CreditAssignment,
+)
 
 
 def grpo_under_ran(steps_run: int, steps: int) -> bool:
     """return true when grpo completes fewer optimizer updates than requested."""
     return int(steps_run) < int(steps)
+
+
+def select_grpo_trainer(
+    base_trainer_class,
+    *,
+    credit_assignment: CreditAssignment,
+    is_multi_turn: bool,
+    use_rollout_func: bool,
+):
+    """select the trainer that can execute the requested credit-assignment semantics."""
+    if credit_assignment != PER_TURN_CREDIT_ASSIGNMENT:
+        return base_trainer_class
+    if use_rollout_func:
+        from flash.engine.worker.grpo_perturn_trainer import GRPOPerTurnTrainer
+
+        return GRPOPerTurnTrainer
+    if is_multi_turn:
+        raise RuntimeError(
+            f"credit_assignment={PER_TURN_CREDIT_ASSIGNMENT!r} is not supported for tool-calling "
+            f"multi-turn environments; use {DEFAULT_CREDIT_ASSIGNMENT!r}"
+        )
+    return base_trainer_class
 
 
 def run_rl():
@@ -593,10 +620,30 @@ def run_rl():
     if is_tool_env and not tools:
         print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
     use_rollout_func = is_multi_turn and not (is_tool_env and tools)
+    credit = _t.credit_assignment if _t else DEFAULT_CREDIT_ASSIGNMENT
+    trainer_class = select_grpo_trainer(
+        GRPOTrainer,
+        credit_assignment=credit,
+        is_multi_turn=is_multi_turn,
+        use_rollout_func=use_rollout_func,
+    )
     if use_rollout_func:
-        from flash.engine.worker.grpo_perturn_trainer import GRPOPerTurnTrainer
-
-    trainer_class = GRPOPerTurnTrainer if use_rollout_func else GRPOTrainer
+        if credit == PER_TURN_CREDIT_ASSIGNMENT:
+            print(
+                "[rl] credit assignment: per-turn "
+                "(each assistant turn credited by its own group-relative reward)"
+            )
+            print(
+                "[rl] per-turn credit requires the env to expose per-turn rewards; "
+                "otherwise it degrades to per-episode"
+            )
+        else:
+            print("[rl] credit assignment: per-episode (one reward per rollout)")
+    elif credit == PER_TURN_CREDIT_ASSIGNMENT:
+        print(
+            "[rl] credit assignment: per-turn is equivalent to per-episode for single-turn "
+            "environments"
+        )
     _w.require_vllm_for_rollout_func(use_rollout_func, True, model_id)
     if is_tool_env and tools:
         extra_trainer_kwargs["tools"] = tools

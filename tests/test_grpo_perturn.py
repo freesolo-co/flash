@@ -12,11 +12,62 @@ from flash.engine.worker.grpo_perturn_trainer import (
     GRPOPerTurnTrainer,
     build_per_turn_advantages,
 )
+from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, PER_TURN_CREDIT_ASSIGNMENT
 from tests.test_multiturn_per_turn_reward import (
     _TOKEN_IDS,
     SyntheticPerTurnEnv,
     _rollout,
 )
+
+
+@pytest.mark.parametrize(
+    ("credit_assignment", "is_multi_turn", "use_rollout_func", "expects_per_turn_trainer"),
+    [
+        (PER_TURN_CREDIT_ASSIGNMENT, True, True, True),
+        (PER_TURN_CREDIT_ASSIGNMENT, False, False, False),
+        (DEFAULT_CREDIT_ASSIGNMENT, False, False, False),
+        (DEFAULT_CREDIT_ASSIGNMENT, True, False, False),
+        (DEFAULT_CREDIT_ASSIGNMENT, True, True, False),
+    ],
+)
+def test_credit_assignment_selects_trainer_class(
+    credit_assignment, is_multi_turn, use_rollout_func, expects_per_turn_trainer
+):
+    from trl import GRPOTrainer
+
+    from flash.engine.worker.rl import select_grpo_trainer
+
+    expected = GRPOPerTurnTrainer if expects_per_turn_trainer else GRPOTrainer
+
+    assert (
+        select_grpo_trainer(
+            GRPOTrainer,
+            credit_assignment=credit_assignment,
+            is_multi_turn=is_multi_turn,
+            use_rollout_func=use_rollout_func,
+        )
+        is expected
+    )
+
+
+def test_per_turn_credit_rejects_tool_calling_multi_turn_environment():
+    from trl import GRPOTrainer
+
+    from flash.engine.worker.rl import select_grpo_trainer
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "credit_assignment='per_turn' is not supported for tool-calling multi-turn "
+            "environments; use 'per_episode'"
+        ),
+    ):
+        select_grpo_trainer(
+            GRPOTrainer,
+            credit_assignment=PER_TURN_CREDIT_ASSIGNMENT,
+            is_multi_turn=True,
+            use_rollout_func=False,
+        )
 
 
 def test_build_per_turn_advantages_centers_by_turn_and_assigns_spans():
