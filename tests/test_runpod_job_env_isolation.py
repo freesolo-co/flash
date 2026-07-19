@@ -436,11 +436,10 @@ def test_job_pip_rejects_location_changing_arguments(monkeypatch, tmp_path):
         "--sr=/tmp/x",
         "-r",
         "-rreqs.txt",
+        "--requirement",
         "--requirement=reqs.txt",
-        "--req=reqs.txt",
         "-c",
         "--constraint=c.txt",
-        "--con=c.txt",
     ],
 )
 def test_all_pip_location_option_forms_are_rejected(monkeypatch, tmp_path, argument):

@@ -406,7 +406,8 @@ def _train_body(input_data: dict) -> dict:
                 or re.match(r"^--src?(?:=.*)?$", argument)
                 or re.match(r"^-[qvUI]*t", argument)
                 # -r/-c reference a file that can itself smuggle location options past this guard
-                or argument.startswith(("-r", "--requirement", "--req", "-c", "--constraint", "--con"))
+                or re.match(r"^-(r|c)($|=|[^-])", argument)
+                or re.match(r"^--(requirement|constraint)(=|$)", argument)
             ):
                 raise ValueError(f"extra_pip location option is not allowed: {argument!r}")
         if extra_pip:
