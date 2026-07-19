@@ -75,12 +75,15 @@ def run_rl():
         exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
-    GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(GRPOTrainer)
+    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
+    GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(GRPOTrainer, model_id)
     if _chalk_grpo_fused:
         print("[rl] Chalk GRPO selected-token log-probabilities active (eager, no full logits)")
     else:
-        print("[rl] Chalk GRPO unavailable or failed its probe; using TRL full-logits fallback")
-    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
+        print(
+            "[rl] Chalk GRPO unavailable, unsupported, or failed its probe; "
+            "using TRL full-logits fallback"
+        )
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     download_seconds = (
         _w.prefetch_model(model_id, revision=model_revision)

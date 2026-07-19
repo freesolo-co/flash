@@ -15,6 +15,20 @@ class ChalkGrpoRuntime:
     selective_log_softmax: Callable[..., Any]
 
 
+# the fused path applies the output projection directly, so only models verified to have no
+# post-projection logit transform may bypass their full forward method.
+_VALIDATED_MODEL_IDS = frozenset(
+    {
+        "openbmb/MiniCPM5-1B",
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
+
+
 def _import_selective_log_softmax() -> Callable[..., Any]:
     module = importlib.import_module("chalk.ops.grpo")
     return module.selective_log_softmax
@@ -181,13 +195,15 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
             mm_token_type_ids=None,
             image_position_ids=None,
         ):
+            # sizing can lift the outer completion batch above the full-logits memory ceiling, so
+            # every fallback keeps trl's inner logit chunk at one completion.
             if self._flash_chalk_failed:
                 return super()._get_per_token_logps_and_entropies(
                     model,
                     input_ids,
                     attention_mask,
                     logits_to_keep,
-                    batch_size,
+                    1,
                     compute_entropy,
                     pixel_values,
                     image_grid_thw,
@@ -226,7 +242,7 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
                     input_ids,
                     attention_mask,
                     logits_to_keep,
-                    batch_size,
+                    1,
                     compute_entropy,
                     pixel_values,
                     image_grid_thw,
@@ -327,7 +343,9 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
     return ChalkGRPOTrainer
 
 
-def resolve_chalk_grpo_trainer(base_trainer):
+def resolve_chalk_grpo_trainer(base_trainer, model_id: str):
+    if model_id not in _VALIDATED_MODEL_IDS:
+        return base_trainer, False
     runtime = probe_chalk_grpo()
     if runtime is None:
         return base_trainer, False

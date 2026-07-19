@@ -54,7 +54,22 @@ def test_resolve_chalk_grpo_trainer_keeps_exact_base_fallback(monkeypatch):
 
     monkeypatch.setattr("flash.engine.worker.grpo_fused.probe_chalk_grpo", lambda: None)
 
-    trainer_class, fused = resolve_chalk_grpo_trainer(BaseTrainer)
+    trainer_class, fused = resolve_chalk_grpo_trainer(BaseTrainer, "Qwen/Qwen3.5-0.8B")
+
+    assert fused is False
+    assert trainer_class is BaseTrainer
+
+
+def test_resolve_chalk_grpo_trainer_rejects_unvalidated_model_before_probe(monkeypatch):
+    class BaseTrainer:
+        pass
+
+    def unexpected_probe():
+        raise AssertionError("unsupported models must not probe or engage the fused path")
+
+    monkeypatch.setattr("flash.engine.worker.grpo_fused.probe_chalk_grpo", unexpected_probe)
+
+    trainer_class, fused = resolve_chalk_grpo_trainer(BaseTrainer, "google/gemma-3-1b-it")
 
     assert fused is False
     assert trainer_class is BaseTrainer
@@ -67,11 +82,41 @@ def test_resolve_chalk_grpo_trainer_engages_validated_runtime(monkeypatch):
     runtime = ChalkGrpoRuntime(_selective_log_softmax)
     monkeypatch.setattr("flash.engine.worker.grpo_fused.probe_chalk_grpo", lambda: runtime)
 
-    trainer_class, fused = resolve_chalk_grpo_trainer(BaseTrainer)
+    trainer_class, fused = resolve_chalk_grpo_trainer(BaseTrainer, "Qwen/Qwen3.5-0.8B")
 
     assert fused is True
     assert issubclass(trainer_class, BaseTrainer)
     assert trainer_class._flash_chalk_runtime is runtime
+
+
+def test_fused_trainer_chunks_persistent_and_runtime_fallbacks_to_one_completion():
+    class BaseTrainer:
+        def _get_per_token_logps_and_entropies(self, *args, **kwargs):
+            self.fallback_batch_sizes.append(args[4])
+            return "fallback"
+
+    trainer_class = make_chalk_grpo_trainer(
+        BaseTrainer, ChalkGrpoRuntime(_selective_log_softmax)
+    )
+    trainer = trainer_class.__new__(trainer_class)
+    trainer.fallback_batch_sizes = []
+    trainer.selected_batch_sizes = []
+    trainer._flash_chalk_failed = True
+
+    assert trainer._get_per_token_logps_and_entropies(None, None, None, 4, 8) == "fallback"
+
+    trainer._flash_chalk_failed = False
+
+    def fail_selected_path(*args, **kwargs):
+        trainer.selected_batch_sizes.append(args[4])
+        raise RuntimeError("shape-specific chalk failure")
+
+    trainer._flash_selected_logps_and_entropies = fail_selected_path
+
+    assert trainer._get_per_token_logps_and_entropies(None, None, None, 4, 8) == "fallback"
+    assert trainer._flash_chalk_failed is True
+    assert trainer.selected_batch_sizes == [8]
+    assert trainer.fallback_batch_sizes == [1, 1]
 
 
 def test_chunked_entropy_matches_full_logits():
