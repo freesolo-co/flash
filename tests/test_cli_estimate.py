@@ -7,6 +7,7 @@ import types
 
 import pytest
 
+from flash.cli import main
 from flash.cli.commands import cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
@@ -388,7 +389,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
-def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
+def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path, capsys):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
@@ -401,19 +402,15 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
         "max_context_tokens = 33000\n"
         'hf_repo = "owner/runs"\n'
     )
-    args = types.SimpleNamespace(
-        config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False
-    )
 
-    with pytest.raises(
-        ValueError,
-        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=32768",
-    ) as exc_info:
-        cmd_train(args)
-
-    assert "your installed flash CLI may be out of date; upgrade to the latest release" in str(
-        exc_info.value
+    assert main(["train", str(cfg), "--cost"]) == 1
+    err = capsys.readouterr().err
+    assert (
+        "train.max_context_tokens=33000 exceeds Qwen/Qwen3.5-4B's serving max_model_len=32768"
+        in err
     )
+    assert "offline estimate uses serving caps shipped with your local flash CLI" in err
+    assert "upgrade to the latest release" in err
 
 
 def test_cmd_train_cost_rejects_unlisted_model(tmp_path):

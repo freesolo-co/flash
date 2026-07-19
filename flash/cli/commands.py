@@ -222,7 +222,14 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
-    preflight_train_context_within_serving(spec)
+    try:
+        preflight_train_context_within_serving(spec)
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}\nnote: this offline estimate uses serving caps shipped with your local flash "
+            "CLI, which may be out of date; upgrade to the latest release if this cap looks lower "
+            "than expected."
+        ) from exc
     if spec.train.init_from_adapter:
         # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
         # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank

@@ -34,8 +34,10 @@ def test_sft_max_context_tokens_above_serving_cap_rejected():
     spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=40000)
     with pytest.raises(
         ValueError, match=r"train\.max_context_tokens=40000 exceeds .*max_model_len=32768"
-    ):
+    ) as exc_info:
         preflight_train_context_within_serving(spec)
+
+    assert "upgrade to the latest release" not in str(exc_info.value)
 
 
 def test_sft_max_context_tokens_at_cap_allowed():
