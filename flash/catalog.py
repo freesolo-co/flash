@@ -123,8 +123,6 @@ class ModelInfo:
     linear_conv_kernel_dim: int = 0
     # fp8 attention-token equivalent of one recurrent-state page, rounded to vllm's 16-token block.
     mamba_block_size: int = 0
-    num_experts: int = 0
-    num_experts_per_token: int = 0
     # grouped (in_features, out_features, count) for peft all-linear on the full loaded model.
     lora_target_shapes: tuple[tuple[int, int, int], ...] = ()
 
@@ -152,8 +150,6 @@ class ModelInfo:
             "linear_key_head_dim",
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
-            "num_experts",
-            "num_experts_per_token",
             "lora_target_shapes",
         ):
             data.pop(key, None)
@@ -430,8 +426,6 @@ MODELS: dict[str, ModelInfo] = {
         # vllm 0.19.1 derives the 1,097,728-byte gdn state page as 1072 fp8 attention
         # tokens after the 16-token backend alignment.
         mamba_block_size=1072,
-        num_experts=256,
-        num_experts_per_token=8,
         # peft targets shared-expert linears on every layer. fused routed-expert tensors are not
         # nn.linear modules and are not adapter targets in the loaded model.
         lora_target_shapes=(

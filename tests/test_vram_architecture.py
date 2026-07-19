@@ -40,11 +40,6 @@ def test_curated_architecture_geometry_covers_every_loaded_lora_target():
             for in_features, out_features, count in info.lora_target_shapes
         )
 
-    moe = MODELS["Qwen/Qwen3.6-35B-A3B"]
-    assert moe.num_experts == 256
-    assert moe.num_experts_per_token == 8
-    assert _EXPECTED_LORA_TARGET_COUNTS[moe.id] > moe.num_experts_per_token
-
 
 @pytest.mark.parametrize("model_id", tuple(MODELS))
 def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
