@@ -389,6 +389,24 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     try:
         # offline sizing/display only; allocator re-resolves at submit time.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
+        if "type" in gpu_raw and not exact_type:
+            authored_type_raw = gpu_raw["type"]
+            try:
+                authored_type = (
+                    canonical_gpu(authored_type_raw)
+                    if isinstance(authored_type_raw, str)
+                    else None
+                )
+            except UnsupportedGpuError:
+                authored_type = None
+            if authored_type != gpu_type:
+                print(
+                    f"note: [gpu] type={authored_type_raw!r} is a non-pinning hint and was not "
+                    "applied; the allocator will pick the cheapest validated class that fits "
+                    f"(selected: {gpu_type!r}). to require a specific class, set [gpu] "
+                    f"exact_type={authored_type_raw!r}.",
+                    file=sys.stderr,
+                )
         if exact_type and not model_revision:
             from flash.providers.allocator import required_vram_gb
 

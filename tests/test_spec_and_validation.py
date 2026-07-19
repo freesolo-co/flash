@@ -669,6 +669,23 @@ def test_gpu_type_is_non_pinning_managed_input() -> None:
     assert authored.gpu.exact_type == ""
 
 
+def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
+    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    warning = capsys.readouterr().err
+    assert "[gpu] type='B200' is a non-pinning hint and was not applied" in warning
+    assert f"selected: {authored.gpu.type!r}" in warning
+    assert "set [gpu] exact_type='B200'" in warning
+
+    spec_from_dict(_raw(**{"gpu.type": "H10O"}))
+    invalid_warning = capsys.readouterr().err
+    assert "[gpu] type='H10O' is a non-pinning hint and was not applied" in invalid_warning
+
+    automatic_raw = _raw()
+    automatic_raw["gpu"].pop("type")
+    spec_from_dict(automatic_raw)
+    assert capsys.readouterr().err == ""
+
+
 def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
     assert JobSpec.from_dict({"gpu": {"type": " h100 "}}).gpu.type == "H100"
     with pytest.raises(TypeError, match=r"gpu\.type must be a string"):

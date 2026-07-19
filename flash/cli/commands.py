@@ -160,8 +160,9 @@ def cmd_gpus(args) -> int:
         (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
     )
     tip = (
-        "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated managed class that fits the model, so you don't pin a GPU type."
+        "Tip: GPU allocation is automatic by default.\n"
+        'The allocator picks the cheapest validated class that fits. Pin a specific class with [gpu] '
+        'exact_type = "<CLASS>".'
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
