@@ -162,6 +162,8 @@ class JobHandle:
     attempt: int
     started_ts: float
     execution_timeout_ms: int | None = None
+    reuse_signature: str | None = None
+    released_to_warm_pool: bool = False
 
     def to_dict(self) -> dict:
         data = {
@@ -176,6 +178,10 @@ class JobHandle:
             data["job_id"] = self.job_id
         if self.execution_timeout_ms is not None:
             data["execution_timeout_ms"] = self.execution_timeout_ms
+        if self.reuse_signature is not None:
+            data["reuse_signature"] = self.reuse_signature
+        if self.released_to_warm_pool:
+            data["released_to_warm_pool"] = True
         return data
 
     @classmethod
@@ -213,14 +219,22 @@ class JobHandle:
             isinstance(timeout_raw, bool) or not isinstance(timeout_raw, int) or timeout_raw <= 0
         ):
             raise ValueError("persisted RunPod execution timeout is invalid")
+        signature = d.get("reuse_signature")
+        if signature is not None and (not isinstance(signature, str) or not signature):
+            raise ValueError("persisted RunPod reuse signature is invalid")
+        released = d.get("released_to_warm_pool", False)
+        if not isinstance(released, bool):
+            raise ValueError("persisted RunPod warm release marker is invalid")
         return cls(
-            endpoint_id,
-            endpoint_name,
-            fingerprint,
-            job_id,
-            attempt,
-            started_ts,
-            timeout_raw,
+            endpoint_id=endpoint_id,
+            endpoint_name=endpoint_name,
+            key_fingerprint=fingerprint,
+            job_id=job_id,
+            attempt=attempt,
+            started_ts=started_ts,
+            execution_timeout_ms=timeout_raw,
+            reuse_signature=signature,
+            released_to_warm_pool=released,
         )
 
 
@@ -244,80 +258,6 @@ def canonical_endpoint_name(name: str) -> str:
 def _is_flash_endpoint(name: str) -> bool:
     """True for a flash training endpoint (in either bare or live- registered form)."""
     return canonical_endpoint_name(name).startswith("flash-")
-
-
-def _current_owning_fingerprint() -> str:
-    """Return the fingerprint for the RunPod account currently selected for provisioning."""
-    from flash.providers.runpod.auth import ensure_auth
-
-    with FLASH_SDK_LOCK:
-        return runpod_api.key_fingerprint(ensure_auth())
-
-
-def _warm_endpoint_reusable(health: object) -> bool:
-    if not isinstance(health, dict):
-        return False
-    workers = health.get("workers")
-    jobs_info = health.get("jobs")
-    if not isinstance(workers, dict) or not isinstance(jobs_info, dict):
-        return False
-    return (
-        (jobs_info.get("inQueue") or 0) == 0
-        and (jobs_info.get("inProgress") or 0) == 0
-        and (workers.get("unhealthy") or 0) == 0
-    )
-
-
-def _claim_warm_endpoint(
-    spec, needed_ms: int, deadline_at: float | None
-) -> tuple[str, str, str, int] | None:
-    from flash.providers.runpod import warm_pool
-
-    try:
-        fingerprint = _current_owning_fingerprint()
-    except Exception:
-        logger.debug(
-            "warm endpoint account lookup unavailable; creating a fresh endpoint", exc_info=True
-        )
-        return None
-    signature = warm_pool.reuse_signature(spec, fingerprint)
-    try:
-        candidates = warm_pool.candidates(signature, needed_ms)
-    except Exception:
-        logger.warning(
-            "warm endpoint registry unavailable; creating a fresh endpoint", exc_info=True
-        )
-        return None
-    for record in candidates:
-        try:
-            health = runpod_api.endpoint_health_for_fingerprint(
-                record.endpoint_id,
-                record.key_fingerprint,
-                **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, deadline_at),
-            )
-        except Exception:
-            with contextlib.suppress(Exception):
-                warm_pool.prune(record.endpoint_id)
-            continue
-        if not _warm_endpoint_reusable(health):
-            with contextlib.suppress(Exception):
-                warm_pool.prune(record.endpoint_id)
-            continue
-        try:
-            claimed = warm_pool.claim(record.endpoint_id)
-        except Exception:
-            logger.warning("warm endpoint claim failed; creating a fresh endpoint", exc_info=True)
-            return None
-        if not claimed:
-            continue
-        logger.info("reusing warm RunPod endpoint %s (%s)", record.name, record.endpoint_id)
-        return (
-            record.endpoint_id,
-            record.name,
-            record.key_fingerprint,
-            record.execution_timeout_ms,
-        )
-    return None
 
 
 def _sweep_idle_flash_endpoints(
@@ -448,6 +388,7 @@ def deploy_train_endpoint(
     disk_gb: int | None = None,
     spec=None,
     endpoint_kwargs: dict | Callable[[], dict] | None = None,
+    worker_image: str | None = None,
     deadline_at: float | None = None,
 ) -> tuple[str, str, str]:
     """Deploy a uniquely-named worker endpoint and return its id, name, and owning fingerprint.
@@ -464,7 +405,7 @@ def deploy_train_endpoint(
     _patch_runpod_backoff()
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    image = worker_image_for_gpu(friendly, allow_default=True)
+    image = worker_image or worker_image_for_gpu(friendly, allow_default=True)
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
@@ -686,9 +627,7 @@ def poll_job(
     last_status = None
     last_hb_key = None
     last_hb_ts = 0.0
-    last_hb_attempt = (
-        -1
-    )  # -1 sentinel < any real attempt; gates out prior-attempt leftover heartbeats
+    last_hb_attempt = -1  # sentinel below any real attempt; gates prior-attempt heartbeats
     last_progress = time.time()
     seen_training_hb = False
     last_health_probe = 0.0
@@ -863,6 +802,7 @@ def submit_run(
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
     from flash.envs.registry import worker_pip_for_env
+    from flash.providers.runpod import warm_pool
     from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
     from flash.runner import flash_code_prefix
 
@@ -885,7 +825,28 @@ def submit_run(
     )
     worker_env["ATTEMPT"] = str(attempt_id)
     needed_ms = timeout_s * 1000
-    warm = _claim_warm_endpoint(spec, needed_ms, deadline_at)
+    resolved_image = worker_image_for_gpu(canonical_gpu(spec.gpu.type), allow_default=True)
+    resolved_endpoint_kwargs = weight_cache_endpoint_kwargs(spec)
+    has_volume = bool(resolved_endpoint_kwargs.get("volume"))
+    first_endpoint_kwargs = [resolved_endpoint_kwargs]
+    deployed_has_volume = [has_volume]
+
+    def endpoint_kwargs_for_deploy():
+        kwargs = (
+            first_endpoint_kwargs.pop()
+            if first_endpoint_kwargs
+            else weight_cache_endpoint_kwargs(spec)
+        )
+        deployed_has_volume[0] = bool(kwargs.get("volume"))
+        return kwargs
+
+    warm = warm_pool.acquire(
+        spec,
+        needed_ms,
+        deadline_at,
+        worker_image=resolved_image,
+        has_volume=has_volume,
+    )
     if warm is None:
         endpoint_id, name, key_fingerprint = deploy_train_endpoint(
             spec.gpu.type,
@@ -893,11 +854,36 @@ def submit_run(
             name_suffix=suffix,
             disk_gb=spec.gpu.disk_gb,
             spec=spec,
+            endpoint_kwargs=endpoint_kwargs_for_deploy,
+            worker_image=resolved_image,
             **deadline_kwargs(deploy_train_endpoint, deadline_at),
         )
         endpoint_timeout_ms = needed_ms
+        signature = warm_pool.reuse_signature(
+            spec,
+            key_fingerprint,
+            worker_image=resolved_image,
+            has_volume=deployed_has_volume[0],
+        )
     else:
-        endpoint_id, name, key_fingerprint, endpoint_timeout_ms = warm
+        endpoint_id = warm.endpoint_id
+        name = warm.name
+        key_fingerprint = warm.key_fingerprint
+        endpoint_timeout_ms = warm.execution_timeout_ms
+        signature = warm.signature
+        if on_handle is not None:
+            on_handle(
+                JobHandle(
+                    endpoint_id=endpoint_id,
+                    endpoint_name=name,
+                    key_fingerprint=key_fingerprint,
+                    job_id=None,
+                    attempt=attempt_id,
+                    started_ts=time.time(),
+                    execution_timeout_ms=endpoint_timeout_ms,
+                    reuse_signature=signature,
+                ).to_dict()
+            )
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
@@ -930,26 +916,28 @@ def submit_run(
         if on_handle is not None:
             on_handle(
                 JobHandle(
-                    endpoint_id,
-                    name,
-                    key_fingerprint,
-                    None,
-                    attempt_id,
-                    time.time(),
-                    endpoint_timeout_ms,
+                    endpoint_id=endpoint_id,
+                    endpoint_name=name,
+                    key_fingerprint=key_fingerprint,
+                    job_id=None,
+                    attempt=attempt_id,
+                    started_ts=time.time(),
+                    execution_timeout_ms=endpoint_timeout_ms,
+                    reuse_signature=signature,
                 ).to_dict()
             )
         raise UnreconciledCreateError(
             "RunPod queue submission could not be reconciled and endpoint deletion was unconfirmed"
         ) from exc
     handle = JobHandle(
-        endpoint_id,
-        name,
-        key_fingerprint,
-        job_id,
-        attempt_id,
-        submitted_ts,
-        endpoint_timeout_ms,
+        endpoint_id=endpoint_id,
+        endpoint_name=name,
+        key_fingerprint=key_fingerprint,
+        job_id=job_id,
+        attempt=attempt_id,
+        started_ts=submitted_ts,
+        execution_timeout_ms=endpoint_timeout_ms,
+        reuse_signature=signature,
     )
     if log is not None:
         print(
@@ -992,10 +980,6 @@ def submit_run(
         **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 
-
-# make_hf_heartbeat_reader / make_hf_failure_detail_reader and the heartbeat-provenance predicate
-# worker_flagged_retriable are provider-neutral and live in flash.providers._hf_artifacts; they are
-# re-exported here so the runpod package and tests reference them as runpod.jobs.<name>.
 
 
 def surfaced_worker_flags(

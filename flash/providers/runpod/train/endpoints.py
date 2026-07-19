@@ -761,19 +761,34 @@ def _endpoint_name_matches_run(name: str, target: str) -> bool:
     return canonical == target or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
 
 
-def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
+def _select_endpoint_resources(
+    resources: dict,
+    target: str,
+    exclude_endpoint_id: str | None = None,
+) -> list[str]:
     """Return exact base and canonical retry endpoint resource ids for one run."""
     if not target:
         return []
     return [
         uid
         for uid, resource in (resources or {}).items()
-        if _endpoint_name_matches_run(getattr(resource, "name", ""), target)
+        if (
+            exclude_endpoint_id is None
+            or (
+                uid != exclude_endpoint_id
+                and getattr(resource, "id", None) != exclude_endpoint_id
+            )
+        )
+        and _endpoint_name_matches_run(getattr(resource, "name", ""), target)
     ]
 
 
-def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
-    """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
+def terminate_endpoint(
+    friendly_gpu: str,
+    run_id: str | None = None,
+    exclude_endpoint_id: str | None = None,
+) -> list[dict]:
+    """Delete a run's endpoints except one released warm endpoint. Best-effort, never raises."""
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
     # Serialize isolation + lookup + undeploy: isolate_flash_state swaps process-wide globals,
@@ -792,7 +807,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
         try:
             rm = ResourceManager()
             resources = rm.list_all_resources()
-            uids = _select_endpoint_resources(resources, target)
+            uids = _select_endpoint_resources(resources, target, exclude_endpoint_id)
         except Exception as exc:
             detail = sanitize_diagnostic(exc, limit=1000)
             return [
@@ -857,12 +872,14 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
         from flash.providers.runpod import api as runpod_api
 
         by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
-        rest_confirmed_clear = not failed_fingerprints
+        rest_confirmed_clear = not failed_fingerprints and exclude_endpoint_id is None
         for fingerprint, endpoints in by_fingerprint.items():
             for endpoint in endpoints:
-                if not _endpoint_name_matches_run(endpoint.get("name", ""), target):
-                    continue
                 endpoint_id = endpoint.get("id")
+                if endpoint_id == exclude_endpoint_id or not _endpoint_name_matches_run(
+                    endpoint.get("name", ""), target
+                ):
+                    continue
                 if not endpoint_id or not runpod_api.delete_endpoint_for_fingerprint(
                     endpoint_id, fingerprint
                 ):
@@ -899,6 +916,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     if rest_confirmed_clear:
         _release_endpoint_slot(target)
 
-    with contextlib.suppress(Exception):
-        stop_endpoint(friendly, name=target)
+    if exclude_endpoint_id is None:
+        with contextlib.suppress(Exception):
+            stop_endpoint(friendly, name=target)
     return results

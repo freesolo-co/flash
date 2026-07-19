@@ -138,6 +138,10 @@ def _strict_teardown_handle(handle) -> None:
     provider = get_provider(handle.provider)
     data = handle.to_dict()
     if handle.provider == "runpod":
+        # a done run keeps its historical remote for billing. once released, that stale owner must
+        # never destroy an endpoint that a later run may already have claimed from the warm pool.
+        if data.get("released_to_warm_pool") is True:
+            return
         if data.get("job_id"):
             with contextlib.suppress(Exception):
                 provider.cancel(handle)
@@ -786,32 +790,6 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     )
 
 
-def _register_warm_runpod_endpoint(status, spec: JobSpec) -> bool:
-    if status.state != "done" or not isinstance(status.remote, dict):
-        return False
-    if status.remote.get("provider") != "runpod":
-        return False
-
-    from flash.providers.base import canonical_gpu
-    from flash.providers.runpod import warm_pool
-    from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-
-    handle = RunpodJobHandle.from_dict(status.remote)
-    execution_timeout_ms = handle.execution_timeout_ms
-    if execution_timeout_ms is None:
-        execution_timeout_ms = int(spec.gpu.max_wall_seconds * 1000)
-    record = warm_pool.WarmEndpoint(
-        endpoint_id=handle.endpoint_id,
-        name=handle.endpoint_name,
-        key_fingerprint=handle.key_fingerprint,
-        signature=warm_pool.reuse_signature(spec, handle.key_fingerprint),
-        gpu_type=canonical_gpu(spec.gpu.type),
-        execution_timeout_ms=execution_timeout_ms,
-        released_at=time.time(),
-    )
-    return warm_pool.register(record)
-
-
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
     from flash.runner import (
@@ -830,25 +808,26 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     if status is not None:
         with contextlib.suppress(Exception):
             spec = effective_spec_from_status(status)
-    warmed_runpod_endpoint = False
+    released_endpoint_id = None
     if (
         status is not None
         and status.remote
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
         with contextlib.suppress(Exception):
-            warmed_runpod_endpoint = _register_warm_runpod_endpoint(status, spec)
-        if not warmed_runpod_endpoint:
+            from flash.providers.runpod import release_warm_endpoint
+
+            released_endpoint_id = release_warm_endpoint(status)
+        if released_endpoint_id is None:
             with contextlib.suppress(Exception):
                 _strict_teardown_handle(status.remote)
-    if not warmed_runpod_endpoint:
-        try:
-            # RunPod gc reaps rN-suffixed endpoints the persisted handle can't name.
-            from flash.providers import get_provider
+    try:
+        # RunPod gc still reaps rN siblings after a warm release, excluding only the pooled endpoint.
+        from flash.providers import get_provider
 
-            get_provider("runpod").gc(spec)
-        except Exception:
-            pass
+        get_provider("runpod").gc(spec, exclude_endpoint_id=released_endpoint_id)
+    except Exception:
+        pass
     from flash.providers import INSTANCE_PROVIDERS, available_providers, get_provider
 
     _avail = available_providers()

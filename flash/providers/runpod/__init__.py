@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from flash.providers._deadline import deadline_kwargs
@@ -13,6 +14,38 @@ from flash.providers.base import (
     PollResult,
     Provider,
 )
+
+
+def release_warm_endpoint(status) -> str | None:
+    """Release one successful endpoint to the warm registry and mark its former owner."""
+    if status.state != "done" or not isinstance(status.remote, dict):
+        return None
+
+    from flash.providers.runpod import warm_pool
+    from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+    handle = RunpodJobHandle.from_dict(status.remote)
+    if handle.released_to_warm_pool:
+        return handle.endpoint_id
+    if handle.reuse_signature is None or handle.execution_timeout_ms is None:
+        return None
+    record = warm_pool.WarmEndpoint(
+        endpoint_id=handle.endpoint_id,
+        name=handle.endpoint_name,
+        key_fingerprint=handle.key_fingerprint,
+        signature=handle.reuse_signature,
+        execution_timeout_ms=handle.execution_timeout_ms,
+        released_at=time.time(),
+    )
+    if not warm_pool.register(record):
+        return None
+
+    from flash.runner import _mark_runpod_remote_released
+
+    if _mark_runpod_remote_released(status.run_id, status.remote):
+        return handle.endpoint_id
+    warm_pool.prune(handle.endpoint_id)
+    return None
 
 
 class RunpodProvider:
@@ -162,6 +195,8 @@ class RunpodProvider:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
         strict = RunpodJobHandle.from_dict(handle.to_dict())
+        if strict.released_to_warm_pool:
+            return
         if not runpod_api.delete_endpoint_for_fingerprint(
             strict.endpoint_id, strict.key_fingerprint
         ):
@@ -169,10 +204,17 @@ class RunpodProvider:
                 f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"
             )
 
-    def gc(self, spec) -> None:
+    def gc(self, spec, *, exclude_endpoint_id: str | None = None) -> None:
         from flash.providers.runpod.train import terminate_endpoint
 
-        terminate_endpoint(spec.gpu.type, spec.run_id)
+        if exclude_endpoint_id is None:
+            terminate_endpoint(spec.gpu.type, spec.run_id)
+            return
+        terminate_endpoint(
+            spec.gpu.type,
+            spec.run_id,
+            exclude_endpoint_id=exclude_endpoint_id,
+        )
 
     def sweep_orphans(
         self,

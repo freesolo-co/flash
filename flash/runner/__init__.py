@@ -1341,6 +1341,33 @@ def _remote_resource_identity(remote: object) -> tuple | None:
     return None
 
 
+def _mark_runpod_remote_released(run_id: str, expected_remote: dict) -> bool:
+    """Mark an exact done-run handle so later deployment cancellation cannot destroy its pool lease."""
+    expected_identity = _remote_resource_identity(expected_remote)
+    if expected_identity is None:
+        return False
+    report_status: RunStatus | None = None
+    with _status_guard(run_id):
+        status = get_status(run_id)
+        if status.state != "done" or _remote_resource_identity(status.remote) != expected_identity:
+            return False
+        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+
+        current = RunpodJobHandle.from_dict(status.remote or {})
+        if current.released_to_warm_pool:
+            return True
+        remote = dict(status.remote or {})
+        remote["released_to_warm_pool"] = True
+        RunpodJobHandle.from_dict(remote)
+        status.remote = remote
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
+
+
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     """Clear only the nonterminal remote that still names the destroyed resource."""
     expected_identity = _remote_resource_identity(expected_remote)
