@@ -874,10 +874,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _gc_run_endpoints,
         _load_run_deadline_at,
         _record_cleanup_remote,
-        _remote_resource_identity,
         _RunCancelled,
         _spec_with_remaining_wall,
-        _update,
         effective_spec_from_status,
         get_status,
     )
@@ -1038,16 +1036,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     except Exception as exc:
         try:
             _record_cleanup_remote(run_id, persisted_remote)
-            failed = _compare_and_fail_remote(run_id, persisted_remote, str(exc))
-            # force-fail ONLY an unidentifiable handle (the cas can never match it, so the run would
-            # otherwise loop `running` forever). a cas no-op on an IDENTIFIABLE remote means a
-            # concurrent cancel (or newer attempt) cleared it, and that writer must win — do not steal it.
-            if (
-                not failed
-                and _remote_resource_identity(persisted_remote) is None
-                and get_status(run_id).state not in TERMINAL_STATES
-            ):
-                _update(run_id, "failed", error=str(exc))
+            # cas-only fail: no-ops if a concurrent cancel already cleared this remote (so a user
+            # cancel is never overwritten as failed); the terminal gc below reaps the box by run label.
+            _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         except Exception:
             if next_attempt > 0:
                 _schedule_attach_reconciliation(

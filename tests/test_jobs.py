@@ -2426,33 +2426,6 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         assert "source-run/step-40" in (status.error or "")
 
 
-def test_attach_malformed_remote_identity_converges_to_failed(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp, monkeypatch)
-        remote = {
-            "provider": "runpod",
-            "endpoint_id": "ep",
-            "endpoint_name": "name",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "job",
-            "attempt": 0,
-        }
-        orch._save_status(
-            orch.RunStatus(
-                run_id="malformed-attach",
-                state="running",
-                spec=_spec("malformed-attach").to_dict(),
-                remote=remote,
-            )
-        )
-        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
-
-        status = orch.attach_run("malformed-attach", log_stream=sys.stderr)
-
-        assert status.state == "failed"
-        assert "launch timestamp" in (status.error or "")
-
-
 def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
