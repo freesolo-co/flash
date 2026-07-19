@@ -419,6 +419,8 @@ def test_job_pip_rejects_location_changing_arguments(monkeypatch, tmp_path):
     [
         "--target",
         "--target=/tmp/x",
+        "--ta",
+        "--ta=/tmp/x",
         "--tar=/tmp/x",
         "--targ=/tmp/x",
         "-t",
@@ -426,10 +428,13 @@ def test_job_pip_rejects_location_changing_arguments(monkeypatch, tmp_path):
         "-t/tmp/x",
         "-qt/tmp/x",
         "--prefix=/tmp/x",
+        "--pref=/tmp/x",
         "--prefi=/tmp/x",
         "--root=/tmp/x",
+        "--roo=/tmp/x",
         "--user",
         "--user=1",
+        "--us=/tmp/x",
         "--src",
         "--src=/tmp/x",
         "--sr",
@@ -448,6 +453,45 @@ def test_all_pip_location_option_forms_are_rejected(monkeypatch, tmp_path, argum
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     with pytest.raises(ValueError, match="extra_pip location option is not allowed"):
         endpoints._train_body(_input_data(code_prefix="../code/flash", extra_pip=[argument]))
+
+
+def test_valid_pip_arguments_reach_pip_install(monkeypatch, tmp_path):
+    from flash.providers.runpod.train import endpoints
+
+    valid = [
+        "--pre",
+        "--require-hashes",
+        "--config-settings=x=y",
+        "--cache-dir=/tmp",
+        "--upgrade",
+        "numpy==1.26",
+    ]
+    pip_calls = []
+    site_packages = None
+
+    class PipReached(Exception):
+        pass
+
+    def fake_run(command, **_kwargs):
+        nonlocal site_packages
+        if command[1:4] == ["-m", "venv", "--system-site-packages"]:
+            site_packages = Path(command[-1]) / "lib" / "python" / "site-packages"
+            site_packages.mkdir(parents=True)
+            return subprocess.CompletedProcess(command, 0)
+        if command[1] == "-c":
+            return subprocess.CompletedProcess(command, 0, stdout=f"{site_packages}\n")
+        if command[1:4] == ["-m", "pip", "install"]:
+            pip_calls.append(command)
+            raise PipReached
+        raise AssertionError(f"unexpected subprocess: {command}")
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(PipReached):
+        endpoints._train_body(_input_data(code_prefix="../code/flash", extra_pip=valid))
+
+    assert pip_calls[0][-len(valid) :] == valid
 
 
 def test_empty_extra_pip_runs_base_worker_with_clean_pythonpath(monkeypatch, tmp_path):

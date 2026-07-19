@@ -396,6 +396,29 @@ def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
     assert warnings, "a failed pool account must be surfaced at WARNING, not swallowed at DEBUG"
 
 
+def test_sweep_releases_deleted_endpoints_canonical_slot(monkeypatch):
+    from flash.providers.runpod.train import endpoints as endpoint_slots
+
+    jobs._idle_since.clear()
+    endpoint = {"id": "ep-warm", "name": "live-flash-5090-warm"}
+    monkeypatch.setattr(
+        jobs.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": [endpoint]}, [])
+    )
+    monkeypatch.setattr(
+        jobs.runpod_api, "endpoint_health_for_fingerprint", lambda *_args: _idle_health()
+    )
+    monkeypatch.setattr(
+        jobs.runpod_api, "delete_endpoint_for_fingerprint", lambda *_args: True
+    )
+    released = []
+    monkeypatch.setattr(
+        endpoint_slots, "_release_endpoint_slot", lambda name: released.append(name) or True
+    )
+
+    assert jobs._sweep_idle_flash_endpoints(protected=set()) == 1
+    assert released == ["flash-5090-warm"]
+
+
 def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
     """Multi-plane safety for RunPod: with a ``known`` scope, the reaper deletes only idle endpoints
     THIS plane has a record of. An idle endpoint owned by another control plane on the same account

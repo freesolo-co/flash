@@ -363,6 +363,12 @@ def _sweep_idle_flash_endpoints(
                     if now - first_idle < min_idle_s:
                         continue
                     if runpod_api.delete_endpoint_for_fingerprint(eid, fp):
+                        with contextlib.suppress(Exception):
+                            from flash.providers.runpod.train.endpoints import (
+                                _release_endpoint_slot,
+                            )
+
+                            _release_endpoint_slot(canon)
                         deleted += 1
                         _idle_since.pop(eid, None)
                         logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)

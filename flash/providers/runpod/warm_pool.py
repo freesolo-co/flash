@@ -159,12 +159,19 @@ def _health_state(health: object) -> str:
         return "stale"
     workers = health.get("workers")
     jobs_info = health.get("jobs")
-    if not isinstance(workers, dict) or not isinstance(jobs_info, dict):
+    if (
+        not isinstance(workers, dict)
+        or not workers
+        or not isinstance(jobs_info, dict)
+        or not jobs_info
+    ):
         return "stale"
     if (
-        (jobs_info.get("inQueue") or 0) != 0
-        or (jobs_info.get("inProgress") or 0) != 0
+        (workers.get("running") or 0) != 0
+        or (workers.get("initializing") or 0) != 0
         or (workers.get("unhealthy") or 0) != 0
+        or (jobs_info.get("inQueue") or 0) != 0
+        or (jobs_info.get("inProgress") or 0) != 0
     ):
         return "busy"
     return "reusable"

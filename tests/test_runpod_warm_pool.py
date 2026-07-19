@@ -278,6 +278,39 @@ def test_successful_run_releases_endpoint_without_deleting(tmp_path, monkeypatch
     assert stored_remote["released_to_warm_pool"] is True
 
 
+def test_failed_warm_register_unmarks_owner(tmp_path, monkeypatch, warm_pool_dir):
+    from flash.providers.runpod import release_warm_endpoint, warm_pool
+
+    runner, spec, _remote = _persist_terminal_run(tmp_path, monkeypatch, "done")
+
+    def reject_register(_record):
+        assert runner.get_status(spec.run_id).remote["released_to_warm_pool"] is True
+        return False
+
+    monkeypatch.setattr(warm_pool, "register", reject_register)
+
+    assert release_warm_endpoint(runner.get_status(spec.run_id)) is None
+    assert "released_to_warm_pool" not in runner.get_status(spec.run_id).remote
+
+
+def test_pooled_warm_release_is_idempotent(tmp_path, monkeypatch, warm_pool_dir):
+    from flash.providers.runpod import release_warm_endpoint, warm_pool
+
+    runner, spec, remote = _persist_terminal_run(tmp_path, monkeypatch, "done")
+
+    assert release_warm_endpoint(runner.get_status(spec.run_id)) == remote["endpoint_id"]
+    stored = runner.get_status(spec.run_id)
+    assert stored.remote["released_to_warm_pool"] is True
+    monkeypatch.setattr(
+        warm_pool,
+        "register",
+        lambda _record: pytest.fail("an already-pooled endpoint must not be registered again"),
+    )
+
+    assert release_warm_endpoint(stored) == remote["endpoint_id"]
+    assert runner.get_status(spec.run_id).remote["released_to_warm_pool"] is True
+
+
 def test_released_owner_handle_cannot_destroy_endpoint_after_claim(
     tmp_path, monkeypatch, warm_pool_dir
 ):
@@ -498,7 +531,13 @@ def test_submit_reuses_matching_healthy_warm_endpoint(monkeypatch, warm_pool_dir
         runpod_api,
         "endpoint_health_for_fingerprint",
         lambda *_args, **_kwargs: {
-            "workers": {"ready": 1, "idle": 1, "unhealthy": 0},
+            "workers": {
+                "running": 0,
+                "initializing": 0,
+                "ready": 1,
+                "idle": 1,
+                "unhealthy": 0,
+            },
             "jobs": {"inQueue": 0, "inProgress": 0},
         },
     )
@@ -574,7 +613,17 @@ def test_acquire_matches_each_records_owning_account(monkeypatch, warm_pool_dir)
     assert acquired.key_fingerprint == other_fingerprint
 
 
-def test_busy_warm_endpoint_is_skipped_without_pruning(monkeypatch, warm_pool_dir):
+@pytest.mark.parametrize(
+    ("workers", "jobs_info"),
+    [
+        ({"running": 1}, {"inQueue": 0, "inProgress": 0}),
+        ({"initializing": 1}, {"inQueue": 0, "inProgress": 0}),
+        ({"unhealthy": 0}, {"inQueue": 0, "inProgress": 1}),
+    ],
+)
+def test_busy_warm_endpoint_is_skipped_without_pruning(
+    monkeypatch, warm_pool_dir, workers, jobs_info
+):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import warm_pool
 
@@ -584,23 +633,37 @@ def test_busy_warm_endpoint_is_skipped_without_pruning(monkeypatch, warm_pool_di
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda *_args, **_kwargs: {
-            "workers": {"idle": 0, "unhealthy": 0},
-            "jobs": {"inQueue": 0, "inProgress": 1},
-        },
+        lambda *_args, **_kwargs: {"workers": workers, "jobs": jobs_info},
     )
 
-    acquired = warm_pool.acquire(
-        spec,
-        1,
-        _submit_deadline(),
-        has_volume=True,
-    )
+    acquired = warm_pool.acquire(spec, 1, _submit_deadline(), has_volume=True)
 
     assert acquired is None
     assert [record.endpoint_id for record in warm_pool.candidates(signature, 0)] == [
         "busy-endpoint"
     ]
+
+
+def test_incomplete_worker_health_prunes_warm_endpoint(monkeypatch, warm_pool_dir):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import warm_pool
+
+    spec = _spec(run_id="reuse-incomplete-health")
+    signature = warm_pool.reuse_signature(spec, _RUNPOD_FINGERPRINT)
+    assert warm_pool.register(_record("stale-endpoint", signature=signature))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: {
+            "workers": {},
+            "jobs": {"inQueue": 0, "inProgress": 0},
+        },
+    )
+
+    acquired = warm_pool.acquire(spec, 1, _submit_deadline(), has_volume=True)
+
+    assert acquired is None
+    assert warm_pool.candidates(signature, 0) == []
 
 
 def test_reused_endpoint_is_deleted_when_queue_submit_fails(monkeypatch, warm_pool_dir):

@@ -37,14 +37,15 @@ def release_warm_endpoint(status) -> str | None:
         execution_timeout_ms=handle.execution_timeout_ms,
         released_at=time.time(),
     )
-    from flash.runner import _mark_runpod_remote_released
+    from flash.runner import _mark_runpod_remote_released, _unmark_runpod_remote_released
 
-    # mark the owner released BEFORE publishing to the pool: a claimable record must never exist for
+    # mark the owner released before publishing to the pool: a claimable record must never exist for
     # an endpoint the original run could still tear down, else a concurrent claim races that teardown.
     if not _mark_runpod_remote_released(status.run_id, status.remote):
         return None
     if warm_pool.register(record):
         return handle.endpoint_id
+    _unmark_runpod_remote_released(status.run_id, status.remote)
     return None
 
 

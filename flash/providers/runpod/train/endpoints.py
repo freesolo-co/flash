@@ -397,13 +397,16 @@ def _train_body(input_data: dict) -> dict:
             return env, askpass
 
         extra_pip = input_data.get("extra_pip") or []
-        location_options = ("--target", "--prefix", "--root", "--user")
+        location_long = ("--target", "--prefix", "--root", "--user", "--src")
         for argument in extra_pip:
+            head = argument.split("=", 1)[0]
             if (
-                argument in (*location_options, "-t")
-                or any(argument.startswith(f"{option}=") for option in location_options)
-                or argument.startswith(("--tar", "--prefi"))
-                or re.match(r"^--src?(?:=.*)?$", argument)
+                (
+                    head.startswith("--")
+                    and len(head) >= 4
+                    and head != "--pre"
+                    and any(option.startswith(head) for option in location_long)
+                )
                 or re.match(r"^-[qvUI]*t", argument)
                 # -r/-c reference a file that can itself smuggle location options past this guard
                 or re.match(r"^-(r|c)($|=|[^-])", argument)
