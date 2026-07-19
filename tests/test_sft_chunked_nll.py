@@ -263,6 +263,8 @@ def test_qwen35_moe_chunked_nll_preserves_plain_objective():
 
 
 def test_chunked_nll_rejects_trainable_output_head():
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
     from peft import LoraConfig
     from transformers import PreTrainedTokenizerBase, Qwen3ForCausalLM
 
