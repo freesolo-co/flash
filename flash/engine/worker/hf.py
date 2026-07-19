@@ -319,11 +319,11 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
                 for row in rows:
                     f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
             staged_dir, staged_path = _stage_optional_file(path, "debug-jsonl")
-        _OPTIONAL_UPLOADER.enqueue(
-            f"debug {repo_name}",
-            staged_dir,
-            lambda: _w.hf_upload_file(staged_path, repo_name),
-        )
+            _OPTIONAL_UPLOADER.enqueue(
+                f"debug {repo_name}",
+                staged_dir,
+                lambda: _w.hf_upload_file(staged_path, repo_name),
+            )
     except Exception as e:
         print(f"debug upload warn ({repo_name}): {sanitize_diagnostic(e, limit=500)}")
 
@@ -957,7 +957,8 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                 if required_steps:
                     raise RuntimeError("required saves have no artifact repository")
                 return
-            if not flush_optional_uploads():
+            optional_uploads_flushed = flush_optional_uploads()
+            if not optional_uploads_flushed:
                 print(
                     f"[ckpt] optional upload flush exceeded "
                     f"{_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S:.0f}s; the newest optional snapshot may be lost"
@@ -966,7 +967,12 @@ def make_checkpoint_upload_callback(save_at_steps=()):
             if latest is not None:
                 step, ckpt_dir = latest
                 should_flush = not required_steps or step in required_steps
-                if should_flush and step not in uploaded_steps and not _upload(step, ckpt_dir):
+                if (
+                    optional_uploads_flushed
+                    and should_flush
+                    and step not in uploaded_steps
+                    and not _upload(step, ckpt_dir)
+                ):
                     if step in required_steps:
                         raise RetriableInfraError(
                             f"required save step {step} full-state checkpoint was not durably published"

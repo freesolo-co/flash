@@ -197,3 +197,86 @@ def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
 
     assert uploader.flush(5)
     assert order == [1, 3]
+
+
+def test_train_end_timeout_does_not_start_a_concurrent_fallback_upload(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path
+):
+    worker, worker_hf = upload_worker
+    uploads: list[str] = []
+
+    class RecordingApi:
+        def upload_folder(self, **kwargs) -> None:
+            uploads.append(kwargs["path_in_repo"])
+
+        def list_repo_files(self, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setattr(worker, "hf_api", lambda: RecordingApi())
+    monkeypatch.setattr(worker_hf, "flush_optional_uploads", lambda: False)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _checkpoint(output_dir, 4)
+
+    worker.make_checkpoint_upload_callback().on_train_end(
+        SimpleNamespace(output_dir=str(output_dir)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert uploads == []
+
+
+def test_concurrent_debug_snapshots_preserve_append_order(upload_worker, monkeypatch):
+    worker, worker_hf = upload_worker
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    uploaded: list[list[dict]] = []
+
+    class CoordinatedUploader:
+        def enqueue(self, _label: str, staged_dir: str, run) -> None:
+            if not first_entered.is_set():
+                first_entered.set()
+                assert release_first.wait(5)
+            else:
+                second_entered.set()
+            try:
+                run()
+            finally:
+                shutil.rmtree(staged_dir, ignore_errors=True)
+
+    debug_path = Path("/tmp/reward_debug_order_test.jsonl")
+    debug_path.unlink(missing_ok=True)
+
+    def upload(path: str, _repo_name: str) -> bool:
+        uploaded.append([json.loads(line) for line in Path(path).read_text().splitlines()])
+        return True
+
+    monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOADER", CoordinatedUploader())
+    monkeypatch.setattr(worker, "hf_upload_file", upload)
+    first = threading.Thread(
+        target=worker.upload_debug_jsonl,
+        args=("reward_debug_order_test.jsonl", [{"reward": 1.0}]),
+    )
+    second = threading.Thread(
+        target=worker.upload_debug_jsonl,
+        args=("reward_debug_order_test.jsonl", [{"reward": 2.0}]),
+    )
+
+    first.start()
+    assert first_entered.wait(1)
+    second.start()
+    second_overtook_first = second_entered.wait(0.05)
+    release_first.set()
+    first.join(5)
+    second.join(5)
+    debug_path.unlink(missing_ok=True)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not second_overtook_first
+    assert uploaded == [
+        [{"reward": 1.0}],
+        [{"reward": 1.0}, {"reward": 2.0}],
+    ]
