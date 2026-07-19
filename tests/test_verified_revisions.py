@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -199,3 +201,30 @@ def test_verified_revision_ledger_survives_new_process(monkeypatch, tmp_path):
 
     assert process.exitcode == 0
     assert output.get(timeout=2) == (revision,)
+
+
+def test_verified_revision_ledger_fails_closed_without_fcntl(monkeypatch):
+    # fcntl is unix-only; on platforms without it the ledger must fail closed
+    # rather than silently skip its cross-process lock.
+    from flash.runner import verified_revisions
+
+    monkeypatch.setattr(verified_revisions, "fcntl", None)
+    with pytest.raises(RuntimeError, match="verified-revision locking is unavailable"):
+        verified_revisions.read_verified_adapter_revisions("run-without-fcntl")
+
+
+def test_cli_import_chain_survives_missing_fcntl():
+    # reproduces the windows `flash login` crash: fcntl is unix-only, so the cli
+    # import chain (flash.cli -> flash.runner -> verified_revisions) must not
+    # hard-depend on it. blocking fcntl mimics a platform that lacks the module.
+    code = (
+        "import sys; sys.modules['fcntl'] = None; "
+        "import flash.runner.verified_revisions; "
+        "import flash.cli"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
