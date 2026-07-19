@@ -1068,3 +1068,21 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
     _, progress = _log_follow_progress(malformed, "unknown")
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
+    from flash.cli.commands import _log_follow_progress
+
+    status = {"state": "running", "last_heartbeat": {"stage": stage}}
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "typically ~8-10 min" in progress
+    assert "setup is not billed" in progress
+    assert "do not cancel" in progress
+
+    status["last_heartbeat"]["stage"] = "rl_step"
+    _, progress = _log_follow_progress(status, "unknown")
+    assert "warming up" not in progress
+    assert "not billed" not in progress

@@ -458,3 +458,25 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_explains_rl_warmup(monkeypatch, stage: str) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage},
+    }
+
+    out = render.run_status(status)
+
+    assert f"warming up (stage={stage})" in out
+    assert "typically ~8-10 min" in out
+    assert "setup is not billed" in out
+    assert "do not cancel" in out
+
+    status["state"] = "done"
+    assert "warming up" not in render.run_status(status).split("details")[0]

@@ -379,6 +379,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
+            if state == "running":
+                warmup = render.warmup_message(stage)
+                if warmup:
+                    parts.append(warmup)
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")

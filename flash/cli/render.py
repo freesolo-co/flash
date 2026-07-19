@@ -548,6 +548,18 @@ def _humanize_age(value) -> str | None:
 # heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
 # (240s quiet phases, up to 900s mid-training), so a frozen ts is usually NOT a dead worker.
 _HB_QUIET_HINT_AFTER_S = 300.0
+_WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
+
+
+def warmup_message(stage: object) -> str | None:
+    """Explain healthy RL setup stages that otherwise look indistinguishable from a hang."""
+    stage_name = str(stage)
+    if stage_name not in _WARMUP_STAGES:
+        return None
+    return (
+        f"warming up (stage={stage_name}): initializing model, vLLM, and training kernels - "
+        "typically ~8-10 min; setup is not billed; do not cancel"
+    )
 
 
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
@@ -562,6 +574,10 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     if hb.get("liveness"):
         worker += " · alive ping"
     pairs = [("worker", worker)]
+    if str(obj.get("state") or "") == "running":
+        warmup = warmup_message(hb.get("stage"))
+        if warmup:
+            pairs.append(("warmup", warmup))
     ts = hb.get("ts")
     age = _humanize_age(ts)
     if age:
