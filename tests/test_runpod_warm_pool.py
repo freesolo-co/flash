@@ -532,11 +532,11 @@ def test_submit_reuses_matching_healthy_warm_endpoint(monkeypatch, warm_pool_dir
 
     assert result.ok
     assert submitted[0][0] == "warm-endpoint"
-    assert events == [("handle", None), ("submit", "warm-endpoint"), ("handle", "job-1")]
+    # the durable handle is persisted once, after submit (job_id set), same as the fresh-deploy path.
+    assert events == [("submit", "warm-endpoint"), ("handle", "job-1")]
+    assert handles[0]["job_id"] == "job-1"
     assert handles[0]["reuse_signature"] == signature
     assert handles[0]["execution_timeout_ms"] == 700_000
-    assert handles[1]["reuse_signature"] == signature
-    assert handles[1]["execution_timeout_ms"] == 700_000
     assert warm_pool.claim("warm-endpoint") is False
 
 

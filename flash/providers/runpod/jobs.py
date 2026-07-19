@@ -872,19 +872,10 @@ def submit_run(
         key_fingerprint = warm.key_fingerprint
         endpoint_timeout_ms = warm.execution_timeout_ms
         signature = warm.signature
-        if on_handle is not None:
-            on_handle(
-                JobHandle(
-                    endpoint_id=endpoint_id,
-                    endpoint_name=name,
-                    key_fingerprint=key_fingerprint,
-                    job_id=None,
-                    attempt=attempt_id,
-                    started_ts=time.time(),
-                    execution_timeout_ms=endpoint_timeout_ms,
-                    reuse_signature=signature,
-                ).to_dict()
-            )
+        # the durable handle is persisted after submit (job_id set), same as the fresh-deploy path.
+        # a crash in the claim->submit window leaves the endpoint reaper-reclaimable, which recovery
+        # handles; persisting an endpoint-only handle here would instead make recovery reject the
+        # unpollable job_id=None handle and delete a possibly-running endpoint.
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
