@@ -353,5 +353,7 @@ def preflight_train_context_within_serving(spec: JobSpec) -> None:
             f"{knob}={effective} exceeds {spec.model}'s serving max_model_len={cap}: a LoRA trained "
             f"at a longer context than it is served wastes compute and learns positions never used "
             f"at inference. Lower it to <= {cap}, or raise the serving context after real-GPU "
-            f"validation."
+            f"validation. If this serving cap looks lower than expected, your installed flash CLI "
+            f"may be out of date; upgrade to the latest release (which raises the managed serving "
+            f"caps) before lowering the context."
         )

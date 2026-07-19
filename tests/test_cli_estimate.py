@@ -408,8 +408,12 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
     with pytest.raises(
         ValueError,
         match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=32768",
-    ):
+    ) as exc_info:
         cmd_train(args)
+
+    assert "your installed flash CLI may be out of date; upgrade to the latest release" in str(
+        exc_info.value
+    )
 
 
 def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
