@@ -1,9 +1,7 @@
-from flash.providers._worker import (
-    BAKED_PER_SM_ARCHES,
-    WORKER_IMAGE,
-    worker_image_for_gpu,
-)
-from flash.providers.base import get_gpu_info
+from types import SimpleNamespace
+
+import flash.providers._worker as worker_module
+from flash.providers._worker import WORKER_IMAGE, worker_image_for_gpu
 
 
 def _clear_image_env(monkeypatch):
@@ -42,17 +40,22 @@ def test_worker_image_appends_arch_to_default_tag(monkeypatch):
     assert worker_image_for_gpu("A100 SXM") == "ghcr.io/freesolo-co/flash-worker:cu128-sm80"
 
 
-def test_worker_image_falls_back_to_base_for_unbaked_arch(monkeypatch):
-    # B200 is sm100, which has no per-SM kernel-cache image baked yet, so it must fall back to the
-    # base WORKER_IMAGE (cold-JIT) rather than select a `cu128-sm100` tag that `docker pull` would
-    # 404 on. A baked arch (sm120 / RTX 5090) still gets its suffix.
+def test_worker_image_uses_sm100_baked_tag_for_b200(monkeypatch):
     _clear_image_env(monkeypatch)
 
-    assert get_gpu_info("B200").sm == "sm100"
-    assert "sm100" not in BAKED_PER_SM_ARCHES
-    assert worker_image_for_gpu("B200") == WORKER_IMAGE  # no -sm100 tag selected
-    # a published arch is unaffected
+    assert worker_image_for_gpu("B200") == "ghcr.io/freesolo-co/flash-worker:cu128-sm100"
     assert worker_image_for_gpu("RTX 5090") == "ghcr.io/freesolo-co/flash-worker:cu128-sm120"
+
+
+def test_worker_image_falls_back_to_base_for_unbaked_arch(monkeypatch):
+    _clear_image_env(monkeypatch)
+    monkeypatch.setattr(
+        worker_module,
+        "get_gpu_info",
+        lambda _friendly_gpu: SimpleNamespace(sm="sm999"),
+    )
+
+    assert worker_image_for_gpu("future gpu") == WORKER_IMAGE
 
 
 def test_worker_image_ignores_unsupported_template_values(monkeypatch):
