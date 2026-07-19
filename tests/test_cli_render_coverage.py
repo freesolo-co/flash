@@ -260,6 +260,14 @@ def test_deployments_table_truncates_long_detail(styled_plain) -> None:
     assert "failed" in out
 
 
+def test_deployments_table_formats_verified_at_as_utc(styled_plain) -> None:
+    out = render.deployments_table(
+        [{"run_id": "r1", "deployment": {"state": "ready", "verified_at": 1700000000}}]
+    )
+    assert "2023-11-14 22:13 UTC" in out  # epoch rendered as UTC, not a raw number
+    assert "1700000000" not in out
+
+
 def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",

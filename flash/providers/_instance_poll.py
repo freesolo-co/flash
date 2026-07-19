@@ -124,10 +124,15 @@ class InstancePollAdapter:
     first_liveness_detail: Callable[[float, float], str]  # (elapsed_s, first_liveness_s) -> str
 
 
-def _decode_terminal_marker(
+def decode_terminal_marker(
     raw: str,
-    adapter: InstancePollAdapter,
+    *,
+    run_id: str,
+    attempt: int,
+    launch_floor: float,
+    deadline_at: float | None = None,
 ) -> dict:
+    """Validate one attempt-scoped terminal marker against its durable identity."""
     marker = json.loads(raw)
     if not isinstance(marker, dict) or set(marker) != {
         "attempt",
@@ -138,11 +143,10 @@ def _decode_terminal_marker(
         "ts",
     }:
         raise ValueError("invalid terminal marker schema")
-    attempt = marker["attempt"]
+    marker_attempt = marker["attempt"]
     ts = marker["ts"]
     error = marker["error"]
     now = time.time()
-    launch_floor = adapter.launch_ts
     if (
         isinstance(launch_floor, bool)
         or not isinstance(launch_floor, (int, float))
@@ -152,10 +156,10 @@ def _decode_terminal_marker(
         or not isinstance(now, (int, float))
         or not math.isfinite(now)
         or now <= 0
-        or _attempt_int(attempt) is None
-        or attempt != _attempt_int(adapter.current_attempt)
+        or _attempt_int(marker_attempt) is None
+        or marker_attempt != _attempt_int(attempt)
         or type(marker["run_id"]) is not str
-        or marker["run_id"] != adapter.run_id
+        or marker["run_id"] != run_id
         or type(marker["ok"]) is not bool
         or type(marker["retriable"]) is not bool
         or type(error) is not str
@@ -165,9 +169,22 @@ def _decode_terminal_marker(
         or not math.isfinite(ts)
         or ts < launch_floor
         or ts > now + 120.0
+        or (deadline_at is not None and ts > deadline_at)
     ):
         raise ValueError("invalid terminal marker identity")
     return marker
+
+
+def _decode_terminal_marker(
+    raw: str,
+    adapter: InstancePollAdapter,
+) -> dict:
+    return decode_terminal_marker(
+        raw,
+        run_id=adapter.run_id,
+        attempt=adapter.current_attempt,
+        launch_floor=adapter.launch_ts,
+    )
 
 
 def poll_instance_job(
@@ -344,9 +361,7 @@ def poll_instance_job(
         # the run deadline stops worker compute, not bounded observation of artifacts already committed
         # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
         deferred_deadline_failure = None
-        read_deadline = time.time() + (
-            _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S
-        )
+        read_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
         terminal = _read_with_retries(
             lambda: terminal_artifact_result(
                 read_deadline_at=read_deadline,
@@ -498,13 +513,10 @@ def poll_instance_job(
             # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
             err = adapter.read_current_error()
             # error files are attempt-scoped, so a present file already belongs to this exact handle.
-            worker_crashed = (
-                bool(err and err.strip())
-                and not worker_flagged_retriable(
-                    heartbeat_reader,
-                    launch_ts=launch_ts,
-                    current_attempt=adapter.current_attempt,
-                )
+            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
+                heartbeat_reader,
+                launch_ts=launch_ts,
+                current_attempt=adapter.current_attempt,
             )
             return PollResult(
                 False,
