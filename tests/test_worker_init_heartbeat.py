@@ -363,15 +363,55 @@ def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
     assert payload["metrics_last"] == [expected]
 
     state.global_step = 2
-    callback.on_log(args, state, None, logs={"reward": 0.8, "reward_std": 0.1})
+    callback.on_log(
+        args,
+        state,
+        None,
+        logs={
+            "reward": 0.8,
+            "reward_std": float("nan"),
+            "grad_norm": float("inf"),
+            "entropy": 0.79,
+        },
+    )
     payload = emitted[-1][1]
-    assert "kl" not in payload
-    assert "kl" not in payload["metrics_last"][-1]
+    assert payload["reward"] == 0.8
+    assert payload["entropy"] == 0.79
+    for key in ("reward_std", "grad_norm", "kl"):
+        assert key not in payload
+        assert key not in payload["metrics_last"][-1]
 
-    for step in range(3, 11):
+    for step in range(3, 19):
         state.global_step = step
-        callback.on_log(args, state, None, logs={"reward": step / 10})
-    assert [item["step"] for item in emitted[-1][1]["metrics_last"]] == list(range(3, 11))
+        callback.on_log(args, state, None, logs={"reward": step / 20})
+    metrics_last = emitted[-1][1]["metrics_last"]
+    assert len(metrics_last) == 16
+    assert [item["step"] for item in metrics_last] == list(range(3, 19))
+
+
+def test_rl_terminal_heartbeat_carries_latest_metrics():
+    import ast
+    import textwrap
+
+    from flash.engine.worker import rl
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl.run_rl)))
+    terminal_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "rl_trained"
+    ]
+    assert len(terminal_calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
+    assert "metrics_last" in keywords, (
+        "the terminal rl_trained heartbeat must carry the callback backlog so short runs surface metrics"
+    )
+    assert "hb_cb" in ast.unparse(keywords["metrics_last"])
 
 
 def test_per_step_training_stages_are_throttled():

@@ -142,6 +142,9 @@ flash runs                       # all your runs and their state/cost
 flash cancel <run-id>            # stop a run
 ```
 
+Live GRPO metrics update at the managed HEARTBEAT cadence, not after every optimizer step.
+The terminal heartbeat carries the latest bounded metric backlog so short runs still surface data.
+
 ### 6. Deploy & chat
 
 ```bash

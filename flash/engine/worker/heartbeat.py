@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import faulthandler
 import json
+import math
 import os
 import sys
 import threading
@@ -255,6 +256,8 @@ def make_reward_heartbeat_callback():
                 r = float(r)
             except (TypeError, ValueError):
                 return
+            if not math.isfinite(r):
+                return
             self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
             metrics = {"step": step, "reward": r}
@@ -271,16 +274,19 @@ def make_reward_heartbeat_callback():
                 if value is None:
                     continue
                 try:
-                    metrics[payload_key] = float(value)
+                    value = float(value)
                 except (TypeError, ValueError):
                     continue
+                if not math.isfinite(value):
+                    continue
+                metrics[payload_key] = value
             max_completion_tokens = getattr(args, "max_completion_length", None)
             if max_completion_tokens is not None:
                 with contextlib.suppress(TypeError, ValueError):
                     metrics["max_completion_tokens"] = int(max_completion_tokens)
             self.metrics_last = [item for item in self.metrics_last if item["step"] != step]
             self.metrics_last.append(metrics)
-            self.metrics_last = self.metrics_last[-8:]
+            self.metrics_last = self.metrics_last[-16:]
             payload = {
                 **metrics,
                 "reward_last": self.reward_history[-8:],

@@ -755,7 +755,13 @@ def run_rl():
         # preserve the final checkpoint only when exact save steps are not configured.
         if final_save_due(_steps_run, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
-    _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=_steps_run,
+        gpu=gpu_diagnostics(),
+        metrics_last=list(getattr(hb_cb, "metrics_last", [])),
+    )
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).
     gen_tokens = steps * batching["unique_prompts_per_step"] * group_size * _max_completion

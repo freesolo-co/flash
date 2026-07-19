@@ -661,6 +661,28 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
     ]
 
 
+def test_log_follow_metric_dedup_is_attempt_aware() -> None:
+    from flash.cli.commands import _log_follow_metric_rows
+
+    seen = set()
+    attempt_one = {
+        "last_heartbeat": {
+            "attempt": 1,
+            "metrics_last": [{"step": 7, "reward": 0.5}],
+        }
+    }
+    attempt_two = {
+        "last_heartbeat": {
+            "attempt": 2,
+            "metrics_last": [{"step": 7, "reward": 0.6}],
+        }
+    }
+
+    assert _log_follow_metric_rows(attempt_one, seen) == ["step=7 reward=0.5"]
+    assert _log_follow_metric_rows(attempt_one, seen) == []
+    assert _log_follow_metric_rows(attempt_two, seen) == ["step=7 reward=0.6"]
+
+
 def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     """`state=cancelled` + adapter_ref=null + cost=0 reads as discardable, yet the per-step
     deployable checkpoints streamed before the cancel survive it — the cancel output must say

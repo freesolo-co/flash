@@ -412,7 +412,7 @@ _FOLLOW_METRIC_FIELDS = (
 
 
 def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
-    """Return unseen heartbeat-backed RL metric rows, deduplicated by optimizer step."""
+    """Return unseen heartbeat-backed RL metric rows, deduplicated by attempt and optimizer step."""
     heartbeat = (status or {}).get("last_heartbeat")
     if not isinstance(heartbeat, dict):
         return []
@@ -420,6 +420,7 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     if not isinstance(metrics_last, list):
         return []
     rows = []
+    attempt = heartbeat.get("attempt")
     for metrics in metrics_last:
         if not isinstance(metrics, dict):
             continue
@@ -430,9 +431,10 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
             step_key = int(step)
         except (TypeError, ValueError):
             step_key = str(step)
-        if step_key in seen_steps:
+        metric_key = (attempt, step_key)
+        if metric_key in seen_steps:
             continue
-        seen_steps.add(step_key)
+        seen_steps.add(metric_key)
         parts = [f"step={step_key}"]
         for key, label in _FOLLOW_METRIC_FIELDS:
             value = metrics.get(key)
