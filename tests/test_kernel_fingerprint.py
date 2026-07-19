@@ -203,6 +203,16 @@ def test_baked_arch_workflows_match_canonical_source():
         if (match := re.fullmatch(r'\s*default:\s*"([^"]+)"\s*', line))
     ]
     default_arches = {arch.strip() for arch in default.split(",") if arch.strip()}
+    (fallback,) = [
+        match.group(1)
+        for line in bake_lines
+        if (
+            match := re.fullmatch(
+                r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line
+            )
+        )
+    ]
+    fallback_arches = {arch.strip() for arch in fallback.split(",") if arch.strip()}
 
     include_block = _workflow_block(
         bake_lines, "jobs:", "  bake:", "    strategy:", "      matrix:", "        include:"
@@ -215,10 +225,9 @@ def test_baked_arch_workflows_match_canonical_source():
     matrix_arches = set(matrix_arch_list)
 
     assert len(source_arches) == len(canonical_arches)
-    assert set(source_arches) == canonical_arches == default_arches
+    assert set(source_arches) == canonical_arches == default_arches == fallback_arches
     assert len(matrix_arch_list) == len(matrix_arches)
-    assert canonical_arches <= matrix_arches
-    assert matrix_arches - canonical_arches == {"sm100"}
+    assert canonical_arches == matrix_arches
 
     auto_lines = (ROOT / ".github" / "workflows" / "auto-rebake.yml").read_text().splitlines()
     run_block = _workflow_block(
