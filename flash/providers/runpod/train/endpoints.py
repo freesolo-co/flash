@@ -200,6 +200,7 @@ def _train_body(input_data: dict) -> dict:
     import math
     import os
     import re
+    import shutil
     import subprocess
     import sys
     import tempfile
@@ -306,8 +307,12 @@ def _train_body(input_data: dict) -> dict:
     except TimeoutError:
         raise RuntimeError("run wall deadline exceeded before bootstrap") from None
 
+    job_venv = None
+
     def _deadline_exit() -> None:
         print("run wall deadline exceeded; terminating worker", flush=True)
+        if job_venv:
+            shutil.rmtree(job_venv, ignore_errors=True)
         os._exit(124)
 
     deadline_timer = threading.Timer(remaining, _deadline_exit)
@@ -317,6 +322,30 @@ def _train_body(input_data: dict) -> dict:
     try:
         overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
         overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
+
+        job_spec = json.loads(input_data["job_spec_json"])
+        run_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(job_spec.get("run_id") or "run"))
+        run_label = run_label.strip("-.")[-48:] or "run"
+        attempt_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", overrides.get("ATTEMPT", "0"))
+        attempt_label = attempt_label.strip("-.")[:16] or "0"
+        venv_root = os.path.join(tempfile.gettempdir(), "flash-runpod-job-venvs")
+        os.makedirs(venv_root, exist_ok=True)
+        for entry in os.scandir(venv_root):
+            with contextlib.suppress(OSError):
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+                else:
+                    os.remove(entry.path)
+        job_venv = tempfile.mkdtemp(
+            prefix=f"{run_label}-a{attempt_label}-",
+            dir=venv_root,
+        )
+        _require_deadline_allowance()
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", job_venv],
+            check=True,
+        )
+        job_python = os.path.join(job_venv, "bin", "python")
 
         def _extra_pip_env() -> tuple[dict[str, str], str | None]:
             env = dict(os.environ)
@@ -343,7 +372,7 @@ def _train_body(input_data: dict) -> dict:
             try:
                 _require_deadline_allowance()
                 subprocess.run(
-                    [sys.executable, "-m", "pip", "install", *extra_pip],
+                    [job_python, "-m", "pip", "install", *extra_pip],
                     check=True,
                     env=extra_env,
                 )
@@ -534,7 +563,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+                    [job_python, "-m", "flash.engine.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,
@@ -577,6 +606,8 @@ def _train_body(input_data: dict) -> dict:
             return json.load(f)
     finally:
         deadline_timer.cancel()
+        if job_venv:
+            shutil.rmtree(job_venv, ignore_errors=True)
 
 
 def isolate_flash_state(scope: str | None = None) -> None:
