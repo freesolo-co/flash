@@ -588,6 +588,79 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     assert "realized_cost=$1.2346" in err
 
 
+def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys) -> None:
+    metric_one = {
+        "step": 1,
+        "reward": 0.75,
+        "reward_std": 0.12,
+        "grad_norm": 1.5,
+        "kl": 0.03,
+        "entropy": 0.82,
+        "frac_reward_zero_std": 0.25,
+        "mean_completion_tokens": 48.5,
+        "truncation_rate": 0.125,
+        "max_completion_tokens": 256,
+    }
+    metric_two = {
+        "step": 2,
+        "reward": 0.8,
+        "reward_std": 0.1,
+        "grad_norm": 1.25,
+        "kl": None,
+        "entropy": 0.79,
+        "frac_reward_zero_std": 0.0,
+        "mean_completion_tokens": 51.0,
+        "truncation_rate": 0.25,
+        "max_completion_tokens": 256,
+    }
+
+    class _MetricClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = iter(
+                [
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "running",
+                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_one]},
+                    },
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "running",
+                        "last_heartbeat": {
+                            "stage": "rl_step",
+                            "metrics_last": [metric_one, metric_two],
+                        },
+                    },
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "done",
+                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_two]},
+                    },
+                ]
+            )
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "running"}
+
+        def get_run(self, run_id: str) -> dict:
+            return next(self.statuses)
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    state, printed_any = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+
+    assert state == "done"
+    assert printed_any is False
+    metric_lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")]
+    assert metric_lines == [
+        "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
+        "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
+        "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
+        "comp_len=51 trunc=0.25 max_comp_tokens=256",
+    ]
+
+
 def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     """`state=cancelled` + adapter_ref=null + cost=0 reads as discardable, yet the per-step
     deployable checkpoints streamed before the cancel survive it — the cancel output must say

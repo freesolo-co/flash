@@ -242,6 +242,7 @@ def make_reward_heartbeat_callback():
     class _RewardHeartbeat(TrainerCallback):
         def __init__(self):
             self.reward_history = []
+            self.metrics_last = []
             self.last_gpu_diag_at = 0.0
 
         def on_log(self, args, state, control, logs=None, **kwargs):
@@ -256,10 +257,34 @@ def make_reward_heartbeat_callback():
                 return
             self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
+            metrics = {"step": step, "reward": r}
+            for payload_key, log_key in (
+                ("reward_std", "reward_std"),
+                ("grad_norm", "grad_norm"),
+                ("kl", "kl"),
+                ("entropy", "entropy"),
+                ("frac_reward_zero_std", "frac_reward_zero_std"),
+                ("mean_completion_tokens", "completions/mean_length"),
+                ("truncation_rate", "completions/clipped_ratio"),
+            ):
+                value = logs.get(log_key)
+                if value is None:
+                    continue
+                try:
+                    metrics[payload_key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            max_completion_tokens = getattr(args, "max_completion_length", None)
+            if max_completion_tokens is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    metrics["max_completion_tokens"] = int(max_completion_tokens)
+            self.metrics_last = [item for item in self.metrics_last if item["step"] != step]
+            self.metrics_last.append(metrics)
+            self.metrics_last = self.metrics_last[-8:]
             payload = {
-                "step": step,
-                "reward": r,
+                **metrics,
                 "reward_last": self.reward_history[-8:],
+                "metrics_last": self.metrics_last,
             }
             now = time.monotonic()
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)

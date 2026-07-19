@@ -579,13 +579,18 @@ in a sensible value, so only override with a reason.
 | Knob | Convention |
 | --- | --- |
 | `group_size` | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs *within-group variance* for an advantage to exist. |
-| `max_completion_tokens` | Completion budget per rollout. Size it to the expected output length — too small silently truncates good answers and poisons the reward; too large just costs more. |
+| `max_completion_tokens` | Completion budget per rollout. Size it to the expected output length; too small silently truncates good answers and poisons the reward, while too large just costs more. |
 | `temperature` | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups. |
 | `kl_penalty_coef` | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move. |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy. |
 | `learning_rate` | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it. |
 | `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
 | `structured_outputs` | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then *cannot* emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
+
+For thinking models, `max_completion_tokens` is shared between `<think>` reasoning and the final
+answer or action, so undersizing it can truncate the action and teach the model to stop reasoning;
+watch `truncation_rate`, which counts completions not ending in EOS and is not strictly
+`finish_reason=length` when stop sequences or multi-turn rollouts are involved.
 
 For pure multi-turn GRPO, Flash gives each Flash-owned vLLM generation request a managed
 10-to-60-minute absolute deadline and at most two physical attempts. A timed-out request is

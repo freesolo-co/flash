@@ -314,6 +314,66 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
+def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as w
+
+    transformers = types.ModuleType("transformers")
+    transformers.TrainerCallback = type("TrainerCallback", (), {})
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
+    emitted = []
+    monkeypatch.setattr(w, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
+
+    callback = hb.make_reward_heartbeat_callback()
+    args = types.SimpleNamespace(max_completion_length=256)
+    state = types.SimpleNamespace(global_step=1)
+    callback.on_log(
+        args,
+        state,
+        None,
+        logs={
+            "reward": 0.75,
+            "reward_std": 0.12,
+            "grad_norm": 1.5,
+            "kl": 0.03,
+            "entropy": 0.82,
+            "frac_reward_zero_std": 0.25,
+            "completions/mean_length": 48.5,
+            "completions/clipped_ratio": 0.125,
+        },
+    )
+
+    stage, payload = emitted[-1]
+    assert stage == "rl_step"
+    expected = {
+        "step": 1,
+        "reward": 0.75,
+        "reward_std": 0.12,
+        "grad_norm": 1.5,
+        "kl": 0.03,
+        "entropy": 0.82,
+        "frac_reward_zero_std": 0.25,
+        "mean_completion_tokens": 48.5,
+        "truncation_rate": 0.125,
+        "max_completion_tokens": 256,
+    }
+    for key, value in expected.items():
+        assert payload[key] == value
+    assert payload["metrics_last"] == [expected]
+
+    state.global_step = 2
+    callback.on_log(args, state, None, logs={"reward": 0.8, "reward_std": 0.1})
+    payload = emitted[-1][1]
+    assert "kl" not in payload
+    assert "kl" not in payload["metrics_last"][-1]
+
+    for step in range(3, 11):
+        state.global_step = step
+        callback.on_log(args, state, None, logs={"reward": step / 10})
+    assert [item["step"] for item in emitted[-1][1]["metrics_last"]] == list(range(3, 11))
+
+
 def test_per_step_training_stages_are_throttled():
     """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
     _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
