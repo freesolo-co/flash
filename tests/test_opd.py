@@ -1091,7 +1091,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     on the growing transcript. Drives the REAL run_opd -> rollout_one_records -> vLLM rollout shim ->
     batched teacher scoring -> _resolve_samples_batched path on CPU with a scripted 3-turn "guess"
     episode: a fake student that emits a distinct completion per turn and a fake teacher that
-    echo-scores each. We assert (1) two turns were distilled with real gradients, (2) the second turn's
+    echo-scores each. We assert (1) three turns were distilled with real gradients, (2) the second turn's
     teacher prompt and loss prefix strictly GREW over the first (per-turn transcript conditioning, not
     a re-scored first turn), and (3) train_meta reports the multi-turn shape."""
     torch = pytest.importorskip("torch")
@@ -1289,7 +1289,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     assert meta["notes"]["episodes"] == 1
     assert meta["notes"]["mean_turns_per_episode"] == 3.0
     assert meta["notes"]["max_turns"] == 4
-    assert meta["step"] == 1  # one optimizer update over the two turn-losses
+    assert meta["step"] == 1  # one optimizer update over the three turn losses
 
 
 def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
