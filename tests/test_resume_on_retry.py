@@ -277,9 +277,7 @@ def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
 
     def snapshot(**kwargs):
         seen.update(kwargs)
-        base = os.path.join(
-            kwargs["local_dir"], "rl", resume_run_id, "checkpoint"
-        )
+        base = os.path.join(kwargs["local_dir"], "rl", resume_run_id, "checkpoint")
         for name in ("checkpoint-40", "checkpoint-latest", "checkpoint-80"):
             os.makedirs(os.path.join(base, name), exist_ok=True)
         return kwargs["local_dir"]
@@ -294,9 +292,7 @@ def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
 
 
 @pytest.mark.parametrize("name", ["checkpoint-0", "checkpoint-040"])
-def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(
-    monkeypatch, resume_run_id, name
-):
+def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(monkeypatch, resume_run_id, name):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -314,9 +310,7 @@ def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(
         worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
 
 
-def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(
-    monkeypatch, resume_run_id
-):
+def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
@@ -419,9 +413,7 @@ def test_hf_resume_checkpoint_fail_closed_at_deadline(monkeypatch, resume_run_id
         worker.hf_resume_checkpoint(fail_closed=True)
 
 
-def test_hf_resume_checkpoint_fail_closed_allows_confirmed_absence(
-    monkeypatch, resume_run_id
-):
+def test_hf_resume_checkpoint_fail_closed_allows_confirmed_absence(monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
@@ -442,17 +434,13 @@ def test_hf_resume_checkpoint_pinned_missing_base_raises(monkeypatch, resume_run
         worker.hf_resume_checkpoint(fail_closed=True, revision="pinned-sha")
 
 
-def test_hf_resume_checkpoint_pinned_absence_clears_stale_local_state(
-    monkeypatch, resume_run_id
-):
+def test_hf_resume_checkpoint_pinned_absence_clears_stale_local_state(monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec, run=resume_run_id)
-    stale = os.path.join(
-        "/tmp/resume", "rl", resume_run_id, "checkpoint", "checkpoint-80"
-    )
+    stale = os.path.join("/tmp/resume", "rl", resume_run_id, "checkpoint", "checkpoint-80")
     os.makedirs(stale, exist_ok=True)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
 
@@ -462,9 +450,7 @@ def test_hf_resume_checkpoint_pinned_absence_clears_stale_local_state(
     assert not os.path.exists(stale)
 
 
-def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(
-    monkeypatch, resume_run_id
-):
+def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -717,9 +703,56 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     assert remote.get("instance_id") == "i-1"
 
 
-@pytest.mark.parametrize("teardown_failure", ["delete_false", "delete_exception"])
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"])
+def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
+    orch, monkeypatch, terminal_status
+):
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    submits = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        submits.append(attempt)
+        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
+        if attempt == 0:
+            return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": terminal_status},
+    )
+    spec = _spec(run_id=f"flash-terminal-{terminal_status.lower()}")
+    _seed_status(orch, spec)
+
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+
+    assert metrics["train_tokens"] == 4096
+    assert submits == [0, 1]
+    raw = orch._load_status_json(spec.run_id)
+    assert [item["endpoint_id"] for item in raw[orch._CLEANUP_REMOTES_KEY]] == ["ep0"]
+    assert orch.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
+
+
+@pytest.mark.parametrize(
+    ("teardown_failure", "status_mode"),
+    [
+        ("cancel", "in_progress"),
+        ("delete_false", "in_progress"),
+        ("delete_exception", "raises"),
+    ],
+)
 def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
-    orch, monkeypatch, teardown_failure
+    orch, monkeypatch, teardown_failure, status_mode
 ):
     from flash.providers.base import PollResult
     from flash.providers.runpod import api as runpod_api
@@ -746,11 +779,17 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
             return False
         if teardown_failure == "delete_exception":
             raise RuntimeError("private deletion response")
-        return True
+        return teardown_failure != "cancel"
+
+    def job_status(*_args, **_kwargs):
+        if status_mode == "raises":
+            raise RuntimeError("private status response")
+        return {"status": "IN_PROGRESS"}
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+    monkeypatch.setattr(runpod_api, "job_status", job_status)
     monkeypatch.setattr(runpod_train, "terminate_endpoint", lambda *_args, **_kwargs: None)
 
     spec = _spec()
