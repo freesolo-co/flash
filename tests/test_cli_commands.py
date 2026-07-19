@@ -1072,13 +1072,15 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
 
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
+    import time as _time
+
     from flash.cli.commands import _log_follow_progress
 
-    status = {"state": "running", "last_heartbeat": {"stage": stage}}
+    status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
     _, progress = _log_follow_progress(status, "unknown")
 
     assert f"warming up (stage={stage})" in progress
-    assert "typically ~8-10 min" in progress
+    assert "typically several minutes, sometimes 15-20 min" in progress
     assert "setup is not billed" in progress
     assert "do not cancel" in progress
 
@@ -1086,3 +1088,21 @@ def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
     _, progress = _log_follow_progress(status, "unknown")
     assert "warming up" not in progress
     assert "not billed" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "hb=20m" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress

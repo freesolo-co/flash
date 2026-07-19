@@ -462,21 +462,45 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
 
 @pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
 def test_run_status_explains_rl_warmup(monkeypatch, stage: str) -> None:
+    import time as _time
+
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
     status = {
         "run_id": "flash-warmup",
         "state": "running",
         "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
-        "last_heartbeat": {"stage": stage},
+        "last_heartbeat": {"stage": stage, "ts": _time.time()},
     }
 
     out = render.run_status(status)
 
     assert f"warming up (stage={stage})" in out
-    assert "typically ~8-10 min" in out
+    assert "typically several minutes, sometimes 15-20 min" in out
     assert "setup is not billed" in out
     assert "do not cancel" in out
 
     status["state"] = "done"
     assert "warming up" not in render.run_status(status).split("details")[0]
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+
+    out = render.run_status(status)
+
+    assert stage in out
+    assert "20m ago" in out
+    assert "quiet is not dead" in out
+    assert "warming up" not in out
+    assert "do not cancel" not in out
