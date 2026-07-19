@@ -7,7 +7,7 @@ import logging
 import os
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from flash.runner import (
     DeploymentRevocationError,
@@ -19,7 +19,14 @@ from flash.runner import (
 from flash.schema import train_schema_metadata
 from flash.server import app as _app
 from flash.server import db
-from flash.server._deps import _parse_spec, _require_bool, _runtime_secrets, owned_run, require_key
+from flash.server._deps import (
+    _parse_spec,
+    _require_bool,
+    _runtime_secrets,
+    owned_run,
+    readable_run,
+    require_key,
+)
 from flash.spec import JobSpec
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -255,8 +262,13 @@ def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
 
 
 @router.get("/v1/runs/{run_id}/logs")
-def run_logs(run_id: str, key: Annotated[dict, Depends(require_key)], offset: int = 0):
-    status = owned_run(run_id, key)
+def run_logs(
+    run_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    offset: int = 0,
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+):
+    status = readable_run(run_id, key, x_freesolo_org_id)
     log_path = runs_file_path(run_id, ".log")
     chunk, end = "", max(0, offset)
     if os.path.exists(log_path):
@@ -280,8 +292,12 @@ def run_logs(run_id: str, key: Annotated[dict, Depends(require_key)], offset: in
 
 
 @router.get("/v1/runs/{run_id}/worker")
-def run_worker_output(run_id: str, key: Annotated[dict, Depends(require_key)]):
-    status = owned_run(run_id, key)
+def run_worker_output(
+    run_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+):
+    status = readable_run(run_id, key, x_freesolo_org_id)
     return {"run_id": run_id, "worker": _app._worker_artifacts(JobSpec.from_dict(status.spec))}
 
 
