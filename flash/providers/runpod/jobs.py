@@ -422,6 +422,7 @@ def deploy_train_endpoint(
                 "min_cuda_version": min_cuda_for(friendly),
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
+                "max_concurrency": 1,  # one job per warm worker; keeps per-job venv cleanup safe
             }
             if image:
                 kwargs["image"] = image
