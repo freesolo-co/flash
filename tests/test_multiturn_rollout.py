@@ -559,7 +559,7 @@ def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
     the real engine finishes requests in completion-length order, not submission order."""
     pending = []  # (req_id, prefix_ids, max_tokens)
 
-    def submit(req_id, prefix_ids, max_tokens, initial):
+    def submit(req_id, prefix_ids, max_tokens, initial, images):
         pending.append((req_id, list(prefix_ids), max_tokens))
 
     def poll():

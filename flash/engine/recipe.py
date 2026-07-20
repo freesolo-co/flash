@@ -35,6 +35,7 @@ class TeacherModel:
     # serverless models — confirm against the live fireworks.ai pricing before relying on the
     # `flash train` cost quote.
     usd_per_1m: tuple[float, float]
+    supports_images: bool = False
 
 
 # The alias used when [train] omits teacher_model — the historical fixed teacher, unchanged.
@@ -64,6 +65,7 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
         model_id="accounts/fireworks/models/kimi-k2p6",
         display_name="Kimi K2.6",
         usd_per_1m=(0.95, 4.00),
+        supports_images=True,
     ),
 }
 
@@ -73,6 +75,11 @@ def normalize_teacher_alias(value: str) -> str:
     whitespace/underscores collapsed to a single hyphen. So ``"GLM 5.2"`` / ``"glm_5.2"`` both map to
     the ``"glm-5.2"`` key. A ``.`` in a version is preserved (``kimi-k2.6``)."""
     return "-".join(str(value).strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def teacher_supports_images(value: str) -> bool:
+    """Return whether the resolved managed teacher accepts image-conditioned echo scoring."""
+    return resolve_teacher(value).supports_images
 
 
 def resolve_teacher(value: str) -> TeacherModel:
