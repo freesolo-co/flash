@@ -95,7 +95,9 @@ def _decode_only_compilation_config() -> dict[str, Any]:
     }
 
 
-def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
+def opd_vllm_kwargs(
+    model_id: str, knobs: Any, seq_cap: int, *, model_revision: str = ""
+) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
         "gpu_memory_utilization": 0.10,
@@ -139,8 +141,12 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                 resolve_params_b,
             )
 
-            info = MODELS.get(model_id)
-            params_b = resolve_params_b(model_id)
+            info = None if model_revision else MODELS.get(model_id)
+            params_b = (
+                resolve_params_b(model_id, revision=model_revision)
+                if model_revision
+                else resolve_params_b(model_id)
+            )
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
             target_concurrency = opd_rollout_concurrency(
                 getattr(knobs, "prompts_per_step", 1),

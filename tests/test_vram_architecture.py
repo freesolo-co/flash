@@ -92,6 +92,26 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
     )
 
 
+def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
+    import flash.engine.vram as vram_mod
+
+    captured = {}
+
+    def _capture_estimate(*_args, **kwargs):
+        captured.update(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(vram_mod, "estimate_vram_gb", _capture_estimate)
+
+    assert vram_mod.grpo_fits_resident(
+        "Qwen/Qwen3.6-35B-A3B",
+        card_vram_gb=180,
+        revision="a" * 40,
+    )
+    assert captured["active_params_b"] == 0.0
+    assert captured["model_info"] is None
+
+
 def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overrouting():
     cases = {
         "gqa_dense_sft": (

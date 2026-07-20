@@ -604,6 +604,7 @@ def grpo_fits_resident(
     thinking: bool = False,
     card_vram_gb: float = 0.0,
     fp8_kv: bool = False,
+    revision: str = "",
     margin: float = 1.15,
 ) -> bool:
     """True when GRPO fits resident (no sleep-mode offload); False on unknown model/card (safe default)."""
@@ -611,13 +612,17 @@ def grpo_fits_resident(
         return False
     from flash.catalog import MODELS, vocab_size_for
 
-    info = MODELS.get(model_id)
-    params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
+    catalog_info = MODELS.get(model_id)
+    params_b = (
+        float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
+    )
     if params_b <= 0:
         return False
-    quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
-    # catalog geometry sizes kv and every lora target. active parameters affect only activations, while
-    # the resident weight copies continue to use total parameters.
+    quant = (
+        (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
+    )
+    # pinned revisions use the conservative generic kv and lora geometry, matching the runtime budget.
+    info = None if revision else catalog_info
     active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
     resident = estimate_vram_gb(
         params_b,
