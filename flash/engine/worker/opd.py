@@ -662,9 +662,15 @@ def run_opd():
 
     # resolve the model/tokenizer halt set once for vllm sampling and termination classification.
     generation_eos_ids = _generation_eos_ids(model, tok)
-    vllm_kwargs = _opd_vllm_kwargs(model_id, knobs, seq_cap)
     lora_rank = _opd_lora_rank(
         model, getattr(_w.JOB_SPEC.train, "lora_rank", 32) if _w.JOB_SPEC else 32
+    )
+    vllm_kwargs = _opd_vllm_kwargs(
+        model_id,
+        knobs,
+        seq_cap,
+        prompts_per_step=prompts_per_step,
+        lora_rank=lora_rank,
     )
     print(
         f"[opd] rollout backend: colocated vLLM model={rollout_model_source} "

@@ -111,11 +111,18 @@ def _sizing_lora_rank(knobs: Any, default: int = 32) -> int:
         return default
 
 
-def _rollout_uplift_validated(params_b: float, lora_rank: int) -> bool:
-    return float(params_b) <= 4.0 and int(lora_rank) <= 32
+def _rollout_uplift_validated(params_b: float | None, lora_rank: int) -> bool:
+    return params_b is not None and float(params_b) <= 4.7 and int(lora_rank) <= 32
 
 
-def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
+def opd_vllm_kwargs(
+    model_id: str,
+    knobs: Any,
+    seq_cap: int,
+    *,
+    prompts_per_step: int | None = None,
+    lora_rank: int | None = None,
+) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
         "gpu_memory_utilization": 0.10,
@@ -163,10 +170,20 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
             info = MODELS.get(model_id)
             params_b = resolve_params_b(model_id)
-            lora_rank = _sizing_lora_rank(knobs)
+            sizing_params_b = float(params_b or 1.0)
+            resolved_lora_rank = (
+                _sizing_lora_rank(knobs)
+                if lora_rank is None
+                else max(1, int(lora_rank))
+            )
+            resolved_prompts_per_step = (
+                getattr(knobs, "prompts_per_step", 1)
+                if prompts_per_step is None
+                else prompts_per_step
+            )
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
             target_concurrency = opd_rollout_concurrency(
-                getattr(knobs, "prompts_per_step", 1),
+                resolved_prompts_per_step,
                 getattr(knobs, "group_size", 1),
             )
             rollout_concurrency = target_concurrency
@@ -188,16 +205,18 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                 # modeled loss forward/backward peak plus allocator slack, then give the remaining
                 # memory to the rollout executor instead of leaving it idle behind the generic cap.
                 training_peak_gb = opd_training_peak_gb(
-                    params_b,
+                    sizing_params_b,
                     int(seq_cap),
                     max_tokens=getattr(knobs, "max_completion", None),
-                    prompts_per_step=getattr(knobs, "prompts_per_step", 1),
+                    prompts_per_step=resolved_prompts_per_step,
                     group_size=getattr(knobs, "group_size", 1),
                     vocab=vocab_size_for(model_id),
                     active_params_b=active_b,
                 )
                 training_reserve_gb = training_peak_gb * 1.15
-                post_init_reserve_gb = opd_post_init_reserve_gb(params_b, lora_rank)
+                post_init_reserve_gb = opd_post_init_reserve_gb(
+                    sizing_params_b, resolved_lora_rank
+                )
                 allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
                 protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
                 rollout_budget_gb = max(0.0, free_gb - protected_gb)
@@ -220,9 +239,9 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                         reserve_gb=protected_gb,
                         rollout_batch_size=rollout_concurrency,
                     )
-                elif _rollout_uplift_validated(params_b, lora_rank):
-                    # 0.80 is a final ceiling for the validated 4b/rank-32 size class; larger or
-                    # higher-rank models keep the existing colocate ceiling until gpu validation.
+                elif _rollout_uplift_validated(params_b, resolved_lora_rank):
+                    # 0.80 is a final ceiling for the validated qwen3.5-4b/rank-32 size class; larger
+                    # or higher-rank models keep the existing colocate ceiling until gpu validation.
                     util = max(util, min(0.80, max_startup_util))
                 print(
                     "[opd] vLLM memory budget "

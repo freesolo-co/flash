@@ -430,6 +430,7 @@ def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
     from flash.engine.worker.opd_vllm import opd_vllm_kwargs
 
     _install_opd_kwargs_test_gpu(monkeypatch, card_gb=card_gb, free_gb=free_gb)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.7)
     monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
 
     out = opd_vllm_kwargs(
@@ -440,7 +441,7 @@ def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
 
     training_reserve_gb = (
         vram.opd_training_peak_gb(
-            4.0,
+            4.7,
             1536,
             max_tokens=512,
             prompts_per_step=8,
@@ -449,7 +450,7 @@ def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
         )
         * 1.15
     )
-    post_init_reserve_gb = vram.opd_post_init_reserve_gb(4.0, 32)
+    post_init_reserve_gb = vram.opd_post_init_reserve_gb(4.7, 32)
     allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
     expected = min(
         0.80,
@@ -464,6 +465,60 @@ def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
         + allocator_margin_gb
         <= free_gb
     )
+
+
+def test_opd_vllm_kwargs_uses_resolved_prompt_count_for_training_reserve(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    captured = {}
+    training_peak = vram.opd_training_peak_gb
+
+    def _capture_training_peak(*args, **kwargs):
+        captured.update(kwargs)
+        return training_peak(*args, **kwargs)
+
+    monkeypatch.setattr(vram, "opd_training_peak_gb", _capture_training_peak)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512, lora_rank=32),
+        1536,
+        prompts_per_step=2,
+    )
+
+    assert captured["prompts_per_step"] == 2
+    assert out["max_num_seqs"] == 2
+    assert out["rollout_batch_size"] == 2
+
+
+def test_opd_vllm_kwargs_uses_resolved_warm_start_rank_for_uplift(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.7)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+    captured = {}
+    post_init_reserve = vram.opd_post_init_reserve_gb
+
+    def _capture_post_init_reserve(params_b, lora_rank):
+        captured["params_b"] = params_b
+        captured["lora_rank"] = lora_rank
+        return post_init_reserve(params_b, lora_rank)
+
+    monkeypatch.setattr(vram, "opd_post_init_reserve_gb", _capture_post_init_reserve)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512, lora_rank=32),
+        1536,
+        lora_rank=64,
+    )
+
+    assert captured == {"params_b": 4.7, "lora_rank": 64}
+    assert out["gpu_memory_utilization"] == 0.22
 
 
 def test_opd_vllm_kwargs_keeps_conservative_util_for_35b_rank64_post_init_growth(monkeypatch):
@@ -533,6 +588,25 @@ def test_opd_vllm_kwargs_keeps_010_fallback_when_budget_sizing_fails(monkeypatch
     )
 
     assert out["gpu_memory_utilization"] == 0.10
+
+
+def test_opd_vllm_kwargs_sizes_unknown_model_without_enabling_uplift(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: None)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+
+    out = opd_vllm_kwargs(
+        "uncataloged/model",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512),
+        1536,
+    )
+
+    assert out["gpu_memory_utilization"] == 0.22
+    assert out["max_num_seqs"] == 8
+    assert out["rollout_batch_size"] == 8
 
 
 def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monkeypatch):
