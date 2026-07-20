@@ -168,6 +168,7 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
 
 
 _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S = 300.0
+_REQUIRED_FINAL_UPLOAD_RESERVE_S = 60.0
 _OPTIONAL_UPLOAD_STAGE_ROOT = "/tmp/flash-optional-uploads"
 _RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
 _FICLONE = 0x40049409
@@ -259,7 +260,8 @@ class _SingleSlotUploader:
             return True
 
 
-_OPTIONAL_UPLOADER = _SingleSlotUploader()
+_OPTIONAL_CHECKPOINT_UPLOADER = _SingleSlotUploader()
+_OPTIONAL_AUX_UPLOADER = _SingleSlotUploader()
 _DEBUG_UPLOAD_LOCK = threading.Lock()
 
 
@@ -304,13 +306,26 @@ def _stage_optional_directory(source: str, label: str) -> tuple[str, str]:
     return staged_dir, staged_path
 
 
-def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) -> bool:
-    """bounded flush for clean train-end, final publication, and error paths.
+def _bounded_optional_flush_timeout(timeout_s: float) -> float:
+    timeout_s = max(0.0, timeout_s)
+    remaining = _w._remaining_worker_wall_seconds()
+    if remaining is None:
+        return timeout_s
+    return min(timeout_s, max(0.0, remaining - _REQUIRED_FINAL_UPLOAD_RESERVE_S))
 
-    abrupt preemption can lose only the newest pending optional snapshot. Clean exits drain that
-    snapshot after the current upload, in deterministic sequence order.
-    """
-    return _OPTIONAL_UPLOADER.flush(timeout_s)
+
+def _checkpoint_upload_lock_timeout() -> float:
+    return _bounded_optional_flush_timeout(_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S)
+
+
+def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) -> bool:
+    """bounded best-effort flush that preserves time for required terminal artifacts."""
+    timeout_s = _bounded_optional_flush_timeout(timeout_s)
+    started = time.monotonic()
+    checkpoints_flushed = _OPTIONAL_CHECKPOINT_UPLOADER.flush(timeout_s)
+    remaining = max(0.0, timeout_s - (time.monotonic() - started))
+    aux_flushed = _OPTIONAL_AUX_UPLOADER.flush(remaining)
+    return checkpoints_flushed and aux_flushed
 
 
 def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
@@ -333,7 +348,7 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
                 for row in rows:
                     f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
             staged_dir, staged_path = _stage_optional_file(path, "debug-jsonl")
-            _OPTIONAL_UPLOADER.enqueue(
+            _OPTIONAL_AUX_UPLOADER.enqueue(
                 f"debug {repo_name}",
                 staged_dir,
                 lambda: _w.hf_upload_file(staged_path, repo_name),
@@ -821,6 +836,7 @@ def upload_resume_checkpoint(
     *,
     before_upload=None,
     after_upload=None,
+    skip_upload=None,
     emit_heartbeat: bool = True,
     lock_timeout_s: float | None = None,
 ) -> bool:
@@ -837,6 +853,8 @@ def upload_resume_checkpoint(
         if not acquired:
             print(f"[ckpt] step {step} upload skipped; another checkpoint upload is still active")
             return False
+        if skip_upload is not None and skip_upload():
+            return True
         heartbeat_context = (
             liveness_heartbeat(
                 "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
@@ -943,16 +961,15 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                     emit_heartbeat=emit_heartbeat,
                 )
 
-        if not upload_resume_checkpoint(
+        return upload_resume_checkpoint(
             step,
             ckpt_dir,
             before_upload=_prepare,
+            after_upload=lambda: uploaded_steps.add(step),
+            skip_upload=lambda: step in uploaded_steps,
             emit_heartbeat=emit_heartbeat,
             lock_timeout_s=lock_timeout_s,
-        ):
-            return False
-        uploaded_steps.add(step)
-        return True
+        )
 
     def _enqueue_optional(step: int, ckpt_dir: str) -> None:
         try:
@@ -963,7 +980,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         except Exception as e:
             print(f"[ckpt] step {step} snapshot warn: {sanitize_diagnostic(e, limit=500)}")
             return
-        _OPTIONAL_UPLOADER.enqueue(
+        _OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
             f"checkpoint step {step}",
             staged_dir,
             lambda: _upload(
@@ -1003,11 +1020,11 @@ def make_checkpoint_upload_callback(save_at_steps=()):
             if step not in required_steps:
                 _enqueue_optional(step, ckpt_dir)
                 return
-            if not flush_optional_uploads():
-                raise RetriableInfraError(
-                    f"required save step {step} timed out waiting for optional uploads"
-                )
-            if not _upload(step, ckpt_dir):
+            if not _upload(
+                step,
+                ckpt_dir,
+                lock_timeout_s=_checkpoint_upload_lock_timeout(),
+            ):
                 raise RetriableInfraError(
                     f"required save step {step} full-state checkpoint was not durably published"
                 )
@@ -1017,12 +1034,6 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                 if required_steps:
                     raise RuntimeError("required saves have no artifact repository")
                 return
-            optional_uploads_flushed = flush_optional_uploads()
-            if not optional_uploads_flushed:
-                print(
-                    f"[ckpt] optional upload flush exceeded "
-                    f"{_OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S:.0f}s; the newest optional snapshot may be lost"
-                )
             latest = _latest_checkpoint_dir(args.output_dir)
             if latest is not None:
                 step, ckpt_dir = latest
@@ -1033,7 +1044,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                     and not _upload(
                         step,
                         ckpt_dir,
-                        lock_timeout_s=None if optional_uploads_flushed else 0.0,
+                        lock_timeout_s=_checkpoint_upload_lock_timeout(),
                     )
                 ):
                     if step in required_steps:

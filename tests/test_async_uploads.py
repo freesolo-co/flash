@@ -32,7 +32,10 @@ def upload_worker(monkeypatch, tmp_path):
     import flash.engine.worker as worker
     from flash.engine.worker import hf as worker_hf
 
-    monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOADER", worker_hf._SingleSlotUploader())
+    monkeypatch.setattr(
+        worker_hf, "_OPTIONAL_CHECKPOINT_UPLOADER", worker_hf._SingleSlotUploader()
+    )
+    monkeypatch.setattr(worker_hf, "_OPTIONAL_AUX_UPLOADER", worker_hf._SingleSlotUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOAD_STAGE_ROOT", str(tmp_path / "staged"))
     monkeypatch.setattr(worker, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker, "PHASE", "rl")
@@ -171,6 +174,81 @@ def test_reward_debug_upload_is_enqueued_without_waiting(upload_worker, monkeypa
     assert uploaded == [[{"reward": 1.0}]]
 
 
+def test_required_checkpoint_does_not_wait_for_debug_upload(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path
+):
+    worker, worker_hf = upload_worker
+    debug_started = threading.Event()
+    debug_release = threading.Event()
+    uploads: list[str] = []
+
+    def upload_debug(_path: str, _repo_name: str) -> bool:
+        debug_started.set()
+        assert debug_release.wait(5)
+        return True
+
+    class RecordingApi:
+        def upload_folder(self, **kwargs) -> None:
+            uploads.append(kwargs["path_in_repo"])
+
+        def list_repo_files(self, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setattr(worker, "hf_upload_file", upload_debug)
+    monkeypatch.setattr(worker, "hf_api", lambda: RecordingApi())
+    worker.upload_debug_jsonl("reward_debug_required_save.jsonl", [{"reward": 1.0}])
+    assert debug_started.wait(1)
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _checkpoint(output_dir, 4)
+    worker.make_checkpoint_upload_callback((4,)).on_save(
+        SimpleNamespace(output_dir=str(output_dir)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert uploads == [
+        "rl/async-test/checkpoints/step-4/adapter",
+        "rl/async-test/checkpoint/checkpoint-4",
+    ]
+    debug_release.set()
+    assert worker_hf.flush_optional_uploads(5)
+
+
+def test_optional_flush_preserves_terminal_deadline_reserve(upload_worker, monkeypatch, tmp_path):
+    worker, worker_hf = upload_worker
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    result: list[bool] = []
+    staged_dir = tmp_path / "blocked"
+    staged_dir.mkdir()
+
+    def blocked_upload() -> None:
+        started.set()
+        assert release.wait(5)
+
+    worker_hf._OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
+        "blocked checkpoint", str(staged_dir), blocked_upload
+    )
+    assert started.wait(1)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 30.0)
+
+    def flush() -> None:
+        result.append(worker_hf.flush_optional_uploads())
+        completed.set()
+
+    flush_thread = threading.Thread(target=flush)
+    flush_thread.start()
+    returned_before_release = completed.wait(0.5)
+    release.set()
+    flush_thread.join(5)
+
+    assert returned_before_release
+    assert result == [False]
+
+
 def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
     from flash.engine.worker.hf import _SingleSlotUploader
 
@@ -202,7 +280,7 @@ def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
 def test_train_end_timeout_still_publishes_latest_checkpoint(
     upload_worker, fake_trainer_callback, monkeypatch, tmp_path
 ):
-    worker, worker_hf = upload_worker
+    worker, _worker_hf = upload_worker
     uploads: list[str] = []
 
     class RecordingApi:
@@ -213,7 +291,6 @@ def test_train_end_timeout_still_publishes_latest_checkpoint(
             return []
 
     monkeypatch.setattr(worker, "hf_api", lambda: RecordingApi())
-    monkeypatch.setattr(worker_hf, "flush_optional_uploads", lambda: False)
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     _checkpoint(output_dir, 4)
@@ -237,7 +314,7 @@ def test_train_end_timeout_does_not_wait_on_active_upload(
     upload_lock = threading.Lock()
     upload_lock.acquire()
     monkeypatch.setattr(worker_hf, "_RESUME_CHECKPOINT_UPLOAD_LOCK", upload_lock)
-    monkeypatch.setattr(worker_hf, "flush_optional_uploads", lambda: False)
+    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 30.0)
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     _checkpoint(output_dir, 4)
@@ -330,7 +407,7 @@ def test_concurrent_debug_snapshots_preserve_append_order(upload_worker, monkeyp
         uploaded.append([json.loads(line) for line in Path(path).read_text().splitlines()])
         return True
 
-    monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOADER", CoordinatedUploader())
+    monkeypatch.setattr(worker_hf, "_OPTIONAL_AUX_UPLOADER", CoordinatedUploader())
     monkeypatch.setattr(worker, "hf_upload_file", upload)
     first = threading.Thread(
         target=worker.upload_debug_jsonl,
