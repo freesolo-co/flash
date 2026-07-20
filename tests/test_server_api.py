@@ -292,6 +292,122 @@ def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
     assert response.json()["state"] == "dry_run"
 
 
+@pytest.mark.parametrize(
+    ("structured_outputs", "message"),
+    [
+        ({"regex": "["}, "regex is invalid"),
+        (
+            {"json": {"$ref": "https://example.invalid/schema.json"}},
+            "external schema retrieval is unsupported",
+        ),
+        (
+            {"json_object": True, "whitespace_pattern": "["},
+            "whitespace_pattern is invalid",
+        ),
+    ],
+)
+def test_dry_run_rejects_invalid_structured_serving_constraints(
+    api, monkeypatch, structured_outputs, message
+) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "submit_job",
+        lambda *_a, **_k: pytest.fail("invalid serving config must fail before submission"),
+    )
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {**SPEC["train"], "structured_outputs": structured_outputs},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        {"regex": r"^[0-9]+$", "whitespace_pattern": r"\s*"},
+        {
+            "json": {
+                "$defs": {"answer": {"type": "string"}},
+                "type": "object",
+                "properties": {"answer": {"$ref": "#/$defs/answer"}},
+            }
+        },
+        {"json": {"const": {"$ref": "https://example.invalid/is-instance-data"}}},
+    ],
+)
+def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_outputs) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {**SPEC["train"], "structured_outputs": structured_outputs},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
+
+
+@pytest.mark.parametrize(
+    ("max_completion_tokens", "status_code"),
+    [(3500, 400), (3000, 200)],
+)
+def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
+    api, monkeypatch, max_completion_tokens, status_code
+) -> None:
+    import flash.schema as schema
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
+    if status_code == 400:
+        monkeypatch.setattr(
+            runs_route._app,
+            "submit_job",
+            lambda *_a, **_k: pytest.fail("invalid context must fail before allocation"),
+        )
+    spec = {
+        **SPEC,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "algorithm": "opd",
+        "thinking": False,
+        "train": {
+            **SPEC["train"],
+            "max_completion_tokens": max_completion_tokens,
+            "structured_outputs": {"choice": ["4"]},
+        },
+        "gpu": {"type": "B200"},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == status_code, response.text
+    if status_code == 400:
+        detail = response.json()["detail"]
+        assert "OPD rollout prompt+completion)=4524" in detail
+        assert "serving max_model_len=4096" in detail
+    else:
+        assert response.json()["state"] == "dry_run"
+
+
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
     import flash.server.routes.runs as runs_route
     from flash.schema import train_schema_metadata

@@ -338,6 +338,38 @@ def serving_completion_token_capacity(spec: JobSpec, *, prompt_allowance: int) -
     return max(0, cap - max(0, int(prompt_allowance)))
 
 
+def _effective_train_context(
+    spec: JobSpec, *, completion_tokens: int | None = None
+) -> tuple[int, str] | None:
+    from flash.engine.vram import grpo_rollout_seq_len, opd_rollout_seq_len
+
+    max_completion_tokens = (
+        completion_tokens if completion_tokens is not None else spec.train.max_completion_tokens
+    )
+    if spec.algorithm == "grpo":
+        return (
+            grpo_rollout_seq_len(
+                spec.train.max_context_tokens or 0,
+                max_completion_tokens,
+                spec.thinking,
+            ),
+            "train.max_context_tokens / train.max_completion_tokens "
+            "(GRPO rollout prompt+completion)",
+        )
+    if spec.algorithm == "opd":
+        return (
+            opd_rollout_seq_len(
+                spec.train.max_context_tokens or 0,
+                max_completion_tokens,
+                spec.thinking,
+            ),
+            "train.max_context_tokens / train.max_completion_tokens "
+            "(OPD rollout prompt+completion)",
+        )
+    effective = int(spec.train.max_context_tokens or 0)
+    return (effective, "train.max_context_tokens") if effective > 0 else None
+
+
 def preflight_train_context_within_serving(
     spec: JobSpec,
     *,
@@ -345,8 +377,6 @@ def preflight_train_context_within_serving(
     prompt_allowance: int = 0,
 ) -> None:
     """Reject a run whose training or completion context exceeds serving ``max_model_len``."""
-    from flash.engine.vram import grpo_rollout_seq_len
-
     cap = serving_context_cap(spec.model)
     if cap is None:
         return
@@ -360,17 +390,10 @@ def preflight_train_context_within_serving(
                 f"tokens for the serving prompt; lower train.max_completion_tokens to <= "
                 f"{capacity}."
             )
+    resolved = _effective_train_context(spec, completion_tokens=completion_tokens)
+    if resolved is None:
         return
-    if spec.algorithm == "grpo":
-        effective = grpo_rollout_seq_len(
-            spec.train.max_context_tokens or 0, spec.train.max_completion_tokens, spec.thinking
-        )
-        knob = "train.max_context_tokens / train.max_completion_tokens (GRPO rollout prompt+completion)"
-    else:
-        effective = int(spec.train.max_context_tokens or 0)
-        if effective <= 0:
-            return
-        knob = "train.max_context_tokens"
+    effective, knob = resolved
     if effective > cap:
         raise ValueError(
             f"{knob}={effective} exceeds {spec.model}'s serving max_model_len={cap}: a LoRA trained "

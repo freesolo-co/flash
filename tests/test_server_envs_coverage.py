@@ -386,10 +386,11 @@ def _smoke_spec(
     thinking: bool,
     constraint: dict | None = None,
     max_completion_tokens: int | None = None,
+    algorithm: str = "grpo",
 ):
     return types.SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
-        algorithm="grpo",
+        algorithm=algorithm,
         thinking=thinking,
         train=types.SimpleNamespace(
             max_completion_tokens=max_completion_tokens,
@@ -470,6 +471,45 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
     _run_smoke(_smoke_spec(thinking=True, constraint={"json_object": True}))
 
     assert calls[0]["max_tokens"] == 1536
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        _smoke_spec(
+            algorithm="sft",
+            thinking=False,
+            constraint={"json_object": True},
+            max_completion_tokens=8192,
+        ),
+        _smoke_spec(algorithm="grpo", thinking=False, max_completion_tokens=8192),
+        _smoke_spec(algorithm="opd", thinking=False, max_completion_tokens=8192),
+        _smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192),
+    ],
+)
+def test_run_deployment_smoke_keeps_non_target_paths_at_256(monkeypatch, spec):
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("{}")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(spec)
+
+    assert calls[0]["max_tokens"] == 256
+
+
+def test_zero_completion_budget_resolves_to_thinking_recipe_default():
+    from flash.serve.preflight import resolve_effective_completion_tokens
+
+    spec = _smoke_spec(
+        thinking=True,
+        constraint={"json_object": True},
+        max_completion_tokens=0,
+    )
+
+    assert resolve_effective_completion_tokens(spec) == 1536
 
 
 def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):

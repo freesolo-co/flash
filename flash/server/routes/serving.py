@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 from referencing import Registry
-from referencing.exceptions import NoSuchResource, Unresolvable
+from referencing.exceptions import Unresolvable
 
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.lora_rank import serving_completion_token_capacity
@@ -46,7 +46,11 @@ from flash.serve.deploy import (
 )
 from flash.serve.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
+    ExternalSchemaReference,
+    reject_external_schema_reference,
     resolve_effective_completion_tokens,
+    validate_local_json_schema,
+    validate_structured_output_patterns,
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
@@ -97,10 +101,6 @@ def _bounded_call(fn, *, deadline: float, budget_s: float):
     return result.get("value")
 
 
-def _reject_external_schema_reference(uri: str):
-    raise NoSuchResource(ref=uri)
-
-
 _DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
 _JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
 _JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
@@ -129,11 +129,10 @@ def _sanitized_schema_error(exc: Exception) -> str:
 
 def _json_schema_validation_worker(connection, instance, schema) -> None:
     try:
-        validator_class = validator_for(schema)
-        validator_class.check_schema(schema)
-        registry = Registry(retrieve=_reject_external_schema_reference)
+        validator_class = validate_local_json_schema(schema, validator_factory=validator_for)
+        registry = Registry(retrieve=reject_external_schema_reference)
         validator_class(schema, registry=registry).validate(instance)
-    except Unresolvable as exc:
+    except (ExternalSchemaReference, Unresolvable) as exc:
         outcome = ("reference", _sanitized_schema_error(exc))
     except SchemaError as exc:
         outcome = ("schema", _sanitized_schema_error(exc))
@@ -393,6 +392,10 @@ def _validate_structured_smoke(
     if time.monotonic() >= deadline:
         raise _smoke_timeout_error(budget_s)
     try:
+        validate_structured_output_patterns(constraint)
+    except ValueError as exc:
+        raise ServingError(f"configured structured-output {exc}") from exc
+    try:
         if "json" in constraint:
             _validate_json_schema(
                 _strict_json_loads(answer),
@@ -432,12 +435,14 @@ def _run_deployment_smoke(
     deadline = started + budget_s
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
-    max_tokens = max(256, resolve_effective_completion_tokens(spec))
-    serving_capacity = serving_completion_token_capacity(
-        spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-    )
-    if serving_capacity is not None:
-        max_tokens = min(max_tokens, serving_capacity)
+    max_tokens = 256
+    if constraint is not None and spec.thinking:
+        max_tokens = max(256, resolve_effective_completion_tokens(spec))
+        serving_capacity = serving_completion_token_capacity(
+            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
+        )
+        if serving_capacity is not None:
+            max_tokens = min(max_tokens, serving_capacity)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
