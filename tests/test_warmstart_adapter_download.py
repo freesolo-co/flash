@@ -37,7 +37,7 @@ def _prepare_download(monkeypatch):
         "_require_hf_deadline_allowance",
         lambda: deadline_checks.append(None),
     )
-    monkeypatch.setattr(adapter.os.path, "isdir", lambda path: path == _ADAPTER_DIR)
+    monkeypatch.setattr(adapter, "_has_deployable_adapter", lambda path: path == _ADAPTER_DIR)
     return deadline_checks
 
 
@@ -146,3 +146,54 @@ def test_deadline_exhausted_during_backoff_raises_retriable_error(monkeypatch):
     assert len(calls) == 1
     assert sleeps == [5.0]
     assert len(deadline_checks) == 1
+
+
+def test_incomplete_snapshot_retries_until_adapter_is_complete(monkeypatch):
+    import huggingface_hub
+
+    deadline_checks = _prepare_download(monkeypatch)
+    calls = []
+    sleeps = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(
+        adapter,
+        "_sleep_with_hf_deadline",
+        lambda delay: sleeps.append(delay) or True,
+    )
+    # first returned snapshot is incomplete (missing weights), the retry lands a loadable adapter.
+    completeness = iter([False, True])
+    monkeypatch.setattr(adapter, "_has_deployable_adapter", lambda _path: next(completeness))
+
+    assert adapter._download_adapter(_ADAPTER_REF) == _ADAPTER_DIR
+    assert len(calls) == 2
+    assert sleeps == [5.0]
+    assert len(deadline_checks) == 2
+
+
+def test_snapshot_success_but_adapter_never_complete_raises_retriable(monkeypatch):
+    import huggingface_hub
+
+    deadline_checks = _prepare_download(monkeypatch)
+    calls = []
+    sleeps = []
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        adapter,
+        "_sleep_with_hf_deadline",
+        lambda delay: sleeps.append(delay) or True,
+    )
+    # snapshot_download keeps returning, but a loadable adapter never materializes -> infra retry.
+    monkeypatch.setattr(adapter, "_has_deployable_adapter", lambda _path: False)
+
+    with pytest.raises(RetriableInfraError) as exc_info:
+        adapter._download_adapter(_ADAPTER_REF)
+
+    assert type(exc_info.value) is RetriableInfraError
+    assert len(calls) == adapter._ADAPTER_DOWNLOAD_RETRIES
+    assert sleeps == [5.0, 10.0, 15.0]
+    assert len(deadline_checks) == adapter._ADAPTER_DOWNLOAD_RETRIES

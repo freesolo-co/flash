@@ -23,7 +23,14 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
     def fake_snapshot_download(**kw):
         calls.update(kw)
         adapter_prefix = kw["allow_patterns"][0].removesuffix("/adapter/*")
-        os.makedirs(os.path.join(kw["local_dir"], adapter_prefix, "adapter"), exist_ok=True)
+        adapter_dir = os.path.join(kw["local_dir"], adapter_prefix, "adapter")
+        os.makedirs(adapter_dir, exist_ok=True)
+        # a real download lands a loadable adapter (config + weights); the worker now treats a dir
+        # without them as an incomplete transfer, so the stub materializes both.
+        with open(os.path.join(adapter_dir, "adapter_config.json"), "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb"):
+            pass
 
     monkeypatch.setattr(W, "HF_REPO", hf_repo, raising=False)
     import huggingface_hub

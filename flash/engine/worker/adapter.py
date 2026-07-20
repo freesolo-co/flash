@@ -8,6 +8,7 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.hf import (
     RetriableInfraError,
+    _has_deployable_adapter,
     _prefetch_error_is_retriable,
     _require_hf_deadline_allowance,
     _sleep_with_hf_deadline,
@@ -219,7 +220,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     repo, prefix = resolved
     from huggingface_hub import snapshot_download
 
-    downloaded = False
+    adir = os.path.join("/tmp/evdl", prefix, "adapter")
     for attempt in range(_ADAPTER_DOWNLOAD_RETRIES):
         _require_hf_deadline_allowance()
         try:
@@ -232,22 +233,23 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
                 revision=(_w.JOB_SPEC.train.init_from_adapter_revision if _w.JOB_SPEC else None)
                 or None,
             )
-            downloaded = True
-            break
         except Exception as error:
             if not _prefetch_error_is_retriable(error):
                 raise RuntimeError(
                     "the prepared warm-start source adapter could not be downloaded"
                 ) from None
-            if attempt + 1 < _ADAPTER_DOWNLOAD_RETRIES:
-                try:
-                    if not _sleep_with_hf_deadline(_ADAPTER_DOWNLOAD_BACKOFF_S * (attempt + 1)):
-                        break
-                except Exception:
+        else:
+            # a returned snapshot can still be incomplete: an interrupted transfer, or hf falling
+            # back to a partial local_dir when a throttled metadata call cannot confirm the file set.
+            # only a loadable adapter counts as success; otherwise retry like any transient failure.
+            if _has_deployable_adapter(adir):
+                return adir
+        if attempt + 1 < _ADAPTER_DOWNLOAD_RETRIES:
+            try:
+                if not _sleep_with_hf_deadline(_ADAPTER_DOWNLOAD_BACKOFF_S * (attempt + 1)):
                     break
-    if not downloaded:
-        raise RetriableInfraError(
-            "the prepared warm-start source adapter could not be downloaded after transient failures"
-        ) from None
-    adir = os.path.join("/tmp/evdl", prefix, "adapter")
-    return adir if os.path.isdir(adir) else None
+            except Exception:
+                break
+    raise RetriableInfraError(
+        "the prepared warm-start source adapter could not be downloaded after transient failures"
+    ) from None
