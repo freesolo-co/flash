@@ -301,6 +301,24 @@ def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
             "external schema retrieval is unsupported",
         ),
         (
+            {
+                "json": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "$dynamicRef": "https://example.invalid/schema.json#answer",
+                }
+            },
+            "external schema retrieval is unsupported",
+        ),
+        (
+            {
+                "json": {
+                    "$schema": "https://json-schema.org/draft/2019-09/schema",
+                    "$recursiveRef": "https://example.invalid/schema.json#",
+                }
+            },
+            "external schema retrieval is unsupported",
+        ),
+        (
             {"json_object": True, "whitespace_pattern": "["},
             "whitespace_pattern is invalid",
         ),
@@ -332,6 +350,28 @@ def test_dry_run_rejects_invalid_structured_serving_constraints(
     assert message in response.json()["detail"]
 
 
+def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+            "structured_outputs": {"json": {"type": 7}},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "train.structured_outputs JSON schema is invalid" in response.json()["detail"]
+    assert "could not be prepared" not in response.json()["detail"]
+
+
 @pytest.mark.parametrize(
     "structured_outputs",
     [
@@ -344,6 +384,12 @@ def test_dry_run_rejects_invalid_structured_serving_constraints(
             }
         },
         {"json": {"const": {"$ref": "https://example.invalid/is-instance-data"}}},
+        {
+            "json": {
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "object",
+            }
+        },
     ],
 )
 def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_outputs) -> None:

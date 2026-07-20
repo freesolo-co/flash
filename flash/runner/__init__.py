@@ -950,11 +950,14 @@ def prepare_job(
     spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
-    from flash.lora_rank import preflight_train_context_within_serving
-    from flash.serve.preflight import preflight_serving_path
+    if spec.train.structured_outputs:
+        from flash.serve.preflight import preflight_serving_path
 
-    preflight_serving_path(spec)
-    preflight_train_context_within_serving(spec)
+        preflight_serving_path(spec)
+    else:
+        from flash.lora_rank import preflight_train_context_within_serving
+
+        preflight_train_context_within_serving(spec)
     if spec.gpu.provider or spec.gpu.exact_type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for

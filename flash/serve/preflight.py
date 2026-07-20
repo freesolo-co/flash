@@ -12,6 +12,7 @@ from referencing.jsonschema import specification_with
 
 from flash.engine.recipe import RECIPE
 from flash.engine.structured_outputs import parse_structured_outputs
+from flash.engine.vram import opd_completion_len
 from flash.lora_rank import preflight_train_context_within_serving
 from flash.spec import JobSpec
 
@@ -24,20 +25,27 @@ class ExternalSchemaReference(ValueError):
         super().__init__(ref)
 
 
+class ServingPreflightError(ValueError):
+    pass
+
+
 def reject_external_schema_reference(uri: str):
     raise NoSuchResource(ref=uri)
 
 
 def _external_schema_reference(schema: dict, validator_class) -> str | None:
-    specification = specification_with(validator_class.META_SCHEMA["$id"])
+    meta_schema = validator_class.META_SCHEMA
+    specification_id = meta_schema.get("$id") or meta_schema.get("id")
+    specification = specification_with(specification_id)
     pending = [specification.create_resource(schema)]
     while pending:
         resource = pending.pop()
         contents = resource.contents
         if isinstance(contents, Mapping):
-            ref = contents.get("$ref")
-            if isinstance(ref, str) and ref and not ref.startswith("#"):
-                return ref
+            for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+                ref = contents.get(keyword)
+                if isinstance(ref, str) and ref and not ref.startswith("#"):
+                    return ref
         pending.extend(resource.subresources())
     return None
 
@@ -67,9 +75,12 @@ def validate_structured_output_patterns(constraint: dict) -> None:
 def resolve_effective_completion_tokens(spec: JobSpec) -> int:
     """Resolve the run's positive explicit or recipe-default completion-token budget."""
     explicit = spec.train.max_completion_tokens
-    if explicit is not None and int(explicit) > 0:
-        return int(explicit)
-    recipe = RECIPE.opd if spec.algorithm == "opd" else RECIPE.rl
+    positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
+    if spec.algorithm == "opd":
+        return opd_completion_len(positive_explicit, spec.thinking)
+    if positive_explicit is not None:
+        return positive_explicit
+    recipe = RECIPE.rl
     return int(recipe.max_completion_len_thinking if spec.thinking else recipe.max_completion_len)
 
 
@@ -81,23 +92,26 @@ def preflight_serving_path(spec: JobSpec) -> None:
     try:
         validate_structured_output_patterns(constraint)
     except ValueError as exc:
-        raise ValueError(f"train.structured_outputs {exc}") from exc
+        raise ServingPreflightError(f"train.structured_outputs {exc}") from exc
     schema = constraint.get("json")
     if schema is not None:
         try:
             validate_local_json_schema(schema)
         except ExternalSchemaReference as exc:
-            raise ValueError(
-                "train.structured_outputs JSON schema uses external $ref "
+            raise ServingPreflightError(
+                "train.structured_outputs JSON schema uses external reference "
                 f"{exc.ref!r}; external schema retrieval is unsupported, so use a local "
                 "fragment reference beginning with '#/'"
             ) from exc
         except SchemaError as exc:
-            raise ValueError(
+            raise ServingPreflightError(
                 f"train.structured_outputs JSON schema is invalid: {exc.message}"
             ) from exc
-    preflight_train_context_within_serving(
-        spec,
-        completion_tokens=resolve_effective_completion_tokens(spec),
-        prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE,
-    )
+    try:
+        preflight_train_context_within_serving(
+            spec,
+            completion_tokens=resolve_effective_completion_tokens(spec),
+            prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE,
+        )
+    except ValueError as exc:
+        raise ServingPreflightError(str(exc)) from exc
