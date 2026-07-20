@@ -151,11 +151,14 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         from flash.providers.runpod import api as runpod_api
         from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
 
+        probe_deadline_at = (
+            deadline_at + _RECOVERY_MARKER_GRACE_S if deadline_at is not None else None
+        )
         job = runpod_api.job_status(
             data["endpoint_id"],
             data["job_id"],
             key_fingerprint=data["key_fingerprint"],
-            deadline_at=deadline_at,
+            deadline_at=probe_deadline_at,
         )
         if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
             return None

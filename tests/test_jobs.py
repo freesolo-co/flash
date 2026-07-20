@@ -3184,6 +3184,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
+        import flash.runner.lifecycle as lifecycle
         from flash.providers.runpod import api as runpod_api
 
         status = orch.RunStatus(
@@ -3221,7 +3222,9 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
-        assert status_deadlines == [orch._load_run_deadline_at("walked")]
+        assert status_deadlines == [
+            orch._load_run_deadline_at("walked") + lifecycle._RECOVERY_MARKER_GRACE_S
+        ]
         import json
         import os
 
