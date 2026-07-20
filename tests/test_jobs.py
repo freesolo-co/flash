@@ -1750,6 +1750,73 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
         assert calls["n"] == 1
 
 
+def test_supervisor_cancel_wins_over_late_runpod_completion(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.providers.allocator as allocator
+        import flash.runner.lifecycle as lifecycle
+        from flash.providers.base import Allocation, Candidate, PollResult
+        from flash.providers.runpod import api as runpod_api
+        from flash.spec import JobSpec
+
+        base = _spec("cancel-before-adoption").to_dict()
+        base["gpu"]["max_retries"] = 0
+        spec = JobSpec.from_dict(base)
+        orch._save_status(
+            orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+            _next_attempt=0,
+        )
+        candidate = Candidate("runpod", "RTX 4090", 0.5, 24)
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *args, **kwargs: Allocation(
+                provider="runpod",
+                gpu="RTX 4090",
+                hourly_usd=0.5,
+                min_vram_gb=24,
+                candidates=(candidate,),
+            ),
+        )
+
+        class Provider:
+            supports_weight_cache = False
+
+            def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
+                on_handle(
+                    {
+                        "provider": "runpod",
+                        "endpoint_id": "ep-cancelled",
+                        "endpoint_name": "cancelled",
+                        "key_fingerprint": _RUNPOD_FINGERPRINT,
+                        "job_id": "job-cancelled",
+                        "attempt": attempt,
+                        "started_ts": 1.0,
+                    }
+                )
+                assert orch._update(spec.run_id, "cancelled", remote=None)
+                return PollResult(False, failure="poll_error", detail="provider api outage")
+
+            def destroy(self, _handle):
+                return None
+
+        monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+        monkeypatch.setattr(
+            runpod_api,
+            "job_status",
+            lambda *_args, **_kwargs: pytest.fail("cancel must win before completion probing"),
+        )
+
+        with pytest.raises(orch._RunCancelled):
+            lifecycle._submit_seed_supervised(
+                spec,
+                spec.seed,
+                io.StringIO(),
+                code_prefix="code/revision",
+            )
+
+
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -3174,6 +3241,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
+        from flash.providers.runpod import api as runpod_api
 
         status = orch.RunStatus(
             run_id="walked",
@@ -3192,17 +3260,25 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
             },
         )
         orch._save_status(status)
-        # Worker output carries wall time but neither cost nor allocated_gpu (the in-process
-        # success path that stamps allocated_gpu is bypassed on recovery).
+        # worker output carries wall time but neither cost nor allocated_gpu, and the failed
+        # poll forces the job-status recovery shortcut to preserve the persisted gpu class.
         monkeypatch.setattr(
             jobs,
             "poll_job",
-            lambda *a, **k: jobs.PollResult(True, metrics={"wall_seconds": 3600.0}),
+            lambda *a, **k: jobs.PollResult(False, failure="poll_error", detail="api outage"),
         )
+        status_deadlines = []
+
+        def completed_status(*_args, **kwargs):
+            status_deadlines.append(kwargs.get("deadline_at"))
+            return {"status": "COMPLETED", "output": {"wall_seconds": 3600.0}}
+
+        monkeypatch.setattr(runpod_api, "job_status", completed_status)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
+        assert status_deadlines == [orch._load_run_deadline_at("walked")]
         import json
         import os
 

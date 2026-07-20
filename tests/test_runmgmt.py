@@ -2204,7 +2204,8 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     assert "deadline exhausted" in (status.error or "")
 
 
-def test_completed_attempt_metrics_keeps_success_pending_when_metrics_lag(monkeypatch):
+@pytest.mark.parametrize(("now", "pending"), [(201.0, True), (321.0, False)])
+def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypatch, now, pending):
     import flash.providers._hf_artifacts as hf_artifacts
     import flash.providers._instance_poll as instance_poll
     import flash.runner.lifecycle as lifecycle
@@ -2220,7 +2221,7 @@ def test_completed_attempt_metrics_keeps_success_pending_when_metrics_lag(monkey
     monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 0.0)
     monkeypatch.setattr(instance_poll, "_METRICS_AFTER_SUCCESS_RETRIES", 1)
     monkeypatch.setattr(instance_poll, "_METRICS_AFTER_SUCCESS_WAIT_S", 0.0)
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
 
     def artifact_reader(_repo, path):
         def read(force=False):
@@ -2234,16 +2235,19 @@ def test_completed_attempt_metrics_keeps_success_pending_when_metrics_lag(monkey
         return read
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-    pending_error = getattr(lifecycle, "_CompletedAttemptPending", RuntimeError)
-
-    with pytest.raises(pending_error, match=r"metrics\.json"):
-        lifecycle._completed_attempt_metrics(
+    def call():
+        return lifecycle._completed_attempt_metrics(
             spec,
             provider="vast",
             attempt=0,
             launch_floor=100.0,
             deadline_at=200.0,
         )
+    if pending:
+        with pytest.raises(lifecycle._CompletedAttemptPending, match=r"metrics\.json"):
+            call()
+    else:
+        assert call() is None
 
 
 def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadline(

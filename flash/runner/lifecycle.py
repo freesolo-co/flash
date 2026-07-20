@@ -140,10 +140,11 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _runpod_completed_metrics(handle) -> dict | None:
+def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> dict | None:
     """Return decoded metrics only when the exact RunPod job completed successfully."""
     try:
-        canonical = _canonical_provider_handle(handle)
+        original = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+        canonical = _canonical_provider_handle(original)
         data = canonical.to_dict()
         if canonical.provider != "runpod" or not data.get("job_id"):
             return None
@@ -154,11 +155,17 @@ def _runpod_completed_metrics(handle) -> dict | None:
             data["endpoint_id"],
             data["job_id"],
             key_fingerprint=data["key_fingerprint"],
+            deadline_at=deadline_at,
         )
         if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
             return None
         metrics = decode_output(job.get("output"))
-        return metrics if isinstance(metrics, dict) else None
+        if not isinstance(metrics, dict):
+            return None
+        allocated_gpu = original.get("allocated_gpu")
+        if allocated_gpu:
+            metrics.setdefault("allocated_gpu", allocated_gpu)
+        return metrics
     except Exception:
         return None
 
@@ -302,17 +309,24 @@ def _completed_attempt_metrics(
         message="successful recovery marker seen; waiting for metrics.json",
         deadline_at=metrics_observation_deadline,
     )
+    metrics_grace_expired = time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
     if metrics_raw is None:
+        if metrics_grace_expired:
+            return None
         raise _CompletedAttemptPending(
             "successful recovery marker is present but metrics.json is not readable yet"
         )
     try:
         metrics = json.loads(metrics_raw)
     except (TypeError, ValueError) as exc:
+        if metrics_grace_expired:
+            return None
         raise _CompletedAttemptPending(
             "successful recovery marker is present but metrics.json is not parseable yet"
         ) from exc
     if not isinstance(metrics, dict):
+        if metrics_grace_expired:
+            return None
         raise _CompletedAttemptPending(
             "successful recovery marker is present but metrics.json is not an object yet"
         )
@@ -491,11 +505,19 @@ def _submit_seed_supervised(
     oom_vram_floor = 0
     for local_attempt in range(retry_budget.max_attempts):
         attempt = attempt_start + local_attempt
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
         if local_attempt > 0 and last_handle:
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            completed_metrics = _runpod_completed_metrics(last_handle)
+            completed_metrics = _runpod_completed_metrics(
+                last_handle,
+                deadline_at=_load_run_deadline_at(spec.run_id),
+            )
             if completed_metrics is not None:
                 _gc_seen_endpoints()
                 if current_gpu.get("name"):
@@ -732,7 +754,16 @@ def _submit_seed_supervised(
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
-        completed_metrics = _runpod_completed_metrics(last_handle)
+        # cancel wins over any retry-shaped failure.
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+        completed_metrics = _runpod_completed_metrics(
+            last_handle,
+            deadline_at=_load_run_deadline_at(spec.run_id),
+        )
         if completed_metrics is not None:
             _gc_seen_endpoints()
             if current_gpu.get("name"):
@@ -742,12 +773,6 @@ def _submit_seed_supervised(
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
-        # cancel wins over any retry-shaped failure.
-        try:
-            if get_status(spec.run_id).state == "cancelled":
-                raise _cancel()
-        except FileNotFoundError:
-            pass
         run_had_cache = bool(
             chosen is not None
             and getattr(get_provider(chosen.provider), "supports_weight_cache", False)

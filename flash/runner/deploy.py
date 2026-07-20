@@ -723,7 +723,10 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             return
-        completed_metrics = _runpod_completed_metrics(handle)
+        completed_metrics = _runpod_completed_metrics(
+            expected_remote,
+            deadline_at=deadline_at,
+        )
         if completed_metrics is not None:
             try:
                 if _adopt_completed_attempt(
@@ -943,10 +946,13 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:
-            metrics = _runpod_completed_metrics(handle)
+            deadline_at = _load_run_deadline_at(run_id)
+            metrics = _runpod_completed_metrics(
+                persisted_remote,
+                deadline_at=deadline_at,
+            )
             started_ts = persisted_remote.get("started_ts")
             if metrics is None and started_ts is not None:
-                deadline_at = _load_run_deadline_at(run_id)
                 metrics = _completed_attempt_metrics(
                     worker_spec,
                     provider=handle.provider,
@@ -989,7 +995,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if not res.ok:
             failure = f"{res.failure or 'job_failed'}: {res.detail or 'provider attempt failed'}"
             print(f"attach: {run_id} ended ({res.failure}); evaluating recovery", file=log)
-            completed_metrics = _runpod_completed_metrics(handle)
+            completed_metrics = _runpod_completed_metrics(
+                persisted_remote,
+                deadline_at=_load_run_deadline_at(run_id),
+            )
             if completed_metrics is not None and _adopt_completed_attempt(
                 run_id,
                 worker_spec,
