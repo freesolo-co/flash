@@ -228,6 +228,7 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.6-27B" in out
     assert "Qwen/Qwen3.5-2B" in out
     assert "openbmb/MiniCPM5-1B" in out
     # only bare model ids, none of the extra per-model detail columns
@@ -239,15 +240,18 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "GPU class selection is fully automatic" in out
-    assert "cheapest validated managed class" in out
+    assert "GPU allocation is automatic by default" in out
+    assert "cheapest validated class" in out
+    assert 'exact_type = "<CLASS>"' in out
+    assert "[gpu] exact_type" not in out
+    assert "gpu.exact_type" not in out
+    assert "don't pin" not in out
+    assert "cannot pin" not in out
     assert "runpod" not in out.lower()
     assert "lambda" not in out.lower()
-    assert "You can still tune" not in out
-    assert "[gpu] config table" not in out
 
 
 def _train_config(tmp_path, *, extra_train: str = ""):

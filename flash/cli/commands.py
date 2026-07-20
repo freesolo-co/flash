@@ -160,8 +160,9 @@ def cmd_gpus(args) -> int:
         (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
     )
     tip = (
-        "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated managed class that fits the model, so you don't pin a GPU type."
+        "Tip: GPU allocation is automatic by default.\n"
+        "The allocator picks the cheapest validated class that fits. Pin a specific class by "
+        'adding exact_type = "<CLASS>" to the [gpu] section.'
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
@@ -313,9 +314,8 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     if args.dry_run:
-        # dry-run is a faithful server-side preview: it sends the same declared secrets and runs the
-        # same config, warm-start, serving, and cost preflights as a real submit, but allocates no gpu
-        # and charges nothing. a rejection surfaces as the server's error with exit status 1.
+        # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
+        # or charging anything. a rejection surfaces as the server's error with exit status 1.
         try:
             status = client.create_run(
                 payload,
@@ -330,6 +330,14 @@ def cmd_train(args) -> int:
             raise ApiError(exc.status, detail) from exc
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
+        print(
+            "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
+            "runtime-secret presence, warm-start source, serving context cap, and cost. it did NOT "
+            "import or run your environment.py; dataset loading, start_episode/episode shapes, "
+            "reward/scorer, worker imports, model load, and gpu/training are first exercised on the "
+            "worker after cold-start.",
+            file=sys.stderr,
+        )
         if render.styled():
             print(
                 render.object_panel(
