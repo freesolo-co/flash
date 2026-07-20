@@ -70,6 +70,7 @@ from flash.engine.worker.opd_vllm import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _sdpa_cudnn_ctx,
+    enable_multimodal_input_require_grads,
     free_gpu,
     gpu_diagnostics,
     grad_checkpointing_on,
@@ -133,12 +134,62 @@ def _reconcile_required_opd_deployable(
     )
 
 
-def _opd_prompt_pool_fingerprint(examples: list[tuple[object, object, list[int]]]) -> str:
+@dataclass(frozen=True)
+class _PromptRecord:
+    example: object
+    student_messages: object
+    teacher_messages: object
+    prompt_ids: list[int]
+    rollout_prompt_ids: list[int]
+    descriptors: tuple[str, ...] = ()
+
+
+def _json_safe_image_example(value, descriptors: tuple[str, ...], *, image_payload=False):
+    """replace raw image payloads with normalized descriptors while preserving other fields."""
+    if image_payload:
+        return list(descriptors)
+    if isinstance(value, dict):
+        block_type = value.get("type")
+        image_block = block_type in {"image", "image_url", "input_image"}
+        return {
+            key: _json_safe_image_example(
+                item,
+                descriptors,
+                image_payload=(
+                    key in {"image", "images", "image_url"}
+                    or (image_block and key in {"source", "url"})
+                ),
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_image_example(item, descriptors) for item in value]
+    return value
+
+
+def _opd_prompt_pool_fingerprint(examples) -> str:
     """hash the exact ordered filtered prompt pool without exposing prompt content."""
     digest = hashlib.sha256()
-    for example, messages, prompt_ids in examples:
+    for item in examples:
+        if isinstance(item, _PromptRecord):
+            if item.descriptors:
+                payload = [
+                    _json_safe_image_example(item.example, item.descriptors),
+                    list(item.descriptors),
+                    item.teacher_messages,
+                    [int(token) for token in item.prompt_ids],
+                ]
+            else:
+                payload = [
+                    item.example,
+                    item.student_messages,
+                    [int(token) for token in item.prompt_ids],
+                ]
+        else:
+            example, messages, prompt_ids = item
+            payload = [example, messages, [int(token) for token in prompt_ids]]
         encoded = json.dumps(
-            [example, messages, [int(token) for token in prompt_ids]],
+            payload,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -146,6 +197,42 @@ def _opd_prompt_pool_fingerprint(examples: list[tuple[object, object, list[int]]
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _materialize_image_prompt(processor, student_messages, descriptors, package_root):
+    """decode and process one image prompt without retaining its images or tensors in the pool."""
+    from trl.data_utils import prepare_multimodal_messages
+
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(descriptors), package_root)
+    pil_messages = prepare_multimodal_messages(student_messages, images=images)
+    processed = processor.apply_chat_template(
+        conversation=[pil_messages],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        enable_thinking=_w.THINKING,
+    )
+    input_ids = processed["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        input_ids = input_ids[0]
+    prompt_ids = [int(token_id) for token_id in input_ids]
+    vision_inputs = {
+        key: value for key, value in processed.items() if key not in {"input_ids", "attention_mask"}
+    }
+    return prompt_ids, vision_inputs
+
+
+def _decode_opd_rollout_images(descriptors, package_root):
+    """decode one retained descriptor set for the current vllm rollout chunk only."""
+    from flash.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(descriptors), package_root)
+    return {"image": images if len(images) > 1 else images[0]}
 
 
 def _apply_opd_optimizer_update(
@@ -462,6 +549,9 @@ def run_opd():
     # conditioned on the transcript so far (see _run_multi_turn_step / rollout_one_records). A
     # single-turn env keeps the original one-generate-per-prompt path.
     multi_turn = bool(getattr(env, "multi_turn", False))
+
+    train = env.dataset()
+
     t_start = time.time()
     _w.heartbeat("opd_start", gpu=gpu_diagnostics())
     knobs = _resolve_opd_knobs()
@@ -472,28 +562,74 @@ def run_opd():
         f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
-    # The GLM teacher key is a platform-owned credential the control plane injects into the worker
-    # env (like HF_TOKEN); users never supply it. Read it like any other flash-used key.
+    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    # build the on-policy prompt pool before loading the student.
+    # the dataset was loaded before credentials, gpu setup, or model files. bound, shuffle, and
+    # pre-filter it here before loading the student.
+    if not train:
+        raise RuntimeError(
+            "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "
+            "environment's dataset()/train split before provisioning a GPU."
+        )
+    _max_examples = getattr(_w.JOB_SPEC.train, "max_examples", None) if _w.JOB_SPEC else None
+    max_examples = int(_max_examples or 0) if _max_examples is not None else 0
+    if max_examples > 0:
+        train = train[:max_examples]
+    rng = random.Random(_w.SEED)
+    rng.shuffle(train)
+    train_count = len(train)
+
+    from flash.multimodal import record_has_images, validate_multimodal_training
+
+    message_rows = []
+    _scanned = 0
+    with liveness_heartbeat("opd_filtering_prompts", progress=lambda: _scanned):
+        for ex in train:
+            messages = env.prompt_messages(ex)
+            message_rows.append((ex, messages, record_has_images(ex, messages)))
+            _scanned += 1
+    multimodal = any(has_images for _ex, _messages, has_images in message_rows)
+    if multimodal:
+        from flash.multimodal import validate_image_opd_teacher
+
+        try:
+            validate_image_opd_teacher(knobs.teacher_model)
+        except ValueError as exc:
+            raise RuntimeError(f"opd: {exc}") from exc
+
+    # the managed fireworks credential is checked only after image-teacher compatibility, before any
+    # teacher request or gpu allocation.
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
-            "no FIREWORKS_API_KEY (the GLM teacher key) in the opd worker env. It is platform-"
-            "managed and injected by the control plane, so this means the deployment has no "
-            "FIREWORKS_API_KEY configured in its environment."
+            "no FIREWORKS_API_KEY in the opd worker env. It is platform-managed and injected by "
+            "the control plane, so this means the deployment has no FIREWORKS_API_KEY configured "
+            "in its environment."
         )
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
-
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
         exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
-    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
-    # Tokenizer only (a few small files) up front -- the prompt-budget filter below needs it. The FULL
-    # base-weight prefetch (tens of GB) is deferred until AFTER the filter confirms a non-empty pool, so
-    # a dataset whose every prompt is over-budget fails fast without paying for the download (codex[bot]).
-    tok = load_tokenizer(model_id, revision=model_revision)
+
+    processor = None
+    if multimodal:
+        from transformers import AutoProcessor
+
+        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **model_revision_kwargs(model_revision),
+        )
+        tok = processor.tokenizer
+    else:
+        # text-only opd keeps the existing tokenizer path unchanged.
+        tok = load_tokenizer(model_id, revision=model_revision)
+    # image adapters must persist the full processor (image preprocessing config), not only the tokenizer.
+    artifact_processing_class = processor if multimodal else tok
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     # Thinking-mode student prompts open a reasoning block (e.g. Qwen's <think>) after the generation
@@ -509,24 +645,6 @@ def run_opd():
     }
     if _attn:
         model_init_kwargs["attn_implementation"] = _attn
-    # --- Build the on-policy prompt pool BEFORE loading the student ------------------------------
-    # Fetch the dataset, seed the RNGs, and pre-filter to the prompts that fit the context budget
-    # HERE — ahead of _student_model, which for a VL warm-start downloads the base and MERGES the SFT
-    # into it. A dataset whose every prompt is over-budget is a deterministic failure; detecting it
-    # now fails fast, before a paid worker pays for the base download + SFT merge (only tok/env/knobs
-    # are needed, none of which depend on the loaded model).
-    train = env.dataset()
-    if not train:
-        raise RuntimeError(
-            "opd: the environment dataset is empty — no prompts to sample on-policy. Check the "
-            "environment's dataset()/train split before provisioning a GPU."
-        )
-    _max_examples = getattr(_w.JOB_SPEC.train, "max_examples", None) if _w.JOB_SPEC else None
-    max_examples = int(_max_examples or 0) if _max_examples is not None else 0
-    if max_examples > 0:
-        train = train[:max_examples]
-    rng = random.Random(_w.SEED)
-    rng.shuffle(train)
     prompts_per_step = knobs.prompts_per_step
     group = knobs.group_size
     # Prompt budget mirrors GRPO: DROP (not truncate) prompts over the context budget, so the student
@@ -564,20 +682,56 @@ def run_opd():
     # so a healthy worker scanning a big split could exceed the grace and be reaped as stalled
     # (codex[bot]). Drive a real progress heartbeat off a monotonic scan counter while filtering.
     _scanned = 0
+    package_root = getattr(env, "package_root", None)
+    image_pad_id = None
+    if multimodal:
+        from flash.multimodal import resolve_image_pad_token_id
+
+        image_pad_id = resolve_image_pad_token_id(processor, tok)
     with liveness_heartbeat("opd_filtering_prompts", progress=lambda: _scanned):
         examples = []
-        for ex in train:
-            # Render ONCE here and CACHE (messages + ids) alongside ex. env.prompt_messages can be
-            # stateful/randomized, so re-rendering at train time could yield a DIFFERENT prompt than the
-            # one admitted by this budget filter — an over-budget re-render would then be dropped, so a
-            # pool that PASSED this filter could still yield no usable samples after paying for GPU/model
-            # setup. Reusing this exact render below guarantees every visited prompt fits (codex[bot]).
-            msgs = env.prompt_messages(ex)
-            ids = _render_prompt_ids(msgs)
-            if len(ids) <= prompt_budget:
-                examples.append((ex, msgs, ids))
+        for ex, messages, has_images in message_rows:
+            if has_images:
+                from flash.multimodal import (
+                    collapse_image_pad_runs,
+                    image_teacher_prompt_messages,
+                    normalize_prompt_images,
+                )
+
+                normalized = normalize_prompt_images(ex, messages, package_root)
+                student_messages = normalized.messages
+                descriptors = tuple(normalized.descriptors)
+                teacher_messages = image_teacher_prompt_messages(
+                    student_messages, len(descriptors)
+                )
+                prompt_ids = _materialize_image_prompt(
+                    processor, student_messages, descriptors, package_root
+                )[0]
+                rollout_prompt_ids = collapse_image_pad_runs(
+                    prompt_ids, image_pad_id, len(descriptors)
+                )
+                record = _PromptRecord(
+                    example=_json_safe_image_example(ex, descriptors),
+                    student_messages=student_messages,
+                    teacher_messages=teacher_messages,
+                    prompt_ids=prompt_ids,
+                    rollout_prompt_ids=rollout_prompt_ids,
+                    descriptors=descriptors,
+                )
+            else:
+                prompt_ids = _render_prompt_ids(messages)
+                record = _PromptRecord(
+                    example=ex,
+                    student_messages=messages,
+                    teacher_messages=messages,
+                    prompt_ids=prompt_ids,
+                    rollout_prompt_ids=prompt_ids,
+                )
+            if len(record.prompt_ids) <= prompt_budget:
+                examples.append(record)
             _scanned += 1
-    n_over_budget = len(train) - len(examples)
+    n_over_budget = train_count - len(examples)
+    del ex, has_images, message_rows, messages, train
     if not examples:
         raise RuntimeError(
             f"opd: every prompt exceeds the {prompt_budget}-token budget "
@@ -589,7 +743,7 @@ def run_opd():
     prompt_pool_fingerprint = _opd_prompt_pool_fingerprint(examples)
     if n_over_budget:
         print(
-            f"[opd] filtered {n_over_budget}/{len(train)} prompts over the "
+            f"[opd] filtered {n_over_budget}/{train_count} prompts over the "
             f"{prompt_budget}-token budget; pool = {len(examples)}"
         )
     if prompts_per_step > len(examples):
@@ -650,6 +804,8 @@ def run_opd():
                 gradient_checkpointing_kwargs={"use_reentrant": _reentrant}
             )
             model.enable_input_require_grads()
+            if multimodal:
+                enable_multimodal_input_require_grads(model)
             print(f"[opd] gradient checkpointing enabled (use_reentrant={_reentrant})")
     # The HF/PEFT model only handles differentiable loss forwards; the colocated vLLM engine owns
     # KV-cached student rollout generation.
@@ -697,6 +853,8 @@ def run_opd():
             structured_outputs=_so_spec,
             reasoning_parser=_reasoning_parser,
             lora_rank=lora_rank,
+            enable_tower_connector_lora=multimodal,
+            image_pad_token_id=image_pad_id,
             seed=backend_seed(_w.SEED),
             **vllm_kwargs,
         )
@@ -792,20 +950,27 @@ def run_opd():
     no_signal_resamples = int(_resumed("no_signal_resamples", 0))
     no_signal_skipped_steps = int(_resumed("no_signal_skipped_steps", 0))
 
-    def _generate_with_rollout_seeds(prompt_ids_batch, *, max_tokens):
+    def _generate_with_rollout_seeds(
+        prompt_ids_batch, *, max_tokens, multi_modal_data_batch=None
+    ):
         nonlocal rollout_seed_ordinal
         request_seeds = [
             rollout_request_seed(_w.SEED, rollout_seed_ordinal + offset)
             for offset in range(len(prompt_ids_batch))
         ]
+        generate_kwargs = {
+            "max_tokens": max_tokens,
+            "request_seeds": request_seeds,
+        }
+        if multi_modal_data_batch is not None:
+            generate_kwargs["multi_modal_data_batch"] = multi_modal_data_batch
         generations = _generate_many_vllm(
             vllm_rollout,
             tok,
             prompt_ids_batch,
             knobs,
             generation_eos_ids,
-            max_tokens=max_tokens,
-            request_seeds=request_seeds,
+            **generate_kwargs,
         )
         if len(generations) != len(prompt_ids_batch):
             raise RuntimeError(
@@ -980,11 +1145,25 @@ def run_opd():
                         if batch:
                             _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
-                def _queue_or_account(p: _Pending) -> None:
+                pending_teacher_batch: list[_Pending] = []
+
+                def _queue_or_account(
+                    p: _Pending, _pending_teacher_batch=pending_teacher_batch
+                ) -> None:
                     if p.gen.skip or p.gen.truncated:
                         _account(_resolve_no_loss_sample(p.gen, None))
                         return
-                    _queue_teacher_batch([p])
+                    _pending_teacher_batch.append(p)
+                    if len(_pending_teacher_batch) >= teacher_batch_size:
+                        _queue_teacher_batch(_pending_teacher_batch[:teacher_batch_size])
+                        del _pending_teacher_batch[:teacher_batch_size]
+
+                def _flush_pending_teacher_batch(
+                    _pending_teacher_batch=pending_teacher_batch,
+                ) -> None:
+                    if _pending_teacher_batch:
+                        _queue_teacher_batch(_pending_teacher_batch)
+                        _pending_teacher_batch.clear()
 
                 def _cancel_pending_teacher_futures(
                     *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
@@ -1014,7 +1193,21 @@ def run_opd():
                     scored_samples = []
                     for p, score in zip(batch, scores, strict=True):
                         p.score = score
-                        scored_samples.append((p.gen, score, p.prompt_ids))
+                        if p.image_record is None:
+                            scored_samples.append((p.gen, score, p.prompt_ids))
+                        else:
+                            scored_samples.append(
+                                _ImageLossSample(
+                                    gen=p.gen,
+                                    score=score,
+                                    prompt_ids=p.prompt_ids,
+                                    student_messages=p.image_record.student_messages,
+                                    descriptors=p.image_record.descriptors,
+                                    processor=processor,
+                                    package_root=package_root,
+                                    teacher_input_tokens=int(score.teacher_input_tokens or 0),
+                                )
+                            )
                     resolved = _resolve_samples_batched(
                         model,
                         tok,
@@ -1050,10 +1243,10 @@ def run_opd():
                         samples_seen += 1
                         _opd_progress(_s, _n)
 
-                    for _ex, _prompt_messages, _prompt_ids in batch:
+                    for prompt_record in batch:
                         for _g in range(group):
                             records = rollout_one_records(
-                                example=_ex,
+                                example=prompt_record.example,
                                 active_env=env,
                                 render=render_fn,
                                 generate=generate_fn,
@@ -1073,19 +1266,42 @@ def run_opd():
                                         prompt_messages=rec["context_messages"],
                                     )
                                 )
+                            _flush_pending_teacher_batch()
                             _drain_ready_teacher_futures()
                 else:
-                    contexts: list[tuple[list[int], object]] = []
+                    contexts: list[_PromptRecord] = []
                     prompts: list[list[int]] = []
-                    for _ex, prompt_messages, prompt_ids in batch:
+                    for prompt_record in batch:
                         for _g in range(group):
-                            contexts.append((prompt_ids, prompt_messages))
-                            prompts.append(prompt_ids)
+                            contexts.append(prompt_record)
+                            prompts.append(prompt_record.rollout_prompt_ids)
                     chunk_size = _opd_rollout_chunk_size(len(prompts))
                     for start in range(0, len(prompts), chunk_size):
                         end = start + chunk_size
                         chunk_prompts = prompts[start:end]
                         chunk_contexts = contexts[start:end]
+                        chunk_multimodal_data = None
+                        teacher_images_by_record: dict[int, tuple[str, ...]] = {}
+                        if multimodal:
+                            from flash.multimodal import image_descriptors_to_data_uris
+
+                            decoded_by_record: dict[int, object] = {}
+                            chunk_multimodal_data = []
+                            for prompt_record in chunk_contexts:
+                                if not prompt_record.descriptors:
+                                    chunk_multimodal_data.append(None)
+                                    continue
+                                record_key = id(prompt_record)
+                                if record_key not in decoded_by_record:
+                                    decoded_by_record[record_key] = _decode_opd_rollout_images(
+                                        prompt_record.descriptors, package_root
+                                    )
+                                    teacher_images_by_record[record_key] = tuple(
+                                        image_descriptors_to_data_uris(
+                                            prompt_record.descriptors, package_root
+                                        )
+                                    )
+                                chunk_multimodal_data.append(decoded_by_record[record_key])
                         with liveness_heartbeat(
                             "opd_step",
                             progress=_samples_progress,
@@ -1094,18 +1310,25 @@ def run_opd():
                         ):
                             rollout_started = time.perf_counter()
                             gens = _generate_with_rollout_seeds(
-                                chunk_prompts, max_tokens=knobs.max_completion
+                                chunk_prompts,
+                                max_tokens=knobs.max_completion,
+                                multi_modal_data_batch=chunk_multimodal_data,
                             )
+                            if multimodal:
+                                decoded_by_record.clear()
+                                chunk_multimodal_data.clear()
                             opd_phase_seconds["rollout_generate"] += (
                                 time.perf_counter() - rollout_started
                             )
                             opd_phase_counts["rollout_generate_calls"] += 1
                         scorable: list[_Pending] = []
-                        for gen, (prompt_ids, prompt_messages) in zip(
-                            gens, chunk_contexts, strict=True
-                        ):
+                        for gen, prompt_record in zip(gens, chunk_contexts, strict=True):
                             p = _Pending(
-                                gen=gen, prompt_ids=prompt_ids, prompt_messages=prompt_messages
+                                gen=gen,
+                                prompt_ids=prompt_record.prompt_ids,
+                                prompt_messages=prompt_record.teacher_messages,
+                                image_record=prompt_record if prompt_record.descriptors else None,
+                                teacher_images=teacher_images_by_record.get(id(prompt_record), ()),
                             )
                             if gen.skip or gen.truncated:
                                 _account(_resolve_no_loss_sample(gen, None))
@@ -1116,6 +1339,7 @@ def run_opd():
                         _queue_teacher_batch(scorable)
                         _drain_ready_teacher_futures()
 
+                _flush_pending_teacher_batch()
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
                 wait_started = time.perf_counter()
                 for fut in as_completed(list(teacher_futures)):
@@ -1209,7 +1433,7 @@ def run_opd():
                 is_required_save = opt_steps in knobs.save_at_steps
                 publish_periodic = checkpoint_due and not is_required_save and not is_final_step
                 if is_required_save or publish_periodic:
-                    _save_adapter(model, tok, adapter_dir)
+                    _save_adapter(model, artifact_processing_class, adapter_dir)
                     if is_final_step:
                         final_adapter_staged = True
                 checkpoint_accounting = {
@@ -1357,7 +1581,7 @@ def run_opd():
         )
 
     if not final_adapter_staged:
-        _save_adapter(model, tok, adapter_dir)
+        _save_adapter(model, artifact_processing_class, adapter_dir)
     # keep the served default while suppressing unrequested final checkpoints.
     _publish_opd_deployable(
         adapter_dir,
@@ -1525,6 +1749,7 @@ class _ScoreResult:
     teacher_toks: object = None
     status: str = "ok"
     error: str = ""
+    teacher_input_tokens: int | None = None
 
 
 def _sample_skip_reason(r: SampleResult) -> str:
@@ -1551,7 +1776,21 @@ class _Pending:
     gen: _GenResult
     prompt_ids: object
     prompt_messages: object
+    image_record: _PromptRecord | None = None
+    teacher_images: tuple[str, ...] = ()
     score: object = None
+
+
+@dataclass(frozen=True)
+class _ImageLossSample:
+    gen: _GenResult
+    score: _ScoreResult | None
+    prompt_ids: object
+    student_messages: object
+    descriptors: tuple[str, ...]
+    processor: object
+    package_root: object
+    teacher_input_tokens: int
 
 
 def _termination_cause(
@@ -1649,12 +1888,17 @@ def _generate_many_vllm(
     *,
     max_tokens: int,
     request_seeds: list[int] | None = None,
+    multi_modal_data_batch: list[object | None] | None = None,
 ) -> list[_GenResult]:
+    generate_kwargs = {
+        "max_tokens": max_tokens,
+        "request_seeds": request_seeds,
+    }
+    if multi_modal_data_batch is not None:
+        generate_kwargs["multi_modal_data_batch"] = multi_modal_data_batch
     return [
         _gen_from_vllm_output(out, tok, knobs, eos_ids)
-        for out in rollout.generate(
-            prompt_ids_batch, max_tokens=max_tokens, request_seeds=request_seeds
-        )
+        for out in rollout.generate(prompt_ids_batch, **generate_kwargs)
     ]
 
 
@@ -1694,20 +1938,121 @@ def _score_one(
     return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
 
 
+def _score_many_multimodal(
+    teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
+) -> list[_ScoreResult]:
+    items = [
+        (
+            _teacher_prompt_text(p.prompt_messages, thinking_prefill),
+            p.gen.completion_text,
+            p.teacher_images,
+        )
+        for p in pendings
+    ]
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            scored = teacher.score_many_multimodal(items)
+        except TeacherError as exc:
+            if exc.permanent:
+                raise
+            if attempt < attempts:
+                print(
+                    "[opd] multimodal teacher batch failed "
+                    f"(transient, retrying batch {attempt}/{attempts}, samples={len(pendings)}): {exc}"
+                )
+                continue
+            print(
+                "[opd] multimodal teacher batch failed "
+                f"(transient, skipping batch, samples={len(pendings)}): {exc}"
+            )
+            return [_ScoreResult(status="transient", error=str(exc)) for _ in pendings]
+        except Exception as exc:
+            if attempt < attempts:
+                print(
+                    "[opd] multimodal teacher batch failed "
+                    f"(retrying batch {attempt}/{attempts}, samples={len(pendings)}): {exc}"
+                )
+                continue
+            print(
+                "[opd] multimodal teacher batch failed "
+                f"(skipping batch, samples={len(pendings)}): {exc}"
+            )
+            return [_ScoreResult(status="error", error=str(exc)) for _ in pendings]
+        if len(scored) != len(pendings):
+            return [
+                _ScoreResult(
+                    status="error",
+                    error=(
+                        f"multimodal teacher batch returned {len(scored)} score(s) for "
+                        f"{len(pendings)} sample(s)"
+                    ),
+                )
+                for _ in pendings
+            ]
+        return [
+            _ScoreResult(
+                teacher_toks=tokens,
+                status="ok",
+                teacher_input_tokens=int(getattr(tokens, "input_tokens", 0) or 0),
+            )
+            for tokens in scored
+        ]
+    return [
+        _ScoreResult(status="error", error="multimodal teacher batch attempts exhausted")
+        for _ in pendings
+    ]
+
+
 def _score_many(
     teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
 ) -> list[_ScoreResult]:
     """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
     if not pendings:
         return []
+    image_positions = [index for index, pending in enumerate(pendings) if pending.teacher_images]
+    if image_positions:
+        image_position_set = set(image_positions)
+        text_positions = [index for index in range(len(pendings)) if index not in image_position_set]
+        results: list[_ScoreResult | None] = [None] * len(pendings)
+        if text_positions:
+            text_results = _score_many(
+                teacher,
+                [pendings[index] for index in text_positions],
+                thinking_prefill=thinking_prefill,
+                max_attempts=max_attempts,
+            )
+            for index, result in zip(text_positions, text_results, strict=True):
+                results[index] = result
+        image_results = _score_many_multimodal(
+            teacher,
+            [pendings[index] for index in image_positions],
+            thinking_prefill=thinking_prefill,
+            max_attempts=max_attempts,
+        )
+        for index, result in zip(image_positions, image_results, strict=True):
+            results[index] = result
+        if any(result is None for result in results):
+            raise RuntimeError("opd teacher batch partition left an unscored sample")
+        return [result for result in results if result is not None]
     prompts = [
         (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
         for p in pendings
     ]
+    unique_prompts: list[tuple[str, str]] = []
+    prompt_indexes: dict[tuple[str, str], int] = {}
+    scatter_indexes: list[int] = []
+    for prompt in prompts:
+        index = prompt_indexes.get(prompt)
+        if index is None:
+            index = len(unique_prompts)
+            prompt_indexes[prompt] = index
+            unique_prompts.append(prompt)
+        scatter_indexes.append(index)
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
-            scored = teacher.score_many(prompts)
+            scored = teacher.score_many(unique_prompts)
         except AttributeError:
             return [
                 _score_one(
@@ -1741,15 +2086,20 @@ def _score_many(
                 continue
             print(f"[opd] teacher batch failed (skipping batch, samples={len(pendings)}): {e}")
             return [_ScoreResult(status="error", error=str(e)) for _ in pendings]
-        if len(scored) != len(pendings):
+        if len(scored) != len(unique_prompts):
             return [
                 _ScoreResult(
                     status="error",
-                    error=f"teacher batch returned {len(scored)} score(s) for {len(pendings)} sample(s)",
+                    error=(
+                        f"teacher batch returned {len(scored)} score(s) for "
+                        f"{len(unique_prompts)} unique sample(s)"
+                    ),
                 )
                 for _ in pendings
             ]
-        return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
+        return [
+            _ScoreResult(teacher_toks=scored[index], status="ok") for index in scatter_indexes
+        ]
     return [
         _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
     ]
@@ -1805,6 +2155,7 @@ class _PreparedLoss:
     gen_tokens: int
     teacher_tokens: int
     group_granularity: float
+    image_sample: _ImageLossSample | None = None
 
 
 def _gkd_loss_from_logits_rows(rows, student_ids, groups, kl_coef=1.0):
@@ -1848,9 +2199,15 @@ def _gkd_loss_from_logps(sp_t, groups, kl_coef=1.0):
 
 
 def _forward_logits(
-    model, input_ids, attention_mask=None, *, position_ids=None, logits_to_keep=None
+    model,
+    input_ids,
+    attention_mask=None,
+    *,
+    position_ids=None,
+    logits_to_keep=None,
+    model_kwargs=None,
 ):
-    kwargs = {}
+    kwargs = dict(model_kwargs or {})
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
     if position_ids is not None:
@@ -1860,7 +2217,7 @@ def _forward_logits(
     try:
         return model(input_ids, **kwargs).logits
     except TypeError:
-        if position_ids is not None or logits_to_keep is not None:
+        if model_kwargs or position_ids is not None or logits_to_keep is not None:
             raise
         if attention_mask is not None:
             return model(input_ids).logits
@@ -1888,14 +2245,24 @@ def _resolve_samples_batched(
         return []
     results: list[SampleResult | None] = [None] * len(samples)
     prepared: list[_PreparedLoss] = []
-    for idx, (gen, score, prompt_ids) in enumerate(samples):
+    for idx, sample in enumerate(samples):
+        if isinstance(sample, _ImageLossSample):
+            gen = sample.gen
+            score = sample.score
+            prompt_ids = sample.prompt_ids
+            image_sample = sample
+            teacher_input_tokens = sample.teacher_input_tokens
+        else:
+            gen, score, prompt_ids = sample
+            image_sample = None
+            teacher_input_tokens = len(prompt_ids) + gen.gen_tokens
         if gen.truncated:
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
         if gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
-        teacher_tokens = len(prompt_ids) + gen.gen_tokens
+        teacher_tokens = teacher_input_tokens
         student_ids, student_toks = student_tokens_with_offsets(
             tok, gen.completion_ids, gen.completion_text
         )
@@ -1937,6 +2304,7 @@ def _resolve_samples_batched(
                 gen_tokens=gen.gen_tokens,
                 teacher_tokens=teacher_tokens,
                 group_granularity=group_granularity,
+                image_sample=image_sample,
             )
         )
 
@@ -1944,9 +2312,11 @@ def _resolve_samples_batched(
         model.train()
         model.config.use_cache = False
         pad_id = int(getattr(tok, "pad_token_id", 0) or 0)
+        text_prepared = [p for p in prepared if p.image_sample is None]
+        image_prepared = [p for p in prepared if p.image_sample is not None]
         mb = max(1, int(microbatch))
-        for start in range(0, len(prepared), mb):
-            chunk = prepared[start : start + mb]
+        for start in range(0, len(text_prepared), mb):
+            chunk = text_prepared[start : start + mb]
             _bump_model_counter(model, "_flash_opd_full_logits_batches")
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
@@ -1988,6 +2358,65 @@ def _resolve_samples_batched(
                 )
             if losses:
                 (sum(losses) * float(backward_scale)).backward()
+
+        for p in image_prepared:
+            _bump_model_counter(model, "_flash_opd_full_logits_batches")
+            image_sample = p.image_sample
+            materialized_prompt_ids, vision_inputs = _materialize_image_prompt(
+                image_sample.processor,
+                image_sample.student_messages,
+                image_sample.descriptors,
+                image_sample.package_root,
+            )
+            if materialized_prompt_ids != list(p.prompt_ids):
+                raise RuntimeError(
+                    "opd image prompt tokenization changed between pool filtering and loss forward"
+                )
+            prompt_len = len(p.prompt_ids)
+            comp_len = len(p.student_ids)
+            seq = list(p.prompt_ids) + list(p.student_ids)
+            input_ids = torch.tensor([seq], dtype=torch.long, device=device)
+            attention_mask = torch.ones_like(input_ids)
+            model_kwargs = {}
+            for key, value in vision_inputs.items():
+                moved = value.to(device) if hasattr(value, "to") else value
+                if key in {"mm_token_type_ids", "token_type_ids"}:
+                    shape = (*moved.shape[:-1], comp_len)
+                    completion_types = torch.zeros(shape, dtype=moved.dtype, device=device)
+                    moved = torch.cat((moved, completion_types), dim=-1)
+                model_kwargs[key] = moved
+            logits = _forward_logits(
+                model,
+                input_ids,
+                attention_mask,
+                model_kwargs=model_kwargs,
+            )
+            rows = logits[0, prompt_len - 1 : prompt_len - 1 + comp_len]
+            loss = _gkd_loss_from_logits_rows(
+                rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+            )
+            if loss is None:
+                results[p.idx] = SampleResult(
+                    teacher_status="ok",
+                    coverage=p.coverage,
+                    gen_tokens=p.gen_tokens,
+                    teacher_tokens=p.teacher_tokens,
+                    group_granularity=p.group_granularity,
+                    skip_reason="alignment_empty",
+                )
+                continue
+            loss_for_result = loss
+            if backward_scale is not None:
+                (loss * float(backward_scale)).backward()
+                loss_for_result = loss.detach()
+            results[p.idx] = SampleResult(
+                loss=loss_for_result,
+                teacher_status="ok",
+                coverage=p.coverage,
+                gen_tokens=p.gen_tokens,
+                teacher_tokens=p.teacher_tokens,
+                group_granularity=p.group_granularity,
+            )
 
     return [r if r is not None else SampleResult(skip_reason="teacher_error") for r in results]
 
@@ -2221,14 +2650,14 @@ def _restore_opd_full_state(
     return state
 
 
-def _save_adapter(model, tok, adapter_dir: str) -> None:
-    """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
+def _save_adapter(model, processing_class, adapter_dir: str) -> None:
+    """Persist the LoRA adapter and tokenizer or processor for deploy."""
     spec = getattr(_w, "JOB_SPEC", None)
     if spec is None:
         raise RuntimeError("OPD adapter save requires a JobSpec")
     _w.stamp_adapter_provenance(model, spec.model, spec.model_revision)
     model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
+    processing_class.save_pretrained(adapter_dir)
     _w.write_base_model_provenance(adapter_dir, spec.model, spec.model_revision)
 
 
