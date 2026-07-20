@@ -21,10 +21,10 @@ from flash.schema import spec_from_dict
 _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
-def _spec(*, rank: int = 16, alpha: int = 32):
+def _spec(*, rank: int = 16, alpha: int = 32, model: str = "Qwen/Qwen3.5-4B"):
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": model,
             "algorithm": "grpo",
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": {
@@ -69,10 +69,20 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
     assert metadata.alpha == 128
 
 
-def test_preflight_rejects_adapter_rank_above_serving_cap():
-    with pytest.raises(ValueError, match=r"rank 96.*serving max_lora_rank=64"):
+@pytest.mark.parametrize(
+    ("model", "adapter_rank"),
+    [
+        ("Qwen/Qwen3.5-4B", 96),
+        ("Qwen/Qwen3.6-27B", 65),
+    ],
+)
+def test_preflight_rejects_adapter_rank_above_serving_cap(model, adapter_rank):
+    with pytest.raises(ValueError, match=rf"rank {adapter_rank}.*serving max_lora_rank=64"):
         preflight_init_adapter_lora_rank(
-            _spec(), config_loader=lambda _ref, _token, _revision: _config(r=96)
+            _spec(model=model),
+            config_loader=lambda _ref, _token, _revision: _config(
+                r=adapter_rank, base_model_name_or_path=model
+            ),
         )
 
 

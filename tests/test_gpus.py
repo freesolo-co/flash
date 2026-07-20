@@ -150,6 +150,8 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     # -> the cheapest validated 80G class (A100 PCIe).
     assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 4090"
     assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
+    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="sft") == "A100 PCIe"
+    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="grpo") == "B200"
 
 
 def test_config_cheapest_policy_validated_pool(monkeypatch):

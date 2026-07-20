@@ -273,6 +273,25 @@ class _FakeTTY(io.StringIO):
         return True
 
 
+def test_push_includes_binary_images_only_under_singular_dataset_directory(monkeypatch, tmp_path):
+    env_dir = tmp_path / "my-env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "dataset").mkdir()
+    (env_dir / "dataset" / "red.png").write_bytes(b"png-bytes")
+    (env_dir / "assets").mkdir()
+    (env_dir / "assets" / "ignored.png").write_bytes(b"ignored")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="image-env")) == 0
+    raw = base64.b64decode(cap["package_b64"])
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        names = {member.name for member in tar.getmembers() if member.isfile()}
+    assert "dataset/red.png" in names
+    assert "assets/ignored.png" not in names
+
+
 def test_push_off_tty_passes_no_progress_callback(monkeypatch, tmp_path):
     # Under pytest stderr is not a TTY, so the upload stays on the plain single-shot path.
     env_file = tmp_path / "environment.py"
