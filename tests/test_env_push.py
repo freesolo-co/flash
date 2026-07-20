@@ -645,3 +645,32 @@ def test_push_fails_fast_on_unreadable_directory(monkeypatch, tmp_path, capsys):
         assert "cannot publish" in capsys.readouterr().err
     finally:
         _os.chmod(locked, 0o755)
+
+
+def test_push_drops_ssh_keys_and_credential_data_but_keeps_python_modules(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # python modules whose names look secret-ish must be kept: code is never name-filtered
+    (env_dir / "credentials.py").write_text("TOKEN = None\n")
+    (env_dir / "id_ed25519_loader.py").write_text("VALUE = 1\n")
+    # private keys of every common type, including nested and extensionless, must be dropped
+    keys = env_dir / "keys"
+    keys.mkdir()
+    (keys / "id_ed25519").write_text("PRIVATE\n")
+    (keys / "id_ecdsa").write_text("PRIVATE\n")
+    (keys / "id_dsa").write_text("PRIVATE\n")
+    (keys / "id_ed25519.pub").write_text("PUBLIC\n")
+    # credential data files must still be dropped
+    (env_dir / "credentials.json").write_text('{"token": "x"}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "credentials.py" in names
+    assert "id_ed25519_loader.py" in names
+    assert "credentials.json" not in names
+    assert "keys/id_ed25519" not in names
+    assert "keys/id_ecdsa" not in names
+    assert "keys/id_dsa" not in names
+    assert "keys/id_ed25519.pub" not in names

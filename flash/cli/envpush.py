@@ -214,7 +214,17 @@ _ENV_PUSH_SECRET_PATTERNS = (
     "credentials.*",
     "id_rsa",
     "id_rsa.*",
+    "id_dsa",
+    "id_dsa.*",
+    "id_ecdsa",
+    "id_ecdsa.*",
+    "id_ed25519",
+    "id_ed25519.*",
 )
+# python source is code, never a secret to be filtered by a look-alike name. exempting these
+# suffixes keeps helper modules like credentials.py or id_ed25519_loader.py in the package
+# instead of silently dropping them and breaking the worker with ModuleNotFoundError.
+_ENV_PUSH_CODE_SUFFIXES = frozenset({".py", ".pyi"})
 _ENV_PUSH_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 try:
@@ -314,7 +324,9 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
         return True
     if path.parent == env_root and lowered_name in _ENV_PUSH_ROOT_IGNORED_NAMES:
         return True
-    if any(fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS):
+    if path.suffix.lower() not in _ENV_PUSH_CODE_SUFFIXES and any(
+        fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS
+    ):
         return True
     return not (path.is_dir() or path.is_file())
 
