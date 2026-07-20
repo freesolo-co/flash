@@ -1670,7 +1670,8 @@ def _adapter_config(*, rank=32, alpha=64):
     }
 
 
-def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
+@pytest.mark.parametrize("cancel_during_status", [False, True])
+def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_during_status):
     from dataclasses import replace
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1730,23 +1731,32 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
                 return None
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-        monkeypatch.setattr(
-            runpod_api,
-            "job_status",
-            lambda *_args, **_kwargs: {
+        def job_status(*_args, **_kwargs):
+            if cancel_during_status:
+                orch._update(spec.run_id, "cancelled")
+            return {
                 "status": "COMPLETED",
                 "output": {"wall_seconds": 5.0, "trained_eval_acc": 0.9},
-            },
-        )
+            }
 
-        metrics = lifecycle._submit_seed_supervised(
-            spec,
-            spec.seed,
-            io.StringIO(),
-            code_prefix="code/revision",
-        )
+        monkeypatch.setattr(runpod_api, "job_status", job_status)
 
-        assert metrics["trained_eval_acc"] == 0.9
+        if cancel_during_status:
+            with pytest.raises(orch._RunCancelled):
+                lifecycle._submit_seed_supervised(
+                    spec,
+                    spec.seed,
+                    io.StringIO(),
+                    code_prefix="code/revision",
+                )
+        else:
+            metrics = lifecycle._submit_seed_supervised(
+                spec,
+                spec.seed,
+                io.StringIO(),
+                code_prefix="code/revision",
+            )
+            assert metrics["trained_eval_acc"] == 0.9
         assert calls["n"] == 1
 
 
