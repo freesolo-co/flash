@@ -562,18 +562,6 @@ _WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
 _WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
 
 
-# attempt identity, matching providers._poll._attempt_int: a bounded nonnegative int, never a bool,
-# string, or float. so "1", True, and 2.7 are not accepted, and a stray inf cannot crash the coercion.
-_MAX_ATTEMPT_ID = (1 << 63) - 1
-
-
-def _attempt_or_none(value: object) -> int | None:
-    """The retry attempt as a bounded nonnegative int, or None for any non-canonical value."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if 0 <= value <= _MAX_ATTEMPT_ID else None
-
-
 def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     """False only when the heartbeat provably belongs to a superseded retry attempt.
 
@@ -585,11 +573,15 @@ def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     ``remote``), fall back to ``warmup_message``'s age gating rather than suppress, so warmup still
     reassures on planes that do not surface a live attempt.
     """
+    # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
+    # or float) so the status display and stall detection agree on what a valid attempt is.
+    from flash.providers._poll import _attempt_int
+
     remote = obj.get("remote")
-    current_attempt = _attempt_or_none(remote.get("attempt")) if isinstance(remote, dict) else None
+    current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
     if current_attempt is None:
         return True
-    return _attempt_or_none(heartbeat.get("attempt")) == current_attempt
+    return _attempt_int(heartbeat.get("attempt")) == current_attempt
 
 
 def warmup_message(
