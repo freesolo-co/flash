@@ -321,9 +321,9 @@ def test_sft_positive_max_steps_is_authoritative():
     assert _spec_steps(above_derived) == 9
 
 
-def test_sft_steps_use_chunked_nll_realized_batch():
-    # qwen chunked nll removes the dense vocab-logits cap, so pricing must mirror the worker's
-    # per-device batch of four and the resulting realized global batch of eight.
+def test_sft_steps_price_gdn_packing_conservatively():
+    # qwen chunked nll permits a per-device batch of four, but the worker's gdn packing path forces
+    # per-device=1. price the requested batch so a non-multiple-of-four request cannot underquote.
     import math
 
     from flash.catalog import vocab_size_for
@@ -348,7 +348,11 @@ def test_sft_steps_use_chunked_nll_realized_batch():
     assert chunked is True
     assert sft_per_device(6, seq_len=1024, vocab=v, fused=chunked) == 4
     assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=chunked) == 8
-    assert _spec_steps(spec) == math.ceil(320 / 8) * 2 == 80
+    assert _spec_steps(spec) == math.ceil(320 / 6) * 2 == 108
+
+    raw["train"]["max_context_tokens"] = 16_385
+    unpacked_spec = spec_from_dict(raw)
+    assert _spec_steps(unpacked_spec) == math.ceil(320 / 8) * 2 == 80
 
 
 def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):

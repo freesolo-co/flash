@@ -94,8 +94,11 @@ def _sft_realized_batch(spec) -> int:
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
     sft_seq = _sft_seq_len(spec)
     # mirror the worker's validated chunked-nll model set so pricing uses the same realized batch.
-    # unsupported and open-policy models keep plain nll and its conservative big-vocab cap.
+    # every allowlisted model is a gdn hybrid; at packable context lengths the worker may force
+    # per-device=1, so price the requested batch rather than the larger chunked-nll rounded batch.
     sft_fused = sft_chunked_nll_enabled(spec.model)
+    if sft_fused and sft_seq <= 16_384:
+        return requested_batch
     return sft_realized_batch(
         requested_batch,
         seq_len=sft_seq,

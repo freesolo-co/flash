@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 
 import pytest
 
@@ -260,6 +261,14 @@ def test_qwen35_moe_chunked_nll_preserves_plain_objective():
     assert chunked_out.loss.item() == pytest.approx(plain_out.loss.item(), abs=1e-6)
     assert chunked_out.aux_loss is None
     assert chunked_out.logits is None
+
+
+def test_chunked_nll_forces_preload_before_model_validation():
+    from flash.engine.worker.sft import run_sft
+
+    source = inspect.getsource(run_sft)
+    assert "force=_sft_chunked" in source
+    assert source.index("force=_sft_chunked") < source.index("_prepare_chunked_nll_model(")
 
 
 def test_chunked_nll_rejects_trainable_output_head():

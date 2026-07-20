@@ -83,6 +83,12 @@ def test_runpod_allocation_lands_on_full_validated_cards():
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "runpod"
     assert a9.gpu == "A100 PCIe"  # cheapest validated 80 GB RunPod card
+    a27_sft = allocator.allocate("Qwen/Qwen3.6-27B", "sft")
+    assert a27_sft.provider == "runpod"
+    assert a27_sft.gpu == "A100 PCIe"
+    a27_grpo = allocator.allocate("Qwen/Qwen3.6-27B", "grpo")
+    assert a27_grpo.provider == "runpod"
+    assert a27_grpo.gpu == "B200"
 
 
 def test_default_max_retries():
@@ -396,6 +402,10 @@ def test_required_vram_policy_floors_and_downrouting():
     assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
     assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8}) >= 80
     assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
+    need_27b_sft = need("Qwen/Qwen3.6-27B", "sft")
+    need_27b_grpo = need("Qwen/Qwen3.6-27B", "grpo")
+    assert need_27b_sft == 80
+    assert need_27b_grpo == 147
     # group size and thinking never DECREASE the requirement
     base = need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4})
     assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16}) >= base
