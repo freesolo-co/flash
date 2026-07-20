@@ -12,6 +12,7 @@ def test_resolve_params_b_uses_catalog_params_b_float():
     assert resolve_params_b("Qwen/Qwen3.5-0.8B") == 0.9
     assert resolve_params_b("Qwen/Qwen3.5-4B") == 4.7
     assert resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
+    assert resolve_params_b("Qwen/Qwen3.6-27B") == 27.0
 
 
 def test_resolve_params_b_zero_falls_through_to_hf_not_string(monkeypatch):

@@ -174,7 +174,13 @@ def test_grpo_use_reentrant_true_for_gdn_hybrid():
     # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    for gdn_id in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"):
+    for gdn_id in (
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
+    ):
         assert grpo_use_reentrant(gdn_id) is True, gdn_id
 
 
