@@ -51,6 +51,7 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
 
     assert created[0].closed is True
     assert deploy._HTTP_CLIENT is None
+    assert deploy._CHAT_HTTP_CLIENT is None
     assert deploy._STREAM_HTTP_CLIENT is None
 
 
@@ -130,6 +131,85 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
     assert len(created) == 2
     assert created[0] is deploy._STREAM_HTTP_CLIENT
     assert created[1] is deploy._HTTP_CLIENT
+
+    deploy._close_http_client()
+    assert all(client.closed for client in created)
+
+
+def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    created = []
+    chat_started = threading.Event()
+    release_chat = threading.Event()
+    chat_result = []
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": []}
+
+    class _UndeployResponse(_Response):
+        def json(self):
+            return {
+                "run_id": "run-1",
+                "disabled_aliases": ["run-1"],
+                "disabled_revisions": [],
+            }
+
+    class _PoolLimitedClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.pool = threading.BoundedSemaphore(1)
+            self.closed = False
+            created.append(self)
+
+        def post(self, *_args, **_kwargs):
+            assert self.pool.acquire(blocking=False)
+            chat_started.set()
+            assert release_chat.wait(timeout=2.0)
+            self.pool.release()
+            return _Response()
+
+        def request(self, *_args, **_kwargs):
+            assert self.pool.acquire(blocking=False)
+            try:
+                return _UndeployResponse()
+            finally:
+                self.pool.release()
+
+        def close(self):
+            self.closed = True
+
+    deploy._close_http_client()
+    monkeypatch.setattr(deploy.httpx, "Client", _PoolLimitedClient)
+
+    thread = threading.Thread(
+        target=lambda: chat_result.append(
+            deploy.chat("run-1", [{"role": "user", "content": "hello"}])
+        )
+    )
+    thread.start()
+    assert chat_started.wait(timeout=1.0)
+    try:
+        result = deploy.undeploy_adapter("run-1")
+    finally:
+        release_chat.set()
+        thread.join(timeout=2.0)
+
+    assert result["serving_deregistered"] is True
+    assert chat_result == [{"choices": []}]
+    assert created[0] is deploy._CHAT_HTTP_CLIENT
+    assert created[1] is deploy._HTTP_CLIENT
+    assert created[0].kwargs["limits"].max_connections is None
+    assert created[0].kwargs["limits"].max_keepalive_connections == 100
 
     deploy._close_http_client()
     assert all(client.closed for client in created)

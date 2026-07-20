@@ -34,6 +34,7 @@ THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _HTTP_CLIENT: httpx.Client | None = None
+_CHAT_HTTP_CLIENT: httpx.Client | None = None
 _STREAM_HTTP_CLIENT: httpx.Client | None = None
 _HTTP_CLIENT_LOCK = threading.Lock()
 
@@ -124,6 +125,19 @@ def _http_client() -> httpx.Client:
     return _HTTP_CLIENT
 
 
+def _chat_http_client() -> httpx.Client:
+    global _CHAT_HTTP_CLIENT
+    if _CHAT_HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _CHAT_HTTP_CLIENT is None:
+                _CHAT_HTTP_CLIENT = httpx.Client(
+                    follow_redirects=True,
+                    max_redirects=100,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+                )
+    return _CHAT_HTTP_CLIENT
+
+
 def _stream_http_client() -> httpx.Client:
     global _STREAM_HTTP_CLIENT
     if _STREAM_HTTP_CLIENT is None:
@@ -134,10 +148,11 @@ def _stream_http_client() -> httpx.Client:
 
 
 def _close_http_client() -> None:
-    global _HTTP_CLIENT, _STREAM_HTTP_CLIENT
+    global _CHAT_HTTP_CLIENT, _HTTP_CLIENT, _STREAM_HTTP_CLIENT
     with _HTTP_CLIENT_LOCK:
-        clients = (_HTTP_CLIENT, _STREAM_HTTP_CLIENT)
+        clients = (_HTTP_CLIENT, _CHAT_HTTP_CLIENT, _STREAM_HTTP_CLIENT)
         _HTTP_CLIENT = None
+        _CHAT_HTTP_CLIENT = None
         _STREAM_HTTP_CLIENT = None
     for client in clients:
         if client is not None:
@@ -915,7 +930,7 @@ def chat(
     client_context = (
         httpx.Client(follow_redirects=True, max_redirects=100)
         if retry_unavailable
-        else contextlib.nullcontext(_http_client())
+        else contextlib.nullcontext(_chat_http_client())
     )
     with client_context as client:
         resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
