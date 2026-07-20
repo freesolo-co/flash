@@ -135,6 +135,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_generate["use_tqdm"] is False
     assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]
     assert _SamplingParams.last_kwargs["include_stop_str_in_output"] is True
+    assert "logit_bias" not in _SamplingParams.last_kwargs
     assert out[0].token_ids == [3, 4]
     assert out[0].terminated is True
 
@@ -638,9 +639,12 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 
     class _SamplingParams:
         last_kwargs: ClassVar[dict] = {}
+        instances: ClassVar[list] = []
 
         def __init__(self, **kwargs):
-            _SamplingParams.last_kwargs = dict(kwargs)
+            self.kwargs = dict(kwargs)
+            _SamplingParams.last_kwargs = self.kwargs
+            _SamplingParams.instances.append(self)
 
     class _StructuredOutputsParams:
         def __init__(self, **kwargs):
@@ -684,7 +688,7 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypatch, tmp_path):
     from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
 
-    _install_fake_vllm(monkeypatch)
+    sampling_params, _ = _install_fake_vllm(monkeypatch)
     fake_llm = sys.modules["vllm"].LLM
 
     class _Model:
@@ -698,6 +702,7 @@ def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypa
         temperature=0.7,
         top_p=0.9,
         enable_tower_connector_lora=True,
+        image_pad_token_id=99,
         adapter_root=str(tmp_path / "sync"),
     )
     engine.sync_from_model(_Model())
@@ -712,6 +717,8 @@ def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypa
         {"prompt_token_ids": [1, 99, 2], "multi_modal_data": {"image": image}},
         {"prompt_token_ids": [7, 8]},
     ]
+    assert sampling_params.instances[-2].kwargs["logit_bias"] == {99: -100.0}
+    assert "logit_bias" not in sampling_params.instances[-1].kwargs
     with pytest.raises(ValueError, match="multimodal data count"):
         engine.generate([[1], [2]], max_tokens=1, multi_modal_data_batch=[None])
 

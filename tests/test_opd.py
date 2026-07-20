@@ -246,7 +246,14 @@ def _patch_opd_run_vllm_stub(monkeypatch, opd_mod, *, sample_result=None, output
             self.model = model
             self.sync_count += 1
 
-        def generate(self, prompt_ids_batch, *, max_tokens, request_seeds=None):
+        def generate(
+            self,
+            prompt_ids_batch,
+            *,
+            max_tokens,
+            request_seeds=None,
+            multi_modal_data_batch=None,
+        ):
             self.request_seeds = list(request_seeds or [])
             out = []
             for _prompt_ids in prompt_ids_batch:
@@ -1348,6 +1355,8 @@ def test_opd_image_deployable_save_uses_full_processor(monkeypatch):
 
     opd_mod.run_opd()
 
+    rollout = opd_mod.OpdVllmRolloutEngine.instances[-1]
+    assert rollout.image_pad_token_id == 99
     assert saved_processing_classes == [processor]
     assert saved_processing_classes[0] is not processor.tokenizer
 

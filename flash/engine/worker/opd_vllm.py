@@ -277,6 +277,7 @@ class OpdVllmRolloutEngine:
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
     enable_tower_connector_lora: bool = False
+    image_pad_token_id: int | None = None
     enforce_eager: bool | None = None
     compilation_config: dict[str, Any] | None = None
     seed: int | None = None
@@ -411,7 +412,13 @@ class OpdVllmRolloutEngine:
                     return False
         return False
 
-    def _sampling_params(self, max_tokens: int, *, seed: int | None = None):
+    def _sampling_params(
+        self,
+        max_tokens: int,
+        *,
+        seed: int | None = None,
+        suppressed_token_id: int | None = None,
+    ):
         kwargs = {
             "max_tokens": max(1, int(max_tokens)),
             "temperature": float(self.temperature),
@@ -420,6 +427,8 @@ class OpdVllmRolloutEngine:
         }
         if seed is not None:
             kwargs["seed"] = int(seed)
+        if suppressed_token_id is not None:
+            kwargs["logit_bias"] = {int(suppressed_token_id): -100.0}
         if self.eos_token_ids:
             kwargs["stop_token_ids"] = list(self.eos_token_ids)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
@@ -472,6 +481,11 @@ class OpdVllmRolloutEngine:
                 if multi_modal_data_batch is not None
                 else None
             )
+            suppressed_chunk = (
+                [int(self.image_pad_token_id) if data is not None else None for data in multimodal_chunk]
+                if multimodal_chunk is not None and self.image_pad_token_id is not None
+                else None
+            )
             prompts = []
             for index, ids in enumerate(prompt_ids_chunk):
                 prompt = {"prompt_token_ids": [int(t) for t in ids]}
@@ -487,11 +501,17 @@ class OpdVllmRolloutEngine:
             sampling_params = (
                 [
                     self._sampling_params(
-                        max_tokens, seed=seeds[index] if seeds is not None else None
+                        max_tokens,
+                        seed=seeds[index] if seeds is not None else None,
+                        suppressed_token_id=(
+                            suppressed_chunk[index] if suppressed_chunk is not None else None
+                        ),
                     )
                     for index in range(len(prompts))
                 ]
-                if self._StructuredOutputsParams is not None or seeds is not None
+                if self._StructuredOutputsParams is not None
+                or seeds is not None
+                or suppressed_chunk is not None
                 else self._sampling_params(max_tokens)
             )
             outputs = self.llm.generate(

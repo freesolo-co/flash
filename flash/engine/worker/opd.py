@@ -853,6 +853,7 @@ def run_opd():
             reasoning_parser=_reasoning_parser,
             lora_rank=lora_rank,
             enable_tower_connector_lora=multimodal,
+            image_pad_token_id=image_pad_id,
             seed=backend_seed(_w.SEED),
             **vllm_kwargs,
         )

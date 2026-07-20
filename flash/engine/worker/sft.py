@@ -206,6 +206,7 @@ def run_sft():
         from flash.multimodal import (
             normalize_prompt_images,
             record_has_images,
+            text_only_prompt_messages,
             validate_multimodal_training,
         )
 
@@ -240,6 +241,7 @@ def run_sft():
             if multimodal:
                 normalized = normalize_prompt_images(ex, prompt_messages, package_root)
                 prompt_messages = normalized.messages
+                completion = text_only_prompt_messages(completion)
                 vl_rows.append(
                     {
                         "prompt": prompt_messages,

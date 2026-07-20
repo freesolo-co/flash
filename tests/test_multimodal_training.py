@@ -536,6 +536,33 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
         _reject_image_completion(completion)
 
 
+def test_sft_mixed_text_completion_shapes_are_arrow_safe():
+    import inspect
+
+    pytest.importorskip("datasets")
+    from datasets import Dataset
+
+    from flash.engine.worker import sft
+
+    completions = [
+        [{"role": "assistant", "content": "red"}],
+        [{"role": "assistant", "content": [{"type": "text", "text": "blue"}]}],
+    ]
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": [{"type": "text", "text": "color?"}]}],
+            "completion": mm.text_only_prompt_messages(completion),
+            "images": [],
+        }
+        for completion in completions
+    ]
+
+    dataset = Dataset.from_list(rows)
+
+    assert [row["completion"][0]["content"] for row in dataset] == ["red", "blue"]
+    assert "completion = text_only_prompt_messages(completion)" in inspect.getsource(sft.run_sft)
+
+
 def test_image_content_key_is_stable_and_pixel_sensitive():
     image_module = pytest.importorskip("PIL.Image")
     red = image_module.new("RGB", (2, 2), (255, 0, 0))
