@@ -3097,6 +3097,38 @@ def test_chat_step_selector_serves_verified_revision_instead_of_current_alias(ap
     assert seen["run_id"] == revisions[0]
 
 
+def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "c" * 40]
+    for revision in revisions:
+        generation = runner.verified_adapter_revision_generation(run_id)
+        assert runner.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=generation,
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an ambiguous step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 20},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "multiple verified revisions at step 20" in detail
+    assert "flash deployments" in detail
+
+
 def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
