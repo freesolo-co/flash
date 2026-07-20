@@ -28,6 +28,8 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
+_OPD_TRAINING_RESERVE_MULTIPLIER = 1.15
+_OPD_ALLOCATOR_MARGIN_MAX_GB = 6.0
 
 
 def _sft_per_device_bs() -> int:
@@ -145,6 +147,35 @@ def opd_training_peak_gb(
     # the backward peak holds both full-sequence bf16 logits and fp32 completion rows plus gradients.
     dense_logits = 2 * loss_mb * (seq_len * 2 + completion * 4) * vocab / 1e9
     return activations + dense_logits
+
+
+def opd_training_reserve_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
+) -> float:
+    """OPD loss-forward/backward peak with the runtime safety multiplier."""
+    return _OPD_TRAINING_RESERVE_MULTIPLIER * opd_training_peak_gb(
+        params_b,
+        seq_len,
+        max_tokens=max_tokens,
+        prompts_per_step=prompts_per_step,
+        group_size=group_size,
+        thinking=thinking,
+        vocab=vocab,
+        active_params_b=active_params_b,
+    )
+
+
+def opd_allocator_margin_gb(total_vram_gb: float) -> float:
+    """Allocator fragmentation slack protected by the OPD startup budget."""
+    return max(2.0, min(_OPD_ALLOCATOR_MARGIN_MAX_GB, float(total_vram_gb) * 0.05))
 
 
 def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
@@ -420,7 +451,7 @@ def estimate_vram_gb(
         # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
         # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
         # keep the runtime reserve and the allocator's total estimate on the same loss-peak model.
-        training_peak = opd_training_peak_gb(
+        training_reserve = opd_training_reserve_gb(
             params_b,
             seq_len,
             max_tokens=max_tokens,
@@ -430,7 +461,14 @@ def estimate_vram_gb(
             vocab=vocab,
             active_params_b=active_params_b,
         )
-        return base + rollout + training_peak
+        post_init_reserve = opd_post_init_reserve_gb(params_b, lora_rank)
+        return (
+            base
+            + rollout
+            + training_reserve
+            + post_init_reserve
+            + _OPD_ALLOCATOR_MARGIN_MAX_GB
+        )
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
     # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
     # comparisons; the default must mirror the worker.
@@ -717,7 +755,9 @@ def model_required_vram_gb(
             fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
         )
-        return math.ceil(est * headroom)
+        # opd carries explicit loss-peak, post-init, and allocator reserves in the estimate itself;
+        # applying the generic multiplier again would double-count safety margin and reject fitting b200s.
+        return math.ceil(est if (algorithm or "").lower() == "opd" else est * headroom)
 
     def _opd_fp8_adjust(
         need: int,

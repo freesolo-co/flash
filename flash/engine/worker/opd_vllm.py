@@ -162,9 +162,10 @@ def opd_vllm_kwargs(
             from flash.catalog import MODELS, vocab_size_for
             from flash.engine.vram import (
                 colocate_kv_util,
+                opd_allocator_margin_gb,
                 opd_post_init_reserve_gb,
                 opd_rollout_concurrency,
-                opd_training_peak_gb,
+                opd_training_reserve_gb,
                 resolve_params_b,
             )
 
@@ -204,7 +205,7 @@ def opd_vllm_kwargs(
                 # free memory is measured after the student and adapter are resident. protect the
                 # modeled loss forward/backward peak plus allocator slack, then give the remaining
                 # memory to the rollout executor instead of leaving it idle behind the generic cap.
-                training_peak_gb = opd_training_peak_gb(
+                training_reserve_gb = opd_training_reserve_gb(
                     sizing_params_b,
                     int(seq_cap),
                     max_tokens=getattr(knobs, "max_completion", None),
@@ -213,11 +214,10 @@ def opd_vllm_kwargs(
                     vocab=vocab_size_for(model_id),
                     active_params_b=active_b,
                 )
-                training_reserve_gb = training_peak_gb * 1.15
                 post_init_reserve_gb = opd_post_init_reserve_gb(
                     sizing_params_b, resolved_lora_rank
                 )
-                allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
+                allocator_margin_gb = opd_allocator_margin_gb(card_gb)
                 protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
                 rollout_budget_gb = max(0.0, free_gb - protected_gb)
                 max_startup_util = rollout_budget_gb / max(1.0, card_gb)
@@ -246,7 +246,6 @@ def opd_vllm_kwargs(
                 print(
                     "[opd] vLLM memory budget "
                     f"free={free_gb:.1f}/{card_gb:.1f} GiB "
-                    f"training_peak={training_peak_gb:.1f} GiB "
                     f"training_reserve={training_reserve_gb:.1f} GiB "
                     f"post_init_reserve={post_init_reserve_gb:.1f} GiB "
                     f"allocator_margin={allocator_margin_gb:.1f} GiB "

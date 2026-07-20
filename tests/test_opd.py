@@ -3158,6 +3158,26 @@ def test_model_required_vram_uses_opd_group_default_not_grpo_default():
     assert grpo_default_group > default_group
 
 
+def test_opd_27b_post_init_reserve_routes_above_h200_to_b200():
+    from flash.engine.vram import model_required_vram_gb
+    from flash.providers.base import cheapest_gpu
+
+    need = model_required_vram_gb(
+        "Qwen/Qwen3.6-27B",
+        "opd",
+        train={
+            "max_context_tokens": 1536,
+            "max_completion_tokens": 512,
+            "batch_size": 8,
+            "group_size": 1,
+            "lora_rank": 32,
+        },
+    )
+
+    assert 141 < need <= 180
+    assert cheapest_gpu(need) == "B200"
+
+
 def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     """35B OPD with colocated student vLLM routes above the old H200-sized OPD estimate."""
     from flash.engine.vram import model_required_vram_gb
@@ -3176,16 +3196,10 @@ def test_opd_35b_vllm_rollout_routes_above_h200_to_b200():
     assert 141 < need <= 180
 
 
-def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
-    """L5 regression: OPD's colocated vLLM rollout reserves an fp8 KV cache on cc >= 8.9 hardware
-    (worker/opd_vllm.py), but model_required_vram_gb sized that KV as bf16 — DOUBLE the real bytes —
-    so a full-context (4096) group_size=1 35B OPD run that actually fits a 180 GB B200 was rejected
-    ('no validated GPU has >= 185 GB VRAM'). Size the KV fp8 once the run is provably modern-card-only,
-    so the B200-fitting config is admitted."""
+def test_opd_35b_full_context_rejects_when_explicit_reserves_exceed_b200():
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
-    from flash.providers.allocator import vram_headroom
-    from flash.providers.base import cheapest_gpu
+    from flash.providers.base import UnsupportedGpuError, cheapest_gpu
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     info = MODELS[moe]
@@ -3196,11 +3210,11 @@ def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
         "group_size": 1,
         "lora_rank": 32,
     }
-    need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
-    assert need <= 180
-    assert cheapest_gpu(need) == "B200"
-    # Prove the fp8 KV sizing is what flips it: the bf16-KV estimate * headroom overflows the B200,
-    # the fp8-KV estimate clears it (same shape as the GRPO resident-fit fp8 test).
+    need = model_required_vram_gb(moe, "opd", train=train)
+    assert need > 180
+    with pytest.raises(UnsupportedGpuError):
+        cheapest_gpu(need)
+
     kw = {
         "seq_len": 4096,
         "max_tokens": 2048,
@@ -3212,9 +3226,7 @@ def test_opd_35b_fp8_kv_admits_full_context_group1_on_b200():
     }
     fp8 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=True, **kw)
     bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
-    assert fp8 < bf16
-    hr = vram_headroom()
-    assert fp8 * hr <= 180 < bf16 * hr
+    assert 180 < fp8 < bf16
 
 
 def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
@@ -3275,8 +3287,8 @@ def test_opd_vram_budgets_dense_logit_backward_buffers():
     forward_only = (
         (seq * 2 + comp * 4) * (v2 - v1) / 1e9
     )  # what the old fwd-only formula would grow by
-    assert delta == pytest.approx(2 * forward_only, rel=1e-9), (
-        "opd dense-logit budget must include the backward buffers (2x the forward-only reservation); "
+    assert delta == pytest.approx(2 * forward_only * 1.15, rel=1e-9), (
+        "opd dense-logit budget must include backward buffers plus the runtime reserve multiplier; "
         f"got delta={delta} GB, forward-only would be {forward_only} GB"
     )
 

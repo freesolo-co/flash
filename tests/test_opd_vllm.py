@@ -439,19 +439,16 @@ def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
         1536,
     )
 
-    training_reserve_gb = (
-        vram.opd_training_peak_gb(
-            4.7,
-            1536,
-            max_tokens=512,
-            prompts_per_step=8,
-            group_size=1,
-            vocab=248_320,
-        )
-        * 1.15
+    training_reserve_gb = vram.opd_training_reserve_gb(
+        4.7,
+        1536,
+        max_tokens=512,
+        prompts_per_step=8,
+        group_size=1,
+        vocab=248_320,
     )
     post_init_reserve_gb = vram.opd_post_init_reserve_gb(4.7, 32)
-    allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
+    allocator_margin_gb = vram.opd_allocator_margin_gb(card_gb)
     expected = min(
         0.80,
         (free_gb - training_reserve_gb - post_init_reserve_gb - allocator_margin_gb) / card_gb,
@@ -473,13 +470,13 @@ def test_opd_vllm_kwargs_uses_resolved_prompt_count_for_training_reserve(monkeyp
 
     _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
     captured = {}
-    training_peak = vram.opd_training_peak_gb
+    training_reserve = vram.opd_training_reserve_gb
 
-    def _capture_training_peak(*args, **kwargs):
+    def _capture_training_reserve(*args, **kwargs):
         captured.update(kwargs)
-        return training_peak(*args, **kwargs)
+        return training_reserve(*args, **kwargs)
 
-    monkeypatch.setattr(vram, "opd_training_peak_gb", _capture_training_peak)
+    monkeypatch.setattr(vram, "opd_training_reserve_gb", _capture_training_reserve)
 
     out = opd_vllm_kwargs(
         "Qwen/Qwen3.5-4B",
@@ -541,20 +538,17 @@ def test_opd_vllm_kwargs_keeps_conservative_util_for_35b_rank64_post_init_growth
     )
 
     active_b = float(MODELS[model_id].active_params_b)
-    loss_backward_reserve_gb = (
-        vram.opd_training_peak_gb(
-            35.0,
-            2816,
-            max_tokens=1024,
-            prompts_per_step=8,
-            group_size=1,
-            vocab=vocab_size_for(model_id),
-            active_params_b=active_b,
-        )
-        * 1.15
+    loss_backward_reserve_gb = vram.opd_training_reserve_gb(
+        35.0,
+        2816,
+        max_tokens=1024,
+        prompts_per_step=8,
+        group_size=1,
+        vocab=vocab_size_for(model_id),
+        active_params_b=active_b,
     )
     post_init_reserve_gb = vram.opd_post_init_reserve_gb(35.0, 64)
-    allocator_margin_gb = 6.0
+    allocator_margin_gb = vram.opd_allocator_margin_gb(card_gb)
 
     assert out["gpu_memory_utilization"] == dev_util
     assert (
