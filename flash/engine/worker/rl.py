@@ -46,7 +46,9 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
     return int(steps_run) < int(steps)
 
 
-def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict:
+def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict | None:
+    if cc == (10, 0):
+        return None
     decode_only_validated = cc in {(8, 0), (9, 0)} or cc[0] in (10, 12)
     if decode_only_validated:
         kwargs = {
@@ -494,7 +496,9 @@ def run_rl():
             except Exception:
                 _cc = (0, 0)
             _rollout_compilation = _patch_colocate_rollout_compilation(_cc)
-            if _rollout_compilation["enforce_eager"]:
+            if _rollout_compilation is None:
+                print("[rl] cc=10.0: keeping the validated b200 vLLM compilation default")
+            elif _rollout_compilation["enforce_eager"]:
                 print(
                     f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
                     "-> unvalidated for decode-only graphs; prevent 0.19.1 "

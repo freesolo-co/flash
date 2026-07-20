@@ -109,6 +109,50 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
+def _is_cudagraph_capture_failure(exc: BaseException) -> bool:
+    markers = (
+        "capture_model",
+        "cuda graph",
+        "cudagraph",
+        "graph capture",
+    )
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(marker in f"{type(current).__name__}: {current}".lower() for marker in markers):
+            return True
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            location = f"{frame.f_code.co_filename}:{frame.f_code.co_name}".lower()
+            if any(marker in location for marker in markers):
+                return True
+            traceback = traceback.tb_next
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _release_failed_cudagraph_capture(exc: BaseException) -> None:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        next_exc = current.__cause__ or current.__context__
+        current.__traceback__ = None
+        current = next_exc
+    try:
+        import gc
+
+        gc.collect()
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as cleanup_exc:
+        print(f"[rl][warn] cuda graph fallback cleanup failed: {cleanup_exc}")
+
+
 def patch_trl_colocate_llm_kwargs(
     *,
     kv_cache_dtype: str | None = None,
@@ -199,7 +243,9 @@ def patch_trl_colocate_llm_kwargs(
         _vg._flash_llm_overrides = overrides
     overrides.update(new_overrides)
     if getattr(_vg, "_flash_llm_kwargs_patched", False):
-        print(f"[rl] colocate vLLM LLM kwargs extended (wrapper already installed): {new_overrides}")
+        print(
+            f"[rl] colocate vLLM LLM kwargs extended (wrapper already installed): {new_overrides}"
+        )
         return True
     # TRL binds the module-global ``LLM`` only under ``if is_vllm_available():`` (it's the symbol the
     # colocate ``self.llm = LLM(...)`` references). If vLLM isn't importable here there is nothing to
@@ -210,11 +256,31 @@ def patch_trl_colocate_llm_kwargs(
         return False
 
     def _patched_LLM(*args, **kwargs):
-        # Override TRL's hardcoded/absent values with ours (the kwargs TRL/env can't set). Read the
+        # override trl's hardcoded/absent values with ours (the kwargs trl/env can't set). read the
         # accumulated dict live so kwargs registered by later calls are applied too.
         kwargs.update(_vg._flash_llm_overrides)
         print(f"[rl] colocate vLLM LLM(...) kwargs override applied: {_vg._flash_llm_overrides}")
-        return _orig_LLM(*args, **kwargs)
+        compilation = kwargs.get("compilation_config") or {}
+        decode_graphs = (
+            not kwargs.get("enforce_eager", False)
+            and compilation.get("cudagraph_mode") == "FULL_DECODE_ONLY"
+        )
+        try:
+            return _orig_LLM(*args, **kwargs)
+        except Exception as capture_exc:
+            if not decode_graphs or not _is_cudagraph_capture_failure(capture_exc):
+                raise
+            _release_failed_cudagraph_capture(capture_exc)
+            eager_kwargs = dict(kwargs)
+            eager_kwargs["enforce_eager"] = True
+            eager_kwargs.pop("compilation_config", None)
+            _vg._flash_llm_overrides["enforce_eager"] = True
+            _vg._flash_llm_overrides.pop("compilation_config", None)
+            print(
+                f"[rl][warn] decode-only cuda graph capture failed ({capture_exc}); "
+                "retrying colocate vLLM initialization once in eager mode"
+            )
+            return _orig_LLM(*args, **eager_kwargs)
 
     _vg.LLM = _patched_LLM
     _vg._flash_llm_kwargs_patched = True
