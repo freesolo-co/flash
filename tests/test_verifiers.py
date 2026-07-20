@@ -414,7 +414,10 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     env_file.write_text("def load_environment(**kwargs): pass\n")
     dataset = tmp_path / "freesolo" / "dataset" / "train.jsonl"
     dataset.parent.mkdir()
-    dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
+    dataset.write_text(
+        '{"id":"row-1","input":"2+2?","output":"4",'
+        '"image":"dataset/red.png","reward_metadata":{"kind":"exact"}}\n'
+    )
 
     from flash.envs.adapter import load_freesolo_environment
 
@@ -426,15 +429,32 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     )
 
     assert env.id == str(env_file)
+    assert env.package_root == env_file.parent.resolve()
     assert seen["reference"] == str(env_file)
     assert seen["kwargs"]["dataset_path"] == str(dataset)
     assert seen["kwargs"]["difficulty"] == "hard"
 
     train = env.dataset()
-    assert train == [{"id": "row-1", "input": "2+2?", "output": "4"}]
+    assert train == [
+        {
+            "id": "row-1",
+            "input": "2+2?",
+            "output": "4",
+            "image": "dataset/red.png",
+            "reward_metadata": {"kind": "exact"},
+        }
+    ]
     assert env.prompt_messages(train[0]) == [
         {"role": "system", "content": "be brief"},
         {"role": "user", "content": "2+2?"},
+    ]
+    image_content = [
+        {"type": "text", "text": "what color?"},
+        {"type": "image", "image": "dataset/red.png"},
+    ]
+    assert env._with_system_prompt([{"role": "user", "content": image_content}]) == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": image_content},
     ]
     assert env.reward("the answer is 4", train[0]) == 1.0
     assert env.grade("the answer is 4", train[0]) is True

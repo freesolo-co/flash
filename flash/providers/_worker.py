@@ -43,7 +43,11 @@ WORKER_DEPS = [
     "datasets>=4.7,<6",
     # >=0.2.54: includes robust JSONL loading and corrected package metadata.
     FREESOLO_WORKER_SPEC,
-    "huggingface_hub>=0.25",
+    # >=1.2.0: built-in RateLimit-header-aware 429 retry for HF downloads (base-model pulls) and
+    # paginated Hub API calls. Must match Dockerfile.worker's floor (the baked image is the default
+    # run path; this list only installs on the no-image/live-function path) -- see
+    # tests/test_kernel_fingerprint.py::test_huggingface_hub_floor_is_in_lockstep.
+    "huggingface_hub>=1.2.0",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
@@ -65,7 +69,7 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
 # back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
-BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120"})
+BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
 def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:

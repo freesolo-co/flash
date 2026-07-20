@@ -599,7 +599,11 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
         "cancel_job",
         lambda e, j, **_kw: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted.append(e) or True)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda e, _fingerprint: deleted.append(e) or True,
+    )
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)
@@ -642,6 +646,11 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
         runpod_api,
         "delete_endpoint_for_fingerprint",
         lambda endpoint_id, _fingerprint: deleted_endpoints.append(endpoint_id) or False,
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "IN_PROGRESS"},
     )
     monkeypatch.setattr(
         RunpodProvider,
@@ -973,6 +982,7 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
         "terminate_instance_confirmed",
         lambda instance_id: terminated.append(instance_id),
     )
+    monkeypatch.setattr(lambda_jobs, "run_instances_remaining", lambda _run_id: [])
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
@@ -1023,6 +1033,7 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", lambda instance_id: None)
+    monkeypatch.setattr(lambda_jobs, "run_instances_remaining", lambda _run_id: [])
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
 
     lam_gpus, rp_gpus = [], []
@@ -1083,7 +1094,11 @@ def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatc
         "cancel_job",
         lambda e, j, **_kw: cancelled_jobs.append((e, j)) or {"id": j, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: deleted_eps.append(e) or True)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda e, _fingerprint: deleted_eps.append(e) or True,
+    )
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
     spec = _spec()
     st = _seed_status(orch, spec)

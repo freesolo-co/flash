@@ -190,6 +190,34 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
+def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
+    from flash.serve.deploy import deploy_adapter
+
+    dep = deploy_adapter(
+        run_id="q27",
+        model="Qwen/Qwen3.6-27B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/q27/seed0",
+        dry_run=True,
+        lora_rank=64,
+    )
+    assert dep.to_dict()["state"] == "dry_run"
+
+
+def test_deploy_27b_rejects_lora_rank_above_serving_cap():
+    from flash.serve.deploy import deploy_adapter
+
+    with pytest.raises(ValueError, match="max_lora_rank=64"):
+        deploy_adapter(
+            run_id="q27-r65",
+            model="Qwen/Qwen3.6-27B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/q27-r65/seed0",
+            dry_run=True,
+            lora_rank=65,
+        )
+
+
 def test_deploy_rejects_lora_rank_above_serving_cap():
     from flash.serve.deploy import deploy_adapter
 

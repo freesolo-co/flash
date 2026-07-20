@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from flash.envs.base import BaseEnvironment, RolloutReward
@@ -78,11 +79,13 @@ class FreesoloEnvironment(BaseEnvironment):
         *,
         source: object | None,
         contract_text: str = "",
+        package_root: str | Path | None = None,
     ):
         super().__init__(id=env_id)
         self._env = sdk_env
         self._source = source
         self._contract_text = contract_text
+        self.package_root = Path(package_root).resolve() if package_root is not None else None
         tools = _import_freesolo_environment_tools()
         self._task_example_from_record = tools["task_example_from_record"]
         self._load_task_examples = tools["load_task_examples"]
