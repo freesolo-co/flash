@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 
 from flash.engine.recipe import RECIPE
 from flash.engine.worker._pkg import W as _w
@@ -14,6 +16,7 @@ from flash.engine.worker.hf import (
     _sleep_with_hf_deadline,
 )
 from flash.engine.worker.lora import (
+    _read_adapter_tensor_keys,
     adapter_is_vl_warmstart,
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
@@ -206,6 +209,20 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     return parse_adapter_storage_ref(adapter_ref)
 
 
+def _warmstart_adapter_is_loadable(adir: str) -> bool:
+    """return true only for a structurally complete adapter config and weight file."""
+    if not _has_deployable_adapter(adir):
+        return False
+    try:
+        with open(os.path.join(adir, "adapter_config.json"), encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        if not isinstance(config, dict) or str(config.get("peft_type", "")).upper() != "LORA":
+            return False
+        return bool(_read_adapter_tensor_keys(adir))
+    except Exception:
+        return False
+
+
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
@@ -234,6 +251,9 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
                 or None,
             )
         except Exception as error:
+            # a later nonessential sidecar may fail after the config and weights are already complete.
+            if _warmstart_adapter_is_loadable(adir):
+                return adir
             if not _prefetch_error_is_retriable(error):
                 raise RuntimeError(
                     "the prepared warm-start source adapter could not be downloaded"
@@ -241,9 +261,10 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
         else:
             # a returned snapshot can still be incomplete: an interrupted transfer, or hf falling
             # back to a partial local_dir when a throttled metadata call cannot confirm the file set.
-            # only a loadable adapter counts as success; otherwise retry like any transient failure.
-            if _has_deployable_adapter(adir):
+            if _warmstart_adapter_is_loadable(adir):
                 return adir
+        # discard partial local_dir materialization so the next attempt cannot reuse stale files.
+        shutil.rmtree(adir, ignore_errors=True)
         if attempt + 1 < _ADAPTER_DOWNLOAD_RETRIES:
             try:
                 if not _sleep_with_hf_deadline(_ADAPTER_DOWNLOAD_BACKOFF_S * (attempt + 1)):
