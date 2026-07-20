@@ -24,6 +24,10 @@ RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _RECOVERY_MARKER_GRACE_S = 120.0
 
 
+class _CompletedAttemptPending(RuntimeError):
+    """A strict success marker exists, but its metrics are not readable yet."""
+
+
 @dataclass
 class _RetryBudget:
     infra_retries: int
@@ -134,6 +138,29 @@ def _canonical_provider_handle(handle):
 
         return JobHandle.from_dict(VastJobHandle.from_dict(data).to_dict())
     raise ValueError("persisted provider identity is missing or unsupported")
+
+
+def _runpod_completed_metrics(handle) -> dict | None:
+    """Return decoded metrics only when the exact RunPod job completed successfully."""
+    try:
+        canonical = _canonical_provider_handle(handle)
+        data = canonical.to_dict()
+        if canonical.provider != "runpod" or not data.get("job_id"):
+            return None
+        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
+
+        job = runpod_api.job_status(
+            data["endpoint_id"],
+            data["job_id"],
+            key_fingerprint=data["key_fingerprint"],
+        )
+        if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
+            return None
+        metrics = decode_output(job.get("output"))
+        return metrics if isinstance(metrics, dict) else None
+    except Exception:
+        return None
 
 
 def _worker_provably_gone(run_id: str, handle) -> bool:
@@ -276,12 +303,20 @@ def _completed_attempt_metrics(
         deadline_at=metrics_observation_deadline,
     )
     if metrics_raw is None:
-        return None
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not readable yet"
+        )
     try:
         metrics = json.loads(metrics_raw)
-    except (TypeError, ValueError):
-        return None
-    return metrics if isinstance(metrics, dict) else None
+    except (TypeError, ValueError) as exc:
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not parseable yet"
+        ) from exc
+    if not isinstance(metrics, dict):
+        raise _CompletedAttemptPending(
+            "successful recovery marker is present but metrics.json is not an object yet"
+        )
+    return metrics
 
 
 def _adopt_completed_attempt(
@@ -460,6 +495,12 @@ def _submit_seed_supervised(
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
+            completed_metrics = _runpod_completed_metrics(last_handle)
+            if completed_metrics is not None:
+                _gc_seen_endpoints()
+                if current_gpu.get("name"):
+                    completed_metrics.setdefault("allocated_gpu", current_gpu["name"])
+                return completed_metrics
             resource_deleted = False
             teardown_error: Exception | None = None
             try:

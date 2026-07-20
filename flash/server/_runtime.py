@@ -245,6 +245,15 @@ def _recovery_block_reason(spec) -> str | None:
     return None
 
 
+def _recovery_wall_deadline_is_open(spec) -> bool:
+    from flash.runner import _remaining_run_wall_seconds
+
+    try:
+        return _remaining_run_wall_seconds(spec.run_id) > 0
+    except Exception:
+        return False
+
+
 def _fail_blocked_recovery(
     spec,
     reason: str,
@@ -298,6 +307,8 @@ def _start_resubmit(
 
     reason = _recovery_block_reason(spec)
     if reason is not None:
+        if _recovery_wall_deadline_is_open(spec):
+            return False
         _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
         return False
     if spec.algorithm == "opd":
@@ -425,7 +436,9 @@ def _deferred_resubmit_loop(spec) -> None:
                     return
             except Exception:
                 pass
-            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
+            if delay > 0:
+                time.sleep(delay)
             continue
         delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
@@ -619,10 +632,12 @@ def recover_runs() -> None:
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)
         if reason is not None:
-            try:
-                applied = _fail_blocked_recovery(spec, reason)
-            except Exception:
-                applied = False
+            applied = False
+            if not _recovery_wall_deadline_is_open(spec):
+                try:
+                    applied = _fail_blocked_recovery(spec, reason)
+                except Exception:
+                    applied = False
             if not applied:
                 try:
                     current = get_status(spec.run_id)

@@ -1670,6 +1670,83 @@ def _adapter_config(*, rank=32, alpha=64):
     }
 
 
+def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.providers.allocator as allocator
+        import flash.runner.lifecycle as lifecycle
+        from flash.providers.base import Allocation, Candidate, PollResult
+        from flash.providers.runpod import api as runpod_api
+
+        spec = _spec("completed-before-retry")
+        orch._save_status(
+            orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+            _next_attempt=0,
+        )
+        candidate = Candidate("runpod", "RTX 4090", 0.5, 24)
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *args, **kwargs: Allocation(
+                provider="runpod",
+                gpu="RTX 4090",
+                hourly_usd=0.5,
+                min_vram_gb=24,
+                candidates=(candidate,),
+            ),
+        )
+        calls = {"n": 0}
+
+        class Provider:
+            supports_weight_cache = False
+
+            def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
+                calls["n"] += 1
+                if on_handle:
+                    on_handle(
+                        {
+                            "provider": "runpod",
+                            "endpoint_id": "ep-completed",
+                            "endpoint_name": "completed",
+                            "key_fingerprint": _RUNPOD_FINGERPRINT,
+                            "job_id": "job-completed",
+                            "attempt": attempt,
+                            "started_ts": 1.0,
+                        }
+                    )
+                return PollResult(False, failure="poll_error", detail="provider api outage")
+
+            def cancel(self, _handle):
+                return None
+
+            def destroy(self, _handle):
+                return None
+
+            def gc(self, _spec):
+                return None
+
+        monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+        monkeypatch.setattr(
+            runpod_api,
+            "job_status",
+            lambda *_args, **_kwargs: {
+                "status": "COMPLETED",
+                "output": {"wall_seconds": 5.0, "trained_eval_acc": 0.9},
+            },
+        )
+
+        metrics = lifecycle._submit_seed_supervised(
+            spec,
+            spec.seed,
+            io.StringIO(),
+            code_prefix="code/revision",
+        )
+
+        assert metrics["trained_eval_acc"] == 0.9
+        assert calls["n"] == 1
+
+
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -2421,7 +2498,7 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
         assert status.state == "failed"
-        assert status.remote is None
+        assert status.remote == remote
         assert "original preparation snapshot is unavailable" in (status.error or "")
         assert "source-run/step-40" in (status.error or "")
 
@@ -3655,7 +3732,7 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.state == "failed"
         assert status.error == "stalled: host vanished"
         assert training_calls == []
-        assert status.remote is None
+        assert status.remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
@@ -3793,7 +3870,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             "attach must attempt a checkpoint resume on any non-ok poll"
         )
         assert st.state == "failed", "a resume that fails again must terminate the run"
-        assert st.remote is None
+        assert st.remote == replacement_remote
         assert "bad reward fn" in (st.error or "")
         assert orch._load_status_json("g1")[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
@@ -4113,6 +4190,51 @@ def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
         assert run_id not in deploy_mod._ATTACH_RECONCILING
 
 
+def test_attach_reconciliation_cleans_endpoint_after_background_completion(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+
+        run_id = "attach-reconcile-cleanup"
+        remote = _vast_recovery_remote()
+        spec = _spec(run_id)
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+
+        def complete_recovery(*_args, **_kwargs):
+            orch._update(run_id, "done")
+
+        cleaned = []
+        monkeypatch.setattr(deploy_mod, "_reconcile_attached_remote", complete_recovery)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda current: cleaned.append(current.run_id))
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(deploy_mod.threading, "Thread", ImmediateThread)
+
+        assert deploy_mod._schedule_attach_reconciliation(
+            run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+        assert cleaned == [run_id]
+
+
 def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -4206,7 +4328,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         status = orch.get_status(spec.run_id)
         assert len(calls) == 2
         assert status.state == "failed"
-        assert status.remote is None
+        assert status.remote == remote
         assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in remote.items() if key != "code_prefix"}
         ]
@@ -4250,7 +4372,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
 
         status = orch.get_status(spec.run_id)
         assert status.state == "done"
-        assert status.remote is None
+        assert status.remote == remote
         assert status.error is None
         assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in remote.items() if key != "code_prefix"}
