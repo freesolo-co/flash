@@ -736,12 +736,19 @@ def _submit_seed_supervised(
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
             oom_vram_floor = max(oom_vram_floor, chosen.vram_gb)
-        # Cancel wins over any retry-shaped failure.
+        # cancel wins over any retry-shaped failure.
         try:
             if get_status(spec.run_id).state == "cancelled":
                 raise _cancel()
         except FileNotFoundError:
             pass
+        if last_handle:
+            completed_metrics = _runpod_completed_metrics(last_handle)
+            if completed_metrics is not None:
+                _gc_seen_endpoints()
+                if current_gpu.get("name"):
+                    completed_metrics.setdefault("allocated_gpu", current_gpu["name"])
+                return completed_metrics
         run_had_cache = bool(
             chosen is not None
             and getattr(get_provider(chosen.provider), "supports_weight_cache", False)

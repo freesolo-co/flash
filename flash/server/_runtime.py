@@ -261,7 +261,7 @@ def _fail_blocked_recovery(
     expected_remote: dict | None = None,
 ) -> bool:
     from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
-    from flash.runner.lifecycle import _adopt_completed_attempt
+    from flash.runner.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
     if status.remote is None:
@@ -269,7 +269,10 @@ def _fail_blocked_recovery(
             deadline_at = _load_run_deadline_at(spec.run_id)
         except RuntimeError:
             deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
-        metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        try:
+            metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        except _CompletedAttemptPending:
+            return False
         if metrics is not None:
             applied = _adopt_completed_attempt(
                 spec.run_id,
@@ -665,7 +668,14 @@ def recover_runs() -> None:
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            _start_resubmit(spec, expected_remote=None, expected_state=prior_state)
+            if _start_resubmit(spec, expected_remote=None, expected_state=prior_state):
+                continue
+            try:
+                current = get_status(spec.run_id)
+            except Exception:
+                current = None
+            if current is not None and current.state in _RECOVERABLE and current.remote is None:
+                threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer with
         # observation bounded by the run wall deadline, then durably persist terminal success or failure.

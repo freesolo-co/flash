@@ -1927,6 +1927,40 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
     assert status.error is None
 
 
+def test_fail_blocked_recovery_defers_pending_completed_metrics(monkeypatch, tmp_path):
+    import flash.runner as runner
+    import flash.runner.lifecycle as lifecycle
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=86500.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_handleless_completed_metrics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            lifecycle._CompletedAttemptPending("waiting for metrics.json")
+        ),
+    )
+
+    assert runtime._fail_blocked_recovery(spec, "recovery blocked") is False
+
+    status = runner.get_status(spec.run_id)
+    assert status.state == "provisioning"
+    assert status.remote is None
+    assert status.error is None
+
+
 def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.runner as runner
     import flash.server._runtime as runtime
@@ -1963,6 +1997,42 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
     assert status.state == "done"
     assert status.remote is None
     assert status.error is None
+
+
+def test_recover_runs_defers_when_resubmit_waits_for_metrics(monkeypatch, tmp_path):
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server._runtime as runtime
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
+    monkeypatch.setattr(providers, "configured_providers", lambda: [])
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+    monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
+    monkeypatch.setattr(runtime, "_start_resubmit", lambda *_args, **_kwargs: False)
+    started = []
+
+    class Thread:
+        def __init__(self, *, target, args, daemon):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert started == [(runtime._deferred_resubmit_loop, (spec,), True)]
 
 
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
