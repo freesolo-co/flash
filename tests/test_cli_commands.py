@@ -14,6 +14,17 @@ import types
 import pytest
 
 import flash.cli as cli
+from flash.providers._poll import _format_heartbeat
+
+
+def test_format_heartbeat_appends_named_reward_metrics() -> None:
+    heartbeat = {"stage": "rl_step", "step": 4, "reward": 0.65}
+    base_line = _format_heartbeat(heartbeat)
+
+    assert base_line == "worker: stage=rl_step step=4 reward=0.650"
+    assert _format_heartbeat(
+        {**heartbeat, "reward_metrics": {"success": 0.8, "format": 0.5}}
+    ) == (base_line + " success=0.800 format=0.500")
 
 
 class _FakeClient:

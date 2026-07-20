@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import faulthandler
 import json
+import math
 import os
 import sys
 import threading
@@ -235,7 +236,24 @@ def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -
     return last_gpu_diag_at
 
 
-def make_reward_heartbeat_callback():
+def _bounded_reward_metrics(metrics, limit: int = 12) -> dict[str, float]:
+    if not isinstance(metrics, dict):
+        return {}
+    bounded: dict[str, float] = {}
+    for name, value in metrics.items():
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score):
+            continue
+        bounded[str(name)] = score
+        if len(bounded) >= limit:
+            break
+    return bounded
+
+
+def make_reward_heartbeat_callback(reward_metrics=None):
     """Return a TRL callback that streams per-step reward to the HF heartbeat channel."""
     from transformers import TrainerCallback
 
@@ -261,6 +279,10 @@ def make_reward_heartbeat_callback():
                 "reward": r,
                 "reward_last": self.reward_history[-8:],
             }
+            latest_metrics = reward_metrics() if callable(reward_metrics) else reward_metrics
+            bounded_metrics = _bounded_reward_metrics(latest_metrics)
+            if bounded_metrics:
+                payload["reward_metrics"] = bounded_metrics
             now = time.monotonic()
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
             _w.heartbeat("rl_step", **payload)

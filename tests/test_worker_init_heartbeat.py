@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import re
 import sys
 import threading
@@ -880,3 +881,29 @@ def test_no_worker_side_stall_watchdog():
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     assert not hasattr(hb, "_rearm_stall_faulthandler")
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
+
+
+def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    worker = importlib.import_module("flash.engine.worker")
+    emitted = []
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
+    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
+
+    transformers = types.ModuleType("transformers")
+    transformers.TrainerCallback = type("TrainerCallback", (), {})
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    metrics = {
+        "nan_metric": float("nan"),
+        "inf_metric": float("inf"),
+        **{f"metric_{index}": float(index) for index in range(14)},
+    }
+    callback = hb.make_reward_heartbeat_callback(lambda: metrics)
+    state = types.SimpleNamespace(global_step=3)
+    callback.on_log(None, state, None, logs={"reward": 0.65})
+
+    assert emitted[0][0] == "rl_step"
+    reward_metrics = emitted[0][1]["reward_metrics"]
+    assert list(reward_metrics) == [f"metric_{index}" for index in range(12)]
+    assert all(math.isfinite(value) for value in reward_metrics.values())

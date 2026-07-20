@@ -337,10 +337,12 @@ def score_response(self, example, response_text) -> RewardResult:
     )
 ```
 
-`score` is what GRPO optimizes (it becomes the run's `total`). Each `RewardMetric` you
-attach is logged by name in the per-scorer breakdown — that is how the clean success
-rate becomes visible. Use the shaped `score` to confirm the model is learning *at all*,
-and judge the run on the explicit `success` metric.
+`score` is what GRPO optimizes (it becomes the run's `total`). In standard (single-turn)
+GRPO, each `RewardMetric` is averaged across scored completions and logged by name at
+the managed heartbeat cadence, which is not guaranteed to be every optimizer step. That
+is how the clean success rate becomes visible. Multi-turn scoring currently reports only
+the scalar reward. Use the shaped `score` to confirm the model is learning *at all*, and
+judge the run on the explicit `success` metric.
 
 When `thinking = true`, score the final answer unless you intentionally need the
 reasoning trace. Flash passes a string-compatible response object to `score_response`;
@@ -548,10 +550,9 @@ every run, the last two matter more the smaller the model:
   frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
   enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
   over-sharpening only compounds over many steps.
-- **Diagnose it in-band.** Watch the per-step **mean completion entropy** in the run's telemetry — a
-  steady decline toward zero is the collapse happening. Confirm at serving by evaluating at
-  **temperature=0** and flagging `finish_reason=length` completions that never emit your answer token,
-  and compare an early checkpoint against the final one to watch the loop emerge over steps.
+- **Diagnose it at serving.** Evaluate at **temperature=0** and flag
+  `finish_reason=length` completions that never emit your answer token. Compare an early checkpoint
+  against the final one to watch the loop emerge over steps.
 
 ### Distilling from base with no format anchor
 

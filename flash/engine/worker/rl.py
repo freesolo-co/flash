@@ -46,6 +46,24 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
     return int(steps_run) < int(steps)
 
 
+def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for breakdown in breakdowns:
+        if not isinstance(breakdown, dict):
+            continue
+        for name, value in breakdown.items():
+            if name == "total":
+                continue
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            totals[name] = totals.get(name, 0.0) + score
+            counts[name] = counts.get(name, 0) + 1
+    return {name: total / counts[name] for name, total in totals.items()}
+
+
 def run_rl():
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
@@ -200,7 +218,10 @@ def run_rl():
     if _w.THINKING:
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
+    latest_named_metrics: dict[str, float] = {}
+
     def reward_fn(completions, **kwargs):
+        latest_named_metrics.clear()
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
             return [float(r) for r in kwargs["reward"]]
@@ -223,6 +244,7 @@ def run_rl():
             )
         examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
+        breakdowns = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             try:
@@ -246,6 +268,7 @@ def run_rl():
                 breakdown = None
                 if hasattr(env, "scores_breakdown"):
                     breakdown = env.scores_breakdown(graded, ex, state)
+                    breakdowns.append(breakdown)
                     r = float(breakdown.get("total", 0.0))
                 else:
                     r = env.reward(graded, ex, state)
@@ -282,6 +305,7 @@ def run_rl():
                         "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
                     }
                 )
+        latest_named_metrics.update(_mean_named_reward_metrics(breakdowns))
         _w.upload_debug_jsonl("reward_debug.jsonl", debug_rows)
         return rewards
 
@@ -585,7 +609,7 @@ def run_rl():
     # VL checkpoints roll out on the FULL multimodal engine (vision tower included) — the colocated
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
-    hb_cb = _w.make_reward_heartbeat_callback()
+    hb_cb = _w.make_reward_heartbeat_callback(lambda: dict(latest_named_metrics))
     # Tool envs hand TRL the tool callables; pure multi-turn envs hand TRL a rollout_func.
     extra_trainer_kwargs: dict = {}
     tools = env.tools() if is_tool_env else []
