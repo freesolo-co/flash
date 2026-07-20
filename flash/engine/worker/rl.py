@@ -51,11 +51,10 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
 
 def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
     totals: dict[str, float] = {}
-    denominator = 0
+    denominator = len(breakdowns)
     for breakdown in breakdowns:
         if not isinstance(breakdown, dict):
             continue
-        denominator += 1
         for name, value in breakdown.items():
             if name == "total":
                 continue
@@ -69,6 +68,14 @@ def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dic
     if denominator == 0:
         return {}
     return {name: total / denominator for name, total in totals.items()}
+
+
+def _take_named_reward_metrics(
+    breakdowns: list[dict[str, float] | None],
+) -> dict[str, float]:
+    metrics = _mean_named_reward_metrics(breakdowns)
+    breakdowns.clear()
+    return metrics
 
 
 def run_rl():
@@ -288,11 +295,10 @@ def run_rl():
     if _w.THINKING:
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
-    latest_named_metrics: dict[str, float] = {}
+    pending_named_breakdowns: list[dict[str, float] | None] = []
     latest_samples: list[dict] = []
 
     def reward_fn(completions, **kwargs):
-        latest_named_metrics.clear()
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
             rewards = [float(r) for r in kwargs["reward"]]
@@ -378,6 +384,7 @@ def run_rl():
                     f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
                     flush=True,
                 )
+                breakdowns.append(None)
                 r = 0.0
                 scoring_failed = True
             if (
@@ -399,7 +406,7 @@ def run_rl():
             else:
                 prompt = ex
             sample_triples.append((prompt, comp, r))
-        latest_named_metrics.update(_mean_named_reward_metrics(breakdowns))
+        pending_named_breakdowns.extend(breakdowns)
         latest_samples.extend(
             select_rollout_samples(sample_triples, generated_at_step=generated_at_step)
         )
@@ -708,7 +715,8 @@ def run_rl():
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback(
-        lambda: dict(latest_named_metrics), lambda: list(latest_samples)
+        lambda: _take_named_reward_metrics(pending_named_breakdowns),
+        lambda: list(latest_samples),
     )
     trainer_callbacks = [
         hb_cb,

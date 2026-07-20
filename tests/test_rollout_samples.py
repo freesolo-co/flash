@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
-import math
 import sys
 import textwrap
 import types
@@ -498,7 +497,7 @@ def _load_nested_reward_fn(monkeypatch):
     module = ast.Module(body=[reward_node], type_ignores=[])
     ast.fix_missing_locations(module)
 
-    latest_named_metrics: dict[str, float] = {}
+    pending_named_breakdowns: list[dict[str, float] | None] = []
     latest_samples: list[dict] = []
 
     def forbidden_upload(*args, **kwargs):
@@ -525,17 +524,16 @@ def _load_nested_reward_fn(monkeypatch):
             {"input": "fallback-b", "reward": 0.2},
             {"input": "fallback-a", "reward": 0.3},
         ],
-        "latest_named_metrics": latest_named_metrics,
+        "pending_named_breakdowns": pending_named_breakdowns,
         "latest_samples": latest_samples,
         "select_rollout_samples": select_rollout_samples,
-        "_mean_named_reward_metrics": rl._mean_named_reward_metrics,
     }
     exec(compile(module, rl.__file__, "exec"), namespace)
-    return namespace["reward_fn"], latest_named_metrics, latest_samples
+    return namespace["reward_fn"], pending_named_breakdowns, latest_samples
 
 
 def test_reward_fn_captures_aligned_samples_without_debug_upload(monkeypatch) -> None:
-    reward_fn, latest_named_metrics, latest_samples = _load_nested_reward_fn(monkeypatch)
+    reward_fn, pending_named_breakdowns, latest_samples = _load_nested_reward_fn(monkeypatch)
 
     rewards = reward_fn(
         ["completion-a1", "completion-b", "completion-a2"],
@@ -545,7 +543,9 @@ def test_reward_fn_captures_aligned_samples_without_debug_upload(monkeypatch) ->
     )
 
     assert rewards == [0.1, 0.2, 0.3]
-    assert math.isclose(latest_named_metrics["quality"], 0.3)
+    assert [breakdown["quality"] for breakdown in pending_named_breakdowns] == pytest.approx(
+        [0.2, 0.3, 0.4]
+    )
     assert [sample["completion"] for sample in latest_samples] == [
         "completion-a1",
         "completion-b",
@@ -573,8 +573,8 @@ def test_reward_fn_captures_aligned_samples_without_debug_upload(monkeypatch) ->
 
 
 def test_reward_fn_forwarded_rewards_capture_aligned_multi_turn_samples(monkeypatch) -> None:
-    reward_fn, latest_named_metrics, latest_samples = _load_nested_reward_fn(monkeypatch)
-    latest_named_metrics["stale"] = 1.0
+    reward_fn, pending_named_breakdowns, latest_samples = _load_nested_reward_fn(monkeypatch)
+    pending_named_breakdowns.append({"stale": 1.0})
     latest_samples.append({"stale": True})
     prompts = [
         [{"role": "user", "content": "question-a"}],
@@ -593,7 +593,7 @@ def test_reward_fn_forwarded_rewards_capture_aligned_multi_turn_samples(monkeypa
     )
 
     assert rewards == [0.25, 0.75]
-    assert latest_named_metrics == {}
+    assert pending_named_breakdowns == [{"stale": 1.0}]
     assert [sample["prompt_tail"] for sample in latest_samples] == [
         "user: question-a",
         "user: question-b",
