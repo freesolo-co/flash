@@ -690,6 +690,51 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
         return False
 
 
+def _deployment_targets_adapter(
+    deployment: dict, *, run_id: str, step: int | None
+) -> bool | None:
+    """return whether deployment may target this adapter, or none when the target is ambiguous."""
+    from flash.schema import parse_adapter_revision
+
+    records = [deployment]
+    previous = deployment.get("previous_deployment")
+    if previous is not None:
+        if not isinstance(previous, dict):
+            return None
+        records.append(previous)
+
+    possible_targets: list[int | None] = []
+    for record in records:
+        record_targets: list[int | None] = []
+        if "checkpoint_step" in record:
+            checkpoint_step = record.get("checkpoint_step")
+            if checkpoint_step is None:
+                record_targets.append(None)
+            elif (
+                isinstance(checkpoint_step, bool)
+                or not isinstance(checkpoint_step, int)
+                or checkpoint_step < 0
+            ):
+                return None
+            else:
+                record_targets.append(checkpoint_step)
+
+        revision = record.get("adapter_revision")
+        if revision is not None:
+            parsed_revision = parse_adapter_revision(revision) if isinstance(revision, str) else None
+            if parsed_revision is None or parsed_revision[0] != run_id:
+                return None
+            record_targets.append(parsed_revision[1])
+
+        if not record_targets or any(
+            target != record_targets[0] for target in record_targets[1:]
+        ):
+            return None
+        possible_targets.append(record_targets[0])
+
+    return step in possible_targets
+
+
 def _require_supported_adapter_continuation(spec: JobSpec) -> None:
     if spec.algorithm == "sft" and spec.train.init_from_adapter:
         raise ValueError(
@@ -717,7 +762,7 @@ def _prepare_init_from_adapter(
         resolve_hf_dataset_revision,
     )
     from flash.runner.checkpoints import CheckpointListingError, adapter_artifact_exists
-    from flash.runner.deploy import _RESTORABLE_DEPLOYMENT_STATES
+    from flash.runner.deploy import _deployment_state_and_requires_revocation
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
@@ -731,26 +776,41 @@ def _prepare_init_from_adapter(
         src_status = get_status(src_run_id)
     except FileNotFoundError:
         raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
+    source_owned_by_key = _source_owned_by_key(src_run_id, owner_key_id)
     owner_org_id = owner_org_id.strip()
     if owner_org_id:
         src_org_id = _status_org_id(src_status)
-        owner_ok = (
-            src_org_id == owner_org_id
-            if src_org_id
-            else _source_owned_by_key(src_run_id, owner_key_id)
-        )
+        owner_ok = src_org_id == owner_org_id if src_org_id else source_owned_by_key
         if not owner_ok:
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
-    if src_status.state == "deployed" or (
-        isinstance(src_status.deployment, dict)
-        and src_status.deployment.get("state") in _RESTORABLE_DEPLOYMENT_STATES
-    ):
+    deployment_state, requires_revocation = _deployment_state_and_requires_revocation(
+        src_status.deployment
+    )
+    deployment_targets_adapter = (
+        _deployment_targets_adapter(src_status.deployment, run_id=src_run_id, step=step)
+        if isinstance(src_status.deployment, dict)
+        else None
+    )
+    unresolved_target = requires_revocation and deployment_targets_adapter is not False
+    missing_final_deployment_record = (
+        src_status.state == "deployed" and src_status.deployment is None and step is None
+    )
+    if unresolved_target or missing_final_deployment_record:
+        if source_owned_by_key:
+            action = f"run 'flash undeploy {src_run_id}' first"
+        else:
+            action = f"ask the source run owner to undeploy {src_run_id!r} first"
+        state_detail = (
+            f"deployment state {deployment_state!r} is active or unresolved"
+            if deployment_state
+            else "deployment state is active or unresolved"
+        )
         raise WarmStartSourceDeployedError(
-            f"warm-start source {src_run_id!r} is currently deployed; run "
-            f"'flash undeploy {src_run_id}' first, then resubmit "
-            "(serving holds the adapter files while it is deployed)"
+            f"warm-start source {src_run_id!r} cannot be used because its {state_detail}; "
+            f"{action}, then resubmit "
+            "(serving may hold the requested adapter files until undeploy completes)"
         )
     src_spec = JobSpec.from_dict(src_status.spec)
     if src_spec.model != spec.model:

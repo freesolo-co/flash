@@ -145,20 +145,33 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "deployment",
+    ("source_state", "deployment"),
     [
-        pytest.param(None, id="never-deployed"),
+        pytest.param("done", None, id="never-deployed"),
         pytest.param(
+            "done",
             {
                 "state": "undeployed",
                 "adapter_revision": "source-run@final." + _REVISION,
+                "checkpoint_step": None,
                 "endpoint_name": "https://serve.example",
             },
             id="post-undeploy",
         ),
+        pytest.param(
+            "deployed",
+            {
+                "state": "deployed",
+                "adapter_revision": "source-run@step-20." + _REVISION,
+                "checkpoint_step": 20,
+            },
+            id="unrelated-checkpoint-deployed",
+        ),
     ],
 )
-def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch, deployment):
+def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(
+    monkeypatch, source_state, deployment
+):
     import flash.lora_rank as rank_mod
     import flash.runner as R
     import flash.runner.checkpoints as checkpoints
@@ -174,7 +187,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     )
     source_status = R.RunStatus(
         run_id="source-run",
-        state="done",
+        state=source_state,
         spec=source.to_dict(),
         deployment=deployment,
     )
@@ -234,9 +247,45 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     }
 
 
+@pytest.mark.parametrize(
+    ("deployment", "step", "expected"),
+    [
+        pytest.param(
+            {
+                "adapter_revision": "source-run@final." + _REVISION,
+                "checkpoint_step": None,
+            },
+            20,
+            False,
+            id="unrelated-final",
+        ),
+        pytest.param(
+            {
+                "adapter_revision": "source-run@step-40." + _REVISION,
+                "checkpoint_step": 40,
+                "previous_deployment": {
+                    "adapter_revision": "source-run@step-20." + _REVISION,
+                    "checkpoint_step": 20,
+                },
+            },
+            20,
+            True,
+            id="reconciling-previous-target",
+        ),
+    ],
+)
+def test_deployment_target_matching_includes_pending_and_previous_targets(
+    deployment, step, expected
+):
+    import flash.runner as R
+
+    assert R._deployment_targets_adapter(deployment, run_id="source-run", step=step) is expected
+
+
 _DEPLOYED_WARMSTART_ERROR = (
-    "warm-start source 'source-run' is currently deployed; run 'flash undeploy source-run' first, "
-    "then resubmit (serving holds the adapter files while it is deployed)"
+    "warm-start source 'source-run' cannot be used because its deployment state 'deployed' is "
+    "active or unresolved; run 'flash undeploy source-run' first, then resubmit "
+    "(serving may hold the requested adapter files until undeploy completes)"
 )
 
 
@@ -263,19 +312,69 @@ def _warmstart_specs(init_ref):
 
 
 @pytest.mark.parametrize(
-    ("source_state", "deployment", "init_ref"),
+    ("source_state", "deployment", "init_ref", "expected_state_detail"),
     [
-        pytest.param("deployed", None, "source-run", id="final-adapter"),
+        pytest.param(
+            "deployed",
+            None,
+            "source-run",
+            "deployment state is active or unresolved",
+            id="missing-final-deployment-record",
+        ),
+        pytest.param(
+            "done",
+            {
+                "state": "ready",
+                "adapter_revision": "source-run@final." + _REVISION,
+                "checkpoint_step": None,
+            },
+            "source-run",
+            "deployment state 'ready' is active or unresolved",
+            id="final-adapter",
+        ),
         pytest.param(
             "running",
-            {"state": "deployed", "adapter_revision": "source-run/step-20"},
+            {
+                "state": "deployed",
+                "adapter_revision": "source-run@step-20." + _REVISION,
+                "checkpoint_step": 20,
+            },
             "source-run/step-20",
+            "deployment state 'deployed' is active or unresolved",
             id="concrete-checkpoint",
+        ),
+        pytest.param(
+            "running",
+            {
+                "state": "revocation_failed",
+                "adapter_revision": "source-run@step-20." + _REVISION,
+                "checkpoint_step": 20,
+            },
+            "source-run/step-20",
+            "deployment state 'revocation_failed' is active or unresolved",
+            id="revocation-failed",
+        ),
+        pytest.param(
+            "running",
+            {
+                "state": "reconciling",
+                "adapter_revision": "source-run@step-40." + _REVISION,
+                "checkpoint_step": 40,
+                "activation_outcome_unknown": True,
+                "previous_deployment": {
+                    "state": "ready",
+                    "adapter_revision": "source-run@step-20." + _REVISION,
+                    "checkpoint_step": 20,
+                },
+            },
+            "source-run/step-20",
+            "deployment state 'reconciling' is active or unresolved",
+            id="reconciling-previous-target",
         ),
     ],
 )
 def test_prepare_rejects_deployed_warmstart_before_hf_access(
-    monkeypatch, source_state, deployment, init_ref
+    monkeypatch, source_state, deployment, init_ref, expected_state_detail
 ):
     import flash.lora_rank as rank_mod
     import flash.runner as R
@@ -298,6 +397,7 @@ def test_prepare_rejects_deployed_warmstart_before_hf_access(
         return fail
 
     monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(R, "_source_owned_by_key", lambda run_id, owner_key_id: True)
     monkeypatch.setattr(
         rank_mod,
         "resolve_hf_dataset_revision",
@@ -320,10 +420,44 @@ def test_prepare_rejects_deployed_warmstart_before_hf_access(
     )
 
     with pytest.raises(R.WarmStartSourceDeployedError) as exc_info:
-        R._prepare_init_from_adapter(child, token="token")
+        R._prepare_init_from_adapter(child, owner_key_id=7, token="token")
 
-    assert str(exc_info.value) == _DEPLOYED_WARMSTART_ERROR
+    message = str(exc_info.value)
+    assert expected_state_detail in message
+    assert "run 'flash undeploy source-run' first" in message
+    assert "ask the source run owner" not in message
     assert hf_calls == []
+
+
+def test_prepare_deployed_same_org_source_directs_caller_to_source_owner(monkeypatch):
+    import flash.runner as R
+
+    source, child = _warmstart_specs("source-run")
+    source_status = R.RunStatus(
+        run_id="source-run",
+        state="deployed",
+        spec=source.to_dict(),
+        platform_context={"org_id": "shared-org"},
+        deployment={
+            "state": "deployed",
+            "adapter_revision": "source-run@final." + _REVISION,
+            "checkpoint_step": None,
+        },
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(R, "_source_owned_by_key", lambda run_id, owner_key_id: False)
+
+    with pytest.raises(R.WarmStartSourceDeployedError) as exc_info:
+        R._prepare_init_from_adapter(
+            child,
+            owner_org_id="shared-org",
+            owner_key_id=7,
+            token="token",
+        )
+
+    message = str(exc_info.value)
+    assert "ask the source run owner to undeploy 'source-run' first" in message
+    assert "run 'flash undeploy source-run' first" not in message
 
 
 def test_create_run_preserves_deployed_warmstart_message(monkeypatch):
