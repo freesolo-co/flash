@@ -85,6 +85,7 @@ from flash.engine.worker.rng import (
     rollout_request_seed,
     seed_training_rngs,
 )
+from flash.engine.worker.rollout_samples import select_rollout_samples
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 from flash.opd_retry_contract import (
@@ -947,6 +948,12 @@ def run_opd():
                 step_cov = 0.0
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
+                # Distilled (prompt_messages, completion_text, loss) captured this attempt so the
+                # post-update opd_step heartbeat can surface a few student completions in `flash log`
+                # (parity with GRPO's reward samples). Reset per attempt so a resampled rollout does
+                # not carry the discarded attempt's completions. Loss is stored as a plain float, never
+                # the graph-holding tensor.
+                step_samples: list[tuple[object, str, float]] = []
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
                 # handed to the resident teacher pool, and completed teacher futures are converted into
                 # differentiable GKD losses as soon as they finish. This preserves one optimizer update
@@ -990,6 +997,7 @@ def run_opd():
                     *,
                     _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
                     _accum_target=accum_target,
+                    _step_samples: list = step_samples,
                 ) -> None:
                     batch = _teacher_futures.pop(fut)
                     try:
@@ -1016,7 +1024,14 @@ def run_opd():
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
                     )
-                    for r in resolved:
+                    # resolved is index-aligned with scored_samples (built from batch in order), so
+                    # each _Pending pairs with its SampleResult. Capture the completion text + loss of
+                    # distilled samples (loss is not None) for the step's heartbeat diagnostics.
+                    for p, r in zip(batch, resolved, strict=True):
+                        if r.loss is not None:
+                            _step_samples.append(
+                                (p.prompt_messages, p.gen.completion_text, float(r.loss.detach()))
+                            )
                         _account(r)
 
                 def _drain_ready_teacher_futures(
@@ -1128,6 +1143,11 @@ def run_opd():
             # each seq's grad was scaled by 1/accum_target; the mutation boundary rescales a partial
             # step, clips, publishes the first-update marker, mutates the optimizer, then increments.
             optimizer_started = time.perf_counter()
+            # Pre-update opt_steps == the policy state that GENERATED this step's rollouts. Use it as
+            # the samples' generated_at_step (parity with GRPO, which records the generation-time
+            # trainer step) so a completion is labelled with the step whose policy produced it, even
+            # though the heartbeat below reports the just-completed update.
+            generated_at_opt_steps = opt_steps
             opt_steps = _apply_opd_optimizer_update(
                 model=model,
                 optimizer=optimizer,
@@ -1142,6 +1162,16 @@ def run_opd():
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
+            # Surface up to three distilled student completions (with their per-sample distillation
+            # loss) on this step's heartbeat so `flash log` shows what the student generated — the OPD
+            # analog of GRPO's reward samples, catching a collapsed/degenerate student early. Each is
+            # labelled with the pre-update step whose policy generated it (generated_at_opt_steps).
+            sampled_completions = select_rollout_samples(
+                step_samples, generated_at_step=generated_at_opt_steps, scalar="loss"
+            )
+            opd_step_kwargs = (
+                {"sampled_completions": sampled_completions} if sampled_completions else {}
+            )
             _w.heartbeat(
                 "opd_step",
                 # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
@@ -1155,6 +1185,7 @@ def run_opd():
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
+                **opd_step_kwargs,
             )
             if _wandb_on:
                 # Best-effort: a W&B network hiccup must never abort a paid training run.

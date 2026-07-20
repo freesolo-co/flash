@@ -195,6 +195,19 @@ def format_gpu_status(gpu: Any) -> str:
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
+def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
+    """Return a sample's scalar as (label, finite value): GRPO ``reward`` or OPD ``loss``."""
+    for key in ("reward", "loss"):
+        if key not in sample:
+            continue
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            return None
+        return (key, value) if math.isfinite(value) else None
+    return None
+
+
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
     if hb.get("liveness"):
@@ -230,7 +243,7 @@ def _format_heartbeat(hb: dict) -> str:
     samples = hb.get("sampled_completions")
     if isinstance(samples, list):
         for sample in samples:
-            if rendered_samples >= 4:
+            if rendered_samples >= 3:
                 break
             if not isinstance(sample, dict):
                 continue
@@ -238,12 +251,11 @@ def _format_heartbeat(hb: dict) -> str:
             completion = sample.get("completion")
             if not isinstance(prompt_tail, str) or not isinstance(completion, str):
                 continue
-            try:
-                reward = float(sample.get("reward"))
-            except (TypeError, ValueError):
+            # A sample carries exactly one scalar: GRPO reward (3dp) or OPD distillation loss (4dp).
+            scalar = _sampled_completion_scalar(sample)
+            if scalar is None:
                 continue
-            if not math.isfinite(reward):
-                continue
+            scalar_label, scalar_value = scalar
             generated_at_step = sample.get("generated_at_step")
             if generated_at_step is None:
                 step_suffix = ""
@@ -253,11 +265,14 @@ def _format_heartbeat(hb: dict) -> str:
                 except (TypeError, ValueError):
                     continue
             rendered_samples += 1
-            prompt_tail = neutralize_control_chars(prompt_tail)[-500:]
-            completion = neutralize_control_chars(completion)[:1012]
+            # Neutralize control chars (defense against a malformed heartbeat.json) but show the full
+            # prompt and completion — samples are surfaced untruncated by design.
+            prompt_tail = neutralize_control_chars(prompt_tail)
+            completion = neutralize_control_chars(completion)
+            digits = 4 if scalar_label == "loss" else 3
             sample_lines.extend(
                 [
-                    f"  sample {rendered_samples} reward={reward:.3f}{step_suffix}",
+                    f"  sample {rendered_samples} {scalar_label}={scalar_value:.{digits}f}{step_suffix}",
                     f"    prompt: {prompt_tail.replace(chr(10), chr(10) + '      ')}",
                     f"    completion: {completion.replace(chr(10), chr(10) + '      ')}",
                 ]

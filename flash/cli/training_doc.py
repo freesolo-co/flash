@@ -273,12 +273,13 @@ spending another GPU run:
 - **Judge the trend, not a single number.** The proof of training is the curve:
   loss falling (SFT) or `reward` rising over steps (GRPO). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
-- **Read the model's outputs, not just the metrics.** A rising reward can come from
-  reward-hacking or a degenerate output the reward still credits — metrics alone never
-  establish that the model got better. For GRPO, `flash log` surfaces a handful of
-  truncated sample completions at the heartbeat cadence, with the first sample-bearing
-  update forced through, so you can catch skipped reasoning or a parroted prompt
-  placeholder by step 1-2. These are bounded diagnostics, not every rollout or a held-out
+- **Read the model's outputs, not just the metrics.** A rising reward (or falling loss)
+  can come from reward-hacking or a degenerate output the metric still credits — metrics
+  alone never establish that the model got better. For GRPO and OPD, `flash log` surfaces a
+  handful of full (untruncated) sample completions at the heartbeat cadence — GRPO shows
+  each completion's reward, OPD its distillation loss — with the first sample-bearing update
+  forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
+  step 1-2. These are bounded diagnostics, not every rollout or a held-out
   evaluation, so still **deploy the adapter and probe it**: `flash deploy <run-id>` then
   `flash chat <run-id> -m "..."` on at least a few real inputs, including ones it should
   get wrong.

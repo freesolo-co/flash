@@ -903,7 +903,9 @@ def _opd_harness(
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None),
+            # exact_type mirrors the real JobSpec.gpu attribute run_opd reads at startup, so the
+            # shared harness can drive run_opd end-to-end (e.g. the sample-completion capture test).
+            gpu=SimpleNamespace(type=None, exact_type=""),
         ),
         THINKING=False,
         SEED=0,
@@ -917,6 +919,7 @@ def _opd_harness(
         hf_resume_checkpoint=lambda **_kwargs: "",
         publish_deployable_checkpoint=lambda *a, **k: None,
         hf_upload_folder=lambda *a, **k: None,
+        publish_opd_optimizer_start_marker=lambda *a, **k: None,
         write_train_meta=(
             (lambda **k: metas.append(k)) if metas is not None else (lambda **k: None)
         ),
@@ -1362,6 +1365,51 @@ def test_opd_vllm_generation_uses_keepalive_heartbeat(monkeypatch):
     assert all(c[3].get("keepalive") is True for c in generate_calls)
     assert callable(generate_calls[0][2])
     assert generate_calls[0][2]() == {"step": 0}
+
+
+def test_opd_step_heartbeat_carries_distilled_sample_completions(monkeypatch):
+    """The forced post-update opd_step heartbeat surfaces the distilled student completions (with each
+    sample's distillation loss) so `flash log` shows what the student generated -- the OPD analog of
+    GRPO's reward samples. The default rollout stub emits completion text "x" for the one prompt."""
+    pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    beats: list = []
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, beats=beats)
+    opd_mod.run_opd()
+
+    sample_beats = [
+        kw for (stage, kw) in beats if stage == "opd_step" and "sampled_completions" in kw
+    ]
+    assert len(sample_beats) == 1, (
+        f"exactly one post-update opd_step heartbeat should carry samples; saw {len(sample_beats)}"
+    )
+    payload = sample_beats[0]
+    # Samples ride the forced post-update ping, which also carries the optimizer step + loss.
+    assert payload["force"] is True
+    assert payload["step"] == 1
+    assert "loss" in payload
+    samples = payload["sampled_completions"]
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample["completion"] == "x"
+    assert sample["prompt_tail"] == "user: a"
+    # OPD samples carry a distillation loss, never a reward.
+    assert "reward" not in sample
+    assert isinstance(sample["loss"], float)
+    # Labelled with the PRE-update step whose policy generated it (0 here), even though the heartbeat
+    # reports the completed update (step 1) -- parity with GRPO's generation-time step.
+    assert sample["generated_at_step"] == 0
 
 
 def test_opd_reconciles_required_resume_companion_before_restored_sync_and_generation(

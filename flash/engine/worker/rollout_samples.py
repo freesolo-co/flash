@@ -1,4 +1,11 @@
-"""Bounded, credential-safe GRPO rollout samples for heartbeat diagnostics."""
+"""Credential-safe rollout samples (full, untruncated) for heartbeat diagnostics.
+
+A "sample" is one on-policy generation surfaced so a user can SEE what the model produced on a logged
+training step (GRPO carries the scored ``reward``; OPD carries the distillation ``loss``). Completions
+and prompts are shown in full — the only transformation is credential redaction and terminal
+control-character neutralization, never length truncation. Sizes are already bounded by the training
+config (``max_completion_tokens`` / the prompt budget), so full text stays sane on the wire.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +15,10 @@ from typing import Any
 
 from flash.diagnostics import neutralize_control_chars, sanitize_diagnostic
 
-_PROMPT_TAIL_CHARS = 500
-_COMPLETION_CHARS = 1000
-_COMPLETION_TRUNCATION_MARKER = "\n[truncated]"
-_DEFAULT_SAMPLE_LIMIT = 3
-_MAX_SAMPLE_LIMIT = 4
+# Exactly three samples per logged step, always. Not configurable.
+_SAMPLE_LIMIT = 3
+# The scalar a sample carries: GRPO reward, OPD distillation loss.
+_SAMPLE_SCALARS = ("reward", "loss")
 
 
 def _sample_text(value: Any) -> str:
@@ -31,55 +37,56 @@ def _sample_text(value: Any) -> str:
     return str(value or "")
 
 
-def _sanitize_rollout_text(text: str) -> str:
+def sanitize_rollout_text(text: str) -> str:
+    """Redact credentials and neutralize terminal control chars, preserving the full text.
+
+    ``limit=sys.maxsize`` disables ``sanitize_diagnostic``'s length bound: samples are shown untruncated
+    (redaction and control-char escaping are the only transformations)."""
     redacted = sanitize_diagnostic(text, limit=sys.maxsize)
     return neutralize_control_chars(redacted)
-
-
-def bound_rollout_prompt_tail(text: str) -> str:
-    """Redact and neutralize a full prompt before retaining its bounded tail."""
-    return _sanitize_rollout_text(text)[-_PROMPT_TAIL_CHARS:]
-
-
-def bound_rollout_completion(text: str) -> str:
-    """Redact and neutralize a full completion before retaining its bounded prefix."""
-    safe_text = _sanitize_rollout_text(text)
-    if len(safe_text) <= _COMPLETION_CHARS:
-        return safe_text
-    return safe_text[:_COMPLETION_CHARS] + _COMPLETION_TRUNCATION_MARKER
 
 
 def build_rollout_sample(
     prompt: Any,
     completion: Any,
-    reward: Any,
-    generated_at_step: Any,
+    *,
+    reward: Any = None,
+    loss: Any = None,
+    generated_at_step: Any = None,
 ) -> dict[str, Any]:
-    """Build one bounded rollout sample without retaining source example objects."""
+    """Build one full, credential-safe rollout sample without retaining source example objects.
+
+    Exactly one of ``reward`` (GRPO) or ``loss`` (OPD) is supplied and stored under its own key."""
     prompt_text = _sample_text(prompt)
     completion_text = _sample_text(completion)
     try:
         step = int(generated_at_step) if generated_at_step is not None else None
     except (TypeError, ValueError):
         step = None
-    return {
-        "prompt_tail": bound_rollout_prompt_tail(prompt_text),
-        "completion": bound_rollout_completion(completion_text),
-        "reward": float(reward),
+    record: dict[str, Any] = {
+        "prompt_tail": sanitize_rollout_text(prompt_text),
+        "completion": sanitize_rollout_text(completion_text),
         "generated_at_step": step,
     }
+    if reward is not None:
+        record["reward"] = float(reward)
+    if loss is not None:
+        record["loss"] = float(loss)
+    return record
 
 
 def select_rollout_samples(
     triples: Iterable[tuple[Any, Any, Any]],
     *,
     generated_at_step: Any = None,
-    limit: int = _DEFAULT_SAMPLE_LIMIT,
+    scalar: str = "reward",
 ) -> list[dict[str, Any]]:
-    """Select deterministic samples, preferring one completion per distinct prompt."""
-    bounded_limit = max(0, min(int(limit), _MAX_SAMPLE_LIMIT))
-    if bounded_limit == 0:
-        return []
+    """Select up to three deterministic samples, preferring one completion per distinct prompt.
+
+    Each triple is ``(prompt, completion, value)``; ``value`` is stored under ``scalar`` — ``"reward"``
+    for GRPO, ``"loss"`` for OPD."""
+    if scalar not in _SAMPLE_SCALARS:
+        raise ValueError(f"rollout sample scalar must be one of {_SAMPLE_SCALARS}, got {scalar!r}")
 
     rows = list(triples)
     distinct: list[tuple[Any, Any, Any]] = []
@@ -93,8 +100,13 @@ def select_rollout_samples(
             seen_prompts.add(prompt_key)
             distinct.append(row)
 
-    selected = (distinct + repeats)[:bounded_limit]
+    selected = (distinct + repeats)[:_SAMPLE_LIMIT]
     return [
-        build_rollout_sample(prompt, completion, reward, generated_at_step)
-        for prompt, completion, reward in selected
+        build_rollout_sample(
+            prompt,
+            completion,
+            generated_at_step=generated_at_step,
+            **{scalar: value},
+        )
+        for prompt, completion, value in selected
     ]

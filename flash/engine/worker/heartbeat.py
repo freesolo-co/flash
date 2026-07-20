@@ -18,10 +18,7 @@ import time
 
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.rollout_samples import (
-    bound_rollout_completion,
-    bound_rollout_prompt_tail,
-)
+from flash.engine.worker.rollout_samples import sanitize_rollout_text
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -280,11 +277,25 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
     return dict(sorted(surviving.items())[:_REWARD_METRIC_LIMIT])
 
 
-def _bounded_sampled_completions(samples, limit: int = 4) -> list[dict]:
+# Exactly three samples per heartbeat, always. Mirrors rollout_samples._SAMPLE_LIMIT.
+_SAMPLE_LIMIT = 3
+
+
+def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
+    """Return the (key, finite value) of a sample's scalar: GRPO ``reward`` or OPD ``loss``."""
+    for key in ("reward", "loss"):
+        if key not in sample:
+            continue
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            return None
+        return (key, value) if math.isfinite(value) else None
+    return None
+
+
+def _bounded_sampled_completions(samples) -> list[dict]:
     if not isinstance(samples, (list, tuple)):
-        return []
-    bounded_limit = max(0, min(int(limit), 4))
-    if bounded_limit == 0:
         return []
     bounded: list[dict] = []
     for sample in samples:
@@ -294,11 +305,8 @@ def _bounded_sampled_completions(samples, limit: int = 4) -> list[dict]:
         completion = sample.get("completion")
         if not isinstance(prompt_tail, str) or not isinstance(completion, str):
             continue
-        try:
-            reward = float(sample.get("reward"))
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(reward):
+        scalar = _sampled_completion_scalar(sample)
+        if scalar is None:
             continue
         generated_at_step = sample.get("generated_at_step")
         if generated_at_step is not None:
@@ -306,15 +314,16 @@ def _bounded_sampled_completions(samples, limit: int = 4) -> list[dict]:
                 generated_at_step = int(generated_at_step)
             except (TypeError, ValueError):
                 continue
+        scalar_key, scalar_value = scalar
         bounded.append(
             {
-                "prompt_tail": bound_rollout_prompt_tail(prompt_tail),
-                "completion": bound_rollout_completion(completion),
-                "reward": reward,
+                "prompt_tail": sanitize_rollout_text(prompt_tail),
+                "completion": sanitize_rollout_text(completion),
+                scalar_key: scalar_value,
                 "generated_at_step": generated_at_step,
             }
         )
-        if len(bounded) >= bounded_limit:
+        if len(bounded) >= _SAMPLE_LIMIT:
             break
     return bounded
 
