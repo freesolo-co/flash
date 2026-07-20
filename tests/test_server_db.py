@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -167,6 +169,71 @@ def test_schema_is_initialized_once_across_many_requests(isolated_db, monkeypatc
 
     assert executescript_calls == 1
     assert journal_mode_calls == 1
+
+
+@pytest.mark.parametrize("remove_parent", [False, True])
+def test_deleted_database_reinitializes_schema_and_replaces_pooled_connection(
+    isolated_db, remove_parent
+) -> None:
+    assert isolated_db.ensure_external_key("fslo_before_delete") is not None
+    old_connection = isolated_db._connect()
+    path = isolated_db.db_path()
+
+    if remove_parent:
+        shutil.rmtree(os.path.dirname(path))
+    else:
+        for candidate in (path, f"{path}-wal", f"{path}-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(candidate)
+
+    assert isolated_db.ensure_external_key("fslo_after_delete") is not None
+    new_connection = isolated_db._connect()
+
+    assert new_connection is not old_connection
+    with pytest.raises(sqlite3.ProgrammingError):
+        old_connection.execute("SELECT 1")
+    tables = {
+        row[0]
+        for row in new_connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert {"api_keys", "runs"} <= tables
+
+
+def test_schema_init_closes_locked_connection_before_backoff(isolated_db, monkeypatch) -> None:
+    real_connect = sqlite3.connect
+    failed_connections = []
+    sleeps = []
+
+    class LockedConnection(sqlite3.Connection):
+        closed = False
+
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA journal_mode=WAL":
+                raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, parameters)
+
+        def close(self):
+            self.closed = True
+            return super().close()
+
+    def tracking_connect(*args, **kwargs):
+        if not failed_connections:
+            connection = real_connect(*args, **kwargs, factory=LockedConnection)
+            failed_connections.append(connection)
+            return connection
+        return real_connect(*args, **kwargs)
+
+    def record_sleep(delay):
+        assert failed_connections[0].closed is True
+        sleeps.append(delay)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(isolated_db.time, "sleep", record_sleep)
+
+    assert isolated_db.ensure_external_key("fslo_retry_after_close") is not None
+    assert sleeps == [0.01]
 
 
 def test_fresh_database_initialization_retries_process_lock_contention(tmp_path) -> None:

@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 DB_PATH = str(Path.home() / ".flash" / "server.db")
 _LAST_USED_WRITE_INTERVAL_S = 60.0
 _INITIALIZATION_LOCK = threading.Lock()
-_INITIALIZED_DATABASES: set[tuple[int, str]] = set()
+_INITIALIZED_DATABASES: dict[tuple[int, str], tuple[int, int]] = {}
 _CONNECTIONS = threading.local()
 
 
@@ -41,24 +41,34 @@ def db_path() -> str:
     return DB_PATH
 
 
+def _database_file_identity(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
 def _initialize_database(path: str) -> None:
     database = (os.getpid(), path)
-    if database in _INITIALIZED_DATABASES:
+    identity = _database_file_identity(path)
+    if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
         return
     with _INITIALIZATION_LOCK:
-        if database in _INITIALIZED_DATABASES:
+        identity = _database_file_identity(path)
+        if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + 30.0
         backoff = 0.01
         while True:
             conn = None
+            retry_delay = None
             try:
                 remaining = max(deadline - time.monotonic(), 0.0)
                 conn = sqlite3.connect(path, timeout=remaining)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
-                break
             except sqlite3.OperationalError as exc:
                 error_code = getattr(exc, "sqlite_errorcode", None)
                 primary_error_code = error_code & 0xFF if isinstance(error_code, int) else None
@@ -71,33 +81,49 @@ def _initialize_database(path: str) -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise
-                time.sleep(min(backoff, remaining))
-                backoff = min(backoff * 2, 0.25)
+                retry_delay = min(backoff, remaining)
             finally:
                 if conn is not None:
                     conn.close()
-        _INITIALIZED_DATABASES.add(database)
+            if retry_delay is None:
+                break
+            time.sleep(retry_delay)
+            backoff = min(backoff * 2, 0.25)
+        identity = _database_file_identity(path)
+        if identity is None:
+            _INITIALIZED_DATABASES.pop(database, None)
+            raise sqlite3.OperationalError("database disappeared during schema initialization")
+        _INITIALIZED_DATABASES[database] = identity
 
 
 def _connect() -> sqlite3.Connection:
     path = db_path()
     process_id = os.getpid()
     _initialize_database(path)
+    file_identity = _database_file_identity(path)
+    if file_identity is None:
+        raise sqlite3.OperationalError("database disappeared after schema initialization")
 
     conn = getattr(_CONNECTIONS, "connection", None)
     if (
         conn is None
         or getattr(_CONNECTIONS, "path", None) != path
         or getattr(_CONNECTIONS, "process_id", None) != process_id
+        or getattr(_CONNECTIONS, "file_identity", None) != file_identity
     ):
         if conn is not None:
             conn.close()
         conn = sqlite3.connect(path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        opened_identity = _database_file_identity(path)
+        if opened_identity is None:
+            conn.close()
+            raise sqlite3.OperationalError("database disappeared while opening a pooled connection")
         _CONNECTIONS.connection = conn
         _CONNECTIONS.path = path
         _CONNECTIONS.process_id = process_id
+        _CONNECTIONS.file_identity = opened_identity
     return conn
 
 
