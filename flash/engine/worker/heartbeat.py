@@ -18,6 +18,10 @@ import time
 
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
+from flash.engine.worker.rollout_samples import (
+    bound_rollout_completion,
+    bound_rollout_prompt_tail,
+)
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -193,6 +197,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             _committed_step = kw.get("step")
             if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
+    payload_committed = False
     if upload_due:
         critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
@@ -210,19 +215,22 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
                     _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
-                elif not liveness:
-                    # this committed snapshot carried real progress; settle the progress-carry
-                    # latch up to the seq captured when the snapshot was built (max: a concurrent
-                    # newer real heartbeat that lost the upload race must stay pending).
-                    with _HB_LOCK:
-                        if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
-                            _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
+                else:
+                    payload_committed = True
+                    if not liveness:
+                        # this committed snapshot carried real progress; settle the progress-carry
+                        # latch up to the seq captured when the snapshot was built (max: a concurrent
+                        # newer real heartbeat that lost the upload race must stay pending).
+                        with _HB_LOCK:
+                            if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
+                                _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
     print("HEARTBEAT", snapshot)
+    return payload_committed
 
 
 def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -> float:
@@ -300,8 +308,8 @@ def _bounded_sampled_completions(samples, limit: int = 4) -> list[dict]:
                 continue
         bounded.append(
             {
-                "prompt_tail": prompt_tail,
-                "completion": completion,
+                "prompt_tail": bound_rollout_prompt_tail(prompt_tail),
+                "completion": bound_rollout_completion(completion),
                 "reward": reward,
                 "generated_at_step": generated_at_step,
             }
@@ -350,8 +358,9 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
             force_first_samples = bool(bounded_samples) and not self.sent_first_sample_heartbeat
             if force_first_samples:
-                _w.heartbeat("rl_step", force=True, **payload)
-                self.sent_first_sample_heartbeat = True
+                committed = _w.heartbeat("rl_step", force=True, **payload)
+                if committed:
+                    self.sent_first_sample_heartbeat = True
             else:
                 _w.heartbeat("rl_step", **payload)
 

@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from flash.diagnostics import neutralize_control_chars
 from flash.providers._deadline import remaining_seconds
 
 # Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
@@ -252,8 +253,8 @@ def _format_heartbeat(hb: dict) -> str:
                 except (TypeError, ValueError):
                     continue
             rendered_samples += 1
-            prompt_tail = prompt_tail[-500:]
-            completion = completion[:1012]
+            prompt_tail = neutralize_control_chars(prompt_tail)[-500:]
+            completion = neutralize_control_chars(completion)[:1012]
             sample_lines.extend(
                 [
                     f"  sample {rendered_samples} reward={reward:.3f}{step_suffix}",

@@ -39,3 +39,14 @@ def sanitize_diagnostic(value: Any, *, limit: int = 2000) -> str:
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _SECRET_KEY_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
     return text[: max(0, int(limit))]
+
+
+def neutralize_control_chars(value: Any) -> str:
+    """Escape terminal control characters while preserving newlines as separators."""
+    text = str(value)
+    return "".join(
+        char
+        if char == "\n" or (ord(char) >= 0x20 and ord(char) != 0x7F)
+        else f"\\x{ord(char):02x}"
+        for char in text
+    )

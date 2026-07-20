@@ -229,10 +229,29 @@ def run_rl():
 
     def reward_fn(completions, **kwargs):
         latest_named_metrics.clear()
-        latest_samples.clear()
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
-            return [float(r) for r in kwargs["reward"]]
+            rewards = [float(r) for r in kwargs["reward"]]
+            prompts_kwarg = kwargs.get("prompts")
+            trainer_state = kwargs.get("trainer_state")
+            generated_at_step = getattr(trainer_state, "global_step", None)
+            sample_triples = []
+            for idx, reward in enumerate(rewards):
+                try:
+                    prompt = prompts_kwarg[idx]
+                except (IndexError, KeyError, TypeError):
+                    prompt = prompts_kwarg if idx == 0 else ""
+                try:
+                    completion = completions[idx]
+                except (IndexError, KeyError, TypeError):
+                    completion = completions if idx == 0 else ""
+                sample_triples.append((prompt, completion, reward))
+            latest_samples.clear()
+            latest_samples.extend(
+                select_rollout_samples(sample_triples, generated_at_step=generated_at_step)
+            )
+            return rewards
+        latest_samples.clear()
         # Fail LOUD if TRL stops forwarding example_idx: defaulting to [] would zip to zero
         # examples -> empty rewards -> silent broken training (#206 / #210).
         example_idx = kwargs.get("example_idx")
