@@ -1,7 +1,7 @@
 """Cost estimator: model-size facts (catalog-only). No network.
 
-The cost model supports the curated catalog only — five dense text models plus one MoE, no
-open-model/unlisted sizing. The numeric size is the catalog's ``params_b`` stat, read directly
+The cost model supports the curated catalog only: six dense models plus one MoE, with no
+open-model or unlisted sizing. The numeric size is the catalog's ``params_b`` stat, read directly
 (no parsing of the ``params`` display string). For the MoE the per-token FLOPs/step-time term reads
 the smaller ``active_params_b`` while memory/size terms (VRAM, disk, download) keep total ``params_b``.
 """
