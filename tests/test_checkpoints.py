@@ -420,10 +420,8 @@ def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trai
     )
 
 
-def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
-    """The streamed resume checkpoint is latest-only, but upload_folder's delete_patterns can't reach
-    sibling step dirs (they're matched relative to the per-step path_in_repo), so older checkpoint-N
-    dirs are pruned explicitly. The plural deployable tree (checkpoints/) must be left intact."""
+def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
+    """Pruning removes older steps without deleting a newer concurrently published checkpoint."""
     import flash.engine.worker.hf as worker_hf
 
     prefix = "rl/flash-ckpt-1"
@@ -432,6 +430,7 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
         f"{prefix}/checkpoint/checkpoint-20/adapter_model.safetensors",
         f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",
         f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
+        f"{prefix}/checkpoint/checkpoint-80/optimizer.pt",
         f"{prefix}/checkpoints/step-60/adapter/adapter_model.safetensors",  # deployable (plural) -> keep
         f"{prefix}/metrics.json",
     ]
@@ -444,7 +443,8 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
         f"{prefix}/checkpoint/checkpoint-20",
         f"{prefix}/checkpoint/checkpoint-40",
     ]
-    assert f"{prefix}/checkpoint/checkpoint-60" not in rec.deleted  # latest kept
+    assert f"{prefix}/checkpoint/checkpoint-60" not in rec.deleted
+    assert f"{prefix}/checkpoint/checkpoint-80" not in rec.deleted
     assert all("checkpoints/" not in d for d in rec.deleted)  # deployable tree untouched
 
 

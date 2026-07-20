@@ -169,6 +169,7 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
 
 _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S = 300.0
 _OPTIONAL_UPLOAD_STAGE_ROOT = "/tmp/flash-optional-uploads"
+_RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
 _FICLONE = 0x40049409
 
 
@@ -663,6 +664,7 @@ def publish_deployable_checkpoint(
     backoff_s: float = 0.0,
     required: bool = False,
     _provenance_ready: bool = False,
+    _emit_heartbeat: bool = True,
 ) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable per-step path.
 
@@ -695,7 +697,8 @@ def publish_deployable_checkpoint(
                 repo_type="dataset",
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
-            _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+            if _emit_heartbeat:
+                _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
         except Exception as e:
             last_error = e
@@ -764,12 +767,12 @@ def _latest_checkpoint_dir(output_dir: str) -> tuple[int, str] | None:
 
 
 def _prune_stale_resume_checkpoints(keep_step: int) -> None:
-    """Delete every ``{prefix}/checkpoint/checkpoint-N`` except ``keep_step``.
+    """Delete older ``{prefix}/checkpoint/checkpoint-N`` directories.
 
     The streamed resume checkpoint is meant to be latest-only, but ``upload_folder``'s delete_patterns
-    are matched RELATIVE to path_in_repo (the per-step dir), so they can never reach sibling step dirs —
-    without this they accumulate unbounded on HF and ``hf_resume_checkpoint`` re-downloads them all.
-    Runs AFTER the new checkpoint lands, so the latest is always present. The deployable-adapter tree
+    are matched relative to path_in_repo (the per-step dir), so they can never reach sibling step dirs.
+    Only lower steps are stale: an older upload can finish after a newer one, and must never delete the
+    newer checkpoint. A later upload removes any lower directory left by that race. The deployable tree
     (``{prefix}/checkpoints/...``, plural) has a different prefix and is untouched.
     """
     if not _w.HF_REPO:
@@ -788,7 +791,7 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
             continue
         seg = f[len(base) :].split("/", 1)[0]
         n = seg[len("checkpoint-") :]
-        if seg.startswith("checkpoint-") and n.isdigit() and int(n) != keep_step:
+        if seg.startswith("checkpoint-") and n.isdigit() and int(n) < keep_step:
             stale.add(f"{base}{seg}")
     for folder in sorted(stale):
         try:
@@ -800,7 +803,12 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
 
 
 def upload_resume_checkpoint(
-    step: int, ckpt_dir: str, *, before_upload=None, after_upload=None
+    step: int,
+    ckpt_dir: str,
+    *,
+    before_upload=None,
+    after_upload=None,
+    emit_heartbeat: bool = True,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _w.HF_REPO:
@@ -811,58 +819,66 @@ def upload_resume_checkpoint(
     before_completed = before_upload is None
     resume_completed = False
     after_completed = after_upload is None
-    with liveness_heartbeat(
-        "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
-    ):
-        for attempt in range(_CKPT_UPLOAD_RETRIES):
-            failure_stage = "resume"
-            try:
-                if not before_completed:
-                    failure_stage = "before"
-                    before_upload()
-                    before_completed = True
-                if not resume_completed:
-                    failure_stage = "resume"
-                    _require_hf_deadline_allowance()
-                    _w.hf_api().upload_folder(
-                        folder_path=ckpt_dir,
-                        path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                        repo_id=_w.HF_REPO,
-                        repo_type="dataset",
-                    )
-                    # prune only after the atomic folder commit lands, so the prior complete save survives
-                    # every failed replacement upload.
-                    _prune_stale_resume_checkpoints(step)
-                    resume_completed = True
-                if not after_completed:
-                    failure_stage = "after"
-                    after_upload()
-                    after_completed = True
-                failure_stage = "heartbeat"
-                _w.heartbeat("checkpoint_uploaded", step=step)
-                return True
-            except RequiredSaveError:
-                raise
-            except Exception as e:
-                if attempt + 1 < _CKPT_UPLOAD_RETRIES:
-                    print(
-                        f"[ckpt] step {step} upload retry "
-                        f"{attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
-                    )
-                    try:
-                        if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
+    with _RESUME_CHECKPOINT_UPLOAD_LOCK:
+        heartbeat_context = (
+            liveness_heartbeat(
+                "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+            )
+            if emit_heartbeat
+            else contextlib.nullcontext()
+        )
+        with heartbeat_context:
+            for attempt in range(_CKPT_UPLOAD_RETRIES):
+                failure_stage = "resume"
+                try:
+                    if not before_completed:
+                        failure_stage = "before"
+                        before_upload()
+                        before_completed = True
+                    if not resume_completed:
+                        failure_stage = "resume"
+                        _require_hf_deadline_allowance()
+                        _w.hf_api().upload_folder(
+                            folder_path=ckpt_dir,
+                            path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                            repo_id=_w.HF_REPO,
+                            repo_type="dataset",
+                        )
+                        # prune only after the atomic folder commit lands, so the prior complete save
+                        # survives every failed replacement upload.
+                        _prune_stale_resume_checkpoints(step)
+                        resume_completed = True
+                    if not after_completed:
+                        failure_stage = "after"
+                        after_upload()
+                        after_completed = True
+                    if emit_heartbeat:
+                        failure_stage = "heartbeat"
+                        _w.heartbeat("checkpoint_uploaded", step=step)
+                    return True
+                except RequiredSaveError:
+                    raise
+                except Exception as e:
+                    if attempt + 1 < _CKPT_UPLOAD_RETRIES:
+                        print(
+                            f"[ckpt] step {step} upload retry "
+                            f"{attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
+                        )
+                        try:
+                            if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
+                                break
+                        except Exception:
                             break
-                    except Exception:
-                        break
-                else:
-                    print(
-                        f"[ckpt] step {step} upload FAILED after "
-                        f"{_CKPT_UPLOAD_RETRIES} attempts: {e}"
-                    )
-                    with contextlib.suppress(Exception):
-                        _w.heartbeat("checkpoint_upload_failed", step=step)
-                    if failure_stage in {"before", "after"}:
-                        raise
+                    else:
+                        print(
+                            f"[ckpt] step {step} upload FAILED after "
+                            f"{_CKPT_UPLOAD_RETRIES} attempts: {e}"
+                        )
+                        if emit_heartbeat:
+                            with contextlib.suppress(Exception):
+                                _w.heartbeat("checkpoint_upload_failed", step=step)
+                        if failure_stage in {"before", "after"}:
+                            raise
     return False
 
 
@@ -874,24 +890,44 @@ def make_checkpoint_upload_callback(save_at_steps=()):
     deployable_steps: set[int] = set()
     uploaded_steps: set[int] = set()
 
-    def _publish_deployable(ckpt_dir: str, step: int, *, provenance_ready: bool = False) -> None:
+    def _publish_deployable(
+        ckpt_dir: str,
+        step: int,
+        *,
+        provenance_ready: bool = False,
+        emit_heartbeat: bool = True,
+    ) -> None:
         """publish the trainer checkpoint's adapter without changing its contents."""
         publish_deployable_checkpoint(
             ckpt_dir,
             step,
             required=step in required_steps,
             _provenance_ready=provenance_ready,
+            _emit_heartbeat=emit_heartbeat,
         )
         if step in required_steps:
             deployable_steps.add(step)
 
-    def _upload(step: int, ckpt_dir: str, *, provenance_ready: bool = False) -> bool:
+    def _upload(
+        step: int,
+        ckpt_dir: str,
+        *,
+        provenance_ready: bool = False,
+        emit_heartbeat: bool = True,
+    ) -> bool:
         # publish the small durable deployable before the latest-only resume checkpoint.
         def _prepare() -> None:
             if step not in deployable_steps:
-                _publish_deployable(ckpt_dir, step, provenance_ready=provenance_ready)
+                _publish_deployable(
+                    ckpt_dir,
+                    step,
+                    provenance_ready=provenance_ready,
+                    emit_heartbeat=emit_heartbeat,
+                )
 
-        if not upload_resume_checkpoint(step, ckpt_dir, before_upload=_prepare):
+        if not upload_resume_checkpoint(
+            step, ckpt_dir, before_upload=_prepare, emit_heartbeat=emit_heartbeat
+        ):
             return False
         uploaded_steps.add(step)
         return True
@@ -908,7 +944,9 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         _OPTIONAL_UPLOADER.enqueue(
             f"checkpoint step {step}",
             staged_dir,
-            lambda: _upload(step, staged_checkpoint, provenance_ready=True),
+            lambda: _upload(
+                step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False
+            ),
         )
 
     class _CheckpointUpload(TrainerCallback):
@@ -967,12 +1005,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
             if latest is not None:
                 step, ckpt_dir = latest
                 should_flush = not required_steps or step in required_steps
-                if (
-                    optional_uploads_flushed
-                    and should_flush
-                    and step not in uploaded_steps
-                    and not _upload(step, ckpt_dir)
-                ):
+                if should_flush and step not in uploaded_steps and not _upload(step, ckpt_dir):
                     if step in required_steps:
                         raise RetriableInfraError(
                             f"required save step {step} full-state checkpoint was not durably published"

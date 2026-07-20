@@ -199,7 +199,7 @@ def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
     assert order == [1, 3]
 
 
-def test_train_end_timeout_does_not_start_a_concurrent_fallback_upload(
+def test_train_end_timeout_still_publishes_latest_checkpoint(
     upload_worker, fake_trainer_callback, monkeypatch, tmp_path
 ):
     worker, worker_hf = upload_worker
@@ -224,7 +224,48 @@ def test_train_end_timeout_does_not_start_a_concurrent_fallback_upload(
         SimpleNamespace(),
     )
 
-    assert uploads == []
+    assert uploads == [
+        "rl/async-test/checkpoints/step-4/adapter",
+        "rl/async-test/checkpoint/checkpoint-4",
+    ]
+
+
+def test_optional_checkpoint_emits_no_stale_heartbeat(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path
+):
+    import importlib
+
+    worker, worker_hf = upload_worker
+    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    heartbeats: list[tuple[str, dict]] = []
+
+    class RecordingApi:
+        def upload_folder(self, **_kwargs) -> None:
+            return None
+
+        def list_repo_files(self, **_kwargs) -> list[str]:
+            return []
+
+    def fail_liveness(*_args, **_kwargs):
+        raise AssertionError("background checkpoint upload must not start a liveness heartbeat")
+
+    monkeypatch.setattr(worker, "hf_api", lambda: RecordingApi())
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+    )
+    monkeypatch.setattr(heartbeat_module, "liveness_heartbeat", fail_liveness)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _checkpoint(output_dir, 4)
+
+    worker.make_checkpoint_upload_callback().on_save(
+        SimpleNamespace(output_dir=str(output_dir)),
+        SimpleNamespace(global_step=4),
+        SimpleNamespace(),
+    )
+
+    assert worker_hf.flush_optional_uploads(5)
+    assert heartbeats == []
 
 
 def test_concurrent_debug_snapshots_preserve_append_order(upload_worker, monkeypatch):
