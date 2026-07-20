@@ -628,6 +628,7 @@ def poll_job(
             last_status = status
             last_progress = time.time()
         if status in TERMINAL_OK:
+            surface_heartbeat(heartbeat_reader, last_hb_key, say)
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:

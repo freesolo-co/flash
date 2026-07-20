@@ -389,6 +389,26 @@ def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
     assert [item["step"] for item in metrics_last] == list(range(3, 1027))
 
 
+def test_heartbeat_console_summarizes_metric_backlog():
+    import json
+
+    from flash.engine.worker.heartbeat import _console_heartbeat_snapshot
+
+    console = json.loads(
+        _console_heartbeat_snapshot(
+            {
+                "stage": "rl_step",
+                "step": 1024,
+                "metrics_last": [{"step": step} for step in range(1024)],
+            }
+        )
+    )
+
+    assert "metrics_last" not in console
+    assert console["metrics_last_count"] == 1024
+    assert console["step"] == 1024
+
+
 def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap

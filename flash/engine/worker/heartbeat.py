@@ -106,6 +106,14 @@ def _rollback_throttle_slot(
             _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
 
 
+def _console_heartbeat_snapshot(payload: dict) -> str:
+    console_payload = dict(payload)
+    metrics_last = console_payload.pop("metrics_last", None)
+    if isinstance(metrics_last, list):
+        console_payload["metrics_last_count"] = len(metrics_last)
+    return json.dumps(console_payload)
+
+
 def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
     global _HB_CLAIM_SEQ
     ts = time.time()
@@ -223,7 +231,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", snapshot)
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload))
 
 
 def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -> float:

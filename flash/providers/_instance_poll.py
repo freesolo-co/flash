@@ -484,6 +484,7 @@ def poll_instance_job(
         # paces its own reads). Folds the DONE and ok/err-marker checks into one call.
         terminal = terminal_artifact_result(force=False)
         if terminal is not None:
+            surface_heartbeat(heartbeat_reader, last_hb_key, say)
             return terminal
 
         # ``unknown`` = "host has no recent heartbeat and won't progress" (host loss) -> dead for fast
