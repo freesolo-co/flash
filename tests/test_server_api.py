@@ -139,7 +139,9 @@ def test_requests_without_key_are_rejected(api):
     # A token that doesn't verify with freesolo is rejected.
     assert api.get("/v1/runs", headers=_bearer("not-a-freesolo-key")).status_code == 401
     assert api.get("/v1/models", headers=_bearer("nope")).status_code == 401
-    assert api.get("/v1/health").status_code == 200  # health stays open
+    health = api.get("/v1/health")
+    assert health.status_code == 200  # health stays open
+    assert "chat_step_selector_v1" in health.json()["capabilities"]
 
 
 def test_dry_run_reports_schema_agreement_without_persisting_it(api) -> None:
@@ -3056,7 +3058,7 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert seen["run_id"] == revision
 
 
-def test_chat_step_selector_serves_verified_revision_instead_of_current_alias(api, monkeypatch):
+def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
 
@@ -3067,7 +3069,7 @@ def test_chat_step_selector_serves_verified_revision_instead_of_current_alias(ap
     status = runner.get_status(run_id)
     status.state = "done"
     runner._save_status(status)
-    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-40." + "b" * 40]
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "b" * 40]
     for revision in revisions:
         runner.mark_checkpoint_deployed(
             run_id,
@@ -3094,7 +3096,7 @@ def test_chat_step_selector_serves_verified_revision_instead_of_current_alias(ap
     )
 
     assert response.status_code == 200, response.text
-    assert seen["run_id"] == revisions[0]
+    assert seen["run_id"] == revisions[1]
 
 
 def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):

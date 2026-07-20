@@ -336,7 +336,12 @@ def _format_deployed_steps(index: dict[int | None, list[str]]) -> str:
 
 
 def _resolve_explicit_chat_revision(
-    run_id: str, adapter_revision, step, verified_revisions: set[str]
+    run_id: str,
+    adapter_revision,
+    step,
+    verified_revisions: set[str],
+    *,
+    preferred_revision: str | None = None,
 ) -> str | None:
     """Resolve an explicit chat target to a verified same-run immutable revision to pin, or None
     for bare-alias chat. 400 on malformed/ambiguous targets, 409 on not-yet-verified targets."""
@@ -371,6 +376,8 @@ def _resolve_explicit_chat_revision(
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
+            if preferred_revision in matches:
+                return preferred_revision
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1143,14 +1150,19 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     adapter_revision = payload.get("adapter_revision")
     step = payload.get("step")
     verified_revisions = _verified_adapter_revisions(status)
+    deployment = status.deployment or {}
+    ready_deployment = _previous_ready_deployment(deployment)
+    ready_revision = ready_deployment.get("adapter_revision") if ready_deployment is not None else None
     pinned_revision = _resolve_explicit_chat_revision(
-        run_id, adapter_revision, step, verified_revisions
+        run_id,
+        adapter_revision,
+        step,
+        verified_revisions,
+        preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
     )
     serving_model = pinned_revision or run_id
     spec = JobSpec.from_dict(status.spec)
-    deployment = status.deployment or {}
     deployment_state = deployment.get("state")
-    ready_deployment = _previous_ready_deployment(deployment)
     has_ready_deploy = pinned_revision is not None or ready_deployment is not None
     if pinned_revision is None and ready_deployment is not None:
         ready_revision = ready_deployment.get("adapter_revision")

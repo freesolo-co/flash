@@ -40,6 +40,9 @@ def stub():
             seen["path"] = self.path
             if self.path.startswith("/v1/envs/") and self.path.endswith("/package"):
                 self._send_bytes(200, b"package-bytes")
+            elif self.path == "/v1/health":
+                capabilities = [] if seen.get("old_chat_server") else ["chat_step_selector_v1"]
+                self._send(200, {"ok": True, "capabilities": capabilities})
             elif self.path == "/v1/runs/old-api/worker":
                 self._send(404, {"detail": "Not Found"})
             elif self.path == "/v1/runs/proxy-old-api/worker":
@@ -319,6 +322,18 @@ def test_chat_checkpoint_shorthand_forwards_step(stub):
     assert "adapter_revision" not in seen["body"]
 
 
+def test_chat_checkpoint_shorthand_rejects_older_server(stub):
+    url, seen = stub
+    seen["old_chat_server"] = True
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="chat_step_selector_v1"):
+        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+
+    assert seen["path"] == "/v1/health"
+    assert "body" not in seen
+
+
 @pytest.mark.parametrize("step", ["00", "01"])
 def test_chat_rejects_zero_padded_immutable_revision(stub, step):
     url, seen = stub
@@ -383,6 +398,18 @@ def test_chat_stream_checkpoint_shorthand_forwards_step(stub):
     assert seen["path"] == "/v1/runs/run-a/chat"
     assert seen["body"]["step"] == 40
     assert "adapter_revision" not in seen["body"]
+
+
+def test_chat_stream_checkpoint_shorthand_rejects_older_server(stub):
+    url, seen = stub
+    seen["old_chat_server"] = True
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="chat_step_selector_v1"):
+        list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
+
+    assert seen["path"] == "/v1/health"
+    assert "body" not in seen
 
 
 def test_chat_stream_accepts_json_fallback(stub):
