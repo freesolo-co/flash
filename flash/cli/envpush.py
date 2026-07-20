@@ -200,17 +200,20 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "venv",
         "node_modules",
         "credentials",
+        "secrets",
     }
 )
 _ENV_PUSH_ROOT_IGNORED_NAMES = frozenset({"pyproject.toml", "source"})
 _ENV_PUSH_SECRET_PATTERNS = (
     ".env.*",
+    "*.env",
     "*.pem",
     "*.key",
     "*.pfx",
     "*.p12",
-    "credentials*",
-    "id_rsa*",
+    "credentials.*",
+    "id_rsa",
+    "id_rsa.*",
 )
 _ENV_PUSH_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
@@ -270,6 +273,11 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     )
 
 
+def _raise_walk_error(error: OSError) -> None:
+    """fail env packaging loudly instead of silently skipping an unreadable directory."""
+    raise error
+
+
 def _tar_b64(directory: Path) -> str:
     """Pack a directory into a base64 tarball, excluding caches and metadata directories."""
     import base64
@@ -296,6 +304,8 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
     lowered_name = name.lower()
     if path.is_symlink():
         return True
+    if path.is_dir() and (path / "pyvenv.cfg").is_file():
+        return True
     if path == entrypoint or (
         path.parent == env_root and lowered_name == _ENV_ENTRYPOINT.lower()
     ):
@@ -317,6 +327,15 @@ def _iter_env_sidecar_files(
 
     roots = [env_root]
     if not include_full_tree:
+        # a single-file push carries only the entrypoint, its dataset sidecars, and its own
+        # docs. ship user-authored docs so the synthesized stub readme does not stand in for
+        # real training guidance the user shipped next to the module.
+        for doc_name in ("README.md", "TRAINING.md"):
+            doc = env_root / doc_name
+            if doc.is_file() and not _ignore_env_push_path(
+                doc, env_root=env_root, entrypoint=entrypoint
+            ):
+                yield doc, doc.relative_to(env_root)
         roots = [
             env_root / name
             for name in ("dataset", "datasets")
@@ -324,7 +343,9 @@ def _iter_env_sidecar_files(
         ]
 
     for walk_root in roots:
-        for root, dirs, files in os.walk(walk_root, topdown=True, followlinks=False):
+        for root, dirs, files in os.walk(
+            walk_root, topdown=True, followlinks=False, onerror=_raise_walk_error
+        ):
             root_path = Path(root)
             dirs[:] = sorted(
                 name
@@ -346,6 +367,7 @@ def _check_env_push_limits(
     """Reject oversized source trees before copying or building an in-memory archive."""
     files = 1
     total_bytes = entrypoint.stat().st_size + len(_ENV_SYSPATH_BOOTSTRAP.encode())
+    directories: set[Path] = set()
     has_readme = False
     for child, relative in _iter_env_sidecar_files(
         env_root, entrypoint=entrypoint, include_full_tree=include_full_tree
@@ -353,19 +375,24 @@ def _check_env_push_limits(
         files += 1
         total_bytes += child.stat().st_size
         has_readme = has_readme or relative == Path("README.md")
+        # the server counts every file AND directory against the same member cap when it
+        # repackages the checkout for download, so count unique parent dirs here too.
+        directories.update(parent for parent in relative.parents if parent != Path("."))
     if not has_readme:
         files += 1
         total_bytes += len(f"# {env_name}\n\nFlash Freesolo environment.\n".encode())
 
+    members = files + len(directories)
     if total_bytes > _ENV_PUSH_MAX_TOTAL_BYTES:
         raise ValueError(
             f"environment package totals {_human_bytes(total_bytes)} "
             f"(limit {_human_bytes(_ENV_PUSH_MAX_TOTAL_BYTES)}); "
             "remove large artifacts or use a smaller dataset"
         )
-    if files > _ENV_PUSH_MAX_FILES:
+    if members > _ENV_PUSH_MAX_FILES:
         raise ValueError(
-            f"selected environment contains {files:,} files (limit {_ENV_PUSH_MAX_FILES:,}); "
+            f"selected environment contains {members:,} files and directories "
+            f"(limit {_ENV_PUSH_MAX_FILES:,}); "
             "remove large artifacts or use a smaller dataset"
         )
 
