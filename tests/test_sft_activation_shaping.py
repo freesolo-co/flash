@@ -69,6 +69,28 @@ def test_packed_token_count_is_linear_and_not_attention_edge_count():
     assert token_count.item() != edge_count.item()
 
 
+def test_padding_free_token_count_ignores_collator_padding():
+    torch = pytest.importorskip("torch")
+
+    class PaddingFreeCollator:
+        def __call__(self, features):
+            return {
+                "input_ids": torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]]),
+                "position_ids": torch.tensor([[0, 1, 2, 0, 1, 0, 0, 0]]),
+            }
+
+    rows = [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}]
+    batch = _SFTTokenCountingCollator(PaddingFreeCollator())(rows)
+
+    assert batch["position_ids"].numel() == 8
+    assert _sft_local_token_count(batch).item() == 5
+
+    from flash.engine.worker import sft
+
+    source = inspect.getsource(sft.run_sft)
+    assert "trainer.data_collator = _SFTTokenCountingCollator(trainer.data_collator)" in source
+
+
 def test_group_by_length_is_gated_to_unpacked_only():
     base = Dataset.from_list(
         [

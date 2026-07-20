@@ -169,7 +169,7 @@ def _configure_unpacked_length_sampling(cfg_kwargs: dict, dataset, *, packed: bo
 
 
 class _SFTTokenCountingCollator:
-    """preserve packed real-token counts without exposing metadata to the model."""
+    """preserve real-token counts without exposing metadata to the model."""
 
     def __init__(self, collator):
         self.collator = collator
@@ -179,7 +179,13 @@ class _SFTTokenCountingCollator:
 
         batch = self.collator(features)
         batch["_flash_seq_lengths"] = torch.tensor(
-            [sum(feature["seq_lengths"]) for feature in features], dtype=torch.long
+            [
+                sum(feature["seq_lengths"])
+                if "seq_lengths" in feature
+                else len(feature["input_ids"])
+                for feature in features
+            ],
+            dtype=torch.long,
         )
         return batch
 
@@ -886,6 +892,9 @@ def run_sft():
             data_collator=_collator,
             callbacks=trainer_callbacks,
         )
+        if not multimodal and _collator is None:
+            # trl rejects custom collators for padding-free bfd, so wrap its generated collator here.
+            trainer.data_collator = _SFTTokenCountingCollator(trainer.data_collator)
         # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
         # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
         # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
