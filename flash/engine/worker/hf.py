@@ -173,6 +173,19 @@ _RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
 _FICLONE = 0x40049409
 
 
+@contextlib.contextmanager
+def _resume_checkpoint_upload_slot(timeout_s: float | None = None):
+    if timeout_s is None:
+        acquired = _RESUME_CHECKPOINT_UPLOAD_LOCK.acquire()
+    else:
+        acquired = _RESUME_CHECKPOINT_UPLOAD_LOCK.acquire(timeout=max(0.0, timeout_s))
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _RESUME_CHECKPOINT_UPLOAD_LOCK.release()
+
+
 @dataclass(frozen=True)
 class _OptionalUpload:
     sequence: int
@@ -809,6 +822,7 @@ def upload_resume_checkpoint(
     before_upload=None,
     after_upload=None,
     emit_heartbeat: bool = True,
+    lock_timeout_s: float | None = None,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _w.HF_REPO:
@@ -819,7 +833,10 @@ def upload_resume_checkpoint(
     before_completed = before_upload is None
     resume_completed = False
     after_completed = after_upload is None
-    with _RESUME_CHECKPOINT_UPLOAD_LOCK:
+    with _resume_checkpoint_upload_slot(lock_timeout_s) as acquired:
+        if not acquired:
+            print(f"[ckpt] step {step} upload skipped; another checkpoint upload is still active")
+            return False
         heartbeat_context = (
             liveness_heartbeat(
                 "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
@@ -914,6 +931,7 @@ def make_checkpoint_upload_callback(save_at_steps=()):
         *,
         provenance_ready: bool = False,
         emit_heartbeat: bool = True,
+        lock_timeout_s: float | None = None,
     ) -> bool:
         # publish the small durable deployable before the latest-only resume checkpoint.
         def _prepare() -> None:
@@ -926,7 +944,11 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                 )
 
         if not upload_resume_checkpoint(
-            step, ckpt_dir, before_upload=_prepare, emit_heartbeat=emit_heartbeat
+            step,
+            ckpt_dir,
+            before_upload=_prepare,
+            emit_heartbeat=emit_heartbeat,
+            lock_timeout_s=lock_timeout_s,
         ):
             return False
         uploaded_steps.add(step)
@@ -1005,7 +1027,15 @@ def make_checkpoint_upload_callback(save_at_steps=()):
             if latest is not None:
                 step, ckpt_dir = latest
                 should_flush = not required_steps or step in required_steps
-                if should_flush and step not in uploaded_steps and not _upload(step, ckpt_dir):
+                if (
+                    should_flush
+                    and step not in uploaded_steps
+                    and not _upload(
+                        step,
+                        ckpt_dir,
+                        lock_timeout_s=None if optional_uploads_flushed else 0.0,
+                    )
+                ):
                     if step in required_steps:
                         raise RetriableInfraError(
                             f"required save step {step} full-state checkpoint was not durably published"

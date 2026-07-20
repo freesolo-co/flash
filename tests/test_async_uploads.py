@@ -230,6 +230,42 @@ def test_train_end_timeout_still_publishes_latest_checkpoint(
     ]
 
 
+def test_train_end_timeout_does_not_wait_on_active_upload(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path
+):
+    worker, worker_hf = upload_worker
+    upload_lock = threading.Lock()
+    upload_lock.acquire()
+    monkeypatch.setattr(worker_hf, "_RESUME_CHECKPOINT_UPLOAD_LOCK", upload_lock)
+    monkeypatch.setattr(worker_hf, "flush_optional_uploads", lambda: False)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _checkpoint(output_dir, 4)
+    completed = threading.Event()
+    errors: list[BaseException] = []
+
+    def finalize() -> None:
+        try:
+            worker.make_checkpoint_upload_callback().on_train_end(
+                SimpleNamespace(output_dir=str(output_dir)),
+                SimpleNamespace(global_step=4),
+                SimpleNamespace(),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    finalizer = threading.Thread(target=finalize)
+    finalizer.start()
+    returned_while_locked = completed.wait(0.5)
+    upload_lock.release()
+    finalizer.join(5)
+
+    assert returned_while_locked
+    assert errors == []
+
+
 def test_optional_checkpoint_emits_no_stale_heartbeat(
     upload_worker, fake_trainer_callback, monkeypatch, tmp_path
 ):
