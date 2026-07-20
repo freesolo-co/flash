@@ -116,6 +116,55 @@ def grpo_use_reentrant(model_id: str) -> bool:
     return _is_gdn_hybrid_family(model_id)
 
 
+def enable_multimodal_input_require_grads(model) -> object | None:
+    """Make the vision patch embeddings differentiable for reentrant checkpointing."""
+    if model is None:
+        return None
+
+    existing_handle = getattr(model, "_mm_vision_require_grads_hook", None)
+    if existing_handle is not None:
+        existing_handle.remove()
+        model._mm_vision_require_grads_hook = None
+
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        base_model = get_base_model()
+    else:
+        peft_base_model = getattr(model, "base_model", None)
+        base_model = getattr(peft_base_model, "model", model)
+
+    for module_path, module in base_model.named_modules():
+        if not module_path.endswith("visual.patch_embed"):
+            continue
+
+        def _require_output_grad(_module, _inputs, output):
+            import torch
+
+            tensor = output[0] if isinstance(output, tuple) and output else output
+            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                tensor.requires_grad_(True)
+            return
+
+        handle = module.register_forward_hook(_require_output_grad)
+        model._mm_vision_require_grads_hook = handle
+        print(f"[multimodal] vision input gradients enabled at {module_path}")
+        return handle
+
+    return None
+
+
+def make_multimodal_input_require_grads_callback():
+    """Return a trainer callback that installs the vision input-gradient hook at train start."""
+    from transformers import TrainerCallback
+
+    class _MultimodalInputRequireGrads(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            enable_multimodal_input_require_grads(kwargs.get("model"))
+            return control
+
+    return _MultimodalInputRequireGrads()
+
+
 def grpo_sleep_mode(
     model_id: str,
     *,
