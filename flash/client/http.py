@@ -498,13 +498,10 @@ class ApiClient:
                 if content:
                     yield str(content)
                 return
-            while raw := resp.read(1):
-                chunk = decoder.decode(raw)
-                if chunk:
-                    yield chunk
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                yield tail
+            read = getattr(resp, "read1", resp.read)
+            while raw := read(4096):
+                yield from decoder.decode(raw)
+            yield from decoder.decode(b"", final=True)
 
 
 def client_from_config(require_key: bool = True) -> ApiClient:
