@@ -1145,6 +1145,115 @@ def test_worker_output_route(api, monkeypatch):
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
 
 
+def test_internal_key_reads_logs_and_worker_with_matching_org(api, monkeypatch):
+    # The platform web proxy has no per-run API key, so it reads a user's run logs with the shared
+    # internal key plus the run's org in X-Freesolo-Org-Id. The header is honored ONLY for the
+    # internal key and ONLY when it matches the run's persisted org. All failures are 404 so run
+    # existence is never leaked, and a rejected request must not trigger the expensive worker fetch.
+    import flash.server.app as app_mod
+
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+    with open(os.path.join(_orch.RUNS_DIR, f"{run_id}.log"), "w") as f:
+        f.write("orchestrator line\n")
+
+    worker_calls = {"n": 0}
+
+    def counting_worker(spec):
+        worker_calls["n"] += 1
+        return {"console_sft.txt": "worker stdout\n"}
+
+    monkeypatch.setattr(app_mod, "_worker_artifacts", counting_worker)
+
+    internal = _bearer("fslo-internal-test")
+    matched = {**internal, "X-Freesolo-Org-Id": org}
+
+    logs = api.get(f"/v1/runs/{run_id}/logs", headers=matched)
+    assert logs.status_code == 200, logs.text
+    assert logs.json()["logs"] == "orchestrator line\n"
+    worker = api.get(f"/v1/runs/{run_id}/worker", headers=matched)
+    assert worker.status_code == 200, worker.text
+    assert worker.json()["worker"] == {"console_sft.txt": "worker stdout\n"}
+    assert worker_calls["n"] == 1
+
+    # wrong org, empty/whitespace org, or no header at all -> 404, and none of these rejected
+    # /worker requests reach the expensive artifact fetch (the call count stays at 1).
+    for headers in (
+        {**internal, "X-Freesolo-Org-Id": "org-someone-else"},
+        {**internal, "X-Freesolo-Org-Id": ""},
+        {**internal, "X-Freesolo-Org-Id": "   "},
+        internal,
+    ):
+        assert api.get(f"/v1/runs/{run_id}/logs", headers=headers).status_code == 404
+        assert api.get(f"/v1/runs/{run_id}/worker", headers=headers).status_code == 404
+    assert worker_calls["n"] == 1
+
+
+def test_org_header_is_ignored_for_non_internal_keys(api):
+    # A non-owner user key can't read another tenant's logs even if it forges the org header: the
+    # header is consulted only for the internal service key, so the owner check still governs users.
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+
+    intruder = _login()
+    forged = {**_bearer(intruder), "X-Freesolo-Org-Id": org}
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=forged).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=forged).status_code == 404
+
+    # the real owner still reads its own run with no org header (unchanged CLI path).
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(owner)).status_code == 200
+
+
+def test_internal_org_header_does_not_widen_owner_only_endpoints(api):
+    # readable_run only governs the read-only /logs and /worker endpoints. /status, /cancel, and
+    # /checkpoints stay owner-only via owned_run, so the internal key plus a matching org header
+    # must NOT grant access to them.
+    owner = _login()
+    org = f"org-{owner.removeprefix(_USER_PREFIX)}"
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+
+    matched = {**_bearer("fslo-internal-test"), "X-Freesolo-Org-Id": org}
+    assert api.get(f"/v1/runs/{run_id}", headers=matched).status_code == 404
+    assert api.post(f"/v1/runs/{run_id}/cancel", headers=matched).status_code == 404
+    assert api.get(f"/v1/runs/{run_id}/checkpoints", headers=matched).status_code == 404
+
+
+def test_internal_key_cannot_read_run_without_persisted_org(api, monkeypatch):
+    # A run with no persisted org context cannot be matched by the internal path even with a
+    # non-empty header: _status_org_id is empty, so it never equals a real org and fails closed.
+    import flash.server.app as app_mod
+
+    owner = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
+    ).json()["run_id"]
+
+    real_get_status = app_mod.get_status
+
+    def stripped(rid):
+        status = real_get_status(rid)
+        if rid == run_id:
+            status.platform_context = None
+            status.billing_context = None
+        return status
+
+    monkeypatch.setattr(app_mod, "get_status", stripped)
+
+    internal = _bearer("fslo-internal-test")
+    for org in ("org-anything", f"org-{owner.removeprefix(_USER_PREFIX)}"):
+        headers = {**internal, "X-Freesolo-Org-Id": org}
+        assert api.get(f"/v1/runs/{run_id}/logs", headers=headers).status_code == 404
+        assert api.get(f"/v1/runs/{run_id}/worker", headers=headers).status_code == 404
+
+
 def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
     """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
     surfaces the FINAL attempt's traceback, not attempt0's stale one."""
@@ -3738,7 +3847,6 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     assert drained == [run_id]
 
 
-
 def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     import flash.providers as providers_mod
     import flash.runner as runner
@@ -3839,7 +3947,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
     # Disable the background retry budget so the defer is a clean no-op for this assertion (no lingering
     # daemon thread polling a torn-down tmp db); the reschedule behavior has its own test below.
-    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_MAX_RETRIES", 0)
+    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
 
@@ -3899,7 +4007,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
     # enumerated -> the guard must fail closed rather than declare clear.
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
-    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_MAX_RETRIES", 0)
+    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
 
@@ -3964,7 +4072,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     # queued run must resubmit anyway, because it provably never created the phantom the guard protects
     # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [])
-    monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_MAX_RETRIES", 0)
+    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
 

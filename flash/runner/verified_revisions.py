@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - linux production fails closed below
+    fcntl = None
 
 from flash.schema import parse_adapter_revision
 
@@ -29,6 +33,8 @@ def _paths(run_id: str) -> tuple[str, str, str]:
 
 @contextmanager
 def _locked_ledger(run_id: str, *, exclusive: bool) -> Iterator[tuple[str, str]]:
+    if fcntl is None:
+        raise RuntimeError("interprocess verified-revision locking is unavailable")
     runs_dir, ledger_path, lock_path = _paths(run_id)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "a+") as lock_file:

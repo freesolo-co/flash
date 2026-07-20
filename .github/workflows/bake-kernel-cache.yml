@@ -22,7 +22,7 @@ on:
     inputs:
       sms:
         description: "comma-separated sm list to bake; default is all validated arches"
-        default: "sm80,sm86,sm89,sm90,sm120"
+        default: "sm80,sm86,sm89,sm90,sm120,sm100"
         required: false
   # auto-rebake.yml calls this for the EXPENSIVE path (the cache is invalid and must be re-warmed on a
   # real GPU). It passes the arch subset, the fingerprints to stamp, and a digest-pinned base so the
@@ -105,10 +105,9 @@ jobs:
               gpu_type_id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
               allowed_cuda: "13.0",
             }
-          # Datacenter Blackwell (sm100, distinct from the sm120 RTX Pro 6000). B200 has 180 GB and
-          # good secure-cloud capacity. CUDA-13 host like the other Blackwell parts. NOT in the default
-          # `sms` list yet (B200 is unvalidated) -- bake it explicitly via `sms=sm100` until a smoke
-          # passes, then add it to the default.
+          # datacenter blackwell (sm100, distinct from the sm120 rtx pro 6000). b200 has 180 gb,
+          # good secure-cloud capacity, and is validated. promote its image only after a successful
+          # real-b200 bake, then include it in default and automatic rebakes.
           - {
               sm: sm100,
               arch: "10.0",
@@ -120,7 +119,7 @@ jobs:
       - name: Should bake ${{ matrix.sm }}?
         id: gate
         run: |
-          req="${{ inputs.sms || 'sm80,sm86,sm89,sm90,sm120' }}"
+          req="${{ inputs.sms || 'sm80,sm86,sm89,sm90,sm120,sm100' }}"
           req="${req// /}"   # tolerate spaces, e.g. "sm80, sm86"
           case ",$req," in
             *,${{ matrix.sm }},*) echo "run=true" >> "$GITHUB_OUTPUT" ;;

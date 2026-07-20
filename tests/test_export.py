@@ -305,6 +305,130 @@ def test_export_adapter_key_collision_leaves_safetensors_unchanged(monkeypatch):
     assert uploaded["weights"] == source_bytes
 
 
+def test_export_adapter_normalizes_lm_keys_with_inert_vision_weights(tmp_path):
+    from flash.serve import export
+
+    lm_a = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    lm_b = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_B.default.weight"
+    vision_a = "base_model.model.model.visual.blocks.0.attn.qkv.lora_A.default.weight"
+    vision_b = "base_model.model.model.visual.blocks.0.attn.qkv.lora_B.default.weight"
+    header = {
+        lm_a: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+        lm_b: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        vision_a: {"dtype": "F16", "shape": [1], "data_offsets": [4, 6]},
+        vision_b: {"dtype": "F16", "shape": [1], "data_offsets": [6, 8]},
+    }
+    data = b"\x01\x02\x03\x04\x05\x06\x00\x00"
+    path = tmp_path / "adapter_model.safetensors"
+    path.write_bytes(_safetensors_bytes(header, data))
+
+    assert export._normalize_export_adapter_keys(tmp_path) is True
+
+    normalized_header, normalized_data = _parse_safetensors_bytes(path.read_bytes())
+    normalized_lm_a = lm_a.replace(".language_model.", ".", 1)
+    normalized_lm_b = lm_b.replace(".language_model.", ".", 1)
+    assert set(normalized_header) == {normalized_lm_a, normalized_lm_b, vision_a, vision_b}
+    assert normalized_header[normalized_lm_a] == header[lm_a]
+    assert normalized_header[normalized_lm_b] == header[lm_b]
+    assert normalized_header[vision_a] == header[vision_a]
+    assert normalized_header[vision_b] == header[vision_b]
+    assert normalized_data == data
+
+
+def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatch):
+    # a genuinely multimodal adapter with nonzero vision lora_b must not be normalized:
+    # stripping only its lm keys would leave a mixed namespace no transformers class loads.
+    uploaded: dict = {}
+    lm_a = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    lm_b = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_B.default.weight"
+    vision_a = "base_model.model.model.visual.blocks.0.attn.proj.lora_A.default.weight"
+    vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
+    source_bytes = _safetensors_bytes(
+        {
+            lm_a: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            lm_b: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+            vision_a: {"dtype": "F16", "shape": [1], "data_offsets": [4, 6]},
+            vision_b: {"dtype": "F16", "shape": [1], "data_offsets": [6, 8]},
+        },
+        b"\x01\x02\x03\x04\x05\x06\x07\x08",
+    )
+
+    def fake_snapshot_download(*, local_dir, **kw):
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(source_bytes)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, folder_path, **kw):
+            uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    from flash.serve.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert uploaded["weights"] == source_bytes
+
+
+def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_unchanged(tmp_path):
+    from flash.serve import export
+
+    lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
+    source_bytes = _safetensors_bytes(
+        {
+            lm_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            vision_b: {"dtype": "F16", "shape": [1], "data_offsets": [2, 5]},
+        },
+        b"\x01\x02\x00\x00",
+    )
+    path = tmp_path / "adapter_model.safetensors"
+    path.write_bytes(source_bytes)
+
+    assert export._normalize_export_adapter_keys(tmp_path) is False
+    assert path.read_bytes() == source_bytes
+
+
+def test_export_adapter_with_unrecognized_non_lm_tensor_is_unchanged(tmp_path):
+    from flash.serve import export
+
+    lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
+    vision_saved = "base_model.model.model.visual.proj.modules_to_save.default.weight"
+    source_bytes = _safetensors_bytes(
+        {
+            lm_key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+            vision_saved: {"dtype": "F16", "shape": [1], "data_offsets": [2, 4]},
+        },
+        b"\x01\x02\x00\x00",
+    )
+    path = tmp_path / "adapter_model.safetensors"
+    path.write_bytes(source_bytes)
+
+    assert export._normalize_export_adapter_keys(tmp_path) is False
+    assert path.read_bytes() == source_bytes
+
+
 def test_export_adapter_without_safetensors_still_exports(monkeypatch):
     uploaded: dict = {}
     bin_weights = b"legacy-adapter-weights"

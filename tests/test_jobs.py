@@ -4,6 +4,7 @@ cross-process cancel, and attach (CPU-only; all network mocked)."""
 from __future__ import annotations
 
 import base64
+import io
 import re
 import sys
 import tempfile
@@ -13,7 +14,9 @@ import pytest
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
-def _runpod_handle(jobs, endpoint_id="ep", endpoint_name="name", job_id="job", attempt=0, started_ts=1.0):
+def _runpod_handle(
+    jobs, endpoint_id="ep", endpoint_name="name", job_id="job", attempt=0, started_ts=1.0
+):
     return jobs.JobHandle(
         endpoint_id,
         endpoint_name,
@@ -320,7 +323,9 @@ def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
     from flash.providers.runpod import jobs
 
     monkeypatch.setattr(
-        runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "TIMED_OUT", "error": "timeout"}
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "TIMED_OUT", "error": "timeout"},
     )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
 
@@ -556,7 +561,9 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
         gpu=GpuSpec(type="RTX 4090"),
     )
     submitted: dict = {}
-    monkeypatch.setattr(jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT))
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
+    )
     monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         runpod_api,
@@ -596,7 +603,9 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
-        jobs, "deploy_train_endpoint", lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT)
+        jobs,
+        "deploy_train_endpoint",
+        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
     monkeypatch.setattr(
         runpod_api,
@@ -641,7 +650,9 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(train, "chalk_extra_pip", lambda _spec: [])
     monkeypatch.setattr(
-        jobs, "deploy_train_endpoint", lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT)
+        jobs,
+        "deploy_train_endpoint",
+        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
     monkeypatch.setattr(
         runpod_api,
@@ -742,7 +753,9 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
     captured = []
 
     monkeypatch.setattr(jobs.time, "time", lambda: 100.0)
-    monkeypatch.setattr(jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT))
+    monkeypatch.setattr(
+        jobs, "deploy_train_endpoint", lambda *a, **k: ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
+    )
     monkeypatch.setattr(runpod_api, "submit_job", lambda *_a, **_k: "job-1")
 
     def fake_poll(handle, **kwargs):
@@ -793,7 +806,9 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
         lambda *_args, **_kwargs: submitted.append(True) or "job-1",
     )
     monkeypatch.setattr(
-        runpod_api, "delete_endpoint_for_fingerprint", lambda endpoint_id, _fingerprint: deleted.append(endpoint_id) or True
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: deleted.append(endpoint_id) or True,
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
@@ -826,7 +841,9 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # The IN_QUEUE phase triggers poll_job's endpoint_health probe on the first loop; stub it so the
     # test is hermetic (never hits the network even if RUNPOD_API_KEY is set in the environment).
     monkeypatch.setattr(
-        runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fingerprint, **_kw: {"workers": {"ready": 1, "running": 1}}
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: {"workers": {"ready": 1, "running": 1}},
     )
     h = _runpod_handle(jobs)
     res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
@@ -866,7 +883,11 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
         return next(statuses)
 
     monkeypatch.setattr(runpod_api, "job_status", fake_job_status)
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fingerprint, **_kw: {"workers": {"throttled": 1}})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: {"workers": {"throttled": 1}},
+    )
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
 
@@ -1182,12 +1203,8 @@ def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
         return state["t"]  # absolute simulated time when it stalled
 
     none_run = _stall_abs_time(None)
-    stale_run = _stall_abs_time(
-        {"stage": "train", "step": 4, "ts": 500, "attempt": 0}
-    )
-    fresh_run = _stall_abs_time(
-        {"stage": "train", "step": 6, "ts": 2000, "attempt": 0}
-    )
+    stale_run = _stall_abs_time({"stage": "train", "step": 4, "ts": 500, "attempt": 0})
+    fresh_run = _stall_abs_time({"stage": "train", "step": 6, "ts": 2000, "attempt": 0})
 
     assert stale_run == none_run, "a stale late heartbeat must be a no-op for progress"
     assert fresh_run > none_run, "a genuinely newer heartbeat does reset progress (stalls later)"
@@ -1208,7 +1225,9 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
     clock = itertools.count(start=0, step=100.0)
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
 
-    hbs = iter([{"stage": "rl_step", "step": 0, "ts": 1, "attempt": 0}])  # gap-filler before the first real step
+    hbs = iter(
+        [{"stage": "rl_step", "step": 0, "ts": 1, "attempt": 0}]
+    )  # gap-filler before the first real step
     res = jobs.poll_job(
         _runpod_handle(jobs),
         interval_s=0,
@@ -1248,7 +1267,9 @@ def test_poll_job_malformed_step_does_not_crash(monkeypatch):
     clock = itertools.count(start=0, step=100.0)
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
 
-    hbs = iter([{"stage": "rl_step", "step": "not-a-number", "ts": 1, "attempt": 0}])  # malformed step
+    hbs = iter(
+        [{"stage": "rl_step", "step": "not-a-number", "ts": 1, "attempt": 0}]
+    )  # malformed step
     res = jobs.poll_job(
         _runpod_handle(jobs),
         interval_s=0,
@@ -1374,7 +1395,11 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
         ]
     )
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(statuses))
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fingerprint, **_kw: next(healths, {"workers": {}}))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: next(healths, {"workers": {}}),
+    )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
@@ -1461,7 +1486,11 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
         ]
     )
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(statuses))
-    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", lambda eid, _fingerprint, **_kw: next(healths, {"workers": {}}))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, _fingerprint, **_kw: next(healths, {"workers": {}}),
+    )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
@@ -1573,7 +1602,9 @@ def test_poll_job_tolerates_transient_api_errors(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "job_status", flaky)
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    res = jobs.poll_job(_runpod_handle(jobs, endpoint_name="n", job_id="j"), interval_s=0, stall_after_s=1e9)
+    res = jobs.poll_job(
+        _runpod_handle(jobs, endpoint_name="n", job_id="j"), interval_s=0, stall_after_s=1e9
+    )
     assert res.ok
     assert calls["n"] == 4
 
@@ -1588,7 +1619,9 @@ def _fresh_orchestrator(tmp, monkeypatch):
     import flash.lora_rank as rank_mod
     from flash.providers.runpod import api as runpod_api
 
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda endpoint_id, _fingerprint: True)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda endpoint_id, _fingerprint: True
+    )
     monkeypatch.setattr(
         rank_mod,
         "adapter_artifact_identity",
@@ -1610,7 +1643,9 @@ def _confirm_runpod_retry_teardown(monkeypatch):
         "cancel_job",
         lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda _endpoint_id, _fingerprint: True)
+    monkeypatch.setattr(
+        runpod_api, "delete_endpoint_for_fingerprint", lambda _endpoint_id, _fingerprint: True
+    )
 
 
 def _spec(run_id):
@@ -2359,20 +2394,21 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
         orch._save_status(
             orch.RunStatus(
                 run_id="warm-recover",
                 state="running",
                 spec=spec.to_dict(),
-                remote={
-                    "provider": "runpod",
-                    "endpoint_id": "ep",
-                    "endpoint_name": "n",
-                    "key_fingerprint": _RUNPOD_FINGERPRINT,
-                    "job_id": "job",
-                    "attempt": 0,
-                    "started_ts": 1.0,
-                },
+                remote=remote,
             )
         )
         monkeypatch.setattr(
@@ -2385,8 +2421,93 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
         assert status.state == "failed"
+        assert status.remote is None
         assert "original preparation snapshot is unavailable" in (status.error or "")
         assert "source-run/step-40" in (status.error or "")
+
+
+def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "name",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="cancelled-attach",
+                state="running",
+                spec=_spec("cancelled-attach").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(
+            orch,
+            "effective_spec_from_status",
+            lambda _status: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+        real_record = orch._record_cleanup_remote
+
+        def cancel_then_record(run_id, cleanup_remote):
+            assert orch._update(run_id, "cancelled", remote=None)
+            return real_record(run_id, cleanup_remote)
+
+        monkeypatch.setattr(orch, "_record_cleanup_remote", cancel_then_record)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
+
+        status = orch.attach_run("cancelled-attach", log_stream=sys.stderr)
+
+        assert status.state == "cancelled"
+        assert status.remote is None
+        assert orch._load_status_json("cancelled-attach")[orch._CLEANUP_REMOTES_KEY] == [remote]
+
+
+def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
+    # a cancel that has cleared status.remote but not yet flipped state to terminal must win: the
+    # attach-setup-failure cas no-ops (the identifiable remote no longer matches) and must NOT
+    # force-fail the run, else a user cancel gets recorded as failed.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep",
+            "endpoint_name": "name",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+        orch._save_status(
+            orch.RunStatus(
+                run_id="precancel-attach",
+                state="running",
+                spec=_spec("precancel-attach").to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(
+            orch,
+            "effective_spec_from_status",
+            lambda _status: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+        real_record = orch._record_cleanup_remote
+
+        def clear_remote_then_record(run_id, cleanup_remote):
+            # a concurrent cancel cleared the remote but has NOT yet flipped state to cancelled
+            assert orch._compare_and_clear_remote(run_id, remote)
+            return real_record(run_id, cleanup_remote)
+
+        monkeypatch.setattr(orch, "_record_cleanup_remote", clear_remote_then_record)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *_args, **_kwargs: None)
+
+        status = orch.attach_run("precancel-attach", log_stream=sys.stderr)
+
+        assert status.state != "failed", "attach-setup-failure stole a pre-commit cancel"
 
 
 def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
@@ -2406,7 +2527,11 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
             "cancel_job",
             lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
         )
-        monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda eid, _fingerprint, **_kw: deleted.append(eid) or True)
+        monkeypatch.setattr(
+            runpod_api,
+            "delete_endpoint_for_fingerprint",
+            lambda eid, _fingerprint, **_kw: deleted.append(eid) or True,
+        )
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             orch._update(spec.run_id, "cancelled")  # cancel lands during provisioning
@@ -3407,8 +3532,8 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
 
         assert status.state == "running"
         assert status.remote == live_remote
-        assert gc_calls == [run_id], (
-            "only stale-handle cleanup may run before live ownership appears"
+        assert gc_calls == [], (
+            "captured-handle recovery must not run run-wide gc after newer ownership appears"
         )
 
 
@@ -3631,7 +3756,18 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         monkeypatch.setattr(
             "flash.providers._worker.upload_code", lambda repo, *, code_prefix: repo
         )
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
         resumed = {"called": False}
+        replacement_remote = {
+            "provider": "runpod",
+            "endpoint_id": "epB",
+            "endpoint_name": "replacement",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "jB",
+            "on_last_gpu": False,
+            "attempt": 1,
+            "started_ts": 2.0,
+        }
 
         def fake_training(
             spec,
@@ -3646,6 +3782,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
             resumed["attempt_start"] = attempt_start
+            orch._update(spec.run_id, "running", remote=replacement_remote)
             raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
         monkeypatch.setattr(orch, "_run_training", fake_training)
@@ -3656,11 +3793,33 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             "attach must attempt a checkpoint resume on any non-ok poll"
         )
         assert st.state == "failed", "a resume that fails again must terminate the run"
+        assert st.remote is None
         assert "bad reward fn" in (st.error or "")
+        assert orch._load_status_json("g1")[orch._CLEANUP_REMOTES_KEY] == [
+            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
+            {
+                "provider": "runpod",
+                "endpoint_id": "epA",
+                "endpoint_name": "n",
+                "key_fingerprint": _RUNPOD_FINGERPRINT,
+                "job_id": "jA",
+                "attempt": 0,
+                "started_ts": 1.0,
+            },
+        ]
 
 
-@pytest.mark.parametrize("teardown_failure", ["delete_false", "delete_exception"])
-def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(monkeypatch, teardown_failure):
+@pytest.mark.parametrize(
+    ("teardown_failure", "status_mode"),
+    [
+        ("cancel", "in_progress"),
+        ("delete_false", "in_progress"),
+        ("delete_exception", "raises"),
+    ],
+)
+def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
+    monkeypatch, teardown_failure, status_mode
+):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -3702,11 +3861,25 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(monkeypatch, te
                 return False
             if teardown_failure == "delete_exception":
                 raise runpod_api.RunpodApiError("delete unconfirmed")
-            return True
+            return teardown_failure != "cancel"
+
+        def job_status(*_args, **_kwargs):
+            if status_mode == "raises":
+                raise runpod_api.RunpodApiError("status unconfirmed")
+            return {"status": "IN_PROGRESS"}
 
         monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
         monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+        monkeypatch.setattr(runpod_api, "job_status", job_status)
         monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+        import flash.runner.deploy as deploy_mod
+
+        scheduled = []
+        monkeypatch.setattr(
+            deploy_mod,
+            "_schedule_attach_reconciliation",
+            lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+        )
         resumed = []
         monkeypatch.setattr(orch, "_run_training", lambda *a, **k: resumed.append(True))
 
@@ -3717,6 +3890,7 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(monkeypatch, te
             ("delete", "ep-old"),
         ]
         assert resumed == []
+        assert len(scheduled) == 1
         assert status.state == "running"
         assert status.remote == remote
 
@@ -3758,25 +3932,31 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
         )
+        import flash.runner.lifecycle as lifecycle_mod
+
+        real_teardown = lifecycle_mod._strict_teardown_handle
+
+        def teardown_then_replace(handle, run_id=None):
+            result = real_teardown(handle, run_id)
+            assert orch._update("attach-newer-remote", "running", remote=newer_remote)
+            return result
+
+        monkeypatch.setattr(lifecycle_mod, "_strict_teardown_handle", teardown_then_replace)
         gc_calls = []
-
-        def racing_gc(_spec):
-            gc_calls.append(True)
-            if len(gc_calls) == 1:
-                assert orch._update("attach-newer-remote", "running", remote=newer_remote)
-
-        monkeypatch.setattr(orch, "_gc_run_endpoints", racing_gc)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: gc_calls.append(True))
         resumed = []
         monkeypatch.setattr(orch, "_run_training", lambda *a, **k: resumed.append(True))
 
         status = orch.attach_run("attach-newer-remote", log_stream=sys.stderr)
 
         assert resumed == []
+        assert gc_calls == []
         assert status.state == "running"
         assert status.remote == newer_remote
 
 
-def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
+@pytest.mark.parametrize("remaining_mode", ["present", "raises"])
+def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, remaining_mode):
     # Codex: a recovered Vast run whose poll ended not-ok must CONFIRM the in-flight instance is gone
     # before resuming. If destroy() raises (unconfirmed DELETE — the old worker may still be running and
     # writing this run's HF artifacts), attach must NOT launch a second worker (double-bill + corrupt
@@ -3823,6 +4003,11 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
             def gc(self, spec):  # best-effort label reap
                 pass
 
+            def run_instances_remaining(self, run_id):
+                if remaining_mode == "raises":
+                    raise vast_api.VastApiError("instance listing unavailable")
+                return [101]
+
             def is_configured(self):  # available_providers() probes this in the terminal-GC finally
                 return False
 
@@ -3839,16 +4024,279 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch):
             resumed["called"] = True
 
         monkeypatch.setattr(orch, "_run_training", fake_loop)
+        import flash.runner.deploy as deploy_mod
+
+        scheduled = []
+        monkeypatch.setattr(
+            deploy_mod,
+            "_schedule_attach_reconciliation",
+            lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+        )
 
         st = orch.attach_run("v1", log_stream=sys.stderr)
 
         assert resumed["called"] is False, (
             "must NOT resume a second worker over a possibly-live box"
         )
+        assert len(scheduled) == 1
         assert st.state == "running", "run left non-terminal for a later recovery/sweep"
         remote = orch.get_status("v1").remote
         assert remote is not None, "handle preserved"
         assert remote.get("instance_id") == 101, "handle preserved"
+
+
+def _vast_recovery_remote(instance_id=101, attempt=0):
+    return {
+        "provider": "vast",
+        "instance_id": instance_id,
+        "offer_id": 202,
+        "machine_id": 303,
+        "label": "flash-reconcile",
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.5,
+        "attempt": attempt,
+        "started_ts": 100.0,
+        "code_prefix": "code/revision",
+    }
+
+
+def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
+    import flash.runner.deploy as deploy_mod
+
+    run_id = "attach-reconcile-thread-start"
+    remote = _vast_recovery_remote()
+    spec = _spec(run_id)
+    with deploy_mod._ATTACH_RECONCILING_LOCK:
+        deploy_mod._ATTACH_RECONCILING.discard(run_id)
+
+    class RaisingThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(deploy_mod.threading, "Thread", RaisingThread)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        deploy_mod._schedule_attach_reconciliation(
+            run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+    with deploy_mod._ATTACH_RECONCILING_LOCK:
+        assert run_id not in deploy_mod._ATTACH_RECONCILING
+
+    monkeypatch.setattr(deploy_mod, "_reconcile_attached_remote", lambda *a, **k: None)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(deploy_mod.threading, "Thread", ImmediateThread)
+    assert deploy_mod._schedule_attach_reconciliation(
+        run_id,
+        remote,
+        spec,
+        1,
+        "code/revision",
+        io.StringIO(),
+        "stalled: host vanished",
+    )
+    with deploy_mod._ATTACH_RECONCILING_LOCK:
+        assert run_id not in deploy_mod._ATTACH_RECONCILING
+
+
+def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.runner.deploy as deploy_mod
+
+        remote = _vast_recovery_remote()
+        spec = _spec("vast-reconcile-clear")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+
+        class Provider:
+            def destroy(self, _handle):
+                raise RuntimeError("delete acknowledgement unavailable")
+
+            def run_instances_remaining(self, run_id):
+                return []
+
+        monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+        monkeypatch.setattr(deploy_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
+        resumed = []
+        monkeypatch.setattr(
+            orch,
+            "_run_training",
+            lambda *args, **kwargs: resumed.append(kwargs["attempt_start"]),
+        )
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert resumed == [1]
+        assert orch.get_status(spec.run_id).state == "running"
+        assert orch.get_status(spec.run_id).remote is None
+
+
+def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _vast_recovery_remote()
+        spec = _spec("vast-reconcile-deadline")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                created_at=100.0,
+                remote=remote,
+            )
+        )
+        deadline = orch._load_run_deadline_at(spec.run_id)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: deadline + 1.0)
+        monkeypatch.setattr(deploy_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
+        monkeypatch.setattr(lifecycle_mod, "_completed_attempt_metrics", lambda *a, **k: None)
+        real_fail = orch._compare_and_fail_remote
+        calls = []
+
+        def flaky_fail(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                raise PermissionError("status store unavailable")
+            return real_fail(*args, **kwargs)
+
+        monkeypatch.setattr(orch, "_compare_and_fail_remote", flaky_fail)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        status = orch.get_status(spec.run_id)
+        assert len(calls) == 2
+        assert status.state == "failed"
+        assert status.remote is None
+        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
+            {key: value for key, value in remote.items() if key != "code_prefix"}
+        ]
+
+
+def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _vast_recovery_remote()
+        spec = _spec("vast-reconcile-complete")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                created_at=100.0,
+                remote=remote,
+            )
+        )
+        deadline = orch._load_run_deadline_at(spec.run_id)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: deadline + 1.0)
+        monkeypatch.setattr(deploy_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_completed_attempt_metrics",
+            lambda *a, **k: {"wall_seconds": 5.0},
+        )
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        status = orch.get_status(spec.run_id)
+        assert status.state == "done"
+        assert status.remote is None
+        assert status.error is None
+        assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
+            {key: value for key, value in remote.items() if key != "code_prefix"}
+        ]
+
+
+def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+
+        old_remote = _vast_recovery_remote(instance_id=101, attempt=0)
+        newer_remote = _vast_recovery_remote(instance_id=202, attempt=1)
+        spec = _spec("vast-reconcile-newer")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=newer_remote,
+            )
+        )
+        monkeypatch.setattr(
+            deploy_mod,
+            "_resume_after_confirmed_teardown",
+            lambda *a, **k: pytest.fail("stale reconciler must not resume"),
+        )
+        monkeypatch.setattr(
+            orch,
+            "_compare_and_fail_remote",
+            lambda *a, **k: pytest.fail("stale reconciler must not fail the run"),
+        )
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            old_remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        status = orch.get_status(spec.run_id)
+        assert status.state == "running"
+        assert status.remote == newer_remote
 
 
 def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):

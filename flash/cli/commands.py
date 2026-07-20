@@ -700,7 +700,7 @@ def cmd_deployments(args) -> int:
         return 0
     print(
         f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
-        f"{'VERIFIED AT':<18}  {'OPENAI MODEL':<30}  DETAIL"
+        f"{'VERIFIED AT':<20}  {'OPENAI MODEL':<30}  DETAIL"
     )
     for row in rows:
         deployment = row.get("deployment") or {}
@@ -708,14 +708,16 @@ def cmd_deployments(args) -> int:
         step = deployment.get("checkpoint_step")
         step_text = "final" if step is None else str(step)
         verified_at = deployment.get("verified_at")
-        verified_text = "-" if verified_at is None else str(verified_at)
+        verified_text = (
+            "-" if verified_at is None else (render._humanize_ts(verified_at) or str(verified_at))
+        )
         revision = str(deployment.get("adapter_revision") or "-")
         state = str(deployment.get("state") or "-")
         openai_model = str(deployment.get("openai_model") or run_id)
         detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
         print(
             f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
-            f"{verified_text:<18}  {openai_model:<30}  {detail}"
+            f"{verified_text:<20}  {openai_model:<30}  {detail}"
         )
     return 0
 

@@ -488,7 +488,10 @@ def deployments_table(rows: list[dict]) -> str:
                 ("final" if step is None else str(step), _TEAL),
                 (str(deployment.get("adapter_revision") or "-"), _ACCENT2),
                 (state, color),
-                ("-" if verified_at is None else str(verified_at), _GRAY),
+                (
+                    "-" if verified_at is None else (_humanize_ts(verified_at) or str(verified_at)),
+                    _GRAY,
+                ),
                 (str(deployment.get("openai_model") or run_id), _GREEN),
                 (detail, _GRAY),
             ]
