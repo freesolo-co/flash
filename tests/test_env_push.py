@@ -674,3 +674,27 @@ def test_push_drops_ssh_keys_and_credential_data_but_keeps_python_modules(monkey
     assert "keys/id_ecdsa" not in names
     assert "keys/id_dsa" not in names
     assert "keys/id_ed25519.pub" not in names
+
+
+def test_push_drops_underscore_secret_files_but_keeps_secretish_packages(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # backup/underscore secret file variants must be dropped, with or without an extension
+    (env_dir / "credentials_backup").write_text("SECRET\n")
+    (env_dir / "credentials_prod.json").write_text('{"t": 1}\n')
+    (env_dir / "id_rsa_backup").write_text("PRIVATE\n")
+    # a legitimate package directory whose name merely starts with a secret-ish prefix must ship
+    pkg = env_dir / "credentials_store"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .load import load\n")
+    (pkg / "load.py").write_text("def load():\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "credentials_backup" not in names
+    assert "credentials_prod.json" not in names
+    assert "id_rsa_backup" not in names
+    assert "credentials_store/__init__.py" in names
+    assert "credentials_store/load.py" in names

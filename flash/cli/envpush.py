@@ -211,19 +211,17 @@ _ENV_PUSH_SECRET_PATTERNS = (
     "*.key",
     "*.pfx",
     "*.p12",
-    "credentials.*",
-    "id_rsa",
-    "id_rsa.*",
-    "id_dsa",
-    "id_dsa.*",
-    "id_ecdsa",
-    "id_ecdsa.*",
-    "id_ed25519",
-    "id_ed25519.*",
+    "credentials*",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
 )
-# python source is code, never a secret to be filtered by a look-alike name. exempting these
-# suffixes keeps helper modules like credentials.py or id_ed25519_loader.py in the package
-# instead of silently dropping them and breaking the worker with ModuleNotFoundError.
+# secret patterns match secret data FILES only (see _ignore_env_push_path): they never prune a
+# directory, so a package tree like credentials_store/ still ships, and python source is exempt,
+# so helper modules like credentials.py or id_ed25519_loader.py travel instead of being silently
+# dropped and breaking the worker with ModuleNotFoundError. that keeps the prefixes broad enough
+# to catch backup variants (credentials_backup, id_rsa_backup) without eating code or packages.
 _ENV_PUSH_CODE_SUFFIXES = frozenset({".py", ".pyi"})
 _ENV_PUSH_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
@@ -324,8 +322,10 @@ def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bo
         return True
     if path.parent == env_root and lowered_name in _ENV_PUSH_ROOT_IGNORED_NAMES:
         return True
-    if path.suffix.lower() not in _ENV_PUSH_CODE_SUFFIXES and any(
-        fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS
+    if (
+        path.is_file()
+        and path.suffix.lower() not in _ENV_PUSH_CODE_SUFFIXES
+        and any(fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS)
     ):
         return True
     return not (path.is_dir() or path.is_file())
