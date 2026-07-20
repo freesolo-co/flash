@@ -109,7 +109,7 @@ def test_serving_capacity_matches_validated_matrix():
         },
         "Qwen/Qwen3.6-27B": {
             "gpu": "H100",
-            "serve_model_id": "Qwen/Qwen3.6-27B-FP8",
+            "serve_model_id": "Freesolo-Co/Qwen3.6-27B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
@@ -158,13 +158,13 @@ def test_public_rows_prune_unset_serving_capacity_fields():
 
 
 def test_serving_fp8_repos_match_current_serving_matrix() -> None:
-    # qwen3.5 dense models serve freesolo-owned fp8 checkpoints; qwen3.6 vl models serve official qwen fp8.
+    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves official qwen fp8.
     assert SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"] == "Freesolo-Co/MiniCPM5-1B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
-    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Qwen/Qwen3.6-27B-FP8"
+    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B-FP8"
 
 
