@@ -3933,6 +3933,33 @@ def test_teacher_score_multimodal_single_request_uses_flat_image_list(monkeypatc
     assert capture["body"]["images"] == ["data:image/png;base64,image"]
 
 
+def test_teacher_multimodal_echo_drops_trailing_zero_width_token(monkeypatch):
+    # a trailing zero-width token after the completion must not be scored as a completion token;
+    # only tokens overlapping the completion region [0, len(completion)) count.
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["prompt", " red", ""],
+                    "token_logprobs": [None, -0.4, -0.9],
+                    "text_offset": [0, 100, 104],
+                }
+            }
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    client = TeacherClient("k", "https://api.example/v1", "kimi")
+
+    scored = client.score_many_multimodal(
+        [("prompt<|media_pad|>", "red", ["data:image/png;base64,image"])]
+    )
+
+    assert [token.text for token in scored[0]] == [" red"]
+    assert (scored[0][0].start, scored[0][0].end) == (0, 3)
+    assert scored[0][0].logprob == -0.4
+
+
 @pytest.mark.parametrize(
     ("tokens", "logprobs", "offsets", "completion", "message"),
     [

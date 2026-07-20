@@ -544,7 +544,10 @@ class TeacherClient:
         for index in range(suffix_start, len(tokens)):
             text = str(tokens[index])
             end = cursor + len(text)
-            if end > 0:
+            # include only tokens that overlap the completion region [0, len(completion_text)).
+            # the upper bound drops any trailing (e.g. zero-width) token that starts at or after
+            # the completion end, so it cannot add a spurious teacher logprob to the alignment.
+            if end > 0 and cursor < len(completion_text):
                 if token_logprobs[index] is None:
                     raise TeacherError(
                         "teacher multimodal echo response has a null token_logprob for a "
