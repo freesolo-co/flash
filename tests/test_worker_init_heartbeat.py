@@ -883,6 +883,27 @@ def test_no_worker_side_stall_watchdog():
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
 
 
+def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    long_name = "x" * 100_000
+
+    bounded = hb._bounded_reward_metrics(
+        {
+            long_name: 1.0,
+            "line\nbreak": 2.0,
+            "reward": 3.0,
+            "step": 4.0,
+        }
+    )
+
+    assert "x" * 64 in bounded
+    assert all(len(name) <= 64 for name in bounded)
+    assert "linebreak" in bounded
+    assert all("\n" not in name for name in bounded)
+    assert "reward" not in bounded
+    assert "step" not in bounded
+
+
 def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     worker = importlib.import_module("flash.engine.worker")
@@ -897,7 +918,7 @@ def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
     metrics = {
         "nan_metric": float("nan"),
         "inf_metric": float("inf"),
-        **{f"metric_{index}": float(index) for index in range(14)},
+        **{f"metric_{index:02d}": float(index) for index in reversed(range(14))},
     }
     callback = hb.make_reward_heartbeat_callback(lambda: metrics)
     state = types.SimpleNamespace(global_step=3)
@@ -905,5 +926,5 @@ def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
 
     assert emitted[0][0] == "rl_step"
     reward_metrics = emitted[0][1]["reward_metrics"]
-    assert list(reward_metrics) == [f"metric_{index}" for index in range(12)]
+    assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
     assert all(math.isfinite(value) for value in reward_metrics.values())

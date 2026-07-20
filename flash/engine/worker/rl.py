@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -48,20 +49,24 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
 
 def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
     totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    denominator = 0
     for breakdown in breakdowns:
         if not isinstance(breakdown, dict):
             continue
+        denominator += 1
         for name, value in breakdown.items():
             if name == "total":
                 continue
+            totals.setdefault(name, 0.0)
             try:
                 score = float(value)
             except (TypeError, ValueError):
                 continue
-            totals[name] = totals.get(name, 0.0) + score
-            counts[name] = counts.get(name, 0) + 1
-    return {name: total / counts[name] for name, total in totals.items()}
+            if math.isfinite(score):
+                totals[name] += score
+    if denominator == 0:
+        return {}
+    return {name: total / denominator for name, total in totals.items()}
 
 
 def run_rl():
@@ -268,8 +273,8 @@ def run_rl():
                 breakdown = None
                 if hasattr(env, "scores_breakdown"):
                     breakdown = env.scores_breakdown(graded, ex, state)
-                    breakdowns.append(breakdown)
                     r = float(breakdown.get("total", 0.0))
+                    breakdowns.append(breakdown)
                 else:
                     r = env.reward(graded, ex, state)
             except Exception as _reward_exc:

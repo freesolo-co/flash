@@ -11,6 +11,7 @@ import faulthandler
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -236,21 +237,39 @@ def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -
     return last_gpu_diag_at
 
 
-def _bounded_reward_metrics(metrics, limit: int = 12) -> dict[str, float]:
+_REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")
+_REWARD_METRIC_RESERVED_NAMES = frozenset(
+    {
+        "reward",
+        "reward_last",
+        "step",
+        "epoch",
+        "loss",
+        "grad_norm",
+        "learning_rate",
+        "stage",
+        "gpu",
+        "diag",
+    }
+)
+_REWARD_METRIC_LIMIT = 12
+
+
+def _bounded_reward_metrics(metrics) -> dict[str, float]:
     if not isinstance(metrics, dict):
         return {}
-    bounded: dict[str, float] = {}
+    surviving: dict[str, float] = {}
     for name, value in metrics.items():
+        sanitized_name = _REWARD_METRIC_NAME_DISALLOWED.sub("", str(name))[:64]
+        if not sanitized_name or sanitized_name in _REWARD_METRIC_RESERVED_NAMES:
+            continue
         try:
             score = float(value)
         except (TypeError, ValueError):
             continue
-        if not math.isfinite(score):
-            continue
-        bounded[str(name)] = score
-        if len(bounded) >= limit:
-            break
-    return bounded
+        if math.isfinite(score):
+            surviving[sanitized_name] = score
+    return dict(sorted(surviving.items())[:_REWARD_METRIC_LIMIT])
 
 
 def make_reward_heartbeat_callback(reward_metrics=None):
