@@ -21,6 +21,7 @@ def write_train_meta(
     notes,
     *,
     step=None,
+    heartbeat_fields=None,
 ):
     env = _w.require_active_env()
     meta = sanitize_worker_metrics(
@@ -42,10 +43,12 @@ def write_train_meta(
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel between
     # here and DONE would otherwise re-price a fully-trained run to 0 steps (codex[bot]).
     _step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
+    _heartbeat_fields = heartbeat_fields or {}
     _w.heartbeat(
         f"{phase}_train_done",
         **_step_field,
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
+        **_heartbeat_fields,
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
@@ -73,4 +76,4 @@ def write_train_meta(
             "job_spec": _w.JOB_SPEC.to_dict() if _w.JOB_SPEC else None,
         },
     )
-    _w._finalize(m)
+    _w._finalize(m, heartbeat_fields=_heartbeat_fields)

@@ -389,7 +389,7 @@ def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
     assert [item["step"] for item in metrics_last] == list(range(3, 19))
 
 
-def test_rl_terminal_heartbeat_carries_latest_metrics():
+def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
 
@@ -407,11 +407,39 @@ def test_rl_terminal_heartbeat_carries_latest_metrics():
         and node.args[0].value == "rl_trained"
     ]
     assert len(terminal_calls) == 1
-    keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
-    assert "metrics_last" in keywords, (
-        "the terminal rl_trained heartbeat must carry the callback backlog so short runs surface metrics"
-    )
-    assert "hb_cb" in ast.unparse(keywords["metrics_last"])
+    terminal_keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
+    assert "metrics_last" in terminal_keywords
+    assert "hb_cb" in ast.unparse(terminal_keywords["metrics_last"])
+
+    liveness_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "liveness_heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value in {"rl_step", "rl_finalizing"}
+    ]
+    assert len(liveness_calls) == 2
+    for call in liveness_calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "fields" in keywords
+        assert "metrics_last" in ast.unparse(keywords["fields"])
+        assert "hb_cb" in ast.unparse(keywords["fields"])
+
+    write_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write_train_meta"
+    ]
+    assert len(write_calls) == 1
+    write_keywords = {keyword.arg: keyword.value for keyword in write_calls[0].keywords}
+    assert "heartbeat_fields" in write_keywords
+    assert "metrics_last" in ast.unparse(write_keywords["heartbeat_fields"])
+    assert "hb_cb" in ast.unparse(write_keywords["heartbeat_fields"])
 
 
 def test_per_step_training_stages_are_throttled():

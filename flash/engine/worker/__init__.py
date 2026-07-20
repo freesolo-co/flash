@@ -273,7 +273,7 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
-def _finalize(metrics: RunMetrics):
+def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -286,7 +286,7 @@ def _finalize(metrics: RunMetrics):
     # completed optimizer updates for opd; None (other phases) -> stepless as before.
     _step = metrics.step
     _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
-    heartbeat("done", **_step_field, gpu=gpu_diagnostics())
+    heartbeat("done", **_step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 
