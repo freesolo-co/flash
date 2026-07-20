@@ -143,7 +143,11 @@ def _stream_http_client() -> httpx.Client:
     if _STREAM_HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
             if _STREAM_HTTP_CLIENT is None:
-                _STREAM_HTTP_CLIENT = httpx.Client(follow_redirects=True, max_redirects=100)
+                _STREAM_HTTP_CLIENT = httpx.Client(
+                    follow_redirects=True,
+                    max_redirects=100,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+                )
     return _STREAM_HTTP_CLIENT
 
 

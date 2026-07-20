@@ -131,6 +131,8 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
     assert len(created) == 2
     assert created[0] is deploy._STREAM_HTTP_CLIENT
     assert created[1] is deploy._HTTP_CLIENT
+    assert created[0].kwargs["limits"].max_connections is None
+    assert created[0].kwargs["limits"].max_keepalive_connections == 100
 
     deploy._close_http_client()
     assert all(client.closed for client in created)
