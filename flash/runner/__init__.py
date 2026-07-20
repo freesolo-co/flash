@@ -1227,7 +1227,11 @@ def get_logs(run_id: str) -> str:
         return f.read()
 
 
-def _sanitize_status_value(value, *, depth: int = 0):
+_STATUS_LIST_LIMIT = 16
+_STATUS_METRICS_HISTORY_LIMIT = 1024
+
+
+def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
     """Bound a heartbeat payload before persisting it in run status JSON."""
     if depth > 5:
         return str(value)[:200]
@@ -1236,14 +1240,21 @@ def _sanitize_status_value(value, *, depth: int = 0):
     if isinstance(value, str):
         return value[:1000]
     if isinstance(value, list):
-        return [_sanitize_status_value(v, depth=depth + 1) for v in value[:16]]
+        if field == "metrics_last":
+            values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
+        else:
+            values = value[:_STATUS_LIST_LIMIT]
+        return [_sanitize_status_value(v, depth=depth + 1) for v in values]
     if isinstance(value, dict):
         out = {}
         for i, (k, v) in enumerate(value.items()):
             if i >= 64:
                 out["truncated"] = True
                 break
-            out[str(k)[:120]] = _sanitize_status_value(v, depth=depth + 1)
+            sanitized_key = str(k)[:120]
+            out[sanitized_key] = _sanitize_status_value(
+                v, depth=depth + 1, field=sanitized_key
+            )
         return out
     return str(value)[:500]
 
