@@ -963,6 +963,7 @@ def test_catalog_image_capability_does_not_change_public_rows():
     from flash.catalog import public_model_rows, supports_image_training
 
     assert supports_image_training("Qwen/Qwen3.5-4B")
+    assert supports_image_training("Qwen/Qwen3.6-27B")
     assert not supports_image_training("openbmb/MiniCPM5-1B")
     forbidden = {"modalities", "multimodal", "supports_images", "image_training"}
     assert all(not (forbidden & set(row)) for row in public_model_rows())

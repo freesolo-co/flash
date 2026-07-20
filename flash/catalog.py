@@ -19,6 +19,7 @@ _IMAGE_TRAINING_MODELS = frozenset(
         "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )
@@ -162,9 +163,9 @@ class ModelInfo:
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 # the pre-quantized fp8 checkpoint each base model's serving engine loads (mirrors serving's
-# ``src.prequant_config``). qwen3.5 dense models serve freesolo-owned fp8_dynamic checkpoints; the
-# qwen3.6 vl checkpoints serve official qwen fp8 variants. informational for the catalog mirror;
-# deploy gating reads only max_lora_rank.
+# ``src.prequant_config``). every dense model serves a freesolo-owned fp8 checkpoint; the qwen3.6
+# 35b-a3b moe serves the official qwen fp8 variant. informational for the catalog mirror; deploy
+# gating reads only max_lora_rank.
 SERVING_FP8_MODEL_REPOS: dict[str, str] = {
     "openbmb/MiniCPM5-1B": "Freesolo-Co/MiniCPM5-1B-FP8",
     "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
@@ -172,7 +173,7 @@ SERVING_FP8_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
-    "Qwen/Qwen3.6-27B": "Qwen/Qwen3.6-27B-FP8",
+    "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
 }
 
 MODELS: dict[str, ModelInfo] = {
@@ -304,10 +305,10 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.98,
         ),
         thinking="hybrid",
-        notes="Dense 27B (multimodal VL checkpoint, served text-only), bf16 LoRA. SFT fits the "
-        "80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
-        "~54GB copies). Serves the official FP8 on an H100 tier (dense, so no MoE expert LoRA-buffer "
-        "multiplier).",
+        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training. SFT fits "
+        "the 80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
+        "~54GB copies). Serves the owned VL-preserving FP8 on an H100 tier (dense, so no MoE expert "
+        "LoRA-buffer multiplier).",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
