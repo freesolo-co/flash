@@ -25,12 +25,13 @@ class _TestTokenizer:
     add_bos_token = False
     add_eos_token = False
 
-    def __init__(self, *, fail=False, require_rayon_disabled=False):
+    def __init__(self, *, fail=False, require_rayon_disabled=False, model_state="base"):
         self.all_special_ids = [0]
         self.special_tokens_map = {"eos_token": "<eos>"}
         self.init_kwargs = {"do_lower_case": False}
         self.fail = fail
         self.require_rayon_disabled = require_rayon_disabled
+        self.model_state = model_state
 
     def get_vocab(self):
         return {"<eos>": 0, "text": 1}
@@ -199,6 +200,44 @@ def test_single_process_map_preserves_parent_tokenizer_parallelism(tmp_path, mon
     assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
 
 
+def test_prepared_prompt_rows_are_not_normalized_twice(tmp_path, monkeypatch):
+    monkeypatch.setattr(sft_mod, "_sft_tokenize_num_proc", lambda _row_count: None)
+
+    class AlreadyNormalizedEnv:
+        def prompt_messages(self, _example):
+            raise AssertionError("prompt normalization repeated")
+
+        def sft_completion(self, _example):
+            raise AssertionError("completion normalization repeated")
+
+    examples = [{"input": "alpha"}]
+    prompt_completion_rows = [
+        (
+            [{"role": "user", "content": "alpha"}],
+            [{"role": "assistant", "content": "one"}],
+        )
+    ]
+
+    texts, rows, dropped, multiturn, cache_hit = _prepare_sft_examples(
+        AlreadyNormalizedEnv(),
+        examples,
+        _TestTokenizer(),
+        env_resolved_sha="a" * 40,
+        seed=7,
+        model_revision="b" * 40,
+        thinking=False,
+        max_length=256,
+        prompt_completion_rows=prompt_completion_rows,
+        cache_root=tmp_path,
+    )
+
+    assert texts
+    assert rows
+    assert dropped == 0
+    assert multiturn == 0
+    assert cache_hit is False
+
+
 def test_stale_temp_cache_is_removed_before_retry(tmp_path):
     fingerprint = "f" * 64
     stale_temp_dir = tmp_path / f".{fingerprint}.orphan"
@@ -284,6 +323,11 @@ def test_tokenizer_identity_covers_behavior_affecting_runtime_settings():
 
     changed.add_eos_token = False
     changed.init_kwargs["do_lower_case"] = True
+    assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
+
+    changed.init_kwargs["do_lower_case"] = False
+    changed.model_state = "different-merges-or-sentencepiece-model"
+    assert changed.get_vocab() == baseline.get_vocab()
     assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
 
 

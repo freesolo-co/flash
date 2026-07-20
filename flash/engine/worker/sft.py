@@ -92,10 +92,12 @@ def _tokenizer_identity(tokenizer) -> str:
 
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is not None and callable(getattr(backend, "to_str", None)):
-        vocabulary = backend.to_str()
+        tokenizer_state = backend.to_str().encode()
     else:
-        get_vocab = getattr(tokenizer, "get_vocab", None)
-        vocabulary = _stable_json(get_vocab() if callable(get_vocab) else {})
+        try:
+            tokenizer_state = pickle.dumps(tokenizer, protocol=pickle.HIGHEST_PROTOCOL)
+        except (pickle.PickleError, TypeError, AttributeError) as exc:
+            raise TypeError("slow tokenizer state must be picklable for SFT caching") from exc
     init_kwargs = getattr(tokenizer, "init_kwargs", {}) or {}
     init_config = json.dumps(
         init_kwargs,
@@ -113,23 +115,33 @@ def _tokenizer_identity(tokenizer) -> str:
         "add_bos_token": bool(getattr(tokenizer, "add_bos_token", False)),
         "add_eos_token": bool(getattr(tokenizer, "add_eos_token", False)),
         "init_config_sha256": hashlib.sha256(init_config.encode()).hexdigest(),
-        "vocabulary_sha256": hashlib.sha256(vocabulary.encode()).hexdigest(),
+        "tokenizer_state_sha256": hashlib.sha256(tokenizer_state).hexdigest(),
     }
     return hashlib.sha256(_stable_json(identity).encode()).hexdigest()
 
 
 def _normalize_sft_records(
-    env, examples, *, prefix_indices: list[int] | None = None
+    env,
+    examples,
+    *,
+    prefix_indices: list[int] | None = None,
+    prompt_completion_rows: list[tuple] | None = None,
 ) -> tuple[list[dict], int]:
     if prefix_indices is None:
         prefix_indices = list(range(len(examples)))
     if len(prefix_indices) != len(examples):
         raise ValueError("prefix indices must match the selected SFT examples")
+    if prompt_completion_rows is None:
+        prompt_completion_rows = [
+            (env.prompt_messages(example), env.sft_completion(example)) for example in examples
+        ]
+    if len(prompt_completion_rows) != len(examples):
+        raise ValueError("normalized prompt rows must match the selected SFT examples")
     records = []
     multiturn_targets = 0
-    for prefix_index, example in zip(prefix_indices, examples, strict=True):
-        completion = env.sft_completion(example)
-        prompt_messages = env.prompt_messages(example)
+    for prefix_index, (prompt_messages, completion) in zip(
+        prefix_indices, prompt_completion_rows, strict=True
+    ):
         if len(completion) > 1:
             multiturn_targets += 1
         try:
@@ -304,10 +316,14 @@ def _prepare_sft_examples(
     thinking: bool,
     max_length: int,
     prefix_indices: list[int] | None = None,
+    prompt_completion_rows: list[tuple] | None = None,
     cache_root: Path | None = None,
 ):
     normalized, multiturn_targets = _normalize_sft_records(
-        env, examples, prefix_indices=prefix_indices
+        env,
+        examples,
+        prefix_indices=prefix_indices,
+        prompt_completion_rows=prompt_completion_rows,
     )
     if not normalized:
         return [], [], 0, multiturn_targets, False
@@ -581,6 +597,10 @@ def run_sft():
                 thinking=_w.THINKING,
                 max_length=sft_max_len,
                 prefix_indices=prefix_indices,
+                prompt_completion_rows=[
+                    (prompt_messages, completion)
+                    for _ex, prompt_messages, completion in prompt_rows
+                ],
             )
             _masked_tok = sum(m.count(0) for m in (row["completion_mask"] for row in _pretok))
             _total_tok = sum(len(row["input_ids"]) for row in _pretok)
