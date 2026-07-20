@@ -97,10 +97,16 @@ def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
 
     captured = {}
 
-    def _capture_estimate(*_args, **kwargs):
+    def _capture_estimate(params_b, *_args, **kwargs):
+        captured["params_b"] = params_b
         captured.update(kwargs)
         return 1.0
 
+    monkeypatch.setattr(
+        vram_mod,
+        "resolve_params_b",
+        lambda _model_id, revision="": 35.5 if revision == "a" * 40 else None,
+    )
     monkeypatch.setattr(vram_mod, "estimate_vram_gb", _capture_estimate)
 
     assert vram_mod.grpo_fits_resident(
@@ -108,6 +114,7 @@ def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
         card_vram_gb=180,
         revision="a" * 40,
     )
+    assert captured["params_b"] == 35.5
     assert captured["active_params_b"] == 0.0
     assert captured["model_info"] is None
 

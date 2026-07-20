@@ -613,9 +613,12 @@ def grpo_fits_resident(
     from flash.catalog import MODELS, vocab_size_for
 
     catalog_info = MODELS.get(model_id)
-    params_b = (
-        float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
-    )
+    if revision:
+        params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
+    else:
+        params_b = (
+            float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
+        )
     if params_b <= 0:
         return False
     quant = (
