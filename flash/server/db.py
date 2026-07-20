@@ -49,12 +49,33 @@ def _initialize_database(path: str) -> None:
         if database in _INITIALIZED_DATABASES:
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=30.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(_SCHEMA)
-        finally:
-            conn.close()
+        deadline = time.monotonic() + 30.0
+        backoff = 0.01
+        while True:
+            conn = None
+            try:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                conn = sqlite3.connect(path, timeout=remaining)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.executescript(_SCHEMA)
+                break
+            except sqlite3.OperationalError as exc:
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                primary_error_code = error_code & 0xFF if isinstance(error_code, int) else None
+                lock_message = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if (
+                    primary_error_code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    and not lock_message
+                ):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(backoff, remaining))
+                backoff = min(backoff * 2, 0.25)
+            finally:
+                if conn is not None:
+                    conn.close()
         _INITIALIZED_DATABASES.add(database)
 
 

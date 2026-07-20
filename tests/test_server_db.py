@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import multiprocessing
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +11,32 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from flash.server import db
+
+
+def _initialize_fresh_database_process(path: str, barrier, results) -> None:
+    from flash.server import db as process_db
+
+    real_connect = sqlite3.connect
+    synchronized = False
+
+    class SynchronizedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal synchronized
+            if sql == "PRAGMA journal_mode=WAL" and not synchronized:
+                synchronized = True
+                barrier.wait(timeout=10)
+            return super().execute(sql, parameters)
+
+    def synchronized_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=SynchronizedConnection)
+
+    process_db.DB_PATH = path
+    process_db.sqlite3.connect = synchronized_connect
+    try:
+        row = process_db.ensure_external_key(f"fslo_process_{os.getpid()}")
+        results.put(None if row is not None else "key provisioning returned no row")
+    except BaseException as exc:
+        results.put(repr(exc))
 
 
 @pytest.fixture
@@ -139,6 +167,36 @@ def test_schema_is_initialized_once_across_many_requests(isolated_db, monkeypatc
 
     assert executescript_calls == 1
     assert journal_mode_calls == 1
+
+
+def test_fresh_database_initialization_retries_process_lock_contention(tmp_path) -> None:
+    context = multiprocessing.get_context("spawn")
+    process_count = 12
+    barrier = context.Barrier(process_count)
+    results = context.Queue()
+    path = str(tmp_path / "state" / "server.db")
+    processes = [
+        context.Process(
+            target=_initialize_fresh_database_process,
+            args=(path, barrier, results),
+        )
+        for _ in range(process_count)
+    ]
+
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=45)
+        assert all(not process.is_alive() for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    errors = [results.get(timeout=5) for _ in processes]
+    assert errors == [None] * process_count
 
 
 def test_connection_is_reused_per_thread(isolated_db) -> None:
