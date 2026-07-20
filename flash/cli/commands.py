@@ -738,7 +738,7 @@ def cmd_chat(args) -> int:
         print(
             "RUN_ID/step-N names a checkpoint to deploy, not a chat target. Deploy it first "
             "with `flash deploy RUN_ID/step-N`, then `flash chat RUN_ID` (the run alias now "
-            "points at that checkpoint) — or chat the full immutable adapter revision listed "
+            "points at that checkpoint). Or chat the full immutable adapter revision listed "
             "by `flash deployments`.",
             file=sys.stderr,
         )
