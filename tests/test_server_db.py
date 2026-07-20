@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -108,6 +110,117 @@ def test_lookup_key_updates_last_used_at_in_database(isolated_db, monkeypatch) -
             "SELECT last_used_at FROM api_keys WHERE id = ?", (row["id"],)
         ).fetchone()[0]
     assert last_used_at == 1234.0
+
+
+def test_schema_is_initialized_once_across_many_requests(isolated_db, monkeypatch) -> None:
+    executescript_calls = 0
+    journal_mode_calls = 0
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def executescript(self, sql_script):
+            nonlocal executescript_calls
+            executescript_calls += 1
+            return super().executescript(sql_script)
+
+        def execute(self, sql, parameters=()):
+            nonlocal journal_mode_calls
+            if sql == "PRAGMA journal_mode=WAL":
+                journal_mode_calls += 1
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+
+    for _ in range(20):
+        assert isolated_db.ensure_external_key("fslo_repeated") is not None
+
+    assert executescript_calls == 1
+    assert journal_mode_calls == 1
+
+
+def test_connection_is_reused_per_thread(isolated_db) -> None:
+    main_connection = isolated_db._connect()
+    assert isolated_db._connect() is main_connection
+
+    barrier = threading.Barrier(3)
+    thread_connections = []
+
+    def connect_twice() -> None:
+        first = isolated_db._connect()
+        second = isolated_db._connect()
+        thread_connections.append((first, second))
+        barrier.wait(timeout=5)
+        barrier.wait(timeout=5)
+
+    threads = [threading.Thread(target=connect_twice) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+
+    barrier.wait(timeout=5)
+    assert len(thread_connections) == 2
+    assert all(first is second for first, second in thread_connections)
+    assert thread_connections[0][0] is not thread_connections[1][0]
+    assert all(first is not main_connection for first, _ in thread_connections)
+    barrier.wait(timeout=5)
+
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_last_used_at_writes_are_throttled(isolated_db, monkeypatch) -> None:
+    update_calls = 0
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal update_calls
+            if sql.startswith("UPDATE api_keys SET last_used_at"):
+                update_calls += 1
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+    times = iter([1000.0, 1001.0, 1010.0, 1050.0, 1062.0])
+    monkeypatch.setattr(isolated_db.time, "time", lambda: next(times))
+
+    row = isolated_db.ensure_external_key("fslo_throttled")
+    assert row is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+
+    with real_connect(isolated_db.db_path()) as conn:
+        last_used_at = conn.execute(
+            "SELECT last_used_at FROM api_keys WHERE id = ?", (row["id"],)
+        ).fetchone()[0]
+    assert update_calls == 2
+    assert last_used_at == 1062.0
+
+
+def test_concurrent_threads_preserve_basic_read_write_correctness(isolated_db) -> None:
+    barrier = threading.Barrier(2)
+
+    def create_owned_run(index: int) -> tuple[int, int | None]:
+        barrier.wait()
+        row = isolated_db.ensure_external_key(f"fslo_thread_{index}")
+        assert row is not None
+        isolated_db.record_run(f"run-thread-{index}", row["id"])
+        return row["id"], isolated_db.run_owner(f"run-thread-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create_owned_run, range(2)))
+
+    assert all(key_id == owner_id for key_id, owner_id in results)
+    assert {row["run_id"] for row in isolated_db.all_runs()} == {
+        "run-thread-0",
+        "run-thread-1",
+    }
 
 
 def test_run_ownership_lists_in_creation_order_and_delete_is_idempotent(

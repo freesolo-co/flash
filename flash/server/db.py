@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -29,20 +31,52 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 
 # Tests override with monkeypatch.setattr(db, "DB_PATH", tmp).
 DB_PATH = str(Path.home() / ".flash" / "server.db")
+_LAST_USED_WRITE_INTERVAL_S = 60.0
+_INITIALIZATION_LOCK = threading.Lock()
+_INITIALIZED_DATABASES: set[tuple[int, str]] = set()
+_CONNECTIONS = threading.local()
 
 
 def db_path() -> str:
     return DB_PATH
 
 
+def _initialize_database(path: str) -> None:
+    database = (os.getpid(), path)
+    if database in _INITIALIZED_DATABASES:
+        return
+    with _INITIALIZATION_LOCK:
+        if database in _INITIALIZED_DATABASES:
+            return
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=30.0)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+        finally:
+            conn.close()
+        _INITIALIZED_DATABASES.add(database)
+
+
 def _connect() -> sqlite3.Connection:
     path = db_path()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+    process_id = os.getpid()
+    _initialize_database(path)
+
+    conn = getattr(_CONNECTIONS, "connection", None)
+    if (
+        conn is None
+        or getattr(_CONNECTIONS, "path", None) != path
+        or getattr(_CONNECTIONS, "process_id", None) != process_id
+    ):
+        if conn is not None:
+            conn.close()
+        conn = sqlite3.connect(path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        _CONNECTIONS.connection = conn
+        _CONNECTIONS.path = path
+        _CONNECTIONS.process_id = process_id
     return conn
 
 
@@ -96,7 +130,14 @@ def lookup_key(api_key: str) -> dict | None:
         ).fetchone()
         if row is None:
             return None
-        conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (time.time(), row["id"]))
+        now = time.time()
+        stale_before = now - _LAST_USED_WRITE_INTERVAL_S
+        if row["last_used_at"] is None or row["last_used_at"] <= stale_before:
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? "
+                "WHERE id = ? AND (last_used_at IS NULL OR last_used_at <= ?)",
+                (now, row["id"], stale_before),
+            )
         return dict(row)
 
 
