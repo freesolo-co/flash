@@ -734,7 +734,12 @@ def run_rl():
             )
             if not isinstance(trainer_model, str):
                 cfg.model_init_kwargs = None
-        trainer = GRPOTrainer(
+        trainer_cls = GRPOTrainer
+        if multimodal and not is_multi_turn and not tools:
+            from flash.engine.worker.grpo_multimodal import single_turn_multimodal_grpo_trainer
+
+            trainer_cls = single_turn_multimodal_grpo_trainer(GRPOTrainer)
+        trainer = trainer_cls(
             model=trainer_model,
             args=cfg,
             train_dataset=ds,
