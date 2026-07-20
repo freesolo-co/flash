@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import os
 import sys
 import tarfile
+
+import pytest
 
 import flash.cli as cli
 from flash.cli.envpush import _human_bytes, _UploadProgress
@@ -31,6 +34,12 @@ def _members(package_b64: str) -> dict[str, str]:
             if m.isfile():
                 out[m.name] = tar.extractfile(m).read().decode()
     return out
+
+
+def _member_names(package_b64: str) -> list[str]:
+    raw = base64.b64decode(package_b64)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        return [member.name for member in tar.getmembers()]
 
 
 def _args(path, *, name: str = "my-env"):
@@ -104,39 +113,75 @@ def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path
     assert cap["name"] == "math"
 
 
-def test_push_single_py_ships_sibling_dataset(monkeypatch, tmp_path):
+def test_push_single_py_ships_only_entrypoint_and_sibling_datasets(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "dataset").mkdir()
     (tmp_path / "dataset" / "train.jsonl").write_text('{"x": 1}\n')
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "eval.jsonl").write_text('{"x": 2}\n')
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "config.yaml").write_text("mode: prod\n")
+    (tmp_path / "unrelated").mkdir()
+    (tmp_path / "unrelated" / "data.json").write_text("{}\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "dataset/train.jsonl" in _members(cap["package_b64"])
+    files = set(_members(cap["package_b64"]))
+    assert files == {
+        "README.md",
+        "dataset/train.jsonl",
+        "datasets/eval.jsonl",
+        "environment.py",
+    }
 
 
-def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "state.sqlite").write_text("sqlite bytes")
-    (tmp_path / "db").mkdir()
-    (tmp_path / "db" / "state.sqlite").write_text("sqlite bytes")
-    (tmp_path / "configs").mkdir()
-    (tmp_path / "configs" / "env.toml").write_text("[env]\n")
-    (tmp_path / "rl.toml").write_text('algorithm = "grpo"\n')
-    (tmp_path / "assets").mkdir()
-    (tmp_path / "assets" / "labels.json").write_text("{}\n")
+def test_push_directory_recursively_ships_full_tree(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("from exploit_env import verifier\n")
+    package = env_dir / "exploit_env"
+    package.mkdir()
+    (package / "__init__.py").write_text("from .verifier import verify\n")
+    (package / "verifier.py").write_text("def verify():\n    return True\n")
+    (env_dir / "dataset").mkdir()
+    (env_dir / "dataset" / "train.jsonl").write_text('{"x": 1}\n')
+    (env_dir / "datasets").mkdir()
+    (env_dir / "datasets" / "eval.parquet").write_bytes(b"parquet bytes")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(_args(env_file)) == 0
+    assert cli.cmd_env_push(_args(env_dir)) == 0
     files = _members(cap["package_b64"])
-    assert "state.sqlite" not in files
-    assert "db/state.sqlite" not in files
-    assert "configs/env.toml" not in files
-    assert "rl.toml" not in files
-    assert "assets/labels.json" not in files
+    assert "exploit_env/__init__.py" in files
+    assert "exploit_env/verifier.py" in files
+    assert "dataset/train.jsonl" in files
+    assert "datasets/eval.parquet" in files
+
+
+def test_push_directory_ships_full_environment_tree(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "state.sqlite").write_text("sqlite bytes")
+    (env_dir / "db").mkdir()
+    (env_dir / "db" / "state.sqlite").write_text("sqlite bytes")
+    (env_dir / "configs").mkdir()
+    (env_dir / "configs" / "env.toml").write_text("[env]\n")
+    (env_dir / "rl.toml").write_text('algorithm = "grpo"\n')
+    (env_dir / "assets").mkdir()
+    (env_dir / "assets" / "labels.json").write_text("{}\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    files = _members(cap["package_b64"])
+    assert "state.sqlite" in files
+    assert "db/state.sqlite" in files
+    assert "configs/env.toml" in files
+    assert "rl.toml" in files
+    assert "assets/labels.json" in files
 
 
 def test_push_ships_training_md_and_keeps_user_readme(monkeypatch, tmp_path):
@@ -168,15 +213,15 @@ def test_push_synthesizes_readme_stub_when_absent(monkeypatch, tmp_path):
     assert "# math-env" in files["README.md"]
 
 
-def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
+def test_push_single_py_does_not_ship_sibling_helper_modules(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
-    env_file.write_text("import helper\n\ndef load_environment(**k):\n    return None\n")
+    env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "helper.py").write_text("VALUE = 1\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "helper.py" in _members(cap["package_b64"])
+    assert "helper.py" not in _members(cap["package_b64"])
 
 
 def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
@@ -190,6 +235,7 @@ def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
     files = _members(cap["package_b64"])
     assert "return 'custom'" in files["environment.py"]
     assert "return 'sibling'" not in files["environment.py"]
+    assert "custom_env.py" not in files
 
 
 def test_push_requires_explicit_name(tmp_path, capsys):
@@ -247,23 +293,129 @@ def test_push_nonexistent_path(tmp_path, capsys):
     assert "no such path" in capsys.readouterr().err
 
 
-def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
+def test_push_rejects_symlink_entrypoints(tmp_path, capsys):
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = True\n")
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").symlink_to(outside)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    assert "symlinks are not allowed" in capsys.readouterr().err
+
+
+def test_push_excludes_secrets_metadata_caches_and_symlinks_at_all_depths(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
     (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / ".env").write_text("TOKEN=secret\n")
+    (env_dir / "credentials.json").write_text('{"token": "secret"}\n')
+    (env_dir / "client.P12").write_bytes(b"secret")
     (env_dir / ".prime").mkdir()
     (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
-    (env_dir / "__pycache__").mkdir()
-    (env_dir / "__pycache__" / "x.pyc").write_text("junk")
+    nested = env_dir / "helpers" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "safe.py").write_text("VALUE = 1\n")
+    (nested / "pyproject.toml").write_text("[project]\n")
+    (nested / "Credentials.YAML").write_text("token: secret\n")
+    (nested / "source").mkdir()
+    (nested / "source" / "index.py").write_text("SECRET = True\n")
+    (nested / "secrets").mkdir()
+    (nested / "secrets" / "api.key").write_text("secret\n")
+    (nested / "__pycache__").mkdir()
+    (nested / "__pycache__" / "safe.pyc").write_bytes(b"junk")
+    (nested / ".venv").mkdir()
+    (nested / ".venv" / "activate.py").write_text("secret\n")
+    (nested / ".git").mkdir()
+    (nested / ".git" / "config").write_text("secret\n")
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_text("SECRET = True\n")
+    outside_dir = tmp_path / "outside-data"
+    outside_dir.mkdir()
+    (outside_dir / "secret.json").write_text('{"secret": true}\n')
+    (nested / "linked.py").symlink_to(outside_file)
+    (nested / "linked-data").symlink_to(outside_dir, target_is_directory=True)
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_dir, name="clean-env")) == 0
     names = set(_members(cap["package_b64"]))
     assert "environment.py" in names
-    assert not any(n.startswith(".prime") for n in names)
-    assert not any("__pycache__" in n for n in names)
+    assert "helpers/nested/safe.py" in names
+    assert "helpers/nested/source/index.py" in names
+    assert "helpers/nested/pyproject.toml" in names
+    assert ".env" not in names
+    assert "credentials.json" not in names
+    assert "client.P12" not in names
+    assert "helpers/nested/Credentials.YAML" not in names
+    assert not any(name.startswith(".prime") for name in names)
+    assert not any("__pycache__" in name for name in names)
+    assert not any("/.venv/" in f"/{name}/" for name in names)
+    assert not any("/.git/" in f"/{name}/" for name in names)
+    assert "helpers/nested/secrets/api.key" not in names
+    assert "helpers/nested/linked.py" not in names
+    assert "helpers/nested/linked-data/secret.json" not in names
+
+
+def test_push_excludes_root_only_paths_but_keeps_nested_package_content(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text(
+        "from my_pkg.source.loader import load\nfrom my_pkg.config.nested import CONFIG\n"
+    )
+    (env_dir / "pyproject.toml").write_text("[project]\n")
+    (env_dir / "source").mkdir()
+    (env_dir / "source" / "root.py").write_text("ROOT = True\n")
+    (env_dir / "my_pkg" / "source").mkdir(parents=True)
+    (env_dir / "my_pkg" / "source" / "loader.py").write_text("def load(): pass\n")
+    (env_dir / "my_pkg" / "config").mkdir()
+    (env_dir / "my_pkg" / "config" / "nested.py").write_text("CONFIG = {}\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "my_pkg/source/loader.py" in names
+    assert "my_pkg/config/nested.py" in names
+    assert "pyproject.toml" not in names
+    assert "source/root.py" not in names
+
+
+def test_push_rejects_oversized_directory_before_packaging(monkeypatch, tmp_path, capsys):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    source = "def load_environment(**k):\n    return None\n"
+    (env_dir / "environment.py").write_text(source)
+    (env_dir / "checkpoint.bin").write_bytes(b"x" * 65)
+    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_TOTAL_BYTES", 64)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("upload must not start")),
+    )
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    error = capsys.readouterr().err
+    assert "environment package totals" in error
+    assert "(limit 64 B)" in error
+    assert "remove large artifacts or use a smaller dataset" in error
+
+
+def test_push_does_not_emit_empty_directories(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "empty").mkdir()
+    ignored_only = env_dir / "ignored-only"
+    ignored_only.mkdir()
+    (ignored_only / "credentials.json").write_text('{"token": "secret"}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = _member_names(cap["package_b64"])
+    assert "empty" not in names
+    assert not any(name == "ignored-only" or name.startswith("ignored-only/") for name in names)
 
 
 class _FakeTTY(io.StringIO):
@@ -273,23 +425,28 @@ class _FakeTTY(io.StringIO):
         return True
 
 
-def test_push_includes_binary_images_only_under_singular_dataset_directory(monkeypatch, tmp_path):
+def test_push_directory_ships_binary_images_across_full_tree(monkeypatch, tmp_path):
+    # a directory push ships binary assets from the full tree, not just dataset/, bytes intact
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "dataset").mkdir()
     (env_dir / "dataset" / "red.png").write_bytes(b"png-bytes")
     (env_dir / "assets").mkdir()
-    (env_dir / "assets" / "ignored.png").write_bytes(b"ignored")
+    (env_dir / "assets" / "blue.png").write_bytes(b"other-png-bytes")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_dir, name="image-env")) == 0
     raw = base64.b64decode(cap["package_b64"])
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
-        names = {member.name for member in tar.getmembers() if member.isfile()}
-    assert "dataset/red.png" in names
-    assert "assets/ignored.png" not in names
+        payloads = {
+            member.name: tar.extractfile(member).read()
+            for member in tar.getmembers()
+            if member.isfile()
+        }
+    assert payloads["dataset/red.png"] == b"png-bytes"
+    assert payloads["assets/blue.png"] == b"other-png-bytes"
 
 
 def test_push_off_tty_passes_no_progress_callback(monkeypatch, tmp_path):
@@ -370,3 +527,174 @@ def test_human_bytes_scales_units():
     assert _human_bytes(1536) == "1.5 KB"
     assert _human_bytes(5 * 1024 * 1024) == "5.0 MB"
     assert _human_bytes(3 * 1024 * 1024 * 1024) == "3.0 GB"
+
+
+def test_push_directory_keeps_secret_named_code_but_drops_actual_secrets(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # legit code whose names merely start with secret-ish prefixes must be kept
+    (env_dir / "credentials_helper.py").write_text("VALUE = 1\n")
+    (env_dir / "id_rsa_utils.py").write_text("VALUE = 2\n")
+    # real secrets must be dropped
+    (env_dir / "credentials.json").write_text('{"token": "secret"}\n')
+    (env_dir / "id_rsa").write_text("PRIVATE KEY\n")
+    (env_dir / "id_rsa.pub").write_text("PUBLIC KEY\n")
+    (env_dir / "config.env").write_text("TOKEN=secret\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "credentials_helper.py" in names
+    assert "id_rsa_utils.py" in names
+    assert "credentials.json" not in names
+    assert "id_rsa" not in names
+    assert "id_rsa.pub" not in names
+    assert "config.env" not in names
+
+
+def test_push_excludes_nested_secrets_directory(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "secrets").mkdir()
+    (env_dir / "secrets" / "service_account.json").write_text('{"token": "secret"}\n')
+    (env_dir / "secrets" / "token.txt").write_text("secret\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert not any(name.startswith("secrets/") or name == "secrets" for name in names)
+
+
+def test_push_excludes_nested_virtualenv_by_marker(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # a virtualenv named `env` (no leading dot, not in the name ignore list) is detected by its marker
+    venv = env_dir / "env"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (venv / "lib").mkdir()
+    (venv / "lib" / "site.py").write_text("SECRET = True\n")
+    # a legit data directory without the marker must still ship
+    data = env_dir / "env_data"
+    data.mkdir()
+    (data / "rows.jsonl").write_text('{"x": 1}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert not any(name == "env" or name.startswith("env/") for name in names)
+    assert "env_data/rows.jsonl" in names
+
+
+def test_push_single_py_ships_sibling_readme_and_training_docs(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "README.md").write_text("# my real readme\n\nuser authored\n")
+    (tmp_path / "TRAINING.md").write_text("# training guide\n")
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    files = _members(cap["package_b64"])
+    # the user's real readme is shipped, not replaced by the stub
+    assert "user authored" in files["README.md"]
+    assert "TRAINING.md" in files
+    # sibling helper modules are still not shipped for single-file pushes
+    assert "helper.py" not in files
+
+
+def test_push_rejects_when_member_count_exceeds_limit_including_dirs(monkeypatch, tmp_path, capsys):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # 3 files across 3 directories -> members well above a tiny cap even though files alone are few
+    for i in range(3):
+        d = env_dir / f"pkg{i}"
+        d.mkdir()
+        (d / "mod.py").write_text("X = 1\n")
+    monkeypatch.setattr("flash.cli.envpush._ENV_PUSH_MAX_FILES", 4)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("upload must not start")),
+    )
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+    error = capsys.readouterr().err
+    assert "files and directories" in error
+    assert "(limit 4)" in error
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses dir perms")
+def test_push_fails_fast_on_unreadable_directory(monkeypatch, tmp_path, capsys):
+    import os as _os
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    locked = env_dir / "locked"
+    locked.mkdir()
+    (locked / "data.jsonl").write_text('{"x": 1}\n')
+    _os.chmod(locked, 0o000)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: (_ for _ in ()).throw(AssertionError("upload must not start")),
+    )
+    try:
+        assert cli.cmd_env_push(_args(env_dir)) == 1
+        assert "cannot publish" in capsys.readouterr().err
+    finally:
+        _os.chmod(locked, 0o755)
+
+
+def test_push_drops_ssh_keys_and_credential_data_but_keeps_python_modules(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # python modules whose names look secret-ish must be kept: code is never name-filtered
+    (env_dir / "credentials.py").write_text("TOKEN = None\n")
+    (env_dir / "id_ed25519_loader.py").write_text("VALUE = 1\n")
+    # private keys of every common type, including nested and extensionless, must be dropped
+    keys = env_dir / "keys"
+    keys.mkdir()
+    (keys / "id_ed25519").write_text("PRIVATE\n")
+    (keys / "id_ecdsa").write_text("PRIVATE\n")
+    (keys / "id_dsa").write_text("PRIVATE\n")
+    (keys / "id_ed25519.pub").write_text("PUBLIC\n")
+    # credential data files must still be dropped
+    (env_dir / "credentials.json").write_text('{"token": "x"}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "credentials.py" in names
+    assert "id_ed25519_loader.py" in names
+    assert "credentials.json" not in names
+    assert "keys/id_ed25519" not in names
+    assert "keys/id_ecdsa" not in names
+    assert "keys/id_dsa" not in names
+    assert "keys/id_ed25519.pub" not in names
+
+
+def test_push_drops_underscore_secret_files_but_keeps_secretish_packages(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    # backup/underscore secret file variants must be dropped, with or without an extension
+    (env_dir / "credentials_backup").write_text("SECRET\n")
+    (env_dir / "credentials_prod.json").write_text('{"t": 1}\n')
+    (env_dir / "id_rsa_backup").write_text("PRIVATE\n")
+    # a legitimate package directory whose name merely starts with a secret-ish prefix must ship
+    pkg = env_dir / "credentials_store"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .load import load\n")
+    (pkg / "load.py").write_text("def load():\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "credentials_backup" not in names
+    assert "credentials_prod.json" not in names
+    assert "id_rsa_backup" not in names
+    assert "credentials_store/__init__.py" in names
+    assert "credentials_store/load.py" in names
