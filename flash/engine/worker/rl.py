@@ -410,8 +410,8 @@ def run_rl():
         from flash.catalog import MODELS
         from flash.engine.vram import colocate_kv_util
 
-        # pass the same catalog geometry used by allocation and the resident-fit gate.
-        _model_info = MODELS.get(model_id)
+        # pinned revisions use conservative generic kv geometry unless their architecture is validated.
+        _model_info = None if model_revision else MODELS.get(model_id)
         _active_b = float(getattr(_model_info, "active_params_b", 0.0) or 0.0)
         _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
         _vllm_gpu_mem_util = colocate_kv_util(
