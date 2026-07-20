@@ -319,6 +319,14 @@ def _verified_adapter_revisions(status) -> set[str]:
     return set(read_verified_adapter_revisions(status.run_id))
 
 
+def _verified_revision_for_step(verified_revisions: set[str], run_id: str, step: int) -> str | None:
+    for revision in verified_revisions:
+        parsed = parse_adapter_revision(revision)
+        if parsed is not None and parsed[0] == run_id and parsed[1] == step:
+            return revision
+    return None
+
+
 def recover_deployments() -> int:
     """Clear deployment lifecycle records left busy by a control-plane restart."""
     recovered = 0
@@ -1066,7 +1074,14 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
     adapter_revision = payload.get("adapter_revision")
+    step = payload.get("step")
+    if adapter_revision is not None and step is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="pass either adapter_revision or step, not both",
+        )
     serving_model = run_id
+    pinned = False
     verified_revisions = _verified_adapter_revisions(status)
     if adapter_revision is not None:
         parsed_revision = (
@@ -1090,12 +1105,50 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                     f"adapter_revision {serving_model} has not passed a successful deployment smoke"
                 ),
             )
+        pinned = True
+    elif step is not None:
+        want: int | None = None
+        if isinstance(step, bool):
+            want = None
+        elif isinstance(step, int):
+            want = step
+        elif isinstance(step, float):
+            want = int(step) if step.is_integer() else None
+        elif isinstance(step, str):
+            value = step.strip()
+            want = int(value) if re.fullmatch(r"[0-9]{1,18}", value) else None
+        if want is None or want < 0:
+            raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {step!r}")
+        revision = _verified_revision_for_step(verified_revisions, run_id, want)
+        if revision is None:
+            parsed_revisions = [
+                parsed
+                for candidate in verified_revisions
+                if (parsed := parse_adapter_revision(candidate)) is not None and parsed[0] == run_id
+            ]
+            deployed_steps = sorted(
+                {parsed[1] for parsed in parsed_revisions if parsed[1] is not None}
+            )
+            step_labels = [str(deployed_step) for deployed_step in deployed_steps]
+            if any(parsed[1] is None for parsed in parsed_revisions):
+                step_labels.append("final")
+            steps_text = ", ".join(step_labels) or "none"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} has no deployed checkpoint at step {want}; deploy it first with "
+                    f"`flash deploy {run_id}/step-{want}` "
+                    f"(currently deployed steps: {steps_text})"
+                ),
+            )
+        serving_model = revision
+        pinned = True
     spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
     deployment_state = deployment.get("state")
     ready_deployment = _previous_ready_deployment(deployment)
-    has_ready_deploy = adapter_revision is not None or ready_deployment is not None
-    if adapter_revision is None and ready_deployment is not None:
+    has_ready_deploy = pinned or ready_deployment is not None
+    if not pinned and ready_deployment is not None:
         ready_revision = ready_deployment.get("adapter_revision")
         parsed_ready_revision = (
             parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None

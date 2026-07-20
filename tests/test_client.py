@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from flash.client import ApiClient, ApiError, ClientError, RequestTimeoutError
+from flash.client.http import _parse_chat_target, _prepare_chat_request
 from flash.client.specs import spec_payload
 from flash.schema import spec_from_dict
 
@@ -242,6 +243,27 @@ def test_get_worker_output_preserves_unknown_run_404(stub):
     assert "unknown run_id: missing" in str(excinfo.value)
 
 
+def test_parse_chat_target_supports_bare_step_and_immutable_revision() -> None:
+    revision = "run-abc@step-5." + "a" * 40
+
+    assert _parse_chat_target("run-abc") == ("run-abc", None, None)
+    assert _parse_chat_target("run-abc/step-5") == ("run-abc", None, 5)
+    assert _parse_chat_target(revision) == ("run-abc", revision, None)
+
+
+def test_prepare_chat_request_sends_step_without_adapter_revision() -> None:
+    base_run_id, body = _prepare_chat_request(
+        "run-abc/step-5",
+        [{"role": "user", "content": "hi"}],
+        0.0,
+        32,
+    )
+
+    assert base_run_id == "run-abc"
+    assert body["step"] == 5
+    assert "adapter_revision" not in body
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
@@ -286,14 +308,15 @@ def test_chat_full_immutable_revision_is_forwarded_unchanged(stub):
     assert seen["body"]["adapter_revision"] == revision
 
 
-def test_chat_rejects_checkpoint_shorthand_without_request(stub):
+def test_chat_checkpoint_shorthand_forwards_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    with pytest.raises(ClientError, match="full immutable adapter revision"):
-        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+    client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
 
-    assert seen == {}
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"]["step"] == 40
+    assert "adapter_revision" not in seen["body"]
 
 
 @pytest.mark.parametrize("step", ["00", "01"])
@@ -350,14 +373,16 @@ def test_chat_stream_full_immutable_revision_is_forwarded_unchanged(stub):
     }
 
 
-def test_chat_stream_rejects_checkpoint_shorthand_without_request(stub):
+def test_chat_stream_checkpoint_shorthand_forwards_step(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    with pytest.raises(ClientError, match="full immutable adapter revision"):
-        list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
+    chunks = list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
 
-    assert seen == {}
+    assert "".join(chunks) == "héllo"
+    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["body"]["step"] == 40
+    assert "adapter_revision" not in seen["body"]
 
 
 def test_chat_stream_accepts_json_fallback(stub):
