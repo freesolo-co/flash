@@ -189,6 +189,9 @@ def test_snapshot_success_but_adapter_never_complete_raises_retriable(monkeypatc
     )
     # snapshot_download keeps returning, but a loadable adapter never materializes -> infra retry.
     monkeypatch.setattr(adapter, "_has_deployable_adapter", lambda _path: False)
+    # the directory itself is present on disk, so this test also fails if the completeness check
+    # regresses to a directory-only `os.path.isdir` check.
+    monkeypatch.setattr(adapter.os.path, "isdir", lambda path: path == _ADAPTER_DIR)
 
     with pytest.raises(RetriableInfraError) as exc_info:
         adapter._download_adapter(_ADAPTER_REF)
