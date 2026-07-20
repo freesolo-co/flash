@@ -179,6 +179,30 @@ def test_score_rollouts_uses_one_typed_scoring_pass():
     assert env.score_calls == 1
 
 
+def test_score_rollouts_uses_reward_many_fallback_for_duck_typed_env():
+    class BatchedEnvironment:
+        def __init__(self):
+            self.batch_calls = 0
+
+        def reward_many(self, items):
+            self.batch_calls += 1
+            return [float(example["reward"]) for example, _state in items]
+
+    env = BatchedEnvironment()
+    requests = [
+        RolloutScoreRequest(example={"reward": 0.25}, state={}, turn_count=1),
+        RolloutScoreRequest(example={"reward": 0.75}, state={}, turn_count=1),
+    ]
+
+    rewards = score_rollouts(env, requests)
+
+    assert rewards == [
+        RolloutReward(episode=0.25, turns=None),
+        RolloutReward(episode=0.75, turns=None),
+    ]
+    assert env.batch_calls == 1
+
+
 def test_base_environment_default_uses_reward_many_once():
     class BatchedEnvironment(BaseEnvironment):
         def __init__(self):
@@ -204,12 +228,11 @@ def test_base_environment_default_uses_reward_many_once():
     assert env.batch_calls == 1
 
 
-def test_score_rollouts_uses_base_scalar_fallback_in_input_order():
-    class ScalarEnvironment(BaseEnvironment):
+def test_score_rollouts_uses_scalar_fallback_for_duck_typed_env_in_input_order():
+    class ScalarEnvironment:
         reward_thread_safe = False
 
         def __init__(self):
-            super().__init__(id="scalar")
             self.calls = []
 
         def reward(self, completion, example, state=None):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from flash.envs.base import RolloutReward
+from flash.envs.base import BaseEnvironment, RolloutReward
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,11 @@ def _validated_reward(reward: RolloutReward, request: RolloutScoreRequest) -> Ro
 def score_rollouts(active_env, requests: list[RolloutScoreRequest]) -> list[RolloutReward]:
     """Score terminal rollout states once and return normalized typed rewards."""
     items = [(request.example, request.state) for request in requests]
-    rewards = active_env.rollout_rewards_many(items)
+    rollout_rewards_many = getattr(active_env, "rollout_rewards_many", None)
+    if callable(rollout_rewards_many):
+        rewards = rollout_rewards_many(items)
+    else:
+        rewards = BaseEnvironment.rollout_rewards_many(active_env, items)
     if len(rewards) != len(requests):
         raise RuntimeError("env.rollout_rewards_many returned the wrong number of rewards")
     return [
