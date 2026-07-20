@@ -69,12 +69,15 @@ def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dic
     return {name: total / denominator for name, total in totals.items()}
 
 
-def _take_named_reward_metrics(
-    breakdowns: list[dict[str, float] | None],
+def _latest_named_reward_metrics(
+    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
 ) -> dict[str, float]:
-    metrics = _mean_named_reward_metrics(breakdowns)
-    breakdowns.clear()
-    return metrics
+    if breakdowns:
+        metrics = _mean_named_reward_metrics(breakdowns)
+        breakdowns.clear()
+        latest.clear()
+        latest.update(metrics)
+    return dict(latest)
 
 
 def run_rl():
@@ -295,6 +298,7 @@ def run_rl():
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
     pending_named_breakdowns: list[dict[str, float] | None] = []
+    latest_named_metrics: dict[str, float] = {}
 
     def reward_fn(completions, **kwargs):
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
@@ -692,7 +696,9 @@ def run_rl():
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback(
-        lambda: _take_named_reward_metrics(pending_named_breakdowns)
+        lambda: _latest_named_reward_metrics(
+            pending_named_breakdowns, latest_named_metrics
+        )
     )
     trainer_callbacks = [
         hb_cb,
@@ -813,6 +819,7 @@ def run_rl():
         liveness_heartbeat(
             "rl_step",
             progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
+            fields=hb_cb.latest_fields,
             progress_step=True,
         ),
         _sdpa_cudnn_ctx(_attn),

@@ -928,3 +928,4 @@ def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
     reward_metrics = emitted[0][1]["reward_metrics"]
     assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
     assert all(math.isfinite(value) for value in reward_metrics.values())
+    assert callback.latest_fields() == {"reward_metrics": reward_metrics}

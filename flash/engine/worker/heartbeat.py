@@ -280,6 +280,12 @@ def make_reward_heartbeat_callback(reward_metrics=None):
         def __init__(self):
             self.reward_history = []
             self.last_gpu_diag_at = 0.0
+            self.latest_reward_metrics: dict[str, float] = {}
+
+        def latest_fields(self) -> dict:
+            if not self.latest_reward_metrics:
+                return {}
+            return {"reward_metrics": dict(self.latest_reward_metrics)}
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -299,9 +305,9 @@ def make_reward_heartbeat_callback(reward_metrics=None):
                 "reward_last": self.reward_history[-8:],
             }
             latest_metrics = reward_metrics() if callable(reward_metrics) else reward_metrics
-            bounded_metrics = _bounded_reward_metrics(latest_metrics)
-            if bounded_metrics:
-                payload["reward_metrics"] = bounded_metrics
+            self.latest_reward_metrics = _bounded_reward_metrics(latest_metrics)
+            if self.latest_reward_metrics:
+                payload["reward_metrics"] = dict(self.latest_reward_metrics)
             now = time.monotonic()
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
             _w.heartbeat("rl_step", **payload)
