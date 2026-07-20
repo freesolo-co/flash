@@ -1110,3 +1110,40 @@ def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) 
     assert "hb=20m" in progress
     assert "warming up" not in progress
     assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
+    # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
+    status = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "remote": {"attempt": 3},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 3},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "do not cancel" in progress

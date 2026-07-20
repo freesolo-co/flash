@@ -562,10 +562,46 @@ _WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
 _WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
 
 
-def warmup_message(stage: object, heartbeat_age_seconds: float | None) -> str | None:
-    """Explain healthy RL setup stages only while their heartbeat is fresh."""
+# attempt identity, matching providers._poll._attempt_int: a bounded nonnegative int, never a bool,
+# string, or float. so "1", True, and 2.7 are not accepted, and a stray inf cannot crash the coercion.
+_MAX_ATTEMPT_ID = (1 << 63) - 1
+
+
+def _attempt_or_none(value: object) -> int | None:
+    """The retry attempt as a bounded nonnegative int, or None for any non-canonical value."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= _MAX_ATTEMPT_ID else None
+
+
+def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
+    """False only when the heartbeat provably belongs to a superseded retry attempt.
+
+    Retries reuse the seed's heartbeat path, so a recovered run flips back to ``running`` for the
+    replacement worker while ``last_heartbeat`` can still be the previous attempt's setup ping until
+    the new worker publishes one. ``remote.attempt`` is the live attempt; ``last_heartbeat.attempt``
+    is the one that produced the ping. When the live attempt is known, keep the reassurance only for a
+    heartbeat whose attempt matches it. When it is unknown (e.g. a managed status payload that omits
+    ``remote``), fall back to ``warmup_message``'s age gating rather than suppress, so warmup still
+    reassures on planes that do not surface a live attempt.
+    """
+    remote = obj.get("remote")
+    current_attempt = _attempt_or_none(remote.get("attempt")) if isinstance(remote, dict) else None
+    if current_attempt is None:
+        return True
+    return _attempt_or_none(heartbeat.get("attempt")) == current_attempt
+
+
+def warmup_message(
+    stage: object,
+    heartbeat_age_seconds: float | None,
+    from_current_attempt: bool = True,
+) -> str | None:
+    """Explain healthy RL setup stages only while the heartbeat is fresh and from the live attempt."""
     stage_name = str(stage)
     if stage_name not in _WARMUP_STAGES:
+        return None
+    if not from_current_attempt:
         return None
     if heartbeat_age_seconds is None:
         return None
@@ -592,7 +628,11 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
     running = str(obj.get("state") or "") == "running"
     if running:
-        warmup = warmup_message(hb.get("stage"), heartbeat_age_seconds)
+        warmup = warmup_message(
+            hb.get("stage"),
+            heartbeat_age_seconds,
+            heartbeat_is_current_attempt(obj, hb),
+        )
         if warmup:
             pairs.append(("warmup", warmup))
     age = _humanize_age_seconds(heartbeat_age_seconds)

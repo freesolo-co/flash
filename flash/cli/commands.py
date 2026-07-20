@@ -389,7 +389,11 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         if stage:
             parts.append(f"stage={stage}")
             if state == "running":
-                warmup = render.warmup_message(stage, heartbeat_age_seconds)
+                warmup = render.warmup_message(
+                    stage,
+                    heartbeat_age_seconds,
+                    render.heartbeat_is_current_attempt(status, heartbeat),
+                )
                 if warmup:
                     parts.append(warmup)
         step = heartbeat.get("step")
