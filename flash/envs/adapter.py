@@ -7,7 +7,7 @@ public names are re-exported here so existing ``flash.envs.adapter`` import path
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -249,7 +249,9 @@ class FreesoloEnvironment(BaseEnvironment):
         values = metadata.get("per_turn_rewards")
         if values is None:
             return None
-        if not isinstance(values, list):
+        if not isinstance(values, Iterable) or isinstance(
+            values, (str, bytes, bytearray, Mapping, set, frozenset)
+        ):
             print("[grpo][warn] malformed per_turn_rewards metadata; using episode reward")
             return None
         try:

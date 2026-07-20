@@ -278,8 +278,15 @@ def _freesolo_env(monkeypatch, result):
     return env, state, score_calls
 
 
-def test_freesolo_rollout_rewards_uses_complete_terminal_metadata_at_cap(monkeypatch):
-    result = RewardResult(score=1.0, metadata={"per_turn_rewards": [0.25, 0.75]})
+@pytest.mark.parametrize(
+    "metadata_value",
+    [[0.25, 0.75], (0.25, 0.75)],
+    ids=["list", "tuple"],
+)
+def test_freesolo_rollout_rewards_uses_complete_terminal_metadata_at_cap(
+    monkeypatch, metadata_value
+):
+    result = RewardResult(score=1.0, metadata={"per_turn_rewards": metadata_value})
     env, state, score_calls = _freesolo_env(monkeypatch, result)
 
     rewards = env.rollout_rewards_many([({"input": "prompt"}, state)])
