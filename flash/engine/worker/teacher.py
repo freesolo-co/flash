@@ -174,6 +174,88 @@ def _validate_echo(tokens, token_logprobs, offsets, full) -> list[tuple[int, int
     return spans
 
 
+class _ScoredTeacherTokens(list[TeacherToken]):
+    """Completion tokens carrying the real echoed input-token count for image accounting."""
+
+    def __init__(self, tokens: list[TeacherToken], *, input_tokens: int) -> None:
+        super().__init__(tokens)
+        self.input_tokens = input_tokens
+
+
+def _validate_multimodal_echo(
+    tokens, token_logprobs, offsets, completion_text: str
+) -> tuple[int, int]:
+    """Validate an image echo and locate the token suffix covering the completion exactly."""
+
+    def _bad(message):
+        raise TeacherError(message, permanent=True)
+
+    if not all(isinstance(value, list) for value in (tokens, token_logprobs, offsets)):
+        _bad(
+            "teacher multimodal echo response logprobs fields are not all lists "
+            f"(tokens={type(tokens).__name__}, token_logprobs={type(token_logprobs).__name__}, "
+            f"text_offset={type(offsets).__name__})"
+        )
+    token_count = len(tokens)
+    if len(token_logprobs) != token_count or len(offsets) != token_count:
+        _bad(
+            f"teacher multimodal echo response arrays disagree in length: tokens={token_count}, "
+            f"token_logprobs={len(token_logprobs)}, text_offset={len(offsets)}"
+        )
+    previous_offset = None
+    for offset in offsets:
+        if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+            _bad(f"teacher multimodal echo response text_offset has a non-numeric value: {offset!r}")
+        if not math.isfinite(offset):
+            _bad(f"teacher multimodal echo response text_offset is not finite: {offset!r}")
+        if offset != int(offset):
+            _bad(f"teacher multimodal echo response text_offset is not an integer: {offset!r}")
+        if offset < 0:
+            _bad(f"teacher multimodal echo response text_offset is negative: {offset!r}")
+        if previous_offset is not None and offset < previous_offset:
+            _bad(
+                "teacher multimodal echo response text_offset is not non-decreasing: "
+                f"{previous_offset!r} -> {offset!r}"
+            )
+        previous_offset = offset
+    if token_count and int(offsets[0]) != 0:
+        _bad(
+            "teacher multimodal echo does not start at offset 0 "
+            f"(first text_offset={int(offsets[0])})"
+        )
+    for logprob in token_logprobs:
+        if logprob is None:
+            continue
+        if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
+            _bad(
+                "teacher multimodal echo response token_logprobs has a non-numeric value: "
+                f"{logprob!r}"
+            )
+        if not math.isfinite(logprob):
+            _bad(
+                "teacher multimodal echo response token_logprobs has a non-finite value: "
+                f"{logprob!r}"
+            )
+        if logprob > 1e-6:
+            _bad(
+                "teacher multimodal echo response token_logprobs has a positive value "
+                f"{logprob!r} (a log-probability cannot exceed 0)."
+            )
+    if not completion_text:
+        return token_count, token_count
+    suffix_start = token_count
+    suffix_text = ""
+    while suffix_start > 0 and len(suffix_text) < len(completion_text):
+        suffix_start -= 1
+        suffix_text = str(tokens[suffix_start]) + suffix_text
+    if len(suffix_text) < len(completion_text) or not suffix_text.endswith(completion_text):
+        _bad(
+            "teacher multimodal echo tokens do not cover the exact completion suffix "
+            f"({len(completion_text)} chars)"
+        )
+    return suffix_start, len(suffix_text) - len(completion_text)
+
+
 class TeacherClient:
     def __init__(
         self,
@@ -313,6 +395,70 @@ class TeacherClient:
             for i in range(len(fulls))
         ]
 
+    def score_many_multimodal(
+        self, items: list[tuple[str, str, list[str] | tuple[str, ...]]]
+    ) -> list[list[TeacherToken]]:
+        """Batch image-conditioned echo scoring with per-prompt base64 data URIs."""
+        if not items:
+            return []
+        fulls = [prompt_text + completion_text for prompt_text, completion_text, _images in items]
+        completions = [completion_text for _prompt_text, completion_text, _images in items]
+        images = [list(item_images) for _prompt, _completion, item_images in items]
+        resp = self._post(
+            "/completions",
+            {
+                "model": self.model,
+                "prompt": fulls if len(fulls) > 1 else fulls[0],
+                "images": images if len(images) > 1 else images[0],
+                "max_tokens": 0,
+                "echo": True,
+                "logprobs": 1,
+                "temperature": 0,
+            },
+        )
+        choices = resp.get("choices")
+        if not isinstance(choices, list) or len(choices) != len(fulls):
+            raise TeacherError(
+                "teacher multimodal echo response returned the wrong number of choices "
+                f"(expected {len(fulls)}, got "
+                f"{len(choices) if isinstance(choices, list) else type(choices).__name__})",
+                permanent=True,
+            )
+        by_index: dict[int, dict] = {}
+        for position, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                raise TeacherError(
+                    f"teacher multimodal echo response choice {position} is not an object",
+                    permanent=True,
+                )
+            index = choice.get("index", position)
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= len(fulls)
+            ):
+                raise TeacherError(
+                    f"teacher multimodal echo response choice {position} has invalid index {index!r}",
+                    permanent=True,
+                )
+            if index in by_index:
+                raise TeacherError(
+                    f"teacher multimodal echo response duplicated choice index {index}",
+                    permanent=True,
+                )
+            by_index[index] = choice
+        if len(by_index) != len(fulls):
+            missing = sorted(set(range(len(fulls))) - set(by_index))
+            raise TeacherError(
+                f"teacher multimodal echo response missing choice index(es): {missing}",
+                permanent=True,
+            )
+        return [
+            self._multimodal_tokens_from_choice(by_index[index], completions[index])
+            for index in range(len(fulls))
+        ]
+
     def score(self, prompt_text: str, completion_text: str) -> list[TeacherToken]:
         """Echo-score one completion and return completion-region teacher tokens."""
         return self.score_many([(prompt_text, completion_text)])[0]
@@ -377,3 +523,50 @@ class TeacherClient:
                 permanent=True,
             )
         return out
+
+    def _multimodal_tokens_from_choice(
+        self, choice: dict, completion_text: str
+    ) -> list[TeacherToken]:
+        try:
+            logprobs = choice["logprobs"]
+            tokens = logprobs["tokens"]
+            token_logprobs = logprobs["token_logprobs"]
+            offsets = logprobs["text_offset"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise TeacherError(
+                f"teacher multimodal echo response missing logprobs: {exc}", permanent=True
+            ) from exc
+        suffix_start, prefix_chars = _validate_multimodal_echo(
+            tokens, token_logprobs, offsets, completion_text
+        )
+        output: list[TeacherToken] = []
+        cursor = -prefix_chars
+        for index in range(suffix_start, len(tokens)):
+            text = str(tokens[index])
+            end = cursor + len(text)
+            # include only tokens that overlap the completion region [0, len(completion_text)).
+            # the upper bound drops any trailing (e.g. zero-width) token that starts at or after
+            # the completion end, so it cannot add a spurious teacher logprob to the alignment.
+            if end > 0 and cursor < len(completion_text):
+                if token_logprobs[index] is None:
+                    raise TeacherError(
+                        "teacher multimodal echo response has a null token_logprob for a "
+                        f"completion token (index {index})",
+                        permanent=True,
+                    )
+                output.append(
+                    TeacherToken(
+                        text=text,
+                        logprob=float(token_logprobs[index]),
+                        start=max(0, cursor),
+                        end=end,
+                    )
+                )
+            cursor = end
+        if completion_text and not output:
+            raise TeacherError(
+                "teacher multimodal echo returned no scored completion token for a non-empty "
+                f"completion ({len(completion_text)} chars)",
+                permanent=True,
+            )
+        return _ScoredTeacherTokens(output, input_tokens=len(tokens))
