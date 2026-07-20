@@ -198,6 +198,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "attempt": 0,
         "metrics_last": [{"step": 4, "reward": 0.75}],
     }
+    forces = []
     monkeypatch.setattr("flash.providers._poll._record_heartbeat", recorded.append)
     monkeypatch.setattr(jobs, "decode_output", lambda _output: {"acc": 1.0})
 
@@ -206,13 +207,18 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "job_status",
         lambda _endpoint_id, _job_id, **_kwargs: {"status": "COMPLETED", "output": {}},
     )
+    def read_heartbeat(force=False):
+        forces.append(force)
+        return heartbeat
+
     res = jobs.poll_job(
         _runpod_handle(jobs),
         interval_s=0,
-        heartbeat_reader=lambda force=False: heartbeat,
+        heartbeat_reader=read_heartbeat,
     )
 
     assert res.ok
+    assert forces == [True]
     assert recorded == [heartbeat]
 
 
