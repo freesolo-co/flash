@@ -815,4 +815,5 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
         env_id,
         source=source,
         contract_text=contract_text,
+        package_root=base_dir,
     )

@@ -119,6 +119,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_kwargs["max_num_batched_tokens"] == 8192
     assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
     assert _FakeLLM.last_kwargs["mm_encoder_attn_backend"] == "TORCH_SDPA"
+    assert "enable_tower_connector_lora" not in _FakeLLM.last_kwargs
     assert _FakeLLM.last_kwargs["enforce_eager"] is True
     assert _FakeLLM.last_kwargs["compilation_config"] == {
         "mode": 0,
@@ -136,6 +137,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_generate["use_tqdm"] is False
     assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]
     assert _SamplingParams.last_kwargs["include_stop_str_in_output"] is True
+    assert "logit_bias" not in _SamplingParams.last_kwargs
     assert out[0].token_ids == [3, 4]
     assert out[0].terminated is True
 
@@ -639,9 +641,12 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 
     class _SamplingParams:
         last_kwargs: ClassVar[dict] = {}
+        instances: ClassVar[list] = []
 
         def __init__(self, **kwargs):
-            _SamplingParams.last_kwargs = dict(kwargs)
+            self.kwargs = dict(kwargs)
+            _SamplingParams.last_kwargs = self.kwargs
+            _SamplingParams.instances.append(self)
 
     class _StructuredOutputsParams:
         def __init__(self, **kwargs):
@@ -655,12 +660,14 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 
     class _FakeLLM:
         last_kwargs: ClassVar[dict] = {}
+        last_prompts: ClassVar[list] = []
 
         def __init__(self, **kwargs):
             _FakeLLM.last_kwargs = dict(kwargs)
             self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            _FakeLLM.last_prompts = list(prompts)
             comp = SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
             return [SimpleNamespace(outputs=[comp]) for _ in prompts]
 
@@ -791,6 +798,44 @@ def test_opd_vllm_adapter_store_falls_back_when_tmpfs_save_fails(monkeypatch, tm
     assert Path(engine._lora_request.lora_path, "adapter_config.json").is_file()
     assert engine.sync_count == 1
     assert engine._adapter_root_is_tmpfs is False
+
+
+def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypatch, tmp_path):
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    sampling_params, _ = _install_fake_vllm(monkeypatch)
+    fake_llm = sys.modules["vllm"].LLM
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    image = object()
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        enable_tower_connector_lora=True,
+        image_pad_token_id=99,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    engine.generate(
+        [[1, 99, 2], [7, 8]],
+        max_tokens=5,
+        multi_modal_data_batch=[{"image": image}, None],
+    )
+
+    assert fake_llm.last_kwargs["enable_tower_connector_lora"] is True
+    assert fake_llm.last_prompts == [
+        {"prompt_token_ids": [1, 99, 2], "multi_modal_data": {"image": image}},
+        {"prompt_token_ids": [7, 8]},
+    ]
+    assert sampling_params.instances[-2].kwargs["logit_bias"] == {99: -100.0}
+    assert "logit_bias" not in sampling_params.instances[-1].kwargs
+    with pytest.raises(ValueError, match="multimodal data count"):
+        engine.generate([[1], [2]], max_tokens=1, multi_modal_data_batch=[None])
 
 
 def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_path):

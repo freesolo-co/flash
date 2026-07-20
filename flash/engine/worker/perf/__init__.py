@@ -51,10 +51,12 @@ from flash.engine.worker.perf.loraplus import loraplus_optimizer_cls
 from flash.engine.worker.perf.memory import (
     _LONG_CONTEXT_TOKENS,
     _memory_mode,
+    enable_multimodal_input_require_grads,
     fused_optim_name,
     grad_checkpointing_on,
     grpo_sleep_mode,
     grpo_use_reentrant,
+    make_multimodal_input_require_grads_callback,
 )
 
 
@@ -480,6 +482,7 @@ __all__ = [
     "_restrict_fla_gdn_autotune_on_blackwell",
     "_round_gb_from_mib",
     "_sdpa_cudnn_ctx",
+    "enable_multimodal_input_require_grads",
     "free_gpu",
     "fused_optim_name",
     "gpu_diagnostics",
@@ -489,6 +492,7 @@ __all__ = [
     "is_cuda_oom",
     "liger_on",
     "loraplus_optimizer_cls",
+    "make_multimodal_input_require_grads_callback",
     "optimal_attn_impl",
     "setup_perf_backends",
     "wait_for_gpu",
