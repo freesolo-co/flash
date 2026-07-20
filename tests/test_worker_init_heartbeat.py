@@ -381,12 +381,12 @@ def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
         assert key not in payload
         assert key not in payload["metrics_last"][-1]
 
-    for step in range(3, 19):
+    for step in range(3, 1027):
         state.global_step = step
-        callback.on_log(args, state, None, logs={"reward": step / 20})
+        callback.on_log(args, state, None, logs={"reward": step / 1027})
     metrics_last = emitted[-1][1]["metrics_last"]
-    assert len(metrics_last) == 16
-    assert [item["step"] for item in metrics_last] == list(range(3, 19))
+    assert len(metrics_last) == 1024
+    assert [item["step"] for item in metrics_last] == list(range(3, 1027))
 
 
 def test_rl_lifecycle_heartbeats_carry_latest_metrics():
