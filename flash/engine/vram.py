@@ -147,6 +147,24 @@ def opd_training_peak_gb(
     return activations + dense_logits
 
 
+def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
+    """Pending LoRA gradient, AdamW state, and persistent post-init growth above model residency.
+
+    OPD trains all linear layers with bf16 LoRA parameters. PyTorch AdamW lazily allocates two
+    parameter-dtype moment tensors on the first step, so each estimated trainable parameter needs
+    2 bytes for its pending gradient plus 4 bytes for optimizer state. Use total model parameters for
+    the rank-linear geometry so MoE experts are not undercounted, then reserve the measured 35B-class
+    first-generation and post-init growth with a size-scaled 12 GB ceiling.
+    """
+    model_params_b = max(0.1, float(params_b))
+    rank = max(1, int(lora_rank))
+    trainable_params_b = (rank / 16.0) * (0.05 + model_params_b / 150.0)
+    gradient_gb = trainable_params_b * 2.0
+    adamw_state_gb = trainable_params_b * 4.0
+    persistent_growth_gb = max(1.0, min(12.0, model_params_b * 0.35))
+    return gradient_gb + adamw_state_gb + persistent_growth_gb
+
+
 def _resident_kv_gb(
     params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
 ) -> float:

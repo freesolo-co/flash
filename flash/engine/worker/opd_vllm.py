@@ -95,6 +95,26 @@ def _decode_only_compilation_config() -> dict[str, Any]:
     }
 
 
+def _sizing_lora_rank(knobs: Any, default: int = 32) -> int:
+    rank = getattr(knobs, "lora_rank", None)
+    if rank is None:
+        try:
+            from flash.engine.worker._pkg import W as _w
+
+            train = getattr(getattr(_w, "JOB_SPEC", None), "train", None)
+            rank = getattr(train, "lora_rank", None)
+        except Exception:
+            rank = None
+    try:
+        return max(1, int(rank if rank is not None else default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rollout_uplift_validated(params_b: float, lora_rank: int) -> bool:
+    return float(params_b) <= 4.0 and int(lora_rank) <= 32
+
+
 def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
@@ -135,6 +155,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
             from flash.catalog import MODELS, vocab_size_for
             from flash.engine.vram import (
                 colocate_kv_util,
+                opd_post_init_reserve_gb,
                 opd_rollout_concurrency,
                 opd_training_peak_gb,
                 resolve_params_b,
@@ -142,6 +163,7 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
             info = MODELS.get(model_id)
             params_b = resolve_params_b(model_id)
+            lora_rank = _sizing_lora_rank(knobs)
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
             target_concurrency = opd_rollout_concurrency(
                 getattr(knobs, "prompts_per_step", 1),
@@ -175,8 +197,9 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                     active_params_b=active_b,
                 )
                 training_reserve_gb = training_peak_gb * 1.15
+                post_init_reserve_gb = opd_post_init_reserve_gb(params_b, lora_rank)
                 allocator_margin_gb = max(2.0, min(6.0, card_gb * 0.05))
-                protected_gb = training_reserve_gb + allocator_margin_gb
+                protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
                 rollout_budget_gb = max(0.0, free_gb - protected_gb)
                 max_startup_util = rollout_budget_gb / max(1.0, card_gb)
                 while rollout_concurrency > 1 and util > max_startup_util:
@@ -197,15 +220,16 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                         reserve_gb=protected_gb,
                         rollout_batch_size=rollout_concurrency,
                     )
-                else:
-                    # 0.80 is a final ceiling for large cards; the measured free-minus-reserve
-                    # budget is normally tighter and keeps the training peak available.
+                elif _rollout_uplift_validated(params_b, lora_rank):
+                    # 0.80 is a final ceiling for the validated 4b/rank-32 size class; larger or
+                    # higher-rank models keep the existing colocate ceiling until gpu validation.
                     util = max(util, min(0.80, max_startup_util))
                 print(
                     "[opd] vLLM memory budget "
                     f"free={free_gb:.1f}/{card_gb:.1f} GiB "
                     f"training_peak={training_peak_gb:.1f} GiB "
                     f"training_reserve={training_reserve_gb:.1f} GiB "
+                    f"post_init_reserve={post_init_reserve_gb:.1f} GiB "
                     f"allocator_margin={allocator_margin_gb:.1f} GiB "
                     f"rollout={util * card_gb:.1f} GiB util={util:.3f}"
                 )
