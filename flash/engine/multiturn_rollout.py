@@ -898,6 +898,10 @@ def build_rollout_func(
                     "prompt_token_ids": collapsed,
                     "multi_modal_data": {"image": images if len(images) > 1 else images[0]},
                 }
+                # suppress the image-pad token during generation: a stray pad emitted into the
+                # assistant turn would corrupt the next turn's collapse_image_pad_runs count and
+                # misalign vision data, aborting the rollout. mirrors the single-turn opd guard.
+                sp_kwargs["logit_bias"] = {int(image_pad_id): -100.0}
             else:
                 prompt = {"prompt_token_ids": list(prefix_ids)}
             llm_engine.add_request(req_id, prompt, SamplingParams(**sp_kwargs))

@@ -84,6 +84,7 @@ def test_collapse_image_pad_runs_rejects_image_count_mismatch():
 class _Engine:
     def __init__(self):
         self.requests = []
+        self.sampling = []
         self.pending = []
         self.llm_engine = SimpleNamespace(
             model_config=SimpleNamespace(get_vocab_size=lambda: 10000),
@@ -95,6 +96,7 @@ class _Engine:
 
     def add_request(self, request_id, prompt, sampling_params):
         self.requests.append(prompt)
+        self.sampling.append(sampling_params)
         self.pending.append(request_id)
 
     def abort_request(self, request_ids):
@@ -246,6 +248,35 @@ def test_real_qwen_processor_image_pad_id_and_expansion():
 
 
 @pytest.mark.usefixtures("_stub_vllm")
+def test_multiturn_image_rollout_suppresses_image_pad_token():
+    # a stray image-pad token emitted into an assistant turn would corrupt the next turn's
+    # collapse_image_pad_runs count and misalign vision data; the image branch must bias the
+    # pad token out of the sampler on every generated turn (mirrors the single-turn opd guard).
+    image_module = pytest.importorskip("PIL.Image")
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "image": image_module.new("RGB", (2, 2), "red")},
+            ],
+        }
+    ]
+    engine = _Engine()
+    rollout = _rollout_func(
+        examples_by_key={multimodal_prompt_key(prompt): {"id": "img"}},
+        processor=_Processor(),
+        multimodal=True,
+    )
+
+    rollout([prompt], _trainer(engine))
+
+    assert len(engine.sampling) == 2
+    for sampling_params in engine.sampling:
+        assert getattr(sampling_params, "logit_bias", None) == {_IMAGE_PAD_ID: -100.0}
+
+
+@pytest.mark.usefixtures("_stub_vllm")
 def test_text_only_multiturn_rollout_payload_is_unchanged():
     prompt = [{"role": "user", "content": "hi"}]
     engine = _Engine()
@@ -256,3 +287,5 @@ def test_text_only_multiturn_rollout_payload_is_unchanged():
     assert result["reward"] == [1.0]
     assert len(engine.requests) == 2
     assert all(set(request) == {"prompt_token_ids"} for request in engine.requests)
+    # no pad-suppression bias leaks into text-only turns
+    assert all(getattr(sampling_params, "logit_bias", None) is None for sampling_params in engine.sampling)
