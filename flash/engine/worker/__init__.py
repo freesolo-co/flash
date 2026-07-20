@@ -185,25 +185,14 @@ _HB_PROGRESS_UPLOADED_SEQ = 0
 # per-repo commit cap while staying under the provider poller's training stall window
 # (STALL_AFTER_S=1500s in flash/providers/_poll.py).
 _HB_MIN_INTERVAL_S = 900.0
-# Highest optimizer step whose heartbeat has been COMMITTED. A force=True heartbeat (opd's
-# post-optimizer-step ping) bypasses the 900s throttle iff its step exceeds this — i.e. force is gated
-# on STEP ADVANCE, not elapsed time. That lands every distinct completed step exactly once (so a cancel
-# always bills the true latest step, never a stale one a mid-step progress ping left behind) while
-# self-limiting forced commits to the actual optimizer-step rate: redundant same-step/liveness pings
-# stay throttled below, and opd_step advances are teacher-round-trip-gated (minutes apart), so forced
-# commits stay far under the HF per-repo cap without a time floor that would blind-spot fast steps.
+# highest optimizer step whose heartbeat has been committed. a forced heartbeat normally bypasses the
+# 900s throttle only on step advance. a sample-bearing payload may also force at the same step because
+# the liveness daemon can commit that step first without samples; redundant same-step payloads without
+# samples remain throttled.
 _HB_LAST_COMMITTED_STEP = 0
-# A forced (post-optimizer-step) commit bypasses the 900s throttle on STEP ADVANCE so a cancel bills the
-# true latest step. But a tiny/smoke OPD config (batch=1, group=1, small student, fast/cached teacher)
-# can land optimizer steps many times per MINUTE, and forcing every one would blow the HF per-repo commit
-# cap before the final adapter/DONE upload. So forced commits are additionally throttled to at most one
-# per _HB_FORCE_MIN_INTERVAL_S -- but the floor is measured from the last FORCED commit
-# (_HB_LAST_FORCED_UPLOAD), not any upload, so a force still punches through IMMEDIATELY after an
-# unrelated (liveness / mid-step) commit stole the slot carrying a stale step (exactly when force is
-# needed). Net: when steps are farther apart than the floor (the normal teacher-round-trip-gated regime)
-# every distinct step still commits exactly once (exact cancel-billing preserved); only a sub-floor BURST
-# is coalesced, bounding the cancel under-bill to one floor-window of steps while keeping forced commits
-# under the HF cap (codex[bot]).
+# forced commits are additionally limited to one per _HB_FORCE_MIN_INTERVAL_S so a tiny fast opd run
+# cannot exhaust the hf commit cap. the floor is measured from the last forced commit, not any upload,
+# so an unrelated liveness commit cannot suppress the next required step or sample payload.
 _HB_LAST_FORCED_UPLOAD = 0.0
 _HB_FORCE_MIN_INTERVAL_S = 60.0
 # Setup liveness is the user-visible signal during cold model download/load. Keep it below common

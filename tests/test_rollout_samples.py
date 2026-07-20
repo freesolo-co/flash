@@ -67,16 +67,18 @@ def test_build_rollout_sample_redacts_completion_secret_without_truncating(monke
 def test_build_rollout_sample_neutralizes_terminal_control_characters() -> None:
     sample = build_rollout_sample(
         "line one\rrewrite\nline two\tindented",
-        "answer\x1b[2J\nnext\x00done\x7f",
+        "answer\x1b[2J\x9b2J\nnext\x00done\x7f",
         reward=1.0,
         generated_at_step=1,
     )
 
     assert sample["prompt_tail"] == "line one\\x0drewrite\nline two\\x09indented"
-    assert sample["completion"] == "answer\\x1b[2J\nnext\\x00done\\x7f"
+    assert sample["completion"] == "answer\\x1b[2J\\x9b2J\nnext\\x00done\\x7f"
     for field in ("prompt_tail", "completion"):
-        assert all(char == "\n" or ord(char) >= 0x20 for char in sample[field])
-        assert "\x7f" not in sample[field]
+        assert all(
+            char == "\n" or 0x20 <= ord(char) < 0x7F or ord(char) >= 0xA0
+            for char in sample[field]
+        )
 
 
 def test_build_rollout_sample_carries_loss_scalar_for_opd() -> None:

@@ -152,26 +152,20 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             if stage in _HB_TIGHT_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
-            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above) when
-            # THIS heartbeat's payload must be the one on record and a throttled drop would leave a STALE
-            # value committed -- opd's post-optimizer-step ping forces so a mid-step progress ping
-            # (carrying the previous opt_steps) that just claimed the slot can't suppress the stepped
-            # commit (else a cancel is billed from the stale step). Force is gated on STEP ADVANCE (this
-            # payload's ``step`` exceeds the last committed step) AND a per-force time floor measured from
-            # the last FORCED commit. The floor throttles only a SUB-FLOOR BURST of step advances (a
-            # tiny/fast OPD config landing many optimizer updates per minute, which unthrottled would blow
-            # the HF per-repo commit cap before the final adapter/DONE upload, codex[bot]); because the
-            # floor keys off the last forced commit -- not the last upload of any kind -- a force still
-            # punches through IMMEDIATELY after a liveness/mid-step ping stole the slot, and steps spaced
-            # farther apart than the floor (the normal teacher-round-trip-gated regime) each still commit
-            # exactly once, so a cancel there still bills the true latest step. The bounded cost is that a
-            # cancel DURING a sub-floor burst under-bills by up to one floor-window of steps -- acceptable
-            # (it favours the customer) and unavoidable once steps outrun the commit cap.
+            # ``force`` bypasses the per-stage throttle when this payload must be on record. it normally
+            # requires a step advance, but a sample-bearing payload may match the committed step because
+            # the liveness daemon can commit that step first without the samples. the per-force floor still
+            # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
+            # not arm the floor and therefore cannot suppress the first sample-bearing payload.
             if force and not upload_due:
                 fstep = kw.get("step")
+                has_samples = bool(kw.get("sampled_completions"))
+                force_step_due = isinstance(fstep, (int, float)) and (
+                    fstep > _w._HB_LAST_COMMITTED_STEP
+                    or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
+                )
                 if (
-                    isinstance(fstep, (int, float))
-                    and fstep > _w._HB_LAST_COMMITTED_STEP
+                    force_step_due
                     and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
                 ):
                     upload_due = True

@@ -46,7 +46,7 @@ def neutralize_control_chars(value: Any) -> str:
     text = str(value)
     return "".join(
         char
-        if char == "\n" or (ord(char) >= 0x20 and ord(char) != 0x7F)
+        if char == "\n" or 0x20 <= ord(char) < 0x7F or ord(char) >= 0xA0
         else f"\\x{ord(char):02x}"
         for char in text
     )
