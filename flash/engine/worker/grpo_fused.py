@@ -290,29 +290,6 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
                     "attention_mask": attention_mask[start:end],
                     "use_cache": False,
                 }
-                if pixel_values is not None:
-                    if image_grid_thw is not None and num_images is not None:
-                        rows_per_image = image_grid_thw.prod(dim=-1)
-                        rows_per_sample = torch.split(rows_per_image, num_images)
-                        rows_per_sample = torch.stack([rows.sum() for rows in rows_per_sample])
-                        cumulative_rows = torch.cat(
-                            [torch.tensor([0], device=rows_per_sample.device), rows_per_sample.cumsum(0)]
-                        )
-                        row_start = int(cumulative_rows[start].item())
-                        row_end = int(cumulative_rows[end].item())
-                        image_counts = torch.tensor([0, *list(num_images)]).cumsum(0)
-                        image_start = int(image_counts[start].item())
-                        image_end = int(image_counts[end].item())
-                        model_inputs["pixel_values"] = pixel_values[row_start:row_end]
-                        model_inputs["image_grid_thw"] = image_grid_thw[image_start:image_end]
-                    elif image_position_ids is not None and num_images is not None:
-                        image_counts = torch.tensor([0, *list(num_images)]).cumsum(0)
-                        image_start = int(image_counts[start].item())
-                        image_end = int(image_counts[end].item())
-                        model_inputs["pixel_values"] = pixel_values[image_start:image_end]
-                        model_inputs["image_position_ids"] = image_position_ids[image_start:image_end]
-                    else:
-                        model_inputs["pixel_values"] = pixel_values[start:end]
                 for name, value in (
                     ("pixel_attention_mask", pixel_attention_mask),
                     ("image_sizes", image_sizes),
@@ -346,8 +323,8 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
     return ChalkGRPOTrainer
 
 
-def resolve_chalk_grpo_trainer(base_trainer, model_id: str):
-    if model_id not in _VALIDATED_MODEL_IDS:
+def resolve_chalk_grpo_trainer(base_trainer, model_id: str, *, model_revision: str = ""):
+    if model_revision or model_id not in _VALIDATED_MODEL_IDS:
         return base_trainer, False
     runtime = probe_chalk_grpo()
     if runtime is None:

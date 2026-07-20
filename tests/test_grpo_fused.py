@@ -75,6 +75,25 @@ def test_resolve_chalk_grpo_trainer_rejects_unvalidated_model_before_probe(monke
     assert trainer_class is BaseTrainer
 
 
+def test_resolve_chalk_grpo_trainer_rejects_pinned_revision_before_probe(monkeypatch):
+    class BaseTrainer:
+        pass
+
+    def unexpected_probe():
+        raise AssertionError("pinned revisions must not probe or engage the fused path")
+
+    monkeypatch.setattr("flash.engine.worker.grpo_fused.probe_chalk_grpo", unexpected_probe)
+
+    trainer_class, fused = resolve_chalk_grpo_trainer(
+        BaseTrainer,
+        "Qwen/Qwen3.5-0.8B",
+        model_revision="0123456789abcdef",
+    )
+
+    assert fused is False
+    assert trainer_class is BaseTrainer
+
+
 def test_resolve_chalk_grpo_trainer_engages_validated_runtime(monkeypatch):
     class BaseTrainer:
         pass

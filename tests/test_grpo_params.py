@@ -887,6 +887,21 @@ def test_run_rl_sizes_from_the_chalk_grpo_feature_gate() -> None:
 
     sizer = next((n for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_sizer(n)), None)
     assert sizer is not None, "run_rl no longer calls rl_per_device_comps"
+    resolver = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "resolve_chalk_grpo_trainer"
+        ),
+        None,
+    )
+    assert resolver is not None, "run_rl no longer resolves the Chalk GRPO trainer"
+    revision_kw = next((k for k in resolver.keywords if k.arg == "model_revision"), None)
+    assert revision_kw is not None
+    assert isinstance(revision_kw.value, ast.Name)
+    assert revision_kw.value.id == "model_revision"
     fused_kw = next((k for k in sizer.keywords if k.arg == "fused_logits"), None)
     assert fused_kw is not None, "rl_per_device_comps call no longer passes fused_logits"
     assert isinstance(fused_kw.value, ast.Name)

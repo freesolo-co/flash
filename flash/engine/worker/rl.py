@@ -76,7 +76,10 @@ def run_rl():
     )
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(GRPOTrainer, model_id)
+    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(
+        GRPOTrainer, model_id, model_revision=model_revision
+    )
     if _chalk_grpo_fused:
         print("[rl] Chalk GRPO selected-token log-probabilities active (eager, no full logits)")
     else:
@@ -84,7 +87,6 @@ def run_rl():
             "[rl] Chalk GRPO unavailable, unsupported, or failed its probe; "
             "using TRL full-logits fallback"
         )
-    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     download_seconds = (
         _w.prefetch_model(model_id, revision=model_revision)
         if model_revision
