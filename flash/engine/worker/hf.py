@@ -7,7 +7,6 @@ monkeypatch.setattr(worker, ...) takes effect in tests.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import shutil
@@ -16,6 +15,11 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 from flash.diagnostics import sanitize_diagnostic
@@ -267,6 +271,9 @@ _DEBUG_UPLOAD_LOCK = threading.Lock()
 
 def _copy_snapshot_file(source: str, destination: str) -> str:
     """reflink a file when supported, otherwise make an independent copy."""
+    if fcntl is None:
+        shutil.copy2(source, destination, follow_symlinks=False)
+        return destination
     try:
         with open(source, "rb") as src, open(destination, "wb") as dst:
             fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())

@@ -249,6 +249,18 @@ def test_optional_flush_preserves_terminal_deadline_reserve(upload_worker, monke
     assert result == [False]
 
 
+def test_copy_snapshot_falls_back_without_fcntl(monkeypatch, tmp_path):
+    from flash.engine.worker import hf as worker_hf
+
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"snapshot")
+    monkeypatch.setattr(worker_hf, "fcntl", None)
+
+    assert worker_hf._copy_snapshot_file(str(source), str(destination)) == str(destination)
+    assert destination.read_bytes() == b"snapshot"
+
+
 def test_single_slot_coalesces_pending_uploads_in_order(tmp_path):
     from flash.engine.worker.hf import _SingleSlotUploader
 
