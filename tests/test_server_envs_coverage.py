@@ -381,11 +381,19 @@ def test_recover_deployments_fails_stale_and_skips_fresh_and_missing(monkeypatch
     assert "control-plane restart" in failed["error"]
 
 
-def _smoke_spec(*, thinking: bool, constraint: dict | None = None):
+def _smoke_spec(
+    *,
+    thinking: bool,
+    constraint: dict | None = None,
+    max_completion_tokens: int | None = None,
+):
     return types.SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
         thinking=thinking,
         train=types.SimpleNamespace(
-            structured_outputs="" if constraint is None else json.dumps(constraint)
+            max_completion_tokens=max_completion_tokens,
+            structured_outputs="" if constraint is None else json.dumps(constraint),
         ),
     )
 
@@ -449,6 +457,19 @@ def test_run_deployment_smoke_uses_only_trusted_fixed_prompt(monkeypatch):
     assert calls[0]["expected_checkpoint"] == "run-1"
     assert calls[0]["timeout_s"] <= 10.0
     assert calls[0]["retry_unavailable"] is True
+
+
+def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response('<think>reasoning</think>{"answer":"4"}')
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    _run_smoke(_smoke_spec(thinking=True, constraint={"json_object": True}))
+
+    assert calls[0]["max_tokens"] == 1536
 
 
 def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):

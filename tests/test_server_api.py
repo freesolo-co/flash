@@ -216,6 +216,82 @@ def test_missing_or_malformed_schema_metadata_does_not_change_parser_acceptance(
         assert "train_schema_compatibility" not in response.json()
 
 
+def test_dry_run_rejects_semantically_invalid_thinking_json_schema(api, monkeypatch) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "submit_job",
+        lambda *_a, **_k: pytest.fail("invalid serving config must fail before submission"),
+    )
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "structured_outputs": {"json": {"type": 7}},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "train.structured_outputs JSON schema is invalid" in response.json()["detail"]
+
+
+def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "max_context_tokens": 1024,
+            "max_completion_tokens": 32513,
+            "structured_outputs": {"choice": ["4"]},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "effective budget (32513) cannot fit" in detail
+    assert "serving max_model_len=32768" in detail
+    assert "lower train.max_completion_tokens to <= 32512" in detail
+
+
+def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "structured_outputs": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
+
+
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
     import flash.server.routes.runs as runs_route
     from flash.schema import train_schema_metadata

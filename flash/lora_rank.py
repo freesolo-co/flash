@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from flash.catalog import serving_lora_rank_cap
+from flash.catalog import serving_context_cap, serving_lora_rank_cap
 
 if TYPE_CHECKING:
     from flash.spec import JobSpec
@@ -330,13 +330,36 @@ def preflight_init_adapter_lora_rank(
     )
 
 
-def preflight_train_context_within_serving(spec: JobSpec) -> None:
-    """Reject a run whose training context exceeds the model's serving ``max_model_len``."""
-    from flash.catalog import serving_context_cap
+def serving_completion_token_capacity(spec: JobSpec, *, prompt_allowance: int) -> int | None:
+    """Return completion tokens available after reserving serving prompt context."""
+    cap = serving_context_cap(spec.model)
+    if cap is None:
+        return None
+    return max(0, cap - max(0, int(prompt_allowance)))
+
+
+def preflight_train_context_within_serving(
+    spec: JobSpec,
+    *,
+    completion_tokens: int | None = None,
+    prompt_allowance: int = 0,
+) -> None:
+    """Reject a run whose training or completion context exceeds serving ``max_model_len``."""
     from flash.engine.vram import grpo_rollout_seq_len
 
     cap = serving_context_cap(spec.model)
     if cap is None:
+        return
+    if completion_tokens is not None:
+        capacity = serving_completion_token_capacity(spec, prompt_allowance=prompt_allowance)
+        assert capacity is not None
+        if completion_tokens > capacity:
+            raise ValueError(
+                f"train.max_completion_tokens effective budget ({completion_tokens}) cannot fit "
+                f"{spec.model}'s serving max_model_len={cap} after reserving {prompt_allowance} "
+                f"tokens for the serving prompt; lower train.max_completion_tokens to <= "
+                f"{capacity}."
+            )
         return
     if spec.algorithm == "grpo":
         effective = grpo_rollout_seq_len(

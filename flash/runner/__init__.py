@@ -950,6 +950,11 @@ def prepare_job(
     spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
+    from flash.lora_rank import preflight_train_context_within_serving
+    from flash.serve.preflight import preflight_serving_path
+
+    preflight_serving_path(spec)
+    preflight_train_context_within_serving(spec)
     if spec.gpu.provider or spec.gpu.exact_type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for
@@ -984,9 +989,7 @@ def prepare_job(
         token=os.environ.get("HF_TOKEN"),
     )
     from flash.cost.spec import estimate_for_spec
-    from flash.lora_rank import preflight_train_context_within_serving
 
-    preflight_train_context_within_serving(worker_spec)
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
     return PreparedJob(
         public_spec=public_spec,

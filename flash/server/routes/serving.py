@@ -23,6 +23,7 @@ from referencing import Registry
 from referencing.exceptions import NoSuchResource, Unresolvable
 
 from flash.engine.structured_outputs import parse_structured_outputs
+from flash.lora_rank import serving_completion_token_capacity
 from flash.runner import (
     adapter_prefix,
     effective_spec_from_status,
@@ -42,6 +43,10 @@ from flash.serve.deploy import (
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,
+)
+from flash.serve.preflight import (
+    SERVING_PROMPT_TOKEN_ALLOWANCE,
+    resolve_effective_completion_tokens,
 )
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
@@ -427,6 +432,12 @@ def _run_deployment_smoke(
     deadline = started + budget_s
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
+    max_tokens = max(256, resolve_effective_completion_tokens(spec))
+    serving_capacity = serving_completion_token_capacity(
+        spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
+    )
+    if serving_capacity is not None:
+        max_tokens = min(max_tokens, serving_capacity)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -438,7 +449,7 @@ def _run_deployment_smoke(
                     run_id=serving_model,
                     messages=[{"role": "user", "content": _SMOKE_PROMPT}],
                     temperature=0.0,
-                    max_tokens=256,
+                    max_tokens=max_tokens,
                     thinking=spec.thinking,
                     expected_checkpoint=expected_checkpoint,
                     timeout_s=timeout_s,
