@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
@@ -22,20 +25,30 @@ from flash.serve.urls import openai_base_url, serving_control_url
 logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
-READBACK_DELAY_SECONDS = 2.0
+READBACK_DELAY_SECONDS = 0.5
+READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 class ServingError(RuntimeError):
     """Serving backend rejected a request or was unreachable; carries the upstream status."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class ActivationOutcomeUnknown(ServingError):
@@ -100,6 +113,27 @@ def _is_hf_not_found_error(exc: Exception) -> bool:
     return getattr(getattr(exc, "response", None), "status_code", None) == 404
 
 
+def _http_client() -> httpx.Client:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(follow_redirects=True, max_redirects=100)
+    return _HTTP_CLIENT
+
+
+def _close_http_client() -> None:
+    global _HTTP_CLIENT
+    with _HTTP_CLIENT_LOCK:
+        client = _HTTP_CLIENT
+        _HTTP_CLIENT = None
+    if client is not None:
+        client.close()
+
+
+atexit.register(_close_http_client)
+
+
 def _serving_request(
     method: str,
     url: str,
@@ -115,7 +149,7 @@ def _serving_request(
     if json is not None:
         kwargs["json"] = json
     try:
-        resp = getattr(httpx, method.lower())(url, **kwargs)
+        resp = _http_client().request(method, url, **kwargs)
         if resp.status_code in ok_statuses:
             return resp
         resp.raise_for_status()
@@ -146,7 +180,9 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
             " — the serving backend is unavailable or has no engine for this base model; "
             "an operator must check the freesolo serving deployment"
         )
-    return ServingError(msg, status_code=status)
+    headers = getattr(resp, "headers", {}) if resp is not None else {}
+    retry_after = headers.get("Retry-After")
+    return ServingError(msg, status_code=status, retry_after=retry_after)
 
 
 def serving_base_url() -> str:
@@ -313,31 +349,40 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
         raise ServingError(
             "could not verify adapter rank: huggingface_hub is not installed"
         ) from exc
-    try:
-        local = hf_hub_download(
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        config_future = executor.submit(
+            hf_hub_download,
             repo_id=hf_repo,
             filename=filename,
             repo_type="dataset",
             revision=hf_revision,
             token=os.environ.get("HF_TOKEN"),
         )
-    except Exception as exc:
-        message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-        if _is_hf_not_found_error(exc):
-            raise AdapterConfigMissing(message) from exc
-        raise ServingError(message) from exc
-    try:
-        with open(local, encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception as exc:
-        raise ValueError(
-            f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
-        ) from exc
-    if not isinstance(config, dict):
-        raise ValueError(
-            f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
+        tensors_future = executor.submit(
+            _verify_adapter_artifact_tensors,
+            hf_repo,
+            subfolder,
+            hf_revision=hf_revision,
         )
-    _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
+        try:
+            local = config_future.result()
+        except Exception as exc:
+            message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
+            if _is_hf_not_found_error(exc):
+                raise AdapterConfigMissing(message) from exc
+            raise ServingError(message) from exc
+        try:
+            with open(local, encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as exc:
+            raise ValueError(
+                f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
+            ) from exc
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
+            )
+        tensors_future.result()
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
@@ -455,8 +500,10 @@ def _adapter_url(adapter_id: str) -> str:
     return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
 
 
-def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
-    """Read one authoritative adapter record, including disabled records."""
+def _registered_adapter_response(
+    adapter_id: str, *, timeout_s: float | None = None
+) -> tuple[dict | None, httpx.Response]:
+    """Read one authoritative adapter record and retain its polling headers."""
     resp = _serving_request(
         "GET",
         _adapter_url(adapter_id),
@@ -464,7 +511,7 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
         timeout_s=timeout_s,
     )
     if resp.status_code == 404:
-        return None
+        return None, resp
     try:
         payload = resp.json()
     except ValueError as exc:
@@ -476,6 +523,12 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
     record = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else payload
     if not isinstance(record, dict):
         raise ServingError(f"serving returned no adapter record for {adapter_id}")
+    return record, resp
+
+
+def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
+    """Read one authoritative adapter record, including disabled records."""
+    record, _ = _registered_adapter_response(adapter_id, timeout_s=timeout_s)
     return record
 
 
@@ -570,6 +623,18 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     return advertised
 
 
+def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(delay) and delay >= 0:
+                return min(delay, READBACK_MAX_DELAY_SECONDS)
+    return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
+
+
 def _wait_revision_ready(
     revision: str,
     subfolder: str,
@@ -582,23 +647,30 @@ def _wait_revision_ready(
     last_state = "registered"
     last_read_error: ServingError | None = None
     first_read = True
+    attempt = 0
+    retry_after: str | None = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         if not first_read:
-            time.sleep(min(READBACK_DELAY_SECONDS, remaining))
+            delay = _readback_delay(attempt - 1, retry_after)
+            time.sleep(min(delay, remaining))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
         first_read = False
         try:
-            record = _registered_adapter(revision, timeout_s=remaining)
+            record, response = _registered_adapter_response(revision, timeout_s=remaining)
         except ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
             last_read_error = exc
+            retry_after = exc.retry_after
+            attempt += 1
             continue
+        retry_after = response.headers.get("Retry-After")
+        attempt += 1
         if time.monotonic() >= deadline:
             break
         if record is None:
@@ -836,8 +908,9 @@ def chat(
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
-    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=timeout) as client:
-        resp = client.post(f"{base}/chat/completions", json=body, headers=headers)
+    resp = _http_client().post(
+        f"{base}/chat/completions", json=body, headers=headers, timeout=timeout
+    )
     if retry_unavailable:
         retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
         if retryable_error is not None:
@@ -887,12 +960,13 @@ def chat_stream(
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
         "stream": True,
     }
-    with (
-        httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
-        client.stream(
-            "POST", f"{base}/chat/completions", json=body, headers=_internal_key_header()
-        ) as resp,
-    ):
+    with _http_client().stream(
+        "POST",
+        f"{base}/chat/completions",
+        json=body,
+        headers=_internal_key_header(),
+        timeout=30 * 60.0,
+    ) as resp:
         resp.raise_for_status()
         if "application/json" in resp.headers.get("content-type", ""):
             # client.stream() leaves body unread; must call resp.read() before .json().

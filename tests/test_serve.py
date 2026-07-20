@@ -20,6 +20,36 @@ _IMMUTABLE_SERVING_CAPABILITIES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _stub_shared_http_client(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            return getattr(deploy.httpx, method.lower())(url, **kwargs)
+
+        def post(self, url, **kwargs):
+            timeout = kwargs.pop("timeout", None)
+            client = deploy.httpx.Client(
+                follow_redirects=True,
+                max_redirects=100,
+                timeout=timeout,
+            )
+            return client.post(url, **kwargs)
+
+        def stream(self, method, url, **kwargs):
+            timeout = kwargs.pop("timeout", None)
+            client = deploy.httpx.Client(
+                follow_redirects=True,
+                max_redirects=100,
+                timeout=timeout,
+            )
+            return client.stream(method, url, **kwargs)
+
+    client = _Client()
+    monkeypatch.setattr(deploy, "_http_client", lambda: client)
+
+
 def _stub_adapter_config(
     monkeypatch,
     tmp_path,
@@ -759,14 +789,14 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        return outcome, types.SimpleNamespace(headers={})
 
     sleeps = []
-    monkeypatch.setattr(d, "_registered_adapter", fake_registered_adapter)
+    monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
     monkeypatch.setattr(d.time, "sleep", sleeps.append)
 
     assert d._wait_revision_ready(revision, ready["subfolder"]) == ready
-    assert sleeps == [d.READBACK_DELAY_SECONDS, d.READBACK_DELAY_SECONDS]
+    assert sleeps == [d._readback_delay(0), d._readback_delay(1)]
 
 
 def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
@@ -788,7 +818,7 @@ def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     monkeypatch.setattr(d, "READBACK_DELAY_SECONDS", 1.0)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", fake_sleep)
-    monkeypatch.setattr(d, "_registered_adapter", fake_registered_adapter)
+    monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
 
     with pytest.raises(d.ServingError, match="readiness could not be confirmed"):
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
@@ -820,14 +850,17 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
         assert adapter_id == registration_body["adapter_id"]
         assert timeout_s == d.REVISION_READY_BUDGET_SECONDS
         clock[0] += timeout_s
-        return {
-            **registration_body,
-            "metadata": {**registration_body["metadata"], "lifecycle_state": "ready"},
-        }
+        return (
+            {
+                **registration_body,
+                "metadata": {**registration_body["metadata"], "lifecycle_state": "ready"},
+            },
+            types.SimpleNamespace(headers={}),
+        )
 
     activations = []
     monkeypatch.setattr(d, "_serving_request", request)
-    monkeypatch.setattr(d, "_registered_adapter", registered)
+    monkeypatch.setattr(d, "_registered_adapter_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
         d,
