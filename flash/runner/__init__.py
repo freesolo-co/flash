@@ -696,7 +696,11 @@ def _deployment_targets_adapter(
     """return whether deployment may target this adapter, or none when the target is ambiguous."""
     from flash.schema import parse_adapter_revision
 
-    records = [deployment]
+    failed_inactive = (
+        deployment.get("state") == "failed"
+        and deployment.get("activation_outcome_unknown") is not True
+    )
+    records = [] if failed_inactive else [deployment]
     previous = deployment.get("previous_deployment")
     if previous is not None:
         if not isinstance(previous, dict):

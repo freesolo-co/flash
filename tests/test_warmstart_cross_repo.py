@@ -167,6 +167,15 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
             },
             id="unrelated-checkpoint-deployed",
         ),
+        pytest.param(
+            "done",
+            {
+                "state": "failed",
+                "adapter_revision": "source-run@final." + _REVISION,
+                "checkpoint_step": None,
+            },
+            id="failed-deploy",
+        ),
     ],
 )
 def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(
@@ -271,6 +280,42 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(
             20,
             True,
             id="reconciling-previous-target",
+        ),
+        pytest.param(
+            {
+                "state": "failed",
+                "adapter_revision": "source-run@step-20." + _REVISION,
+                "checkpoint_step": 20,
+            },
+            20,
+            False,
+            id="failed-target-inactive",
+        ),
+        pytest.param(
+            {
+                "state": "failed",
+                "adapter_revision": "source-run@step-40." + _REVISION,
+                "checkpoint_step": 40,
+                "previous_deployment": {
+                    "state": "ready",
+                    "adapter_revision": "source-run@step-20." + _REVISION,
+                    "checkpoint_step": 20,
+                },
+            },
+            20,
+            True,
+            id="failed-previous-target-active",
+        ),
+        pytest.param(
+            {
+                "state": "failed",
+                "activation_outcome_unknown": True,
+                "adapter_revision": "source-run@step-40." + _REVISION,
+                "checkpoint_step": 40,
+            },
+            40,
+            True,
+            id="failed-unknown-target-active",
         ),
     ],
 )
