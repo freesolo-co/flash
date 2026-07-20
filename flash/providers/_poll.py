@@ -224,6 +224,45 @@ def _format_heartbeat(hb: dict) -> str:
             if isinstance(value, (int, float)):
                 msg += f" {name}={value:.3f}"
     msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))
+    sample_lines: list[str] = []
+    rendered_samples = 0
+    samples = hb.get("sampled_completions")
+    if isinstance(samples, list):
+        for sample in samples:
+            if rendered_samples >= 4:
+                break
+            if not isinstance(sample, dict):
+                continue
+            prompt_tail = sample.get("prompt_tail")
+            completion = sample.get("completion")
+            if not isinstance(prompt_tail, str) or not isinstance(completion, str):
+                continue
+            try:
+                reward = float(sample.get("reward"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(reward):
+                continue
+            generated_at_step = sample.get("generated_at_step")
+            if generated_at_step is None:
+                step_suffix = ""
+            else:
+                try:
+                    step_suffix = f" step={int(generated_at_step)}"
+                except (TypeError, ValueError):
+                    continue
+            rendered_samples += 1
+            prompt_tail = prompt_tail[-500:]
+            completion = completion[:1012]
+            sample_lines.extend(
+                [
+                    f"  sample {rendered_samples} reward={reward:.3f}{step_suffix}",
+                    f"    prompt: {prompt_tail.replace(chr(10), chr(10) + '      ')}",
+                    f"    completion: {completion.replace(chr(10), chr(10) + '      ')}",
+                ]
+            )
+    if sample_lines:
+        msg += "\n" + "\n".join(sample_lines)
     return msg
 
 

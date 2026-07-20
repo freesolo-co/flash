@@ -40,6 +40,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rollout_samples import select_rollout_samples
 
 
 def grpo_under_ran(steps_run: int, steps: int) -> bool:
@@ -224,9 +225,11 @@ def run_rl():
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
     latest_named_metrics: dict[str, float] = {}
+    latest_samples: list[dict] = []
 
     def reward_fn(completions, **kwargs):
         latest_named_metrics.clear()
+        latest_samples.clear()
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
             return [float(r) for r in kwargs["reward"]]
@@ -248,35 +251,38 @@ def run_rl():
                 "the sampled completions; aborting rather than training on a shifted reward signal."
             )
         examples = [rollout_examples[int(i)] for i in example_idx]
+        prompts_kwarg = kwargs.get("prompts")
+        trainer_state = kwargs.get("trainer_state")
+        generated_at_step = getattr(trainer_state, "global_step", None)
         rewards = []
         breakdowns = []
-        debug_rows = []
+        sample_triples = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
+            is_message_completion = isinstance(comp, list)
+            scoring_failed = False
             try:
-                if isinstance(comp, list):
+                if is_message_completion:
                     # Conversational transcript (list of messages): score the whole transcript.
                     r = env.reward_from_messages(comp, ex)
-                    rewards.append(r)
-                    continue
-                graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
-                state = (
-                    {
-                        "raw": comp,
-                        "completion": graded,
-                        "thinking": _w.thinking_text(
-                            comp, prompt_opened_thinking=_prompt_opens_thinking
-                        ),
-                    }
-                    if _w.THINKING
-                    else None
-                )
-                breakdown = None
-                if hasattr(env, "scores_breakdown"):
-                    breakdown = env.scores_breakdown(graded, ex, state)
-                    r = float(breakdown.get("total", 0.0))
-                    breakdowns.append(breakdown)
                 else:
-                    r = env.reward(graded, ex, state)
+                    graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
+                    state = (
+                        {
+                            "raw": comp,
+                            "completion": graded,
+                            "thinking": _w.thinking_text(
+                                comp, prompt_opened_thinking=_prompt_opens_thinking
+                            ),
+                        }
+                        if _w.THINKING
+                        else None
+                    )
+                    if hasattr(env, "scores_breakdown"):
+                        breakdown = env.scores_breakdown(graded, ex, state)
+                        r = float(breakdown.get("total", 0.0))
+                        breakdowns.append(breakdown)
+                    else:
+                        r = env.reward(graded, ex, state)
             except Exception as _reward_exc:
                 # The user's env raised during scoring: score 0 rather than killing the run.
                 # Scoped to the env calls only — flash's own logic below stays outside.
@@ -285,33 +291,31 @@ def run_rl():
                     f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
                     flush=True,
                 )
-                rewards.append(0.0)
-                continue
-            if _think_penalty > 0 and _w.THINKING:
+                r = 0.0
+                scoring_failed = True
+            if (
+                not is_message_completion
+                and not scoring_failed
+                and _think_penalty > 0
+                and _w.THINKING
+            ):
                 # Gated on _prompt_opens_thinking so a template that ignores enable_thinking
                 # doesn't get its tagless answers counted as reasoning.
                 r -= _think_penalty * _w.think_token_count(
                     comp, tok, prompt_opened_thinking=_prompt_opens_thinking
                 )
             rewards.append(r)
-            if idx < 8:
-                debug_rows.append(
-                    {
-                        "ts": time.time(),
-                        "attempt": _w.ATTEMPT,
-                        "run_id": _w.RUN_ID,
-                        "mode": _w.RUN_MODE,
-                        "seed": _w.SEED,
-                        "reward": r,
-                        "breakdown": breakdown,
-                        "completion_prefix": str(comp or "")[:1000],
-                        "graded_prefix": str(graded or "")[:1000],
-                        "example_id": (ex or {}).get("id") if isinstance(ex, dict) else None,
-                        "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
-                    }
-                )
+            if isinstance(prompts_kwarg, (list, tuple)) and idx < len(prompts_kwarg):
+                prompt = prompts_kwarg[idx]
+            elif isinstance(ex, dict):
+                prompt = (ex or {}).get("input", "")
+            else:
+                prompt = ex
+            sample_triples.append((prompt, comp, r))
         latest_named_metrics.update(_mean_named_reward_metrics(breakdowns))
-        _w.upload_debug_jsonl("reward_debug.jsonl", debug_rows)
+        latest_samples.extend(
+            select_rollout_samples(sample_triples, generated_at_step=generated_at_step)
+        )
         return rewards
 
     from flash.engine.vram import resolve_params_b
@@ -614,7 +618,9 @@ def run_rl():
     # VL checkpoints roll out on the FULL multimodal engine (vision tower included) — the colocated
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
-    hb_cb = _w.make_reward_heartbeat_callback(lambda: dict(latest_named_metrics))
+    hb_cb = _w.make_reward_heartbeat_callback(
+        lambda: dict(latest_named_metrics), lambda: list(latest_samples)
+    )
     # Tool envs hand TRL the tool callables; pure multi-turn envs hand TRL a rollout_func.
     extra_trainer_kwargs: dict = {}
     tools = env.tools() if is_tool_env else []

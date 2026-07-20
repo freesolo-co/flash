@@ -10,7 +10,6 @@ import contextlib
 import json
 import os
 import shutil
-import threading
 import time
 
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
@@ -161,33 +160,6 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -
         required,
         "hf_upload_file",
     )
-
-
-_DEBUG_UPLOAD_LOCK = threading.Lock()
-
-
-def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
-    """Append bounded JSONL debug rows and upload as an optional artifact (best-effort)."""
-    if not rows or not _w.HF_REPO:
-        return
-    repo_name = os.path.basename(name if name.endswith(".jsonl") else f"{name}.jsonl")
-    path = os.path.join("/tmp", repo_name)
-    try:
-        with _DEBUG_UPLOAD_LOCK:
-            existing: list[str] = []
-            # open() is evaluated before suppress() context enters — use try/except, not suppress.
-            try:
-                with open(path) as f:
-                    existing = f.readlines()[-keep_last:]
-            except FileNotFoundError:
-                pass
-            with open(path, "w") as f:
-                f.writelines(existing)
-                for row in rows:
-                    f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
-            _w.hf_upload_file(path, repo_name)
-    except Exception as e:
-        print(f"debug upload warn ({repo_name}): {e}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:

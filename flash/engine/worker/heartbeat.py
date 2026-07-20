@@ -272,7 +272,46 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
     return dict(sorted(surviving.items())[:_REWARD_METRIC_LIMIT])
 
 
-def make_reward_heartbeat_callback(reward_metrics=None):
+def _bounded_sampled_completions(samples, limit: int = 4) -> list[dict]:
+    if not isinstance(samples, (list, tuple)):
+        return []
+    bounded_limit = max(0, min(int(limit), 4))
+    if bounded_limit == 0:
+        return []
+    bounded: list[dict] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        prompt_tail = sample.get("prompt_tail")
+        completion = sample.get("completion")
+        if not isinstance(prompt_tail, str) or not isinstance(completion, str):
+            continue
+        try:
+            reward = float(sample.get("reward"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(reward):
+            continue
+        generated_at_step = sample.get("generated_at_step")
+        if generated_at_step is not None:
+            try:
+                generated_at_step = int(generated_at_step)
+            except (TypeError, ValueError):
+                continue
+        bounded.append(
+            {
+                "prompt_tail": prompt_tail,
+                "completion": completion,
+                "reward": reward,
+                "generated_at_step": generated_at_step,
+            }
+        )
+        if len(bounded) >= bounded_limit:
+            break
+    return bounded
+
+
+def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
     """Return a TRL callback that streams per-step reward to the HF heartbeat channel."""
     from transformers import TrainerCallback
 
@@ -280,6 +319,7 @@ def make_reward_heartbeat_callback(reward_metrics=None):
         def __init__(self):
             self.reward_history = []
             self.last_gpu_diag_at = 0.0
+            self.sent_first_sample_heartbeat = False
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -302,9 +342,18 @@ def make_reward_heartbeat_callback(reward_metrics=None):
             bounded_metrics = _bounded_reward_metrics(latest_metrics)
             if bounded_metrics:
                 payload["reward_metrics"] = bounded_metrics
+            latest_samples = samples() if callable(samples) else samples
+            bounded_samples = _bounded_sampled_completions(latest_samples)
+            if bounded_samples:
+                payload["sampled_completions"] = bounded_samples
             now = time.monotonic()
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
-            _w.heartbeat("rl_step", **payload)
+            force_first_samples = bool(bounded_samples) and not self.sent_first_sample_heartbeat
+            if force_first_samples:
+                _w.heartbeat("rl_step", force=True, **payload)
+                self.sent_first_sample_heartbeat = True
+            else:
+                _w.heartbeat("rl_step", **payload)
 
     return _RewardHeartbeat()
 

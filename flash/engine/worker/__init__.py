@@ -82,7 +82,6 @@ from flash.engine.worker.hf import (
     prefetch_model,
     publish_deployable_checkpoint,
     publish_opd_optimizer_start_marker,
-    upload_debug_jsonl,
     upload_resume_checkpoint,
     write_base_model_provenance,
 )
@@ -530,7 +529,6 @@ __all__ = [
     "strip_think",
     "think_token_count",
     "thinking_text",
-    "upload_debug_jsonl",
     "upload_resume_checkpoint",
     "wait_for_gpu",
     "wandb_finish",
