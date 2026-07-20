@@ -1927,7 +1927,7 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
     assert status.error is None
 
 
-def test_fail_blocked_recovery_defers_pending_completed_metrics(monkeypatch, tmp_path):
+def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkeypatch, tmp_path):
     import flash.runner as runner
     import flash.runner.lifecycle as lifecycle
     import flash.server._runtime as runtime
@@ -1940,21 +1940,18 @@ def test_fail_blocked_recovery_defers_pending_completed_metrics(monkeypatch, tmp
             run_id=spec.run_id,
             state="provisioning",
             spec=spec.to_dict(),
-            created_at=100.0,
         ),
-        _run_deadline_at=86500.0,
         _next_attempt=1,
     )
     monkeypatch.setattr(
         runtime,
         "_handleless_completed_metrics",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("waiting for metrics.json")
+            lifecycle._CompletedAttemptPending("successful marker; waiting for metrics.json")
         ),
     )
 
     assert runtime._fail_blocked_recovery(spec, "recovery blocked") is False
-
     status = runner.get_status(spec.run_id)
     assert status.state == "provisioning"
     assert status.remote is None
