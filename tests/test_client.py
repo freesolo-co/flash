@@ -290,9 +290,13 @@ def test_chat_rejects_checkpoint_shorthand_without_request(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    with pytest.raises(ClientError, match="full immutable adapter revision"):
+    with pytest.raises(ClientError) as exc_info:
         client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
 
+    message = str(exc_info.value)
+    assert "flash deploy RUN_ID/step-N" in message
+    assert "flash chat RUN_ID" in message
+    assert "full immutable adapter revision" in message
     assert seen == {}
 
 
@@ -354,9 +358,13 @@ def test_chat_stream_rejects_checkpoint_shorthand_without_request(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    with pytest.raises(ClientError, match="full immutable adapter revision"):
+    with pytest.raises(ClientError) as exc_info:
         list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
 
+    message = str(exc_info.value)
+    assert "flash deploy RUN_ID/step-N" in message
+    assert "flash chat RUN_ID" in message
+    assert "full immutable adapter revision" in message
     assert seen == {}
 
 

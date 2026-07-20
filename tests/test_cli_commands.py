@@ -690,7 +690,10 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
 
 def test_chat_checkpoint_ref_is_rejected(fake_client, capsys) -> None:
     assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 1
-    assert "full immutable adapter revision" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "flash deploy RUN_ID/step-N" in error
+    assert "flash chat RUN_ID" in error
+    assert "full immutable adapter revision" in error
     assert not any(call[0] == "chat_stream" for call in fake_client.calls)
 
 

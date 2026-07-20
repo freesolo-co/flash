@@ -143,8 +143,10 @@ def _parse_chat_target(target: str) -> tuple[str, str | None]:
     run_id, step = parsed
     if step is not None:
         raise ClientError(
-            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
-            "run alias; use the full immutable adapter revision returned by flash deployments"
+            "RUN_ID/step-N names a checkpoint to deploy, not a chat target. Deploy it first "
+            "with `flash deploy RUN_ID/step-N`, then `flash chat RUN_ID` (the run alias now "
+            "points at that checkpoint) — or chat the full immutable adapter revision listed "
+            "by `flash deployments`."
         )
     return run_id, None
 
