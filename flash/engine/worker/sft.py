@@ -95,6 +95,14 @@ def _tokenizer_identity(tokenizer) -> str:
     else:
         get_vocab = getattr(tokenizer, "get_vocab", None)
         vocabulary = _stable_json(get_vocab() if callable(get_vocab) else {})
+    init_kwargs = getattr(tokenizer, "init_kwargs", {}) or {}
+    init_config = json.dumps(
+        init_kwargs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=repr,
+    )
     identity = {
         "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
         "name_or_path": str(getattr(tokenizer, "name_or_path", "") or ""),
@@ -103,6 +111,7 @@ def _tokenizer_identity(tokenizer) -> str:
         "truncation_side": str(getattr(tokenizer, "truncation_side", "right") or "right"),
         "add_bos_token": bool(getattr(tokenizer, "add_bos_token", False)),
         "add_eos_token": bool(getattr(tokenizer, "add_eos_token", False)),
+        "init_config_sha256": hashlib.sha256(init_config.encode()).hexdigest(),
         "vocabulary_sha256": hashlib.sha256(vocabulary.encode()).hexdigest(),
     }
     return hashlib.sha256(_stable_json(identity).encode()).hexdigest()
@@ -233,6 +242,9 @@ def _load_or_prepare_sft_dataset(
             return load_from_disk(str(dataset_dir)), True
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
+        for stale_temp_dir in root.glob(f".{fingerprint}.*"):
+            if stale_temp_dir.is_dir():
+                shutil.rmtree(stale_temp_dir)
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f".{fingerprint}.", dir=root))
         try:
@@ -397,6 +409,15 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         return c_hidden, c_layers
 
 
+def _select_indexed_sft_examples(train, max_examples, seed):
+    if max_examples > 0:
+        train = train[:max_examples]
+    indexed_train = list(enumerate(train))
+    rng = random.Random(seed)
+    rng.shuffle(indexed_train)
+    return indexed_train
+
+
 def select_sft_examples(train, max_examples, seed):
     """Pick the SFT sample: the first ``max_examples`` rows of the dataset (file order), shuffled.
 
@@ -405,11 +426,7 @@ def select_sft_examples(train, max_examples, seed):
     prompt-only (empty-output) GRPO rows after can cap SFT to the labeled head — an empty
     completion can never be shuffled into the SFT sample and teach the model to emit nothing.
     """
-    if max_examples > 0:
-        train = train[:max_examples]
-    rng = random.Random(seed)
-    rng.shuffle(train)
-    return train
+    return [example for _, example in _select_indexed_sft_examples(train, max_examples, seed)]
 
 
 def sft_completed_train_tokens(
@@ -479,8 +496,8 @@ def run_sft():
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
-        indexed_train = select_sft_examples(
-            list(enumerate(env.dataset())), int(_train_opt("max_examples", 0) or 0), _w.SEED
+        indexed_train = _select_indexed_sft_examples(
+            env.dataset(), int(_train_opt("max_examples", 0) or 0), _w.SEED
         )
         prefix_indices = [index for index, _ in indexed_train]
         train = [example for _, example in indexed_train]

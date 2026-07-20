@@ -28,6 +28,7 @@ class _TestTokenizer:
     def __init__(self, *, fail=False, require_rayon_disabled=False):
         self.all_special_ids = [0]
         self.special_tokens_map = {"eos_token": "<eos>"}
+        self.init_kwargs = {"do_lower_case": False}
         self.fail = fail
         self.require_rayon_disabled = require_rayon_disabled
 
@@ -198,6 +199,34 @@ def test_single_process_map_preserves_parent_tokenizer_parallelism(tmp_path, mon
     assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
 
 
+def test_stale_temp_cache_is_removed_before_retry(tmp_path):
+    fingerprint = "f" * 64
+    stale_temp_dir = tmp_path / f".{fingerprint}.orphan"
+    stale_temp_dir.mkdir()
+    (stale_temp_dir / "map.arrow").write_bytes(b"stale")
+    env = _ParentOnlyEnv()
+    examples = [
+        {
+            "input": "alpha",
+            "completion": [{"role": "assistant", "content": "one"}],
+        }
+    ]
+    records, _ = _normalize_sft_records(env, examples)
+
+    mapped, cache_hit = sft_mod._load_or_prepare_sft_dataset(
+        records,
+        _TestTokenizer(),
+        fingerprint=fingerprint,
+        max_length=256,
+        thinking=False,
+        cache_root=tmp_path,
+    )
+
+    assert mapped.to_list()
+    assert cache_hit is False
+    assert not stale_temp_dir.exists()
+
+
 def test_interrupted_map_never_publishes_a_partial_cache(tmp_path):
     env = _ParentOnlyEnv()
     tokenizer = _TestTokenizer(fail=True)
@@ -251,6 +280,10 @@ def test_tokenizer_identity_covers_behavior_affecting_runtime_settings():
 
     changed.truncation_side = "right"
     changed.add_eos_token = True
+    assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
+
+    changed.add_eos_token = False
+    changed.init_kwargs["do_lower_case"] = True
     assert _tokenizer_identity(changed) != _tokenizer_identity(baseline)
 
 

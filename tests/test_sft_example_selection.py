@@ -30,6 +30,21 @@ def test_selection_is_seed_deterministic_but_still_shuffled():
     assert a != list(range(50))  # ...but shuffled for training
 
 
+def test_max_examples_slices_before_enumerating_the_dataset():
+    class PrefixOnlyDataset:
+        def __getitem__(self, index):
+            assert isinstance(index, slice)
+            assert index.start is None
+            assert index.step is None
+            return list(range(index.stop))
+
+        def __iter__(self):
+            raise AssertionError("full dataset must not be enumerated")
+
+    out = select_sft_examples(PrefixOnlyDataset(), 10, seed=3)
+    assert sorted(out) == list(range(10))
+
+
 def test_zero_or_unset_max_examples_keeps_the_full_dataset():
     rows = list(range(20))
     out = select_sft_examples(list(rows), 0, seed=3)
