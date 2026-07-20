@@ -148,12 +148,13 @@ def test_huggingface_hub_floor_is_in_lockstep():
     from flash.providers.runpod.train import WORKER_DEPS
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
-    docker_hf = next(
-        s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"
-    )
-    worker_hf = next(d for d in WORKER_DEPS if kf._pkg_name(d) == "huggingface_hub")
-    assert docker_hf == worker_hf, (
-        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf!r} vs WORKER_DEPS={worker_hf!r}; "
+    docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
+    worker_hf = [d for d in WORKER_DEPS if kf._pkg_name(d) == "huggingface_hub"]
+    # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
+    assert len(docker_hf) == 1, f"expected one huggingface_hub pin in Dockerfile.worker, found {docker_hf}"
+    assert len(worker_hf) == 1, f"expected one huggingface_hub pin in WORKER_DEPS, found {worker_hf}"
+    assert docker_hf[0] == worker_hf[0], (
+        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs WORKER_DEPS={worker_hf[0]!r}; "
         "bump both together so the baked image and the live-function path share the 429 retry floor"
     )
 
