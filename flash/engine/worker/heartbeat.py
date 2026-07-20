@@ -220,7 +220,12 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", snapshot)
+    console_payload = payload
+    if not payload_committed and payload.get("sampled_completions"):
+        console_payload = {
+            key: value for key, value in payload.items() if key != "sampled_completions"
+        }
+    print("HEARTBEAT", json.dumps(console_payload))
     return payload_committed
 
 

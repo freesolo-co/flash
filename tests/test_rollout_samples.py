@@ -81,6 +81,29 @@ def test_build_rollout_sample_neutralizes_terminal_control_characters() -> None:
         )
 
 
+def test_build_rollout_sample_replaces_non_text_multimodal_parts() -> None:
+    image_data = "image-base64-payload" * 100
+    audio_data = "audio-base64-payload" * 100
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe the media"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                {"type": "input_audio", "input_audio": {"data": audio_data}},
+                {"type": "tool_result", "payload": {"opaque": "do-not-log"}},
+            ],
+        }
+    ]
+
+    sample = build_rollout_sample(prompt, "answer", reward=1.0, generated_at_step=1)
+
+    assert sample["prompt_tail"] == ("user: describe the media\n<image>\n<audio>\n<non-text>")
+    assert image_data not in sample["prompt_tail"]
+    assert audio_data not in sample["prompt_tail"]
+    assert "do-not-log" not in sample["prompt_tail"]
+
+
 def test_build_rollout_sample_carries_loss_scalar_for_opd() -> None:
     sample = build_rollout_sample("prompt", "student answer", loss=0.4213, generated_at_step=3)
 
@@ -242,6 +265,40 @@ def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -
 
     assert worker.heartbeat("rl_step", step=1, force=True) is False
     assert worker.heartbeat("rl_step", step=1, force=True) is True
+
+
+def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> None:
+    import flash.engine.worker as worker
+
+    monkeypatch.setattr(worker, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 1000.0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 1)
+    monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    heartbeat_module = importlib.import_module("flash.engine.worker.heartbeat")
+    monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
+
+    committed = worker.heartbeat(
+        "rl_step",
+        step=2,
+        sampled_completions=[
+            {
+                "prompt_tail": "prompt-that-must-not-print",
+                "completion": "completion-that-must-not-print",
+                "reward": 1.0,
+                "generated_at_step": 2,
+            }
+        ],
+    )
+
+    console = capsys.readouterr().out
+    assert committed is False
+    assert '"step": 2' in console
+    assert "sampled_completions" not in console
+    assert "prompt-that-must-not-print" not in console
+    assert "completion-that-must-not-print" not in console
 
 
 def test_format_heartbeat_renders_reward_samples_after_reward_metrics() -> None:

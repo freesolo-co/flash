@@ -1,10 +1,10 @@
 """Credential-safe rollout samples (full, untruncated) for heartbeat diagnostics.
 
 A "sample" is one on-policy generation surfaced so a user can SEE what the model produced on a logged
-training step (GRPO carries the scored ``reward``; OPD carries the distillation ``loss``). Completions
-and prompts are shown in full — the only transformation is credential redaction and terminal
-control-character neutralization, never length truncation. Sizes are already bounded by the training
-config (``max_completion_tokens`` / the prompt budget), so full text stays sane on the wire.
+training step (GRPO carries the scored ``reward``; OPD carries the distillation ``loss``). Text content
+is shown in full with credential redaction and terminal control-character neutralization; non-text
+multimodal parts are replaced with placeholders. Sizes are already bounded by the training config
+(``max_completion_tokens`` / the prompt budget), so full text stays sane on the wire.
 """
 
 from __future__ import annotations
@@ -21,19 +21,55 @@ _SAMPLE_LIMIT = 3
 _SAMPLE_SCALARS = ("reward", "loss")
 
 
-def _sample_text(value: Any) -> str:
+def _content_part_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return "<non-text>"
+
+    part_type = str(value.get("type") or "").strip().lower()
+    text = value.get("text")
+    if part_type in {"text", "input_text", "output_text"} or (
+        not part_type and isinstance(text, str)
+    ):
+        return text if isinstance(text, str) else ""
+    if "image" in part_type:
+        return "<image>"
+    if "audio" in part_type:
+        return "<audio>"
+    if "video" in part_type:
+        return "<video>"
+    return "<non-text>"
+
+
+def _content_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            if isinstance(item, dict) and "content" in item:
-                role = str(item.get("role") or "").strip()
-                content = str(item.get("content") or "")
-                parts.append(f"{role}: {content}" if role else content)
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
+        return "\n".join(_content_part_text(part) for part in value)
+    if isinstance(value, dict):
+        return _content_part_text(value)
+    return str(value or "")
+
+
+def _message_text(value: dict[str, Any]) -> str:
+    role = str(value.get("role") or "").strip()
+    content = _content_text(value.get("content"))
+    return f"{role}: {content}" if role else content
+
+
+def _sample_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return _message_text(value) if "content" in value else _content_part_text(value)
+    if isinstance(value, list):
+        return "\n".join(
+            _message_text(item)
+            if isinstance(item, dict) and "content" in item
+            else _content_part_text(item)
+            for item in value
+        )
     return str(value or "")
 
 
