@@ -485,6 +485,17 @@ def _submit_seed_supervised(
         _gc_seen_endpoints()
         return _RunCancelled(f"run {spec.run_id} was cancelled")
 
+    def _return_completed_runpod_metrics(metrics: dict) -> dict:
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+        _gc_seen_endpoints()
+        if current_gpu.get("name"):
+            metrics.setdefault("allocated_gpu", current_gpu["name"])
+        return metrics
+
     max_retries = int(spec.gpu.max_retries)
     infra_budget = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
     last_detail = None
@@ -519,10 +530,7 @@ def _submit_seed_supervised(
                 deadline_at=_load_run_deadline_at(spec.run_id),
             )
             if completed_metrics is not None:
-                _gc_seen_endpoints()
-                if current_gpu.get("name"):
-                    completed_metrics.setdefault("allocated_gpu", current_gpu["name"])
-                return completed_metrics
+                return _return_completed_runpod_metrics(completed_metrics)
             resource_deleted = False
             teardown_error: Exception | None = None
             try:
@@ -765,10 +773,7 @@ def _submit_seed_supervised(
             deadline_at=_load_run_deadline_at(spec.run_id),
         )
         if completed_metrics is not None:
-            _gc_seen_endpoints()
-            if current_gpu.get("name"):
-                completed_metrics.setdefault("allocated_gpu", current_gpu["name"])
-            return completed_metrics
+            return _return_completed_runpod_metrics(completed_metrics)
         last_detail = f"{res.failure}: {res.detail}"
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
