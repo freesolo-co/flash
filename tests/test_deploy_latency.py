@@ -5,6 +5,8 @@ import sys
 import threading
 import types
 
+import pytest
+
 
 def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
     import flash.serve.deploy as deploy
@@ -175,23 +177,20 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     assert sleeps == [1.25, 2.0]
 
 
-def test_adapter_preflight_fetches_config_and_tensors_concurrently(monkeypatch, tmp_path):
+def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, tmp_path):
     import flash.serve.deploy as deploy
 
     config_path = tmp_path / "adapter_config.json"
     config_path.write_text(json.dumps({"r": 32}), encoding="utf-8")
-    barrier = threading.Barrier(2, timeout=2.0)
-    started = []
+    calls = []
 
-    def hf_hub_download(**kwargs):
-        started.append("config")
-        barrier.wait()
+    def hf_hub_download(**_kwargs):
+        calls.append("config")
         return str(config_path)
 
     class _HfApi:
         def list_repo_tree(self, **kwargs):
-            started.append("tensors")
-            barrier.wait()
+            calls.append("tensors")
             subfolder = kwargs["path_in_repo"]
             return [
                 types.SimpleNamespace(
@@ -214,60 +213,124 @@ def test_adapter_preflight_fetches_config_and_tensors_concurrently(monkeypatch, 
         )
         == 32
     )
-    assert set(started) == {"config", "tensors"}
+    assert calls == ["config", "tensors"]
 
 
-def test_adapter_preflight_config_failure_does_not_wait_for_tensors(monkeypatch):
+def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypatch):
     import flash.serve.deploy as deploy
 
-    tensor_started = threading.Event()
-    release_tensor = threading.Event()
-    result_ready = threading.Event()
-    background_exception_consumed = threading.Event()
-    result = {}
+    tensor_started = False
 
     def hf_hub_download(**_kwargs):
-        assert tensor_started.wait(1.0)
         raise RuntimeError("config failed")
 
     class _HfApi:
         def list_repo_tree(self, **_kwargs):
-            tensor_started.set()
-            assert release_tensor.wait(2.0)
-            raise RuntimeError("tensor failed")
+            nonlocal tensor_started
+            tensor_started = True
+            return []
 
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
         types.SimpleNamespace(hf_hub_download=hf_hub_download, HfApi=_HfApi),
     )
-    original_consume = deploy._consume_future_exception
 
-    def consume_future_exception(future):
-        original_consume(future)
-        background_exception_consumed.set()
+    with pytest.raises(deploy.ServingError, match="failed to read org/repo"):
+        deploy.adapter_artifact_lora_rank(
+            "org/repo",
+            "sft/run-1/seed0/adapter",
+            hf_revision="a" * 40,
+        )
 
-    monkeypatch.setattr(deploy, "_consume_future_exception", consume_future_exception)
+    assert tensor_started is False
 
-    def run_preflight():
-        try:
-            deploy.adapter_artifact_lora_rank(
-                "org/repo",
-                "sft/run-1/seed0/adapter",
-                hf_revision="a" * 40,
-            )
-        except Exception as exc:
-            result["error"] = exc
-        finally:
-            result_ready.set()
 
-    caller = threading.Thread(target=run_preflight)
-    caller.start()
-    completed_before_tensor_release = result_ready.wait(0.5)
-    release_tensor.set()
-    caller.join(timeout=2.0)
+def test_zero_retry_after_uses_positive_readiness_backoff(monkeypatch):
+    import flash.serve.deploy as deploy
 
-    assert completed_before_tensor_release
-    assert isinstance(result["error"], deploy.ServingError)
-    assert "failed to read org/repo" in str(result["error"])
-    assert background_exception_consumed.wait(1.0)
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.5)
+    assert deploy._readback_delay(0, "0") == 0.5
+
+
+def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    revision = "run-1@final." + "a" * 40
+    previous = "run-1@final." + "b" * 40
+    aliases = [
+        {"metadata": {"alias_of": previous}},
+        {"metadata": {"alias_of": previous}},
+        {"metadata": {"alias_of": revision}, "updated_at": "2026-07-20T00:00:00Z"},
+    ]
+    sleeps = []
+
+    def fail_activation(*_args, **_kwargs):
+        raise deploy.ServingError("activation response lost")
+
+    monkeypatch.setattr(deploy, "_serving_request", fail_activation)
+    monkeypatch.setattr(deploy, "_registered_adapter", lambda _run_id: aliases.pop(0))
+    monkeypatch.setattr(deploy.time, "sleep", sleeps.append)
+
+    result = deploy._activate_revision(
+        "run-1",
+        revision,
+        "run-1/step-10",
+        expected_adapter_revision=previous,
+    )
+
+    assert result["target_adapter_revision"] == revision
+    assert sleeps == [
+        deploy.ACTIVATION_READBACK_DELAY_SECONDS,
+        deploy.ACTIVATION_READBACK_DELAY_SECONDS,
+    ]
+
+
+def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    created = []
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": []}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            created.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(deploy.httpx, "Client", _Client)
+    monkeypatch.setattr(
+        deploy,
+        "_http_client",
+        lambda: (_ for _ in ()).throw(AssertionError("smoke must not use shared client")),
+    )
+
+    assert deploy.chat(
+        "run-1@final." + "a" * 40,
+        [{"role": "user", "content": "hello"}],
+        timeout_s=1.0,
+        retry_unavailable=True,
+    ) == {"choices": []}
+    assert len(created) == 1
+    assert created[0].closed is True

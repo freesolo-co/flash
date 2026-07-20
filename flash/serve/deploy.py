@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import math
 import os
 import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
@@ -29,6 +29,7 @@ READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
+ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
@@ -84,11 +85,6 @@ class AdapterConfigMissing(ServingError):
 
 class AdapterTensorMissing(ServingError):
     """The adapter artifact has metadata but no loadable LoRA tensor file."""
-
-
-def _consume_future_exception(future: Future[None]) -> None:
-    if not future.cancelled():
-        future.exception()
 
 
 def _is_adapter_tensor_filename(filename: str) -> bool:
@@ -366,48 +362,31 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
         raise ServingError(
             "could not verify adapter rank: huggingface_hub is not installed"
         ) from exc
-    executor = ThreadPoolExecutor(max_workers=2)
-    config_future = executor.submit(
-        hf_hub_download,
-        repo_id=hf_repo,
-        filename=filename,
-        repo_type="dataset",
-        revision=hf_revision,
-        token=os.environ.get("HF_TOKEN"),
-    )
-    tensors_future = executor.submit(
-        _verify_adapter_artifact_tensors,
-        hf_repo,
-        subfolder,
-        hf_revision=hf_revision,
-    )
     try:
-        try:
-            local = config_future.result()
-        except Exception as exc:
-            message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-            if _is_hf_not_found_error(exc):
-                raise AdapterConfigMissing(message) from exc
-            raise ServingError(message) from exc
-        try:
-            with open(local, encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as exc:
-            raise ValueError(
-                f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
-            ) from exc
-        if not isinstance(config, dict):
-            raise ValueError(
-                f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
-            )
-    except BaseException:
-        tensors_future.add_done_callback(_consume_future_exception)
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
+        local = hf_hub_download(
+            repo_id=hf_repo,
+            filename=filename,
+            repo_type="dataset",
+            revision=hf_revision,
+            token=os.environ.get("HF_TOKEN"),
+        )
+    except Exception as exc:
+        message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
+        if _is_hf_not_found_error(exc):
+            raise AdapterConfigMissing(message) from exc
+        raise ServingError(message) from exc
     try:
-        tensors_future.result()
-    finally:
-        executor.shutdown()
+        with open(local, encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as exc:
+        raise ValueError(
+            f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
+        )
+    _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
@@ -655,7 +634,7 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
         except (TypeError, ValueError):
             pass
         else:
-            if math.isfinite(delay) and delay >= 0:
+            if math.isfinite(delay) and delay > 0:
                 return min(delay, READBACK_MAX_DELAY_SECONDS)
     return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
 
@@ -801,7 +780,7 @@ def _activate_revision(
         target = None
         for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
             if attempt:
-                time.sleep(READBACK_DELAY_SECONDS)
+                time.sleep(ACTIVATION_READBACK_DELAY_SECONDS)
             try:
                 alias = _registered_adapter(run_id)
                 read_error = None
@@ -933,22 +912,26 @@ def chat(
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
-    resp = _http_client().post(
-        f"{base}/chat/completions", json=body, headers=headers, timeout=timeout
+    client_context = (
+        httpx.Client(follow_redirects=True, max_redirects=100)
+        if retry_unavailable
+        else contextlib.nullcontext(_http_client())
     )
-    if retry_unavailable:
-        retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
-        if retryable_error is not None:
-            raise retryable_error
-    resp.raise_for_status()
-    payload = resp.json()
-    if expected_checkpoint and isinstance(payload, dict):
-        payload["_freesolo_headers"] = {
-            "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
-            "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
-            "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
-        }
-    return payload
+    with client_context as client:
+        resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
+        if retry_unavailable:
+            retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
+            if retryable_error is not None:
+                raise retryable_error
+        resp.raise_for_status()
+        payload = resp.json()
+        if expected_checkpoint and isinstance(payload, dict):
+            payload["_freesolo_headers"] = {
+                "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
+                "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
+                "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
+            }
+        return payload
 
 
 def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
