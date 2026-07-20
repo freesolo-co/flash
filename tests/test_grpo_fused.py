@@ -119,6 +119,33 @@ def test_fused_trainer_chunks_persistent_and_runtime_fallbacks_to_one_completion
     assert trainer.fallback_batch_sizes == [1, 1]
 
 
+def test_fused_trainer_falls_back_before_bypassing_multimodal_preprocessing():
+    class BaseTrainer:
+        def _get_per_token_logps_and_entropies(self, *args, **kwargs):
+            self.fallback_batch_sizes.append(args[4])
+            return "fallback"
+
+    trainer_class = make_chalk_grpo_trainer(
+        BaseTrainer, ChalkGrpoRuntime(_selective_log_softmax)
+    )
+    trainer = trainer_class.__new__(trainer_class)
+    trainer.fallback_batch_sizes = []
+    trainer._flash_chalk_failed = False
+
+    result = trainer._get_per_token_logps_and_entropies(
+        None,
+        None,
+        None,
+        4,
+        8,
+        pixel_values=object(),
+    )
+
+    assert result == "fallback"
+    assert trainer._flash_chalk_failed is True
+    assert trainer.fallback_batch_sizes == [1]
+
+
 def test_chunked_entropy_matches_full_logits():
     torch.manual_seed(7)
     hidden = torch.randn(2, 5, 6)

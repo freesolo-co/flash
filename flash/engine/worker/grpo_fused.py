@@ -271,6 +271,9 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
             mm_token_type_ids,
             image_position_ids,
         ):
+            if pixel_values is not None:
+                raise RuntimeError("Chalk GRPO cannot bypass multimodal model preprocessing")
+
             import torch
 
             batch_size = batch_size or input_ids.size(0)
