@@ -674,7 +674,7 @@ def recover_runs() -> None:
                 current = get_status(spec.run_id)
             except Exception:
                 current = None
-            if current is not None and current.state in _RECOVERABLE and current.remote is None:
+            if current is None or (current.state in _RECOVERABLE and current.remote is None):
                 threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer with

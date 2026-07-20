@@ -1996,7 +1996,10 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
     assert status.error is None
 
 
-def test_recover_runs_defers_when_resubmit_waits_for_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("status_read_fails", [False, True])
+def test_recover_runs_defers_when_resubmit_waits_for_metrics(
+    monkeypatch, tmp_path, status_read_fails
+):
     import flash.providers as providers
     import flash.runner as runner
     import flash.server._runtime as runtime
@@ -2015,7 +2018,21 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(monkeypatch, tmp_pa
     monkeypatch.setattr(providers, "configured_providers", lambda: [])
     monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
-    monkeypatch.setattr(runtime, "_start_resubmit", lambda *_args, **_kwargs: False)
+    resubmit_attempted = {"value": False}
+
+    def start_resubmit(*_args, **_kwargs):
+        resubmit_attempted["value"] = True
+        return False
+
+    real_get_status = runtime.get_status
+
+    def get_status(run_id):
+        if status_read_fails and resubmit_attempted["value"]:
+            raise OSError("status store unavailable")
+        return real_get_status(run_id)
+
+    monkeypatch.setattr(runtime, "_start_resubmit", start_resubmit)
+    monkeypatch.setattr(runtime, "get_status", get_status)
     started = []
 
     class Thread:
