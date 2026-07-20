@@ -952,14 +952,14 @@ def model_required_vram_gb(
                 model_info=sizing_info,
             )
         floor = 0
-        if is_grpo and getattr(sizing_info, "grpo_min_vram_gb", 0):
-            floor = int(sizing_info.grpo_min_vram_gb)
-        if not is_grpo and getattr(sizing_info, "sft_min_vram_gb", 0):
-            floor = max(floor, int(sizing_info.sft_min_vram_gb))
+        if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
+            floor = int(info.grpo_min_vram_gb)
+        if not is_grpo and getattr(info, "sft_min_vram_gb", 0):
+            floor = max(floor, int(info.sft_min_vram_gb))
         # Escalate on active_params_b for MoE: keying on total would over-reject (35B total's
         # threshold is below default rollout length); ~3B active gives ~16k headroom.
         if is_grpo and floor:
-            if getattr(sizing_info, "sleep_unsupported", False):
+            if getattr(info, "sleep_unsupported", False):
                 # Sleep is non-functional for this model (it HANGS) -> it MUST fit RESIDENT. Size the
                 # requirement on the RESIDENT peak (engine live through the backward, fp8 KV on the big
                 # floor card which is sm100) instead of the sleep estimate + grpo_seq_escalation_gb, so

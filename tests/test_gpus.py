@@ -286,3 +286,29 @@ def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
     assert bf16_floor > ceiling
     assert fp8_floor > ceiling
     assert fp8_floor <= need < bf16_floor
+
+
+def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):
+    from flash.catalog import MODELS
+    from flash.engine import vram
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    monkeypatch.setattr(
+        vram,
+        "_validated_revision_geometry",
+        lambda model_id, revision, model_info: (model_info.params_b, model_info.vocab_size),
+    )
+
+    grpo_need = vram.model_required_vram_gb(
+        info.id,
+        "grpo",
+        model_revision="a" * 40,
+    )
+    sft_need = vram.model_required_vram_gb(
+        info.id,
+        "sft",
+        model_revision="a" * 40,
+    )
+
+    assert grpo_need >= info.grpo_min_vram_gb
+    assert sft_need >= info.sft_min_vram_gb
