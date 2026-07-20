@@ -118,6 +118,25 @@ def test_supported_source_forms_decode_from_arrow_safe_descriptors(tmp_path):
     assert [image.size for image in decoded] == [(2, 2)] * len(sources)
 
 
+def test_image_descriptors_convert_to_base64_data_uris_without_paths(tmp_path):
+    root, _image = _package(tmp_path)
+    data = _png_bytes()
+    descriptors = [
+        mm.normalize_image_source(data, root),
+        mm.normalize_image_source("dataset/red.png", root),
+    ]
+
+    uris = mm.image_descriptors_to_data_uris(descriptors, root)
+
+    assert len(uris) == 2
+    assert all(uri.startswith("data:image/png;base64,") for uri in uris)
+    assert all("dataset/red.png" not in uri for uri in uris)
+    assert [base64.b64decode(uri.split(",", 1)[1], validate=True) for uri in uris] == [
+        data,
+        data,
+    ]
+
+
 def test_data_uri_preserves_base64_and_percent_encoded_images(tmp_path):
     root, _image = _package(tmp_path)
     data = _png_bytes()
@@ -628,6 +647,37 @@ def test_multimodal_examples_index_reports_identical_prompt_image_collision():
     assert next(iter(index.values())) == {"answer": "last"}
 
 
+def test_image_teacher_prompt_uses_one_media_pad_per_descriptor_in_order():
+    messages = [
+        {"role": "system", "content": "rules"},
+        {
+            "role": "user",
+            "name": "viewer",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image"},
+                {"type": "text", "text": "middle"},
+                {"type": "image"},
+                {"type": "text", "text": "after"},
+            ],
+        },
+    ]
+
+    rendered = mm.image_teacher_prompt_messages(messages, 2)
+
+    assert rendered == [
+        {"role": "system", "content": "rules"},
+        {
+            "role": "user",
+            "name": "viewer",
+            "content": "before<|media_pad|>middle<|media_pad|>after",
+        },
+    ]
+    assert rendered[1]["content"].count(mm.IMAGE_TEACHER_PLACEHOLDER) == 2
+    with pytest.raises(ValueError, match="expected 1 normalized image descriptor"):
+        mm.image_teacher_prompt_messages(messages, 1)
+
+
 def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
     image_module = pytest.importorskip("PIL.Image")
     pil = image_module.new("RGB", (1, 1), "red")
@@ -680,6 +730,7 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         environment=environment,
+        train=SimpleNamespace(teacher_model="kimi-k2.6"),
     )
     mm.preflight_validate_image_opd(supported)
 
@@ -687,9 +738,29 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
         model="openbmb/MiniCPM5-1B",
         algorithm="opd",
         environment=environment,
+        train=SimpleNamespace(teacher_model="kimi-k2.6"),
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
         mm.preflight_validate_image_opd(unsupported)
+
+
+@pytest.mark.parametrize("teacher_model", ["", "glm-5.2", "deepseek-v4-pro"])
+def test_image_opd_preflight_requires_kimi_vision_teacher(tmp_path, teacher_model):
+    root, _image = _package(tmp_path)
+    env_file = root / "environment.py"
+    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
+    (root / "dataset" / "train.jsonl").write_text(
+        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
+    )
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}),
+        train=SimpleNamespace(teacher_model=teacher_model),
+    )
+
+    with pytest.raises(ValueError, match=r"requires .*kimi-k2\.6"):
+        mm.preflight_validate_image_opd(spec)
 
 
 def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
@@ -705,6 +776,7 @@ def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
         environment=SimpleNamespace(
             id=str(env_file), resolved_sha="", params={}, multi_turn=True
         ),
+        train=SimpleNamespace(teacher_model="kimi-k2.6"),
     )
 
     with pytest.raises(ValueError, match="single-turn"):
@@ -773,7 +845,7 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
                     ]
                 },
             },
-            "train": {"epochs": 1, "max_examples": 1},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
         }
     )
 
@@ -816,7 +888,7 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
             "model": model,
             "algorithm": algorithm,
             "environment": {"id": "local", "params": params},
-            "train": {"epochs": 1, "max_examples": 1},
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
         }
     )
 

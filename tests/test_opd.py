@@ -7,8 +7,10 @@ CI, which has the training stack).
 
 from __future__ import annotations
 
+import base64
 import io
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -870,6 +872,7 @@ def _opd_harness(
     save_every=0,
     save_at_steps=(),
     env=None,
+    teacher_model="accounts/fireworks/models/glm-5p2",
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -932,7 +935,7 @@ def _opd_harness(
         opd_mod,
         "_resolve_opd_knobs",
         lambda: opd_mod.OpdKnobs(
-            teacher_model="accounts/fireworks/models/glm-5p2",
+            teacher_model=teacher_model,
             teacher_base_url="http://teacher.invalid",
             epochs=epochs,
             learning_rate=1e-4,
@@ -970,7 +973,14 @@ def _opd_harness(
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
     import flash.engine.worker.teacher as tmod
 
-    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    class _TeacherTokenBatch(list):
+        input_tokens = 3
+
+    class _Teacher:
+        def score_many_multimodal(self, items):
+            return [_TeacherTokenBatch() for _item in items]
+
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: _Teacher())
     monkeypatch.setenv("FIREWORKS_API_KEY", "unit-test-teacher-key")
     return opd_mod
 
@@ -1135,7 +1145,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
         opd_mod,
         "_resolve_opd_knobs",
         lambda: opd_mod.OpdKnobs(
-            teacher_model="teacher",
+            teacher_model="accounts/fireworks/models/kimi-k2p6",
             teacher_base_url="http://teacher.invalid",
             epochs=1,
             learning_rate=1e-4,
@@ -1177,9 +1187,79 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
         "teacher_messages",
         "prompt_ids",
         "rollout_prompt_ids",
-        "teacher_prompt_tokens",
         "descriptors",
     }
+
+
+@pytest.mark.parametrize(
+    "teacher_model",
+    [
+        "",
+        "accounts/fireworks/models/glm-5p2",
+        "accounts/fireworks/models/deepseek-v4-pro",
+    ],
+)
+def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
+    monkeypatch, teacher_model
+):
+    fake_torch = types.ModuleType("torch")
+    fake_torch.manual_seed = lambda _seed: None
+    fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    import flash.engine.worker.teacher as teacher_mod
+    from flash.engine.worker import opd as opd_mod
+
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        dataset=lambda: [{"image": "dataset/red.png"}],
+        prompt_messages=lambda _record: [
+            {"role": "user", "content": [{"type": "image"}]}
+        ],
+    )
+    train = SimpleNamespace(
+        init_from_adapter="",
+        max_examples=1,
+        teacher_model=teacher_model,
+        epochs=1,
+        temperature=None,
+        save_at_steps=(),
+        stop_sequences=(),
+        structured_outputs="",
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(
+            SEED=0,
+            THINKING=False,
+            require_active_env=lambda: env,
+            JOB_SPEC=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-4B",
+                model_revision="",
+                gpu=SimpleNamespace(type=None, exact_type=""),
+            ),
+            heartbeat=lambda *args, **kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        teacher_mod,
+        "TeacherClient",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("teacher client must not be constructed")
+        ),
+    )
+    monkeypatch.setattr(
+        opd_mod,
+        "wait_for_gpu",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("gpu allocation must not be reached")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"requires .*kimi-k2\.6"):
+        opd_mod.run_opd()
 
 
 def test_opd_image_deployable_save_uses_full_processor(monkeypatch):
@@ -1244,7 +1324,12 @@ def test_opd_image_deployable_save_uses_full_processor(monkeypatch):
         )
 
     processor = _Processor()
-    opd_mod = _opd_harness(monkeypatch, sample_result=one_update, env=env)
+    opd_mod = _opd_harness(
+        monkeypatch,
+        sample_result=one_update,
+        env=env,
+        teacher_model="accounts/fireworks/models/kimi-k2p6",
+    )
     opd_mod._w.JOB_SPEC.model = "Qwen/Qwen3.5-4B"
     opd_mod._w.JOB_SPEC.model_revision = ""
     monkeypatch.setattr(
@@ -1292,7 +1377,6 @@ def test_opd_image_prompt_fingerprint_is_json_safe_for_pil_and_bytes():
                 teacher_messages=teacher_messages,
                 prompt_ids=[1, 99, 99, 2],
                 rollout_prompt_ids=[1, 99, 2],
-                teacher_prompt_tokens=2,
                 descriptors=(descriptor,),
             )
         )
@@ -1313,7 +1397,6 @@ def test_opd_image_prompt_fingerprint_uses_descriptors_and_teacher_messages():
         "teacher_messages": [{"role": "user", "content": "describe"}],
         "prompt_ids": [1, 99, 99, 2],
         "rollout_prompt_ids": [1, 99, 2],
-        "teacher_prompt_tokens": 2,
         "descriptors": ("descriptor-a",),
     }
     first = opd_mod._PromptRecord(**base)
@@ -1344,7 +1427,6 @@ def test_opd_text_prompt_fingerprint_is_legacy_byte_identical():
         teacher_messages=[{"role": "user", "content": "hello"}],
         prompt_ids=[1, 2, 3],
         rollout_prompt_ids=[1, 2, 3],
-        teacher_prompt_tokens=3,
     )
 
     assert (
@@ -3750,9 +3832,132 @@ def test_teacher_score_many_sends_prompt_list_and_maps_choice_indexes(monkeypatc
 
     out = client.score_many([("Q1", "A"), ("Q2", "B")])
 
-    assert capture["body"]["prompt"] == ["Q1A", "Q2B"]
+    assert capture["body"] == {
+        "model": "glm",
+        "prompt": ["Q1A", "Q2B"],
+        "max_tokens": 0,
+        "echo": True,
+        "logprobs": 1,
+        "temperature": 0,
+    }
     assert [[t.text for t in toks] for toks in out] == [["A"], ["B"]]
     assert [out[0][0].logprob, out[1][0].logprob] == [-0.1, -0.2]
+
+
+def test_teacher_score_many_multimodal_sends_nested_images_and_extracts_completion_suffix(
+    monkeypatch,
+):
+    payload = {
+        "choices": [
+            {
+                "index": 1,
+                "logprobs": {
+                    "tokens": ["User", ": ", "<expanded-image>", "\nAssistant:", " blue"],
+                    "token_logprobs": [None, -0.1, -0.2, -0.3, -0.7],
+                    "text_offset": [0, 4, 6, 106, 118],
+                },
+            },
+            {
+                "index": 0,
+                "logprobs": {
+                    "tokens": ["User", ": ", "<expanded-image>", "\nAssistant:", " red"],
+                    "token_logprobs": [None, -0.1, -0.2, -0.3, -0.4],
+                    "text_offset": [0, 4, 4, 104, 116],
+                },
+            },
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    client = TeacherClient("k", "https://api.example/v1", "kimi")
+    prompt = "User: <|media_pad|>\nAssistant: "
+
+    scored = client.score_many_multimodal(
+        [
+            (prompt, "red", ["data:image/png;base64,red"]),
+            (prompt, "blue", ["data:image/png;base64,blue"]),
+        ]
+    )
+
+    assert capture["body"] == {
+        "model": "kimi",
+        "prompt": [prompt + "red", prompt + "blue"],
+        "images": [
+            ["data:image/png;base64,red"],
+            ["data:image/png;base64,blue"],
+        ],
+        "max_tokens": 0,
+        "echo": True,
+        "logprobs": 1,
+        "temperature": 0,
+    }
+    assert [[token.text for token in tokens] for tokens in scored] == [[" red"], [" blue"]]
+    assert [(scored[0][0].start, scored[0][0].end), (scored[1][0].start, scored[1][0].end)] == [
+        (0, 3),
+        (0, 4),
+    ]
+    assert [scored[0][0].logprob, scored[1][0].logprob] == [-0.4, -0.7]
+    assert [scored[0].input_tokens, scored[1].input_tokens] == [5, 5]
+
+
+def test_teacher_score_multimodal_single_request_uses_flat_image_list(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["prompt", " answer"],
+                    "token_logprobs": [None, -0.2],
+                    "text_offset": [0, 100],
+                }
+            }
+        ]
+    }
+    capture = {}
+    _mock_urlopen(monkeypatch, payload, capture)
+    client = TeacherClient("k", "https://api.example/v1", "kimi")
+
+    client.score_many_multimodal(
+        [("prompt<|media_pad|>", "answer", ["data:image/png;base64,image"])]
+    )
+
+    assert capture["body"]["prompt"] == "prompt<|media_pad|>answer"
+    assert capture["body"]["images"] == ["data:image/png;base64,image"]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "logprobs", "offsets", "completion", "message"),
+    [
+        (["p", " x"], [None], [0, 100], "x", "length"),
+        (["p", " x"], [None, None], [0, 100], "x", "null"),
+        (["p", " x"], [None, float("nan")], [0, 100], "x", "non-finite"),
+        (["p", " x"], [None, 0.2], [0, 100], "x", "positive"),
+        (["p", " y"], [None, -0.2], [0, 100], "x", "exact completion suffix"),
+    ],
+)
+def test_teacher_multimodal_echo_validator_rejects_bad_completion_contract(
+    monkeypatch, tokens, logprobs, offsets, completion, message
+):
+    from flash.engine.worker.teacher import TeacherError
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": tokens,
+                    "token_logprobs": logprobs,
+                    "text_offset": offsets,
+                }
+            }
+        ]
+    }
+    _mock_urlopen(monkeypatch, payload)
+    client = TeacherClient("k", "https://api.example/v1", "kimi")
+
+    with pytest.raises(TeacherError, match=message) as exc_info:
+        client.score_many_multimodal(
+            [("prompt<|media_pad|>", completion, ["data:image/png;base64,image"])]
+        )
+    assert exc_info.value.permanent is True
 
 
 def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
@@ -4269,6 +4474,49 @@ def test_teacher_score_rejects_echo_with_no_completion_tokens_as_permanent(monke
     assert "no completion-region tokens" in str(ei.value).lower()
 
 
+def test_score_many_preserves_mixed_text_and_image_sample_order():
+    from flash.engine.worker import opd as opd_mod
+
+    class _ImageTokens(list):
+        def __init__(self, label, input_tokens):
+            super().__init__([TeacherToken(label, -0.5, 0, 1)])
+            self.input_tokens = input_tokens
+
+    class _Teacher:
+        def score_many(self, items):
+            assert [completion for _prompt, completion in items] == ["t"]
+            return [[TeacherToken("t", -0.1, 0, 1)]]
+
+        def score_many_multimodal(self, items):
+            assert [completion for _prompt, completion, _images in items] == ["a", "b"]
+            return [_ImageTokens("a", 11), _ImageTokens("b", 12)]
+
+    pendings = [
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="a"),
+            prompt_ids=[1],
+            prompt_messages=[{"role": "user", "content": "<|media_pad|>"}],
+            teacher_images=("data:image/png;base64,a",),
+        ),
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="t"),
+            prompt_ids=[2],
+            prompt_messages=[{"role": "user", "content": "text"}],
+        ),
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="b"),
+            prompt_ids=[3],
+            prompt_messages=[{"role": "user", "content": "<|media_pad|>"}],
+            teacher_images=("data:image/png;base64,b",),
+        ),
+    ]
+
+    results = opd_mod._score_many(_Teacher(), pendings, thinking_prefill="")
+
+    assert [result.teacher_toks[0].text for result in results] == ["a", "t", "b"]
+    assert [result.teacher_input_tokens for result in results] == [11, None, 12]
+
+
 def test_score_one_retries_same_completion_after_transient_teacher_failure():
     """A flaky teacher response should retry scoring the realized completion before OPD spends another
     GPU rollout."""
@@ -4427,6 +4675,43 @@ def test_groupwise_alignment_emits_no_empty_student_group():
     groups = groupwise_alignment(student, teacher)
     assert all(s_idx for s_idx, _ in groups)  # every group has >= 1 student token
     assert [s_idx for s_idx, _ in groups] == [[0, 1]]
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    os.environ.get("FLASH_LIVE") != "1" or not os.environ.get("FIREWORKS_API_KEY"),
+    reason="set FLASH_LIVE=1 and FIREWORKS_API_KEY to run the live Fireworks teacher test",
+)
+def test_live_kimi_multimodal_teacher_conditions_red_completion_on_image():
+    image_module = pytest.importorskip("PIL.Image")
+
+    def data_uri(color):
+        image = image_module.new("RGB", (48, 48), color)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    prompt = (
+        "User: <|media_pad|>\nWhat color is this image? Reply with one lowercase word.\n"
+        "Assistant: "
+    )
+    client = TeacherClient(
+        os.environ["FIREWORKS_API_KEY"],
+        "https://api.fireworks.ai/inference/v1",
+        "accounts/fireworks/models/kimi-k2p6",
+    )
+    red_tokens, blue_tokens = client.score_many_multimodal(
+        [
+            (prompt, "red", [data_uri((220, 20, 20))]),
+            (prompt, "red", [data_uri((20, 20, 220))]),
+        ]
+    )
+    delta = sum(token.logprob for token in red_tokens) - sum(
+        token.logprob for token in blue_tokens
+    )
+
+    assert delta > 0.05
 
 
 def test_teacher_client_requires_key():
@@ -4819,7 +5104,7 @@ def test_resolve_image_sample_lazily_processes_vision_inputs_and_extends_token_t
         descriptors=(descriptor,),
         processor=_Processor(),
         package_root=None,
-        teacher_prompt_tokens=2,
+        teacher_input_tokens=6,
     )
 
     assert processor_calls == []
@@ -4834,7 +5119,7 @@ def test_resolve_image_sample_lazily_processes_vision_inputs_and_extends_token_t
     )[0]
 
     assert result.loss is not None
-    assert result.teacher_tokens == 3
+    assert result.teacher_tokens == 6
     assert len(processor_calls) == 1
     assert processor_calls[0]["return_tensors"] == "pt"
     assert len(model.calls) == 1
@@ -4868,7 +5153,7 @@ def test_resolve_image_sample_rejects_rematerialized_prompt_id_mismatch(monkeypa
         descriptors=("descriptor",),
         processor=object(),
         package_root=None,
-        teacher_prompt_tokens=1,
+        teacher_input_tokens=4,
     )
     monkeypatch.setattr(
         opd_mod,

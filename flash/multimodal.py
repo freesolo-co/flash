@@ -30,6 +30,7 @@ MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 REMOTE_IMAGE_ENV = "FLASH_MULTIMODAL_ALLOW_REMOTE_IMAGES"
 _REMOTE_TIMEOUT_SECONDS = 10.0
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
+IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 
 
 @dataclass(frozen=True)
@@ -319,6 +320,46 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
+def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
+    """Render normalized image blocks as Kimi media placeholders without changing text order."""
+    rendered: list[dict] = []
+    image_count = 0
+    for message_index, message in enumerate(messages):
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block_index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    raise ValueError(
+                        f"malformed content block at message {message_index}, index {block_index}: "
+                        "expected an object"
+                    )
+                block_type = block.get("type")
+                if block_type == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif block_type in _IMAGE_BLOCK_TYPES:
+                    parts.append(IMAGE_TEACHER_PLACEHOLDER)
+                    image_count += 1
+                else:
+                    raise ValueError(
+                        f"unsupported content block type {block_type!r} at message "
+                        f"{message_index}, index {block_index}"
+                    )
+            copied["content"] = "".join(parts)
+        elif content is None:
+            copied["content"] = ""
+        elif not isinstance(content, str):
+            raise ValueError(f"message {message_index} content must be text or content blocks")
+        rendered.append(copied)
+    if image_count != descriptor_count:
+        raise ValueError(
+            f"image teacher prompt contains {image_count} placeholder(s), expected "
+            f"{descriptor_count} normalized image descriptor(s)"
+        )
+    return rendered
+
+
 def normalize_prompt_images(
     record: dict,
     messages: list[dict],
@@ -513,6 +554,56 @@ def _read_descriptor_source(descriptor: str, package_root: str | Path | None) ->
         raise ValueError("invalid internal image descriptor kind")
     _check_source_size(len(data))
     return data
+
+
+def _base64_image_data_uri(data: bytes) -> tuple[str, int]:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for multimodal image training") from exc
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            decoded_bytes = _validate_dimensions(image.width, image.height)
+            media_type = Image.MIME.get(str(image.format or "").upper())
+            if not media_type:
+                media_type = image.get_format_mimetype()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("image source is not a valid image") from exc
+    if not isinstance(media_type, str) or not media_type.startswith("image/"):
+        raise ValueError("image source has an unsupported media type")
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{media_type};base64,{encoded}", decoded_bytes
+
+
+def image_descriptors_to_data_uris(
+    descriptors: list[str] | tuple[str, ...], package_root: str | Path | None
+) -> list[str]:
+    """Convert normalized descriptors to Fireworks data URIs under existing aggregate limits."""
+    if len(descriptors) > MAX_IMAGES_PER_EXAMPLE:
+        raise ValueError(
+            f"example contains {len(descriptors)} images, exceeding the "
+            f"{MAX_IMAGES_PER_EXAMPLE}-image limit"
+        )
+    uris: list[str] = []
+    source_bytes = 0
+    decoded_bytes = 0
+    for descriptor in descriptors:
+        data = _read_descriptor_source(descriptor, package_root)
+        source_bytes += len(data)
+        if source_bytes > MAX_TOTAL_IMAGE_SOURCE_BYTES:
+            raise ValueError(
+                f"example image sources exceed the {MAX_TOTAL_IMAGE_SOURCE_BYTES}-byte limit"
+            )
+        uri, image_decoded_bytes = _base64_image_data_uri(data)
+        decoded_bytes += image_decoded_bytes
+        if decoded_bytes > MAX_TOTAL_DECODED_BYTES:
+            raise ValueError(
+                f"example decoded images exceed the {MAX_TOTAL_DECODED_BYTES}-byte limit"
+            )
+        uris.append(uri)
+    return uris
 
 
 def _decode_image_bytes(data: bytes):
@@ -799,6 +890,18 @@ def validate_multimodal_training(model_id: str, algorithm: str, *, multi_turn: b
         raise ValueError("opd supports image-bearing records only for single-turn environments")
 
 
+def validate_image_opd_teacher(teacher_model: str | None) -> None:
+    """Require the managed Kimi vision teacher for image-bearing OPD."""
+    from flash.engine.recipe import resolve_teacher, teacher_supports_images
+
+    teacher = resolve_teacher(teacher_model or "")
+    if not teacher_supports_images(teacher_model or ""):
+        raise ValueError(
+            "image-bearing opd requires [train] teacher_model = 'kimi-k2.6'; "
+            f"the selected teacher {teacher.alias!r} does not support images"
+        )
+
+
 def assistant_completion_text(completion: object) -> str:
     if not isinstance(completion, list):
         return str(completion or "")
@@ -897,4 +1000,5 @@ def preflight_validate_image_opd(spec) -> None:
             validate_multimodal_training(
                 str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
             )
+            validate_image_opd_teacher(getattr(train, "teacher_model", "") if train else "")
             return

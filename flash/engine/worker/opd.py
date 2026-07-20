@@ -140,7 +140,6 @@ class _PromptRecord:
     teacher_messages: object
     prompt_ids: list[int]
     rollout_prompt_ids: list[int]
-    teacher_prompt_tokens: int
     descriptors: tuple[str, ...] = ()
 
 
@@ -562,22 +561,6 @@ def run_opd():
         f"mode={'multi-turn' if multi_turn else 'single-turn'}"
     )
 
-    # The GLM teacher key is a platform-owned credential the control plane injects into the worker
-    # env (like HF_TOKEN); users never supply it. Read it like any other flash-used key.
-    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "no FIREWORKS_API_KEY (the GLM teacher key) in the opd worker env. It is platform-"
-            "managed and injected by the control plane, so this means the deployment has no "
-            "FIREWORKS_API_KEY configured in its environment."
-        )
-    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
-
-    wait_for_gpu(
-        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
-    )
-    setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
     # build the on-policy prompt pool before loading the student.
@@ -606,6 +589,30 @@ def run_opd():
             message_rows.append((ex, messages, record_has_images(ex, messages)))
             _scanned += 1
     multimodal = any(has_images for _ex, _messages, has_images in message_rows)
+    if multimodal:
+        from flash.multimodal import validate_image_opd_teacher
+
+        try:
+            validate_image_opd_teacher(knobs.teacher_model)
+        except ValueError as exc:
+            raise RuntimeError(f"opd: {exc}") from exc
+
+    # the managed fireworks credential is checked only after image-teacher compatibility, before any
+    # teacher request or gpu allocation.
+    api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "no FIREWORKS_API_KEY in the opd worker env. It is platform-managed and injected by "
+            "the control plane, so this means the deployment has no FIREWORKS_API_KEY configured "
+            "in its environment."
+        )
+    teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
+    setup_perf_backends()
+
     processor = None
     if multimodal:
         from transformers import AutoProcessor
@@ -686,28 +693,28 @@ def run_opd():
             if has_images:
                 from flash.multimodal import (
                     collapse_image_pad_runs,
+                    image_teacher_prompt_messages,
                     normalize_prompt_images,
-                    text_only_prompt_messages,
                 )
 
                 normalized = normalize_prompt_images(ex, messages, package_root)
                 student_messages = normalized.messages
-                teacher_messages = text_only_prompt_messages(student_messages)
                 descriptors = tuple(normalized.descriptors)
+                teacher_messages = image_teacher_prompt_messages(
+                    student_messages, len(descriptors)
+                )
                 prompt_ids = _materialize_image_prompt(
                     processor, student_messages, descriptors, package_root
                 )[0]
                 rollout_prompt_ids = collapse_image_pad_runs(
                     prompt_ids, image_pad_id, len(descriptors)
                 )
-                teacher_prompt_tokens = len(_render_prompt_ids(teacher_messages))
                 record = _PromptRecord(
                     example=_json_safe_image_example(ex, descriptors),
                     student_messages=student_messages,
                     teacher_messages=teacher_messages,
                     prompt_ids=prompt_ids,
                     rollout_prompt_ids=rollout_prompt_ids,
-                    teacher_prompt_tokens=teacher_prompt_tokens,
                     descriptors=descriptors,
                 )
             else:
@@ -718,7 +725,6 @@ def run_opd():
                     teacher_messages=messages,
                     prompt_ids=prompt_ids,
                     rollout_prompt_ids=prompt_ids,
-                    teacher_prompt_tokens=len(prompt_ids),
                 )
             if len(record.prompt_ids) <= prompt_budget:
                 examples.append(record)
@@ -1176,7 +1182,7 @@ def run_opd():
                                     descriptors=p.image_record.descriptors,
                                     processor=processor,
                                     package_root=package_root,
-                                    teacher_prompt_tokens=int(p.teacher_prompt_tokens or 0),
+                                    teacher_input_tokens=int(score.teacher_input_tokens or 0),
                                 )
                             )
                     resolved = _resolve_samples_batched(
@@ -1244,7 +1250,10 @@ def run_opd():
                         chunk_prompts = prompts[start:end]
                         chunk_contexts = contexts[start:end]
                         chunk_multimodal_data = None
+                        teacher_images_by_record: dict[int, tuple[str, ...]] = {}
                         if multimodal:
+                            from flash.multimodal import image_descriptors_to_data_uris
+
                             decoded_by_record: dict[int, object] = {}
                             chunk_multimodal_data = []
                             for prompt_record in chunk_contexts:
@@ -1255,6 +1264,11 @@ def run_opd():
                                 if record_key not in decoded_by_record:
                                     decoded_by_record[record_key] = _decode_opd_rollout_images(
                                         prompt_record.descriptors, package_root
+                                    )
+                                    teacher_images_by_record[record_key] = tuple(
+                                        image_descriptors_to_data_uris(
+                                            prompt_record.descriptors, package_root
+                                        )
                                     )
                                 chunk_multimodal_data.append(decoded_by_record[record_key])
                         with liveness_heartbeat(
@@ -1283,7 +1297,7 @@ def run_opd():
                                 prompt_ids=prompt_record.prompt_ids,
                                 prompt_messages=prompt_record.teacher_messages,
                                 image_record=prompt_record if prompt_record.descriptors else None,
-                                teacher_prompt_tokens=prompt_record.teacher_prompt_tokens,
+                                teacher_images=teacher_images_by_record.get(id(prompt_record), ()),
                             )
                             if gen.skip or gen.truncated:
                                 _account(_resolve_no_loss_sample(gen, None))
@@ -1687,6 +1701,7 @@ class _ScoreResult:
     teacher_toks: object = None
     status: str = "ok"
     error: str = ""
+    teacher_input_tokens: int | None = None
 
 
 def _sample_skip_reason(r: SampleResult) -> str:
@@ -1714,7 +1729,7 @@ class _Pending:
     prompt_ids: object
     prompt_messages: object
     image_record: _PromptRecord | None = None
-    teacher_prompt_tokens: int | None = None
+    teacher_images: tuple[str, ...] = ()
     score: object = None
 
 
@@ -1727,7 +1742,7 @@ class _ImageLossSample:
     descriptors: tuple[str, ...]
     processor: object
     package_root: object
-    teacher_prompt_tokens: int
+    teacher_input_tokens: int
 
 
 def _termination_cause(
@@ -1875,12 +1890,103 @@ def _score_one(
     return _ScoreResult(status="error", error="teacher scoring attempts exhausted")
 
 
+def _score_many_multimodal(
+    teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
+) -> list[_ScoreResult]:
+    items = [
+        (
+            _teacher_prompt_text(p.prompt_messages, thinking_prefill),
+            p.gen.completion_text,
+            p.teacher_images,
+        )
+        for p in pendings
+    ]
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            scored = teacher.score_many_multimodal(items)
+        except TeacherError as exc:
+            if exc.permanent:
+                raise
+            if attempt < attempts:
+                print(
+                    "[opd] multimodal teacher batch failed "
+                    f"(transient, retrying batch {attempt}/{attempts}, samples={len(pendings)}): {exc}"
+                )
+                continue
+            print(
+                "[opd] multimodal teacher batch failed "
+                f"(transient, skipping batch, samples={len(pendings)}): {exc}"
+            )
+            return [_ScoreResult(status="transient", error=str(exc)) for _ in pendings]
+        except Exception as exc:
+            if attempt < attempts:
+                print(
+                    "[opd] multimodal teacher batch failed "
+                    f"(retrying batch {attempt}/{attempts}, samples={len(pendings)}): {exc}"
+                )
+                continue
+            print(
+                "[opd] multimodal teacher batch failed "
+                f"(skipping batch, samples={len(pendings)}): {exc}"
+            )
+            return [_ScoreResult(status="error", error=str(exc)) for _ in pendings]
+        if len(scored) != len(pendings):
+            return [
+                _ScoreResult(
+                    status="error",
+                    error=(
+                        f"multimodal teacher batch returned {len(scored)} score(s) for "
+                        f"{len(pendings)} sample(s)"
+                    ),
+                )
+                for _ in pendings
+            ]
+        return [
+            _ScoreResult(
+                teacher_toks=tokens,
+                status="ok",
+                teacher_input_tokens=int(getattr(tokens, "input_tokens", 0) or 0),
+            )
+            for tokens in scored
+        ]
+    return [
+        _ScoreResult(status="error", error="multimodal teacher batch attempts exhausted")
+        for _ in pendings
+    ]
+
+
 def _score_many(
     teacher, pendings: list[_Pending], *, thinking_prefill, max_attempts: int = 2
 ) -> list[_ScoreResult]:
     """[THREAD POOL — network only] Batch teacher echo-scoring for one chunk of scorable samples."""
     if not pendings:
         return []
+    image_positions = [index for index, pending in enumerate(pendings) if pending.teacher_images]
+    if image_positions:
+        image_position_set = set(image_positions)
+        text_positions = [index for index in range(len(pendings)) if index not in image_position_set]
+        results: list[_ScoreResult | None] = [None] * len(pendings)
+        if text_positions:
+            text_results = _score_many(
+                teacher,
+                [pendings[index] for index in text_positions],
+                thinking_prefill=thinking_prefill,
+                max_attempts=max_attempts,
+            )
+            for index, result in zip(text_positions, text_results, strict=True):
+                results[index] = result
+        image_results = _score_many_multimodal(
+            teacher,
+            [pendings[index] for index in image_positions],
+            thinking_prefill=thinking_prefill,
+            max_attempts=max_attempts,
+        )
+        for index, result in zip(image_positions, image_results, strict=True):
+            results[index] = result
+        if any(result is None for result in results):
+            raise RuntimeError("opd teacher batch partition left an unscored sample")
+        return [result for result in results if result is not None]
     prompts = [
         (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
         for p in pendings
@@ -2082,18 +2188,18 @@ def _resolve_samples_batched(
             score = sample.score
             prompt_ids = sample.prompt_ids
             image_sample = sample
-            teacher_prompt_tokens = sample.teacher_prompt_tokens
+            teacher_input_tokens = sample.teacher_input_tokens
         else:
             gen, score, prompt_ids = sample
             image_sample = None
-            teacher_prompt_tokens = len(prompt_ids)
+            teacher_input_tokens = len(prompt_ids) + gen.gen_tokens
         if gen.truncated:
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
         if gen.skip or score is None or score.status != "ok":
             results[idx] = _resolve_no_loss_sample(gen, score)
             continue
-        teacher_tokens = teacher_prompt_tokens + gen.gen_tokens
+        teacher_tokens = teacher_input_tokens
         student_ids, student_toks = student_tokens_with_offsets(
             tok, gen.completion_ids, gen.completion_text
         )
