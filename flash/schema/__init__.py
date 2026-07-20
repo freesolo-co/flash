@@ -389,30 +389,37 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     try:
         # offline sizing/display only; allocator re-resolves at submit time.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
-        if "type" in gpu_raw and not exact_type:
+        # gpu_type here is the provider-agnostic provisional; a provider-pinned run resolves through
+        # the provider-restricted allocator instead, so naming a "selected" class would be wrong. only
+        # emit the non-pinning clarity note when the allocator is unconstrained by provider.
+        if "type" in gpu_raw and not exact_type and not gpu_provider:
             authored_type_raw = gpu_raw["type"]
-            try:
-                authored_type = (
-                    canonical_gpu(authored_type_raw)
-                    if isinstance(authored_type_raw, str)
-                    else None
-                )
-            except UnsupportedGpuError:
-                authored_type = None
-            if authored_type is None:
+            # only an active validated class is a usable exact_type pin; an unrecognized string or a
+            # retired-but-known class (e.g. RTX A6000) must not be echoed back as an exact_type, since
+            # the exact_type validation above would then reject the very config the note suggested.
+            pinnable: str | None = None
+            if isinstance(authored_type_raw, str):
+                try:
+                    canonical = canonical_gpu(authored_type_raw)
+                except UnsupportedGpuError:
+                    canonical = None
+                info = GPU_INFO.get(canonical) if canonical else None
+                if info is not None and info.validated:
+                    pinnable = canonical
+            if pinnable is None:
                 print(
-                    f"note: [gpu] type={authored_type_raw!r} is not a recognized GPU class and "
-                    "was ignored; the allocator will pick the cheapest validated class that fits "
+                    f"note: [gpu] type={authored_type_raw!r} is not an active GPU class and was "
+                    "ignored; the allocator will pick the cheapest validated class that fits "
                     f"(selected: {gpu_type!r}). run `flash gpus` to list valid classes; to pin one, "
-                    "set [gpu] exact_type.",
+                    'add exact_type = "<CLASS>" to your [gpu] section.',
                     file=sys.stderr,
                 )
-            elif authored_type != gpu_type:
+            elif pinnable != gpu_type:
                 print(
                     f"note: [gpu] type={authored_type_raw!r} is a non-pinning hint and was not "
                     "applied; the allocator will pick the cheapest validated class that fits "
-                    f"(selected: {gpu_type!r}). to require a specific class, set [gpu] "
-                    f"exact_type={authored_type_raw!r}.",
+                    f"(selected: {gpu_type!r}). to require a specific class, add "
+                    f'exact_type = "{pinnable}" to your [gpu] section.',
                     file=sys.stderr,
                 )
         if exact_type and not model_revision:

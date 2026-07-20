@@ -244,7 +244,9 @@ def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) 
     out = capsys.readouterr().out
     assert "GPU allocation is automatic by default" in out
     assert "cheapest validated class" in out
-    assert '[gpu] exact_type = "<CLASS>"' in out
+    assert 'exact_type = "<CLASS>"' in out
+    assert "[gpu] exact_type" not in out
+    assert "gpu.exact_type" not in out
     assert "don't pin" not in out
     assert "cannot pin" not in out
     assert "runpod" not in out.lower()

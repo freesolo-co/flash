@@ -161,8 +161,8 @@ def cmd_gpus(args) -> int:
     )
     tip = (
         "Tip: GPU allocation is automatic by default.\n"
-        'The allocator picks the cheapest validated class that fits. Pin a specific class with [gpu] '
-        'exact_type = "<CLASS>".'
+        "The allocator picks the cheapest validated class that fits. Pin a specific class by "
+        'adding exact_type = "<CLASS>" to the [gpu] section.'
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]

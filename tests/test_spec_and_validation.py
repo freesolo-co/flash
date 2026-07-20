@@ -674,13 +674,25 @@ def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
     warning = capsys.readouterr().err
     assert "[gpu] type='B200' is a non-pinning hint and was not applied" in warning
     assert f"selected: {authored.gpu.type!r}" in warning
-    assert "set [gpu] exact_type='B200'" in warning
+    # the suggested pin must paste into the user's existing [gpu] table as-is: a bare
+    # `exact_type = "..."` key, never the `[gpu] exact_type=...` one-line header form (invalid TOML)
+    # nor a dotted `gpu.exact_type` (which nests to gpu.gpu.exact_type when written inside [gpu]).
+    assert 'add exact_type = "B200" to your [gpu] section.' in warning
+    assert "[gpu] exact_type" not in warning
+    assert "gpu.exact_type" not in warning
 
     spec_from_dict(_raw(**{"gpu.type": "H10O"}))
     invalid_warning = capsys.readouterr().err
-    assert "[gpu] type='H10O' is not a recognized GPU class and was ignored" in invalid_warning
+    assert "[gpu] type='H10O' is not an active GPU class and was ignored" in invalid_warning
     assert "`flash gpus` to list valid classes" in invalid_warning
-    assert "set [gpu] exact_type='H10O'" not in invalid_warning
+    assert 'add exact_type = "H10O"' not in invalid_warning
+
+    # a retired-but-known class canonicalizes but is not validated, so it must be treated like an
+    # unrecognized hint and never echoed back as an exact_type the schema would immediately reject.
+    spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
+    retired_warning = capsys.readouterr().err
+    assert "[gpu] type='RTX A6000' is not an active GPU class and was ignored" in retired_warning
+    assert 'add exact_type = "RTX A6000"' not in retired_warning
 
     automatic_raw = _raw()
     automatic_raw["gpu"].pop("type")
@@ -690,6 +702,16 @@ def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
     selected = spec_from_dict(automatic_raw).gpu.type
     capsys.readouterr()
     spec_from_dict(_raw(**{"gpu.type": selected}))
+    assert capsys.readouterr().err == ""
+
+
+def test_gpu_type_override_warning_suppressed_for_provider_pinned_runs(capsys) -> None:
+    # without a provider pin, an authored non-pinning type fires the clarity note...
+    spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    assert "non-pinning hint" in capsys.readouterr().err
+    # ...but the provider-agnostic provisional cannot name the class a provider-restricted allocator
+    # will actually choose, so pinning a provider suppresses the note instead of naming a wrong one.
+    spec_from_dict(_raw(**{"gpu.type": "B200", "gpu.provider": "lambda"}))
     assert capsys.readouterr().err == ""
 
 
