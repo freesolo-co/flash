@@ -60,9 +60,9 @@ class _RetryBudget:
 
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
-    from flash.multimodal import preflight_validate_image_opd
+    from flash.multimodal import preflight_validate_image_training
 
-    preflight_validate_image_opd(spec)
+    preflight_validate_image_training(spec)
 
     # Lazy import: dry-run / unit tests never construct a Flash endpoint.
     from flash.providers._worker import upload_code

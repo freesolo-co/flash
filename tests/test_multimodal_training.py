@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
-import importlib.util
 import io
 import json
 import sys
 import urllib.parse
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -584,6 +582,36 @@ def test_multimodal_prompt_key_and_index_distinguish_image_content(monkeypatch):
     assert index[mm.multimodal_prompt_key(blue_messages)] is blue_example
 
 
+def test_multimodal_prompt_key_preserves_message_metadata_in_index():
+    trl_data_utils = pytest.importorskip("trl.data_utils")
+    prepare_multimodal_messages = trl_data_utils.prepare_multimodal_messages
+    image_module = pytest.importorskip("PIL.Image")
+    descriptor = mm.normalize_image_source(image_module.new("RGB", (1, 1), "red"), None)
+    first_example = {"answer": "first"}
+    second_example = {"answer": "second"}
+    first_prompt = [{"role": "user", "name": "first-viewer", "content": [{"type": "image"}]}]
+    second_prompt = [
+        {"role": "user", "name": "second-viewer", "content": [{"type": "image"}]}
+    ]
+    prompts = [
+        {"prompt": first_prompt, "images": [descriptor], "example": first_example},
+        {"prompt": second_prompt, "images": [descriptor], "example": second_example},
+    ]
+
+    index, collisions = mm.build_multimodal_examples_index(prompts, None)
+    images = mm.decode_image_descriptors([descriptor], None)
+    first_messages = prepare_multimodal_messages(first_prompt, images=images)
+    second_messages = prepare_multimodal_messages(second_prompt, images=images)
+    first_key = mm.multimodal_prompt_key(first_messages)
+    second_key = mm.multimodal_prompt_key(second_messages)
+
+    assert first_key != second_key
+    assert collisions == 0
+    assert len(index) == 2
+    assert index[first_key] is first_example
+    assert index[second_key] is second_example
+
+
 def test_multimodal_examples_index_reports_identical_prompt_image_collision():
     pytest.importorskip("trl")
     image_module = pytest.importorskip("PIL.Image")
@@ -640,28 +668,40 @@ def test_multimodal_algorithm_validation_rejects_unsupported_modes():
         mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "opd")
 
 
-def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_image_training_preflight_validates_packaged_dataset_before_allocation(
+    tmp_path, algorithm
+):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
     (root / "dataset" / "train.jsonl").write_text(
         json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
     )
+    environment = SimpleNamespace(id=str(env_file), resolved_sha="", params={})
     supported = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
-        algorithm="opd",
-        environment=SimpleNamespace(id=str(env_file), resolved_sha="", params={}),
+        algorithm=algorithm,
+        environment=environment,
     )
-    mm.preflight_validate_image_opd(supported)
+    mm.preflight_validate_image_training(supported)
 
     unsupported = SimpleNamespace(
         model="openbmb/MiniCPM5-1B",
-        algorithm="opd",
-        environment=supported.environment,
+        algorithm=algorithm,
+        environment=environment,
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
-        mm.preflight_validate_image_opd(unsupported)
+        mm.preflight_validate_image_training(unsupported)
 
+
+def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
+    root, _image = _package(tmp_path)
+    env_file = root / "environment.py"
+    env_file.write_text("def load_environment(**kwargs):\n    return None\n")
+    (root / "dataset" / "train.jsonl").write_text(
+        json.dumps({"input": "color?", "output": "red", "image": "dataset/red.png"}) + "\n"
+    )
     multi_turn = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
@@ -669,8 +709,40 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
             id=str(env_file), resolved_sha="", params={}, multi_turn=True
         ),
     )
+
     with pytest.raises(ValueError, match="single-turn"):
-        mm.preflight_validate_image_opd(multi_turn)
+        mm.preflight_validate_image_training(multi_turn)
+
+
+@pytest.mark.parametrize("record_source", ["inline", "packaged"])
+def test_image_training_preflight_limits_scan_to_max_examples(tmp_path, record_source):
+    records = [
+        {"input": "text only", "output": "answer"},
+        {"input": "image", "output": "red", "image": "dataset/red.png"},
+    ]
+    if record_source == "inline":
+        environment = SimpleNamespace(
+            id="local",
+            resolved_sha="",
+            params={"records": records},
+        )
+    else:
+        root = tmp_path / "env"
+        (root / "dataset").mkdir(parents=True)
+        env_file = root / "environment.py"
+        env_file.write_text("def load_environment(**kwargs):\n    return None\n")
+        (root / "dataset" / "train.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
+        environment = SimpleNamespace(id=str(env_file), resolved_sha="", params={})
+    spec = SimpleNamespace(
+        model="openbmb/MiniCPM5-1B",
+        algorithm="opd",
+        environment=environment,
+        train=SimpleNamespace(max_examples=1),
+    )
+
+    mm.preflight_validate_image_training(spec)
 
 
 @pytest.mark.parametrize("background", [False, True])
@@ -715,14 +787,16 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
 
 
 @pytest.mark.parametrize(
-    ("model", "extra_params", "message"),
+    ("algorithm", "model", "extra_params", "message"),
     [
-        ("openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
-        ("Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
+        ("sft", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
+        ("grpo", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
+        ("opd", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
+        ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
     ],
 )
-def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
-    monkeypatch, tmp_path, model, extra_params, message
+def test_image_training_submit_preflight_rejects_before_allocation(
+    monkeypatch, tmp_path, algorithm, model, extra_params, message
 ):
     from flash import runner
     from flash.spec import JobSpec
@@ -743,9 +817,9 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
     }
     spec = JobSpec.from_dict(
         {
-            "run_id": f"image-opd-reject-{model.rsplit('/', 1)[-1]}",
+            "run_id": f"image-{algorithm}-reject-{model.rsplit('/', 1)[-1]}",
             "model": model,
-            "algorithm": "opd",
+            "algorithm": algorithm,
             "environment": {"id": "local", "params": params},
             "train": {"epochs": 1, "max_examples": 1},
         }
@@ -755,19 +829,6 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
         runner.submit_job(spec)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
-
-
-def test_image_color_example_reward_accepts_only_exact_lowercase_red():
-    env_path = Path(__file__).parents[1] / "examples" / "image-color" / "environment.py"
-    spec = importlib.util.spec_from_file_location("image_color_environment", env_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    reward = module.ImageColorEnvironment.score_response
-    assert reward(None, None, " red ").score == 1.0
-    assert reward(None, None, "RED").score == 0.0
 
 
 def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():

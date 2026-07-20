@@ -651,8 +651,13 @@ def multimodal_prompt_key(messages: list[dict]) -> str:
                     raise ValueError(f"unsupported multimodal prompt content type: {part_type!r}")
         elif content is not None:
             raise ValueError("multimodal prompt message content must be text or content parts")
-        canonical.append((message.get("role"), parts))
-    return json.dumps(canonical, sort_keys=True)
+        metadata = {
+            key: value
+            for key, value in message.items()
+            if key != "content" and value is not None
+        }
+        canonical.append((metadata, parts))
+    return json.dumps(canonical, sort_keys=True, default=str)
 
 
 def _multimodal_prompt_keys(prompts: list[dict], package_root: str | Path | None) -> list[str]:
@@ -846,9 +851,10 @@ def _read_json_records(path: Path) -> list[dict]:
     return value
 
 
-def preflight_validate_image_opd(spec) -> None:
-    """Validate statically discoverable image OPD datasets before GPU allocation."""
-    if getattr(spec, "algorithm", "") != "opd":
+def preflight_validate_image_training(spec) -> None:
+    """Validate statically discoverable image training datasets before GPU allocation."""
+    algorithm = getattr(spec, "algorithm", "")
+    if algorithm not in {"sft", "grpo", "opd"}:
         return
     environment = getattr(spec, "environment", None)
     params = dict(getattr(environment, "params", None) or {})
@@ -880,12 +886,16 @@ def preflight_validate_image_opd(spec) -> None:
         if path is None or not path.is_file() or path.suffix.lower() not in {".json", ".jsonl"}:
             return
         records = _read_json_records(path)
+    train = getattr(spec, "train", None)
+    max_examples = int(getattr(train, "max_examples", 0) or 0)
+    if max_examples > 0:
+        records = records[:max_examples]
     for record in records:
         if record_has_images(record, _record_messages(record)):
             multi_turn = bool(
                 getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
             )
             validate_multimodal_training(
-                str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
+                str(getattr(spec, "model", "")), algorithm, multi_turn=multi_turn
             )
             return

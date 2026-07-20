@@ -290,8 +290,8 @@ def run_rl():
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             try:
-                if isinstance(comp, list) and is_multi_turn:
-                    # conversational multi-turn transcripts are scored as complete episodes.
+                if isinstance(comp, list) and (is_multi_turn or is_tool_env):
+                    # multi-turn and native tool-loop transcripts are scored as complete episodes.
                     r = env.reward_from_messages(comp, ex)
                     rewards.append(r)
                     continue

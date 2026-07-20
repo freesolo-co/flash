@@ -869,6 +869,7 @@ def _opd_harness(
     outputs=None,
     save_every=0,
     save_at_steps=(),
+    env=None,
 ):
     """Wire run_opd's fakes (torch student, tokenizer, teacher, deterministic knobs) for a 1-prompt
     loop and install the caller's sample stub behind the mandatory vLLM rollout. Returns the opd
@@ -895,10 +896,11 @@ def _opd_harness(
             super().__init__(torch, T=4, V=8)
             self.config = SimpleNamespace(use_cache=False)
 
-    env = SimpleNamespace(
-        dataset=lambda: [{"q": "a"}],
-        prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
-    )
+    if env is None:
+        env = SimpleNamespace(
+            dataset=lambda: [{"q": "a"}],
+            prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
+        )
     fake_w = SimpleNamespace(
         require_active_env=lambda: env,
         JOB_SPEC=SimpleNamespace(
@@ -1047,7 +1049,11 @@ def test_opd_rejects_tool_environments(monkeypatch):
     from flash.engine.worker import opd as opd_mod
 
     env = SimpleNamespace(is_tool_env=True)
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(require_active_env=lambda e=env: e))
+    monkeypatch.setattr(
+        opd_mod,
+        "_w",
+        SimpleNamespace(SEED=0, require_active_env=lambda e=env: e),
+    )
     with pytest.raises(RuntimeError, match="tool-calling"):
         opd_mod.run_opd()
 
@@ -1160,7 +1166,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
     with pytest.raises(AssertionError, match="reached student model loading"):
         opd_mod.run_opd()
 
-    assert events[:3] == ["require_active_env", "seed:7", "dataset"]
+    assert events[:3] == ["seed:7", "require_active_env", "dataset"]
     assert events.count("prompt_messages") == 1
     assert events.count("prefetch_model") == 1
     assert len(processor_calls) == 1
@@ -1174,6 +1180,91 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
         "teacher_prompt_tokens",
         "descriptors",
     }
+
+
+def test_opd_image_deployable_save_uses_full_processor(monkeypatch):
+    torch = pytest.importorskip("torch")
+    image_module = pytest.importorskip("PIL.Image")
+    transformers = pytest.importorskip("transformers")
+
+    class _Tok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "PROMPT"
+
+        def __call__(self, text, add_special_tokens=False):
+            return SimpleNamespace(input_ids=[1, 2])
+
+        def convert_tokens_to_ids(self, token):
+            assert token == "<|image_pad|>"
+            return 99
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" for _ in ids)
+
+    class _Processor:
+        def __init__(self):
+            self.tokenizer = _Tok()
+
+        def apply_chat_template(self, **kwargs):
+            return {
+                "input_ids": torch.tensor([[1, 99, 99, 2]]),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "pixel_values": torch.ones((4, 3)),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            }
+
+    image = image_module.new("RGB", (2, 2), "red")
+    env = SimpleNamespace(
+        is_tool_env=False,
+        multi_turn=False,
+        package_root=None,
+        dataset=lambda: [{"input": "describe", "image": image}],
+        prompt_messages=lambda _record: [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image"},
+                ],
+            }
+        ],
+    )
+
+    def one_update(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    processor = _Processor()
+    opd_mod = _opd_harness(monkeypatch, sample_result=one_update, env=env)
+    opd_mod._w.JOB_SPEC.model = "Qwen/Qwen3.5-4B"
+    opd_mod._w.JOB_SPEC.model_revision = ""
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: processor,
+    )
+    saved_processing_classes = []
+    monkeypatch.setattr(
+        opd_mod,
+        "_save_adapter",
+        lambda _model, processing_class, _adapter_dir: saved_processing_classes.append(
+            processing_class
+        ),
+    )
+
+    opd_mod.run_opd()
+
+    assert saved_processing_classes == [processor]
+    assert saved_processing_classes[0] is not processor.tokenizer
 
 
 def test_opd_image_prompt_fingerprint_is_json_safe_for_pil_and_bytes():

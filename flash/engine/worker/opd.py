@@ -535,6 +535,7 @@ def run_opd():
     from flash.engine.worker.hf import load_tokenizer, model_revision_kwargs
     from flash.engine.worker.teacher import TeacherClient
 
+    seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     if getattr(env, "is_tool_env", False):
         # Tool envs need TRL's native tool-call loop (rl.py hands the tool schemas + callables to the
@@ -549,7 +550,6 @@ def run_opd():
     # single-turn env keeps the original one-generate-per-prompt path.
     multi_turn = bool(getattr(env, "multi_turn", False))
 
-    seed_training_rngs(_w.SEED)
     train = env.dataset()
 
     t_start = time.time()
@@ -620,6 +620,8 @@ def run_opd():
     else:
         # text-only opd keeps the existing tokenizer path unchanged.
         tok = load_tokenizer(model_id, revision=model_revision)
+    # image adapters must persist the full processor (image preprocessing config), not only the tokenizer.
+    artifact_processing_class = processor if multimodal else tok
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     # Thinking-mode student prompts open a reasoning block (e.g. Qwen's <think>) after the generation
@@ -1369,7 +1371,7 @@ def run_opd():
                 is_required_save = opt_steps in knobs.save_at_steps
                 publish_periodic = checkpoint_due and not is_required_save and not is_final_step
                 if is_required_save or publish_periodic:
-                    _save_adapter(model, tok, adapter_dir)
+                    _save_adapter(model, artifact_processing_class, adapter_dir)
                     if is_final_step:
                         final_adapter_staged = True
                 checkpoint_accounting = {
@@ -1517,7 +1519,7 @@ def run_opd():
         )
 
     if not final_adapter_staged:
-        _save_adapter(model, tok, adapter_dir)
+        _save_adapter(model, artifact_processing_class, adapter_dir)
     # keep the served default while suppressing unrequested final checkpoints.
     _publish_opd_deployable(
         adapter_dir,
@@ -2479,14 +2481,14 @@ def _restore_opd_full_state(
     return state
 
 
-def _save_adapter(model, tok, adapter_dir: str) -> None:
-    """Persist the LoRA adapter + tokenizer for deploy (identical layout to SFT)."""
+def _save_adapter(model, processing_class, adapter_dir: str) -> None:
+    """Persist the LoRA adapter and tokenizer or processor for deploy."""
     spec = getattr(_w, "JOB_SPEC", None)
     if spec is None:
         raise RuntimeError("OPD adapter save requires a JobSpec")
     _w.stamp_adapter_provenance(model, spec.model, spec.model_revision)
     model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
+    processing_class.save_pretrained(adapter_dir)
     _w.write_base_model_provenance(adapter_dir, spec.model, spec.model_revision)
 
 
