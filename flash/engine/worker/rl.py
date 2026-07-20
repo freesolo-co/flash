@@ -47,6 +47,12 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
 
 
 def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict | None:
+    if cc and cc[0] in (10, 12):
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        print(
+            f"[rl][warn] Blackwell/sm{cc[0]}{cc[1]}: VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+            "for the colocate rollout (avoid V1 SyncMPClient EngineCore startup stalls)"
+        )
     if cc == (10, 0):
         return None
     decode_only_validated = cc in {(8, 0), (9, 0)} or cc[0] in (10, 12)

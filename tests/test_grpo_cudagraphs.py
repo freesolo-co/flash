@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -11,6 +12,7 @@ def test_colocate_rollout_uses_decode_only_graphs_on_validated_arches(monkeypatc
     from flash.engine.worker import rl
 
     calls = []
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
     monkeypatch.setattr(
         rl._w, "patch_trl_colocate_llm_kwargs", lambda **kwargs: calls.append(kwargs)
     )
@@ -26,12 +28,17 @@ def test_colocate_rollout_uses_decode_only_graphs_on_validated_arches(monkeypatc
     }
     assert selected == expected
     assert calls == [expected]
+    if cc[0] in (10, 12):
+        assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+    else:
+        assert "VLLM_ENABLE_V1_MULTIPROCESSING" not in os.environ
 
 
 def test_colocate_rollout_keeps_vllm_default_on_b200(monkeypatch):
     from flash.engine.worker import rl
 
     calls = []
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
     monkeypatch.setattr(
         rl._w, "patch_trl_colocate_llm_kwargs", lambda **kwargs: calls.append(kwargs)
     )
@@ -40,6 +47,7 @@ def test_colocate_rollout_keeps_vllm_default_on_b200(monkeypatch):
 
     assert selected is None
     assert calls == []
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
 
 
 @pytest.mark.parametrize("cc", [(0, 0), (8, 6), (8, 9), (11, 0)])
@@ -47,6 +55,7 @@ def test_colocate_rollout_keeps_eager_fallback_on_unvalidated_arches(monkeypatch
     from flash.engine.worker import rl
 
     calls = []
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
     monkeypatch.setattr(
         rl._w, "patch_trl_colocate_llm_kwargs", lambda **kwargs: calls.append(kwargs)
     )
@@ -55,6 +64,7 @@ def test_colocate_rollout_keeps_eager_fallback_on_unvalidated_arches(monkeypatch
 
     assert selected == {"enforce_eager": True}
     assert calls == [{"enforce_eager": True}]
+    assert "VLLM_ENABLE_V1_MULTIPROCESSING" not in os.environ
 
 
 def test_colocate_rollout_retries_eager_after_graph_capture_failure(monkeypatch):
