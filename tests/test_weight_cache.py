@@ -684,13 +684,20 @@ def test_assign_weight_cache_attaches_fitting_catalog_model():
     assert out.gpu.network_volume == "flash-weights"
 
 
-def test_fits_weight_cache_dense_models_fit_moe_does_not():
+def test_fits_weight_cache_is_size_based():
     from flash import runner
     from flash.catalog import MODELS
 
-    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])  # 35B MoE overflows
-    for mid in ("openbmb/MiniCPM5-1B", "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"):
-        assert runner._fits_weight_cache(MODELS[mid]), mid  # every dense catalog model fits
+    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-27B"])
+    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])
+    for mid in (
+        "openbmb/MiniCPM5-1B",
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+    ):
+        assert runner._fits_weight_cache(MODELS[mid]), mid
 
 
 def test_submit_job_assigns_weight_cache(monkeypatch):
@@ -892,7 +899,9 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     # non-fitting model only overflows the fixed mount). Mirrors the submit path's _fits_weight_cache.
     assert ids == {mid for mid, info in MODELS.items() if _fits_weight_cache(info)}
     assert ids <= set(MODELS)
-    # The ~70 GB 35B MoE (peak ~140 GB > 100 GB cache) must be excluded from the default warm set.
+    # oversized checkpoints must be excluded from the default warm set.
+    assert "Qwen/Qwen3.6-27B" in MODELS
+    assert "Qwen/Qwen3.6-27B" not in ids
     assert "Qwen/Qwen3.6-35B-A3B" in MODELS
     assert "Qwen/Qwen3.6-35B-A3B" not in ids
 
