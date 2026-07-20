@@ -203,6 +203,72 @@ def test_packer_conserves_tokens_and_never_splits():
     assert Counter(t for r in rows for t in r["input_ids"]) == Counter(t for s in seqs for t in s)
 
 
+def test_packer_preserves_legacy_ffd_order_and_is_deterministic():
+    sequences = [
+        list(range(0, 10)),
+        list(range(10, 16)),
+        list(range(16, 21)),
+        list(range(21, 25)),
+        list(range(25, 28)),
+        list(range(28, 31)),
+        list(range(31, 33)),
+        list(range(33, 35)),
+        [35],
+        [],
+    ]
+    masks = [[index % 2 for index in range(len(sequence))] for sequence in sequences]
+
+    def alternating(*lengths):
+        return [index % 2 for length in lengths for index in range(length)]
+
+    expected = [
+        {"input_ids": list(range(0, 8)), "seq_lengths": [8], "completion_mask": alternating(8)},
+        {
+            "input_ids": [*range(10, 16), *range(31, 33)],
+            "seq_lengths": [6, 2],
+            "completion_mask": alternating(6, 2),
+        },
+        {
+            "input_ids": [*range(16, 21), *range(25, 28)],
+            "seq_lengths": [5, 3],
+            "completion_mask": alternating(5, 3),
+        },
+        {
+            "input_ids": [*range(21, 25), *range(28, 31), 35],
+            "seq_lengths": [4, 3, 1],
+            "completion_mask": alternating(4, 3, 1),
+        },
+        {
+            "input_ids": list(range(33, 35)),
+            "seq_lengths": [2],
+            "completion_mask": alternating(2),
+        },
+    ]
+    first = pack_token_ids(sequences, 8, completion_masks=masks)
+    second = pack_token_ids(sequences, 8, completion_masks=masks)
+
+    assert first == expected
+    assert second == first
+    for row in first:
+        assert sum(row["seq_lengths"]) == len(row["input_ids"]) == len(row["completion_mask"])
+        assert len(row["input_ids"]) <= 8
+
+    from collections import Counter
+
+    expected_pairs = Counter(
+        pair
+        for sequence, mask in zip(sequences, masks, strict=True)
+        if sequence
+        for pair in zip(sequence[:8], mask[:8], strict=True)
+    )
+    packed_pairs = Counter(
+        pair
+        for row in first
+        for pair in zip(row["input_ids"], row["completion_mask"], strict=True)
+    )
+    assert packed_pairs == expected_pairs
+
+
 def test_packer_truncates_overlong_example():
     rows = pack_token_ids([list(range(20))], max_length=8)
     assert len(rows) == 1
