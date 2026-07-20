@@ -1486,9 +1486,9 @@ class _CharTok:
 def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     """END-TO-END proof that multi-turn opd distils EACH assistant turn against the teacher, conditioned
     on the growing transcript. Drives the REAL run_opd -> rollout_one_records -> vLLM rollout shim ->
-    batched teacher scoring -> _resolve_samples_batched path on CPU with a scripted 2-turn "guess"
+    batched teacher scoring -> _resolve_samples_batched path on CPU with a scripted 3-turn "guess"
     episode: a fake student that emits a distinct completion per turn and a fake teacher that
-    echo-scores each. We assert (1) two turns were distilled with real gradients, (2) the second turn's
+    echo-scores each. We assert (1) three turns were distilled with real gradients, (2) the second turn's
     teacher prompt and loss prefix strictly GREW over the first (per-turn transcript conditioning, not
     a re-scored first turn), and (3) train_meta reports the multi-turn shape."""
     torch = pytest.importorskip("torch")
@@ -1525,18 +1525,20 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         def save_pretrained(self, *a, **k):
             pass
 
-    model = _MTModel(["42", "ok"])
+    model = _MTModel(["42", "ok", "42"])
 
-    teacher_calls = []
+    teacher_batches = []
 
     class _CountingTeacher:
-        def score(self, prompt, completion):
-            teacher_calls.append((prompt, completion))
-            # One teacher token tiling the whole completion -> a single alignment group.
-            return [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+        def score_many(self, items):
+            teacher_batches.append(list(items))
+            return [
+                [TeacherToken(text=completion, logprob=-1.0, start=0, end=len(completion))]
+                for _prompt, completion in items
+            ]
 
     class _GuessEnv:
-        """Two-assistant-turn episode: guess -> env nudge -> guess -> done."""
+        """three-assistant-turn episode with an environment nudge between guesses."""
 
         multi_turn = True
         is_tool_env = False
@@ -1561,7 +1563,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
 
         def env_reply(self, messages, state):
             state["turn"] += 1
-            if state["turn"] >= 2:
+            if state["turn"] >= 3:
                 state["done"] = True
                 return []
             return [{"role": "user", "content": "n"}]
@@ -1608,6 +1610,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         wandb_run_info=lambda: {},
     )
     monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(opd_mod, "_opd_teacher_batch_size", lambda _total: 2)
     monkeypatch.setattr(
         opd_mod,
         "_resolve_opd_knobs",
@@ -1638,12 +1641,15 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
     monkeypatch.setattr(opd_mod, "active_kernels", lambda *a, **k: [])
     monkeypatch.setattr(opd_mod, "free_gpu", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod, "_save_opd_resume_checkpoint", lambda **kwargs: None)
+    monkeypatch.setattr(opd_mod, "_save_adapter", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *a, **k: None)
     _patch_opd_run_vllm_stub(
         monkeypatch,
         opd_mod,
         outputs=[
             opd_mod.OpdVllmOutput([*tok._enc("42"), tok.eos_token_id], "42", finish_reason="stop"),
             opd_mod.OpdVllmOutput([*tok._enc("ok"), tok.eos_token_id], "ok", finish_reason="stop"),
+            opd_mod.OpdVllmOutput([*tok._enc("42"), tok.eos_token_id], "42", finish_reason="stop"),
         ],
     )
     import transformers
@@ -1659,29 +1665,29 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
 
     opd_mod.run_opd()
 
-    # (1) Both assistant turns were distilled with a real (non-None) loss, texts in generation order.
-    assert len(loss_calls) == 2, f"expected 2 per-turn losses, got {loss_calls}"
-    assert [c[1] for c in loss_calls] == ["42", "ok"]
+    assert len(loss_calls) == 3, f"expected 3 per-turn losses, got {loss_calls}"
+    assert [c[1] for c in loss_calls] == ["42", "ok", "42"]
     assert all(c[2] for c in loss_calls), "every distilled turn must produce a real loss"
     # The second turn's loss prefix (transcript so far) is strictly LONGER than the first's.
     assert loss_calls[1][0] > loss_calls[0][0]
 
-    # (2) The teacher was called once per turn, each conditioned on the growing transcript: turn 2's
-    # prompt contains the prior assistant answer ("Assistant: 42") AND the env nudge ("User: n");
-    # turn 1's flat prompt is just the opening user turn with neither.
-    assert len(teacher_calls) == 2
-    assert "Assistant: 42" not in teacher_calls[0][0]
-    assert "User: n" not in teacher_calls[0][0]
-    assert "Assistant: 42" in teacher_calls[1][0]
-    assert "User: n" in teacher_calls[1][0]
+    assert [len(batch) for batch in teacher_batches] == [2, 1]
+    scored_items = [item for batch in teacher_batches for item in batch]
+    first_prompt, _first_completion = scored_items[0]
+    second_prompt, _second_completion = scored_items[1]
+    assert [completion for _prompt, completion in scored_items] == ["42", "ok", "42"]
+    assert "Assistant: 42" not in first_prompt
+    assert "User: n" not in first_prompt
+    assert "Assistant: 42" in second_prompt
+    assert "User: n" in second_prompt
 
     # (3) A real optimizer step landed and moved the weights; train_meta shows the multi-turn shape.
     assert not torch.equal(before, model.w.detach())
     assert meta["notes"]["multi_turn"] is True
     assert meta["notes"]["episodes"] == 1
-    assert meta["notes"]["mean_turns_per_episode"] == 2.0
+    assert meta["notes"]["mean_turns_per_episode"] == 3.0
     assert meta["notes"]["max_turns"] == 4
-    assert meta["step"] == 1  # one optimizer update over the two turn-losses
+    assert meta["step"] == 1  # one optimizer update over the three turn losses
 
 
 def test_opd_passes_worker_env_teacher_key_to_client(monkeypatch):
@@ -3777,13 +3783,13 @@ class _FakeResp:
 def _mock_urlopen(monkeypatch, payload, capture=None):
     import flash.engine.worker.teacher as tm
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(_transport, req, timeout=None):
         if capture is not None:
             capture["url"] = req.full_url
             capture["body"] = json.loads(req.data.decode())
         return _FakeResp(payload)
 
-    monkeypatch.setattr(tm.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
 
 
 def test_teacher_score_returns_completion_region_with_rebased_offsets_and_logprobs(monkeypatch):
@@ -3996,6 +4002,78 @@ def test_teacher_multimodal_echo_validator_rejects_bad_completion_contract(
     assert exc_info.value.permanent is True
 
 
+def test_teacher_transport_reuses_connection_and_reconnects_after_eof(monkeypatch):
+    import http.client
+
+    import flash.engine.worker.teacher as tm
+
+    payload = {
+        "choices": [
+            {
+                "logprobs": {
+                    "tokens": ["P", "hi"],
+                    "token_logprobs": [0.0, -0.5],
+                    "text_offset": [0, 1],
+                }
+            }
+        ]
+    }
+    instances = []
+    delays = []
+
+    class _Socket:
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+    class _Response:
+        status = 200
+        reason = "OK"
+        will_close = False
+
+        def __init__(self):
+            self.headers = {}
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def __init__(self, host, port, timeout):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.sock = _Socket()
+            self.request_count = 0
+            instances.append(self)
+
+        def request(self, method, selector, body=None, headers=None):
+            self.request_count += 1
+            if len(instances) == 1 and self.request_count == 3:
+                raise http.client.RemoteDisconnected("stale keep-alive socket")
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            self.sock = None
+
+    monkeypatch.setattr(tm.http.client, "HTTPSConnection", _Connection)
+    monkeypatch.setattr(tm.time, "sleep", delays.append)
+    client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
+
+    client.score("P", "hi")
+    client.score("P", "hi")
+    client.score("P", "hi")
+    client.score("P", "hi")
+
+    assert len(instances) == 2
+    assert instances[0].request_count == 3
+    assert instances[1].request_count == 2
+    assert delays == [2.0]
+
+
 def test_teacher_score_keeps_boundary_crossing_token_clamped_to_completion(monkeypatch):
     # Prompt ends in whitespace ("P: ", plen=3); the teacher emits a leading-space merge token
     # " hi" that starts at char 2 (inside the prompt) and ends at 5 (inside the completion). Rather
@@ -4123,10 +4201,10 @@ def test_teacher_4xx_is_permanent_but_5xx_is_transient(monkeypatch):
     from flash.engine.worker.teacher import TeacherError
 
     def raise_http(code):
-        def fake_urlopen(req, timeout=None):
+        def fake_urlopen(_transport, req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, code, f"HTTP {code}", {}, None)
 
-        monkeypatch.setattr(tm.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", fake_urlopen)
 
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
     # 401 (bad key) is permanent -> raised immediately so the worker aborts, not burns every step.
@@ -4151,7 +4229,7 @@ def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
 
     private = b"opaque-private-teacher-sentinel-91ad"
 
-    def raise_http(req, timeout=None):
+    def raise_http(_transport, req, timeout=None):
         raise urllib.error.HTTPError(
             req.full_url,
             403,
@@ -4160,7 +4238,7 @@ def test_teacher_http_error_diagnostic_omits_opaque_response_body(monkeypatch):
             io.BytesIO(private),
         )
 
-    monkeypatch.setattr(tm.urllib.request, "urlopen", raise_http)
+    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", raise_http)
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=1)
 
     with pytest.raises(TeacherError) as exc_info:
@@ -4222,7 +4300,11 @@ def test_teacher_malformed_200_body_is_transient_teacher_error(monkeypatch):
         def read(self):
             return b"<html>502 Bad Gateway</html>"  # HTTP 200 status, non-JSON body
 
-    monkeypatch.setattr(tm.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    monkeypatch.setattr(
+        tm._ThreadLocalHttpsTransport,
+        "urlopen",
+        lambda _transport, req, timeout=None: _Resp(),
+    )
     monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
     with pytest.raises(TeacherError) as ei:
@@ -4251,7 +4333,11 @@ def test_teacher_incomplete_read_body_is_transient_teacher_error(monkeypatch):
         def read(self):
             raise http.client.IncompleteRead(b"half", 100)  # body truncated mid-read
 
-    monkeypatch.setattr(tm.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    monkeypatch.setattr(
+        tm._ThreadLocalHttpsTransport,
+        "urlopen",
+        lambda _transport, req, timeout=None: _Resp(),
+    )
     monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff sleeps
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
     with pytest.raises(TeacherError) as ei:
@@ -4582,6 +4668,44 @@ def test_score_one_retries_same_completion_after_transient_teacher_failure():
     assert result.teacher_toks
 
 
+def test_score_many_deduplicates_exact_pairs_and_scatters_results():
+    from flash.engine.worker import opd as opd_mod
+
+    calls = []
+
+    class _Teacher:
+        def score_many(self, items):
+            calls.append(list(items))
+            return [["first-score"], ["second-score"]]
+
+    shared_messages = [{"role": "user", "content": "same prompt"}]
+    pendings = [
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="same completion"),
+            prompt_ids=[],
+            prompt_messages=shared_messages,
+        ),
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="different completion"),
+            prompt_ids=[],
+            prompt_messages=shared_messages,
+        ),
+        opd_mod._Pending(
+            gen=opd_mod._GenResult(completion_text="same completion"),
+            prompt_ids=[],
+            prompt_messages=shared_messages,
+        ),
+    ]
+
+    results = opd_mod._score_many(_Teacher(), pendings, thinking_prefill="")
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
+    assert results[0].teacher_toks == ["first-score"]
+    assert results[1].teacher_toks == ["second-score"]
+    assert results[2].teacher_toks == ["first-score"]
+
+
 def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkeypatch):
     """Regression (codex[bot], teacher.py:62): a retryable 5xx whose error body is truncated makes
     e.read() raise IncompleteRead BEFORE last_err is set — without a guard it escapes _post as a generic
@@ -4600,10 +4724,10 @@ def test_teacher_http_error_with_unreadable_body_still_classified_by_code(monkey
     err = _BadBodyHTTPError("http://x", 503, "Service Unavailable", {}, None)
     err.fp = object()  # force the `if e.fp` branch so the guarded read() is attempted
 
-    def raise_503(req, timeout=None):
+    def raise_503(_transport, req, timeout=None):
         raise err
 
-    monkeypatch.setattr(tm.urllib.request, "urlopen", raise_503)
+    monkeypatch.setattr(tm._ThreadLocalHttpsTransport, "urlopen", raise_503)
     monkeypatch.setattr(tm.time, "sleep", lambda *a, **k: None)  # skip real backoff
     client = TeacherClient("k", "https://api.example/v1", "glm", max_retries=2)
     with pytest.raises(TeacherError) as ei:
