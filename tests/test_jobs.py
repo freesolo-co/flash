@@ -1671,6 +1671,8 @@ def _adapter_config(*, rank=32, alpha=64):
 
 
 def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
+    from dataclasses import replace
+
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers as providers
@@ -1680,6 +1682,7 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch):
         from flash.providers.runpod import api as runpod_api
 
         spec = _spec("completed-before-retry")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
         orch._save_status(
             orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
             _next_attempt=0,

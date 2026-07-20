@@ -261,7 +261,7 @@ def _fail_blocked_recovery(
     expected_remote: dict | None = None,
 ) -> bool:
     from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
-    from flash.runner.lifecycle import _adopt_completed_attempt
+    from flash.runner.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
     if status.remote is None:
@@ -269,7 +269,10 @@ def _fail_blocked_recovery(
             deadline_at = _load_run_deadline_at(spec.run_id)
         except RuntimeError:
             deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
-        metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        try:
+            metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        except _CompletedAttemptPending:
+            return False
         if metrics is not None:
             applied = _adopt_completed_attempt(
                 spec.run_id,

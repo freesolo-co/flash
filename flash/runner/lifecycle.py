@@ -732,6 +732,12 @@ def _submit_seed_supervised(
             if chosen is not None and isinstance(res.metrics, dict):
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
+        completed_metrics = _runpod_completed_metrics(last_handle)
+        if completed_metrics is not None:
+            _gc_seen_endpoints()
+            if current_gpu.get("name"):
+                completed_metrics.setdefault("allocated_gpu", current_gpu["name"])
+            return completed_metrics
         last_detail = f"{res.failure}: {res.detail}"
         oom_shaped = res.failure == "oom"
         if oom_shaped and chosen is not None:
