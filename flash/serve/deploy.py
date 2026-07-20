@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
@@ -33,6 +33,7 @@ THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _HTTP_CLIENT: httpx.Client | None = None
+_STREAM_HTTP_CLIENT: httpx.Client | None = None
 _HTTP_CLIENT_LOCK = threading.Lock()
 
 
@@ -85,6 +86,11 @@ class AdapterTensorMissing(ServingError):
     """The adapter artifact has metadata but no loadable LoRA tensor file."""
 
 
+def _consume_future_exception(future: Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
 def _is_adapter_tensor_filename(filename: str) -> bool:
     name = filename.rsplit("/", 1)[-1]
     if name in ADAPTER_WEIGHT_FILES:
@@ -122,13 +128,24 @@ def _http_client() -> httpx.Client:
     return _HTTP_CLIENT
 
 
+def _stream_http_client() -> httpx.Client:
+    global _STREAM_HTTP_CLIENT
+    if _STREAM_HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _STREAM_HTTP_CLIENT is None:
+                _STREAM_HTTP_CLIENT = httpx.Client(follow_redirects=True, max_redirects=100)
+    return _STREAM_HTTP_CLIENT
+
+
 def _close_http_client() -> None:
-    global _HTTP_CLIENT
+    global _HTTP_CLIENT, _STREAM_HTTP_CLIENT
     with _HTTP_CLIENT_LOCK:
-        client = _HTTP_CLIENT
+        clients = (_HTTP_CLIENT, _STREAM_HTTP_CLIENT)
         _HTTP_CLIENT = None
-    if client is not None:
-        client.close()
+        _STREAM_HTTP_CLIENT = None
+    for client in clients:
+        if client is not None:
+            client.close()
 
 
 atexit.register(_close_http_client)
@@ -349,21 +366,22 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
         raise ServingError(
             "could not verify adapter rank: huggingface_hub is not installed"
         ) from exc
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        config_future = executor.submit(
-            hf_hub_download,
-            repo_id=hf_repo,
-            filename=filename,
-            repo_type="dataset",
-            revision=hf_revision,
-            token=os.environ.get("HF_TOKEN"),
-        )
-        tensors_future = executor.submit(
-            _verify_adapter_artifact_tensors,
-            hf_repo,
-            subfolder,
-            hf_revision=hf_revision,
-        )
+    executor = ThreadPoolExecutor(max_workers=2)
+    config_future = executor.submit(
+        hf_hub_download,
+        repo_id=hf_repo,
+        filename=filename,
+        repo_type="dataset",
+        revision=hf_revision,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    tensors_future = executor.submit(
+        _verify_adapter_artifact_tensors,
+        hf_repo,
+        subfolder,
+        hf_revision=hf_revision,
+    )
+    try:
         try:
             local = config_future.result()
         except Exception as exc:
@@ -382,7 +400,14 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
             raise ValueError(
                 f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
             )
+    except BaseException:
+        tensors_future.add_done_callback(_consume_future_exception)
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    try:
         tensors_future.result()
+    finally:
+        executor.shutdown()
     return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
 
 
@@ -960,7 +985,7 @@ def chat_stream(
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
         "stream": True,
     }
-    with _http_client().stream(
+    with _stream_http_client().stream(
         "POST",
         f"{base}/chat/completions",
         json=body,

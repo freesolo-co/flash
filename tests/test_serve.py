@@ -48,6 +48,7 @@ def _stub_shared_http_client(monkeypatch):
 
     client = _Client()
     monkeypatch.setattr(deploy, "_http_client", lambda: client)
+    monkeypatch.setattr(deploy, "_stream_http_client", lambda: client)
 
 
 def _stub_adapter_config(

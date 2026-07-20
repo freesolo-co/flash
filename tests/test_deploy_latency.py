@@ -6,7 +6,7 @@ import threading
 import types
 
 
-def test_http_client_is_reused_and_closed(monkeypatch):
+def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
     import flash.serve.deploy as deploy
 
     created = []
@@ -49,6 +49,88 @@ def test_http_client_is_reused_and_closed(monkeypatch):
 
     assert created[0].closed is True
     assert deploy._HTTP_CLIENT is None
+    assert deploy._STREAM_HTTP_CLIENT is None
+
+
+def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    created = []
+
+    class _UndeployResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "run_id": "run-1",
+                "disabled_aliases": ["run-1"],
+                "disabled_revisions": [],
+            }
+
+    class _StreamResponse:
+        def __init__(self, client, request):
+            self.client = client
+            self.request = request
+            self.headers = {"content-type": "text/event-stream"}
+
+        def __enter__(self):
+            if not self.client.pool.acquire(blocking=False):
+                raise deploy.httpx.PoolTimeout("pool exhausted", request=self.request)
+            return self
+
+        def __exit__(self, *_args):
+            self.client.pool.release()
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"held"}}]}'
+            yield "data: [DONE]"
+
+    class _PoolLimitedClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.pool = threading.BoundedSemaphore(1)
+            self.closed = False
+            created.append(self)
+
+        def stream(self, method, url, **_kwargs):
+            return _StreamResponse(self, deploy.httpx.Request(method, url))
+
+        def request(self, method, url, **_kwargs):
+            request = deploy.httpx.Request(method, url)
+            if not self.pool.acquire(blocking=False):
+                raise deploy.httpx.PoolTimeout("pool exhausted", request=request)
+            try:
+                return _UndeployResponse()
+            finally:
+                self.pool.release()
+
+        def close(self):
+            self.closed = True
+
+    deploy._close_http_client()
+    monkeypatch.setattr(deploy.httpx, "Client", _PoolLimitedClient)
+
+    stream = deploy.chat_stream("run-1", [{"role": "user", "content": "hello"}])
+    assert next(stream) == "held"
+    try:
+        result = deploy.undeploy_adapter("run-1")
+    finally:
+        stream.close()
+
+    assert result["serving_deregistered"] is True
+    assert len(created) == 2
+    assert created[0] is deploy._STREAM_HTTP_CLIENT
+    assert created[1] is deploy._HTTP_CLIENT
+
+    deploy._close_http_client()
+    assert all(client.closed for client in created)
 
 
 def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
@@ -133,3 +215,59 @@ def test_adapter_preflight_fetches_config_and_tensors_concurrently(monkeypatch, 
         == 32
     )
     assert set(started) == {"config", "tensors"}
+
+
+def test_adapter_preflight_config_failure_does_not_wait_for_tensors(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    tensor_started = threading.Event()
+    release_tensor = threading.Event()
+    result_ready = threading.Event()
+    background_exception_consumed = threading.Event()
+    result = {}
+
+    def hf_hub_download(**_kwargs):
+        assert tensor_started.wait(1.0)
+        raise RuntimeError("config failed")
+
+    class _HfApi:
+        def list_repo_tree(self, **_kwargs):
+            tensor_started.set()
+            assert release_tensor.wait(2.0)
+            raise RuntimeError("tensor failed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(hf_hub_download=hf_hub_download, HfApi=_HfApi),
+    )
+    original_consume = deploy._consume_future_exception
+
+    def consume_future_exception(future):
+        original_consume(future)
+        background_exception_consumed.set()
+
+    monkeypatch.setattr(deploy, "_consume_future_exception", consume_future_exception)
+
+    def run_preflight():
+        try:
+            deploy.adapter_artifact_lora_rank(
+                "org/repo",
+                "sft/run-1/seed0/adapter",
+                hf_revision="a" * 40,
+            )
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            result_ready.set()
+
+    caller = threading.Thread(target=run_preflight)
+    caller.start()
+    completed_before_tensor_release = result_ready.wait(0.5)
+    release_tensor.set()
+    caller.join(timeout=2.0)
+
+    assert completed_before_tensor_release
+    assert isinstance(result["error"], deploy.ServingError)
+    assert "failed to read org/repo" in str(result["error"])
+    assert background_exception_consumed.wait(1.0)
