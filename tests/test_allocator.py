@@ -468,16 +468,17 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(2.0, "sft", seq_len=4096, max_tokens=8192)
 
 
-def test_opd_vram_estimate_budgets_one_chunked_ce_vocab_buffer():
-    from flash.engine import vram
+def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
     from flash.engine.vram import estimate_vram_gb as e
 
+    seq_len = 4096
+    completion = 512
     vocab = 248_320
     with_vocab = e(
         2.0,
         "opd",
-        seq_len=4096,
-        max_tokens=512,
+        seq_len=seq_len,
+        max_tokens=completion,
         vocab=vocab,
         batch_size=4,
         group_size=4,
@@ -485,36 +486,18 @@ def test_opd_vram_estimate_budgets_one_chunked_ce_vocab_buffer():
     without_vocab = e(
         2.0,
         "opd",
-        seq_len=4096,
-        max_tokens=512,
+        seq_len=seq_len,
+        max_tokens=completion,
         vocab=0,
         batch_size=4,
         group_size=4,
     )
-    expected = vram.OPD_CE_CHUNK_SIZE * vocab * vram._OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+    expected = (seq_len * 4 + completion * 8) * vocab / 1e9
     assert with_vocab - without_vocab == pytest.approx(expected)
-    assert expected < 0.3
 
-    # once one ce chunk is full, longer completions do not grow the vocab-sized peak.
-    short = e(
-        2.0,
-        "opd",
-        seq_len=4096,
-        max_tokens=128,
-        vocab=vocab,
-        batch_size=4,
-        group_size=4,
-    )
-    long = e(
-        2.0,
-        "opd",
-        seq_len=4096,
-        max_tokens=2048,
-        vocab=vocab,
-        batch_size=4,
-        group_size=4,
-    )
-    assert long == short
+    short = e(2.0, "opd", seq_len=seq_len, max_tokens=128, vocab=vocab)
+    long = e(2.0, "opd", seq_len=seq_len, max_tokens=2048, vocab=vocab)
+    assert long > short
 
 
 def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
@@ -681,8 +664,8 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
             "A100 PCIe",
         ),
         (
-            # completion-only chunked ce removes the dense-logit peak; the resident rollout kv now
-            # determines this route, which remains safely above the 32/40 gb consumer classes.
+            # the dense image fallback grows with context and keeps this mixed-modality-safe route
+            # above the 96 gb class.
             "max_context_16384",
             {
                 "epochs": 1,
@@ -691,7 +674,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "RTX Pro 6000",
+            "H200",
         ),
         (
             "max_context_24576",
@@ -797,9 +780,9 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    # completion-only chunked ce removes the old dense-logit peak while the resident rollout still
-    # keeps this run above the 40 gb class; it now fits the 80 gb a100 pcie.
-    assert 40 < need <= 80
+    # the dense image fallback keeps this run above the 80 gb class while still fitting the 96 gb
+    # rtx pro 6000.
+    assert 80 < need <= 96
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
     alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
@@ -815,7 +798,7 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
         )
     )
 
-    assert preview_gpu == "A100 PCIe"
+    assert preview_gpu == "RTX Pro 6000"
     assert alloc.gpu == preview_gpu
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need

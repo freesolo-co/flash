@@ -372,15 +372,17 @@ def estimate_vram_gb(
         rollout = weights + max(
             _KV_CAP, _resident_kv_gb(eff_b, seq_len, rollout_concurrency, fp8_kv=fp8_kv)
         )
-        # opd projects only completion-prediction hidden states and computes exact full-vocabulary ce
-        # in checkpointed chunks. prompt logits and the full [loss_mb, completion, vocab] tensor never
-        # exist. budget one live chunk across its bf16 projection, fp32 normalization, and backward
-        # gradients; the chunk cap makes the vocab peak independent of completion length once filled.
+        # text opd projects only completion-prediction hidden states and computes exact full-vocabulary
+        # ce in checkpointed chunks. image samples still use the dense full-sequence logits path and are
+        # processed one at a time. allocation does not know the dataset modality, so reserve the larger
+        # of one text ce chunk and one dense image loss forward/backward peak.
         completion = opd_completion_len(max_tokens, thinking)
         loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
         activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
         ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
-        logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+        chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+        dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
+        logits = max(chunked_logits, dense_image_logits)
         return base + rollout + activations + logits
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
     # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical

@@ -3600,7 +3600,7 @@ def test_opd_35b_full_context_group1_fits_b200():
     need = model_required_vram_gb(moe, "opd", train=train, headroom=vram_headroom())
     assert need <= 180
     assert cheapest_gpu(need) == "B200"
-    # fp8 kv remains cheaper, but chunked ce now lets the conservative bf16 kv estimate fit too.
+    # fp8 kv keeps the dense-image-safe estimate within b200; the conservative bf16 kv estimate does not.
     kw = {
         "seq_len": 4096,
         "max_tokens": 2048,
@@ -3614,7 +3614,7 @@ def test_opd_35b_full_context_group1_fits_b200():
     bf16 = estimate_vram_gb(info.params_b, "opd", "bf16", fp8_kv=False, **kw)
     assert fp8 < bf16
     hr = vram_headroom()
-    assert fp8 * hr < bf16 * hr <= 180
+    assert fp8 * hr <= 180 < bf16 * hr
 
 
 def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
@@ -3651,8 +3651,8 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink():
     assert "max_completion_tokens" in msg
 
 
-def test_opd_vram_budgets_one_chunked_ce_buffer():
-    """opd budgets one live checkpointed ce chunk instead of full-sequence logits."""
+def test_opd_vram_keeps_chunked_text_peak_when_it_exceeds_dense_image_peak():
+    """opd reserves the larger of one checkpointed text ce chunk and one dense image sample."""
     from flash.engine.vram import (
         _OPD_CE_PEAK_BYTES_PER_LOGIT,
         OPD_CE_CHUNK_SIZE,
@@ -3660,8 +3660,8 @@ def test_opd_vram_budgets_one_chunked_ce_buffer():
     )
 
     kw = {
-        "seq_len": 9216,
-        "max_tokens": 8192,
+        "seq_len": 1,
+        "max_tokens": OPD_CE_CHUNK_SIZE,
         "lora_rank": 16,
         "batch_size": 1,
         "group_size": 1,
@@ -3674,14 +3674,14 @@ def test_opd_vram_budgets_one_chunked_ce_buffer():
     assert delta == pytest.approx(expected, rel=1e-9)
 
 
-def test_opd_vram_ce_peak_is_bounded_after_chunk_fills():
-    """completion length does not grow the vocabulary peak after one ce chunk is full."""
+def test_opd_vram_dense_image_peak_grows_with_completion_budget():
+    """the dense image fallback grows with the completion rows retained for its loss."""
     from flash.engine.vram import estimate_vram_gb
 
     kw = {"seq_len": 4096, "vocab": 248_320, "lora_rank": 16}
     non_think = estimate_vram_gb(4.0, "opd", "bf16", thinking=False, **kw)
     think = estimate_vram_gb(4.0, "opd", "bf16", thinking=True, **kw)
-    assert think == non_think
+    assert think > non_think
 
 
 def test_opd_vram_scales_to_loss_microbatch_not_full_batch():
