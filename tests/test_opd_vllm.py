@@ -741,6 +741,33 @@ def test_opd_vllm_sync_atomically_publishes_before_dropping_old_adapter(
     assert not any(path.name.startswith(".adapter-") for path in (tmp_path / "sync").iterdir())
 
 
+def test_opd_vllm_sync_replaces_stale_version_directory(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    adapter_root = tmp_path / "sync"
+    stale_dir = adapter_root / "adapter-000001"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+    class _Model:
+        def save_pretrained(self, path):
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        adapter_root=str(adapter_root),
+    )
+    engine.sync_from_model(_Model())
+
+    assert engine.sync_count == 1
+    assert not (stale_dir / "stale.txt").exists()
+    assert (stale_dir / "adapter_config.json").is_file()
+
+
 def test_opd_vllm_adapter_store_prefers_tmpfs(monkeypatch, tmp_path):
     from flash.engine.worker import opd_vllm
 

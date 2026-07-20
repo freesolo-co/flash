@@ -431,6 +431,11 @@ class OpdVllmRolloutEngine:
             lora_request = self._LoRARequest(
                 f"opd-step-{next_version}", next_version, adapter_dir
             )
+            if os.path.lexists(adapter_dir):
+                if os.path.isdir(adapter_dir) and not os.path.islink(adapter_dir):
+                    shutil.rmtree(adapter_dir)
+                else:
+                    os.unlink(adapter_dir)
             os.replace(staging_dir, adapter_dir)
         except BaseException:
             shutil.rmtree(staging_dir, ignore_errors=True)
