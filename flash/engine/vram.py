@@ -422,6 +422,40 @@ def grpo_kv_floor_gb(
     return upper
 
 
+def _rollout_kv_floor_gb(
+    params_b: float,
+    vllm_max_len: int,
+    concurrency: int,
+    *,
+    active_params_b: float | None = None,
+    model_info=None,
+    preserve_legacy_floor: bool = False,
+) -> int:
+    floor = grpo_kv_floor_gb(
+        params_b,
+        vllm_max_len,
+        concurrency,
+        active_params_b=active_params_b,
+        model_info=model_info,
+        preserve_legacy_floor=preserve_legacy_floor,
+    )
+    from flash.providers.base import max_non_fp8_kv_vram_gb
+
+    ceiling = max_non_fp8_kv_vram_gb()
+    if floor <= ceiling:
+        return floor
+    fp8_floor = grpo_kv_floor_gb(
+        params_b,
+        vllm_max_len,
+        concurrency,
+        active_params_b=active_params_b,
+        fp8_kv=True,
+        model_info=model_info,
+        preserve_legacy_floor=preserve_legacy_floor,
+    )
+    return fp8_floor if fp8_floor > ceiling else floor
+
+
 @dataclass(frozen=True)
 class VramEstimate:
     params_b: float | None
@@ -895,7 +929,9 @@ def model_required_vram_gb(
             params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
         quant = getattr(info, "quant", "bf16") or "bf16"
         use_vllm = True
-        active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
+        # pinned commits retain validated coarse geometry but use conservative generic architecture sizing.
+        sizing_info = None if model_revision else info
+        active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
         need = _need(
             params_b or 4.0,
             algorithm,
@@ -903,7 +939,7 @@ def model_required_vram_gb(
             use_vllm=use_vllm,
             vocab=model_vocab,
             active_params_b=active_b,
-            model_info=info,
+            model_info=sizing_info,
         )
         if is_opd:
             need = _opd_fp8_adjust(
@@ -913,17 +949,17 @@ def model_required_vram_gb(
                 use_vllm=use_vllm,
                 vocab=model_vocab,
                 active_params_b=active_b,
-                model_info=info,
+                model_info=sizing_info,
             )
         floor = 0
-        if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
-            floor = int(info.grpo_min_vram_gb)
-        if not is_grpo and getattr(info, "sft_min_vram_gb", 0):
-            floor = max(floor, int(info.sft_min_vram_gb))
+        if is_grpo and getattr(sizing_info, "grpo_min_vram_gb", 0):
+            floor = int(sizing_info.grpo_min_vram_gb)
+        if not is_grpo and getattr(sizing_info, "sft_min_vram_gb", 0):
+            floor = max(floor, int(sizing_info.sft_min_vram_gb))
         # Escalate on active_params_b for MoE: keying on total would over-reject (35B total's
         # threshold is below default rollout length); ~3B active gives ~16k headroom.
         if is_grpo and floor:
-            if getattr(info, "sleep_unsupported", False):
+            if getattr(sizing_info, "sleep_unsupported", False):
                 # Sleep is non-functional for this model (it HANGS) -> it MUST fit RESIDENT. Size the
                 # requirement on the RESIDENT peak (engine live through the backward, fp8 KV on the big
                 # floor card which is sm100) instead of the sleep estimate + grpo_seq_escalation_gb, so
@@ -945,7 +981,7 @@ def model_required_vram_gb(
                         sleep_offload=False,
                         active_params_b=active_b,
                         fp8_kv=True,
-                        model_info=info,
+                        model_info=sizing_info,
                     )
                     # match grpo_fits_resident's 1.15 margin (NOT the looser 1.1 headroom) so the
                     # parse-time reject lands at the SAME resident wall the worker gate enforces.
@@ -965,12 +1001,12 @@ def model_required_vram_gb(
             # memory for the cache blocks") on a card the training-peak estimate accepted.
             need = max(
                 need,
-                grpo_kv_floor_gb(
+                _rollout_kv_floor_gb(
                     params_b or 4.0,
                     seq_len,
                     vllm_concurrency,
                     active_params_b=active_b,
-                    model_info=info,
+                    model_info=sizing_info,
                     preserve_legacy_floor=is_opd,
                 ),
             )
@@ -995,7 +1031,7 @@ def model_required_vram_gb(
         floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
         if is_opd and params_b >= 2.0:
             floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
-        need = max(need, floor_gb, grpo_kv_floor_gb(params_b, seq_len, vllm_concurrency))
+        need = max(need, floor_gb, _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency))
     return need
 
 

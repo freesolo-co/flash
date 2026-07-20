@@ -250,3 +250,39 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
 
     # The validated lean default (group 8, short context) stays on the 32 GB tier.
     assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 36
+
+
+def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
+    from flash.catalog import MODELS
+    from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
+    from flash.providers.base import max_non_fp8_kv_vram_gb
+
+    info = MODELS["openbmb/MiniCPM5-1B"]
+    concurrency = 8 * 16
+    ceiling = max_non_fp8_kv_vram_gb()
+    bf16_floor = grpo_kv_floor_gb(
+        info.params_b,
+        4096,
+        concurrency,
+        active_params_b=info.active_params_b,
+        model_info=info,
+        preserve_legacy_floor=True,
+    )
+    fp8_floor = grpo_kv_floor_gb(
+        info.params_b,
+        4096,
+        concurrency,
+        active_params_b=info.active_params_b,
+        fp8_kv=True,
+        model_info=info,
+        preserve_legacy_floor=True,
+    )
+    need = model_required_vram_gb(
+        info.id,
+        "opd",
+        train={"batch_size": 8, "group_size": 16, "max_context_tokens": 4096},
+    )
+
+    assert bf16_floor > ceiling
+    assert fp8_floor > ceiling
+    assert fp8_floor <= need < bf16_floor
