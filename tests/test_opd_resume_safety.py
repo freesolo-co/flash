@@ -874,7 +874,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(
     assert events == ["cancel", "destroy"]
     assert resumed == []
     assert status.state == "failed"
-    assert status.remote is None
+    assert status.remote == _remote(attempt=0)
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
