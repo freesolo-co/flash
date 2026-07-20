@@ -668,10 +668,7 @@ def test_multimodal_algorithm_validation_rejects_unsupported_modes():
         mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "opd")
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_image_training_preflight_validates_packaged_dataset_before_allocation(
-    tmp_path, algorithm
-):
+def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
     env_file.write_text("def load_environment(**kwargs):\n    return None\n")
@@ -681,18 +678,18 @@ def test_image_training_preflight_validates_packaged_dataset_before_allocation(
     environment = SimpleNamespace(id=str(env_file), resolved_sha="", params={})
     supported = SimpleNamespace(
         model="Qwen/Qwen3.5-4B",
-        algorithm=algorithm,
+        algorithm="opd",
         environment=environment,
     )
-    mm.preflight_validate_image_training(supported)
+    mm.preflight_validate_image_opd(supported)
 
     unsupported = SimpleNamespace(
         model="openbmb/MiniCPM5-1B",
-        algorithm=algorithm,
+        algorithm="opd",
         environment=environment,
     )
     with pytest.raises(ValueError, match="does not support image-bearing"):
-        mm.preflight_validate_image_training(unsupported)
+        mm.preflight_validate_image_opd(unsupported)
 
 
 def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
@@ -711,11 +708,11 @@ def test_image_opd_preflight_preserves_multi_turn_rejection(tmp_path):
     )
 
     with pytest.raises(ValueError, match="single-turn"):
-        mm.preflight_validate_image_training(multi_turn)
+        mm.preflight_validate_image_opd(multi_turn)
 
 
 @pytest.mark.parametrize("record_source", ["inline", "packaged"])
-def test_image_training_preflight_limits_scan_to_max_examples(tmp_path, record_source):
+def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source):
     records = [
         {"input": "text only", "output": "answer"},
         {"input": "image", "output": "red", "image": "dataset/red.png"},
@@ -742,7 +739,7 @@ def test_image_training_preflight_limits_scan_to_max_examples(tmp_path, record_s
         train=SimpleNamespace(max_examples=1),
     )
 
-    mm.preflight_validate_image_training(spec)
+    mm.preflight_validate_image_opd(spec)
 
 
 @pytest.mark.parametrize("background", [False, True])
@@ -789,13 +786,11 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
 @pytest.mark.parametrize(
     ("algorithm", "model", "extra_params", "message"),
     [
-        ("sft", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
-        ("grpo", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
         ("opd", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
         ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
     ],
 )
-def test_image_training_submit_preflight_rejects_before_allocation(
+def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
     monkeypatch, tmp_path, algorithm, model, extra_params, message
 ):
     from flash import runner

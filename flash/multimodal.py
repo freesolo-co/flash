@@ -851,10 +851,9 @@ def _read_json_records(path: Path) -> list[dict]:
     return value
 
 
-def preflight_validate_image_training(spec) -> None:
-    """Validate statically discoverable image training datasets before GPU allocation."""
-    algorithm = getattr(spec, "algorithm", "")
-    if algorithm not in {"sft", "grpo", "opd"}:
+def preflight_validate_image_opd(spec) -> None:
+    """Validate statically discoverable image OPD datasets before GPU allocation."""
+    if getattr(spec, "algorithm", "") != "opd":
         return
     environment = getattr(spec, "environment", None)
     params = dict(getattr(environment, "params", None) or {})
@@ -896,6 +895,6 @@ def preflight_validate_image_training(spec) -> None:
                 getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
             )
             validate_multimodal_training(
-                str(getattr(spec, "model", "")), algorithm, multi_turn=multi_turn
+                str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
             )
             return
