@@ -498,9 +498,19 @@ class ApiClient:
                 if content:
                     yield str(content)
                 return
-            read = getattr(resp, "read1", resp.read)
-            while raw := read(4096):
-                yield from decoder.decode(raw)
+            read1 = getattr(resp, "read1", None)
+            read = read1 if read1 is not None else resp.read
+            read_size = 4096 if read1 is not None else 1
+            while raw := read(read_size):
+                state = decoder.getstate()
+                try:
+                    decoded = decoder.decode(raw)
+                except UnicodeDecodeError as exc:
+                    decoder.setstate(state)
+                    prefix_end = max(0, exc.start - len(state[0]))
+                    yield from decoder.decode(raw[:prefix_end])
+                    raise
+                yield from decoded
             yield from decoder.decode(b"", final=True)
 
 

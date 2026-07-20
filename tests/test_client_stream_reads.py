@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import io
+from collections.abc import Iterator
 
 import pytest
 
@@ -31,27 +32,41 @@ class _Read1Response(_ReadResponse):
         return self._stream.read(size)
 
 
-def _decode_byte_by_byte(payload: bytes) -> list[str]:
+class _BlockingLargeReadResponse(_ReadResponse):
+    def read(self, size: int = -1) -> bytes:
+        self.calls.append(("read", size))
+        if size != 1:
+            raise TimeoutError("large reads would block")
+        return self._stream.read(size)
+
+
+def _decode_byte_by_byte(payload: bytes) -> Iterator[str]:
     decoder = codecs.getincrementaldecoder("utf-8")()
-    chunks: list[str] = []
     for byte in payload:
-        chunk = decoder.decode(bytes([byte]))
-        if chunk:
-            chunks.append(chunk)
-    tail = decoder.decode(b"", final=True)
-    if tail:
-        chunks.append(tail)
-    return chunks
+        yield from decoder.decode(bytes([byte]))
+    yield from decoder.decode(b"", final=True)
+
+
+def _collect_until_unicode_error(chunks: Iterator[str]) -> list[str]:
+    output: list[str] = []
+    while True:
+        try:
+            output.append(next(chunks))
+        except UnicodeDecodeError:
+            return output
+        except StopIteration:
+            pytest.fail("stream ended without a UnicodeDecodeError")
 
 
 @pytest.mark.parametrize(
-    ("response_type", "reader_name"),
-    [(_Read1Response, "read1"), (_ReadResponse, "read")],
+    ("response_type", "reader_name", "read_size"),
+    [(_Read1Response, "read1", 4096), (_ReadResponse, "read", 1)],
 )
-def test_chat_stream_buffered_reads_match_bytewise_utf8_chunks(
+def test_chat_stream_reads_match_bytewise_utf8_chunks(
     monkeypatch: pytest.MonkeyPatch,
     response_type: type[_ReadResponse],
     reader_name: str,
+    read_size: int,
 ) -> None:
     text = "a" * 4095 + "€\nfirst line\n第二行\n"
     payload = text.encode("utf-8")
@@ -60,7 +75,35 @@ def test_chat_stream_buffered_reads_match_bytewise_utf8_chunks(
 
     chunks = list(ApiClient("http://test").chat_stream("run-a", []))
 
-    assert chunks == _decode_byte_by_byte(payload)
+    assert chunks == list(_decode_byte_by_byte(payload))
     assert "".join(chunks) == text
     assert response.calls
-    assert all(call == (reader_name, 4096) for call in response.calls)
+    assert all(call == (reader_name, read_size) for call in response.calls)
+
+
+def test_chat_stream_without_read1_yields_before_full_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _BlockingLargeReadResponse(b"first chunk")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+    stream = ApiClient("http://test").chat_stream("run-a", [])
+
+    try:
+        assert next(stream) == "f"
+    finally:
+        stream.close()
+
+    assert response.calls == [("read", 1)]
+
+
+def test_chat_stream_yields_valid_prefix_before_unicode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"visible prefix\xffhidden"
+    response = _Read1Response(payload)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    expected = _collect_until_unicode_error(_decode_byte_by_byte(payload))
+    actual = _collect_until_unicode_error(ApiClient("http://test").chat_stream("run-a", []))
+
+    assert actual == expected == list("visible prefix")
