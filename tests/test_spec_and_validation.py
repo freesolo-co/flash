@@ -670,10 +670,13 @@ def test_gpu_type_is_non_pinning_managed_input() -> None:
 
 
 def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
-    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+    spec_from_dict(_raw(**{"gpu.type": "B200"}))
     warning = capsys.readouterr().err
     assert "[gpu] type='B200' is a non-pinning hint and was not applied" in warning
-    assert f"selected: {authored.gpu.type!r}" in warning
+    # the provisional is an offline RunPod-static estimate, not the final pick, so the note must not
+    # label any class "selected"; the submit-time allocator re-resolves across live providers.
+    assert "picks the cheapest validated class that fits at submit time" in warning
+    assert "selected" not in warning
     # the suggested pin must paste into the user's existing [gpu] table as-is: a bare
     # `exact_type = "..."` key, never the `[gpu] exact_type=...` one-line header form (invalid TOML)
     # nor a dotted `gpu.exact_type` (which nests to gpu.gpu.exact_type when written inside [gpu]).
@@ -709,8 +712,8 @@ def test_gpu_type_override_warning_suppressed_for_provider_pinned_runs(capsys) -
     # without a provider pin, an authored non-pinning type fires the clarity note...
     spec_from_dict(_raw(**{"gpu.type": "B200"}))
     assert "non-pinning hint" in capsys.readouterr().err
-    # ...but the provider-agnostic provisional cannot name the class a provider-restricted allocator
-    # will actually choose, so pinning a provider suppresses the note instead of naming a wrong one.
+    # ...but the note is scoped to provider-agnostic runs (under a provider pin the exact_type it
+    # would suggest might not be provisionable there), so pinning a provider suppresses it.
     spec_from_dict(_raw(**{"gpu.type": "B200", "gpu.provider": "lambda"}))
     assert capsys.readouterr().err == ""
 

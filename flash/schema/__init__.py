@@ -389,9 +389,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     try:
         # offline sizing/display only; allocator re-resolves at submit time.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
-        # gpu_type here is the provider-agnostic provisional; a provider-pinned run resolves through
-        # the provider-restricted allocator instead, so naming a "selected" class would be wrong. only
-        # emit the non-pinning clarity note when the allocator is unconstrained by provider.
+        # the note deliberately does not name a concrete "selected" class: gpu_type is only the
+        # offline RunPod-static sizing estimate, while the submit-time allocator re-resolves the
+        # cheapest fitting class across all live providers (so it can differ even with no provider
+        # pinned). it is also scoped to provider-agnostic runs, since under a [gpu] provider pin the
+        # exact_type it suggests might not be provisionable there.
         if "type" in gpu_raw and not exact_type and not gpu_provider:
             authored_type_raw = gpu_raw["type"]
             # only an active validated class is a usable exact_type pin; an unrecognized string or a
@@ -409,16 +411,16 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             if pinnable is None:
                 print(
                     f"note: [gpu] type={authored_type_raw!r} is not an active GPU class and was "
-                    "ignored; the allocator will pick the cheapest validated class that fits "
-                    f"(selected: {gpu_type!r}). run `flash gpus` to list valid classes; to pin one, "
-                    'add exact_type = "<CLASS>" to your [gpu] section.',
+                    "ignored; the allocator automatically picks the cheapest validated class "
+                    "that fits at submit time. run `flash gpus` to list valid classes; to pin "
+                    'one, add exact_type = "<CLASS>" to your [gpu] section.',
                     file=sys.stderr,
                 )
             elif pinnable != gpu_type:
                 print(
                     f"note: [gpu] type={authored_type_raw!r} is a non-pinning hint and was not "
-                    "applied; the allocator will pick the cheapest validated class that fits "
-                    f"(selected: {gpu_type!r}). to require a specific class, add "
+                    "applied; the allocator automatically picks the cheapest validated class "
+                    "that fits at submit time. to require a specific class, add "
                     f'exact_type = "{pinnable}" to your [gpu] section.',
                     file=sys.stderr,
                 )
