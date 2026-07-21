@@ -137,6 +137,32 @@ def gdn_packing_available(model_id: str | None = None, revision: str = "") -> bo
         return False
 
 
+class _FirstFitFreeSpace:
+    """track bin capacity and return the leftmost bin that fits in logarithmic time."""
+
+    def __init__(self, max_bins: int):
+        self._leaf_count = 1 << (max_bins - 1).bit_length()
+        self._tree = [0] * (2 * self._leaf_count)
+
+    def first_fit(self, need: int) -> int | None:
+        if self._tree[1] < need:
+            return None
+        node = 1
+        while node < self._leaf_count:
+            left = node << 1
+            node = left if self._tree[left] >= need else left + 1
+        return node - self._leaf_count
+
+    def update(self, bin_index: int, free: int) -> None:
+        node = self._leaf_count + bin_index
+        self._tree[node] = free
+        while node > 1:
+            node >>= 1
+            left = self._tree[node << 1]
+            right = self._tree[(node << 1) + 1]
+            self._tree[node] = left if left >= right else right
+
+
 def pack_token_ids(
     sequences: list[list[int]],
     max_length: int,
@@ -168,23 +194,28 @@ def pack_token_ids(
             if s
         ]
     order = sorted(range(len(items)), key=lambda i: len(items[i][0]), reverse=True)
+    if not order:
+        return []
     bins: list[dict] = []
+    free_space = _FirstFitFreeSpace(len(items))
     for i in order:
         s, m = items[i]
         need = len(s)
-        for b in bins:
-            if b["free"] >= need:
-                b["input_ids"].extend(s)
-                b["seq_lengths"].append(need)
-                if m is not None:
-                    b["completion_mask"].extend(m)
-                b["free"] -= need
-                break
-        else:
-            nb = {"input_ids": list(s), "seq_lengths": [need], "free": max_length - need}
+        bin_index = free_space.first_fit(need)
+        if bin_index is None:
+            bin_index = len(bins)
+            b = {"input_ids": list(s), "seq_lengths": [need], "free": max_length - need}
             if m is not None:
-                nb["completion_mask"] = list(m)
-            bins.append(nb)
+                b["completion_mask"] = list(m)
+            bins.append(b)
+        else:
+            b = bins[bin_index]
+            b["input_ids"].extend(s)
+            b["seq_lengths"].append(need)
+            if m is not None:
+                b["completion_mask"].extend(m)
+            b["free"] -= need
+        free_space.update(bin_index, b["free"])
     rows: list[dict] = []
     for b in bins:
         row = {"input_ids": b["input_ids"], "seq_lengths": b["seq_lengths"]}
