@@ -164,11 +164,24 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
             return None
         metrics = decode_output(job.get("output"))
         if not isinstance(metrics, dict):
-            return None
+            # the queue job is terminal-ok but its output metrics are not readable yet;
+            # treat this lag like instance recovery (raise pending) so callers keep
+            # reconciling instead of tearing down a job that already completed.
+            grace_expired = (
+                deadline_at is None
+                or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
+            )
+            if grace_expired:
+                return None
+            raise _CompletedAttemptPending(
+                "runpod job completed but its output metrics are not readable yet"
+            )
         allocated_gpu = original.get("allocated_gpu")
         if allocated_gpu:
             metrics.setdefault("allocated_gpu", allocated_gpu)
         return metrics
+    except _CompletedAttemptPending:
+        raise
     except Exception:
         return None
 

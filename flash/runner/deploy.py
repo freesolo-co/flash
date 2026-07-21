@@ -691,11 +691,13 @@ def _reconcile_attached_remote(
         _load_run_deadline_at,
         _record_cleanup_remote,
         _remote_resource_identity,
+        _spec_with_remaining_wall,
         get_status,
     )
     from flash.runner.lifecycle import (
         _adopt_completed_attempt,
         _completed_attempt_metrics,
+        _CompletedAttemptPending,
         _runpod_completed_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
@@ -723,10 +725,16 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             return
-        completed_metrics = _runpod_completed_metrics(
-            expected_remote,
-            deadline_at=deadline_at,
-        )
+        try:
+            completed_metrics = _runpod_completed_metrics(
+                expected_remote,
+                deadline_at=deadline_at,
+            )
+        except _CompletedAttemptPending:
+            # the queue job already completed but its metrics are still landing; keep
+            # reconciling (do not tear it down) until they are readable.
+            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            continue
         if completed_metrics is not None:
             try:
                 if _adopt_completed_attempt(
@@ -738,8 +746,11 @@ def _reconcile_attached_remote(
                 ):
                     return
             except Exception:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
+                pass
+            # the job completed with metrics; never tear it down — keep retrying
+            # adoption (e.g. across a transient cleanup failure) until it sticks.
+            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            continue
         if time.time() >= deadline_at:
             try:
                 metrics = _completed_attempt_metrics(
@@ -787,6 +798,16 @@ def _reconcile_attached_remote(
         delay = min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
             time.sleep(delay)
+        if time.time() < deadline_at:
+            # if a replacement cannot meet the 60-second provider minimum yet the run
+            # wall deadline is still open, keep reconciling (probe for completion) rather
+            # than tearing down and failing early — mirror handle-less recovery, which
+            # waits until the wall deadline.
+            try:
+                _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
+            except RuntimeError:
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
         try:
             resource_deleted = _strict_teardown_handle(handle, run_id)
             worker_gone = True
