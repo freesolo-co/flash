@@ -388,6 +388,8 @@ def deploy_train_endpoint(
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
+        from flash.spec import gpu_count_of
+
         if deadline_at is not None:
             require_create_allowance(deadline_at)
         with FLASH_SDK_LOCK:
@@ -397,7 +399,8 @@ def deploy_train_endpoint(
             kwargs = {
                 "name": name,
                 "gpu": flash_gpu(friendly),
-                "gpu_count": 1,
+                # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
+                "gpu_count": gpu_count_of(spec),
                 "min_cuda_version": min_cuda_for(friendly),
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
@@ -697,7 +700,9 @@ def poll_job(
                 h = runpod_api.endpoint_health_for_fingerprint(
                     handle.endpoint_id,
                     handle.key_fingerprint,
-                    **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+                    **deadline_kwargs(
+                        runpod_api.endpoint_health_for_fingerprint, absolute_deadline
+                    ),
                 )
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
@@ -750,9 +755,7 @@ def poll_job(
                     last_hb_ts = hb_ts or 0.0
                     last_progress = time.time()
                     seen_training_hb = is_training_hb
-                elif hb_attempt == last_hb_attempt and (
-                    hb_ts is None or hb_ts > last_hb_ts
-                ):
+                elif hb_attempt == last_hb_attempt and (hb_ts is None or hb_ts > last_hb_ts):
                     # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
                     if hb_ts is not None:
                         last_hb_ts = hb_ts
