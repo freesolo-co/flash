@@ -160,8 +160,9 @@ def cmd_gpus(args) -> int:
         (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
     )
     tip = (
-        "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated managed class that fits the model, so you don't pin a GPU type."
+        "Tip: GPU allocation is automatic by default.\n"
+        "The allocator picks the cheapest validated class that fits. Pin a specific class by "
+        'adding exact_type = "<CLASS>" to the [gpu] section.'
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
@@ -313,9 +314,8 @@ def cmd_train(args) -> int:
         runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
     )
     if args.dry_run:
-        # dry-run is a faithful server-side preview: it sends the same declared secrets and runs the
-        # same config, warm-start, serving, and cost preflights as a real submit, but allocates no gpu
-        # and charges nothing. a rejection surfaces as the server's error with exit status 1.
+        # dry-run runs submit-time server preflights without importing user code, allocating a gpu,
+        # or charging anything. a rejection surfaces as the server's error with exit status 1.
         try:
             status = client.create_run(
                 payload,
@@ -330,6 +330,14 @@ def cmd_train(args) -> int:
             raise ApiError(exc.status, detail) from exc
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
+        print(
+            "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
+            "runtime-secret presence, warm-start source, serving context cap, and cost. it did NOT "
+            "import or run your environment.py; dataset loading, start_episode/episode shapes, "
+            "reward/scorer, worker imports, model load, and gpu/training are first exercised on the "
+            "worker after cold-start.",
+            file=sys.stderr,
+        )
         if render.styled():
             print(
                 render.object_panel(
@@ -376,18 +384,26 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
     if isinstance(heartbeat, dict):
+        heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
+            if state == "running":
+                warmup = render.warmup_message(
+                    stage,
+                    heartbeat_age_seconds,
+                    render.heartbeat_is_current_attempt(status, heartbeat),
+                )
+                if warmup:
+                    parts.append(warmup)
         step = heartbeat.get("step")
         if step is not None:
             parts.append(f"step={step}")
         # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
         # minute granularity: the non-TTY follow path prints a line whenever this string changes,
         # so a seconds-precision age would emit one line per poll.
-        ts = heartbeat.get("ts")
-        if isinstance(ts, (int, float)) and ts > 0:
-            mins = int(max(0.0, time.time() - ts) // 60)
+        if heartbeat_age_seconds is not None:
+            mins = int(heartbeat_age_seconds // 60)
             parts.append(f"hb={mins}m" if mins else "hb=<1m")
     realized = status.get("realized_cost_usd")
     if realized is not None:
@@ -785,18 +801,11 @@ def cmd_chat(args) -> int:
     if revision is None and parsed is None:
         print(
             f"invalid chat target {args.run_id!r} "
-            "(expected a bare <run_id> or full immutable adapter revision)",
+            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)",
             file=sys.stderr,
         )
         return 1
-    if revision is None and parsed[1] is not None:
-        print(
-            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
-            "run alias; use the full immutable adapter revision returned by `flash deployments`",
-            file=sys.stderr,
-        )
-        return 1
-    chat_target = args.run_id if revision is not None else parsed[0]
+    chat_target = args.run_id
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
     system = getattr(args, "system", None)

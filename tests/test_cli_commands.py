@@ -228,6 +228,7 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.6-27B" in out
     assert "Qwen/Qwen3.5-2B" in out
     assert "openbmb/MiniCPM5-1B" in out
     # only bare model ids, none of the extra per-model detail columns
@@ -239,15 +240,18 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "GPU class selection is fully automatic" in out
-    assert "cheapest validated managed class" in out
+    assert "GPU allocation is automatic by default" in out
+    assert "cheapest validated class" in out
+    assert 'exact_type = "<CLASS>"' in out
+    assert "[gpu] exact_type" not in out
+    assert "gpu.exact_type" not in out
+    assert "don't pin" not in out
+    assert "cannot pin" not in out
     assert "runpod" not in out.lower()
     assert "lambda" not in out.lower()
-    assert "You can still tune" not in out
-    assert "[gpu] config table" not in out
 
 
 def _train_config(tmp_path, *, extra_train: str = ""):
@@ -782,10 +786,12 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
-def test_chat_checkpoint_ref_is_rejected(fake_client, capsys) -> None:
-    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 1
-    assert "full immutable adapter revision" in capsys.readouterr().err
-    assert not any(call[0] == "chat_stream" for call in fake_client.calls)
+def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
+    target = "flash-1/step-40"
+
+    assert _run(["chat", target, "-m", "What is 6*7?"]) == 0
+    assert fake_client.calls[-1][0] == "chat_stream"
+    assert fake_client.calls[-1][1] == target
 
 
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
@@ -1163,3 +1169,78 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
     _, progress = _log_follow_progress(malformed, "unknown")
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "typically several minutes, sometimes 15-20 min" in progress
+    assert "setup is not billed" in progress
+    assert "do not cancel" in progress
+
+    status["last_heartbeat"]["stage"] = "rl_step"
+    _, progress = _log_follow_progress(status, "unknown")
+    assert "warming up" not in progress
+    assert "not billed" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "hb=20m" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
+    # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
+    status = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "remote": {"attempt": 3},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 3},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "do not cancel" in progress

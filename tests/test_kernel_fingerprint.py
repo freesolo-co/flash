@@ -141,6 +141,24 @@ def test_fa3_default_is_in_lockstep():
     )
 
 
+def test_huggingface_hub_floor_is_in_lockstep():
+    """The huggingface_hub floor is declared twice for the worker: Dockerfile.worker bakes it into the
+    per-arch image (the default run path) and WORKER_DEPS installs it on the no-image/live-function
+    path. They must stay equal so both paths carry the same built-in 429 RateLimit auto-retry floor."""
+    from flash.providers.runpod.train import WORKER_DEPS
+
+    dockerfile = (ROOT / "Dockerfile.worker").read_text()
+    docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
+    worker_hf = [d for d in WORKER_DEPS if kf._pkg_name(d) == "huggingface_hub"]
+    # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
+    assert len(docker_hf) == 1, f"expected one huggingface_hub pin in Dockerfile.worker, found {docker_hf}"
+    assert len(worker_hf) == 1, f"expected one huggingface_hub pin in WORKER_DEPS, found {worker_hf}"
+    assert docker_hf[0] == worker_hf[0], (
+        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs WORKER_DEPS={worker_hf[0]!r}; "
+        "bump both together so the baked image and the live-function path share the 429 retry floor"
+    )
+
+
 def test_parse_baked_per_sm_arches_contract():
     annotated = 'BAKED_PER_SM_ARCHES: frozenset[str] = frozenset({"sm90", "sm80"})\n'
     assert kf.parse_baked_per_sm_arches(annotated) == ["sm90", "sm80"]

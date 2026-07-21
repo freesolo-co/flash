@@ -263,8 +263,9 @@ def test_serving_prices_pin_public_rates_plus_markup():
         "Qwen/Qwen3.5-0.8B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-2B": (0.02, 0.10, 0.004),
         "Qwen/Qwen3.5-4B": (0.03, 0.15, 0.006),
-        "Qwen/Qwen3.5-9B": (0.10, 0.15, 0.020),
-        "Qwen/Qwen3.6-35B-A3B": (0.15, 1.00, 0.050),
+        "Qwen/Qwen3.5-9B": (0.114, 0.19, 0.023),
+        "Qwen/Qwen3.6-27B": (0.4254, 3.055, 0.14),
+        "Qwen/Qwen3.6-35B-A3B": (0.198, 1.265, 0.066),
     }
     for model_id, (input_rate, output_rate, cached_rate) in typical.items():
         price = SERVING_PRICES[model_id]
