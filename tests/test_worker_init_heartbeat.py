@@ -366,6 +366,40 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
     assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
 
 
+@pytest.mark.parametrize("stage", ["rl_step", "opd_step"])
+def test_forced_sample_payload_commits_after_same_step_liveness(monkeypatch, stage):
+    """a liveness commit for a step must not throttle the first sample payload for that step."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+
+    ne.heartbeat(stage, step=1)
+    assert len(uploads) == 1
+
+    committed = ne.heartbeat(
+        stage,
+        step=1,
+        force=True,
+        sampled_completions=[
+            {
+                "prompt_tail": "prompt",
+                "completion": "completion",
+                "reward" if stage == "rl_step" else "loss": 1.0,
+                "generated_at_step": 0,
+            }
+        ],
+    )
+
+    assert committed is True
+    assert len(uploads) == 2
+
+
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
     """Regression (cursor[bot], heartbeat.py): when optimizer steps land FARTHER apart than the force
     floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
