@@ -322,12 +322,10 @@ def test_on_train_end_no_checkpoints_is_noop(tmp_path, monkeypatch, fake_trainer
     assert rec.uploads == []
 
 
-def test_on_save_uploads_synchronously_before_returning(
+def test_on_save_uploads_optional_checkpoint_after_flush(
     tmp_path, monkeypatch, fake_trainer_callback
 ):
-    """Uploads are synchronous: by the time on_save returns, the checkpoint is fully on HF — no
-    background thread is left running. This is what makes "upload busy" impossible by construction:
-    a later save can never find this one still in flight."""
+    """optional saves return after local staging and finish through the bounded uploader."""
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -337,7 +335,7 @@ def test_on_save_uploads_synchronously_before_returning(
     _make_ckpt_dir(out, 4)
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
-    # Fully uploaded the moment on_save returns — no polling, no thread join needed.
+    assert worker.flush_optional_uploads()
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert "rl/flash-ckpt-1/checkpoints/step-4/adapter" in paths
     assert "rl/flash-ckpt-1/checkpoint/checkpoint-4" in paths
@@ -355,6 +353,7 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     _make_ckpt_dir(out, 4)
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert worker.flush_optional_uploads()
     paths = [u["path_in_repo"] for u in rec.uploads]
     assert paths == [
         "rl/flash-ckpt-1/checkpoints/step-4/adapter",  # deployable first
@@ -362,10 +361,10 @@ def test_on_save_publishes_deployable_before_resume(tmp_path, monkeypatch, fake_
     ]
 
 
-def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake_trainer_callback):
-    """Every save uploads its own step. Synchronous uploads make "upload busy" coalescing
-    impossible: back-to-back saves each publish their deployable, so the registered step list is
-    never thinned under contention (the old newest-wins slot dropped intermediate steps)."""
+def test_consecutive_saves_each_upload_when_uploader_keeps_up(
+    tmp_path, monkeypatch, fake_trainer_callback
+):
+    """each optional save uploads unchanged when the single uploader is available."""
     import flash.engine.worker as worker
 
     rec = _RecordingHfApi()
@@ -376,6 +375,7 @@ def test_consecutive_saves_each_upload_no_coalescing(tmp_path, monkeypatch, fake
     for step in (4, 8, 12):
         _make_ckpt_dir(out, step)
         cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=step), None)
+        assert worker.flush_optional_uploads()
     deployables = sorted(
         p["path_in_repo"] for p in rec.uploads if p["path_in_repo"].endswith("/adapter")
     )
@@ -413,16 +413,15 @@ def test_on_save_retries_transient_upload_error(tmp_path, monkeypatch, fake_trai
 
     cb = worker.make_checkpoint_upload_callback()
     cb.on_save(SimpleNamespace(output_dir=str(out)), SimpleNamespace(global_step=4), None)
+    assert worker.flush_optional_uploads()
     assert resume_calls["n"] == 2, "the resume upload must be retried after a transient failure"
     assert any(u["path_in_repo"].endswith("checkpoint/checkpoint-4") for u in rec.uploads), (
         "the checkpoint must land on retry, not be skipped"
     )
 
 
-def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
-    """The streamed resume checkpoint is latest-only, but upload_folder's delete_patterns can't reach
-    sibling step dirs (they're matched relative to the per-step path_in_repo), so older checkpoint-N
-    dirs are pruned explicitly. The plural deployable tree (checkpoints/) must be left intact."""
+def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
+    """Pruning removes older steps without deleting a newer concurrently published checkpoint."""
     import flash.engine.worker.hf as worker_hf
 
     prefix = "rl/flash-ckpt-1"
@@ -431,6 +430,7 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
         f"{prefix}/checkpoint/checkpoint-20/adapter_model.safetensors",
         f"{prefix}/checkpoint/checkpoint-40/optimizer.pt",
         f"{prefix}/checkpoint/checkpoint-60/optimizer.pt",
+        f"{prefix}/checkpoint/checkpoint-80/optimizer.pt",
         f"{prefix}/checkpoints/step-60/adapter/adapter_model.safetensors",  # deployable (plural) -> keep
         f"{prefix}/metrics.json",
     ]
@@ -443,7 +443,8 @@ def test_prune_stale_resume_checkpoints_keeps_only_latest(monkeypatch):
         f"{prefix}/checkpoint/checkpoint-20",
         f"{prefix}/checkpoint/checkpoint-40",
     ]
-    assert f"{prefix}/checkpoint/checkpoint-60" not in rec.deleted  # latest kept
+    assert f"{prefix}/checkpoint/checkpoint-60" not in rec.deleted
+    assert f"{prefix}/checkpoint/checkpoint-80" not in rec.deleted
     assert all("checkpoints/" not in d for d in rec.deleted)  # deployable tree untouched
 
 
