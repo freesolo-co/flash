@@ -32,6 +32,11 @@ def _signal_sequences(group_ids, response_mask):
     return ((group_ids >= 0) & response_mask.bool()).any(dim=-1)
 
 
+def _full_sequence_signal_sequences(group_ids):
+    """Detect aligned metadata in native full-sequence teacher tensors."""
+    return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
+
+
 def _flash_groupwise_reverse_kl_values(
     student_logprobs,
     teacher_logsums,
@@ -226,7 +231,9 @@ def _install_verl_extensions() -> None:
 
                 params["structured_outputs"] = StructuredOutputsParams(**structured)
                 params["logprobs"] = True
-            return await super().run(params, **kwargs)
+            output = await super().run(params, **kwargs)
+            output.reward_score = 0.0
+            return output
 
     FlashSingleTurnAgentLoop.__module__ = __name__
     globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
@@ -235,16 +242,15 @@ def _install_verl_extensions() -> None:
         fields = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            select_fields=["teacher_ids", "response_mask"],
+            select_fields=["teacher_ids"],
         )
         group_ids = fields["teacher_ids"]
-        response_mask = fields["response_mask"]
         if group_ids.is_nested:
-            group_ids = group_ids.to_padded_tensor(-1)
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
-        group_ids = group_ids.squeeze(-1)
-        keep = _signal_sequences(group_ids, response_mask)
+            keep = torch.tensor(
+                [row.ge(0).any().item() for row in group_ids.unbind()], dtype=torch.bool
+            )
+        else:
+            keep = _full_sequence_signal_sequences(group_ids)
         keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
         tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
         if not keys:

@@ -14,6 +14,7 @@ from flash.engine.worker.opd_verl import (
 )
 from flash.engine.worker.opd_verl_plugin import (
     _flash_groupwise_reverse_kl_values,
+    _full_sequence_signal_sequences,
     _signal_sequences,
     deterministic_rollout_seed,
 )
@@ -68,6 +69,10 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
     group_ids = torch.tensor([[0, -1, -1], [-1, -1, -1], [2, 2, -1]])
     response_mask = torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
     assert _signal_sequences(group_ids, response_mask).tolist() == [True, False, True]
+    full_sequence_ids = torch.tensor(
+        [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
+    ).unsqueeze(-1)
+    assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
