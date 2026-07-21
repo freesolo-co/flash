@@ -44,17 +44,13 @@ def test_apply_disk_gb_noops():
     apply_disk_gb(_FakeConfig(template=None), 160)  # missing template: warn, don't raise
 
 
-def test_default_catalog_models_need_no_disk_bump():
-    """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0).
-
-    The only exception is the Qwen3.6 35B-A3B MoE: its ~70 GB bf16 checkpoint + HF/Xet temp
-    overflow the 64 GB default, so it carries an explicit disk floor.
-    """
+def test_oversized_catalog_models_carry_disk_floors():
+    """Models whose transient download peak exceeds the shared cache need per-job disk floors."""
     from flash.catalog import MODELS
 
-    assert all(
-        m.min_disk_gb == 0 for m in MODELS.values() if m.id != "Qwen/Qwen3.6-35B-A3B"
-    )
+    disk_floor_models = {"Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-35B-A3B"}
+    assert all(m.min_disk_gb == 0 for m in MODELS.values() if m.id not in disk_floor_models)
+    assert MODELS["Qwen/Qwen3.6-27B"].min_disk_gb == 160
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].min_disk_gb == 200
 
 
