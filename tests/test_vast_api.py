@@ -361,9 +361,7 @@ def test_create_instance_diagnostics_never_render_opaque_response_body(monkeypat
     with pytest.raises(vast_api.VastAmbiguousCreate) as exc_info:
         vast_api.create_instance(123, **kwargs)
     detail = str(exc_info.value)
-    formatted = "".join(
-        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
-    )
+    formatted = "".join(traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb))
     assert private not in detail
     assert private not in formatted
     assert "HTTP 409" in detail
@@ -761,3 +759,14 @@ def test_list_instances_strict_rejects_non_list_instances_page(monkeypatch):
     # lenient default: a missing 'instances' list is just an empty page (prior best-effort behavior)
     _capture_urlopen(monkeypatch, [{"success": False}])
     assert vast_api.list_instances() == []
+
+
+def test_search_offers_num_gpus_threads_into_query(monkeypatch):
+    """num_gpus > 1 filters to multi-card hosts; the default (1) is exercised elsewhere."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{"offers": [{"id": 1}]}])
+    vast_api.search_offers(24576, num_gpus=2, limit=10)
+    _method, _url, body, _auth = calls[0]
+    assert body["q"]["num_gpus"] == {"eq": 2}
