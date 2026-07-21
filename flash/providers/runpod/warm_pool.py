@@ -97,14 +97,12 @@ def try_acquire(
         owner_key_id=owner_key_id,
         owner_org_id=owner_org_id,
         compat_sig=sig,
-        claimed_by=run_id,
         now=now,
     )
     if record is None:
         return None
     if not _endpoint_is_reusable(record["endpoint_id"], record["owning_fingerprint"]):
-        # Stale record for a vanished endpoint: drop it so it never blocks a future deploy.
-        db.release_warm_endpoint(record["endpoint_id"])
+        # Claim already consumed the row; the endpoint turned out to be gone, so just deploy fresh.
         logger.info("keep-warm: claimed endpoint %s was gone; deploying fresh", record["endpoint_id"])
         return None
     logger.info("keep-warm: reusing warm endpoint %s for run %s", record["endpoint_id"], run_id)

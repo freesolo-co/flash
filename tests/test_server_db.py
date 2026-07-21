@@ -513,11 +513,12 @@ def _warm(endpoint_id="ep-1", *, owner_key_id=7, owner_org_id="org-a", compat_si
 def test_warm_endpoint_register_and_acquire_same_owner(isolated_db) -> None:
     db.register_warm_endpoint(**_warm())
     got = db.acquire_warm_endpoint(
-        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="run-2", now=1.0
+        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", now=1.0
     )
     assert got is not None
     assert got["endpoint_id"] == "ep-1"
-    assert got["claimed_by"] == "run-2"
+    # consumed on claim: the row is gone so the idle reaper won't fight the reusing run for it
+    assert db.all_warm_endpoints() == []
 
 
 def test_warm_endpoint_acquire_rejects_different_org(isolated_db) -> None:
@@ -525,17 +526,19 @@ def test_warm_endpoint_acquire_rejects_different_org(isolated_db) -> None:
     # different org in the same key must NOT reuse another domain's warm worker (secrets/env code leak)
     assert (
         db.acquire_warm_endpoint(
-            owner_key_id=7, owner_org_id="org-b", compat_sig="sig-x", claimed_by="r", now=1.0
+            owner_key_id=7, owner_org_id="org-b", compat_sig="sig-x", now=1.0
         )
         is None
     )
+    # rejected claim must not consume the record
+    assert len(db.all_warm_endpoints()) == 1
 
 
 def test_warm_endpoint_acquire_rejects_different_key(isolated_db) -> None:
     db.register_warm_endpoint(**_warm(owner_key_id=7))
     assert (
         db.acquire_warm_endpoint(
-            owner_key_id=8, owner_org_id="org-a", compat_sig="sig-x", claimed_by="r", now=1.0
+            owner_key_id=8, owner_org_id="org-a", compat_sig="sig-x", now=1.0
         )
         is None
     )
@@ -545,7 +548,7 @@ def test_warm_endpoint_acquire_rejects_different_compat_sig(isolated_db) -> None
     db.register_warm_endpoint(**_warm(compat_sig="sig-x"))
     assert (
         db.acquire_warm_endpoint(
-            owner_key_id=7, owner_org_id="org-a", compat_sig="sig-y", claimed_by="r", now=1.0
+            owner_key_id=7, owner_org_id="org-a", compat_sig="sig-y", now=1.0
         )
         is None
     )
@@ -556,7 +559,7 @@ def test_warm_endpoint_expiry_is_not_acquirable_and_is_reapable(isolated_db) -> 
     # now past expiry: not acquirable, excluded from protection, listed for reaping
     assert (
         db.acquire_warm_endpoint(
-            owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="r", now=200.0
+            owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", now=200.0
         )
         is None
     )
@@ -570,24 +573,20 @@ def test_warm_endpoint_expiry_is_not_acquirable_and_is_reapable(isolated_db) -> 
 def test_warm_endpoint_claim_is_atomic_single_winner(isolated_db) -> None:
     db.register_warm_endpoint(**_warm())
     first = db.acquire_warm_endpoint(
-        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="run-a", now=1.0
+        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", now=1.0
     )
     second = db.acquire_warm_endpoint(
-        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="run-b", now=1.0
+        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", now=1.0
     )
     assert first is not None and second is None
 
 
-def test_warm_endpoint_unclaim_makes_it_available_again(isolated_db) -> None:
-    db.register_warm_endpoint(**_warm())
-    db.acquire_warm_endpoint(
-        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="run-a", now=1.0
-    )
-    db.unclaim_warm_endpoint("ep-1")
-    again = db.acquire_warm_endpoint(
-        owner_key_id=7, owner_org_id="org-a", compat_sig="sig-x", claimed_by="run-b", now=1.0
-    )
-    assert again is not None and again["claimed_by"] == "run-b"
+def test_warm_endpoint_register_is_idempotent_does_not_extend_window(isolated_db) -> None:
+    db.register_warm_endpoint(**_warm(expiry_ts=700.0))
+    # a second teardown pass (server restart / recovery sweep) must NOT push the expiry out
+    db.register_warm_endpoint(**_warm(expiry_ts=9_999.0))
+    rows = db.all_warm_endpoints()
+    assert len(rows) == 1 and rows[0]["expiry_ts"] == 700.0
 
 
 def test_warm_endpoint_release_removes_record(isolated_db) -> None:
@@ -601,7 +600,7 @@ def test_warm_endpoint_local_null_key_scoping(isolated_db) -> None:
     db.register_warm_endpoint(**_warm(owner_key_id=None, owner_org_id=""))
     assert (
         db.acquire_warm_endpoint(
-            owner_key_id=None, owner_org_id="", compat_sig="sig-x", claimed_by="r", now=1.0
+            owner_key_id=None, owner_org_id="", compat_sig="sig-x", now=1.0
         )
         is not None
     )

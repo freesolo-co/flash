@@ -283,10 +283,14 @@ def register_warm_endpoint(
     gpu_type: str,
     expiry_ts: float,
 ) -> None:
-    """Record (or refresh) an endpoint kept warm for reuse. Registered unclaimed and available."""
+    """Record an endpoint kept warm for reuse. Idempotent per endpoint: a run's teardown may fire
+    more than once (completion + every server-restart recovery sweep), and re-inserting must NOT
+    extend the keep-alive window (that would be runaway idle billing). A genuinely-reused endpoint
+    is consumed by ``acquire_warm_endpoint`` first, so its next completion re-registers a fresh
+    window cleanly."""
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO warm_endpoints (endpoint_id, name, owning_fingerprint, "
+            "INSERT OR IGNORE INTO warm_endpoints (endpoint_id, name, owning_fingerprint, "
             "owner_key_id, owner_org_id, compat_sig, gpu_type, expiry_ts, claimed_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
             (
@@ -308,19 +312,20 @@ def acquire_warm_endpoint(
     owner_key_id: int | None,
     owner_org_id: str,
     compat_sig: str,
-    claimed_by: str,
     now: float,
 ) -> dict | None:
-    """Atomically claim the freshest unexpired, unclaimed endpoint for this exact owner+signature.
+    """Atomically claim (by consuming) the freshest unexpired endpoint for this exact owner+signature.
 
     Owner scoping is the security boundary: a warm worker retains the prior run's fetched
     environment code and on-disk secrets, so it is reused ONLY within the identical
-    (owner_key_id, owner_org_id) domain. Returns the claimed record, or None on any miss/race
-    (the caller then deploys a fresh endpoint, which is always safe).
+    (owner_key_id, owner_org_id) domain. The row is DELETED on claim: the reusing run takes the
+    endpoint out of the pool (while it runs, the endpoint reads as busy so the idle reaper leaves it
+    alone), and re-registers a fresh keep-alive window when it finishes. Returns the claimed record,
+    or None on any miss/race (the caller then deploys a fresh endpoint, which is always safe).
     """
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM warm_endpoints WHERE claimed_by IS NULL AND expiry_ts > ? "
+            "SELECT * FROM warm_endpoints WHERE expiry_ts > ? "
             "AND compat_sig = ? AND owner_key_id IS ? AND owner_org_id = ? "
             "ORDER BY created_at DESC LIMIT 1",
             (now, compat_sig, owner_key_id, owner_org_id or ""),
@@ -328,22 +333,11 @@ def acquire_warm_endpoint(
         if row is None:
             return None
         claimed = conn.execute(
-            "UPDATE warm_endpoints SET claimed_by = ? WHERE endpoint_id = ? AND claimed_by IS NULL",
-            (claimed_by, row["endpoint_id"]),
+            "DELETE FROM warm_endpoints WHERE endpoint_id = ?", (row["endpoint_id"],)
         )
         if claimed.rowcount != 1:
             return None
-        record = dict(row)
-        record["claimed_by"] = claimed_by
-        return record
-
-
-def unclaim_warm_endpoint(endpoint_id: str) -> None:
-    """Release a claim without deleting the record (a reuse attempt failed after claiming)."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE warm_endpoints SET claimed_by = NULL WHERE endpoint_id = ?", (endpoint_id,)
-        )
+        return dict(row)
 
 
 def release_warm_endpoint(endpoint_id: str) -> None:
