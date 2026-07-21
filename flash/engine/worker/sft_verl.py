@@ -484,13 +484,11 @@ class _VerlCheckpointWatcher:
 
 
 def _cached_model_path(model_id: str, model_revision: str) -> str:
-    if not model_revision:
-        return model_id
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
         repo_id=model_id,
-        revision=model_revision,
+        revision=model_revision or None,
         local_files_only=True,
     )
 
@@ -578,6 +576,30 @@ def _restore_verl_resume(local_dir: str) -> int:
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
     return step
+
+
+def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
+    candidates = [step for step in required_steps if step <= resume_step]
+    if not candidates:
+        return set()
+    if not _w.HF_REPO:
+        raise RuntimeError("required SFT saves have no artifact repository")
+    durable: set[int] = set()
+    for step in candidates:
+        marker = f"{_w.hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
+        try:
+            exists = _w.hf_api().file_exists(
+                repo_id=_w.HF_REPO,
+                filename=marker,
+                repo_type="dataset",
+            )
+        except Exception as error:
+            raise _w.RetriableInfraError(
+                f"could not verify required SFT save step {step} on hf"
+            ) from error
+        if exists:
+            durable.add(step)
+    return durable
 
 
 def run_sft_verl(spec=None) -> None:
@@ -840,6 +862,11 @@ def run_sft_verl(spec=None) -> None:
         model_revision=model_revision,
         required_steps=save_at_steps,
     )
+    watcher.processed_steps.update(_durable_required_save_steps(save_at_steps, resume_step))
+    if resume_step >= update_horizon:
+        missing = sorted(watcher.required_steps - watcher.processed_steps)
+        if missing:
+            raise RuntimeError(f"required saves were not durably published: {missing}")
 
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = os.pathsep.join(
@@ -847,6 +874,8 @@ def run_sft_verl(spec=None) -> None:
     )
     child_env["PYTHONUNBUFFERED"] = "1"
     child_env["HYDRA_FULL_ERROR"] = "1"
+    child_env["HF_HUB_OFFLINE"] = "1"
+    child_env["TRANSFORMERS_OFFLINE"] = "1"
     command = [
         python_bin,
         "-m",

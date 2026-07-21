@@ -212,6 +212,34 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     assert watcher.processed_steps == {5}
 
 
+def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_verl
+
+    class Api:
+        def file_exists(self, *, filename, **kwargs):
+            return "/step-3/" in filename
+
+    monkeypatch.setattr(worker, "HF_REPO", "owner/artifacts")
+    monkeypatch.setattr(worker, "hf_prefix", lambda: "sft/run")
+    monkeypatch.setattr(worker, "hf_api", Api)
+
+    assert sft_verl._durable_required_save_steps((3, 5, 9), 5) == {3}
+
+
+def test_cached_model_path_uses_prefetched_snapshot_for_mutable_refs(monkeypatch):
+    from flash.engine.worker import sft_verl
+
+    calls = []
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **kwargs: calls.append(kwargs) or "/cache/snapshot/commit",
+    )
+
+    assert sft_verl._cached_model_path("org/model", "") == "/cache/snapshot/commit"
+    assert calls == [{"repo_id": "org/model", "revision": None, "local_files_only": True}]
+
+
 def test_run_sft_verl_orchestrates_subprocess_export_and_metadata(monkeypatch):
     import flash.engine.worker as worker
     from flash.engine.worker import sft_verl
@@ -363,6 +391,8 @@ def test_run_sft_verl_orchestrates_subprocess_export_and_metadata(monkeypatch):
     assert "--nproc-per-node=2" in captured["command"]
     assert "verl.trainer.sft_trainer" in captured["command"]
     assert captured["child_env"]["PYTHONPATH"].split(os.pathsep)[0].endswith("/shim")
+    assert captured["child_env"]["HF_HUB_OFFLINE"] == "1"
+    assert captured["child_env"]["TRANSFORMERS_OFFLINE"] == "1"
     assert captured["uploads"][0][1:] == ("adapter", True)
     assert captured["published"][0][1] == 2
     assert captured["meta"]["step"] == 2
