@@ -30,6 +30,9 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
+# smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
+# than the 0.5s readiness backoff base, so cold-start smoke retries don't hammer serving.
+SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
@@ -694,8 +697,8 @@ def _wait_revision_ready(
             continue
         retry_after = response.headers.get("Retry-After")
         attempt += 1
-        if time.monotonic() >= deadline:
-            break
+        # a record fetched within the deadline must be inspected for readiness before giving up; the
+        # top-of-loop and post-sleep deadline checks already prevent starting a NEW poll past it.
         if record is None:
             continue
         last_read_error = None
@@ -896,9 +899,9 @@ def _retryable_smoke_unavailable(
     try:
         retry_after_seconds = float(raw_delay)
     except (TypeError, ValueError):
-        retry_after_seconds = READBACK_DELAY_SECONDS
+        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
     if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
-        retry_after_seconds = READBACK_DELAY_SECONDS
+        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
