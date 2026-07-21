@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any
+from typing import Any, Literal
 
 from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
 from .opd_retry_contract import OPD_RESUME_REVISION_ENV
@@ -15,6 +15,33 @@ _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 # default for old payloads and callers that do not select a per-run seed.
 FIXED_SEED = 42
 _MAX_SEED = 2**63 - 1
+
+CreditAssignment = Literal["per_episode", "per_turn"]
+DEFAULT_CREDIT_ASSIGNMENT: CreditAssignment = "per_episode"
+PER_TURN_CREDIT_ASSIGNMENT: CreditAssignment = "per_turn"
+CREDIT_ASSIGNMENTS: tuple[CreditAssignment, ...] = (
+    DEFAULT_CREDIT_ASSIGNMENT,
+    PER_TURN_CREDIT_ASSIGNMENT,
+)
+
+
+def _coerce_credit_assignment(value: Any) -> CreditAssignment:
+    """coerce a deserialized credit-assignment value to the typed literal, rejecting unknown modes.
+
+    mirrors the client-side schema validator: missing/blank -> default, a known mode -> that mode,
+    anything else -> ValueError (a valid client cannot submit an unknown value, so this only guards
+    a malformed or tampered internal/persisted payload from silently downgrading to per-episode).
+    """
+    if value is None:
+        return DEFAULT_CREDIT_ASSIGNMENT
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return DEFAULT_CREDIT_ASSIGNMENT
+        for mode in CREDIT_ASSIGNMENTS:
+            if normalized == mode:
+                return mode
+    raise ValueError(f"credit_assignment must be one of {CREDIT_ASSIGNMENTS}; got {value!r}")
 
 
 def _str_tuple(value: Any) -> tuple[str, ...]:
@@ -234,6 +261,9 @@ class TrainSpec:
     # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once
     # at parse time (schema/fields.py) so worker/hub/api hops carry one stable string form.
     structured_outputs: str = field(default="", metadata={"introduced_in": "0.2.56"})
+    credit_assignment: CreditAssignment = field(
+        default=DEFAULT_CREDIT_ASSIGNMENT, metadata={"introduced_in": "1.0.2"}
+    )
 
     def __post_init__(self) -> None:
         max_steps = parse_max_steps(self.max_steps)
@@ -397,6 +427,7 @@ class JobSpec:
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
+                credit_assignment=_coerce_credit_assignment(train.get("credit_assignment")),
             ),
             gpu=GpuSpec(
                 type=gpu_type,
