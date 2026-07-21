@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import Future
 from typing import Any
 
 from . import db
@@ -25,6 +26,7 @@ _MAX_TOKEN_LEN = 256
 # token -> (verified_bool, identity_dict, expires_at); positives and negatives both cached.
 _verify_cache: dict[str, tuple[bool, dict[str, Any], float]] = {}
 _verify_cache_lock = threading.Lock()
+_verify_inflight: dict[str, Future[bool]] = {}
 _VERIFY_CACHE_MAX = 1024
 
 
@@ -157,26 +159,49 @@ def _freesolo_verify(token: str) -> bool:
         cached = _verify_cache.get(token)
         if cached is not None and cached[2] > now:
             return cached[0]
-    url = f"{freesolo_base_url()}/api/auth/verify"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    identity: dict[str, Any] = {}
+        pending = _verify_inflight.get(token)
+        if pending is None:
+            pending = Future[bool]()
+            _verify_inflight[token] = pending
+            owns_verify = True
+        else:
+            owns_verify = False
+    if not owns_verify:
+        return pending.result()
+
     try:
-        with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
-            verified = resp.status == 200
-            if verified:
-                identity = _identity_from_verify_body(_response_body(resp))
-    except urllib.error.HTTPError as exc:
-        # 5xx/429 are transient — don't cache so a valid key isn't locked out.
-        if exc.code >= 500 or exc.code == 429:
-            return False
-        verified = False
-    except (OSError, ValueError):
-        return False
-    with _verify_cache_lock:
-        _prune_verify_cache_locked(now)
-        ttl = _VERIFY_CACHE_TTL_S if verified else _VERIFY_CACHE_NEG_TTL_S
-        _verify_cache[token] = (verified, identity if verified else {}, now + ttl)
-    return verified
+        url = f"{freesolo_base_url()}/api/auth/verify"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        identity: dict[str, Any] = {}
+        cache_result = True
+        try:
+            with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
+                verified = resp.status == 200
+                if verified:
+                    identity = _identity_from_verify_body(_response_body(resp))
+        except urllib.error.HTTPError as exc:
+            # treat 5xx/429 as transient and do not cache them.
+            if exc.code >= 500 or exc.code == 429:
+                cache_result = False
+            verified = False
+        except (OSError, ValueError):
+            verified = False
+            cache_result = False
+        if cache_result:
+            with _verify_cache_lock:
+                _prune_verify_cache_locked(now)
+                ttl = _VERIFY_CACHE_TTL_S if verified else _VERIFY_CACHE_NEG_TTL_S
+                _verify_cache[token] = (verified, identity if verified else {}, now + ttl)
+    except BaseException as exc:
+        pending.set_exception(exc)
+        raise
+    else:
+        pending.set_result(verified)
+        return verified
+    finally:
+        with _verify_cache_lock:
+            if _verify_inflight.get(token) is pending:
+                del _verify_inflight[token]
 
 
 def authenticate(authorization: str | None) -> dict | None:
