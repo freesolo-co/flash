@@ -444,7 +444,9 @@ def _rollout_kv_floor_gb(
     ceiling = max_non_fp8_kv_vram_gb()
     if floor <= ceiling:
         return floor
-    fp8_floor = grpo_kv_floor_gb(
+    # bf16 floor already exceeds the non-fp8 ceiling, so the run must use fp8 kv: return the fp8
+    # floor even when it fits under the ceiling, otherwise the oversized bf16 floor over-routes.
+    return grpo_kv_floor_gb(
         params_b,
         vllm_max_len,
         concurrency,
@@ -453,9 +455,6 @@ def _rollout_kv_floor_gb(
         model_info=model_info,
         preserve_legacy_floor=preserve_legacy_floor,
     )
-    # bf16 floor already exceeds the non-fp8 ceiling, so the run must use fp8 kv: return the fp8
-    # floor even when it fits under the ceiling, otherwise the oversized bf16 floor over-routes.
-    return fp8_floor
 
 
 @dataclass(frozen=True)
