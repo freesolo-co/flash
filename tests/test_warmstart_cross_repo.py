@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,20 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
     def fake_snapshot_download(**kw):
         calls.update(kw)
         adapter_prefix = kw["allow_patterns"][0].removesuffix("/adapter/*")
-        os.makedirs(os.path.join(kw["local_dir"], adapter_prefix, "adapter"), exist_ok=True)
+        adapter_dir = os.path.join(kw["local_dir"], adapter_prefix, "adapter")
+        os.makedirs(adapter_dir, exist_ok=True)
+        # a real download lands a loadable adapter (config + weights); the worker now treats a dir
+        # without them as an incomplete transfer, so the stub materializes both.
+        with open(os.path.join(adapter_dir, "adapter_config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"peft_type": "LORA"}, fh)
+        tensor_name = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+        header = json.dumps(
+            {tensor_name: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+        ).encode()
+        with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
+            fh.write(struct.pack("<Q", len(header)))
+            fh.write(header)
+            fh.write(struct.pack("<f", 1.0))
 
     monkeypatch.setattr(W, "HF_REPO", hf_repo, raising=False)
     import huggingface_hub
