@@ -197,7 +197,7 @@ def test_exhaustion_aborts_each_attempt_and_raises():
     aborted = []
     ids = iter(["attempt-1", "attempt-2"])
 
-    def submit(request_id, prefix, max_tokens, initial):
+    def submit(request_id, prefix, max_tokens, initial, images):
         submitted.append((request_id, list(prefix), max_tokens, initial))
         pending.add(request_id)
 
@@ -235,7 +235,7 @@ def test_failure_aborts_all_active_requests():
     pending = set()
     aborted = []
 
-    def submit(request_id, prefix, max_tokens, initial):
+    def submit(request_id, prefix, max_tokens, initial, images):
         pending.add(request_id)
 
     def abort(request_ids):
@@ -287,7 +287,7 @@ def test_request_deadlines_do_not_create_episode_cutoff():
     pending = []
     aborted = []
 
-    def submit(request_id, prefix, max_tokens, initial):
+    def submit(request_id, prefix, max_tokens, initial, images):
         pending.append(request_id)
 
     def poll():
@@ -322,7 +322,7 @@ def test_concurrent_rollouts_use_process_unique_ids():
     def run(index):
         pending = []
 
-        def submit(request_id, prefix, max_tokens, initial):
+        def submit(request_id, prefix, max_tokens, initial, images):
             all_ids[index].append(request_id)
             pending.append(request_id)
             barrier.wait(timeout=2.0)
