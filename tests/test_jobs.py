@@ -4855,3 +4855,68 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
         assert not done.wait(0.2)
     t.join(timeout=2)
     assert done.is_set()  # completes as soon as the lock is released
+
+
+def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):
+    """gpu.count from the job spec becomes the runpod Endpoint gpu_count (multi-gpu pod)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+    from flash.spec import GpuSpec, JobSpec
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-multi"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    spec = JobSpec(gpu=GpuSpec(count=2))
+    # endpoint_kwargs={} bypasses weight_cache_endpoint_kwargs so the base gpu_count is asserted directly.
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", spec=spec, endpoint_kwargs={})
+    assert captured["gpu_count"] == 2
+
+
+def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
+    """No spec keeps the historical single-gpu Endpoint payload (count == 1)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-single"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", endpoint_kwargs={})
+    assert captured["gpu_count"] == 1

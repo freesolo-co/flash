@@ -79,9 +79,14 @@ def search_offers(
     min_duration_seconds: float = 0,
     limit: int = 64,
     gpu_names: tuple[str, ...] = (),
+    num_gpus: int = 1,
     deadline_at: float | None = None,
 ) -> list[dict]:
-    """Rentable single-GPU offers from verified datacenter hosts, cheapest first.
+    """Rentable offers from verified datacenter hosts, cheapest first.
+
+    ``num_gpus`` filters to hosts advertising exactly that many cards on one machine (1 = the
+    historical single-card search). Threading it from the job spec is left to the multi-gpu
+    allocator work; callers default to 1 today.
 
     ``min_duration_seconds`` applies Vast's ``duration`` filter (offer available for at least
     this long from now); prevents renting a short-lived offer that preempts mid-run. 0 = off.
@@ -92,7 +97,7 @@ def search_offers(
         "verified": {"eq": True},
         "datacenter": {"eq": True},
         "rentable": {"eq": True},
-        "num_gpus": {"eq": 1},
+        "num_gpus": {"eq": int(num_gpus)},
         "gpu_ram": {"gte": int(min_vram_mb)},
         "reliability2": {"gte": float(min_reliability)},
         "type": "ask",
@@ -271,8 +276,7 @@ def create_instance(
         )
     if parsed_id is None:
         raise VastAmbiguousCreate(
-            f"create_instance({offer_id}) returned no usable instance id "
-            "(possible billed contract)"
+            f"create_instance({offer_id}) returned no usable instance id (possible billed contract)"
         )
     return parsed_id
 
