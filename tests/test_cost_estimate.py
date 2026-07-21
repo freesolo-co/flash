@@ -547,3 +547,24 @@ def test_breakdown_and_panel_surface_absorbed_setup_cost(est):
     assert "Setup cost" in plain
     assert "not charged" in plain
     assert "setup cost" in cost_panel(est)
+
+
+def test_lifecycle_invariant_holds_when_wall_capped():
+    # the decomposition must survive the wall-clock cap: capping rewrites setup/train but wall stays
+    # setup + train, so provider_cost_usd == fixed_lifecycle_usd + total_usd still holds and the
+    # customer charge is still training-only.
+    capped = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000))
+    assert capped.wall_capped
+    assert capped.provider_cost_usd == pytest.approx(capped.fixed_lifecycle_usd + capped.total_usd)
+    assert capped.total_usd == pytest.approx(capped.train_seconds / 3600.0 * capped.gpu_hourly_usd)
+
+
+def test_provider_cost_excludes_opd_teacher_spend():
+    # provider_cost_usd is the gpu cogs only. for opd the platform also pays the teacher api, but
+    # that is tracked in teacher_api_usd and must NOT be folded into provider_cost_usd, so the
+    # gpu-cost decomposition provider_cost_usd == fixed_lifecycle_usd + total_usd still holds.
+    opd = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-4B", "opd", 10, batch_size=8, group_size=1, seq_len=2048)
+    )
+    assert opd.teacher_api_usd > 0
+    assert opd.provider_cost_usd == pytest.approx(opd.fixed_lifecycle_usd + opd.total_usd)

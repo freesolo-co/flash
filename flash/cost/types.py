@@ -156,7 +156,8 @@ class CostEstimate:
     ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd`` and is the CUSTOMER charge.
     Setup/cold-start time is reported as elapsed wall time but is not billed to the user estimate.
     ``fixed_lifecycle_usd`` is that absorbed cold-start cost (setup hours * ``gpu_hourly_usd``) and
-    ``provider_cost_usd`` is the estimated provider cogs (full wall * ``gpu_hourly_usd``); both are
+    ``provider_cost_usd`` is the estimated provider GPU cogs (full wall * ``gpu_hourly_usd``; GPU cost
+    only, so the opd ``teacher_api_usd`` platform spend is separate and NOT folded in); both are
     cost-visibility fields only and are NOT charged to the customer (by construction
     ``provider_cost_usd == fixed_lifecycle_usd + total_usd``). ``teacher_api_usd`` (opd only) uses the
     platform-managed teacher key and remains itemized separately from the customer GPU charge, so it
@@ -185,7 +186,8 @@ class CostEstimate:
     notes: tuple[str, ...] = ()
     # cost-visibility only, never charged to the customer (the charge is total_usd, training only).
     # fixed_lifecycle_usd = absorbed cold-start cost (setup hours * gpu_hourly_usd); provider_cost_usd
-    # = estimated provider cogs (full wall * gpu_hourly_usd) == fixed_lifecycle_usd + total_usd.
+    # = estimated provider gpu cogs (full wall * gpu_hourly_usd) == fixed_lifecycle_usd + total_usd
+    # (gpu only; the opd teacher_api_usd platform spend is tracked separately, not included here).
     fixed_lifecycle_usd: float = 0.0
     provider_cost_usd: float = 0.0
 
