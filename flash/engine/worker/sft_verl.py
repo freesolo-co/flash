@@ -91,3 +91,26 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
     else:
         ov.append(f"trainer.total_epochs={_hydra_val(epochs)}")
     return ov
+
+
+def build_sft_verl_messages_rows(prompt_completion_rows) -> list[dict]:
+    """turn flash sft examples into verl `messages` parquet rows (structural mapping).
+
+    each flash example is ``(prompt_messages, completion_messages)`` - both lists of {role, content}
+    dicts (env.prompt_messages / env.sft_completion). verl's sft trainer takes a single `messages`
+    list per row and trains the assistant-role tokens. rows with an empty completion are dropped,
+    matching flash's "no real completion target" drop.
+
+    PARITY NOTE: verl trains ALL assistant-role tokens; flash's completion_mask trains the completion
+    span. these agree for single-turn (prompt has no assistant turn) but can DIVERGE for multi-turn
+    prompts that already contain assistant history. this builder only guarantees the structural
+    mapping; the tokenizer-level mask-parity test (flash completion_mask vs verl role-mask) is what
+    verifies the masks actually match per example, and gates whether a multi-turn special case is
+    needed.
+    """
+    rows: list[dict] = []
+    for prompt_messages, completion_messages in prompt_completion_rows:
+        if not completion_messages:
+            continue
+        rows.append({"messages": [*prompt_messages, *completion_messages]})
+    return rows

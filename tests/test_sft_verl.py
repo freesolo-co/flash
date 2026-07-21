@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from flash.engine.worker.sft_verl import build_sft_verl_overrides
+from flash.engine.worker.sft_verl import (
+    build_sft_verl_messages_rows,
+    build_sft_verl_overrides,
+)
 
 
 def _cfg(**over):
@@ -78,3 +81,22 @@ def test_missing_required_key_raises():
     del bad["model_path"]
     with pytest.raises(KeyError, match="model_path"):
         build_sft_verl_overrides(bad)
+
+
+def test_messages_rows_concatenate_prompt_and_completion():
+    prompt = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    completion = [{"role": "assistant", "content": "a"}]
+    rows = build_sft_verl_messages_rows([(prompt, completion)])
+    assert rows == [{"messages": [*prompt, *completion]}]
+
+
+def test_messages_rows_drop_empty_completion():
+    prompt = [{"role": "user", "content": "u"}]
+    rows = build_sft_verl_messages_rows(
+        [
+            (prompt, [{"role": "assistant", "content": "a"}]),
+            (prompt, []),
+        ]
+    )
+    assert len(rows) == 1
+    assert rows[0]["messages"][-1]["role"] == "assistant"
