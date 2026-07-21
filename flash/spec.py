@@ -93,6 +93,31 @@ def _volume_gb(value: Any, default: int = 100) -> int:
     return gb if gb > 0 else default
 
 
+# Upper bound on gpu.keep_alive_seconds: keeping a gpu idle-warm for longer is almost never worth
+# the billing, so a value above this is treated as a config typo rather than silently honored.
+KEEP_ALIVE_SECONDS_MAX = 24 * 3600
+
+
+def _keep_alive_seconds(value: Any) -> int:
+    """Parse gpu.keep_alive_seconds; reject negatives, bools, non-ints, and runaway billing values."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise TypeError("gpu.keep_alive_seconds must be an integer number of seconds, not a bool")
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("gpu.keep_alive_seconds must be an integer number of seconds") from exc
+    if seconds < 0:
+        raise ValueError("gpu.keep_alive_seconds must be >= 0 (0 disables keep-warm)")
+    if seconds > KEEP_ALIVE_SECONDS_MAX:
+        raise ValueError(
+            f"gpu.keep_alive_seconds must be <= {KEEP_ALIVE_SECONDS_MAX} "
+            f"({KEEP_ALIVE_SECONDS_MAX // 3600}h); got {seconds}"
+        )
+    return seconds
+
+
 def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
@@ -284,6 +309,11 @@ class GpuSpec:
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     max_retries: int = 5
+    # Keep the provisioned gpu warm this many seconds after a run so a COMPATIBLE, same-owner
+    # next run reuses it instead of paying the cold start (image pull, boot, dep install, and -
+    # with residency - the base-model reload). 0 disables keep-warm (tear down immediately, the
+    # historical behavior). Reuse is owner-scoped in the control plane; this field never widens it.
+    keep_alive_seconds: int = 0
     # PLATFORM-MANAGED: runner assigns weight-cache volume; None = cold download.
     network_volume: str | None = None
     network_volume_gb: int = 100
@@ -436,6 +466,7 @@ class JobSpec:
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
+                keep_alive_seconds=_keep_alive_seconds(gpu.get("keep_alive_seconds", 0)),
                 # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
                 # _assign_managed_hf_repo before deploy.

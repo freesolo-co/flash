@@ -478,7 +478,7 @@ def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
         spec_from_dict(unknown)
 
 
-@pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds"])
+@pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds", "keep_alive_seconds"])
 @pytest.mark.parametrize(
     ("value", "match"),
     [
@@ -501,6 +501,30 @@ def test_gpu_retry_and_wall_minimums() -> None:
         with pytest.raises(ConfigError, match=r"gpu\.max_wall_seconds must be >= 60"):
             spec_from_dict(_raw(**{"gpu.max_wall_seconds": value}))
     assert spec_from_dict(_raw(**{"gpu.max_wall_seconds": 60})).gpu.max_wall_seconds == 60
+
+
+def test_gpu_keep_alive_seconds_default_authored_and_bounds() -> None:
+    from flash.spec import KEEP_ALIVE_SECONDS_MAX
+
+    # default: keep-warm off (tear down immediately, historical behavior)
+    assert GpuSpec().keep_alive_seconds == 0
+    assert spec_from_dict(_raw()).gpu.keep_alive_seconds == 0
+    # authored value flows through the schema and round-trips both dict forms
+    spec = spec_from_dict(_raw(**{"gpu.keep_alive_seconds": 600}))
+    assert spec.gpu.keep_alive_seconds == 600
+    assert JobSpec.from_dict(spec.to_internal_dict()).gpu.keep_alive_seconds == 600
+    assert JobSpec.from_dict(spec.to_dict()).gpu.keep_alive_seconds == 600
+    # 0 is explicitly valid (disables keep-warm)
+    assert spec_from_dict(_raw(**{"gpu.keep_alive_seconds": 0})).gpu.keep_alive_seconds == 0
+    # negatives rejected
+    with pytest.raises(ConfigError, match=r"gpu\.keep_alive_seconds must be >= 0"):
+        spec_from_dict(_raw(**{"gpu.keep_alive_seconds": -1}))
+    # runaway idle-billing values rejected (config-typo guard)
+    with pytest.raises(ConfigError, match=r"gpu\.keep_alive_seconds must be <="):
+        spec_from_dict(_raw(**{"gpu.keep_alive_seconds": KEEP_ALIVE_SECONDS_MAX + 1}))
+    # the ceiling itself is accepted
+    at_max = spec_from_dict(_raw(**{"gpu.keep_alive_seconds": KEEP_ALIVE_SECONDS_MAX}))
+    assert at_max.gpu.keep_alive_seconds == KEEP_ALIVE_SECONDS_MAX
 
 
 def test_environment_subfields_reject_wrong_types() -> None:

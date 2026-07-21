@@ -36,6 +36,7 @@ from flash.schema.fields import (
 )
 from flash.spec import (
     FIXED_SEED,
+    KEEP_ALIVE_SECONDS_MAX,
     EnvironmentSpec,
     GpuSpec,
     JobSpec,
@@ -353,11 +354,19 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         )
     gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
     gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
+    gpu_keep_alive_seconds = _section_int(gpu_raw, "gpu", "keep_alive_seconds", minimum=0)
+    if gpu_keep_alive_seconds is not None and gpu_keep_alive_seconds > KEEP_ALIVE_SECONDS_MAX:
+        raise ConfigError(
+            f"gpu.keep_alive_seconds must be <= {KEEP_ALIVE_SECONDS_MAX} "
+            f"({KEEP_ALIVE_SECONDS_MAX // 3600}h); got {gpu_keep_alive_seconds}"
+        )
     gpu_options = {}
     if gpu_max_retries is not None:
         gpu_options["max_retries"] = gpu_max_retries
     if gpu_max_wall_seconds is not None:
         gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
+    if gpu_keep_alive_seconds is not None:
+        gpu_options["keep_alive_seconds"] = gpu_keep_alive_seconds
 
     provider_raw = gpu_raw.get("provider", "")
     if not isinstance(provider_raw, str):
