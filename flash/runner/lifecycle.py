@@ -163,11 +163,21 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         )
         if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
             return None
-        metrics = decode_output(job.get("output"))
-        if not isinstance(metrics, dict):
-            # the queue job is terminal-ok but its output metrics are not readable yet;
-            # treat this lag like instance recovery (raise pending) so callers keep
-            # reconciling instead of tearing down a job that already completed.
+        try:
+            metrics = decode_output(job.get("output"))
+            output_readable = isinstance(metrics, dict)
+        except Exception:
+            # decode_output raised: the terminal-ok job's output is present but not yet
+            # decodable. treat it exactly like a missing/non-dict output below instead of
+            # falling through to the broad handler, which would return None (not completed)
+            # and let callers tear the job down.
+            metrics = None
+            output_readable = False
+        if not output_readable:
+            # the queue job is terminal-ok but its output metrics are not readable yet
+            # (missing, non-dict, or not yet decodable); treat this lag like instance
+            # recovery (raise pending) so callers keep reconciling instead of tearing down
+            # a job that already completed.
             grace_expired = (
                 deadline_at is None
                 or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S

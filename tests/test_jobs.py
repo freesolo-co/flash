@@ -5002,3 +5002,33 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
         assert not done.wait(0.2)
     t.join(timeout=2)
     assert done.is_set()  # completes as soon as the lock is released
+
+
+def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkeypatch):
+    # regression (#613): a terminal-ok RunPod job whose output metrics are present but not yet
+    # DECODABLE (decode_output raises, not merely returns a non-dict) must be treated as pending
+    # within the recovery grace. previously the raise fell through to the broad handler and
+    # returned None, letting callers tear down / resubmit a job that had already completed.
+    import time as _time
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": {"present": "but-bad"}},
+    )
+
+    def _raise(_output):
+        raise RuntimeError("output envelope not decodable yet")
+
+    monkeypatch.setattr(jobs, "decode_output", _raise)
+    handle = _runpod_handle(jobs)
+    now = _time.time()
+    # within the grace window -> keep reconciling (raise pending), never return None
+    with pytest.raises(lifecycle._CompletedAttemptPending):
+        lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0)
+    # once the grace has expired -> give up (return None)
+    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
