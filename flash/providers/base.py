@@ -137,19 +137,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
-LEGACY_GPU_CLASSES: tuple[GpuClass, ...] = (
-    GpuClass(
-        "RTX A6000",
-        "NVIDIA_RTX_A6000",
-        48,
-        "a6000",
-        "sm86",
-        0.49,
-        lambda_name="gpu_1x_a6000",
-        vast_name="RTX A6000",
-    ),
-)
-_GPU_INFO_ALL: dict[str, GpuClass] = {**GPU_INFO, **{g.name: g for g in LEGACY_GPU_CLASSES}}
 KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
@@ -204,7 +191,7 @@ def _alias_keys(name: str) -> set[str]:
 
 
 _ALIAS_TARGETS: dict[str, set[str]] = {}
-for _info in _GPU_INFO_ALL.values():
+for _info in GPU_INFO.values():
     for _provider_name in (_info.name, _info.vast_name, *_info.vast_aliases):
         if not _provider_name:
             continue
@@ -214,7 +201,7 @@ _ALIASES: dict[str, str] = {
     key: next(iter(targets)) for key, targets in _ALIAS_TARGETS.items() if len(targets) == 1
 }
 # exact canonical names always resolve to themselves even if a provider spelling collides with them.
-_ALIASES.update({_info.name.lower(): _info.name for _info in _GPU_INFO_ALL.values()})
+_ALIASES.update({_info.name.lower(): _info.name for _info in GPU_INFO.values()})
 # full marketing names (nvidia-smi / runpod api) and historical aliases not covered by generic rules.
 _ALIASES.update(
     {
@@ -264,11 +251,7 @@ class UnreconciledCreateError(RuntimeError):
 
 
 def canonical_gpu(name: str) -> str:
-    """Normalize a friendly GPU name to an active or retired class; raise otherwise.
-
-    Retired classes resolve for teardown/pricing compatibility but stay absent from ``GPU_INFO`` so
-    allocation, display, and provider offer matching do not select them.
-    """
+    """Normalize a friendly GPU name to a managed GPU class; raise otherwise."""
     key = (name or "").strip().lower()
     if key in _ALIASES:
         return _ALIASES[key]
@@ -276,7 +259,7 @@ def canonical_gpu(name: str) -> str:
 
 
 def get_gpu_info(name: str) -> GpuClass:
-    return _GPU_INFO_ALL[canonical_gpu(name)]
+    return GPU_INFO[canonical_gpu(name)]
 
 
 def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
