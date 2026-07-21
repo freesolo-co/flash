@@ -208,15 +208,18 @@ def _sft_local_token_count(inputs: dict):
     raise ValueError("expected attention_mask, position_ids, or packed sequence lengths")
 
 
-def _sft_quality_metrics_due(state, args, accelerator) -> bool:
-    """return true on the final microbatch of an optimizer step that will log."""
-    if not accelerator.sync_gradients:
-        return False
+def _sft_step_will_log(state, args) -> bool:
+    """true throughout every microbatch of an optimizer step that will log."""
     next_step = int(state.global_step) + 1
     if bool(getattr(args, "logging_first_step", False)) and next_step == 1:
         return True
     logging_steps = int(getattr(args, "logging_steps", 0) or 0)
     return logging_steps > 0 and next_step % logging_steps == 0
+
+
+def _sft_quality_metrics_due(state, args, accelerator) -> bool:
+    """return true on the final microbatch of an optimizer step that will log."""
+    return bool(accelerator.sync_gradients) and _sft_step_will_log(state, args)
 
 
 def sft_completed_train_tokens(
@@ -728,6 +731,13 @@ def run_sft():
         class _SFT(SFTTrainer):  # local lora+ and metric-shaping subclass
             _loraplus_applied = False  # true only once the lora+ grouping actually installs
             _flash_total_train_tokens = None
+            # quality-metric accumulators spanning the microbatches of one logging step
+            _flash_qm_step = -1
+            _flash_qm_entropy_sum = None
+            _flash_qm_total_tokens = None
+            _flash_qm_correct_tokens = None
+            _flash_qm_aux_sum = None
+            _flash_qm_aux_count = 0
 
             def compute_loss(
                 self,
@@ -765,7 +775,7 @@ def run_sft():
                 else:
                     self._flash_total_train_tokens += local_tokens
 
-                if _sft_quality_metrics_due(self.state, self.args, self.accelerator):
+                if _sft_step_will_log(self.state, self.args):
                     with torch.no_grad():
                         if "shift_labels" in inputs:
                             shift_logits = outputs.logits
@@ -781,32 +791,64 @@ def run_sft():
                             shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
 
                         mask = shift_labels != -100
-                        entropy_sum = (entropy_from_logits(shift_logits) * mask).sum()
-                        total_tokens = mask.sum()
-                        correct_tokens = (
+                        entropy_sum_mb = (entropy_from_logits(shift_logits) * mask).sum()
+                        total_tokens_mb = mask.sum()
+                        correct_tokens_mb = (
                             (shift_logits.argmax(dim=-1) == shift_labels) & mask
                         ).sum()
-                        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
-                        total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
-                        correct_tokens = self.accelerator.gather_for_metrics(correct_tokens).sum()
+                    # accumulate the token-weighted sums across every microbatch of this logging step
+                    # (keyed on global_step) so logged entropy/accuracy reflect the whole optimizer
+                    # step, not only its final microbatch. reset when a new logging step begins.
+                    if self._flash_qm_step != int(self.state.global_step):
+                        self._flash_qm_step = int(self.state.global_step)
+                        self._flash_qm_entropy_sum = entropy_sum_mb
+                        self._flash_qm_total_tokens = total_tokens_mb
+                        self._flash_qm_correct_tokens = correct_tokens_mb
+                        self._flash_qm_aux_sum = None
+                        self._flash_qm_aux_count = 0
+                    else:
+                        self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
+                        self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
+                        self._flash_qm_correct_tokens = (
+                            self._flash_qm_correct_tokens + correct_tokens_mb
+                        )
+                    if self.aux_loss_enabled:
+                        aux_mb = outputs.aux_loss.detach()
+                        self._flash_qm_aux_sum = (
+                            aux_mb
+                            if self._flash_qm_aux_sum is None
+                            else self._flash_qm_aux_sum + aux_mb
+                        )
+                        self._flash_qm_aux_count += 1
+                    if self.accelerator.sync_gradients:
+                        entropy_sum = self.accelerator.gather_for_metrics(
+                            self._flash_qm_entropy_sum
+                        ).sum()
+                        total_tokens = self.accelerator.gather_for_metrics(
+                            self._flash_qm_total_tokens
+                        ).sum()
+                        correct_tokens = self.accelerator.gather_for_metrics(
+                            self._flash_qm_correct_tokens
+                        ).sum()
                         entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
                         accuracy = (
                             (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
                         )
-                    self._metrics["train"]["entropy"].append(entropy)
-                    self._metrics["train"]["mean_token_accuracy"].append(accuracy)
-                    total_train_tokens = (
-                        self.accelerator.gather_for_metrics(self._flash_total_train_tokens)
-                        .sum()
-                        .item()
-                    )
-                    self._total_train_tokens = total_train_tokens
-                    self._metrics["train"]["num_tokens"] = [total_train_tokens]
-                    if self.aux_loss_enabled:
-                        aux_loss = (
-                            self.accelerator.gather_for_metrics(outputs.aux_loss).mean().item()
+                        self._metrics["train"]["entropy"].append(entropy)
+                        self._metrics["train"]["mean_token_accuracy"].append(accuracy)
+                        total_train_tokens = (
+                            self.accelerator.gather_for_metrics(self._flash_total_train_tokens)
+                            .sum()
+                            .item()
                         )
-                        self._metrics["train"]["aux_loss"].append(aux_loss)
+                        self._total_train_tokens = total_train_tokens
+                        self._metrics["train"]["num_tokens"] = [total_train_tokens]
+                        if self.aux_loss_enabled and self._flash_qm_aux_count > 0:
+                            aux_mean_local = self._flash_qm_aux_sum / self._flash_qm_aux_count
+                            aux_loss = (
+                                self.accelerator.gather_for_metrics(aux_mean_local).mean().item()
+                            )
+                            self._metrics["train"]["aux_loss"].append(aux_loss)
 
                 return (loss, outputs) if return_outputs else loss
 
