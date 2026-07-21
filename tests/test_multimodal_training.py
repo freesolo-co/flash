@@ -745,6 +745,23 @@ def test_multimodal_algorithm_validation_rejects_unsupported_modes():
         mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "opd")
 
 
+def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
+    import inspect
+
+    from flash.engine.worker import rl
+
+    source = inspect.getsource(rl.run_rl)
+    guard = "if multimodal and not is_multi_turn:"
+    suppression = (
+        '_gen_kwargs["logit_bias"] = '
+        "{resolve_image_pad_token_id(processor, tok): -100.0}"
+    )
+
+    assert guard in source
+    assert suppression in source
+    assert source.index(guard) < source.index(suppression)
+
+
 def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_path):
     root, _image = _package(tmp_path)
     env_file = root / "environment.py"
