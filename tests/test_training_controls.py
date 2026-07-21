@@ -396,6 +396,8 @@ def test_resume_upload_failure_requires_full_state_only_at_exact_save(
             save()
     else:
         save()
+        if hook == "on_save":
+            assert worker.flush_optional_uploads()
 
     assert calls == {"deployable": 1, "resume": 3}
 

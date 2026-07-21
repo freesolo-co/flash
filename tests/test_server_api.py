@@ -139,7 +139,9 @@ def test_requests_without_key_are_rejected(api):
     # A token that doesn't verify with freesolo is rejected.
     assert api.get("/v1/runs", headers=_bearer("not-a-freesolo-key")).status_code == 401
     assert api.get("/v1/models", headers=_bearer("nope")).status_code == 401
-    assert api.get("/v1/health").status_code == 200  # health stays open
+    health = api.get("/v1/health")
+    assert health.status_code == 200  # health stays open
+    assert "chat_step_selector_v1" in health.json()["capabilities"]
 
 
 def test_dry_run_reports_schema_agreement_without_persisting_it(api) -> None:
@@ -3054,6 +3056,159 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert response.status_code == 200, text
     assert text == "verified"
     assert seen["run_id"] == revision
+
+
+def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "b" * 40]
+    for revision in revisions:
+        runner.mark_checkpoint_deployed(
+            run_id,
+            {
+                "state": "ready",
+                "endpoint_name": "https://serve.example",
+                "adapter_revision": revision,
+            },
+            verification_generation=runner.verified_adapter_revision_generation(run_id),
+        )
+    assert runner.get_status(run_id).deployment["adapter_revision"] == revisions[1]
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 20},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["run_id"] == revisions[1]
+
+
+def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "c" * 40]
+    for revision in revisions:
+        generation = runner.verified_adapter_revision_generation(run_id)
+        assert runner.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=generation,
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an ambiguous step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 20},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "multiple verified revisions at step 20" in detail
+    assert "flash deployments" in detail
+
+
+def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@final." + "b" * 40]
+    for revision in revisions:
+        generation = runner.verified_adapter_revision_generation(run_id)
+        assert runner.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=generation,
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an unverified step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 40},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "deploy it first" in detail
+    assert f"flash deploy {run_id}/step-40" in detail
+    assert "currently deployed steps: 20, final" in detail
+
+
+def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an ambiguous target must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "adapter_revision": f"{run_id}@step-20." + "a" * 40,
+            "step": 20,
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "pass either adapter_revision or step, not both"
+
+
+@pytest.mark.parametrize("step", ["abc", 1.5, -1, True])
+def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an invalid step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": step},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "invalid checkpoint step" in response.json()["detail"]
 
 
 def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monkeypatch):
