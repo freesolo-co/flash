@@ -1025,11 +1025,8 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
-# algorithms whose trainer can shard a single job across gpu.count > 1 cards. empty until the
-# per-algorithm multi-gpu trainers land (the sft/opd verl migrations add themselves here). keeping
-# this empty makes the multi-gpu *plumbing* landable now while multi-gpu *training* stays impossible
-# to trigger, so a count > 1 job can never silently provision and bill idle cards.
-_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset({"sft"})
+# algorithms whose trainer can shard a single job across gpu.count > 1 cards.
+_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset({"opd", "sft"})
 
 
 def _require_supported_gpu_count(spec: JobSpec) -> None:

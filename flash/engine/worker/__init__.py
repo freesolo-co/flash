@@ -96,7 +96,7 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     patch_grpo_mask_aware_lm_head,
 )
-from flash.engine.worker.opd import run_opd
+from flash.engine.worker.opd_verl import run_opd_verl as run_opd
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,
