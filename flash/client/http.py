@@ -512,13 +512,22 @@ class ApiClient:
                 if content:
                     yield str(content)
                 return
-            while raw := resp.read(1):
-                chunk = decoder.decode(raw)
-                if chunk:
-                    yield chunk
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                yield tail
+            read1 = getattr(resp, "read1", None)
+            read = read1 if read1 is not None else resp.read
+            read_size = 4096 if read1 is not None else 1
+            while raw := read(read_size):
+                state = decoder.getstate()
+                try:
+                    decoded = decoder.decode(raw)
+                except UnicodeDecodeError as exc:
+                    decoder.setstate(state)
+                    prefix_end = max(0, exc.start - len(state[0]))
+                    yield from decoder.decode(raw[:prefix_end])
+                    # bind + re-raise explicitly: the yield above clears the active exception, so a
+                    # bare `raise` here would fail with "No active exception to reraise".
+                    raise exc
+                yield from decoded
+            yield from decoder.decode(b"", final=True)
 
 
 def client_from_config(require_key: bool = True) -> ApiClient:
