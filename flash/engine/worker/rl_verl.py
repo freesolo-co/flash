@@ -25,10 +25,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from flash.engine.recipe import RECIPE
+from flash.engine.steps import on_policy_steps, resolve_update_horizon
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
-from flash.engine.worker.rng import seed_training_rngs
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
 
 DATA_SOURCE = "flash_env"
 
@@ -66,32 +67,39 @@ def build_verl_dataset_rows(
 def build_verl_overrides(cfg: dict) -> list[str]:
     """build the hydra override list for `python -m verl.trainer.main_ppo` (grpo + lora + vllm).
 
-    cfg keys: train_files, val_files, model_id, lora_rank, lora_alpha, target_modules, lr,
-    group_size, prompts_per_step, micro_batch, max_prompt_len, max_completion, temperature,
-    kl_loss_coef, gpu_mem_util, tp_size, reward_path, reward_name, total_epochs, save_freq,
-    local_dir.
+    carries the flash grpo recipe: dr-grpo advantages (no std norm, constant-length loss), the
+    job's kl coefficient (flash default 0 = no kl term), constant lr, seed, sampling top_p,
+    num_iterations (ppo_epochs), the max-steps horizon, and the save schedule.
     """
-    return [
+    kl_on = float(cfg["kl_coef"]) > 0
+    o = [
         "algorithm.adv_estimator=grpo",
+        # dr-grpo recipe: group-mean-centered advantages with NO std normalization, and a
+        # constant-length loss aggregation (no per-response length bias). matches the trl path's
+        # scale_rewards=none + loss_type=dr_grpo.
+        "algorithm.norm_adv_by_std_in_grpo=False",
+        f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
+        "algorithm.use_kl_in_reward=False",
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
         f"data.max_prompt_length={cfg['max_prompt_len']}",
         f"data.max_response_length={cfg['max_completion']}",
         "data.prompt_key=prompt",
+        f"data.seed={cfg['seed']}",
         f"actor_rollout_ref.model.path={cfg['model_id']}",
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
+        # memory: match the trl path's gradient checkpointing.
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
+        # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
+        "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={cfg['prompts_per_step']}",
         f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={cfg['micro_batch']}",
-        # grpo uses a token-level kl loss against the reference policy.
-        "actor_rollout_ref.actor.use_kl_loss=True",
-        f"actor_rollout_ref.actor.kl_loss_coef={cfg['kl_loss_coef']}",
-        # ref + rollout log-prob micro batch are required once a reference policy is active.
-        f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
-        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
+        # num_iterations: amortize each generation batch over N optimizer passes.
+        f"actor_rollout_ref.actor.ppo_epochs={cfg['num_iterations']}",
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # safetensors load format is required for lora rollout on vllm.
@@ -99,12 +107,18 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['tp_size']}",
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
+        f"actor_rollout_ref.rollout.top_p={cfg['top_p']}",
+        # verl recomputes rollout log-probs for the importance ratio regardless of the kl term.
+        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
         f"custom_reward_function.path={cfg['reward_path']}",
         f"custom_reward_function.name={cfg['reward_name']}",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
         f"trainer.total_epochs={cfg['total_epochs']}",
+        # honor [train].max_steps: total_training_steps caps the optimizer-update horizon.
+        f"trainer.total_training_steps={cfg['steps']}",
         f"trainer.save_freq={cfg['save_freq']}",
+        "trainer.max_actor_ckpt_to_keep=1",
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
         "trainer.logger=console",
@@ -112,6 +126,17 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "trainer.experiment_name=grpo",
         f"trainer.default_local_dir={cfg['local_dir']}",
     ]
+    if kl_on:
+        # a reference policy is active -> add the token-level kl loss + the ref log-prob micro batch.
+        o += [
+            "actor_rollout_ref.actor.use_kl_loss=True",
+            f"actor_rollout_ref.actor.kl_loss_coef={cfg['kl_coef']}",
+            f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={cfg['micro_batch']}",
+        ]
+    else:
+        # flash default: dr-grpo with no kl term, so no reference policy.
+        o.append("actor_rollout_ref.actor.use_kl_loss=False")
+    return o
 
 
 def render_reward_module(url_env: str = "FLASH_VERL_REWARD_URL") -> str:
@@ -345,12 +370,36 @@ def _resolve_single_turn_inputs():
 
     rl = RECIPE.rl
     _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    # fail loud on grpo features the verl backend does not yet honor, so a migration never silently
+    # trains without a requested behavior.
+    if _t and getattr(_t, "structured_outputs", ""):
+        raise RuntimeError(
+            "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
+            "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
+        )
+    if _t and getattr(_t, "init_from_adapter", ""):
+        raise RuntimeError(
+            "train.init_from_adapter (warm-start) is not yet supported on the verl backend; use the "
+            "trl backend (unset FLASH_RL_BACKEND) for warm-start runs."
+        )
+    if _t and getattr(_t, "stop_sequences", ()):
+        raise RuntimeError(
+            "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
+            "no stop-string field here); use the trl backend (unset FLASH_RL_BACKEND) for it."
+        )
     gcfg = _w.grpo_overrides()
     prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
     group_size = int(gcfg.get("group_size") or rl.group_size)
     _gcfg_temp = gcfg.get("temperature")
     temperature = float(_gcfg_temp if _gcfg_temp is not None else rl.sampling_temperature)
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
+    # flash defaults kl_penalty_coef to 0 (dr-grpo, no kl term); honor it rather than forcing a kl.
+    kl_coef = float(gcfg.get("kl_penalty_coef") or 0.0)
+    learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
+    # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
+    # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
+    lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
+    lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
 
     train = env.dataset()
     _max_examples = getattr(_t, "max_examples", None) if _t else None
@@ -395,6 +444,14 @@ def _resolve_single_turn_inputs():
     prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
 
+    # optimizer-update horizon, honoring [train].max_steps exactly like the trl path.
+    epochs = int(_t.epochs) if (_t and _t.epochs is not None) else int(rl.num_epochs)
+    derived_steps = on_policy_steps(
+        epochs=epochs, prompt_count=len(prompts), prompts_per_step=prompts_per_step
+    )
+    steps = resolve_update_horizon(derived_steps, getattr(_t, "max_steps", None) if _t else None)
+    save_every = int(_t.save_every) if (_t and _t.save_every) else 20
+
     return {
         "env": env,
         "tok": tok,
@@ -404,14 +461,21 @@ def _resolve_single_turn_inputs():
         "prompts_per_step": prompts_per_step,
         "group_size": group_size,
         "temperature": temperature,
+        "top_p": float(rl.sampling_top_p),
         "think_penalty": think_penalty,
+        "kl_coef": kl_coef,
         "max_completion": max_completion,
         "max_prompt_len": prompt_budget,
         "prompt_opened_thinking": prompt_opened_thinking,
-        "lr": float(rl.learning_rate),
-        "lora_rank": int(RECIPE.lora.rank),
-        "lora_alpha": int(RECIPE.lora.alpha),
-        "epochs": int(_t.epochs) if (_t and _t.epochs) else int(rl.num_epochs),
+        "lr": learning_rate,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "epochs": epochs,
+        "steps": int(steps),
+        "save_every": save_every,
+        # flash amortizes each generation batch over 2 optimizer passes (num_iterations=2).
+        "num_iterations": 2,
+        "seed": int(backend_seed(_w.SEED)),
     }
 
 
@@ -474,7 +538,7 @@ def run_rl_verl():
     try:
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
-        expected_steps = inp["epochs"] * max(1, len(prompts) // inp["prompts_per_step"])
+        expected_steps = int(inp["steps"])
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
             "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
@@ -482,10 +546,12 @@ def run_rl_verl():
             "lr": inp["lr"], "group_size": inp["group_size"],
             "prompts_per_step": inp["prompts_per_step"], "micro_batch": micro_batch,
             "max_prompt_len": inp["max_prompt_len"], "max_completion": inp["max_completion"],
-            "temperature": inp["temperature"], "kl_loss_coef": 0.001,
+            "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
+            "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
+            "num_iterations": inp["num_iterations"], "steps": expected_steps,
             "gpu_mem_util": 0.5, "tp_size": 1,
             "reward_path": reward_py, "reward_name": "compute_score",
-            "total_epochs": inp["epochs"], "save_freq": 1, "local_dir": local_dir,
+            "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }
         overrides = build_verl_overrides(cfg)
 
