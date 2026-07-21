@@ -69,11 +69,7 @@ def _flash_groupwise_reverse_kl_values(
             group_length = group_mask.sum().to(dtype=student_logprobs.dtype)
             student_logsum = student_logprobs[row][group_mask].detach().sum()
             teacher_logsum = teacher_logsums[row][group_mask][0]
-            coefficient = (
-                float(kl_penalty_coef)
-                * (student_logsum - teacher_logsum)
-                / group_length
-            )
+            coefficient = float(kl_penalty_coef) * (student_logsum - teacher_logsum) / group_length
             values[row][group_mask] = coefficient * student_logprobs[row][group_mask]
         values[row][selected] *= response_count / selected_count
     return values
@@ -174,7 +170,13 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
             details = payload["error"]
             classification = str(details["classification"])
             message = str(details["message"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as decode_error:
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as decode_error:
             raise FlashTeacherBridgeError(
                 f"flash OPD bridge returned unclassified HTTP {error.code}",
                 classification="permanent",
@@ -402,7 +404,9 @@ def _install_verl_extensions() -> None:
         def _get_required_batch_multiple(self, dp_size: int) -> int:
             return dp_size
 
-        def _balance_batch(self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        def _balance_batch(
+            self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False
+        ):
             return super()._balance_batch(
                 filter_signal_batch(batch),
                 metrics,
@@ -442,8 +446,14 @@ def _install_verl_extensions() -> None:
             lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
             if lora_rank <= 0:
                 lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+            ref_in_actor = (
+                lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            )
+            role = (
+                Role.ActorRolloutRef
+                if need_reference_policy(config) and not ref_in_actor
+                else Role.ActorRollout
+            )
             self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
             self.mapping[role] = "global_pool"
 

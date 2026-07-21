@@ -97,9 +97,20 @@ def export_peft_adapter(
     merge_env["TRANSFORMERS_OFFLINE"] = "1"
     merge_env["HF_HUB_DISABLE_XET"] = "1"
     subprocess.run(
-        [python_bin, "-m", "verl.model_merger", "merge", "--backend", "fsdp",
-         "--local_dir", ckpt_actor_dir, "--target_dir", merge_out],
-        check=True, env=merge_env,
+        [
+            python_bin,
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            ckpt_actor_dir,
+            "--target_dir",
+            merge_out,
+        ],
+        check=True,
+        env=merge_env,
     )
     lora_dir = os.path.join(merge_out, "lora_adapter")
     if not os.path.exists(os.path.join(lora_dir, "adapter_config.json")):

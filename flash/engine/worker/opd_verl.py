@@ -76,9 +76,7 @@ def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:
     for prompt in prompts:
         fingerprint_fields = [prompt.student_messages, list(prompt.prompt_ids)]
         if prompt.image_descriptors:
-            fingerprint_fields.extend(
-                [prompt.teacher_messages, list(prompt.image_descriptors)]
-            )
+            fingerprint_fields.extend([prompt.teacher_messages, list(prompt.image_descriptors)])
         payload = json.dumps(
             fingerprint_fields,
             sort_keys=True,
@@ -103,7 +101,9 @@ def _normalize_prompt_ids(value) -> tuple[int, ...]:
         value = value[0]
     if not isinstance(value, list):
         raise TypeError("processor prompt input_ids must be list-like")
-    return tuple(int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value)
+    return tuple(
+        int(token_id.item() if hasattr(token_id, "item") else token_id) for token_id in value
+    )
 
 
 def _processor_expanded_prompt_ids(
@@ -189,7 +189,9 @@ class _TeacherAlignmentBridge:
         self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
         self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
         self.empty_alignments = int(
-            state.get("empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0))
+            state.get(
+                "empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0)
+            )
         )
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
@@ -509,7 +511,9 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "data.image_key=images",
         "data.return_raw_chat=true",
         "data.return_multi_modal_inputs=false",
-        "data.apply_chat_template_kwargs={enable_thinking:" + _hydra_val(config.get("thinking", False)) + "}",
+        "data.apply_chat_template_kwargs={enable_thinking:"
+        + _hydra_val(config.get("thinking", False))
+        + "}",
         f"actor_rollout_ref.model.path={_hydra_val(config['model_path'])}",
         "actor_rollout_ref.model.trust_remote_code=true",
         "actor_rollout_ref.model.use_remove_padding=true",
@@ -634,9 +638,7 @@ def _metric_value(line: str, name: str) -> float | None:
     return None
 
 
-def _raise_verl_failure(
-    return_code: int, teacher_failure: tuple[str, str] | None
-) -> None:
+def _raise_verl_failure(return_code: int, teacher_failure: tuple[str, str] | None) -> None:
     if return_code == 0:
         return
     if teacher_failure is not None:
@@ -789,7 +791,9 @@ def _restore_verl_resume(
     return step, state
 
 
-def _generation_eos_from_cached_config(model_id: str, model_revision: str, tokenizer) -> frozenset[int]:
+def _generation_eos_from_cached_config(
+    model_id: str, model_revision: str, tokenizer
+) -> frozenset[int]:
     from transformers import AutoConfig, GenerationConfig
 
     config = AutoConfig.from_pretrained(
@@ -823,7 +827,9 @@ def run_opd_verl(spec=None) -> None:
     env = _w.require_active_env()
     unsupported_backend = "not yet supported on the verl OPD backend"
     if getattr(env, "is_tool_env", False) or getattr(env, "multi_turn", False):
-        raise RuntimeError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+        raise RuntimeError(
+            f"multi-turn and tool-calling OPD environments are {unsupported_backend}"
+        )
     knobs = _resolve_opd_knobs()
     if knobs.structured_outputs:
         raise RuntimeError(
@@ -1156,13 +1162,19 @@ def run_opd_verl(spec=None) -> None:
                 python_bin=python_bin,
             )
             _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-            if final_save_due(final_step, knobs.save_at_steps) and final_step not in watcher.processed_steps:
-                _w.publish_deployable_checkpoint(
-                    adapter_dir, final_step, _provenance_ready=True
-                )
+            if (
+                final_save_due(final_step, knobs.save_at_steps)
+                and final_step not in watcher.processed_steps
+            ):
+                _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
 
         setup_seconds = train_started_at - started_at
-        _w.heartbeat("opd_trained", step=final_step, train_wall=train_wall, gpu=_w.gpu_diagnostics(include_torch=False))
+        _w.heartbeat(
+            "opd_trained",
+            step=final_step,
+            train_wall=train_wall,
+            gpu=_w.gpu_diagnostics(include_torch=False),
+        )
         _w.write_train_meta(
             phase="opd",
             step=final_step,
