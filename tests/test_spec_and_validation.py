@@ -682,7 +682,7 @@ def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> No
         spec_from_dict(_raw(**{"gpu.provider": "aws"}))
     with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
         spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
-    with pytest.raises(ConfigError, match="validated"):
+    with pytest.raises(ConfigError, match=r"unsupported gpu 'RTX A6000'"):
         spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
     with pytest.raises(ConfigError, match="requires at least"):
         spec_from_dict(
@@ -730,8 +730,8 @@ def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
     assert "`flash gpus` to list valid classes" in invalid_warning
     assert 'add exact_type = "H10O"' not in invalid_warning
 
-    # a retired-but-known class canonicalizes but is not validated, so it must be treated like an
-    # unrecognized hint and never echoed back as an exact_type the schema would immediately reject.
+    # an unrecognized type hint (e.g. a removed/retired class name) must be treated like any unknown
+    # string and never echoed back as an exact_type the schema would immediately reject.
     spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
     retired_warning = capsys.readouterr().err
     assert "[gpu] type='RTX A6000' is not an active GPU class and was ignored" in retired_warning
@@ -764,7 +764,7 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         JobSpec.from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match=r"gpu\.type: unsupported gpu 'H10O'"):
         JobSpec.from_dict({"gpu": {"type": "H10O"}})
-    with pytest.raises(ValueError, match="active validated GPU class"):
+    with pytest.raises(ValueError, match=r"unsupported gpu 'RTX A6000'"):
         JobSpec.from_dict({"gpu": {"type": "RTX A6000"}})
 
 
