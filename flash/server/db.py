@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -29,20 +31,125 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 
 # Tests override with monkeypatch.setattr(db, "DB_PATH", tmp).
 DB_PATH = str(Path.home() / ".flash" / "server.db")
+_LAST_USED_WRITE_INTERVAL_S = 60.0
+_INITIALIZATION_LOCK = threading.Lock()
+_INITIALIZED_DATABASES: dict[tuple[int, str], tuple[int, int]] = {}
+_CONNECTIONS = threading.local()
 
 
 def db_path() -> str:
     return DB_PATH
 
 
+def _database_file_identity(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def _initialize_database(path: str) -> None:
+    database = (os.getpid(), path)
+    identity = _database_file_identity(path)
+    if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
+        return
+    _INITIALIZATION_LOCK.acquire()
+    try:
+        identity = _database_file_identity(path)
+        if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
+            return
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 30.0
+        backoff = 0.01
+        schema_identity = None
+        while True:
+            conn = None
+            retry_delay = None
+            try:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                conn = sqlite3.connect(path, timeout=remaining)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.executescript(_SCHEMA)
+                # Record the identity of the file the schema actually ran on while
+                # the connection is still open, so a file replaced at the same path
+                # afterwards can't be cached as initialized without _SCHEMA on it.
+                schema_identity = _database_file_identity(path)
+            except sqlite3.OperationalError as exc:
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                primary_error_code = error_code & 0xFF if isinstance(error_code, int) else None
+                lock_message = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if (
+                    primary_error_code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    and not lock_message
+                ):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                retry_delay = min(backoff, remaining)
+            finally:
+                if conn is not None:
+                    conn.close()
+            if retry_delay is None:
+                break
+            # Don't hold the initialization lock while backing off: another process
+            # may finish creating the schema, and sibling threads shouldn't block on
+            # in-process init for the whole deadline.
+            _INITIALIZATION_LOCK.release()
+            try:
+                time.sleep(retry_delay)
+            finally:
+                _INITIALIZATION_LOCK.acquire()
+            backoff = min(backoff * 2, 0.25)
+            identity = _database_file_identity(path)
+            if identity is not None and _INITIALIZED_DATABASES.get(database) == identity:
+                return
+        if schema_identity is None:
+            _INITIALIZED_DATABASES.pop(database, None)
+            raise sqlite3.OperationalError("database disappeared during schema initialization")
+        _INITIALIZED_DATABASES[database] = schema_identity
+    finally:
+        _INITIALIZATION_LOCK.release()
+
+
 def _connect() -> sqlite3.Connection:
     path = db_path()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+    process_id = os.getpid()
+    _initialize_database(path)
+    file_identity = _database_file_identity(path)
+    if file_identity is None:
+        raise sqlite3.OperationalError("database disappeared after schema initialization")
+
+    conn = getattr(_CONNECTIONS, "connection", None)
+    if (
+        conn is None
+        or getattr(_CONNECTIONS, "path", None) != path
+        or getattr(_CONNECTIONS, "process_id", None) != process_id
+        or getattr(_CONNECTIONS, "file_identity", None) != file_identity
+    ):
+        # Clear the pooled handle before reopening so a failed reconnect never
+        # leaves a stale/closed connection behind for this thread to reuse.
+        _CONNECTIONS.connection = None
+        _CONNECTIONS.path = None
+        _CONNECTIONS.process_id = None
+        _CONNECTIONS.file_identity = None
+        if conn is not None:
+            conn.close()
+        conn = sqlite3.connect(path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        opened_identity = _database_file_identity(path)
+        if opened_identity is None or opened_identity != file_identity:
+            # The file was removed or replaced between the identity check and the
+            # open, so this connection may point at a ghost inode. Discard it and
+            # let the caller retry rather than caching a mismatched identity pair.
+            conn.close()
+            raise sqlite3.OperationalError("database changed while opening a pooled connection")
+        _CONNECTIONS.connection = conn
+        _CONNECTIONS.path = path
+        _CONNECTIONS.process_id = process_id
+        _CONNECTIONS.file_identity = opened_identity
     return conn
 
 
@@ -96,7 +203,14 @@ def lookup_key(api_key: str) -> dict | None:
         ).fetchone()
         if row is None:
             return None
-        conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (time.time(), row["id"]))
+        now = time.time()
+        stale_before = now - _LAST_USED_WRITE_INTERVAL_S
+        if row["last_used_at"] is None or row["last_used_at"] <= stale_before:
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? "
+                "WHERE id = ? AND (last_used_at IS NULL OR last_used_at <= ?)",
+                (now, row["id"], stale_before),
+            )
         return dict(row)
 
 
