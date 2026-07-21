@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -50,6 +51,44 @@ from flash.spec import (
 def grpo_under_ran(steps_run: int, steps: int) -> bool:
     """return true when grpo completes fewer optimizer updates than requested."""
     return int(steps_run) < int(steps)
+
+
+def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    denominator = len(breakdowns)
+    for breakdown in breakdowns:
+        if not isinstance(breakdown, dict):
+            continue
+        for name, value in breakdown.items():
+            if name == "total":
+                continue
+            totals.setdefault(name, 0.0)
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score):
+                totals[name] += score
+    if denominator == 0:
+        return {}
+    return {name: total / denominator for name, total in totals.items()}
+
+
+def _latest_named_reward_metrics(
+    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
+) -> dict[str, float]:
+    if breakdowns:
+        metrics = _mean_named_reward_metrics(breakdowns)
+        breakdowns.clear()
+        if metrics:
+            latest.clear()
+            latest.update(metrics)
+        elif latest:
+            # every completion failed scoring this generation: surface the known metrics as
+            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
+            # than hiding behind missing heartbeat fields.
+            latest.update(dict.fromkeys(latest, 0.0))
+    return dict(latest)
 
 
 def select_grpo_trainer(
@@ -302,6 +341,9 @@ def run_rl():
     if _w.THINKING:
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
+    pending_named_breakdowns: list[dict[str, float] | None] = []
+    latest_named_metrics: dict[str, float] = {}
+
     def reward_fn(completions, **kwargs):
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
@@ -325,6 +367,7 @@ def run_rl():
             )
         examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
+        breakdowns = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             try:
@@ -353,6 +396,7 @@ def run_rl():
                 if hasattr(env, "scores_breakdown"):
                     breakdown = env.scores_breakdown(graded, ex, state)
                     r = float(breakdown.get("total", 0.0))
+                    breakdowns.append(breakdown)
                 else:
                     r = env.reward(graded, ex, state)
             except Exception as _reward_exc:
@@ -363,6 +407,7 @@ def run_rl():
                     f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
                     flush=True,
                 )
+                breakdowns.append(None)
                 rewards.append(0.0)
                 continue
             if _think_penalty > 0 and _w.THINKING:
@@ -388,6 +433,7 @@ def run_rl():
                         "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
                     }
                 )
+        pending_named_breakdowns.extend(breakdowns)
         _w.upload_debug_jsonl("reward_debug.jsonl", debug_rows)
         return rewards
 
@@ -635,6 +681,10 @@ def run_rl():
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
     _gen_kwargs: dict = {}
+    if multimodal and not is_multi_turn:
+        from flash.multimodal import resolve_image_pad_token_id
+
+        _gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}
     if _t and _t.stop_sequences:
         _gen_kwargs["stop"] = list(_t.stop_sequences)
     # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
@@ -693,7 +743,11 @@ def run_rl():
     # VL checkpoints roll out on the FULL multimodal engine (vision tower included) — the colocated
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
-    hb_cb = _w.make_reward_heartbeat_callback()
+    hb_cb = _w.make_reward_heartbeat_callback(
+        lambda: _latest_named_reward_metrics(
+            pending_named_breakdowns, latest_named_metrics
+        )
+    )
     trainer_callbacks = [
         hb_cb,
         _w.make_checkpoint_upload_callback(save_at_steps),
@@ -843,6 +897,7 @@ def run_rl():
         liveness_heartbeat(
             "rl_step",
             progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
+            fields=hb_cb.latest_fields,
             progress_step=True,
         ),
         _sdpa_cudnn_ctx(_attn),

@@ -218,6 +218,11 @@ def _format_heartbeat(hb: dict) -> str:
                 msg += f" {key}={value:.{digits}f}"
         else:
             msg += f" {key}={value}"
+    reward_metrics = hb.get("reward_metrics")
+    if isinstance(reward_metrics, dict):
+        for name, value in reward_metrics.items():
+            if isinstance(value, (int, float)):
+                msg += f" {name}={value:.3f}"
     msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))
     return msg
 
