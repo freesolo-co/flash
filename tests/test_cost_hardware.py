@@ -100,3 +100,22 @@ def test_pick_gpu_impossible_raises():
 def test_pick_gpu_auto_matches_default():
     assert pick_gpu(24, provider="auto") == pick_gpu(24)
     assert pick_gpu(12) == "RTX 4090"
+
+
+def test_effective_train_tflops_caps_b200_at_h200_class():
+    # b200/sm100 training falls back to portable kernels, so realized training throughput is
+    # h200-class, not the 2.25 pflops peak. the cost model must not treat b200 as faster than h200.
+    from flash.cost.facts import effective_train_tflops
+
+    assert gpu_tflops("B200") == 2250.0  # raw peak unchanged (vram/serving still use gpu_tflops)
+    assert effective_train_tflops("B200") == 990.0
+    assert effective_train_tflops("B200") == effective_train_tflops("H200")
+
+
+def test_effective_train_tflops_is_peak_for_uncapped_classes():
+    from flash.cost.facts import effective_train_tflops
+
+    for name in ("H100", "H200", "A100 SXM", "RTX 4090", "B200"):
+        # only b200 is capped; every other class keeps its peak.
+        expected = 990.0 if name == "B200" else gpu_tflops(name)
+        assert effective_train_tflops(name) == expected
