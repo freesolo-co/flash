@@ -86,27 +86,31 @@ def resolve_effective_completion_tokens(spec: JobSpec) -> int:
 
 def preflight_serving_path(spec: JobSpec) -> None:
     """Validate structured-output serving inputs without contacting a live server."""
-    constraint = parse_structured_outputs(spec.train.structured_outputs)
-    if constraint is None:
-        return
     try:
-        validate_structured_output_patterns(constraint)
+        constraint = parse_structured_outputs(spec.train.structured_outputs)
     except ValueError as exc:
         raise ServingPreflightError(f"train.structured_outputs {exc}") from exc
-    schema = constraint.get("json")
-    if schema is not None:
+    if constraint is not None:
         try:
-            validate_local_json_schema(schema)
-        except ExternalSchemaReference as exc:
-            raise ServingPreflightError(
-                "train.structured_outputs JSON schema uses external reference "
-                f"{exc.ref!r}; external schema retrieval is unsupported, so use a local "
-                "fragment reference beginning with '#/'"
-            ) from exc
-        except SchemaError as exc:
-            raise ServingPreflightError(
-                f"train.structured_outputs JSON schema is invalid: {exc.message}"
-            ) from exc
+            validate_structured_output_patterns(constraint)
+        except ValueError as exc:
+            raise ServingPreflightError(f"train.structured_outputs {exc}") from exc
+        schema = constraint.get("json")
+        if schema is not None:
+            try:
+                validate_local_json_schema(schema)
+            except ExternalSchemaReference as exc:
+                raise ServingPreflightError(
+                    "train.structured_outputs JSON schema uses external reference "
+                    f"{exc.ref!r}; external schema retrieval is unsupported, so use a local "
+                    "fragment reference beginning with '#/'"
+                ) from exc
+            except SchemaError as exc:
+                raise ServingPreflightError(
+                    f"train.structured_outputs JSON schema is invalid: {exc.message}"
+                ) from exc
+    # always run the serving context guard, even when structured-outputs parses to
+    # None (a truthy-but-empty value), so it can never skip the context check.
     try:
         preflight_train_context_within_serving(
             spec,
