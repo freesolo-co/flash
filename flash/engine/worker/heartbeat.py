@@ -257,6 +257,8 @@ _REWARD_METRIC_RESERVED_NAMES = frozenset(
     }
 )
 _REWARD_METRIC_LIMIT = 12
+# names TRAINING.md tells users to judge on: never dropped by the alphabetical cap.
+_REWARD_METRIC_PRIORITY_NAMES = ("success",)
 
 
 def _bounded_reward_metrics(metrics) -> dict[str, float]:
@@ -271,9 +273,25 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
             score = float(value)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(score):
-            surviving[sanitized_name] = score
-    return dict(sorted(surviving.items())[:_REWARD_METRIC_LIMIT])
+        if not math.isfinite(score):
+            continue
+        # distinct source names that sanitize to the same key must not silently overwrite each
+        # other; disambiguate with a numeric suffix (kept within the 64-char bound, allowed chars).
+        unique_name = sanitized_name
+        suffix = 2
+        while unique_name in surviving:
+            tail = f"_{suffix}"
+            unique_name = sanitized_name[: 64 - len(tail)] + tail
+            suffix += 1
+        surviving[unique_name] = score
+    if len(surviving) <= _REWARD_METRIC_LIMIT:
+        return dict(sorted(surviving.items()))
+    # the cap must not drop metrics users are told to judge on (e.g. success); keep those first,
+    # then fill the remaining slots alphabetically.
+    priority = [n for n in _REWARD_METRIC_PRIORITY_NAMES if n in surviving]
+    remaining = max(0, _REWARD_METRIC_LIMIT - len(priority))
+    rest = sorted(n for n in surviving if n not in priority)[:remaining]
+    return {n: surviving[n] for n in sorted(priority + rest)}
 
 
 # Exactly three samples per heartbeat, always. Mirrors rollout_samples._SAMPLE_LIMIT.
@@ -336,6 +354,12 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
             self.reward_history = []
             self.last_gpu_diag_at = 0.0
             self.sent_first_sample_heartbeat = False
+            self.latest_reward_metrics: dict[str, float] = {}
+
+        def latest_fields(self) -> dict:
+            if not self.latest_reward_metrics:
+                return {}
+            return {"reward_metrics": dict(self.latest_reward_metrics)}
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -355,9 +379,9 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
                 "reward_last": self.reward_history[-8:],
             }
             latest_metrics = reward_metrics() if callable(reward_metrics) else reward_metrics
-            bounded_metrics = _bounded_reward_metrics(latest_metrics)
-            if bounded_metrics:
-                payload["reward_metrics"] = bounded_metrics
+            self.latest_reward_metrics = _bounded_reward_metrics(latest_metrics)
+            if self.latest_reward_metrics:
+                payload["reward_metrics"] = dict(self.latest_reward_metrics)
             latest_samples = samples() if callable(samples) else samples
             bounded_samples = _bounded_sampled_completions(latest_samples)
             if bounded_samples:

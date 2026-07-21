@@ -75,12 +75,21 @@ def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dic
     return {name: total / denominator for name, total in totals.items()}
 
 
-def _take_named_reward_metrics(
-    breakdowns: list[dict[str, float] | None],
+def _latest_named_reward_metrics(
+    breakdowns: list[dict[str, float] | None], latest: dict[str, float]
 ) -> dict[str, float]:
-    metrics = _mean_named_reward_metrics(breakdowns)
-    breakdowns.clear()
-    return metrics
+    if breakdowns:
+        metrics = _mean_named_reward_metrics(breakdowns)
+        breakdowns.clear()
+        if metrics:
+            latest.clear()
+            latest.update(metrics)
+        elif latest:
+            # every completion failed scoring this generation: surface the known metrics as
+            # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
+            # than hiding behind missing heartbeat fields.
+            latest.update(dict.fromkeys(latest, 0.0))
+    return dict(latest)
 
 
 def select_grpo_trainer(
@@ -335,6 +344,7 @@ def run_rl():
 
     pending_named_breakdowns: list[dict[str, float] | None] = []
     latest_samples: list[dict] = []
+    latest_named_metrics: dict[str, float] = {}
 
     def reward_fn(completions, **kwargs):
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
@@ -694,6 +704,10 @@ def run_rl():
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
     _gen_kwargs: dict = {}
+    if multimodal and not is_multi_turn:
+        from flash.multimodal import resolve_image_pad_token_id
+
+        _gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}
     if _t and _t.stop_sequences:
         _gen_kwargs["stop"] = list(_t.stop_sequences)
     # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
@@ -753,7 +767,9 @@ def run_rl():
     # vLLM loads Qwen3_5ForConditionalGeneration and its own hf_to_vllm_mapper maps the trainer's
     # ``model.language_model.*`` weight-sync names, so no flash-side remap is needed.
     hb_cb = _w.make_reward_heartbeat_callback(
-        lambda: _take_named_reward_metrics(pending_named_breakdowns),
+        lambda: _latest_named_reward_metrics(
+            pending_named_breakdowns, latest_named_metrics
+        ),
         lambda: list(latest_samples),
     )
     trainer_callbacks = [
@@ -905,6 +921,7 @@ def run_rl():
         liveness_heartbeat(
             "rl_step",
             progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
+            fields=hb_cb.latest_fields,
             progress_step=True,
         ),
         _sdpa_cudnn_ctx(_attn),

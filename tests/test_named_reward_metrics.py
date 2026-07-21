@@ -1,8 +1,8 @@
 import inspect
 
 from flash.engine.worker.rl import (
+    _latest_named_reward_metrics,
     _mean_named_reward_metrics,
-    _take_named_reward_metrics,
     run_rl,
 )
 
@@ -32,13 +32,18 @@ def test_failed_scoring_attempt_counts_as_zero() -> None:
     assert _mean_named_reward_metrics(breakdowns) == {"success": 0.5}
 
 
-def test_named_metrics_accumulate_until_heartbeat_consumes_them() -> None:
+def test_named_metrics_repeat_until_new_breakdowns_replace_them() -> None:
     pending = [{"success": 1.0, "total": 1.0}]
     pending.extend([{"success": 0.0, "total": 0.0}, None])
+    latest: dict[str, float] = {}
 
-    assert _take_named_reward_metrics(pending) == {"success": 1.0 / 3.0}
+    expected = {"success": 1.0 / 3.0}
+    assert _latest_named_reward_metrics(pending, latest) == expected
     assert pending == []
-    assert _take_named_reward_metrics(pending) == {}
+    assert _latest_named_reward_metrics(pending, latest) == expected
+
+    pending.extend([{"success": 1.0, "total": 1.0}])
+    assert _latest_named_reward_metrics(pending, latest) == {"success": 1.0}
 
 
 def test_non_finite_named_metric_counts_as_zero() -> None:
@@ -69,5 +74,6 @@ def test_reward_fn_accumulates_breakdowns_across_microbatches() -> None:
     source = inspect.getsource(run_rl)
 
     assert "pending_named_breakdowns.extend(breakdowns)" in source
-    assert "_take_named_reward_metrics(pending_named_breakdowns)" in source
+    assert "_latest_named_reward_metrics(" in source
+    assert "fields=hb_cb.latest_fields" in source
     assert "breakdowns.append(None)" in source

@@ -1200,6 +1200,17 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
     }
 
 
+def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
+    import inspect
+
+    from flash.engine.worker import opd as opd_mod
+
+    source = inspect.getsource(opd_mod.run_opd)
+    validation = 'validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)'
+
+    assert source.index(validation) < source.index("wait_for_gpu(")
+
+
 @pytest.mark.parametrize(
     "teacher_model",
     [
