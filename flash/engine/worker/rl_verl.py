@@ -472,10 +472,12 @@ def _resolve_single_turn_inputs():
             raise RuntimeError(
                 "warm-start source adapter could not be downloaded; refusing to start from the base."
             )
+        from flash.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
+
         with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
             _src_cfg = json.load(f)
-        lora_rank = int(_src_cfg.get("r", lora_rank))
-        lora_alpha = int(_src_cfg.get("lora_alpha", lora_alpha))
+        lora_rank = rank_from_adapter_config(_src_cfg, source=_t.init_from_adapter)
+        lora_alpha = alpha_from_adapter_config(_src_cfg, source=_t.init_from_adapter)
         print(
             f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
             f"from {_t.init_from_adapter}",
