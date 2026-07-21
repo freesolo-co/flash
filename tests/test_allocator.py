@@ -468,6 +468,38 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     assert e(2.0, "sft", seq_len=4096, max_tokens=256) == e(2.0, "sft", seq_len=4096, max_tokens=8192)
 
 
+def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
+    from flash.engine.vram import estimate_vram_gb as e
+
+    seq_len = 4096
+    completion = 512
+    vocab = 248_320
+    with_vocab = e(
+        2.0,
+        "opd",
+        seq_len=seq_len,
+        max_tokens=completion,
+        vocab=vocab,
+        batch_size=4,
+        group_size=4,
+    )
+    without_vocab = e(
+        2.0,
+        "opd",
+        seq_len=seq_len,
+        max_tokens=completion,
+        vocab=0,
+        batch_size=4,
+        group_size=4,
+    )
+    expected = (seq_len * 4 + completion * 8) * vocab / 1e9
+    assert with_vocab - without_vocab == pytest.approx(expected)
+
+    short = e(2.0, "opd", seq_len=seq_len, max_tokens=128, vocab=vocab)
+    long = e(2.0, "opd", seq_len=seq_len, max_tokens=2048, vocab=vocab)
+    assert long > short
+
+
 def test_open_model_opd_uses_opd_sizing_not_grpo(monkeypatch):
     """Regression (codex[bot], vram.py): for an uncataloged (model_policy='allow') model the open-model
     fallback hardcoded ``_need(params_b, 'grpo', ...)``, so an OPD run was sized as a colocated-vLLM GRPO
@@ -629,11 +661,11 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            "RTX Pro 6000",
+            "A100 PCIe",
         ),
         (
-            # fp8 KV (cc >= 8.9) halves the resident rollout KV, so this fits the 141 GB H200 and no
-            # longer needs the 180 GB B200 — still far off the 32/40 GB consumer classes this guards.
+            # the dense image fallback grows with context and keeps this mixed-modality-safe route
+            # above the 96 gb class.
             "max_context_16384",
             {
                 "epochs": 1,
@@ -653,7 +685,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "lora_rank": 32,
                 "lora_alpha": 64,
             },
-            None,
+            "H200",
         ),
         (
             "group_size_8",
@@ -748,9 +780,8 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    # Off the 40 GB class, but no longer forced onto the 141 GB H200: the colocated OPD rollout uses an
-    # fp8 KV cache on cc >= 8.9 hardware, and a run this size can only land on a modern (cc >= 8.9)
-    # card, so its KV pool is fp8-sized — it fits the cheaper 96 GB RTX Pro 6000 (Blackwell).
+    # the dense image fallback keeps this run above the 80 gb class while still fitting the 96 gb
+    # rtx pro 6000.
     assert 80 < need <= 96
 
     preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
