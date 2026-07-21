@@ -112,7 +112,9 @@ class _TeacherAlignmentBridge:
         eos_token_ids: frozenset[int],
         stop_sequences: tuple[str, ...],
         mutation_callback,
+        initial_state: dict | None = None,
     ) -> None:
+        state = initial_state or {}
         self.prompts = prompts
         self.tokenizer = tokenizer
         self.teacher = teacher
@@ -126,15 +128,23 @@ class _TeacherAlignmentBridge:
         self._mutation_lock = threading.Lock()
         self._mutation_notified = False
         self._stats_lock = threading.Lock()
-        self.generated_tokens = 0
-        self.teacher_input_tokens = 0
-        self.aligned_sequences = 0
-        self.empty_alignments = 0
-        self.truncated_rollouts = 0
-        self.coverage_sum = 0.0
-        self.teacher_ok = 0
-        self.teacher_transient = 0
-        self.teacher_error = 0
+        self.generated_tokens = int(state.get("generated_tokens", 0))
+        self.teacher_input_tokens = int(state.get("teacher_input_tokens", 0))
+        self.aligned_sequences = int(state.get("aligned_sequences", state.get("granularity_n", 0)))
+        self.empty_alignments = int(
+            state.get("empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0))
+        )
+        self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
+        self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
+        self.teacher_ok = int(state.get("teacher_ok", 0))
+        self.teacher_transient = int(state.get("teacher_transient", 0))
+        self.teacher_error = int(state.get("teacher_error", 0))
+        self.score_requests = int(state.get("episodes_seen", state.get("samples_seen", 0)))
+        self.no_signal_resamples = int(state.get("no_signal_resamples", 0))
+        self.no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
+        self.skip_counts = dict(state.get("skip_counts", {}))
+        self.opd_phase_seconds = dict(state.get("opd_phase_seconds", {}))
+        self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
         self._teacher_failure: tuple[str, str] | None = None
 
     def _record_teacher_failure(self, classification: str, message: str) -> None:
@@ -151,6 +161,32 @@ class _TeacherAlignmentBridge:
         with self._stats_lock:
             return self._teacher_failure
 
+    def accounting_snapshot(self) -> dict:
+        with self._stats_lock:
+            skip_counts = dict(self.skip_counts)
+            skip_counts["empty_alignment"] = self.empty_alignments
+            return {
+                "generated_tokens": self.generated_tokens,
+                "teacher_input_tokens": self.teacher_input_tokens,
+                "truncated_rollouts": self.truncated_rollouts,
+                "granularity_n": self.aligned_sequences,
+                "samples_seen": self.score_requests,
+                "teacher_ok": self.teacher_ok,
+                "teacher_transient": self.teacher_transient,
+                "teacher_error": self.teacher_error,
+                "no_signal_resamples": self.no_signal_resamples,
+                "no_signal_skipped_steps": self.no_signal_skipped_steps,
+                "episodes_seen": self.score_requests,
+                "mt_turn_records": 0,
+                "granularity_sum": self.coverage_sum,
+                "skip_counts": skip_counts,
+                "opd_phase_seconds": dict(self.opd_phase_seconds),
+                "opd_phase_counts": dict(self.opd_phase_counts),
+                "aligned_sequences": self.aligned_sequences,
+                "empty_alignments": self.empty_alignments,
+                "coverage_sum": self.coverage_sum,
+            }
+
     def _empty(self, prompt_length: int, response_length: int) -> dict:
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
             prompt_length, response_length, []
@@ -158,6 +194,8 @@ class _TeacherAlignmentBridge:
         return {"teacher_ids": teacher_ids, "teacher_logprobs": teacher_logprobs}
 
     def score(self, index: int, sequence_ids: list[int]) -> dict:
+        with self._stats_lock:
+            self.score_requests += 1
         if index < 0 or index >= len(self.prompts):
             raise ValueError("flash OPD bridge received an unknown dataset index")
         prompt = self.prompts[index]
@@ -273,6 +311,73 @@ class _TeacherAlignmentBridge:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+
+class _OpdProgressState:
+    def __init__(self, resume_state: dict | None = None) -> None:
+        state = resume_state or {}
+        self._condition = threading.Condition()
+        self.loss_curve = [float(value) for value in state.get("loss_curve", [])]
+        self.coverage_curve = [float(value) for value in state.get("coverage_curve", [])]
+        self.base_train_wall_seconds = float(state.get("train_wall_seconds", 0.0))
+        self._train_started_at: float | None = None
+        self._step_states: dict[int, dict] = {}
+        if resume_state is not None:
+            self._step_states[int(state["opt_steps"])] = dict(state)
+
+    def start_training(self) -> None:
+        self._train_started_at = time.time()
+
+    def _train_wall_seconds(self) -> float:
+        elapsed = 0.0
+        if self._train_started_at is not None:
+            elapsed = max(0.0, time.time() - self._train_started_at)
+        return self.base_train_wall_seconds + elapsed
+
+    def record_step(self, step: int, loss: float, bridge: _TeacherAlignmentBridge) -> None:
+        with self._condition:
+            expected_step = len(self.loss_curve) + 1
+            if step != expected_step:
+                raise RuntimeError(
+                    f"verl OPD metric step {step} does not follow accumulated step {expected_step - 1}"
+                )
+            snapshot = bridge.accounting_snapshot()
+            self.loss_curve.append(float(loss))
+            aligned = int(snapshot["aligned_sequences"])
+            coverage = float(snapshot["coverage_sum"]) / aligned if aligned else 0.0
+            self.coverage_curve.append(coverage)
+            snapshot.update(
+                {
+                    "train_wall_seconds": self._train_wall_seconds(),
+                    "loss_curve": list(self.loss_curve),
+                    "coverage_curve": list(self.coverage_curve),
+                }
+            )
+            self._step_states[step] = snapshot
+            self._condition.notify_all()
+
+    def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while step not in self._step_states:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"timed out waiting for honest OPD accounting through checkpoint step {step}"
+                    )
+                self._condition.wait(remaining)
+            return dict(self._step_states[step])
+
+    def final_state(self, bridge: _TeacherAlignmentBridge) -> dict:
+        snapshot = bridge.accounting_snapshot()
+        snapshot.update(
+            {
+                "train_wall_seconds": self._train_wall_seconds(),
+                "loss_curve": list(self.loss_curve),
+                "coverage_curve": list(self.coverage_curve),
+            }
+        )
+        return snapshot
 
 
 _REQUIRED_OVERRIDE_KEYS = (
@@ -461,6 +566,7 @@ def _stage_retry_contract(
     prompts_per_step: int,
     group_size: int,
     adapter_dir: str,
+    accounting_state: dict,
 ) -> None:
     for name in os.listdir(adapter_dir):
         if name == "adapter_config.json" or name.startswith("adapter_model"):
@@ -475,35 +581,17 @@ def _stage_retry_contract(
     if rng_source is None:
         raise RuntimeError("verl OPD checkpoint has no resumable dataloader or rng state")
     shutil.copy2(rng_source, os.path.join(checkpoint_dir, "rng_state.pth"))
-    zero_curve = [0.0] * step
     state = {
+        **accounting_state,
         "contract_version": OPD_RESUME_STATE_VERSION,
         "seed": seed,
         "opt_steps": step,
         "step": step,
         "rollout_seed_ordinal": step * prompts_per_step * group_size,
         "prompt_pool_fingerprint": prompt_pool_fingerprint,
-        "generated_tokens": 0,
-        "teacher_input_tokens": 0,
-        "truncated_rollouts": 0,
-        "granularity_n": 0,
-        "samples_seen": step * prompts_per_step * group_size,
-        "teacher_ok": 0,
-        "teacher_transient": 0,
-        "teacher_error": 0,
-        "no_signal_resamples": 0,
-        "no_signal_skipped_steps": 0,
-        "episodes_seen": 0,
-        "mt_turn_records": 0,
-        "granularity_sum": 0.0,
-        "train_wall_seconds": 0.0,
-        "loss_curve": zero_curve,
-        "coverage_curve": zero_curve,
-        "skip_counts": {},
-        "opd_phase_seconds": {},
-        "opd_phase_counts": {},
         "verl_checkpoint": True,
     }
+    validate_opd_resume_state_metadata(state, expected_seed=seed, checkpoint_step=step)
     with open(os.path.join(checkpoint_dir, "opd_state.json"), "w", encoding="utf-8") as file:
         json.dump(state, file, sort_keys=True)
 
@@ -516,6 +604,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         prompt_pool_fingerprint: str,
         prompts_per_step: int,
         group_size: int,
+        accounting_state,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -523,6 +612,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         self.prompt_pool_fingerprint = prompt_pool_fingerprint
         self.prompts_per_step = prompts_per_step
         self.group_size = group_size
+        self.accounting_state = accounting_state
 
     def _should_publish(self, step: int) -> bool:
         return True
@@ -545,6 +635,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             prompts_per_step=self.prompts_per_step,
             group_size=self.group_size,
             adapter_dir=adapter_dir,
+            accounting_state=self.accounting_state(step),
         )
 
         def publish_required_adapter() -> None:
@@ -569,11 +660,11 @@ def _restore_verl_resume(
     *,
     prompt_pool_fingerprint: str,
     update_horizon: int,
-) -> int:
+) -> tuple[int, dict | None]:
     revision = _w.OPD_RESUME_REVISION or None
     resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
     if not resume:
-        return 0
+        return 0, None
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
     if match is None:
         raise RuntimeError(f"invalid OPD resume checkpoint path {resume!r}")
@@ -590,7 +681,7 @@ def _restore_verl_resume(
     shutil.copytree(resume, target, dirs_exist_ok=True)
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
-    return step
+    return step, state
 
 
 def _generation_eos_from_cached_config(model_id: str, model_revision: str, tokenizer) -> frozenset[int]:
@@ -746,6 +837,11 @@ def run_opd_verl(spec=None) -> None:
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
 
+    resume_step, resume_state = _restore_verl_resume(
+        local_dir,
+        prompt_pool_fingerprint=prompt_pool_fingerprint,
+        update_horizon=update_horizon,
+    )
     bridge = _TeacherAlignmentBridge(
         prompts=prompts,
         tokenizer=tokenizer,
@@ -754,6 +850,7 @@ def run_opd_verl(spec=None) -> None:
         eos_token_ids=eos_token_ids,
         stop_sequences=tuple(str(value) for value in knobs.stop_sequences),
         mutation_callback=_w.publish_opd_optimizer_start_marker,
+        initial_state=resume_state,
     )
     bridge.start()
     try:
@@ -788,11 +885,7 @@ def run_opd_verl(spec=None) -> None:
             "loggers": loggers,
         }
         overrides = build_opd_verl_overrides(config)
-        resume_step = _restore_verl_resume(
-            local_dir,
-            prompt_pool_fingerprint=prompt_pool_fingerprint,
-            update_horizon=update_horizon,
-        )
+        progress_state = _OpdProgressState(resume_state)
         watcher = _OpdVerlCheckpointWatcher(
             local_dir=local_dir,
             export_root=export_root,
@@ -804,7 +897,10 @@ def run_opd_verl(spec=None) -> None:
             prompt_pool_fingerprint=prompt_pool_fingerprint,
             prompts_per_step=prompts_per_step,
             group_size=knobs.group_size,
+            accounting_state=progress_state.checkpoint_state,
         )
+        if resume_step:
+            watcher.processed_steps.add(resume_step)
         watcher.processed_steps.update(
             _durable_required_save_steps(knobs.save_at_steps, resume_step)
         )
@@ -819,7 +915,6 @@ def run_opd_verl(spec=None) -> None:
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
-        loss_curve: list[float] = []
 
         def on_line(line: str) -> None:
             watcher.raise_if_failed()
@@ -829,9 +924,11 @@ def run_opd_verl(spec=None) -> None:
             loss = _metric_value(line, "actor/distillation/loss")
             if loss is None:
                 loss = _metric_value(line, "distillation/loss")
-            if loss is not None:
-                progress["loss"] = loss
-                loss_curve.append(float(loss))
+            if loss is None:
+                raise RuntimeError("verl OPD step log is missing the distillation loss metric")
+            step = int(step_match.group(1))
+            progress["loss"] = loss
+            progress_state.record_step(step, loss, bridge)
 
         def on_step(step: int) -> None:
             progress["step"] = step
@@ -846,7 +943,9 @@ def run_opd_verl(spec=None) -> None:
         gpu_sampler = _NvidiaSmiPeakSampler().start()
         train_started_at = time.time()
         return_code = 0
+        training_completed = resume_step >= update_horizon
         if resume_step < update_horizon:
+            progress_state.start_training()
             watcher.start()
             try:
                 with liveness_heartbeat(
@@ -861,11 +960,13 @@ def run_opd_verl(spec=None) -> None:
                         on_line=on_line,
                         heartbeat=child_heartbeat,
                     )
+                    training_completed = return_code == 0
             finally:
-                watcher.stop(require_complete=return_code == 0)
-        train_wall = time.time() - train_started_at
+                watcher.stop(require_complete=training_completed)
         peak_gpu_gb = gpu_sampler.stop_gb()
         _raise_verl_failure(return_code, bridge.teacher_failure)
+        final_accounting = progress_state.final_state(bridge)
+        train_wall = float(final_accounting["train_wall_seconds"])
 
         actor_dir, final_step = latest_global_step_dir(local_dir)
         if final_step < update_horizon:
@@ -899,7 +1000,7 @@ def run_opd_verl(spec=None) -> None:
             train_wall=train_wall,
             setup_seconds=setup_seconds,
             train_tokens=0,
-            generated_tokens=bridge.generated_tokens,
+            generated_tokens=int(final_accounting["generated_tokens"]),
             notes={
                 "steps": update_horizon,
                 "epochs": knobs.epochs,
@@ -910,16 +1011,20 @@ def run_opd_verl(spec=None) -> None:
                 "teacher_model": knobs.teacher_model,
                 "download_seconds": download_seconds,
                 "thinking": _w.THINKING,
-                "loss_curve": loss_curve,
+                "loss_curve": final_accounting["loss_curve"],
                 "mean_coverage": (
-                    bridge.coverage_sum / bridge.aligned_sequences
-                    if bridge.aligned_sequences
+                    float(final_accounting["coverage_sum"])
+                    / int(final_accounting["aligned_sequences"])
+                    if final_accounting["aligned_sequences"]
                     else 0.0
                 ),
-                "truncated_rollouts": bridge.truncated_rollouts,
-                "teacher_input_tokens": bridge.teacher_input_tokens,
-                "aligned_sequences": bridge.aligned_sequences,
-                "empty_alignments": bridge.empty_alignments,
+                "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
+                "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
+                "aligned_sequences": int(final_accounting["aligned_sequences"]),
+                "empty_alignments": int(final_accounting["empty_alignments"]),
+                "teacher_ok": int(final_accounting["teacher_ok"]),
+                "teacher_transient": int(final_accounting["teacher_transient"]),
+                "teacher_error": int(final_accounting["teacher_error"]),
                 "temperature": knobs.temperature,
                 "group_size": knobs.group_size,
                 "prompts_per_step": prompts_per_step,

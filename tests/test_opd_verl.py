@@ -10,7 +10,10 @@ from flash.engine.worker.opd import _gkd_loss_from_logps
 from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
+    _OpdProgressState,
     _raise_verl_failure,
+    _restore_verl_resume,
+    _stage_retry_contract,
     _TeacherAlignmentBridge,
     build_opd_verl_overrides,
     encode_shifted_group_metadata,
@@ -208,6 +211,39 @@ class _BridgeTokenizer:
         return "".join(mapping[int(token_id)] for token_id in token_ids)
 
 
+def _resume_accounting(step=2):
+    return {
+        "contract_version": 2,
+        "seed": 42,
+        "opt_steps": step,
+        "step": step,
+        "rollout_seed_ordinal": 12,
+        "prompt_pool_fingerprint": "a" * 64,
+        "generated_tokens": 41,
+        "teacher_input_tokens": 37,
+        "truncated_rollouts": 3,
+        "granularity_n": 5,
+        "samples_seen": 8,
+        "teacher_ok": 6,
+        "teacher_transient": 1,
+        "teacher_error": 0,
+        "no_signal_resamples": 2,
+        "no_signal_skipped_steps": 1,
+        "episodes_seen": 8,
+        "mt_turn_records": 0,
+        "granularity_sum": 3.5,
+        "train_wall_seconds": 12.5,
+        "loss_curve": [1.25, 0.75][:step],
+        "coverage_curve": [0.5, 0.7][:step],
+        "skip_counts": {"empty_alignment": 2},
+        "opd_phase_seconds": {"teacher": 4.0},
+        "opd_phase_counts": {"teacher": 6},
+        "aligned_sequences": 5,
+        "empty_alignments": 2,
+        "coverage_sum": 3.5,
+    }
+
+
 class _BridgeTeacher:
     def score(self, prompt_text, completion_text):
         assert prompt_text == "User: question\nAssistant: "
@@ -240,6 +276,104 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, [10, 12, 65, 99])
+
+
+def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    adapter = tmp_path / "adapter"
+    checkpoint.mkdir()
+    adapter.mkdir()
+    (checkpoint / "optim_state.bin").write_bytes(b"optimizer")
+    (checkpoint / "data.pt").write_bytes(b"rng")
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+    accounting = _resume_accounting()
+
+    _stage_retry_contract(
+        str(checkpoint),
+        step=2,
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=2,
+        group_size=3,
+        adapter_dir=str(adapter),
+        accounting_state=accounting,
+    )
+
+    import json
+
+    state = json.loads((checkpoint / "opd_state.json").read_text())
+    assert state["loss_curve"] == [1.25, 0.75]
+    assert state["coverage_curve"] == [0.5, 0.7]
+    assert state["generated_tokens"] == 41
+    assert state["teacher_input_tokens"] == 37
+    assert state["teacher_ok"] == 6
+    assert state["teacher_transient"] == 1
+    assert state["samples_seen"] == 8
+    assert state["train_wall_seconds"] == 12.5
+    assert state["rollout_seed_ordinal"] == 12
+
+
+def test_resume_restores_bridge_counters_and_extends_full_curves():
+    state = _resume_accounting()
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+        initial_state=state,
+    )
+    progress = _OpdProgressState(state)
+    progress.start_training()
+    bridge.score(0, [10, 11, 65, 66, 99])
+    progress.record_step(3, 0.5, bridge)
+    restored = progress.checkpoint_state(3, timeout_s=0.1)
+
+    assert restored["loss_curve"] == [1.25, 0.75, 0.5]
+    assert restored["coverage_curve"][:2] == [0.5, 0.7]
+    assert restored["generated_tokens"] == 44
+    assert restored["teacher_input_tokens"] == 42
+    assert restored["teacher_ok"] == 7
+    assert restored["aligned_sequences"] == 6
+    assert restored["empty_alignments"] == 2
+    assert restored["train_wall_seconds"] >= 12.5
+
+
+def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_verl
+
+    resume = tmp_path / "checkpoint-2"
+    resume.mkdir()
+    state = _resume_accounting()
+    import json
+
+    (resume / "opd_state.json").write_text(json.dumps(state))
+    (resume / "payload.bin").write_bytes(b"checkpoint")
+    monkeypatch.setattr(opd_verl._w, "OPD_RESUME_REVISION", "revision")
+    monkeypatch.setattr(opd_verl._w, "SEED", 42)
+    monkeypatch.setattr(
+        opd_verl._w,
+        "hf_resume_checkpoint",
+        lambda **_kwargs: str(resume),
+    )
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+
+    step, restored = _restore_verl_resume(
+        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3
+    )
+
+    assert step == 2
+    assert restored == state
+    assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
 
 
 @pytest.mark.parametrize(
