@@ -29,6 +29,15 @@ def _validated_reward(reward: RolloutReward, request: RolloutScoreRequest) -> Ro
         return RolloutReward(episode=float("nan"), turns=None)
     if reward.turns is None:
         return RolloutReward(episode=episode, turns=None)
+    if not isinstance(reward.turns, (list, tuple)):
+        # only an ordered list/tuple carries a well-defined per-turn order. a str, bytes,
+        # bytearray, mapping, or unordered set would still iterate into floats and could pass
+        # the count check while assigning rewards to the wrong turns -- reject and fall back.
+        print(
+            "[grpo][warn] per-turn rewards unavailable (turns is not an ordered list/tuple); "
+            "using episode reward"
+        )
+        return RolloutReward(episode=episode, turns=None)
 
     reason: str | None = None
     coerced: tuple[float, ...] | None = None

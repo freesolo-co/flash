@@ -68,7 +68,12 @@ def build_per_turn_advantages(
                 row_index
                 for row_index in range(group_start, group_end)
                 if turn_index < len(rows[row_index].turns or ())
+                and rows[row_index].spans[turn_index][1] > rows[row_index].spans[turn_index][0]
             ]
+            if not member_indexes:
+                # every member's span for this turn is zero-width (no emitted tokens); an
+                # empty turn contributes no advantage and must not skew the group baseline.
+                continue
             mean_reward = sum(
                 cast(tuple[float, ...], rows[row_index].turns)[turn_index]
                 for row_index in member_indexes
