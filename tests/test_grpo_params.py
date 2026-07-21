@@ -763,6 +763,7 @@ def test_tool_env_reward_scores_native_list_transcript_as_full_episode() -> None
         "_think_penalty": 0.0,
         "tok": object(),
         "time": time,
+        "pending_named_breakdowns": [],
         "_w": SimpleNamespace(
             THINKING=False,
             ATTEMPT=1,
