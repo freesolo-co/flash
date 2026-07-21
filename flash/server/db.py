@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
+CREATE TABLE IF NOT EXISTS warm_endpoints (
+  endpoint_id        TEXT PRIMARY KEY,
+  name               TEXT NOT NULL,
+  owning_fingerprint TEXT NOT NULL,
+  owner_key_id       INTEGER,
+  owner_org_id       TEXT NOT NULL DEFAULT '',
+  compat_sig         TEXT NOT NULL,
+  gpu_type           TEXT NOT NULL,
+  expiry_ts          REAL NOT NULL,
+  claimed_by         TEXT,
+  created_at         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS warm_endpoints_reuse_idx
+  ON warm_endpoints(owner_key_id, owner_org_id, compat_sig);
 """
 
 
@@ -245,4 +259,118 @@ def runs_for_key(key_id: int) -> list[dict]:
 def all_runs() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT run_id, key_id, kind, created_at FROM runs").fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- keep-warm endpoint registry -------------------------------------------------------------
+#
+# A finished run whose spec set ``gpu.keep_alive_seconds > 0`` leaves its provider endpoint alive
+# and records it here so a COMPATIBLE, SAME-OWNER next run can reuse it (skipping the cold start)
+# instead of provisioning a fresh one. Reuse is fail-closed and owner-scoped: acquire matches the
+# exact (owner_key_id, owner_org_id) security domain AND the compat signature. A record older than
+# ``expiry_ts`` is dead: the reaper deletes the endpoint and drops the row. Reuse is best-effort --
+# any miss, race, or unhealthy endpoint just falls back to a fresh deploy, which is always correct.
+
+
+def register_warm_endpoint(
+    *,
+    endpoint_id: str,
+    name: str,
+    owning_fingerprint: str,
+    owner_key_id: int | None,
+    owner_org_id: str,
+    compat_sig: str,
+    gpu_type: str,
+    expiry_ts: float,
+) -> None:
+    """Record (or refresh) an endpoint kept warm for reuse. Registered unclaimed and available."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO warm_endpoints (endpoint_id, name, owning_fingerprint, "
+            "owner_key_id, owner_org_id, compat_sig, gpu_type, expiry_ts, claimed_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+            (
+                endpoint_id,
+                name,
+                owning_fingerprint,
+                owner_key_id,
+                owner_org_id or "",
+                compat_sig,
+                gpu_type,
+                float(expiry_ts),
+                time.time(),
+            ),
+        )
+
+
+def acquire_warm_endpoint(
+    *,
+    owner_key_id: int | None,
+    owner_org_id: str,
+    compat_sig: str,
+    claimed_by: str,
+    now: float,
+) -> dict | None:
+    """Atomically claim the freshest unexpired, unclaimed endpoint for this exact owner+signature.
+
+    Owner scoping is the security boundary: a warm worker retains the prior run's fetched
+    environment code and on-disk secrets, so it is reused ONLY within the identical
+    (owner_key_id, owner_org_id) domain. Returns the claimed record, or None on any miss/race
+    (the caller then deploys a fresh endpoint, which is always safe).
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM warm_endpoints WHERE claimed_by IS NULL AND expiry_ts > ? "
+            "AND compat_sig = ? AND owner_key_id IS ? AND owner_org_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (now, compat_sig, owner_key_id, owner_org_id or ""),
+        ).fetchone()
+        if row is None:
+            return None
+        claimed = conn.execute(
+            "UPDATE warm_endpoints SET claimed_by = ? WHERE endpoint_id = ? AND claimed_by IS NULL",
+            (claimed_by, row["endpoint_id"]),
+        )
+        if claimed.rowcount != 1:
+            return None
+        record = dict(row)
+        record["claimed_by"] = claimed_by
+        return record
+
+
+def unclaim_warm_endpoint(endpoint_id: str) -> None:
+    """Release a claim without deleting the record (a reuse attempt failed after claiming)."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE warm_endpoints SET claimed_by = NULL WHERE endpoint_id = ?", (endpoint_id,)
+        )
+
+
+def release_warm_endpoint(endpoint_id: str) -> None:
+    """Drop a warm record (endpoint reused, torn down, or reaped)."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM warm_endpoints WHERE endpoint_id = ?", (endpoint_id,))
+
+
+def unexpired_warm_endpoint_names(now: float) -> set[str]:
+    """Endpoint names the reaper must PROTECT: intentionally warm and not yet expired."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM warm_endpoints WHERE expiry_ts > ?", (now,)
+        ).fetchall()
+        return {r["name"] for r in rows}
+
+
+def expired_warm_endpoints(now: float) -> list[dict]:
+    """Records past their keep-alive window: the reaper tears these down and drops the rows."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM warm_endpoints WHERE expiry_ts <= ?", (now,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def all_warm_endpoints() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM warm_endpoints ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
