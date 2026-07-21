@@ -774,6 +774,10 @@ def cost_panel(est) -> str:
         ),
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
         ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
+        (
+            "setup cost",
+            f"{money(est.fixed_lifecycle_usd, 2)}  {_dim('(cold start; absorbed, not charged)')}",
+        ),
     ]
     # opd teacher spend is itemized but NOT part of total_usd (billed by Fireworks on the managed key).
     # Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it (cursor[bot]).

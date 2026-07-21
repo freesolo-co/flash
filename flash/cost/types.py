@@ -153,10 +153,14 @@ class RunConfig:
 class CostEstimate:
     """A pre-flight estimate.
 
-    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd``. Setup/cold-start time is reported
-    as elapsed wall time but is not billed to the user estimate. ``teacher_api_usd`` (opd only) uses
-    the platform-managed teacher key and remains itemized separately from the customer GPU charge,
-    so it is not included in ``total_usd``.
+    ``total_usd`` = training-only GPU hours * ``gpu_hourly_usd`` and is the CUSTOMER charge.
+    Setup/cold-start time is reported as elapsed wall time but is not billed to the user estimate.
+    ``fixed_lifecycle_usd`` is that absorbed cold-start cost (setup hours * ``gpu_hourly_usd``) and
+    ``provider_cost_usd`` is the estimated provider cogs (full wall * ``gpu_hourly_usd``); both are
+    cost-visibility fields only and are NOT charged to the customer (by construction
+    ``provider_cost_usd == fixed_lifecycle_usd + total_usd``). ``teacher_api_usd`` (opd only) uses the
+    platform-managed teacher key and remains itemized separately from the customer GPU charge, so it
+    is not included in ``total_usd``.
     """
 
     model_id: str
@@ -179,6 +183,11 @@ class CostEstimate:
     # diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
+    # cost-visibility only, never charged to the customer (the charge is total_usd, training only).
+    # fixed_lifecycle_usd = absorbed cold-start cost (setup hours * gpu_hourly_usd); provider_cost_usd
+    # = estimated provider cogs (full wall * gpu_hourly_usd) == fixed_lifecycle_usd + total_usd.
+    fixed_lifecycle_usd: float = 0.0
+    provider_cost_usd: float = 0.0
 
     @property
     def wall_clock_hours(self) -> float:
@@ -209,6 +218,9 @@ class CostEstimate:
                 f"Teacher API: ${self.teacher_api_usd:.2f} (Fireworks teacher token spend on the "
                 "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
+        lines.append(
+            f"Setup cost : ${self.fixed_lifecycle_usd:.2f} (cold start; absorbed, not charged)"
+        )
         lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")

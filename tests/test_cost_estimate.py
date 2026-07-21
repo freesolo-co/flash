@@ -480,3 +480,70 @@ def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monke
     assert seen["disk_gb"] == 200.0
     # and the quote reflects the live allocation rather than a static gpu_hourly_usd lookup.
     assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
+
+
+# --- lifecycle cost visibility (P2-1): expose absorbed setup + provider cogs, charge unchanged ---
+
+
+def test_lifecycle_cost_fields_are_consistent(est):
+    # provider_cost_usd (estimated cogs = full wall) decomposes exactly into the absorbed cold-start
+    # cost plus the customer charge, and is never below the charge.
+    assert est.provider_cost_usd == pytest.approx(est.fixed_lifecycle_usd + est.total_usd)
+    assert est.provider_cost_usd >= est.total_usd
+    assert est.fixed_lifecycle_usd >= 0.0
+
+
+def test_total_usd_is_unchanged_training_only(est):
+    # the customer charge stays training-only: total_usd == train hours * $/hr, cold start excluded.
+    assert est.total_usd == pytest.approx(est.train_seconds / 3600.0 * est.gpu_hourly_usd)
+
+
+def test_fixed_lifecycle_usd_is_setup_dollarized(est):
+    # the absorbed cost is exactly the cold-start wall priced at the same $/hr.
+    assert est.fixed_lifecycle_usd == pytest.approx(est.setup_seconds / 3600.0 * est.gpu_hourly_usd)
+
+
+def test_short_job_absorbed_setup_dominates_charge():
+    # on a tiny job the fixed cold-start cost the platform absorbs dwarfs the training-only charge:
+    # this is the 30-300x estimate-vs-realized gap P2-1 makes visible (the charge omits all of it).
+    short = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 1))
+    assert short.total_usd > 0.0
+    assert short.fixed_lifecycle_usd > short.total_usd
+
+
+def test_fixed_lifecycle_cost_scales_with_gpu_price(monkeypatch):
+    # absorbed cost = setup_hours * $/hr, so for the same model+setup a pricier card (b200) absorbs a
+    # larger fixed lifecycle cost than a cheaper one (h200) -- why short jobs on the biggest cards
+    # bleed the most margin. same model => identical setup seconds, so it scales purely with $/hr.
+    from types import SimpleNamespace
+
+    import flash.providers.allocator as allocator_mod
+    from flash.cost.facts import gpu_hourly_usd
+
+    def alloc_as(gpu):
+        rate = gpu_hourly_usd(gpu)
+
+        def fake_allocate(model_id, method, **kwargs):
+            return SimpleNamespace(gpu=gpu, provider="runpod", hourly_usd=rate, min_vram_gb=80)
+
+        return fake_allocate
+
+    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("H200"))
+    h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H200"))
+    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("B200"))
+    b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="B200"))
+
+    assert b200.gpu_hourly_usd > h200.gpu_hourly_usd
+    assert b200.setup_seconds == pytest.approx(h200.setup_seconds)
+    assert b200.fixed_lifecycle_usd > h200.fixed_lifecycle_usd
+
+
+def test_breakdown_and_panel_surface_absorbed_setup_cost(est):
+    # both the plain breakdown and the styled panel show the absorbed cold-start cost so the user
+    # sees what was NOT charged; total stays the customer charge.
+    from flash.cli.render import cost_panel
+
+    plain = est.breakdown()
+    assert "Setup cost" in plain
+    assert "not charged" in plain
+    assert "setup cost" in cost_panel(est)

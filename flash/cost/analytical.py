@@ -370,6 +370,13 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
         # only as a diagnostic and is not passed through to the customer.
         total_usd=train / 3600.0 * hourly,
+        # cost-visibility only, never charged: fixed_lifecycle_usd is the cold-start cost the
+        # platform absorbs (setup hours x $/hr); provider_cost_usd is the estimated provider cogs
+        # (full wall = setup + train, x $/hr). by construction provider_cost_usd ==
+        # fixed_lifecycle_usd + total_usd, so the gap between what we bill (total_usd) and what the
+        # provider bills us (provider_cost_usd) is exactly the absorbed setup.
+        fixed_lifecycle_usd=setup / 3600.0 * hourly,
+        provider_cost_usd=wall / 3600.0 * hourly,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )
