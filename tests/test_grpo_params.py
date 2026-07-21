@@ -722,6 +722,66 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
 
 
+def test_tool_env_reward_scores_native_list_transcript_as_full_episode() -> None:
+    import ast
+    import inspect
+    import time
+    from types import SimpleNamespace
+
+    from flash.engine.worker import rl
+
+    tree = ast.parse(inspect.getsource(rl.run_rl))
+    reward_node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "reward_fn"
+    )
+    reward_module = ast.fix_missing_locations(ast.Module(body=[reward_node], type_ignores=[]))
+
+    transcript = [
+        {"role": "assistant", "tool_calls": [{"name": "lookup", "arguments": {"q": "x"}}]},
+        {"role": "tool", "name": "lookup", "content": "result"},
+        {"role": "assistant", "content": "final"},
+    ]
+    example = {"id": "tool-example"}
+    scored = []
+
+    class _Env:
+        def reward_from_messages(self, messages, record):
+            scored.append((messages, record))
+            return 0.75
+
+        def reward(self, completion, record, state):
+            return -1.0
+
+    namespace = {
+        "env": _Env(),
+        "is_multi_turn": False,
+        "is_tool_env": True,
+        "rollout_examples": [example],
+        "_prompt_opens_thinking": False,
+        "_think_penalty": 0.0,
+        "tok": object(),
+        "time": time,
+        "_w": SimpleNamespace(
+            THINKING=False,
+            ATTEMPT=1,
+            RUN_ID="run",
+            RUN_MODE="test",
+            SEED=0,
+            graded_text=lambda value, **kwargs: value,
+            upload_debug_jsonl=lambda *args, **kwargs: None,
+        ),
+    }
+    exec(compile(reward_module, "<reward_fn>", "exec"), namespace)
+
+    rewards = namespace["reward_fn"]([transcript], example_idx=[0])
+
+    assert rewards == [0.75]
+    assert scored == [(transcript, example)]
+    assert scored[0][0] is transcript
+
+
 def test_grpo_masks_truncated_completions_by_default() -> None:
     """GRPO drops truncated (non-EOS) completions from the loss by default.
 

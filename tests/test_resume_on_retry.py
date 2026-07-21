@@ -144,6 +144,7 @@ def test_upload_callback_streams_full_state_checkpoint_latest_only(
         SimpleNamespace(global_step=60),
         SimpleNamespace(),
     )
+    assert worker.flush_optional_uploads()
 
     streams = [u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoint/checkpoint-60")]
     assert len(streams) == 1, "the resumable full-state checkpoint must be streamed exactly once"
@@ -176,6 +177,7 @@ def test_upload_callback_also_publishes_deployable_snapshot(
         SimpleNamespace(global_step=60),
         SimpleNamespace(),
     )
+    assert worker.flush_optional_uploads()
 
     deployable = [
         u for u in rec.uploads if u["path_in_repo"].endswith("/checkpoints/step-60/adapter")
