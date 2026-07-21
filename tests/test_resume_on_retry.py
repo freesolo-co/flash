@@ -788,7 +788,7 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
     result = lifecycle._await_runpod_completed_metrics(object(), far_deadline)
 
     assert result is None
-    # bounded to ~grace/poll-interval probes and ~grace of elapsed time, NOT the 24h deadline.
+    # bounded to ~grace/poll-interval probes and ~grace of elapsed time, not the 24h deadline.
     max_probes = lifecycle._RECOVERY_MARKER_GRACE_S / lifecycle._RECOVERY_METRICS_POLL_S + 2
     assert probes["n"] <= max_probes
     assert (

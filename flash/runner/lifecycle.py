@@ -431,7 +431,7 @@ def _await_runpod_completed_metrics(last_handle, deadline_at) -> dict | None:
     # a job that already completed.
     #
     # bound the wait to a short observation window measured from first observation (never past the
-    # run wall), NOT the full run wall deadline. callers pass the run wall deadline, up to
+    # run wall), not the full run wall deadline. callers pass the run wall deadline, up to
     # max_wall_seconds (default 24h); passing it straight through let a terminal-ok job whose output
     # never became readable pin the supervisor for the remainder of the run instead of failing over
     # to a retry. _runpod_completed_metrics returns None once time >= observation_floor +
