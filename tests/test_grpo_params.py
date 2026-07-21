@@ -729,6 +729,7 @@ def test_tool_env_reward_scores_native_list_transcript_as_full_episode() -> None
     from types import SimpleNamespace
 
     from flash.engine.worker import rl
+    from flash.engine.worker.rollout_samples import select_rollout_samples
 
     tree = ast.parse(inspect.getsource(rl.run_rl))
     reward_node = next(
@@ -763,6 +764,9 @@ def test_tool_env_reward_scores_native_list_transcript_as_full_episode() -> None
         "_think_penalty": 0.0,
         "tok": object(),
         "time": time,
+        "pending_named_breakdowns": [],
+        "latest_samples": [],
+        "select_rollout_samples": select_rollout_samples,
         "_w": SimpleNamespace(
             THINKING=False,
             ATTEMPT=1,
