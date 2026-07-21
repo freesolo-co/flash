@@ -75,6 +75,14 @@ def _flash_groupwise_reverse_kl_values(
     return values
 
 
+def _set_current_global_batch_info(config, data) -> None:
+    """Mirror verl 0.8.0 ppo_loss metadata population for the current microbatch."""
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+
 def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -120,6 +128,7 @@ def _install_verl_extensions() -> None:
         DistillationLossSettings(names=["flash_groupwise_reverse_kl"], use_estimator=True)
     )
     def flash_groupwise_reverse_kl(config, distillation_config, model_output, data):
+        _set_current_global_batch_info(config, data)
         student_logprobs = no_padding_2_padding(model_output["log_probs"], data)
         teacher_logsums = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
         group_ids = no_padding_2_padding(data["teacher_ids"], data).squeeze(-1).long()

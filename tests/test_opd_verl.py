@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from flash.engine.worker.opd import _gkd_loss_from_logps
@@ -15,6 +17,7 @@ from flash.engine.worker.opd_verl import (
 from flash.engine.worker.opd_verl_plugin import (
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
+    _set_current_global_batch_info,
     _signal_sequences,
     deterministic_rollout_seed,
 )
@@ -62,6 +65,114 @@ def test_groupwise_reverse_kl_scalar_and_analytic_gradient_match_legacy():
     assert torch.allclose(verl_loss, legacy_loss, atol=1e-12, rtol=1e-12)
     assert torch.allclose(verl_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
     assert torch.equal(verl_gradient[:, 3], torch.zeros(2, dtype=torch.float64))
+
+
+def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence_mean():
+    torch = pytest.importorskip("torch")
+    steps = [
+        {
+            "student": [
+                [-0.4, -0.8, -1.2, -2.0],
+                [-0.3, -0.9, -1.7, -2.1],
+                [-0.6, -1.4, -2.2, -2.8],
+            ],
+            "teacher": [
+                [-0.6, -2.3, -2.3, 0.0],
+                [-0.5, -1.5, 0.0, 0.0],
+                [-0.9, 0.0, 0.0, 0.0],
+            ],
+            "groups": [[0, 1, 1, -1], [0, 1, -1, -1], [0, -1, -1, -1]],
+            "mask": [[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0]],
+            "splits": [(0, 2), (2, 3)],
+        },
+        {
+            "student": [[-0.2, -0.7, -1.3, -1.9], [-0.5, -1.0, -1.6, -2.4]],
+            "teacher": [[-0.4, -1.8, -1.8, 0.0], [-0.8, -1.1, 0.0, 0.0]],
+            "groups": [[0, 1, 1, -1], [0, 1, -1, -1]],
+            "mask": [[1, 1, 1, 1], [1, 1, 1, 0]],
+            "splits": [(0, 1), (1, 2)],
+        },
+    ]
+    coef = 0.7
+    observed = []
+    expected = []
+
+    for step in steps:
+        student = torch.tensor(step["student"], dtype=torch.float64, requires_grad=True)
+        teacher = torch.tensor(step["teacher"], dtype=torch.float64)
+        group_ids = torch.tensor(step["groups"])
+        response_mask = torch.tensor(step["mask"], dtype=torch.bool)
+        config = SimpleNamespace(
+            global_batch_info={
+                "dp_size": 99,
+                "batch_num_tokens": 1,
+                "global_batch_size": 99,
+                "loss_scale_factor": 99,
+            },
+            loss_scale_factor=None,
+        )
+        micro_losses = []
+        global_batch_size = student.shape[0]
+        batch_num_tokens = int(response_mask.sum().item())
+        for start, end in step["splits"]:
+            data = {
+                "dp_size": 1,
+                "batch_num_tokens": batch_num_tokens,
+                "global_batch_size": global_batch_size,
+            }
+            _set_current_global_batch_info(config, data)
+            values = _flash_groupwise_reverse_kl_values(
+                student[start:end],
+                teacher[start:end],
+                group_ids[start:end],
+                response_mask[start:end],
+                coef,
+            )
+            counts = response_mask[start:end].sum(dim=-1)
+            sequence_losses = (values * response_mask[start:end]).sum(dim=-1) / counts
+            micro_losses.append(
+                sequence_losses.sum()
+                / config.global_batch_info["global_batch_size"]
+                * config.global_batch_info["dp_size"]
+            )
+            _set_current_global_batch_info(config, data)
+        actual = torch.stack(micro_losses).sum()
+        legacy = torch.stack(
+            [
+                _gkd_loss_from_logps(
+                    student[row],
+                    [
+                        (
+                            torch.nonzero(group_ids[row].eq(group_id), as_tuple=False)
+                            .flatten()
+                            .tolist(),
+                            float(teacher[row][group_ids[row].eq(group_id)][0]),
+                        )
+                        for group_id in torch.unique(
+                            group_ids[row][group_ids[row].ge(0)], sorted=True
+                        )
+                    ],
+                    kl_coef=coef,
+                )
+                for row in range(student.shape[0])
+            ]
+        ).mean()
+        actual_gradient = torch.autograd.grad(actual, student, retain_graph=True)[0]
+        legacy_gradient = torch.autograd.grad(legacy, student)[0]
+
+        assert config.global_batch_info == {
+            "dp_size": 1,
+            "batch_num_tokens": batch_num_tokens,
+            "global_batch_size": global_batch_size,
+            "loss_scale_factor": None,
+        }
+        assert torch.allclose(actual, legacy, atol=1e-12, rtol=1e-12)
+        assert torch.allclose(actual_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
+        observed.append(float(actual))
+        expected.append(float(legacy))
+
+    assert observed == pytest.approx(expected, abs=1e-12, rel=1e-12)
+    assert len(steps[0]["student"]) != len(steps[1]["student"])
 
 
 def test_no_signal_sequence_is_excluded_before_actor_training():
