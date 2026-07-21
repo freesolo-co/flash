@@ -1150,42 +1150,51 @@ def run_sft():
                     self._flash_total_train_tokens += local_tokens
 
                 if _sft_step_will_log(self.state, self.args):
-                    with torch.no_grad():
-                        if "shift_labels" in inputs:
-                            shift_logits = outputs.logits
-                            shift_labels = inputs["shift_labels"]
-                        else:
-                            shift_logits = outputs.logits[..., :-1, :]
-                            shift_labels = labels[..., 1:]
-                        if (
-                            self.num_virtual_tokens > 0
-                            and model.peft_config[model.active_adapter].peft_type
-                            != PeftType.PREFIX_TUNING
-                        ):
-                            shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
-
-                        mask = shift_labels != -100
-                        entropy_sum_mb = (entropy_from_logits(shift_logits) * mask).sum()
-                        total_tokens_mb = mask.sum()
-                        correct_tokens_mb = (
-                            (shift_logits.argmax(dim=-1) == shift_labels) & mask
-                        ).sum()
-                    # accumulate the token-weighted sums across every microbatch of this logging step
-                    # (keyed on global_step) so logged entropy/accuracy reflect the whole optimizer
-                    # step, not only its final microbatch. reset when a new logging step begins.
+                    # chunked_nll does not materialize outputs.logits, so the logits-based quality
+                    # metrics (entropy / token accuracy) are skipped in that case; loss, num_tokens
+                    # and aux_loss are still logged.
+                    logits_available = outputs.logits is not None
+                    # reset the per-logging-step accumulators when a new logging step begins (keyed on
+                    # global_step) so logged metrics reflect the whole optimizer step, not only its
+                    # final microbatch.
                     if self._flash_qm_step != int(self.state.global_step):
                         self._flash_qm_step = int(self.state.global_step)
-                        self._flash_qm_entropy_sum = entropy_sum_mb
-                        self._flash_qm_total_tokens = total_tokens_mb
-                        self._flash_qm_correct_tokens = correct_tokens_mb
+                        self._flash_qm_entropy_sum = None
+                        self._flash_qm_total_tokens = None
+                        self._flash_qm_correct_tokens = None
                         self._flash_qm_aux_sum = None
                         self._flash_qm_aux_count = 0
-                    else:
-                        self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
-                        self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
-                        self._flash_qm_correct_tokens = (
-                            self._flash_qm_correct_tokens + correct_tokens_mb
-                        )
+                    if logits_available:
+                        with torch.no_grad():
+                            if "shift_labels" in inputs:
+                                shift_logits = outputs.logits
+                                shift_labels = inputs["shift_labels"]
+                            else:
+                                shift_logits = outputs.logits[..., :-1, :]
+                                shift_labels = labels[..., 1:]
+                            if (
+                                self.num_virtual_tokens > 0
+                                and model.peft_config[model.active_adapter].peft_type
+                                != PeftType.PREFIX_TUNING
+                            ):
+                                shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
+
+                            mask = shift_labels != -100
+                            entropy_sum_mb = (entropy_from_logits(shift_logits) * mask).sum()
+                            total_tokens_mb = mask.sum()
+                            correct_tokens_mb = (
+                                (shift_logits.argmax(dim=-1) == shift_labels) & mask
+                            ).sum()
+                        if self._flash_qm_entropy_sum is None:
+                            self._flash_qm_entropy_sum = entropy_sum_mb
+                            self._flash_qm_total_tokens = total_tokens_mb
+                            self._flash_qm_correct_tokens = correct_tokens_mb
+                        else:
+                            self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
+                            self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
+                            self._flash_qm_correct_tokens = (
+                                self._flash_qm_correct_tokens + correct_tokens_mb
+                            )
                     if self.aux_loss_enabled:
                         aux_mb = outputs.aux_loss.detach()
                         self._flash_qm_aux_sum = (
@@ -1195,21 +1204,22 @@ def run_sft():
                         )
                         self._flash_qm_aux_count += 1
                     if self.accelerator.sync_gradients:
-                        entropy_sum = self.accelerator.gather_for_metrics(
-                            self._flash_qm_entropy_sum
-                        ).sum()
-                        total_tokens = self.accelerator.gather_for_metrics(
-                            self._flash_qm_total_tokens
-                        ).sum()
-                        correct_tokens = self.accelerator.gather_for_metrics(
-                            self._flash_qm_correct_tokens
-                        ).sum()
-                        entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
-                        accuracy = (
-                            (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
-                        )
-                        self._metrics["train"]["entropy"].append(entropy)
-                        self._metrics["train"]["mean_token_accuracy"].append(accuracy)
+                        if self._flash_qm_entropy_sum is not None:
+                            entropy_sum = self.accelerator.gather_for_metrics(
+                                self._flash_qm_entropy_sum
+                            ).sum()
+                            total_tokens = self.accelerator.gather_for_metrics(
+                                self._flash_qm_total_tokens
+                            ).sum()
+                            correct_tokens = self.accelerator.gather_for_metrics(
+                                self._flash_qm_correct_tokens
+                            ).sum()
+                            entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+                            accuracy = (
+                                (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
+                            )
+                            self._metrics["train"]["entropy"].append(entropy)
+                            self._metrics["train"]["mean_token_accuracy"].append(accuracy)
                         total_train_tokens = (
                             self.accelerator.gather_for_metrics(self._flash_total_train_tokens)
                             .sum()
