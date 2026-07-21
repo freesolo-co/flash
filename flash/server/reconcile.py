@@ -106,6 +106,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
     remote = status.remote or {}
+    spec = status.spec or {}
     # raw persisted RunStatus.remote may omit started_ts or contain a falsey value. 0.0 means an
     # unknown launch rather than the epoch; falling back to created_at prevents inflated flat-rate
     # instance billing.
@@ -126,7 +127,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         "runId": status.run_id,
         "realizedCostUsd": realized.realized_usd,
         "provider": realized.provider,
-        "gpu": remote.get("allocated_gpu") or remote.get("gpu"),
+        "gpu": remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type"),
         "costByResource": realized.by_resource,
         "wallSeconds": realized.wall_seconds,
         "costBasis": "realized",

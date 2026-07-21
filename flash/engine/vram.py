@@ -27,6 +27,8 @@ _BYTES_PER_PARAM = {
 _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
+OPD_CE_CHUNK_SIZE = 64
+_OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
 
 def _sft_per_device_bs() -> int:
@@ -112,7 +114,7 @@ def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> i
 
 
 def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
-    """Loss microbatch size used by OPD's dense-logit GKD backward.
+    """Loss microbatch size used by OPD's GKD backward.
 
     Keep this in lockstep with worker.opd._opd_loss_microbatch_size without importing the worker from
     the sizing path. Small/medium catalog models run up to four loss samples per forward; 35B-class
@@ -380,35 +382,17 @@ def estimate_vram_gb(
         rollout = weights + max(
             _KV_CAP, _resident_kv_gb(eff_b, seq_len, rollout_concurrency, fp8_kv=fp8_kv)
         )
-        # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
-        # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
-        # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
-        # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
-        # sized for an under-capacity card and OOM.
-        #
-        # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
-        # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
-        # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
+        # text opd projects only completion-prediction hidden states and computes exact full-vocabulary
+        # ce in checkpointed chunks. image samples still use the dense full-sequence logits path and are
+        # processed one at a time. allocation does not know the dataset modality, so reserve the larger
+        # of one text ce chunk and one dense image loss forward/backward peak.
         completion = opd_completion_len(max_tokens, thinking)
-        # run_opd backprops a small loss microbatch. Budget that actual dense-logit microbatch, not
-        # the full rollout/teacher batch and not a single sequence.
         loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
         activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (OPD has no fused CE):
-        #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
-        #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
-        #                                                             (completion * 4)
-        #   - backward: fp32 gradient of those completion rows [completion, vocab]
-        #                                                             (completion * 4)
-        #               bf16 gradient scattered back into the full logits [seq, vocab] to reach lm_head
-        #                                                             (seq * 2)
-        # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
-        # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
-        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in OPD loss backward
-        # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
-        logits_fwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits_bwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits = (logits_fwd + logits_bwd) / 1e9
+        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
+        chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+        dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
+        logits = max(chunked_logits, dense_image_logits)
         return base + rollout + activations + logits
     # direct callers default to the conservative plain-nll estimate. model_required_vram_gb passes
     # the worker's validated chunked-nll decision explicitly when it knows the model identity.
