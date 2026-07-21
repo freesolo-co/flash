@@ -231,7 +231,7 @@ def rollout_one(
         "env_mask": env_mask,
         "reward": score.episode,
         "turn_spans": turn_spans,
-        "turn_rewards": list(score.turns) if score.turns else None,
+        "turn_rewards": list(score.turns) if score.turns is not None else None,
     }
 
 
@@ -696,7 +696,7 @@ def rollout_async(
     return [
         rollout.result(
             score.episode,
-            list(score.turns) if score.turns else None,
+            list(score.turns) if score.turns is not None else None,
         )
         for rollout, score in zip(rollouts, scores, strict=True)
     ]
