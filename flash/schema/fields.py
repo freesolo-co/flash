@@ -18,7 +18,12 @@ from flash.spec import (
 
 
 def _section_int(
-    section_raw: dict, section: str, key: str, *, minimum: int | None = None
+    section_raw: dict,
+    section: str,
+    key: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
 ) -> int | None:
     """validate an optional section-qualified integer knob."""
     v = section_raw.get(key)
@@ -30,8 +35,12 @@ def _section_int(
     if not math.isfinite(v) or float(v) != int(v):
         raise ConfigError(f"{section}.{key} must be a finite integer")
     v = int(v)
+    if minimum is not None and maximum is not None and (v < minimum or v > maximum):
+        raise ConfigError(f"{section}.{key} must be between {minimum} and {maximum}")
     if minimum is not None and v < minimum:
         raise ConfigError(f"{section}.{key} must be >= {minimum}")
+    if maximum is not None and v > maximum:
+        raise ConfigError(f"{section}.{key} must be <= {maximum}")
     return v
 
 
