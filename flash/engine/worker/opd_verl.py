@@ -54,6 +54,8 @@ from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resu
 
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
 _VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
+_PERMANENT_TEACHER_EXIT = 86
+_TRANSIENT_TEACHER_EXIT = 87
 
 
 @dataclass(frozen=True)
@@ -545,6 +547,10 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
+    if return_code == _TRANSIENT_TEACHER_EXIT:
+        raise _w.RetriableInfraError("transient teacher bridge failure")
+    if return_code == _PERMANENT_TEACHER_EXIT:
+        raise RuntimeError("permanent teacher bridge failure")
     raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 

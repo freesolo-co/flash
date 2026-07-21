@@ -422,6 +422,19 @@ def test_bridge_returns_typed_teacher_failures_and_records_classification(
     assert bridge.teacher_ok == 0
 
 
+def test_bridge_transport_failure_is_typed_retriable(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def offline(*_args, **_kwargs):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", offline)
+    with pytest.raises(FlashTeacherBridgeError) as error:
+        _post_json("http://127.0.0.1:1", "token", "/score", {})
+    assert error.value.classification == "transient"
+
+
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -429,6 +442,10 @@ def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
         _raise_verl_failure(86, ("permanent", "bad credentials"))
     with pytest.raises(RetriableInfraError, match="transient teacher failure"):
         _raise_verl_failure(87, ("transient", "service unavailable"))
+    with pytest.raises(RetriableInfraError, match="transient teacher bridge failure"):
+        _raise_verl_failure(87, None)
+    with pytest.raises(RuntimeError, match="permanent teacher bridge failure"):
+        _raise_verl_failure(86, None)
     with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
         _raise_verl_failure(9, None)
 

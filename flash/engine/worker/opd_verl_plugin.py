@@ -105,7 +105,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=600) as response:
-            return json.loads(response.read().decode("utf-8"))
+            body = response.read()
     except urllib.error.HTTPError as error:
         try:
             payload = json.loads(error.read().decode("utf-8"))
@@ -113,14 +113,28 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
             classification = str(details["classification"])
             message = str(details["message"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as decode_error:
-            raise RuntimeError(
-                f"flash OPD bridge returned unclassified HTTP {error.code}"
+            raise FlashTeacherBridgeError(
+                f"flash OPD bridge returned unclassified HTTP {error.code}",
+                classification="permanent",
             ) from decode_error
         if classification not in {"permanent", "transient"}:
-            raise RuntimeError(
-                f"flash OPD bridge returned unknown teacher failure classification {classification!r}"
+            raise FlashTeacherBridgeError(
+                f"flash OPD bridge returned unknown teacher failure classification {classification!r}",
+                classification="permanent",
             ) from error
         raise FlashTeacherBridgeError(message, classification=classification) from error
+    except (OSError, TimeoutError, urllib.error.URLError) as error:
+        raise FlashTeacherBridgeError(
+            f"flash OPD bridge transport failed: {type(error).__name__}",
+            classification="transient",
+        ) from error
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise FlashTeacherBridgeError(
+            "flash OPD bridge returned malformed success JSON",
+            classification="permanent",
+        ) from error
 
 
 def _install_verl_extensions() -> None:
@@ -236,6 +250,8 @@ def _install_verl_extensions() -> None:
                     else _TRANSIENT_TEACHER_EXIT
                 )
                 os._exit(exit_code)
+            except Exception:
+                os._exit(_PERMANENT_TEACHER_EXIT)
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
             teacher_logprobs = torch.tensor(
                 payload["teacher_logprobs"], dtype=torch.float32
