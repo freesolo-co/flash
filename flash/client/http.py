@@ -523,7 +523,9 @@ class ApiClient:
                     decoder.setstate(state)
                     prefix_end = max(0, exc.start - len(state[0]))
                     yield from decoder.decode(raw[:prefix_end])
-                    raise
+                    # bind + re-raise explicitly: the yield above clears the active exception, so a
+                    # bare `raise` here would fail with "No active exception to reraise".
+                    raise exc
                 yield from decoded
             yield from decoder.decode(b"", final=True)
 
