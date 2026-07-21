@@ -36,6 +36,7 @@ def upload_worker(monkeypatch, tmp_path):
         worker_hf, "_OPTIONAL_CHECKPOINT_UPLOADER", worker_hf._SingleSlotUploader()
     )
     monkeypatch.setattr(worker_hf, "_OPTIONAL_AUX_UPLOADER", worker_hf._SingleSlotUploader())
+    monkeypatch.setattr(worker_hf, "_OPTIONAL_DEPLOYABLE_UPLOADER", worker_hf._FifoUploader())
     monkeypatch.setattr(worker_hf, "_OPTIONAL_UPLOAD_STAGE_ROOT", str(tmp_path / "staged"))
     monkeypatch.setattr(worker, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker, "PHASE", "rl")
@@ -446,3 +447,57 @@ def test_concurrent_debug_snapshots_preserve_append_order(upload_worker, monkeyp
         [{"reward": 1.0}],
         [{"reward": 1.0}, {"reward": 2.0}],
     ]
+
+
+def test_coalesced_optional_resume_still_publishes_every_deployable(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path
+):
+    """regression: coalescing an optional resume checkpoint must not drop its per-step deployable."""
+    worker, worker_hf = upload_worker
+    api = _BlockingHfApi()
+    monkeypatch.setattr(worker, "hf_api", lambda: api)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    callback = worker.make_checkpoint_upload_callback()  # all steps optional
+
+    _checkpoint(output_dir, 2)
+    callback.on_save(
+        SimpleNamespace(output_dir=str(output_dir)), SimpleNamespace(global_step=2), SimpleNamespace()
+    )
+    assert api.started.wait(1)  # step-2 uploads are in-flight and blocked
+    for step in (4, 6):  # step-4's resume enqueues pending; step-6 coalesces it away
+        _checkpoint(output_dir, step)
+        callback.on_save(
+            SimpleNamespace(output_dir=str(output_dir)),
+            SimpleNamespace(global_step=step),
+            SimpleNamespace(),
+        )
+    api.release.set()
+    assert worker_hf.flush_optional_uploads(5.0)
+    deployables = {p for p, _ in api.uploads if p.startswith("rl/async-test/checkpoints/")}
+    assert deployables == {
+        "rl/async-test/checkpoints/step-2/adapter",
+        "rl/async-test/checkpoints/step-4/adapter",
+        "rl/async-test/checkpoints/step-6/adapter",
+    }
+
+
+def test_optional_staging_failure_is_surfaced(
+    upload_worker, fake_trainer_callback, monkeypatch, tmp_path, capsys
+):
+    """regression: a staging failure must be surfaced, not silently treated as a successful save."""
+    worker, worker_hf = upload_worker
+    monkeypatch.setattr(worker, "hf_api", lambda: _BlockingHfApi())
+
+    def _boom(*_a, **_k):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(worker_hf, "_stage_optional_directory", _boom)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _checkpoint(output_dir, 4)
+    callback = worker.make_checkpoint_upload_callback()
+    callback.on_save(
+        SimpleNamespace(output_dir=str(output_dir)), SimpleNamespace(global_step=4), SimpleNamespace()
+    )
+    assert "not published" in capsys.readouterr().out
