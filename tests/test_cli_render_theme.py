@@ -88,7 +88,7 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
         "run_id": "flash-1",
         "state": "done",
         "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
-        "remote": {"gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
+        "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
     runs = render.runs_table([run])
     status = render.run_status(run)
@@ -129,6 +129,17 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
     }
     assert "RTX Pro 6000" in render.runs_table([spec_only_run])
     assert "RTX Pro 6000" in render.run_status(spec_only_run)
+
+    # the removed legacy remote["gpu"] key is no longer honored: the label resolves from the
+    # authoritative allocated_gpu or the provisional spec type, never the dead key.
+    legacy_key_run = {
+        "run_id": "flash-legacy-key",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+        "remote": {"gpu": "B200"},
+    }
+    assert "B200" not in render.runs_table([legacy_key_run])
+    assert "RTX Pro 6000" in render.runs_table([legacy_key_run])
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
