@@ -1,8 +1,9 @@
 """Colocated vLLM rollout helper for OPD student generation.
 
 OPD owns its teacher scoring and GKD loss loop, so it cannot reuse TRL's GRPOTrainer wrapper directly.
-This module keeps the vLLM surface small: build one resident LLM, save the current PEFT adapter to a
-versioned temp dir after each optimizer step, and generate with a matching LoRARequest.
+This module keeps the vLLM surface small: build one resident LLM, publish the current PEFT adapter to
+a versioned directory that prefers memory-backed storage after each optimizer step, and generate with
+a matching LoRARequest.
 """
 
 from __future__ import annotations
@@ -12,6 +13,28 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    # peft writes adapter_model.safetensors, so a full /dev/shm during the weight write surfaces as
+    # SafetensorError (an OSError sibling, not subclass). ships with peft in real runs; keep optional.
+    from safetensors import SafetensorError
+except ImportError:  # pragma: no cover
+    SafetensorError = ()
+
+_ADAPTER_TMPFS_ROOT = "/dev/shm"
+
+
+def _make_adapter_root() -> tuple[str, bool]:
+    """Create the supported path-based vLLM adapter store, preferring memory-backed storage."""
+    try:
+        return tempfile.mkdtemp(prefix="flash_opd_vllm_lora_", dir=_ADAPTER_TMPFS_ROOT), True
+    except OSError as exc:
+        adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+        print(
+            f"[opd][warn] tmpfs adapter store unavailable ({exc}); "
+            f"using filesystem fallback {adapter_root}"
+        )
+        return adapter_root, False
 
 
 @dataclass(frozen=True)
@@ -294,6 +317,8 @@ class OpdVllmRolloutEngine:
     _lora_int_id: int | None = None
     _lora_request: object | None = None
     _sync_dirs: list[str] = field(default_factory=list)
+    _adapter_roots: list[str] = field(default_factory=list, init=False)
+    _adapter_root_is_tmpfs: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         from vllm import LLM, SamplingParams
@@ -354,9 +379,10 @@ class OpdVllmRolloutEngine:
                 raise startup_oom from exc
             raise
         if self.adapter_root is None:
-            self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+            self.adapter_root, self._adapter_root_is_tmpfs = _make_adapter_root()
         else:
             os.makedirs(self.adapter_root, exist_ok=True)
+        self._adapter_roots.append(self.adapter_root)
 
     def _enginecore_startup_oom(self, exc: RuntimeError) -> BaseException | None:
         """Recast vLLM's parent EngineCore wrapper as OOM when the hidden root is memory preflight."""
@@ -387,19 +413,56 @@ class OpdVllmRolloutEngine:
     def sync_count(self) -> int:
         return self._version
 
+    def _save_adapter_staging(self, model, version: int) -> str:
+        staging_dir = tempfile.mkdtemp(prefix=f".adapter-{version:06d}-", dir=self.adapter_root)
+        try:
+            model.save_pretrained(staging_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return staging_dir
+
     def sync_from_model(self, model) -> None:
-        """Save the current PEFT adapter and make future generations use that exact version."""
+        """Atomically publish the current PEFT adapter for future generations."""
         old_lora_id = self._lora_int_id
         old_adapter_dir = self._sync_dirs[-1] if self._sync_dirs else None
-        self._version += 1
-        adapter_dir = os.path.join(self.adapter_root, f"adapter-{self._version:06d}")
-        os.makedirs(adapter_dir, exist_ok=True)
-        model.save_pretrained(adapter_dir)
+        next_version = self._version + 1
+        try:
+            staging_dir = self._save_adapter_staging(model, next_version)
+        except (OSError, SafetensorError) as exc:
+            # I/O failures mean tmpfs is unavailable (matching _make_adapter_root). safetensors raises
+            # SafetensorError (not OSError) on a full /dev/shm during the weight write, so catch it too;
+            # a genuine non-I/O failure re-raises from the filesystem retry below rather than being lost.
+            if not self._adapter_root_is_tmpfs:
+                raise
+            self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+            self._adapter_roots.append(self.adapter_root)
+            self._adapter_root_is_tmpfs = False
+            print(
+                f"[opd][warn] tmpfs adapter save failed ({exc}); "
+                f"using filesystem fallback {self.adapter_root}"
+            )
+            staging_dir = self._save_adapter_staging(model, next_version)
+
+        adapter_dir = os.path.join(self.adapter_root, f"adapter-{next_version:06d}")
+        try:
+            lora_request = self._LoRARequest(
+                f"opd-step-{next_version}", next_version, adapter_dir
+            )
+            if os.path.lexists(adapter_dir):
+                if os.path.isdir(adapter_dir) and not os.path.islink(adapter_dir):
+                    shutil.rmtree(adapter_dir)
+                else:
+                    os.unlink(adapter_dir)
+            os.replace(staging_dir, adapter_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
         self._sync_dirs.append(adapter_dir)
-        self._lora_int_id = self._version
-        self._lora_request = self._LoRARequest(
-            f"opd-step-{self._version}", self._lora_int_id, adapter_dir
-        )
+        self._version = next_version
+        self._lora_int_id = next_version
+        self._lora_request = lora_request
         if old_adapter_dir and old_lora_id is not None and self._remove_lora(old_lora_id):
             shutil.rmtree(old_adapter_dir, ignore_errors=True)
             self._sync_dirs = [d for d in self._sync_dirs if d != old_adapter_dir]
@@ -538,8 +601,8 @@ class OpdVllmRolloutEngine:
                 shutdown()
             except Exception as exc:
                 print(f"[opd] vLLM shutdown failed; continuing: {exc}")
-        if self.adapter_root:
-            shutil.rmtree(self.adapter_root, ignore_errors=True)
+        for adapter_root in self._adapter_roots:
+            shutil.rmtree(adapter_root, ignore_errors=True)
 
 
 def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:

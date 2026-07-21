@@ -64,12 +64,14 @@ def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
     assert vast_gpu_for_offer("Tesla T4", 16 * 1024) is None
 
 
-def test_retired_gpu_resolves_but_is_not_active():
-    from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info
+def test_removed_gpu_class_is_unmanaged():
+    # RTX A6000 was a retired class kept only to resolve legacy records; it is now fully removed, so
+    # it is not a managed class and resolves nowhere (no special retired-but-known status remains).
+    from flash.providers.base import KNOWN, UnsupportedGpuError, canonical_gpu
 
-    assert canonical_gpu("RTX A6000") == "RTX A6000"
-    assert get_gpu_info("RTX A6000").vram_gb == 48
-    assert "RTX A6000" not in GPU_INFO
+    assert "RTX A6000" not in KNOWN
+    with pytest.raises(UnsupportedGpuError):
+        canonical_gpu("RTX A6000")
 
 
 def test_expanded_gpu_table():
@@ -205,9 +207,8 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B is bf16 (QLoRA dropped), and real TRL SFT materializes dense logits, so the cheapest
-    # validated class that fits is now the 80 GB A100 tier.
-    assert spec.gpu.type == "A100 PCIe"
+    # chunked nll bounds the 248k-vocab projection, so the default 9b sft fits the 32 gb tier.
+    assert spec.gpu.type == "RTX 5090"
 
 
 def test_build_worker_env():

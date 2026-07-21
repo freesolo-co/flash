@@ -277,8 +277,11 @@ def test_sft_steps_default_epochs_mirror_the_worker():
 def test_sft_steps_use_worker_realized_grad_accum_batch():
     # batch_size 6 is NOT a multiple of the micro-batch (4): the worker realizes per_device(4) x
     # grad_accum(ceil(6/4)=2) = 8, so steps = epochs(2) x ceil(320/8) = 80 -- NOT the raw-batch
-    # ceil(320/6)*2 = 108 the old derivation produced.
-    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2)
+    # ceil(320/6)*2 = 108. Pin the estimator to the worker's independent step derivation here on the
+    # UNPACKED path (context > 16k): the chunked-nll gdn-packing special-case that deliberately prices
+    # the requested batch conservatively only applies at packable (<=16k) context and is covered by
+    # test_sft_steps_price_gdn_packing_conservatively.
+    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2, max_context_tokens=16_385)
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=6, epochs=2) == 80
 
 
@@ -321,16 +324,13 @@ def test_sft_positive_max_steps_is_authoritative():
     assert _spec_steps(above_derived) == 9
 
 
-def test_sft_steps_honor_big_vocab_per_device_cap():
-    # For a sub-3B short-ctx SFT the worker vocab-sizes the per-device micro-batch (the big-vocab
-    # logits cap), which with CEIL'd grad-accum changes the REALIZED global batch -- so the priced
-    # step count must mirror the capped batch, not the fixed pd=4 one. Qwen3.5-0.8B (0.9B, ~248k
-    # vocab) at a 1024 ctx leaves CE un-fused -> per_device caps 4->1, so batch 6 realizes 1x6=6
-    # (not 4x2=8): steps = epochs(2) x ceil(320/6) = 108, NOT the uncapped ceil(320/8)*2 = 80.
+def test_sft_steps_price_gdn_packing_conservatively():
+    # qwen chunked nll permits a per-device batch of four, but the worker's gdn packing path forces
+    # per-device=1. price the requested batch so a non-multiple-of-four request cannot underquote.
     import math
 
     from flash.catalog import vocab_size_for
-    from flash.engine.vram import sft_logits_fused, sft_per_device, sft_realized_batch
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_per_device, sft_realized_batch
 
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
@@ -347,12 +347,15 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
     }
     spec = spec_from_dict(raw)
     v = vocab_size_for("Qwen/Qwen3.5-0.8B")
-    fused = sft_logits_fused(0.9, 1024)
-    assert fused is False
-    assert sft_per_device(6, seq_len=1024, vocab=v, fused=fused) == 1
-    assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=fused) == 6
+    chunked = sft_chunked_nll_enabled(spec.model)
+    assert chunked is True
+    assert sft_per_device(6, seq_len=1024, vocab=v, fused=chunked) == 4
+    assert sft_realized_batch(6, seq_len=1024, vocab=v, fused=chunked) == 8
     assert _spec_steps(spec) == math.ceil(320 / 6) * 2 == 108
-    assert _spec_steps(spec) != 80  # the pre-fix uncapped (pd=4 -> realized 8) step count
+
+    raw["train"]["max_context_tokens"] = 16_385
+    unpacked_spec = spec_from_dict(raw)
+    assert _spec_steps(unpacked_spec) == math.ceil(320 / 8) * 2 == 80
 
 
 def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):

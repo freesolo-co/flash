@@ -41,6 +41,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rollout_samples import select_rollout_samples
 from flash.spec import (
     DEFAULT_CREDIT_ASSIGNMENT,
     PER_TURN_CREDIT_ASSIGNMENT,
@@ -52,6 +53,29 @@ def grpo_under_ran(steps_run: int, steps: int) -> bool:
     """return true when grpo completes fewer optimizer updates than requested."""
     return int(steps_run) < int(steps)
 
+
+def _patch_colocate_rollout_compilation(cc: tuple[int, int]) -> dict | None:
+    if cc and cc[0] in (10, 12):
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        print(
+            f"[rl][warn] Blackwell/sm{cc[0]}{cc[1]}: VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+            "for the colocate rollout (avoid V1 SyncMPClient EngineCore startup stalls)"
+        )
+    if cc == (10, 0):
+        return None
+    decode_only_validated = cc in {(8, 0), (9, 0)} or cc[0] in (10, 12)
+    if decode_only_validated:
+        kwargs = {
+            "enforce_eager": False,
+            "compilation_config": {
+                "mode": 0,
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+            },
+        }
+    else:
+        kwargs = {"enforce_eager": True}
+    _w.patch_trl_colocate_llm_kwargs(**kwargs)
+    return kwargs
 
 def _mean_named_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:
     totals: dict[str, float] = {}
@@ -342,12 +366,33 @@ def run_rl():
         print(f"[rl] prompt_opens_thinking={_prompt_opens_thinking}")
 
     pending_named_breakdowns: list[dict[str, float] | None] = []
+    latest_samples: list[dict] = []
     latest_named_metrics: dict[str, float] = {}
 
     def reward_fn(completions, **kwargs):
         # rollout_func (multi-turn) reward is computed by the env and forwarded as "reward".
         if kwargs.get("reward") is not None:
-            return [float(r) for r in kwargs["reward"]]
+            rewards = [float(r) for r in kwargs["reward"]]
+            prompts_kwarg = kwargs.get("prompts")
+            trainer_state = kwargs.get("trainer_state")
+            generated_at_step = getattr(trainer_state, "global_step", None)
+            sample_triples = []
+            for idx, reward in enumerate(rewards):
+                try:
+                    prompt = prompts_kwarg[idx]
+                except (IndexError, KeyError, TypeError):
+                    prompt = prompts_kwarg if idx == 0 else ""
+                try:
+                    completion = completions[idx]
+                except (IndexError, KeyError, TypeError):
+                    completion = completions if idx == 0 else ""
+                sample_triples.append((prompt, completion, reward))
+            latest_samples.clear()
+            latest_samples.extend(
+                select_rollout_samples(sample_triples, generated_at_step=generated_at_step)
+            )
+            return rewards
+        latest_samples.clear()
         # Fail LOUD if TRL stops forwarding example_idx: defaulting to [] would zip to zero
         # examples -> empty rewards -> silent broken training (#206 / #210).
         example_idx = kwargs.get("example_idx")
@@ -366,39 +411,47 @@ def run_rl():
                 "the sampled completions; aborting rather than training on a shifted reward signal."
             )
         examples = [rollout_examples[int(i)] for i in example_idx]
+        prompts_kwarg = kwargs.get("prompts")
+        trainer_state = kwargs.get("trainer_state")
+        generated_at_step = getattr(trainer_state, "global_step", None)
         rewards = []
         breakdowns = []
-        debug_rows = []
+        sample_triples = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
+            is_message_completion = isinstance(comp, list)
+            # single-turn multimodal completions arrive as message lists but are converted to
+            # plain text below and scored like text, so they must still get the thinking-length
+            # penalty. only genuine multi-turn / tool-loop transcripts are scored as whole
+            # episodes (and are excluded from the per-completion thinking penalty).
+            scored_as_episode = is_message_completion and (is_multi_turn or is_tool_env)
+            scoring_failed = False
             try:
-                if isinstance(comp, list) and (is_multi_turn or is_tool_env):
+                if scored_as_episode:
                     # multi-turn and native tool-loop transcripts are scored as complete episodes.
                     r = env.reward_from_messages(comp, ex)
-                    rewards.append(r)
-                    continue
-                if isinstance(comp, list):
-                    from flash.multimodal import assistant_completion_text
-
-                    comp = assistant_completion_text(comp)
-                graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
-                state = (
-                    {
-                        "raw": comp,
-                        "completion": graded,
-                        "thinking": _w.thinking_text(
-                            comp, prompt_opened_thinking=_prompt_opens_thinking
-                        ),
-                    }
-                    if _w.THINKING
-                    else None
-                )
-                breakdown = None
-                if hasattr(env, "scores_breakdown"):
-                    breakdown = env.scores_breakdown(graded, ex, state)
-                    r = float(breakdown.get("total", 0.0))
-                    breakdowns.append(breakdown)
                 else:
-                    r = env.reward(graded, ex, state)
+                    if is_message_completion:
+                        from flash.multimodal import assistant_completion_text
+
+                        comp = assistant_completion_text(comp)
+                    graded = _w.graded_text(comp, prompt_opened_thinking=_prompt_opens_thinking)
+                    state = (
+                        {
+                            "raw": comp,
+                            "completion": graded,
+                            "thinking": _w.thinking_text(
+                                comp, prompt_opened_thinking=_prompt_opens_thinking
+                            ),
+                        }
+                        if _w.THINKING
+                        else None
+                    )
+                    if hasattr(env, "scores_breakdown"):
+                        breakdown = env.scores_breakdown(graded, ex, state)
+                        r = float(breakdown.get("total", 0.0))
+                        breakdowns.append(breakdown)
+                    else:
+                        r = env.reward(graded, ex, state)
             except Exception as _reward_exc:
                 # The user's env raised during scoring: score 0 rather than killing the run.
                 # Scoped to the env calls only — flash's own logic below stays outside.
@@ -408,33 +461,31 @@ def run_rl():
                     flush=True,
                 )
                 breakdowns.append(None)
-                rewards.append(0.0)
-                continue
-            if _think_penalty > 0 and _w.THINKING:
+                r = 0.0
+                scoring_failed = True
+            if (
+                not scored_as_episode
+                and not scoring_failed
+                and _think_penalty > 0
+                and _w.THINKING
+            ):
                 # Gated on _prompt_opens_thinking so a template that ignores enable_thinking
                 # doesn't get its tagless answers counted as reasoning.
                 r -= _think_penalty * _w.think_token_count(
                     comp, tok, prompt_opened_thinking=_prompt_opens_thinking
                 )
             rewards.append(r)
-            if idx < 8:
-                debug_rows.append(
-                    {
-                        "ts": time.time(),
-                        "attempt": _w.ATTEMPT,
-                        "run_id": _w.RUN_ID,
-                        "mode": _w.RUN_MODE,
-                        "seed": _w.SEED,
-                        "reward": r,
-                        "breakdown": breakdown,
-                        "completion_prefix": str(comp or "")[:1000],
-                        "graded_prefix": str(graded or "")[:1000],
-                        "example_id": (ex or {}).get("id") if isinstance(ex, dict) else None,
-                        "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
-                    }
-                )
+            if isinstance(prompts_kwarg, (list, tuple)) and idx < len(prompts_kwarg):
+                prompt = prompts_kwarg[idx]
+            elif isinstance(ex, dict):
+                prompt = (ex or {}).get("input", "")
+            else:
+                prompt = ex
+            sample_triples.append((prompt, comp, r))
         pending_named_breakdowns.extend(breakdowns)
-        _w.upload_debug_jsonl("reward_debug.jsonl", debug_rows)
+        latest_samples.extend(
+            select_rollout_samples(sample_triples, generated_at_step=generated_at_step)
+        )
         return rewards
 
     from flash.engine.vram import resolve_params_b
@@ -616,8 +667,8 @@ def run_rl():
         True,
         "vLLM chunked prefill",
     )
-    # vLLM > 0.19.0 regressed the Triton slot-mapping kernel into an illegal memory access on
-    # the first generation step (CUDA graph compilation triggers it); skip FULL_AND_PIECEWISE.
+    # vllm > 0.19.0 regressed the triton slot-mapping kernel into an illegal memory access on
+    # the first generation step under full compile-and-capture, so use the narrower decode profile.
     _cudagraph_safe = True
     try:
         import vllm as _vllm_mod
@@ -626,29 +677,25 @@ def run_rl():
         _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
         if _vllm_ver > (0, 19, 0):
             _cudagraph_safe = False
-            print(
-                f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
-                "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
-                "crash workaround; update vLLM to a TRL-supported version to re-enable)"
-            )
             try:
                 import torch as _t_cc
 
                 _cc = _t_cc.cuda.get_device_capability()
             except Exception:
                 _cc = (0, 0)
-            _is_b200 = _cc == (10, 0)  # sm100, the only arch validated for cudagraphs here
-            if not _is_b200:
-                _w.patch_trl_colocate_llm_kwargs(enforce_eager=True)
+            _rollout_compilation = _patch_colocate_rollout_compilation(_cc)
+            if _rollout_compilation is None:
+                print("[rl] cc=10.0: keeping the validated b200 vLLM compilation default")
+            elif _rollout_compilation["enforce_eager"]:
                 print(
                     f"[rl][warn] enforce_eager=True on the colocate rollout (cc={_cc[0]}.{_cc[1]} "
-                    "-> prevent 0.19.1 aot_compile/slot-mapping crash; the removed "
-                    "VLLM_TORCH_COMPILE_LEVEL env no longer applies on this vLLM)"
+                    "-> unvalidated for decode-only graphs; prevent 0.19.1 "
+                    "aot_compile/slot-mapping crashes)"
                 )
             else:
                 print(
-                    f"[rl] cc={_cc[0]}.{_cc[1]} (B200/sm100): keeping vLLM CUDA graphs for the "
-                    "rollout (validated; MoE-decode speedup)"
+                    f"[rl] cc={_cc[0]}.{_cc[1]}: using decode-only vLLM CUDA graphs for the "
+                    "colocate rollout (torch.compile disabled)"
                 )
     except Exception:
         pass
@@ -682,6 +729,10 @@ def run_rl():
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
     _gen_kwargs: dict = {}
+    if multimodal and not is_multi_turn:
+        from flash.multimodal import resolve_image_pad_token_id
+
+        _gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}
     if _t and _t.stop_sequences:
         _gen_kwargs["stop"] = list(_t.stop_sequences)
     # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
@@ -743,7 +794,8 @@ def run_rl():
     hb_cb = _w.make_reward_heartbeat_callback(
         lambda: _latest_named_reward_metrics(
             pending_named_breakdowns, latest_named_metrics
-        )
+        ),
+        lambda: list(latest_samples),
     )
     trainer_callbacks = [
         hb_cb,
