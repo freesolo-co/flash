@@ -122,14 +122,17 @@ def test_transient_sidecar_error_accepts_completed_adapter(monkeypatch):
         "_sleep_with_hf_deadline",
         lambda _delay: pytest.fail("a complete adapter must not back off"),
     )
+    removed = []
     monkeypatch.setattr(
         adapter.shutil,
         "rmtree",
-        lambda *_args, **_kwargs: pytest.fail("a complete adapter must not be removed"),
+        lambda path, ignore_errors: removed.append((path, ignore_errors)),
     )
 
     assert adapter._download_adapter(_ADAPTER_REF) == _ADAPTER_DIR
     assert len(calls) == 1
+    # only the startup clear runs; a completed adapter must not be discarded after the sidecar error
+    assert removed == [(_ADAPTER_DIR, True)]
     assert len(deadline_checks) == 1
 
 
@@ -246,7 +249,8 @@ def test_incomplete_snapshot_retries_until_adapter_is_complete(monkeypatch):
     assert adapter._download_adapter(_ADAPTER_REF) == _ADAPTER_DIR
     assert len(calls) == 2
     assert sleeps == [5.0]
-    assert removed == [(_ADAPTER_DIR, True)]
+    # startup clear plus the post-incomplete clear both run
+    assert removed == [(_ADAPTER_DIR, True), (_ADAPTER_DIR, True)]
     assert len(deadline_checks) == 2
 
 
