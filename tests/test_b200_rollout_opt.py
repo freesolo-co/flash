@@ -108,6 +108,13 @@ def test_patch_injects_enforce_eager(fake_vg):
     assert _FakeLLM.last_kwargs["enforce_eager"] is True
 
 
+def test_patch_injects_compilation_config(fake_vg):
+    config = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
+    assert patch_trl_colocate_llm_kwargs(compilation_config=config) is True
+    fake_vg.LLM(model="m")
+    assert _FakeLLM.last_kwargs["compilation_config"] == config
+
+
 def test_patch_injects_attention_backend(fake_vg):
     # Codex MsOqv: VLLM_ATTENTION_BACKEND was dropped from vLLM 0.19.1's env registry, so the sm120
     # backend is pinned via the LLM(...) attention_backend kwarg (EngineArgs coerces the bare name).
