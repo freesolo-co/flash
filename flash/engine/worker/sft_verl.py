@@ -43,6 +43,8 @@ from flash.engine.worker.verl_common import (
     stamp_adapter_dir_provenance,
 )
 
+# todo: run the deferred two-gpu SFT smoke on the exact RunPod image and command assembled below.
+# todo: compare verl's role mask with flash's completion mask using the real model tokenizer.
 _SFT_LORAPLUS_RATIO = 16.0
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
 _VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
@@ -121,6 +123,8 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
         f"model.use_liger={_hydra_val(cfg.get('use_liger', True))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
+        "engine.model_dtype=bfloat16",
+        f"engine.seed={_hydra_val(cfg['seed'])}",
         f"engine.ulysses_sequence_parallel_size={_hydra_val(cfg['ulysses_sp_size'])}",
         f"optim.lr={_hydra_val(cfg['lr'])}",
         f"optim.lr_warmup_steps_ratio={_hydra_val(cfg['warmup_ratio'])}",

@@ -34,7 +34,19 @@ def resolve_verl_python(workdir: str) -> str:
         # isolated env: verl brings its own torch/vllm; a full install (not --no-deps) so runtime
         # deps are present. exact pins are validated on the gpu pod before paid launch.
         subprocess.run(["uv", "venv", venv], check=True)
-        subprocess.run(["uv", "pip", "install", "--python", py, "verl"], check=True)
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                py,
+                "verl==0.8.0",
+                "liger-kernel",
+                "bitsandbytes>=0.49",
+            ],
+            check=True,
+        )
     return py
 
 

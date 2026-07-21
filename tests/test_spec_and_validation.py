@@ -233,9 +233,11 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         }
 
 
-def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
-    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
-        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+def test_sft_init_from_adapter_is_accepted_at_parse_time() -> None:
+    raw = _raw(algorithm="sft", **{"train.init_from_adapter": "source-run"})
+    raw["train"].pop("lora_rank")
+    spec = spec_from_dict(raw)
+    assert spec.train.init_from_adapter == "source-run"
 
 
 @pytest.mark.parametrize(
@@ -874,7 +876,9 @@ def test_programmatic_sft_submit_requires_max_examples(tmp_path, monkeypatch) ->
         orch.submit_job(spec, dry_run=True)
 
 
-def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+def test_programmatic_sft_allows_adapter_continuation_algorithm_gate(
+    tmp_path, monkeypatch
+) -> None:
     from flash.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
@@ -884,8 +888,7 @@ def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypa
         algorithm="sft",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
     )
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
-        orch.submit_job(spec, dry_run=True)
+    assert orch._require_supported_adapter_continuation(spec) is None
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:

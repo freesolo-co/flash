@@ -142,10 +142,15 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
     assert raised.code == 0, "must exit 0 on success"
 
 
-def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
+def test_worker_dispatches_sft_adapter_continuation(monkeypatch):
     from flash.spec import JobSpec, TrainSpec
 
-    _patch_common(monkeypatch, lambda code=0: None)
+    ran = {"value": False}
+
+    def fake_exit(code=0):
+        raise _HardExit(code)
+
+    _patch_common(monkeypatch, fake_exit)
     monkeypatch.setattr(
         worker,
         "JOB_SPEC",
@@ -154,18 +159,11 @@ def test_worker_rejects_sft_adapter_continuation_before_handler(monkeypatch):
             train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
         ),
     )
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
-    monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "wandb_finish", lambda *a, **k: None)
-    monkeypatch.setattr(
-        worker,
-        "run_sft",
-        lambda: pytest.fail("sft handler must not run for adapter continuation"),
-    )
+    monkeypatch.setattr(worker, "run_sft", lambda: ran.__setitem__("value", True))
 
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
+    with pytest.raises(_HardExit):
         worker.main()
+    assert ran["value"] is True
 
 
 def test_worker_dispatches_opd_run_mode(monkeypatch):

@@ -547,86 +547,42 @@ def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
     assert askpass_paths
 
 
-def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
-    """guard completion-only masking, chunked nll, and the existing sft optimizations together."""
+def test_run_sft_verl_preserves_the_sft_optimization_surface():
     import inspect
 
-    from flash.engine.worker import sft
+    from flash.engine.worker import sft_verl
 
-    src = inspect.getsource(sft.run_sft)
-    prep_src = inspect.getsource(sft._render_tokenize_sft_batch)
-    output_src = inspect.getsource(sft._prepare_sft_examples)
+    src = inspect.getsource(sft_verl.run_sft_verl)
+    override_src = inspect.getsource(sft_verl.build_sft_verl_overrides)
+    shim_src = inspect.getsource(sft_verl._render_sft_sitecustomize)
 
-    # completion-only loss is on and the old false literal for that key is gone
-    assert '"completion_only_loss": True' in src
-    assert '"completion_only_loss": False' not in src
-    # the parallel prep path preserves the prompt boundary and pre-tokenized representation
-    assert "completion_mask_from_ids(" in prep_src
-    assert '"completion_mask":' in prep_src
-    assert "tokenize_for_packing(" in prep_src
-    assert '"completion_mask": row["completion_mask"]' in output_src
-    assert "_prepare_sft_examples(" in src
-    assert "Dataset.from_list(_pretok)" in src
-    # both flash custom-packing paths thread the completion mask through the packer
-    assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
-
-    # example packing (all three backends: trl bfd, sdpa 4d-mask, gdn varlen)
-    assert 'cfg_kwargs["packing"] = True' in src  # TRL bfd (pure-attn FA2)
-    assert "BlockDiagonalCollator(pad_token_id=tok.pad_token_id)" in src  # SDPA 4D-mask
-    assert "emit_varlen=True" in src  # GDN varlen
-    assert "model_is_pure_attention" in src
-    assert "gdn_packing_available" in src
-    # (tokenize_for_packing now lives in the parallel prep path asserted above.)
-    # chalk standalone RMSNorm/SwiGLU/RoPE stay enabled; chalk flce is OFF on the trl SFT path (returns
-    # logits=None, which trl's SFTTrainer.compute_loss can't consume). when _sft_fused is true, trl's own
-    # chunked_nll owns the output-head loss; the microbatch/grad-accum are sized up front for the chosen path.
-    assert "install_chalk_kernels(" in src
-    assert "fused_ce=False" in src
-    assert "_sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal" in src
-    assert '"loss_type": "chunked_nll" if _sft_fused else "nll"' in src
-    assert "_prepare_chunked_nll_model(sft_model, tok, _lora_config)" in src
-    assert 'cfg_kwargs["use_liger_kernel"] = False' in src
-    assert 'cfg_kwargs["use_liger_kernel"] = True' not in src
-    # LoRA+ (B-matrix LR ratio)
-    assert "create_loraplus_optimizer" in src
-    assert "_lp_ratio" in src
-    # large-vocab logits cap (per-device micro-batch sizing)
+    assert "build_sft_verl_messages_rows(" in src
+    assert '"messages": messages' in src
     assert "sft_grad_accum(" in src
-    # PR #538 finding (worker/quote SFT vocab drift): the worker must size the realized batch through the
-    # SAME revision-aware resolver the cost quote priced with (cost/spec.py _sft_realized_batch ->
-    # resolve_vocab_size on the same (model, revision)). sizing via the revision-blind vocab_size_for made a
-    # revision-pinned run's realized batch drift from its quote. resolve once, reuse for the packing path.
-    assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
-    assert "vocab=_sft_vocab" in src
-    assert "vocab_size_for(model_id)" not in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
-    # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
-    assert "grad_checkpointing_on(\n        model_id,\n        _runtime_max_len," in src
-    assert '"gradient_checkpointing": _grad_ckpt' in src
-    # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
-    # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
-    # non-reentrant's metadata-equality assert kills the first backward. Dense stays non-reentrant.
-    assert '"use_reentrant": grpo_use_reentrant(model_id)' in src
-    assert '"optim": fused_optim_name()' in src
+    assert "resolve_vocab_size(model_id, model_revision)" in src
+    assert "grad_checkpointing_on(" in src
+    assert "grpo_use_reentrant(model_id)" in src
+    assert "loraplus_optimizer_cls" in src
+    assert "_SFT_LORAPLUS_RATIO" in src
+    assert "make_lora(model_id)" in src
+    assert "model.use_remove_padding=true" in override_src
+    assert "model.use_liger" in override_src
+    assert "data.use_dynamic_bsz=true" in override_src
+    assert "optim.lr_scheduler_type=linear" in override_src
+    assert "_flash_non_dropping_loader" in shim_src
+    assert "_flash_build_reentrant_module" in shim_src
 
 
-def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
-    """When TRL bfd packing stays ON, grad_accum must be re-derived from the ~ex/block estimate so
-    the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
-    inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
-    already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
+def test_verl_non_dropping_batches_preserve_partial_final_update():
     import inspect
 
-    from flash.engine.worker import sft
+    from flash.engine.worker import sft_verl
 
-    src = inspect.getsource(sft.run_sft)
-    # the shared packed-path re-derivation uses the bfd ex/block estimate after backend selection.
-    assert "_bfd_preview = pack_dataset(" in src
-    assert 'strategy="bfd"' in src
-    assert 'f"[sft] {_packing_kind} packing:' in src
-    assert "if _packed_examples_per_block is not None:" in src
-    assert "per_device_bs * _packed_examples_per_block" in src
-    assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
+    source = inspect.getsource(sft_verl._render_sft_sitecustomize)
+    assert 'kwargs["drop_last"] = False' in source
+    run_source = inspect.getsource(sft_verl.run_sft_verl)
+    assert "steps_per_epoch = max(1, math.ceil(len(rows) / train_batch_size))" in run_source
+    assert "sft_update_steps(" in run_source
 
 
 def test_trl_collator_masks_prompt_from_pretokenized_rows():

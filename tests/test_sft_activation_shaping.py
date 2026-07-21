@@ -85,10 +85,10 @@ def test_padding_free_token_count_ignores_collator_padding():
     assert batch["position_ids"].numel() == 8
     assert _sft_local_token_count(batch).item() == 5
 
-    from flash.engine.worker import sft
+    from flash.engine.worker import sft_verl
 
-    source = inspect.getsource(sft.run_sft)
-    assert "trainer.data_collator = _SFTTokenCountingCollator(trainer.data_collator)" in source
+    source = inspect.getsource(sft_verl.build_sft_verl_overrides)
+    assert '"model.use_remove_padding=true"' in source
 
 
 def test_group_by_length_is_gated_to_unpacked_only():
@@ -123,18 +123,10 @@ def test_quality_metrics_run_only_on_logging_microbatch():
     assert _sft_quality_metrics_due(state, args, SimpleNamespace(sync_gradients=True)) is False
 
 
-def test_non_blocking_h2d_is_passed_to_sft_config():
-    from flash.engine.worker import sft
+def test_verl_sft_uses_padding_removal_and_dynamic_token_batches():
+    from flash.engine.worker import sft_verl
 
-    source = inspect.getsource(sft.run_sft)
-    assert '"accelerator_config": {"non_blocking": True}' in source
-
-    trl = pytest.importorskip("trl")
-    cfg = trl.SFTConfig(
-        output_dir="/tmp/sft-activation-shaping-test",
-        use_cpu=True,
-        bf16=False,
-        loss_type="nll",
-        accelerator_config={"non_blocking": True},
-    )
-    assert cfg.accelerator_config.non_blocking is True
+    source = inspect.getsource(sft_verl.build_sft_verl_overrides)
+    assert '"model.use_remove_padding=true"' in source
+    assert '"data.use_dynamic_bsz=true"' in source
+    assert "data.max_token_len_per_gpu" in source

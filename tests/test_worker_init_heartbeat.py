@@ -797,24 +797,28 @@ def test_rl_init_wraps_trainer_build_in_liveness_heartbeat():
     assert 'liveness_heartbeat("rl_initializing")' in inspect.getsource(rl.run_rl)
 
 
-def test_sft_init_wraps_trainer_build_in_liveness_heartbeat():
-    from flash.engine.worker import sft
+def test_sft_verl_wraps_subprocess_in_liveness_heartbeat():
+    from flash.engine.worker import sft_verl
 
-    assert 'liveness_heartbeat("sft_initializing")' in inspect.getsource(sft.run_sft)
+    source = inspect.getsource(sft_verl.run_sft_verl)
+    assert 'liveness_heartbeat(\n                "sft_step",' in source
+    assert "run_verl_training(" in source
 
 
 @pytest.mark.parametrize(
     ("modname", "outer", "stage"),
     [
         ("flash.engine.worker.rl", "run_rl", "rl_step"),
-        ("flash.engine.worker.sft", "run_sft", "sft_step"),
+        ("flash.engine.worker.sft_verl", "run_sft_verl", "sft_step"),
     ],
 )
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
     mod = importlib.import_module(modname)
     src = inspect.getsource(getattr(mod, outer))
-    assert f'liveness_heartbeat(\n            "{stage}",\n            progress=' in src, (
-        f"{outer} must wrap trainer.train() in liveness_heartbeat({stage!r}, progress=...) — "
+    assert re.search(
+        rf'liveness_heartbeat\(\s*"{re.escape(stage)}",\s*progress=', src
+    ), (
+        f"{outer} must wrap trainer.train() in liveness_heartbeat({stage!r}, progress=...); "
         "without the wrap the cold first step emits no real heartbeat and looks like a hang, and "
         "without progress= the daemon can win the throttled upload slot with a bare liveness ping "
         "and starve the provider's stall clock while training is healthy"
@@ -839,8 +843,8 @@ def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
     ("modname", "outer", "stages"),
     [
         (
-            "flash.engine.worker.sft",
-            "run_sft",
+            "flash.engine.worker.sft_verl",
+            "run_sft_verl",
             ("sft_data_loading", "sft_finalizing"),
         ),
         (
@@ -874,7 +878,7 @@ def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
 
 @pytest.mark.parametrize(
     ("modname", "outer"),
-    [("flash.engine.worker.sft", "run_sft"), ("flash.engine.worker.rl", "run_rl")],
+    [("flash.engine.worker.rl", "run_rl")],
 )
 def test_chalk_kernel_install_runs_inside_init_liveness_wrap(modname, outer):
     """install_chalk_kernels can JIT-compile for minutes right after trainer init; it must run

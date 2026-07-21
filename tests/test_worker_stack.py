@@ -908,13 +908,14 @@ def test_warmstart_base_loader_forwards_model_revision(monkeypatch):
 def test_sft_and_rl_wire_vl_full_lora_base_loader():
     import inspect
 
-    from flash.engine.worker import rl, sft
+    from flash.engine.worker import rl, sft_verl
 
-    sft_src = inspect.getsource(sft.run_sft)
+    sft_src = inspect.getsource(sft_verl.run_sft_verl)
     rl_src = inspect.getsource(rl.run_rl)
 
-    assert "sft_model = _w.prepare_fresh_lora_base(" in sft_src
-    assert "model=sft_model" in sft_src
+    assert "validate_multimodal_training(model_id, \"sft\")" in sft_src
+    assert "normalize_prompt_images(" in sft_src
+    assert "lora_config = _w.make_lora(model_id)" in sft_src
     assert "trainer_model = _w.prepare_fresh_lora_base(" in rl_src
     assert 'model_init_kwargs["device_map"] = None' in rl_src
     assert 'device_map", "auto"' not in rl_src

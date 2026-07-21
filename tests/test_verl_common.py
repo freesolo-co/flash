@@ -48,18 +48,36 @@ def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
     assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
 
 
+def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
+    monkeypatch.setattr(vc.subprocess, "run", lambda command, check: calls.append(command))
+
+    python_bin = vc.resolve_verl_python(str(tmp_path))
+
+    assert python_bin.endswith("/verl-venv/bin/python")
+    assert calls[0][:2] == ["uv", "venv"]
+    install = calls[1]
+    assert "verl==0.8.0" in install
+    assert "liger-kernel" in install
+    assert "bitsandbytes>=0.49" in install
+
+
 def test_run_verl_training_streams_steps_and_returns_code():
     seen: list[int] = []
+    lines: list[str] = []
     beats: list[int] = []
     code = vc.run_verl_training(
         ["bash", "-c", "echo 'foo step: 1 bar'; echo 'step: 2'; echo done"],
         env=dict(os.environ),
         on_step=seen.append,
+        on_line=lines.append,
         heartbeat=lambda: beats.append(1),
         heartbeat_interval_s=0.0,
     )
     assert code == 0
     assert seen == [1, 2]
+    assert lines[-1] == "done\n"
     # heartbeat_interval_s=0 => fires on every scanned line (3 lines here).
     assert len(beats) >= 1
 
@@ -71,3 +89,15 @@ def test_run_verl_training_propagates_nonzero_exit():
         on_step=lambda _s: None,
     )
     assert code == 7
+
+
+def test_run_verl_training_terminates_child_when_callback_fails():
+    def fail(_line):
+        raise RuntimeError("checkpoint upload failed")
+
+    with pytest.raises(RuntimeError, match="checkpoint upload failed"):
+        vc.run_verl_training(
+            ["bash", "-c", "echo ready; sleep 30"],
+            env=dict(os.environ),
+            on_line=fail,
+        )

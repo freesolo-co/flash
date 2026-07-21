@@ -1,4 +1,4 @@
-"""SFT training path (TRL SFTTrainer) for the fine-tuning worker."""
+"""pure SFT data/accounting helpers plus the thin verl delegator."""
 
 from __future__ import annotations
 

@@ -542,7 +542,7 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker import sft
+    from flash.engine.worker import sft_verl
 
     completions = [
         [{"role": "assistant", "content": "red"}],
@@ -560,7 +560,9 @@ def test_sft_mixed_text_completion_shapes_are_arrow_safe():
     dataset = Dataset.from_list(rows)
 
     assert [row["completion"][0]["content"] for row in dataset] == ["red", "blue"]
-    assert "completion = text_only_prompt_messages(completion)" in inspect.getsource(sft.run_sft)
+    source = inspect.getsource(sft_verl.run_sft_verl)
+    assert "completion_messages = text_only_prompt_messages(completion_messages)" in source
+    assert "_materialize_verl_images(" in source
 
 
 def test_image_content_key_is_stable_and_pixel_sensitive():
