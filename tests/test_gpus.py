@@ -64,12 +64,14 @@ def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
     assert vast_gpu_for_offer("Tesla T4", 16 * 1024) is None
 
 
-def test_retired_gpu_resolves_but_is_not_active():
-    from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info
+def test_removed_gpu_class_is_unmanaged():
+    # RTX A6000 was a retired class kept only to resolve legacy records; it is now fully removed, so
+    # it is not a managed class and resolves nowhere (no special retired-but-known status remains).
+    from flash.providers.base import KNOWN, UnsupportedGpuError, canonical_gpu
 
-    assert canonical_gpu("RTX A6000") == "RTX A6000"
-    assert get_gpu_info("RTX A6000").vram_gb == 48
-    assert "RTX A6000" not in GPU_INFO
+    assert "RTX A6000" not in KNOWN
+    with pytest.raises(UnsupportedGpuError):
+        canonical_gpu("RTX A6000")
 
 
 def test_expanded_gpu_table():
