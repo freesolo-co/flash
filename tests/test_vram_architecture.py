@@ -21,6 +21,7 @@ _EXPECTED_LORA_TARGET_COUNTS = {
     "Qwen/Qwen3.5-4B": 346,
     "Qwen/Qwen3.5-9B": 358,
     "Qwen/Qwen3.6-35B-A3B": 460,
+    "Qwen/Qwen3.6-27B": 606,
 }
 
 
