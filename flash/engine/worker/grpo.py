@@ -45,10 +45,16 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
 
     Dataset.from_list infers one type per field across ALL rows; mixed-type metadata
     (e.g. int vs str in the same field) causes ArrowInvalid at RL startup. Fix: keep only
-    trivially-typed columns (prompt + integer example_idx); reward_fn maps the index back.
+    trivially typed columns (prompt, integer example_idx, and optional image descriptor strings);
+    reward_fn maps the index back.
     """
     examples = [p["example"] for p in prompts]
-    rows = [{"prompt": p["prompt"], "example_idx": i} for i, p in enumerate(prompts)]
+    rows = []
+    for i, prompt in enumerate(prompts):
+        row = {"prompt": prompt["prompt"], "example_idx": i}
+        if "images" in prompt:
+            row["images"] = list(prompt["images"])
+        rows.append(row)
     return rows, examples
 
 

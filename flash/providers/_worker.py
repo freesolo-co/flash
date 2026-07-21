@@ -43,7 +43,11 @@ WORKER_DEPS = [
     "datasets>=4.7,<6",
     # >=0.2.54: includes robust JSONL loading and corrected package metadata.
     FREESOLO_WORKER_SPEC,
-    "huggingface_hub>=0.25",
+    # >=1.2.0: built-in RateLimit-header-aware 429 retry for HF downloads (base-model pulls) and
+    # paginated Hub API calls. Must match Dockerfile.worker's floor (the baked image is the default
+    # run path; this list only installs on the no-image/live-function path) -- see
+    # tests/test_kernel_fingerprint.py::test_huggingface_hub_floor_is_in_lockstep.
+    "huggingface_hub>=1.2.0",
     "accelerate>=1.4",
     # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
     "wandb>=0.17",
