@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -22,20 +25,36 @@ from flash.serve.urls import openai_base_url, serving_control_url
 logger = get_logger(__name__)
 
 DEFAULT_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
-READBACK_DELAY_SECONDS = 2.0
+READBACK_DELAY_SECONDS = 0.5
+READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
 ACTIVATION_READBACK_ATTEMPTS = 3
+ACTIVATION_READBACK_DELAY_SECONDS = 2.0
+# smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
+# than the 0.5s readiness backoff base, so cold-start smoke retries don't hammer serving.
+SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
+_HTTP_CLIENT: httpx.Client | None = None
+_CHAT_HTTP_CLIENT: httpx.Client | None = None
+_STREAM_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 class ServingError(RuntimeError):
     """Serving backend rejected a request or was unreachable; carries the upstream status."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class ActivationOutcomeUnknown(ServingError):
@@ -100,6 +119,56 @@ def _is_hf_not_found_error(exc: Exception) -> bool:
     return getattr(getattr(exc, "response", None), "status_code", None) == 404
 
 
+def _http_client() -> httpx.Client:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(follow_redirects=True, max_redirects=100)
+    return _HTTP_CLIENT
+
+
+def _chat_http_client() -> httpx.Client:
+    global _CHAT_HTTP_CLIENT
+    if _CHAT_HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _CHAT_HTTP_CLIENT is None:
+                _CHAT_HTTP_CLIENT = httpx.Client(
+                    follow_redirects=True,
+                    max_redirects=100,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+                )
+    return _CHAT_HTTP_CLIENT
+
+
+def _stream_http_client() -> httpx.Client:
+    global _STREAM_HTTP_CLIENT
+    if _STREAM_HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _STREAM_HTTP_CLIENT is None:
+                _STREAM_HTTP_CLIENT = httpx.Client(
+                    follow_redirects=True,
+                    max_redirects=100,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+                )
+    return _STREAM_HTTP_CLIENT
+
+
+def _close_http_client() -> None:
+    global _CHAT_HTTP_CLIENT, _HTTP_CLIENT, _STREAM_HTTP_CLIENT
+    with _HTTP_CLIENT_LOCK:
+        clients = (_HTTP_CLIENT, _CHAT_HTTP_CLIENT, _STREAM_HTTP_CLIENT)
+        _HTTP_CLIENT = None
+        _CHAT_HTTP_CLIENT = None
+        _STREAM_HTTP_CLIENT = None
+    for client in clients:
+        if client is not None:
+            client.close()
+
+
+atexit.register(_close_http_client)
+
+
 def _serving_request(
     method: str,
     url: str,
@@ -115,7 +184,7 @@ def _serving_request(
     if json is not None:
         kwargs["json"] = json
     try:
-        resp = getattr(httpx, method.lower())(url, **kwargs)
+        resp = _http_client().request(method, url, **kwargs)
         if resp.status_code in ok_statuses:
             return resp
         resp.raise_for_status()
@@ -146,7 +215,9 @@ def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
             " — the serving backend is unavailable or has no engine for this base model; "
             "an operator must check the freesolo serving deployment"
         )
-    return ServingError(msg, status_code=status)
+    headers = getattr(resp, "headers", {}) if resp is not None else {}
+    retry_after = headers.get("Retry-After")
+    return ServingError(msg, status_code=status, retry_after=retry_after)
 
 
 def serving_base_url() -> str:
@@ -455,8 +526,10 @@ def _adapter_url(adapter_id: str) -> str:
     return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
 
 
-def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
-    """Read one authoritative adapter record, including disabled records."""
+def _registered_adapter_response(
+    adapter_id: str, *, timeout_s: float | None = None
+) -> tuple[dict | None, httpx.Response]:
+    """Read one authoritative adapter record and retain its polling headers."""
     resp = _serving_request(
         "GET",
         _adapter_url(adapter_id),
@@ -464,7 +537,7 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
         timeout_s=timeout_s,
     )
     if resp.status_code == 404:
-        return None
+        return None, resp
     try:
         payload = resp.json()
     except ValueError as exc:
@@ -476,6 +549,12 @@ def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> d
     record = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else payload
     if not isinstance(record, dict):
         raise ServingError(f"serving returned no adapter record for {adapter_id}")
+    return record, resp
+
+
+def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
+    """Read one authoritative adapter record, including disabled records."""
+    record, _ = _registered_adapter_response(adapter_id, timeout_s=timeout_s)
     return record
 
 
@@ -570,6 +649,18 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     return advertised
 
 
+def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(delay) and delay > 0:
+                return min(delay, READBACK_MAX_DELAY_SECONDS)
+    return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
+
+
 def _wait_revision_ready(
     revision: str,
     subfolder: str,
@@ -582,25 +673,35 @@ def _wait_revision_ready(
     last_state = "registered"
     last_read_error: ServingError | None = None
     first_read = True
+    attempt = 0
+    retry_after: str | None = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         if not first_read:
-            time.sleep(min(READBACK_DELAY_SECONDS, remaining))
+            delay = _readback_delay(attempt - 1, retry_after)
+            time.sleep(min(delay, remaining))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
         first_read = False
         try:
-            record = _registered_adapter(revision, timeout_s=remaining)
+            record, response = _registered_adapter_response(revision, timeout_s=remaining)
         except ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
             last_read_error = exc
+            retry_after = exc.retry_after
+            attempt += 1
             continue
-        if time.monotonic() >= deadline:
+        # a read that only completes once the whole budget is spent was not confirmed ready in
+        # time; do not honor it, and leave last_state untouched so the timeout is reported.
+        if deadline - time.monotonic() <= 0:
             break
+        retry_after = response.headers.get("Retry-After")
+        attempt += 1
+        # a record fetched within the deadline is still inspected for readiness before giving up.
         if record is None:
             continue
         last_read_error = None
@@ -704,7 +805,7 @@ def _activate_revision(
         target = None
         for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
             if attempt:
-                time.sleep(READBACK_DELAY_SECONDS)
+                time.sleep(ACTIVATION_READBACK_DELAY_SECONDS)
             try:
                 alias = _registered_adapter(run_id)
                 read_error = None
@@ -801,9 +902,9 @@ def _retryable_smoke_unavailable(
     try:
         retry_after_seconds = float(raw_delay)
     except (TypeError, ValueError):
-        retry_after_seconds = READBACK_DELAY_SECONDS
+        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
     if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
-        retry_after_seconds = READBACK_DELAY_SECONDS
+        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
     return RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
@@ -836,21 +937,26 @@ def chat(
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
-    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=timeout) as client:
-        resp = client.post(f"{base}/chat/completions", json=body, headers=headers)
-    if retry_unavailable:
-        retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
-        if retryable_error is not None:
-            raise retryable_error
-    resp.raise_for_status()
-    payload = resp.json()
-    if expected_checkpoint and isinstance(payload, dict):
-        payload["_freesolo_headers"] = {
-            "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
-            "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
-            "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
-        }
-    return payload
+    client_context = (
+        httpx.Client(follow_redirects=True, max_redirects=100)
+        if retry_unavailable
+        else contextlib.nullcontext(_chat_http_client())
+    )
+    with client_context as client:
+        resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
+        if retry_unavailable:
+            retryable_error = _retryable_smoke_unavailable(resp, requested_model=run_id)
+            if retryable_error is not None:
+                raise retryable_error
+        resp.raise_for_status()
+        payload = resp.json()
+        if expected_checkpoint and isinstance(payload, dict):
+            payload["_freesolo_headers"] = {
+                "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
+                "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
+                "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
+            }
+        return payload
 
 
 def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
@@ -887,12 +993,13 @@ def chat_stream(
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
         "stream": True,
     }
-    with (
-        httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
-        client.stream(
-            "POST", f"{base}/chat/completions", json=body, headers=_internal_key_header()
-        ) as resp,
-    ):
+    with _stream_http_client().stream(
+        "POST",
+        f"{base}/chat/completions",
+        json=body,
+        headers=_internal_key_header(),
+        timeout=30 * 60.0,
+    ) as resp:
         resp.raise_for_status()
         if "application/json" in resp.headers.get("content-type", ""):
             # client.stream() leaves body unread; must call resp.read() before .json().
