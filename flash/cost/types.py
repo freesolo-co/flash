@@ -78,6 +78,10 @@ class RunConfig:
             raise TypeError("gpu_count must be an integer")
         if self.gpu_count < 1:
             raise ValueError(f"gpu_count must be >= 1, got {self.gpu_count}")
+        # upper bound mirrors GpuSpec's 1..8 so a direct RunConfig(gpu_count=...) cannot price a
+        # count the spec layer would reject.
+        if self.gpu_count > 8:
+            raise ValueError(f"gpu_count must be <= 8, got {self.gpu_count}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.
