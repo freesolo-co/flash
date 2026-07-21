@@ -556,19 +556,18 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     from flash.engine.worker import sft
 
     src = inspect.getsource(sft.run_sft)
-    # The {input_ids, completion_mask} representation is built by the extracted pre-tokenizer; inspect
-    # it for the boundary/representation, and run_sft for the wiring + surviving optimizations.
-    pre_src = inspect.getsource(sft._pretokenize_completion_only)
+    prep_src = inspect.getsource(sft._render_tokenize_sft_batch)
+    output_src = inspect.getsource(sft._prepare_sft_examples)
 
-    # completion-only loss is ON (and the old `False` literal for that key is gone)
+    # completion-only loss is on and the old false literal for that key is gone
     assert '"completion_only_loss": True' in src
     assert '"completion_only_loss": False' not in src
-    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation lives in the
-    # helper; run_sft consumes it and turns it into the dataset
-    assert "completion_mask_from_ids(" in pre_src
-    assert '"completion_mask":' in pre_src
-    assert "tokenize_for_packing(" in pre_src  # EOS-append parity tokenization
-    assert "_pretokenize_completion_only(" in src
+    # the parallel prep path preserves the prompt boundary and pre-tokenized representation
+    assert "completion_mask_from_ids(" in prep_src
+    assert '"completion_mask":' in prep_src
+    assert "tokenize_for_packing(" in prep_src
+    assert '"completion_mask": row["completion_mask"]' in output_src
+    assert "_prepare_sft_examples(" in src
     assert "Dataset.from_list(_pretok)" in src
     # both flash custom-packing paths thread the completion mask through the packer
     assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
@@ -580,7 +579,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "emit_varlen=True" in src  # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
-    # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
+    # tokenize_for_packing stays in the parallel prep path asserted above
     # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None, which
     # trl's SFTTrainer.compute_loss can't consume) — so SFT materialises logits and is sized UNFUSED
     # (_sft_fused = False) up front, no post-init batch/grad-accum fixup.
