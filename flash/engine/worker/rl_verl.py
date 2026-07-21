@@ -81,6 +81,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "algorithm.norm_adv_by_std_in_grpo=False",
         f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
         "algorithm.use_kl_in_reward=False",
+        # truncated importance sampling (token-level, cap 2.0): corrects the vllm-rollout vs
+        # fsdp-train policy mismatch. matches the trl path's tis recipe (token_truncate, c_max=2.0);
+        # verl otherwise defaults to sequence-level tis, so pin token to match flash.
+        "algorithm.rollout_correction.rollout_is=token",
+        "algorithm.rollout_correction.rollout_is_threshold=2.0",
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
@@ -137,6 +142,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
+    if cfg.get("fp8_kv"):
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the trl colocate path; tis (above) covers
+        # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
+        # engine_kwargs.vllm struct (it is not a default field).
+        o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
     return o
 
 
@@ -567,6 +577,12 @@ def run_rl_verl():
         expected_steps = int(inp["steps"])
         # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
         loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path.
+        try:
+            import torch as _torch_cc
+            fp8_kv = bool(_torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9))
+        except Exception:  # no cuda / probe failure -> conservative bf16 kv
+            fp8_kv = False
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
             "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
@@ -577,7 +593,7 @@ def run_rl_verl():
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
-            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers,
+            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers, "fp8_kv": fp8_kv,
             "reward_path": reward_py, "reward_name": "compute_score",
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }

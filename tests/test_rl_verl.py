@@ -56,7 +56,7 @@ def _overrides_cfg(**over):
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
-        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console",
+        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
         "reward_path": "/w/reward.py", "reward_name": "compute_score", "total_epochs": 1,
         "save_freq": 20, "local_dir": "/w/ckpt",
     }
@@ -84,11 +84,21 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "trainer.max_actor_ckpt_to_keep=1" in o
     assert "trainer.logger=[console]" in o
     assert "data.train_batch_size=16" in o
+    # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
+    assert "algorithm.rollout_correction.rollout_is=token" in o
+    assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
 
 
 def test_build_verl_overrides_wandb_logger_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(loggers="console,wandb"))
     assert "trainer.logger=[console,wandb]" in o
+
+
+def test_build_verl_overrides_fp8_kv_gated_on_hardware():
+    off = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=False))
+    assert not any("kv_cache_dtype" in x for x in off)
+    on = rl_verl.build_verl_overrides(_overrides_cfg(fp8_kv=True))
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" in on
 
 
 def test_build_verl_overrides_kl_off_by_default():
