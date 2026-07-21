@@ -374,6 +374,31 @@ def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
     assert "could not be prepared" not in response.json()["detail"]
 
 
+def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
+    # a warm-start run whose non-structured context preflight fails must surface the SPECIFIC
+    # context error, not the generic warm-start "could not be prepared" mask (the context guard
+    # runs ahead of adapter resolution, so its ValueError must propagate like structured runs do)
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+            "max_completion_tokens": 3500,
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "could not be prepared" not in detail
+    assert "serving max_model_len" in detail
+
+
 @pytest.mark.parametrize(
     "structured_outputs",
     [
