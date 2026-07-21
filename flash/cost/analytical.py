@@ -166,7 +166,9 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
         completions, seq_tokens = _opd_step_shape(n)
         gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
-        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * update_mfu)
+        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (
+            peak * update_mfu
+        )
         teacher_lat = teacher_seconds_per_completion()
         # run_opd's primary path scores a step's completions CONCURRENTLY over Fireworks with a fan-out
         # cap of the step's OWN completion count (prompts_per_step * group_size, opd.py Phase 2), so
@@ -190,6 +192,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         math.ceil(completions / REWARD_CONCURRENCY) * latency
     )  # ceil: a partial wave still costs one latency
     return overhead + gen_s + reward_s + update_s
+
 
 def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> float:
     """SFT steady-state wall time for an actual token count on ``gpu``."""
@@ -276,7 +279,11 @@ def _notes(
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
     # Billing cap: mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
-    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    cap_s = (
+        max(60.0, float(config.max_wall_seconds))
+        if config.max_wall_seconds is not None
+        else wall_cap_s
+    )
     # Vast market duration filter: price against offers that outlast the run, using the SAME semantics
     # ``usable_offers`` applies at LAUNCH (not the 60s-floored billing cap_s) — a non-positive wall means
     # NO filter, a positive one is floored at 60s by usable_offers itself:
@@ -331,7 +338,9 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     compile_s = compile_seconds(config, gpu)
     raw_train = compile_s + config.steps * sps + required_save_s
     if not config.is_grpo and config.train_tokens is not None:
-        raw_train = compile_s + sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+        raw_train = (
+            compile_s + sft_seconds_for_tokens(config, gpu, config.train_tokens) + required_save_s
+        )
     sps = raw_train / config.steps
 
     # The cap is on total elapsed wall; setup is reported but not billed, so only training
@@ -367,9 +376,11 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         train_seconds=train,
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
+        gpu_count=config.gpu_count,
         # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
-        # only as a diagnostic and is not passed through to the customer.
-        total_usd=train / 3600.0 * hourly,
+        # only as a diagnostic and is not passed through to the customer. an n-card job occupies
+        # n cards for the billed training wall, so the charge scales linearly with gpu_count.
+        total_usd=train / 3600.0 * hourly * config.gpu_count,
         teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )
