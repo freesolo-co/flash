@@ -2805,6 +2805,11 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         from flash.providers.base import Allocation, Candidate
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
+        # this test targets oom supervision; the verl environment contract is covered separately.
+        monkeypatch.setattr(
+            "flash.runner.lifecycle._preflight_opd_verl_environment", lambda _spec: None
+        )
+
         candidates = (
             Candidate("runpod", "A100 SXM 40GB", 1.00, 40),
             Candidate("runpod", "A100 SXM 40GB", 1.01, 40),
