@@ -440,6 +440,17 @@ def _resolve_single_turn_inputs():
             "advantages (no value clip), matching the trl path",
             flush=True,
         )
+    # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
+    # default True); verl's vllm rollout here has no per-completion truncation-mask knob, so verl
+    # keeps them. stop_sequences (the only case that turns masking off) already fails loudly above,
+    # so this is always the default-True case. record the divergence for parity observability
+    # rather than silently ignoring it; adding verl-side masking is a tracked follow-up.
+    if _w.grpo_mask_truncated_completions(_t):
+        print(
+            "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
+            "grpo loss (no verl truncation-mask knob) -- recorded parity caveat, not applied",
+            flush=True,
+        )
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
@@ -581,6 +592,7 @@ def run_rl_verl():
 
     server, reward_url = start_reward_server(_score)
     try:
+        proc = None
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
@@ -602,7 +614,13 @@ def run_rl_verl():
         }
         overrides = build_verl_overrides(cfg)
 
-        _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
+        # clear any checkpoints left by a prior run on this fixed per-seed worker dir, so finalize's
+        # highest-global_step_N pick can only ever see THIS run's checkpoints (a retry or partial
+        # run otherwise leaves stale global_step_* folders that could export a prior run's adapter).
+        shutil.rmtree(local_dir, ignore_errors=True)
+
+        setup_seconds = time.time() - t_start
+        _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
         step_box = [0]
 
         def _progress():
@@ -639,6 +657,12 @@ def run_rl_verl():
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
     finally:
+        # ensure the verl child can't outlive us holding gpu memory if stdout reading raised before
+        # proc.wait() (shutting down the reward server alone would leave main_ppo running).
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
@@ -649,6 +673,15 @@ def run_rl_verl():
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
+    # an empty reward_history means the reward bridge never scored a completion (rollout produced
+    # nothing, or scoring never ran): a no-op run, not a success. mirror the trl path and fail
+    # loudly instead of exporting/publishing an untrained adapter. verl never resumes -> ckpt None.
+    if _w._grpo_is_no_op_failure(reward_history, None, expected_steps, steps_run):
+        raise RuntimeError(
+            f"verl grpo scored no reward over {steps_run} step(s) — the rollout produced no "
+            "completions, so the policy was never actually trained. failing loudly instead of "
+            "publishing a no-op run as done."
+        )
 
     with liveness_heartbeat("rl_verl_finalizing", progress=lambda: steps_run, progress_step=True, keepalive=True):
         _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
@@ -665,6 +698,7 @@ def run_rl_verl():
         adapter_dir=adapter_dir,
         model_id=inp["model_id"],
         train_wall=train_wall,
+        setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=0,
         notes={
