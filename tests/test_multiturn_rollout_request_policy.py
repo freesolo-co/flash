@@ -15,6 +15,7 @@ from flash.engine.multiturn_rollout import (
     resolve_rollout_request_timeout_seconds,
     rollout_async,
 )
+from flash.envs.base import BaseEnvironment
 
 
 class _Clock:
@@ -30,6 +31,7 @@ class _Clock:
 
 class _Env:
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def __init__(self, turns=1):
         self.turns = turns
