@@ -195,7 +195,11 @@ def _architecture_kv_raw_gb(
         value_dim = int(getattr(model_info, "linear_value_head_dim", 0) or 0)
         conv_kernel = int(getattr(model_info, "linear_conv_kernel_dim", 0) or 0)
         if not all((key_heads, value_heads, key_dim, value_dim, conv_kernel)):
-            return None
+            # linear-attention dims are absent from the catalog: we can't size the recurrent/conv
+            # state, but the standard attention KV already accumulated in total_bytes is a better
+            # (if partial) estimate than the params-only legacy heuristic. The caller floors this
+            # partial value with legacy so a hybrid model is never under-sized below the heuristic.
+            return total_bytes / 1e9
         # vllm stores qwen gated-deltanet recurrent and convolution state in bf16 pages.
         state_elements = value_heads * key_dim * value_dim
         state_elements += (key_heads * key_dim + value_heads * value_dim) * conv_kernel
@@ -233,7 +237,24 @@ def _resident_kv_gb(
     profiled = max(_KV_CAP, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
     # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
     # conservative pool until the architecture equation is validated on those exact gpu paths.
-    if preserve_legacy_floor or getattr(model_info, "sleep_unsupported", False):
+    # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV
+    # only); floor it with legacy so the dropped recurrent/conv state can't under-size it.
+    _declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
+    _linear_dims_known = all(
+        int(getattr(model_info, _f, 0) or 0)
+        for _f in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+        )
+    )
+    if (
+        preserve_legacy_floor
+        or getattr(model_info, "sleep_unsupported", False)
+        or (_declares_linear and not _linear_dims_known)
+    ):
         profiled = max(profiled, legacy)
     return profiled
 
