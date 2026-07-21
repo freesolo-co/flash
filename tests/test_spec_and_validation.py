@@ -116,6 +116,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
+    assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -128,8 +129,46 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "teacher_model",
             "structured_outputs",
             "save_at_steps",
+            "credit_assignment",
         }
     } == {"0.2.0"}
+
+
+def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
+    default = spec_from_dict(_raw())
+    assert default.train.credit_assignment == "per_episode"
+    assert JobSpec.from_json(default.to_json()).train.credit_assignment == "per_episode"
+
+    empty = spec_from_dict(_raw(**{"train.credit_assignment": "  "}))
+    assert empty.train.credit_assignment == "per_episode"
+
+    per_turn = spec_from_dict(_raw(**{"train.credit_assignment": " Per_Turn "}))
+    assert per_turn.train.credit_assignment == "per_turn"
+    assert per_turn.to_dict()["train"]["credit_assignment"] == "per_turn"
+    assert JobSpec.from_json(per_turn.to_json()).train.credit_assignment == "per_turn"
+
+
+@pytest.mark.parametrize("invalid", ["per_step", 1])
+def test_credit_assignment_rejects_invalid_values(invalid: object) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        spec_from_dict(_raw(**{"train.credit_assignment": invalid}))
+    assert str(excinfo.value) == (
+        f'train.credit_assignment must be "per_episode" or "per_turn"; got {invalid!r}'
+    )
+
+
+def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> None:
+    # the worker-side deserialization boundary must round-trip valid modes, default a missing value,
+    # and reject a malformed persisted/tampered value rather than silently downgrading to per-episode.
+    payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_turn"
+
+    payload["train"].pop("credit_assignment", None)
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
+
+    payload["train"]["credit_assignment"] = "per_step"
+    with pytest.raises(ValueError, match="credit_assignment must be one of"):
+        JobSpec.from_dict(payload)
 
 
 def test_train_key_validator_rejects_unknown_names_only() -> None:
@@ -174,9 +213,10 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. current adds save_at_steps and removes the legacy opd eos key.
+    # did. current adds save_at_steps and credit_assignment, and removes the legacy opd eos key.
     assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
-        "save_at_steps"
+        "credit_assignment",
+        "save_at_steps",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
@@ -642,7 +682,7 @@ def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> No
         spec_from_dict(_raw(**{"gpu.provider": "aws"}))
     with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
         spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
-    with pytest.raises(ConfigError, match="validated"):
+    with pytest.raises(ConfigError, match=r"unsupported gpu 'RTX A6000'"):
         spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
     with pytest.raises(ConfigError, match="requires at least"):
         spec_from_dict(
@@ -690,8 +730,8 @@ def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
     assert "`flash gpus` to list valid classes" in invalid_warning
     assert 'add exact_type = "H10O"' not in invalid_warning
 
-    # a retired-but-known class canonicalizes but is not validated, so it must be treated like an
-    # unrecognized hint and never echoed back as an exact_type the schema would immediately reject.
+    # an unrecognized type hint (e.g. a removed/retired class name) must be treated like any unknown
+    # string and never echoed back as an exact_type the schema would immediately reject.
     spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
     retired_warning = capsys.readouterr().err
     assert "[gpu] type='RTX A6000' is not an active GPU class and was ignored" in retired_warning
@@ -724,7 +764,7 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         JobSpec.from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match=r"gpu\.type: unsupported gpu 'H10O'"):
         JobSpec.from_dict({"gpu": {"type": "H10O"}})
-    with pytest.raises(ValueError, match="active validated GPU class"):
+    with pytest.raises(ValueError, match=r"unsupported gpu 'RTX A6000'"):
         JobSpec.from_dict({"gpu": {"type": "RTX A6000"}})
 
 

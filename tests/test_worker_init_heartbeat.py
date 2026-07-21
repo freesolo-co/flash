@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import re
 import sys
 import threading
@@ -363,6 +364,40 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
     assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
     ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
     assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+
+
+@pytest.mark.parametrize("stage", ["rl_step", "opd_step"])
+def test_forced_sample_payload_commits_after_same_step_liveness(monkeypatch, stage):
+    """a liveness commit for a step must not throttle the first sample payload for that step."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+
+    ne.heartbeat(stage, step=1)
+    assert len(uploads) == 1
+
+    committed = ne.heartbeat(
+        stage,
+        step=1,
+        force=True,
+        sampled_completions=[
+            {
+                "prompt_tail": "prompt",
+                "completion": "completion",
+                "reward" if stage == "rl_step" else "loss": 1.0,
+                "generated_at_step": 0,
+            }
+        ],
+    )
+
+    assert committed is True
+    assert len(uploads) == 2
 
 
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
@@ -880,3 +915,51 @@ def test_no_worker_side_stall_watchdog():
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     assert not hasattr(hb, "_rearm_stall_faulthandler")
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
+
+
+def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    long_name = "x" * 100_000
+
+    bounded = hb._bounded_reward_metrics(
+        {
+            long_name: 1.0,
+            "line\nbreak": 2.0,
+            "reward": 3.0,
+            "step": 4.0,
+        }
+    )
+
+    assert "x" * 64 in bounded
+    assert all(len(name) <= 64 for name in bounded)
+    assert "linebreak" in bounded
+    assert all("\n" not in name for name in bounded)
+    assert "reward" not in bounded
+    assert "step" not in bounded
+
+
+def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    worker = importlib.import_module("flash.engine.worker")
+    emitted = []
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
+    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
+
+    transformers = types.ModuleType("transformers")
+    transformers.TrainerCallback = type("TrainerCallback", (), {})
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    metrics = {
+        "nan_metric": float("nan"),
+        "inf_metric": float("inf"),
+        **{f"metric_{index:02d}": float(index) for index in reversed(range(14))},
+    }
+    callback = hb.make_reward_heartbeat_callback(lambda: metrics)
+    state = types.SimpleNamespace(global_step=3)
+    callback.on_log(None, state, None, logs={"reward": 0.65})
+
+    assert emitted[0][0] == "rl_step"
+    reward_metrics = emitted[0][1]["reward_metrics"]
+    assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
+    assert all(math.isfinite(value) for value in reward_metrics.values())
+    assert callback.latest_fields() == {"reward_metrics": reward_metrics}
