@@ -1281,7 +1281,10 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         if isinstance(hb, dict) and "metrics_last" not in hb:
             prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
-            if isinstance(prev_metrics, list) and prev_metrics:
+            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
+            # new attempt must not inherit the prior attempt's stale per-step metrics.
+            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
+            if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
                 hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
