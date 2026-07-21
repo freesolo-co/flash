@@ -88,7 +88,7 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
         "run_id": "flash-1",
         "state": "done",
         "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
-        "remote": {"gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
+        "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
     runs = render.runs_table([run])
     status = render.run_status(run)
@@ -98,6 +98,48 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     assert "runpod" not in status.lower()
     assert "provider" not in status.lower()
     assert "flash_arm" not in status.lower()
+
+
+def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    allocated_run = {
+        "run_id": "flash-allocated",
+        "state": "done",
+        "spec": {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX Pro 6000"},
+        },
+        "remote": {"allocated_gpu": "B200"},
+    }
+    runs = render.runs_table([allocated_run])
+    status = render.run_status(allocated_run)
+    status_panel = status.split("details", 1)[0]
+    assert "B200" in runs
+    assert "B200" in status_panel
+    assert "RTX Pro 6000" not in runs
+    assert "RTX Pro 6000" not in status_panel
+
+    spec_only_run = {
+        "run_id": "flash-spec-only",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+    }
+    assert "RTX Pro 6000" in render.runs_table([spec_only_run])
+    assert "RTX Pro 6000" in render.run_status(spec_only_run)
+
+    # the removed legacy remote["gpu"] key is no longer honored: the label resolves from the
+    # authoritative allocated_gpu or the provisional spec type, never the dead key.
+    legacy_key_run = {
+        "run_id": "flash-legacy-key",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+        "remote": {"gpu": "B200"},
+    }
+    assert "B200" not in render.runs_table([legacy_key_run])
+    assert "RTX Pro 6000" in render.runs_table([legacy_key_run])
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
