@@ -904,7 +904,12 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
     ("algorithm", "model", "extra_params", "message"),
     [
         ("opd", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
-        ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
+        (
+            "opd",
+            "Qwen/Qwen3.5-4B",
+            {"multi_turn": True},
+            "not yet supported on the verl OPD backend",
+        ),
     ],
 )
 def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
