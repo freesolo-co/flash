@@ -8,7 +8,13 @@ from typing import Any
 
 from flash.engine.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.envs.adapter import is_freesolo_environment_id
-from flash.spec import WandbSpec, validate_worker_env_reserved
+from flash.spec import (
+    CREDIT_ASSIGNMENTS,
+    DEFAULT_CREDIT_ASSIGNMENT,
+    CreditAssignment,
+    WandbSpec,
+    validate_worker_env_reserved,
+)
 
 
 def _section_int(
@@ -235,6 +241,22 @@ def _train_structured_outputs(train_raw: dict) -> str:
     if canonical is None:
         return ""
     return json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+
+
+def _train_credit_assignment(train_raw: dict) -> CreditAssignment:
+    """Validate the multi-turn GRPO credit-assignment mode."""
+    value = train_raw.get("credit_assignment")
+    if value is None:
+        return DEFAULT_CREDIT_ASSIGNMENT
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return DEFAULT_CREDIT_ASSIGNMENT
+        for mode in CREDIT_ASSIGNMENTS:
+            if normalized == mode:
+                return mode
+    allowed = '" or "'.join(CREDIT_ASSIGNMENTS)
+    raise ConfigError(f'train.credit_assignment must be "{allowed}"; got {value!r}')
 
 
 def _require_environment_ref(value: str, message: str) -> None:
