@@ -87,7 +87,7 @@ def _latest_named_reward_metrics(
             # every completion failed scoring this generation: surface the known metrics as
             # zeros instead of dropping them, so a full scoring outage shows a flat 0 rather
             # than hiding behind missing heartbeat fields.
-            latest.update({name: 0.0 for name in latest})
+            latest.update(dict.fromkeys(latest, 0.0))
     return dict(latest)
 
 
