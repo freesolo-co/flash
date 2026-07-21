@@ -660,7 +660,8 @@ def run_rl_verl():
         # ensure the verl child can't outlive us holding gpu memory if stdout reading raised before
         # proc.wait() (shutting down the reward server alone would leave main_ppo running).
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=10)
         server.shutdown()
