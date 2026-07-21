@@ -221,6 +221,7 @@ def opd_vllm_kwargs(
                 protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
                 rollout_budget_gb = max(0.0, free_gb - protected_gb)
                 max_startup_util = rollout_budget_gb / max(1.0, card_gb)
+                lean_trimmed = False
                 while rollout_concurrency > 1 and util > max_startup_util:
                     rollout_concurrency -= 1
                     util = _util_for(rollout_concurrency)
@@ -248,6 +249,16 @@ def opd_vllm_kwargs(
                         )
                         protected_gb = lean_protected_gb
                         max_startup_util = lean_startup_util
+                        lean_trimmed = True
+                        # the concurrency loop above bottomed out against the stricter full
+                        # budget; re-seek how many sequences now fit under the relaxed lean
+                        # ceiling so the lean path is not frozen at the reduced floor.
+                        while (
+                            rollout_concurrency < target_concurrency
+                            and _util_for(rollout_concurrency + 1) <= max_startup_util
+                        ):
+                            rollout_concurrency += 1
+                            util = _util_for(rollout_concurrency)
                     else:
                         startup_oom = _startup_oom_error(
                             free_gb=free_gb,
@@ -256,9 +267,15 @@ def opd_vllm_kwargs(
                             reserve_gb=protected_gb,
                             rollout_batch_size=rollout_concurrency,
                         )
-                if startup_oom is None and _rollout_uplift_validated(params_b, resolved_lora_rank):
+                if (
+                    startup_oom is None
+                    and not lean_trimmed
+                    and _rollout_uplift_validated(params_b, resolved_lora_rank)
+                ):
                     # 0.80 is a final ceiling for the validated qwen3.5-4b/rank-32 size class; larger
                     # or higher-rank models keep the existing colocate ceiling until gpu validation.
+                    # skip uplift when we had to lean-trim: the lean budget only leaves ~1 GiB of
+                    # headroom for the training peak, so spending it on the rollout executor risks OOM.
                     util = max(util, min(0.80, max_startup_util))
                 print(
                     "[opd] vLLM memory budget "
