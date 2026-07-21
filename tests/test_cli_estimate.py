@@ -277,8 +277,11 @@ def test_sft_steps_default_epochs_mirror_the_worker():
 def test_sft_steps_use_worker_realized_grad_accum_batch():
     # batch_size 6 is NOT a multiple of the micro-batch (4): the worker realizes per_device(4) x
     # grad_accum(ceil(6/4)=2) = 8, so steps = epochs(2) x ceil(320/8) = 80 -- NOT the raw-batch
-    # ceil(320/6)*2 = 108 the old derivation produced.
-    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2)
+    # ceil(320/6)*2 = 108. Pin the estimator to the worker's independent step derivation here on the
+    # UNPACKED path (context > 16k): the chunked-nll gdn-packing special-case that deliberately prices
+    # the requested batch conservatively only applies at packable (<=16k) context and is covered by
+    # test_sft_steps_price_gdn_packing_conservatively.
+    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2, max_context_tokens=16_385)
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=6, epochs=2) == 80
 
 
