@@ -214,6 +214,16 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
+def _is_balance_error(exc: Exception) -> bool:
+    """True when RunPod refuses to create an endpoint because the account is out of balance.
+
+    Like a worker-quota error this is account-specific (another pool account may have funds), so it
+    must trigger failover to the next key — but unlike a quota error, sweeping idle endpoints on the
+    broke account can't help, so the caller fails over immediately instead of sweeping and retrying.
+    """
+    return "account balance" in str(exc).lower()
+
+
 # {endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)} — grace timer per endpoint.
 # Serialized by _idle_since_lock; two threads (periodic reaper + deploy-time quota sweep) can race.
 _idle_since: dict[str, tuple[float, str]] = {}
@@ -457,6 +467,10 @@ def deploy_train_endpoint(
                 resource, owning_fingerprint = _deploy_once()
                 break  # success
             except Exception as exc:
+                if _is_balance_error(exc):
+                    # a broke account can't be helped by sweeping idle endpoints — fail over now
+                    quota_exc = exc
+                    break
                 if not _is_workers_quota_error(exc):
                     raise
                 quota_exc = exc
@@ -466,9 +480,14 @@ def deploy_train_endpoint(
             with FLASH_SDK_LOCK:
                 rp_keys.advance_key()
             failovers_left -= 1
+            reason = (
+                "has insufficient balance"
+                if quota_exc is not None and _is_balance_error(quota_exc)
+                else "worker quota exhausted after sweeping"
+            )
             logger.warning(
-                "RunPod worker quota exhausted on this account after sweeping; failing over to "
-                "the next RUNPOD_API_KEY account (%d configured)",
+                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
+                reason,
                 rp_keys.key_count(),
             )
             continue
