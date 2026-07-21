@@ -955,8 +955,10 @@ def prepare_job(
 
         preflight_serving_path(spec)
     else:
-        from flash.lora_rank import preflight_train_context_within_serving
-        from flash.serve.preflight import ServingPreflightError
+        from flash.lora_rank import (
+            ServingPreflightError,
+            preflight_train_context_within_serving,
+        )
 
         # mirror preflight_serving_path: surface the specific context error as a
         # ServingPreflightError so create_run re-raises it unchanged instead of the

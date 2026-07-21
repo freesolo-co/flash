@@ -380,10 +380,11 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
     # runs ahead of adapter resolution, so its ValueError must propagate like structured runs do)
     spec = {
         **SPEC,
+        "model": "Qwen/Qwen3.5-0.8B",
         "train": {
             **SPEC["train"],
             "init_from_adapter": "source-run",
-            "max_completion_tokens": 3500,
+            "max_completion_tokens": 34000,
         },
     }
 
