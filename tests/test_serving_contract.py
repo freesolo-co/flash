@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from flash.serve.deploy import (
@@ -10,6 +12,18 @@ from flash.serve.deploy import (
     serving_base_url,
     undeploy_adapter,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_shared_http_client(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            return getattr(deploy.httpx, method.lower())(url, **kwargs)
+
+    client = _Client()
+    monkeypatch.setattr(deploy, "_http_client", lambda: client)
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
@@ -263,8 +277,9 @@ def test_serving_prices_pin_public_rates_plus_markup():
         "Qwen/Qwen3.5-0.8B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-2B": (0.02, 0.10, 0.004),
         "Qwen/Qwen3.5-4B": (0.03, 0.15, 0.006),
-        "Qwen/Qwen3.5-9B": (0.10, 0.15, 0.020),
-        "Qwen/Qwen3.6-35B-A3B": (0.15, 1.00, 0.050),
+        "Qwen/Qwen3.5-9B": (0.114, 0.19, 0.023),
+        "Qwen/Qwen3.6-27B": (0.4254, 3.055, 0.14),
+        "Qwen/Qwen3.6-35B-A3B": (0.198, 1.265, 0.066),
     }
     for model_id, (input_rate, output_rate, cached_rate) in typical.items():
         price = SERVING_PRICES[model_id]
@@ -494,8 +509,8 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
     mismatched = {**expected, "repo_id": "other/repo"}
     monkeypatch.setattr(
         deploy,
-        "_registered_adapter",
-        lambda adapter_id, **_kwargs: mismatched,
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (mismatched, types.SimpleNamespace(headers={})),
     )
 
     with pytest.raises(deploy.ServingError, match="different immutable identity"):
@@ -530,8 +545,11 @@ def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypat
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
         deploy,
-        "_registered_adapter",
-        lambda adapter_id, **_kwargs: readback["record"],
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (
+            readback["record"],
+            types.SimpleNamespace(headers={}),
+        ),
     )
 
     assert (

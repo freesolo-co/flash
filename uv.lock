@@ -1024,7 +1024,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.0.2"
+version = "1.0.8"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1093,9 +1093,9 @@ requires-dist = [
     { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.2.54" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
-    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=0.34" },
-    { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = ">=0.34" },
-    { name = "huggingface-hub", marker = "extra == 'server'", specifier = ">=0.34" },
+    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=1.2.0" },
+    { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = ">=1.2.0" },
+    { name = "huggingface-hub", marker = "extra == 'server'", specifier = ">=1.2.0" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.23" },
     { name = "jsonschema", marker = "extra == 'server'", specifier = ">=4.23" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },

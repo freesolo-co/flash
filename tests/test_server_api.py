@@ -139,7 +139,9 @@ def test_requests_without_key_are_rejected(api):
     # A token that doesn't verify with freesolo is rejected.
     assert api.get("/v1/runs", headers=_bearer("not-a-freesolo-key")).status_code == 401
     assert api.get("/v1/models", headers=_bearer("nope")).status_code == 401
-    assert api.get("/v1/health").status_code == 200  # health stays open
+    health = api.get("/v1/health")
+    assert health.status_code == 200  # health stays open
+    assert "chat_step_selector_v1" in health.json()["capabilities"]
 
 
 def test_dry_run_reports_schema_agreement_without_persisting_it(api) -> None:
@@ -214,6 +216,259 @@ def test_missing_or_malformed_schema_metadata_does_not_change_parser_acceptance(
         response = api.post("/v1/runs", headers=_bearer("fslo-internal-test"), json=payload)
         assert response.status_code == 200, response.text
         assert "train_schema_compatibility" not in response.json()
+
+
+def test_dry_run_rejects_semantically_invalid_thinking_json_schema(api, monkeypatch) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "submit_job",
+        lambda *_a, **_k: pytest.fail("invalid serving config must fail before submission"),
+    )
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "structured_outputs": {"json": {"type": 7}},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "train.structured_outputs JSON schema is invalid" in response.json()["detail"]
+
+
+def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "max_context_tokens": 1024,
+            "max_completion_tokens": 32513,
+            "structured_outputs": {"choice": ["4"]},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "effective budget (32513) cannot fit" in detail
+    assert "serving max_model_len=32768" in detail
+    assert "lower train.max_completion_tokens to <= 32512" in detail
+
+
+def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "structured_outputs": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
+
+
+@pytest.mark.parametrize(
+    ("structured_outputs", "message"),
+    [
+        ({"regex": "["}, "regex is invalid"),
+        (
+            {"json": {"$ref": "https://example.invalid/schema.json"}},
+            "external schema retrieval is unsupported",
+        ),
+        (
+            {
+                "json": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "$dynamicRef": "https://example.invalid/schema.json#answer",
+                }
+            },
+            "external schema retrieval is unsupported",
+        ),
+        (
+            {
+                "json": {
+                    "$schema": "https://json-schema.org/draft/2019-09/schema",
+                    "$recursiveRef": "https://example.invalid/schema.json#",
+                }
+            },
+            "external schema retrieval is unsupported",
+        ),
+        (
+            {"json_object": True, "whitespace_pattern": "["},
+            "whitespace_pattern is invalid",
+        ),
+    ],
+)
+def test_dry_run_rejects_invalid_structured_serving_constraints(
+    api, monkeypatch, structured_outputs, message
+) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "submit_job",
+        lambda *_a, **_k: pytest.fail("invalid serving config must fail before submission"),
+    )
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {**SPEC["train"], "structured_outputs": structured_outputs},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {
+            **SPEC["train"],
+            "init_from_adapter": "source-run",
+            "structured_outputs": {"json": {"type": 7}},
+        },
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "train.structured_outputs JSON schema is invalid" in response.json()["detail"]
+    assert "could not be prepared" not in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        {"regex": r"^[0-9]+$", "whitespace_pattern": r"\s*"},
+        {
+            "json": {
+                "$defs": {"answer": {"type": "string"}},
+                "type": "object",
+                "properties": {"answer": {"$ref": "#/$defs/answer"}},
+            }
+        },
+        {"json": {"const": {"$ref": "https://example.invalid/is-instance-data"}}},
+        {
+            "json": {
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "object",
+            }
+        },
+    ],
+)
+def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_outputs) -> None:
+    spec = {
+        **SPEC,
+        "thinking": True,
+        "train": {**SPEC["train"], "structured_outputs": structured_outputs},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
+
+
+@pytest.mark.parametrize(
+    ("max_completion_tokens", "status_code"),
+    [(3500, 400), (3000, 200)],
+)
+def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
+    api, monkeypatch, tmp_path, max_completion_tokens, status_code
+) -> None:
+    import flash.envs.loader as envs_loader
+    import flash.schema as schema
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
+    # offline: the valid-context path pins the github env ref to a sha; stub it so the
+    # test never makes a real github request (the api fixture only sets a fake token)
+    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
+    # the valid-context path also runs the image-opd preflight, which resolves the env
+    # reference to inspect its dataset for images. point it at an empty local dir so the
+    # preflight finds no packaged dataset and returns without a real github request.
+    _offline_env_dir = tmp_path / "env"
+    _offline_env_dir.mkdir()
+    (_offline_env_dir / "environment.py").write_text("")
+    monkeypatch.setattr(
+        envs_loader,
+        "_resolve_environment_reference",
+        lambda *_a, **_k: str(_offline_env_dir / "environment.py"),
+    )
+    if status_code == 400:
+        monkeypatch.setattr(
+            runs_route._app,
+            "submit_job",
+            lambda *_a, **_k: pytest.fail("invalid context must fail before allocation"),
+        )
+    spec = {
+        **SPEC,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "algorithm": "opd",
+        "thinking": False,
+        "train": {
+            **SPEC["train"],
+            "max_completion_tokens": max_completion_tokens,
+            "structured_outputs": {"choice": ["4"]},
+        },
+        "gpu": {"type": "B200"},
+    }
+
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert response.status_code == status_code, response.text
+    if status_code == 400:
+        detail = response.json()["detail"]
+        assert "OPD rollout prompt+completion)=4524" in detail
+        assert "serving max_model_len=4096" in detail
+    else:
+        assert response.json()["state"] == "dry_run"
 
 
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
@@ -3054,6 +3309,159 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     assert response.status_code == 200, text
     assert text == "verified"
     assert seen["run_id"] == revision
+
+
+def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "b" * 40]
+    for revision in revisions:
+        runner.mark_checkpoint_deployed(
+            run_id,
+            {
+                "state": "ready",
+                "endpoint_name": "https://serve.example",
+                "adapter_revision": revision,
+            },
+            verification_generation=runner.verified_adapter_revision_generation(run_id),
+        )
+    assert runner.get_status(run_id).deployment["adapter_revision"] == revisions[1]
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 20},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["run_id"] == revisions[1]
+
+
+def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "c" * 40]
+    for revision in revisions:
+        generation = runner.verified_adapter_revision_generation(run_id)
+        assert runner.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=generation,
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an ambiguous step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 20},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "multiple verified revisions at step 20" in detail
+    assert "flash deployments" in detail
+
+
+def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@final." + "b" * 40]
+    for revision in revisions:
+        generation = runner.verified_adapter_revision_generation(run_id)
+        assert runner.add_verified_adapter_revision(
+            run_id,
+            revision,
+            expected_generation=generation,
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an unverified step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": 40},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "deploy it first" in detail
+    assert f"flash deploy {run_id}/step-40" in detail
+    assert "currently deployed steps: 20, final" in detail
+
+
+def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an ambiguous target must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "adapter_revision": f"{run_id}@step-20." + "a" * 40,
+            "step": 20,
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "pass either adapter_revision or step, not both"
+
+
+@pytest.mark.parametrize("step", ["abc", 1.5, -1, True])
+def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: pytest.fail("an invalid step must not reach serving"),
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "step": step},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "invalid checkpoint step" in response.json()["detail"]
 
 
 def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monkeypatch):

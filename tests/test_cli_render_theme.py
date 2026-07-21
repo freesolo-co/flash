@@ -88,7 +88,7 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
         "run_id": "flash-1",
         "state": "done",
         "spec": {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo"},
-        "remote": {"gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
+        "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
     runs = render.runs_table([run])
     status = render.run_status(run)
@@ -98,6 +98,48 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
     assert "runpod" not in status.lower()
     assert "provider" not in status.lower()
     assert "flash_arm" not in status.lower()
+
+
+def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    allocated_run = {
+        "run_id": "flash-allocated",
+        "state": "done",
+        "spec": {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX Pro 6000"},
+        },
+        "remote": {"allocated_gpu": "B200"},
+    }
+    runs = render.runs_table([allocated_run])
+    status = render.run_status(allocated_run)
+    status_panel = status.split("details", 1)[0]
+    assert "B200" in runs
+    assert "B200" in status_panel
+    assert "RTX Pro 6000" not in runs
+    assert "RTX Pro 6000" not in status_panel
+
+    spec_only_run = {
+        "run_id": "flash-spec-only",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+    }
+    assert "RTX Pro 6000" in render.runs_table([spec_only_run])
+    assert "RTX Pro 6000" in render.run_status(spec_only_run)
+
+    # the removed legacy remote["gpu"] key is no longer honored: the label resolves from the
+    # authoritative allocated_gpu or the provisional spec type, never the dead key.
+    legacy_key_run = {
+        "run_id": "flash-legacy-key",
+        "state": "done",
+        "spec": {"gpu": {"type": "RTX Pro 6000"}},
+        "remote": {"gpu": "B200"},
+    }
+    assert "B200" not in render.runs_table([legacy_key_run])
+    assert "RTX Pro 6000" in render.runs_table([legacy_key_run])
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
@@ -458,3 +500,111 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_explains_rl_warmup(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time()},
+    }
+
+    out = render.run_status(status)
+
+    assert f"warming up (stage={stage})" in out
+    assert "typically several minutes, sometimes 15-20 min" in out
+    assert "setup is not billed" in out
+    assert "do not cancel" in out
+
+    status["state"] = "done"
+    assert "warming up" not in render.run_status(status).split("details")[0]
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+
+    out = render.run_status(status)
+
+    assert stage in out
+    assert "20m ago" in out
+    assert "quiet is not dead" in out
+    assert "warming up" not in out
+    assert "do not cancel" not in out
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_omits_warmup_claim_for_prior_attempt_heartbeat(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a recovered run flips back to running for attempt 1, but last_heartbeat is the fresh-looking
+    # setup ping the dead attempt 0 left behind (retries reuse the seed heartbeat path). reassuring
+    # "do not cancel" against it would mislabel a retry stall as healthy warmup.
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
+    }
+
+    out = render.run_status(status).split("details")[0]
+
+    assert stage in out  # the stage is still reported factually
+    assert "warming up" not in out
+    assert "do not cancel" not in out
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_explains_warmup_when_heartbeat_matches_attempt(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a fresh heartbeat from the live attempt keeps the reassurance: the gate must not over-suppress.
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "remote": {"attempt": 2},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 2},
+    }
+
+    out = render.run_status(status)
+
+    assert f"warming up (stage={stage})" in out
+    assert "do not cancel" in out
+
+
+def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
+    is_current = render.heartbeat_is_current_attempt
+
+    # a malformed heartbeat attempt cannot prove it is the live attempt, so it earns no reassurance
+    # and must never crash the display path (e.g. on inf, which the old int() coercion raised on).
+    for bad in ["1", " 1 ", True, 2.7, float("inf"), -1, object()]:
+        assert is_current({"remote": {"attempt": 1}}, {"attempt": bad}) is False
+
+    # a malformed live attempt reads as unknown -> fall back to age gating (keep showing the note)
+    for bad in ["1", True, 2.7, float("inf"), -1]:
+        assert is_current({"remote": {"attempt": bad}}, {"attempt": 1}) is True
+
+    # canonical int identities: exact match shows, mismatch suppresses
+    assert is_current({"remote": {"attempt": 2}}, {"attempt": 2}) is True
+    assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False

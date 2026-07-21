@@ -1,8 +1,9 @@
 """Colocated vLLM rollout helper for OPD student generation.
 
 OPD owns its teacher scoring and GKD loss loop, so it cannot reuse TRL's GRPOTrainer wrapper directly.
-This module keeps the vLLM surface small: build one resident LLM, save the current PEFT adapter to a
-versioned temp dir after each optimizer step, and generate with a matching LoRARequest.
+This module keeps the vLLM surface small: build one resident LLM, publish the current PEFT adapter to
+a versioned directory that prefers memory-backed storage after each optimizer step, and generate with
+a matching LoRARequest.
 """
 
 from __future__ import annotations
@@ -12,6 +13,28 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    # peft writes adapter_model.safetensors, so a full /dev/shm during the weight write surfaces as
+    # SafetensorError (an OSError sibling, not subclass). ships with peft in real runs; keep optional.
+    from safetensors import SafetensorError
+except ImportError:  # pragma: no cover
+    SafetensorError = ()
+
+_ADAPTER_TMPFS_ROOT = "/dev/shm"
+
+
+def _make_adapter_root() -> tuple[str, bool]:
+    """Create the supported path-based vLLM adapter store, preferring memory-backed storage."""
+    try:
+        return tempfile.mkdtemp(prefix="flash_opd_vllm_lora_", dir=_ADAPTER_TMPFS_ROOT), True
+    except OSError as exc:
+        adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+        print(
+            f"[opd][warn] tmpfs adapter store unavailable ({exc}); "
+            f"using filesystem fallback {adapter_root}"
+        )
+        return adapter_root, False
 
 
 @dataclass(frozen=True)
@@ -69,7 +92,7 @@ def _startup_oom_error(
     free_gb: float,
     total_gb: float,
     requested_util: float,
-    margin_gb: float,
+    reserve_gb: float,
     rollout_batch_size: int,
 ) -> BaseException:
     requested_gb = float(requested_util) * float(total_gb)
@@ -77,8 +100,8 @@ def _startup_oom_error(
         "Free memory on device cuda:0 "
         f"({free_gb:.2f}/{total_gb:.2f} GiB) on startup is less than desired GPU "
         f"memory utilization ({requested_util:.6f} -> {requested_gb:.2f} GiB) "
-        f"with {margin_gb:.2f} GiB startup margin after reducing OPD rollout_batch_size "
-        f"to {rollout_batch_size}. Retry on a larger GPU."
+        f"with {reserve_gb:.2f} GiB reserved for the OPD training peak and allocator "
+        f"after reducing OPD rollout_batch_size to {rollout_batch_size}. Retry on a larger GPU."
     )
     try:
         import torch
@@ -95,7 +118,34 @@ def _decode_only_compilation_config() -> dict[str, Any]:
     }
 
 
-def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
+def _sizing_lora_rank(knobs: Any, default: int = 32) -> int:
+    rank = getattr(knobs, "lora_rank", None)
+    if rank is None:
+        try:
+            from flash.engine.worker._pkg import W as _w
+
+            train = getattr(getattr(_w, "JOB_SPEC", None), "train", None)
+            rank = getattr(train, "lora_rank", None)
+        except Exception:
+            rank = None
+    try:
+        return max(1, int(rank if rank is not None else default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rollout_uplift_validated(params_b: float | None, lora_rank: int) -> bool:
+    return params_b is not None and float(params_b) <= 4.7 and int(lora_rank) <= 32
+
+
+def opd_vllm_kwargs(
+    model_id: str,
+    knobs: Any,
+    seq_cap: int,
+    *,
+    prompts_per_step: int | None = None,
+    lora_rank: int | None = None,
+) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
         "gpu_memory_utilization": 0.10,
@@ -132,18 +182,32 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
     if card_gb > 0:
         try:
-            from flash.catalog import MODELS
+            from flash.catalog import MODELS, vocab_size_for
             from flash.engine.vram import (
                 colocate_kv_util,
+                opd_allocator_margin_gb,
+                opd_post_init_reserve_gb,
                 opd_rollout_concurrency,
+                opd_training_reserve_gb,
                 resolve_params_b,
             )
 
             info = MODELS.get(model_id)
             params_b = resolve_params_b(model_id)
+            sizing_params_b = float(params_b or 1.0)
+            resolved_lora_rank = (
+                _sizing_lora_rank(knobs)
+                if lora_rank is None
+                else max(1, int(lora_rank))
+            )
+            resolved_prompts_per_step = (
+                getattr(knobs, "prompts_per_step", 1)
+                if prompts_per_step is None
+                else prompts_per_step
+            )
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
             target_concurrency = opd_rollout_concurrency(
-                getattr(knobs, "prompts_per_step", 1),
+                resolved_prompts_per_step,
                 getattr(knobs, "group_size", 1),
             )
             rollout_concurrency = target_concurrency
@@ -161,12 +225,26 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
 
             util = _util_for(rollout_concurrency)
             if free_gb > 0:
-                # vLLM rejects startup unless its whole executor budget is free right now. OPD builds
-                # the rollout engine after the student + warm-start adapter are resident, so choose the
-                # largest rollout chunk that fits the observed residual memory instead of reserving for
-                # every prompt in the optimizer step.
-                startup_margin_gb = max(1.0, min(4.0, card_gb * 0.03))
-                max_startup_util = max(0.0, (free_gb - startup_margin_gb) / max(1.0, card_gb))
+                # free memory is measured after the student and adapter are resident. protect the
+                # modeled loss forward/backward peak plus allocator slack, then give the remaining
+                # memory to the rollout executor instead of leaving it idle behind the generic cap.
+                training_reserve_gb = opd_training_reserve_gb(
+                    sizing_params_b,
+                    int(seq_cap),
+                    max_tokens=getattr(knobs, "max_completion", None),
+                    prompts_per_step=resolved_prompts_per_step,
+                    group_size=getattr(knobs, "group_size", 1),
+                    vocab=vocab_size_for(model_id),
+                    active_params_b=active_b,
+                )
+                post_init_reserve_gb = opd_post_init_reserve_gb(
+                    sizing_params_b, resolved_lora_rank
+                )
+                allocator_margin_gb = opd_allocator_margin_gb(card_gb)
+                protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
+                rollout_budget_gb = max(0.0, free_gb - protected_gb)
+                max_startup_util = rollout_budget_gb / max(1.0, card_gb)
+                lean_trimmed = False
                 while rollout_concurrency > 1 and util > max_startup_util:
                     rollout_concurrency -= 1
                     util = _util_for(rollout_concurrency)
@@ -175,16 +253,61 @@ def opd_vllm_kwargs(model_id: str, knobs: Any, seq_cap: int) -> dict[str, Any]:
                         "[opd] reduced vLLM rollout batch "
                         f"{target_concurrency}->{rollout_concurrency} to fit startup memory "
                         f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB, "
-                        f"margin={startup_margin_gb:.1f} GiB)"
+                        f"protected={protected_gb:.1f} GiB)"
                     )
                 if util > max_startup_util:
-                    startup_oom = _startup_oom_error(
-                        free_gb=free_gb,
-                        total_gb=card_gb,
-                        requested_util=util,
-                        margin_gb=startup_margin_gb,
-                        rollout_batch_size=rollout_concurrency,
-                    )
+                    # concurrency bottomed out but the resident-KV floor (vLLM weight copy + _KV_CAP)
+                    # keeps the minimal executor above the protected budget. before hard-OOMing, trim
+                    # the allocator slack to the old ~1 GiB startup margin so configs that fit before
+                    # the protected-budget change are not newly rejected; the modeled training peak and
+                    # post-init reserve stay intact.
+                    lean_protected_gb = training_reserve_gb + post_init_reserve_gb + 1.0
+                    lean_startup_util = max(0.0, free_gb - lean_protected_gb) / max(1.0, card_gb)
+                    if util <= lean_startup_util:
+                        print(
+                            "[opd] trimmed allocator margin "
+                            f"{allocator_margin_gb:.1f}->1.0 GiB to fit rollout executor at "
+                            f"concurrency {rollout_concurrency} "
+                            f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB)"
+                        )
+                        protected_gb = lean_protected_gb
+                        max_startup_util = lean_startup_util
+                        lean_trimmed = True
+                        # the concurrency loop above bottomed out against the stricter full
+                        # budget; re-seek how many sequences now fit under the relaxed lean
+                        # ceiling so the lean path is not frozen at the reduced floor.
+                        while (
+                            rollout_concurrency < target_concurrency
+                            and _util_for(rollout_concurrency + 1) <= max_startup_util
+                        ):
+                            rollout_concurrency += 1
+                            util = _util_for(rollout_concurrency)
+                    else:
+                        startup_oom = _startup_oom_error(
+                            free_gb=free_gb,
+                            total_gb=card_gb,
+                            requested_util=util,
+                            reserve_gb=protected_gb,
+                            rollout_batch_size=rollout_concurrency,
+                        )
+                if (
+                    startup_oom is None
+                    and not lean_trimmed
+                    and _rollout_uplift_validated(params_b, resolved_lora_rank)
+                ):
+                    # 0.80 is a final ceiling for the validated qwen3.5-4b/rank-32 size class; larger
+                    # or higher-rank models keep the existing colocate ceiling until gpu validation.
+                    # skip uplift when we had to lean-trim: the lean budget only leaves ~1 GiB of
+                    # headroom for the training peak, so spending it on the rollout executor risks OOM.
+                    util = max(util, min(0.80, max_startup_util))
+                print(
+                    "[opd] vLLM memory budget "
+                    f"free={free_gb:.1f}/{card_gb:.1f} GiB "
+                    f"training_reserve={training_reserve_gb:.1f} GiB "
+                    f"post_init_reserve={post_init_reserve_gb:.1f} GiB "
+                    f"allocator_margin={allocator_margin_gb:.1f} GiB "
+                    f"rollout={util * card_gb:.1f} GiB util={util:.3f}"
+                )
             kwargs["gpu_memory_utilization"] = util
             kwargs["max_num_seqs"] = rollout_concurrency
             kwargs["rollout_batch_size"] = rollout_concurrency
@@ -276,6 +399,8 @@ class OpdVllmRolloutEngine:
     rollout_batch_size: int | None = None
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
+    enable_tower_connector_lora: bool = False
+    image_pad_token_id: int | None = None
     enforce_eager: bool | None = None
     compilation_config: dict[str, Any] | None = None
     seed: int | None = None
@@ -284,6 +409,8 @@ class OpdVllmRolloutEngine:
     _lora_int_id: int | None = None
     _lora_request: object | None = None
     _sync_dirs: list[str] = field(default_factory=list)
+    _adapter_roots: list[str] = field(default_factory=list, init=False)
+    _adapter_root_is_tmpfs: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         from vllm import LLM, SamplingParams
@@ -328,6 +455,8 @@ class OpdVllmRolloutEngine:
             kwargs["attention_backend"] = self.attention_backend
         if self.mm_encoder_attn_backend:
             kwargs["mm_encoder_attn_backend"] = self.mm_encoder_attn_backend
+        if self.enable_tower_connector_lora:
+            kwargs["enable_tower_connector_lora"] = True
         if self.enforce_eager is not None:
             kwargs["enforce_eager"] = bool(self.enforce_eager)
         if self.compilation_config:
@@ -342,9 +471,10 @@ class OpdVllmRolloutEngine:
                 raise startup_oom from exc
             raise
         if self.adapter_root is None:
-            self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+            self.adapter_root, self._adapter_root_is_tmpfs = _make_adapter_root()
         else:
             os.makedirs(self.adapter_root, exist_ok=True)
+        self._adapter_roots.append(self.adapter_root)
 
     def _enginecore_startup_oom(self, exc: RuntimeError) -> BaseException | None:
         """Recast vLLM's parent EngineCore wrapper as OOM when the hidden root is memory preflight."""
@@ -375,19 +505,56 @@ class OpdVllmRolloutEngine:
     def sync_count(self) -> int:
         return self._version
 
+    def _save_adapter_staging(self, model, version: int) -> str:
+        staging_dir = tempfile.mkdtemp(prefix=f".adapter-{version:06d}-", dir=self.adapter_root)
+        try:
+            model.save_pretrained(staging_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return staging_dir
+
     def sync_from_model(self, model) -> None:
-        """Save the current PEFT adapter and make future generations use that exact version."""
+        """Atomically publish the current PEFT adapter for future generations."""
         old_lora_id = self._lora_int_id
         old_adapter_dir = self._sync_dirs[-1] if self._sync_dirs else None
-        self._version += 1
-        adapter_dir = os.path.join(self.adapter_root, f"adapter-{self._version:06d}")
-        os.makedirs(adapter_dir, exist_ok=True)
-        model.save_pretrained(adapter_dir)
+        next_version = self._version + 1
+        try:
+            staging_dir = self._save_adapter_staging(model, next_version)
+        except (OSError, SafetensorError) as exc:
+            # I/O failures mean tmpfs is unavailable (matching _make_adapter_root). safetensors raises
+            # SafetensorError (not OSError) on a full /dev/shm during the weight write, so catch it too;
+            # a genuine non-I/O failure re-raises from the filesystem retry below rather than being lost.
+            if not self._adapter_root_is_tmpfs:
+                raise
+            self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
+            self._adapter_roots.append(self.adapter_root)
+            self._adapter_root_is_tmpfs = False
+            print(
+                f"[opd][warn] tmpfs adapter save failed ({exc}); "
+                f"using filesystem fallback {self.adapter_root}"
+            )
+            staging_dir = self._save_adapter_staging(model, next_version)
+
+        adapter_dir = os.path.join(self.adapter_root, f"adapter-{next_version:06d}")
+        try:
+            lora_request = self._LoRARequest(
+                f"opd-step-{next_version}", next_version, adapter_dir
+            )
+            if os.path.lexists(adapter_dir):
+                if os.path.isdir(adapter_dir) and not os.path.islink(adapter_dir):
+                    shutil.rmtree(adapter_dir)
+                else:
+                    os.unlink(adapter_dir)
+            os.replace(staging_dir, adapter_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
         self._sync_dirs.append(adapter_dir)
-        self._lora_int_id = self._version
-        self._lora_request = self._LoRARequest(
-            f"opd-step-{self._version}", self._lora_int_id, adapter_dir
-        )
+        self._version = next_version
+        self._lora_int_id = next_version
+        self._lora_request = lora_request
         if old_adapter_dir and old_lora_id is not None and self._remove_lora(old_lora_id):
             shutil.rmtree(old_adapter_dir, ignore_errors=True)
             self._sync_dirs = [d for d in self._sync_dirs if d != old_adapter_dir]
@@ -408,7 +575,13 @@ class OpdVllmRolloutEngine:
                     return False
         return False
 
-    def _sampling_params(self, max_tokens: int, *, seed: int | None = None):
+    def _sampling_params(
+        self,
+        max_tokens: int,
+        *,
+        seed: int | None = None,
+        suppressed_token_id: int | None = None,
+    ):
         kwargs = {
             "max_tokens": max(1, int(max_tokens)),
             "temperature": float(self.temperature),
@@ -417,6 +590,8 @@ class OpdVllmRolloutEngine:
         }
         if seed is not None:
             kwargs["seed"] = int(seed)
+        if suppressed_token_id is not None:
+            kwargs["logit_bias"] = {int(suppressed_token_id): -100.0}
         if self.eos_token_ids:
             kwargs["stop_token_ids"] = list(self.eos_token_ids)
         # Keep stop strings in the returned text when supported so OPD can trim ids/text in one place,
@@ -448,20 +623,38 @@ class OpdVllmRolloutEngine:
         *,
         max_tokens: int,
         request_seeds: list[int] | None = None,
+        multi_modal_data_batch: list[object | None] | None = None,
     ) -> list[OpdVllmOutput]:
         if not prompt_ids_batch:
             return []
         if request_seeds is not None and len(request_seeds) != len(prompt_ids_batch):
             raise ValueError("opd rollout request seed count must match prompt count")
+        if multi_modal_data_batch is not None and len(multi_modal_data_batch) != len(
+            prompt_ids_batch
+        ):
+            raise ValueError("opd rollout multimodal data count must match prompt count")
         if self._lora_request is None:
             raise RuntimeError("opd vLLM rollout used before sync_from_model()")
         limit = max(1, int(self.rollout_batch_size or len(prompt_ids_batch)))
         out: list[OpdVllmOutput] = []
         for start in range(0, len(prompt_ids_batch), limit):
-            prompts = [
-                {"prompt_token_ids": [int(t) for t in ids]}
-                for ids in prompt_ids_batch[start : start + limit]
-            ]
+            prompt_ids_chunk = prompt_ids_batch[start : start + limit]
+            multimodal_chunk = (
+                multi_modal_data_batch[start : start + limit]
+                if multi_modal_data_batch is not None
+                else None
+            )
+            suppressed_chunk = (
+                [int(self.image_pad_token_id) if data is not None else None for data in multimodal_chunk]
+                if multimodal_chunk is not None and self.image_pad_token_id is not None
+                else None
+            )
+            prompts = []
+            for index, ids in enumerate(prompt_ids_chunk):
+                prompt = {"prompt_token_ids": [int(t) for t in ids]}
+                if multimodal_chunk is not None and multimodal_chunk[index] is not None:
+                    prompt["multi_modal_data"] = multimodal_chunk[index]
+                prompts.append(prompt)
             seeds = request_seeds[start : start + limit] if request_seeds is not None else None
             # vLLM's structured-output processor stamps per-request backend state onto the
             # StructuredOutputsParams instance, so a single shared constrained params corrupts
@@ -471,11 +664,17 @@ class OpdVllmRolloutEngine:
             sampling_params = (
                 [
                     self._sampling_params(
-                        max_tokens, seed=seeds[index] if seeds is not None else None
+                        max_tokens,
+                        seed=seeds[index] if seeds is not None else None,
+                        suppressed_token_id=(
+                            suppressed_chunk[index] if suppressed_chunk is not None else None
+                        ),
                     )
                     for index in range(len(prompts))
                 ]
-                if self._StructuredOutputsParams is not None or seeds is not None
+                if self._StructuredOutputsParams is not None
+                or seeds is not None
+                or suppressed_chunk is not None
                 else self._sampling_params(max_tokens)
             )
             outputs = self.llm.generate(
@@ -494,8 +693,8 @@ class OpdVllmRolloutEngine:
                 shutdown()
             except Exception as exc:
                 print(f"[opd] vLLM shutdown failed; continuing: {exc}")
-        if self.adapter_root:
-            shutil.rmtree(self.adapter_root, ignore_errors=True)
+        for adapter_root in self._adapter_roots:
+            shutil.rmtree(adapter_root, ignore_errors=True)
 
 
 def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:

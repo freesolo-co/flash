@@ -950,6 +950,14 @@ def prepare_job(
     spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
+    if spec.train.structured_outputs:
+        from flash.serve.preflight import preflight_serving_path
+
+        preflight_serving_path(spec)
+    else:
+        from flash.lora_rank import preflight_train_context_within_serving
+
+        preflight_train_context_within_serving(spec)
     if spec.gpu.provider or spec.gpu.exact_type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for
@@ -984,9 +992,7 @@ def prepare_job(
         token=os.environ.get("HF_TOKEN"),
     )
     from flash.cost.spec import estimate_for_spec
-    from flash.lora_rank import preflight_train_context_within_serving
 
-    preflight_train_context_within_serving(worker_spec)
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
     return PreparedJob(
         public_spec=public_spec,
@@ -1023,6 +1029,28 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
+# algorithms whose trainer can shard a single job across gpu.count > 1 cards. empty until the
+# per-algorithm multi-gpu trainers land (the sft/opd verl migrations add themselves here). keeping
+# this empty makes the multi-gpu *plumbing* landable now while multi-gpu *training* stays impossible
+# to trigger, so a count > 1 job can never silently provision and bill idle cards.
+_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset()
+
+
+def _require_supported_gpu_count(spec: JobSpec) -> None:
+    """reject gpu.count > 1 until the job's algorithm has a multi-gpu trainer.
+
+    gpu.count already provisions and bills n cards (runpod/vast payloads + cost), but every trainer
+    is single-process today, so a count > 1 job would overbill for idle cards. later prs add each
+    algorithm to _MULTI_GPU_ALGORITHMS as its trainer gains sharding.
+    """
+    count = getattr(spec.gpu, "count", 1)
+    if count > 1 and spec.algorithm not in _MULTI_GPU_ALGORITHMS:
+        raise ValueError(
+            f"multi-gpu training (gpu.count={count}) is not yet supported for algorithm "
+            f"{spec.algorithm!r}; set gpu.count to 1"
+        )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -1034,6 +1062,9 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
+    # fail closed on unsupported multi-gpu before any provisioning or billing (also in dry-run, so
+    # the user learns early). removed per-algorithm as each trainer gains sharding.
+    _require_supported_gpu_count(spec)
     prepared = prepared_job or prepare_job(
         spec,
         billing_context=billing_context,
@@ -1042,7 +1073,15 @@ def submit_job(
     )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
+    # Re-gate on the EFFECTIVE worker spec: the check above validated the public ``spec``, but a caller
+    # can supply ``prepared_job`` whose worker_spec carries a different gpu.count, which is what
+    # allocation and training actually provision. Fail closed here too (dry-run included) so the
+    # mismatch can never provision or bill multiple cards.
+    _require_supported_gpu_count(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
+    from flash.multimodal import preflight_validate_image_opd
+
+    preflight_validate_image_opd(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:

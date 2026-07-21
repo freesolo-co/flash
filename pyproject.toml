@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.0.2"
+version = "1.0.8"
 description = "Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -37,7 +37,7 @@ gpu = [
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
     "freesolo>=0.2.54",
-    "huggingface-hub>=0.34",
+    "huggingface-hub>=1.2.0",
 ]
 # freesolo-chalk (freesolo's custom triton/cuda kernels) is a worker-side package selected by the
 # submit path, not a control-plane dependency. flash appends the chalk package spec from
@@ -48,9 +48,12 @@ gpu = [
 # Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
 # code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
 # Keeping runpod-flash out of the base install also stops its `flash` console script shadowing
-# ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=0.34:
-# upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings API
-# (0.25.x only accepts `gated` and raises TypeError on `private`).
+# ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=1.2.0:
+# 1.2.0+ adds built-in RateLimit-header-aware 429 retry for downloads (resolvers) and paginated Hub
+# API calls. Our outer _hf_call wrappers stay on top: the library does not retry the complete mutating
+# operations (create_commit / create_repo / update_repo_settings) and the wrappers also bound an
+# overall deadline. (>=0.34 was already required for upload_code()'s update_repo_settings(private=True);
+# 0.25.x only accepts `gated` and raises TypeError on `private`.)
 # SFT `flash train --cost` no longer imports Freesolo environments to count data. It requires
 # [train].max_examples to be set explicitly, so the estimate never guesses a hidden dataset size.
 server = [
@@ -61,7 +64,7 @@ server = [
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
-    "huggingface-hub>=0.34",
+    "huggingface-hub>=1.2.0",
     "datasets>=2.19",
     "freesolo>=0.2.54",
     "transformers>=5.6,<5.11",
@@ -78,7 +81,7 @@ dev = [
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
-    "huggingface-hub>=0.34",
+    "huggingface-hub>=1.2.0",
     "datasets>=2.19",
     "freesolo>=0.2.54",
     "transformers>=5.6,<5.11",
@@ -113,7 +116,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.0.2"
+version = "1.0.8"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

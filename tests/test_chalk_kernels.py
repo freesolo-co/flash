@@ -61,12 +61,7 @@ def test_applies_fixed_gap_fillers(monkeypatch):
 
 
 def test_fused_ce_false_disables_only_flce_for_the_trl_sft_path(monkeypatch):
-    """The trl SFT path passes fused_ce=False: flce returns logits=None, which trl's
-    SFTTrainer.compute_loss can't consume (it reads outputs.logits and only skips them under
-    use_liger_kernel=True, which flash can't set — that would make trl apply Liger and clash with
-    chalk). So flce is turned OFF there and the model materialises logits; every OTHER kernel is
-    unchanged. Default fused_ce=True keeps flce on for the custom GRPO/opd loops (they read the fused
-    loss directly)."""
+    """trl chunked nll owns the sft loss, so chalk flce is off while every other kernel is unchanged."""
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     install_chalk_kernels(object(), fused_ce=False)

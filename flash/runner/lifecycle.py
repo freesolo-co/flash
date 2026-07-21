@@ -60,6 +60,10 @@ class _RetryBudget:
 
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+    from flash.multimodal import preflight_validate_image_opd
+
+    preflight_validate_image_opd(spec)
+
     # Lazy import: dry-run / unit tests never construct a Flash endpoint.
     from flash.providers._worker import upload_code
     from flash.runner import (
@@ -794,6 +798,7 @@ def _run_training(
     from flash.runner import (
         TERMINAL_STATES,
         _persist_metrics,
+        _require_supported_gpu_count,
         _RunCancelled,
         _status_estimated_charge,
         _submit_seed_supervised,
@@ -801,6 +806,12 @@ def _run_training(
         artifacts_dir,
         get_status,
     )
+
+    # Fail closed on unsupported multi-gpu using the EFFECTIVE worker spec. This path is shared by a
+    # fresh submit and by post-restart recovery, and recovery rebuilds the spec from a persisted
+    # snapshot without re-running submit_job's gate -- so gating here is the single choke that keeps a
+    # count > 1 spec (however it was persisted) from re-provisioning and billing idle cards on resume.
+    _require_supported_gpu_count(spec)
 
     # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
     # terminal state — not just `cancelled` — by a concurrent thread/process between the resume

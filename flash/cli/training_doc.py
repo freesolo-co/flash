@@ -109,6 +109,8 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
+# multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
+# credit_assignment = "per_episode"
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
@@ -208,9 +210,11 @@ Work in tight, attributable iterations. Each one is a hypothesis:
 1. Reconstruct state — what's the best run so far, and what have you already tried?
 2. Form a hypothesis — pick ONE lever and say WHY it will move the metric.
 3. Change that ONE lever.
-4. Validate — `flash train configs/sft.toml --dry-run` (server-side preview: catches config
-   errors, serving rank/context caps, and warm-start rank mismatches for free — no GPU, no charge;
-   a paid run on a broken config or an all-zero reward is wasted budget).
+4. Validate with `flash train configs/sft.toml --dry-run`. This server-side preview checks
+   config/schema, model+algorithm compatibility, LoRA rank, runtime-secret presence, warm-start
+   source, serving context cap, and cost for free, with no GPU or charge. It does not import or run
+   `environment.py`; dataset loading, episode shapes, reward/scorer, worker imports, model load, and
+   GPU/training are first exercised on the worker after cold-start.
 5. Submit — `flash train configs/sft.toml`.
 6. Judge — read the metric trend AND a sample of real rollouts (see below).
 7. Keep the best run; revert the change if it didn't beat the noise band. Repeat.
@@ -247,7 +251,7 @@ spending another GPU run:
 
 | Issue | Symptom | Mitigation |
 | --- | --- | --- |
-| Environment id is blank or stale | `flash train --dry-run` fails, or the worker uses old reward/data | Run `flash env push --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
+| Environment id is blank or stale | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
 | Local-only env path in config | Config validation says there is no local path mode | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths. |
 | Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
 | Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
@@ -273,13 +277,16 @@ spending another GPU run:
 - **Judge the trend, not a single number.** The proof of training is the curve:
   loss falling (SFT) or `reward` rising over steps (GRPO). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
-- **Read the model's outputs, not just the metrics.** A rising reward can come from
-  reward-hacking or a degenerate output the reward still credits — metrics alone never
-  establish that the model got better. Flash does not expose training-time rollouts
-  through the CLI (`flash log` gives you the metric trend and the worker's console/error
-  logs, not the sampled generations), so to read real outputs **deploy the adapter and
-  probe it**: `flash deploy <run-id>` then `flash chat <run-id> -m "..."` on at least a
-  few real inputs, including ones it should get wrong.
+- **Read the model's outputs, not just the metrics.** A rising reward (or falling loss)
+  can come from reward-hacking or a degenerate output the metric still credits — metrics
+  alone never establish that the model got better. For GRPO and OPD, `flash log` surfaces a
+  handful of full (untruncated) sample completions at the heartbeat cadence — GRPO shows
+  each completion's reward, OPD its distillation loss — with the first sample-bearing update
+  forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
+  step 1-2. These are bounded diagnostics, not every rollout or a held-out
+  evaluation, so still **deploy the adapter and probe it**: `flash deploy <run-id>` then
+  `flash chat <run-id> -m "..."` on at least a few real inputs, including ones it should
+  get wrong.
 
   ```bash
   flash status <run-id>            # state + accrued cost
@@ -337,10 +344,12 @@ def score_response(self, example, response_text) -> RewardResult:
     )
 ```
 
-`score` is what GRPO optimizes (it becomes the run's `total`). Each `RewardMetric` you
-attach is logged by name in the per-scorer breakdown — that is how the clean success
-rate becomes visible. Use the shaped `score` to confirm the model is learning *at all*,
-and judge the run on the explicit `success` metric.
+`score` is what GRPO optimizes (it becomes the run's `total`). In standard (single-turn)
+GRPO, each `RewardMetric` is averaged across scored completions and logged by name at
+the managed heartbeat cadence, which is not guaranteed to be every optimizer step. That
+is how the clean success rate becomes visible. Multi-turn scoring currently reports only
+the scalar reward. Use the shaped `score` to confirm the model is learning *at all*, and
+judge the run on the explicit `success` metric.
 
 When `thinking = true`, score the final answer unless you intentionally need the
 reasoning trace. Flash passes a string-compatible response object to `score_response`;
@@ -548,10 +557,9 @@ every run, the last two matter more the smaller the model:
   frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
   enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
   over-sharpening only compounds over many steps.
-- **Diagnose it in-band.** Watch the per-step **mean completion entropy** in the run's telemetry — a
-  steady decline toward zero is the collapse happening. Confirm at serving by evaluating at
-  **temperature=0** and flagging `finish_reason=length` completions that never emit your answer token,
-  and compare an early checkpoint against the final one to watch the loop emerge over steps.
+- **Diagnose it at serving.** Evaluate at **temperature=0** and flag
+  `finish_reason=length` completions that never emit your answer token. Compare an early checkpoint
+  against the final one to watch the loop emerge over steps.
 
 ### Distilling from base with no format anchor
 
