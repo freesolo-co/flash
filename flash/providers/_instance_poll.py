@@ -359,11 +359,16 @@ def poll_instance_job(
     def _surface_final_heartbeat() -> None:
         # persist the latest metrics before any terminal give-up so `flash log -f` still shows the final
         # per-step metrics for runs that end via deadline / dead-host / poll-outage / stall, not only the
-        # per-iteration terminal path below.
+        # per-iteration terminal path below. deadline_at=None reads heartbeats already committed at the
+        # boundary even though this runs past the compute deadline; capturing the returned key stops a
+        # repeat (pre- vs post-reread) call from surfacing the same heartbeat twice.
+        nonlocal last_hb_key
         forced_reader = (
-            (lambda: heartbeat_reader(force=True)) if heartbeat_reader is not None else None
+            (lambda: heartbeat_reader(force=True, deadline_at=None))
+            if heartbeat_reader is not None
+            else None
         )
-        surface_heartbeat(forced_reader, last_hb_key, say)
+        last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
 
     def deadline_unless_terminal() -> PollResult:
         nonlocal deferred_deadline_failure
