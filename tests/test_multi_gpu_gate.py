@@ -52,3 +52,32 @@ def test_submit_job_rejects_multi_gpu_at_boundary(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         with pytest.raises(ValueError, match="multi-gpu training"):
             runner.submit_job(_spec(2), dry_run=True)
+
+
+def test_submit_job_rejects_multi_gpu_prepared_worker_spec(monkeypatch):
+    from flash import runner
+    from flash.runner import PreparedJob
+
+    # a single-gpu public spec paired with a prepared_job whose EFFECTIVE worker_spec is multi-gpu must
+    # still be rejected: allocation and training provision the worker_spec, not the public spec.
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        prepared = PreparedJob(
+            public_spec=_spec(1),
+            worker_spec=_spec(2),
+            estimated_cost_usd=0.0,
+        )
+        with pytest.raises(ValueError, match="multi-gpu training"):
+            runner.submit_job(_spec(1), dry_run=True, prepared_job=prepared)
+
+
+def test_run_training_gates_effective_spec_on_recovery():
+    import io
+
+    from flash.runner.lifecycle import _run_training
+
+    # recovery rebuilds the worker spec from a persisted snapshot and calls _run_training directly,
+    # bypassing submit_job's gate; the shared submit+recovery path must fail closed on a multi-gpu spec
+    # before any provisioning (the gate precedes the first get_status/allocation touch).
+    with pytest.raises(ValueError, match="multi-gpu training"):
+        _run_training(_spec(2), io.StringIO(), prior_cost=0.0)

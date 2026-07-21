@@ -1067,6 +1067,11 @@ def submit_job(
     )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
+    # Re-gate on the EFFECTIVE worker spec: the check above validated the public ``spec``, but a caller
+    # can supply ``prepared_job`` whose worker_spec carries a different gpu.count, which is what
+    # allocation and training actually provision. Fail closed here too (dry-run included) so the
+    # mismatch can never provision or bill multiple cards.
+    _require_supported_gpu_count(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.multimodal import preflight_validate_image_opd
 
