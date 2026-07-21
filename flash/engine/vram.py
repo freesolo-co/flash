@@ -27,6 +27,9 @@ _BYTES_PER_PARAM = {
 _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
+_VOCAB_DEFAULT = 248_320
+_OPD_TRAINING_RESERVE_MULTIPLIER = 1.15
+_OPD_ALLOCATOR_MARGIN_MAX_GB = 6.0
 OPD_CE_CHUNK_SIZE = 64
 _OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
@@ -124,6 +127,75 @@ def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: 
     params = float(params_b or 0.0)
     default = 4 if params and params <= 10.0 else 1
     return max(1, min(total, default))
+
+
+def opd_training_peak_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
+) -> float:
+    """Additional OPD loss-forward/backward memory above the resident student model."""
+    eff_b = float(active_params_b) if active_params_b else float(params_b)
+    width = math.sqrt(max(eff_b, 0.1))
+    loss_mb = opd_loss_microbatch(params_b, prompts_per_step, group_size)
+    activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
+    completion = opd_completion_len(max_tokens, thinking)
+    # the backward peak holds both full-sequence bf16 logits and fp32 completion rows plus gradients.
+    dense_logits = 2 * loss_mb * (seq_len * 2 + completion * 4) * vocab / 1e9
+    return activations + dense_logits
+
+
+def opd_training_reserve_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
+) -> float:
+    """OPD loss-forward/backward peak with the runtime safety multiplier."""
+    return _OPD_TRAINING_RESERVE_MULTIPLIER * opd_training_peak_gb(
+        params_b,
+        seq_len,
+        max_tokens=max_tokens,
+        prompts_per_step=prompts_per_step,
+        group_size=group_size,
+        thinking=thinking,
+        vocab=vocab,
+        active_params_b=active_params_b,
+    )
+
+
+def opd_allocator_margin_gb(total_vram_gb: float) -> float:
+    """Allocator fragmentation slack protected by the OPD startup budget."""
+    return max(2.0, min(_OPD_ALLOCATOR_MARGIN_MAX_GB, float(total_vram_gb) * 0.05))
+
+
+def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
+    """Pending LoRA gradient, AdamW state, and persistent post-init growth above model residency.
+
+    OPD trains all linear layers with bf16 LoRA parameters. PyTorch AdamW lazily allocates two
+    parameter-dtype moment tensors on the first step, so each estimated trainable parameter needs
+    2 bytes for its pending gradient plus 4 bytes for optimizer state. Use total model parameters for
+    the rank-linear geometry so MoE experts are not undercounted, then reserve the measured 35B-class
+    first-generation and post-init growth with a size-scaled 12 GB ceiling.
+    """
+    model_params_b = max(0.1, float(params_b))
+    rank = max(1, int(lora_rank))
+    trainable_params_b = (rank / 16.0) * (0.05 + model_params_b / 150.0)
+    gradient_gb = trainable_params_b * 2.0
+    adamw_state_gb = trainable_params_b * 4.0
+    persistent_growth_gb = max(1.0, min(12.0, model_params_b * 0.35))
+    return gradient_gb + adamw_state_gb + persistent_growth_gb
 
 
 def _resident_kv_gb(
@@ -224,7 +296,6 @@ _VLLM_COLOCATE_FLOOR_GB = 28.0
 # init time. Keep 2B+ OPD off <=40 GB classes so the allocator picks an 80 GB-class card instead of a
 # consumer GPU that passes the aggregate estimate but fails the vLLM free-memory preflight.
 _OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
-_VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
