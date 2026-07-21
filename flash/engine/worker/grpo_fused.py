@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -144,23 +143,6 @@ def _output_projection(model):
     if getattr(head, "disable_adapters", False) is False and getattr(head, "active_adapters", []):
         raise RuntimeError("Chalk GRPO does not bypass an adapter-updated output projection")
     return head.weight, getattr(head, "bias", None)
-
-
-def _maybe_gather_projection(trainer, weight, bias):
-    plugin = getattr(getattr(trainer.accelerator, "state", None), "deepspeed_plugin", None)
-    if plugin is None or getattr(plugin, "zero_stage", None) != 3:
-        return nullcontext()
-    try:
-        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-
-        params = [weight] if bias is None else [weight, bias]
-        if all(p.ds_status == ZeroParamStatus.AVAILABLE for p in params):
-            return nullcontext()
-        import deepspeed
-
-        return deepspeed.zero.GatheredParameters(params, modifier_rank=None)
-    except (AttributeError, ImportError) as exc:
-        raise RuntimeError("unable to gather the output projection for Chalk GRPO") from exc
 
 
 def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
@@ -315,21 +297,20 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
                 hidden = backbone(**_accepted_model_inputs(backbone, model_inputs)).last_hidden_state
                 hidden = hidden[:, :-1, :][:, -logits_to_keep:, :]
                 targets = input_ids[start:end, -logits_to_keep:]
-                with _maybe_gather_projection(self, weight, bias):
-                    logps = self._flash_chalk_runtime.selective_log_softmax(
-                        hidden,
-                        weight,
-                        targets,
-                        bias=bias,
-                        # greedy (temperature=0.0) would divide by zero in the fused kernel and
-                        # trip the permanent TRL fallback; treat it as unscaled like _chunked_entropy.
-                        temperature=self.temperature or 1.0,
+                logps = self._flash_chalk_runtime.selective_log_softmax(
+                    hidden,
+                    weight,
+                    targets,
+                    bias=bias,
+                    # greedy (temperature=0.0) would divide by zero in the fused kernel and
+                    # trip the permanent TRL fallback; treat it as unscaled like _chunked_entropy.
+                    temperature=self.temperature or 1.0,
+                )
+                all_logps.append(logps)
+                if compute_entropy:
+                    all_entropies.append(
+                        _chunked_entropy(hidden, weight, bias, self.temperature)
                     )
-                    all_logps.append(logps)
-                    if compute_entropy:
-                        all_entropies.append(
-                            _chunked_entropy(hidden, weight, bias, self.temperature)
-                        )
             logps = torch.cat(all_logps, dim=0)
             entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
             return logps, entropies

@@ -156,6 +156,7 @@ def run_rl():
     setup_perf_backends()
     model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
     model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    _base_grpo_trainer = GRPOTrainer
     GRPOTrainer, _chalk_grpo_fused = resolve_chalk_grpo_trainer(
         GRPOTrainer, model_id, model_revision=model_revision
     )
@@ -220,9 +221,11 @@ def run_rl():
             for ex, messages in zip(train, message_prompts, strict=True)
         )
         if multimodal and _chalk_grpo_fused:
-            # fused selected-token logprobs can't consume pixel_values; a vl+image run falls back to
-            # the trl full-logits path every batch, so drop the fused flag here (before it wrongly
-            # lifts the full-logits cap below) now that the dataset is known to carry images.
+            # fused selected-token logprobs can't consume pixel_values; a vl+image run must use the trl
+            # full-logits path for every batch. swap the trainer back to the base class (not just clear
+            # the sizing flag below) so text-only batches don't silently keep fusing and image batches
+            # don't rely on a one-shot per-batch exception to fall back.
+            GRPOTrainer = _base_grpo_trainer
             _chalk_grpo_fused = False
             print("[rl] multimodal image run detected; chalk fused grpo disabled, using trl full-logits path")
         processor = None
