@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 from types import SimpleNamespace
 
@@ -356,13 +355,6 @@ def test_adapter_provenance_is_stamped_and_conflicts_fail(monkeypatch):
     config.revision = "2" * 40
     with pytest.raises(RuntimeError, match="does not match"):
         adapter.stamp_adapter_provenance(model, "owner/model", revision)
-
-
-def test_opd_model_revision_is_keyword_only():
-    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
-
-    parameter = inspect.signature(OpdVllmRolloutEngine).parameters["model_revision"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch, tmp_path):

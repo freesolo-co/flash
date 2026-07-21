@@ -12,6 +12,21 @@ from dataclasses import dataclass
 from flash.engine.recipe import RECIPE, resolve_teacher
 from flash.engine.vram import opd_completion_len
 from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.opd_gkd import (
+    _generation_eos_ids,
+    _rollout_terminated,
+    _teacher_prompt_text,
+    _trim_trailing_stop,
+    student_tokens_with_offsets,
+)
+
+__all__ = [
+    "_generation_eos_ids",
+    "_rollout_terminated",
+    "_teacher_prompt_text",
+    "_trim_trailing_stop",
+    "student_tokens_with_offsets",
+]
 
 
 @dataclass(frozen=True)

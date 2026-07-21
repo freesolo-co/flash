@@ -765,8 +765,8 @@ def model_required_vram_gb(
     ) -> int:
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
-        The colocated OPD vLLM rollout engine reserves an fp8 KV cache on cc >= 8.9 hardware
-        (engine/worker/opd_vllm.py), but the estimate defaults to a bf16 KV pool. Any OPD run needing
+        The verl-native OPD vLLM rollout reserves an fp8 KV cache on cc >= 8.9 hardware, but the
+        estimate defaults to a bf16 KV pool. Any OPD run needing
         more VRAM than the biggest non-fp8 validated card (the 80 GB A100) can ONLY land on a modern
         (cc >= 8.9) card, so that bf16 pool is a phantom: it doubles the real KV and wrongly rejects
         full-context / grouped OPD configs on the 35B that actually fit a B200. Halve it — but only
