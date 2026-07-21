@@ -418,10 +418,14 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     api, monkeypatch, max_completion_tokens, status_code
 ) -> None:
+    import flash.envs.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
+    # offline: the valid-context path pins the github env ref to a sha; stub it so the
+    # test never makes a real github request (the api fixture only sets a fake token)
+    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
     if status_code == 400:
         monkeypatch.setattr(
             runs_route._app,
