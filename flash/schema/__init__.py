@@ -397,9 +397,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # exact_type it suggests might not be provisionable there.
         if "type" in gpu_raw and not exact_type and not gpu_provider:
             authored_type_raw = gpu_raw["type"]
-            # only an active validated class is a usable exact_type pin; an unrecognized string or a
-            # retired-but-known class (e.g. RTX A6000) must not be echoed back as an exact_type, since
-            # the exact_type validation above would then reject the very config the note suggested.
+            # only an active validated class is a usable exact_type pin; an unrecognized string must
+            # not be echoed back as an exact_type, since the exact_type validation above would then
+            # reject the very config the note suggested.
             pinnable: str | None = None
             if isinstance(authored_type_raw, str):
                 try:
