@@ -733,8 +733,16 @@ def _reconcile_attached_remote(
             )
         except _CompletedAttemptPending:
             # the queue job already completed but its metrics are still landing; keep
-            # reconciling (do not tear it down) until they are readable.
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            # reconciling (do not tear it down) until they are readable -- but do not sleep
+            # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
+            # full interval beyond it before terminating.
+            pending_interval = _ATTACH_RECONCILE_INTERVAL_S
+            if deadline_at is not None:
+                pending_interval = min(
+                    pending_interval,
+                    max(0.0, deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()),
+                )
+            time.sleep(pending_interval)
             continue
         if completed_metrics is not None:
             try:
@@ -1004,15 +1012,31 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                     deadline_at=deadline_at,
                     log=log,
                 )
-            if metrics is not None and _adopt_completed_attempt(
-                run_id,
-                worker_spec,
-                persisted_remote,
-                metrics,
-                log=log,
-            ):
+            if metrics is not None:
+                try:
+                    adopted = _adopt_completed_attempt(
+                        run_id,
+                        worker_spec,
+                        persisted_remote,
+                        metrics,
+                        log=log,
+                    )
+                except Exception:
+                    adopted = False
+                if adopted:
+                    print(
+                        f"attach: {run_id} adopted a completed attempt at the wall deadline",
+                        file=log,
+                    )
+                    return status_for_return()
+                # completed work whose adoption is a transient defer (e.g. a cleanup blip) must NEVER be
+                # torn down at the wall deadline; defer to background reconciliation, which retries
+                # adoption until the deadline like the in-loop completion path.
+                _schedule_attach_reconciliation(
+                    run_id, persisted_remote, worker_spec, next_attempt, code_prefix, log, str(exc)
+                )
                 print(
-                    f"attach: {run_id} adopted a completed attempt at the wall deadline",
+                    f"attach: {run_id} completed RunPod work at the wall deadline; deferring adoption to reconciliation",
                     file=log,
                 )
                 return status_for_return()

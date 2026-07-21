@@ -168,6 +168,16 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
             output_readable = isinstance(metrics, dict)
         except Exception:
             raw_output = job.get("output")
+            if isinstance(raw_output, str):
+                # a string-form envelope (json text) is still a READABLE failure if it decodes to one;
+                # parse it before falling through to the pending path so a completed-with-failure job
+                # is not kept reconciling as if its output were merely lagging.
+                try:
+                    decoded = json.loads(raw_output)
+                except (ValueError, TypeError):
+                    decoded = None
+                if isinstance(decoded, dict):
+                    raw_output = decoded
             if isinstance(raw_output, dict) and (
                 raw_output.get("error")
                 or ("success" in raw_output and not raw_output.get("success"))
