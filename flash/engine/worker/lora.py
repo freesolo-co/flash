@@ -249,6 +249,20 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
                 f"{st_path}: safetensors header is not a JSON object "
                 "(corrupt or not a safetensors file)"
             )
+        data_size = file_size - 8 - hdr_len
+        for key, tensor_info in header.items():
+            if key == "__metadata__":
+                continue
+            offsets = tensor_info.get("data_offsets") if isinstance(tensor_info, dict) else None
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(not isinstance(offset, int) or isinstance(offset, bool) for offset in offsets)
+                or offsets[0] < 0
+                or offsets[0] > offsets[1]
+                or offsets[1] > data_size
+            ):
+                raise ValueError(f"{st_path}: invalid or truncated tensor data for {key!r}")
         return [k for k in header if k != "__metadata__"]
     bin_path = os.path.join(adir, "adapter_model.bin")
     if os.path.isfile(bin_path):
