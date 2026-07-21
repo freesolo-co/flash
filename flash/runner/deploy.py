@@ -826,7 +826,9 @@ def _reconcile_attached_remote(
             try:
                 _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
             except RuntimeError:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                # cap the reconcile wait at the wall deadline so a near-deadline wake does
+                # not overshoot the run's wall deadline by a full interval.
+                time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time())))
                 continue
         try:
             resource_deleted = _strict_teardown_handle(handle, run_id)

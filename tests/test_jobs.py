@@ -5034,6 +5034,31 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
     assert lifecycle._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
 
 
+def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
+    # regression (#613): a terminal-ok RunPod job whose output is a READABLE worker-failure
+    # envelope (success=False) is a definitive completion-with-failure, not lagging metrics.
+    # it must return None (not raise _CompletedAttemptPending), so callers take the failed
+    # path instead of reconciling a job that already failed.
+    import time as _time
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {
+            "status": "COMPLETED",
+            "output": {"success": False, "error": "boom"},
+        },
+    )
+    handle = _runpod_handle(jobs)
+    now = _time.time()
+    # even well within the grace window, a readable failure envelope is never pending
+    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0) is None
+
+
 def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):
     """gpu.count from the job spec becomes the runpod Endpoint gpu_count (multi-gpu pod)."""
     import sys

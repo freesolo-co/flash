@@ -167,10 +167,20 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
             metrics = decode_output(job.get("output"))
             output_readable = isinstance(metrics, dict)
         except Exception:
-            # decode_output raised: the terminal-ok job's output is present but not yet
-            # decodable. treat it exactly like a missing/non-dict output below instead of
-            # falling through to the broad handler, which would return None (not completed)
-            # and let callers tear the job down.
+            raw_output = job.get("output")
+            if isinstance(raw_output, dict) and (
+                raw_output.get("error")
+                or ("success" in raw_output and not raw_output.get("success"))
+            ):
+                # the terminal-ok job's output is a READABLE worker-failure envelope, not
+                # lagging success metrics: the attempt definitively completed with a failure.
+                # do not raise _CompletedAttemptPending (which would keep reconciling a job
+                # that already failed); return None so the caller takes the completed-without-
+                # metrics (failed) path.
+                return None
+            # otherwise the output is present but not yet decodable (unparseable/non-dict):
+            # treat it like a missing output below (pending within grace) so a job that
+            # already completed is not torn down over a transient output lag.
             metrics = None
             output_readable = False
         if not output_readable:
