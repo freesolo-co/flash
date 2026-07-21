@@ -13,7 +13,7 @@ from referencing.jsonschema import specification_with
 from flash.engine.recipe import RECIPE
 from flash.engine.structured_outputs import parse_structured_outputs
 from flash.engine.vram import opd_completion_len
-from flash.lora_rank import preflight_train_context_within_serving
+from flash.lora_rank import ServingPreflightError, preflight_train_context_within_serving
 from flash.spec import JobSpec
 
 SERVING_PROMPT_TOKEN_ALLOWANCE = 256
@@ -23,10 +23,6 @@ class ExternalSchemaReference(ValueError):
     def __init__(self, ref: str) -> None:
         self.ref = ref
         super().__init__(ref)
-
-
-class ServingPreflightError(ValueError):
-    pass
 
 
 def reject_external_schema_reference(uri: str):
