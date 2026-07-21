@@ -55,7 +55,7 @@ RUN pip install --no-cache-dir \
     "flashinfer-python==0.6.6" \
     "bitsandbytes>=0.49" \
     "datasets>=4.7,<6" \
-    "huggingface_hub>=0.25" \
+    "huggingface_hub>=1.2.0" \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \

@@ -323,6 +323,83 @@ def _verified_adapter_revisions(status) -> set[str]:
     return set(read_verified_adapter_revisions(status.run_id))
 
 
+def _verified_step_index(verified_revisions: set[str], run_id: str) -> dict[int | None, list[str]]:
+    index: dict[int | None, list[str]] = {}
+    for revision in verified_revisions:
+        parsed = parse_adapter_revision(revision)
+        if parsed is not None and parsed[0] == run_id:
+            index.setdefault(parsed[1], []).append(revision)
+    return index
+
+
+def _format_deployed_steps(index: dict[int | None, list[str]]) -> str:
+    labels = [str(step) for step in sorted(step for step in index if step is not None)]
+    if None in index:
+        labels.append("final")
+    return ", ".join(labels) or "none"
+
+
+def _resolve_explicit_chat_revision(
+    run_id: str,
+    adapter_revision,
+    step,
+    verified_revisions: set[str],
+    *,
+    preferred_revision: str | None = None,
+) -> str | None:
+    """Resolve an explicit chat target to a verified same-run immutable revision to pin, or None
+    for bare-alias chat. 400 on malformed/ambiguous targets, 409 on not-yet-verified targets."""
+    if adapter_revision is not None and step is not None:
+        raise HTTPException(
+            status_code=400, detail="pass either adapter_revision or step, not both"
+        )
+    if adapter_revision is not None:
+        parsed_revision = (
+            parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
+        )
+        if parsed_revision is None:
+            raise HTTPException(
+                status_code=400, detail="adapter_revision must be a full immutable adapter revision"
+            )
+        if parsed_revision[0] != run_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
+            )
+        revision = adapter_revision.strip()
+        if revision not in verified_revisions:
+            raise HTTPException(
+                status_code=409,
+                detail=f"adapter_revision {revision} has not passed a successful deployment smoke",
+            )
+        return revision
+    if step is not None:
+        want = _parse_checkpoint_step(step)
+        index = _verified_step_index(verified_revisions, run_id)
+        matches = index.get(want, [])
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            if preferred_revision in matches:
+                return preferred_revision
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} has multiple verified revisions at step {want}; chat the full "
+                    "immutable adapter revision from `flash deployments`"
+                ),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} has no deployed checkpoint at step {want}; deploy it first with "
+                f"`flash deploy {run_id}/step-{want}` "
+                f"(currently deployed steps: {_format_deployed_steps(index)})"
+            ),
+        )
+    return None
+
+
 def recover_deployments() -> int:
     """Clear deployment lifecycle records left busy by a control-plane restart."""
     recovered = 0
@@ -735,14 +812,12 @@ def _validate_hf_repo_id(repository: str) -> None:
         ) from exc
 
 
-def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
-    """Validate optional checkpoint step; returns int or None (final adapter). 400 on bad step, 404 on missing."""
-    if raw_step is None:
-        return None
+def _parse_checkpoint_step(raw_step) -> int:
+    """Validate a raw JSON checkpoint step into a non-negative int; 400 on bad input.
 
-    # Reject bool (True -> step 1) and non-integer floats; str path uses fullmatch not isdigit
-    # (isdigit accepts unicode digits + "-5" which crash int() -> 500). The length bound also keeps a
-    # 4301+ digit string from tripping Python's int-string-conversion limit (another int() -> 500).
+    accepts a bare int, an integral float, or a bounded digit string; rejects bool,
+    non-integer floats, negatives, and unicode/oversized digit strings that would crash int().
+    """
     want: int | None = None
     if isinstance(raw_step, bool):
         want = None
@@ -753,10 +828,17 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
     elif isinstance(raw_step, str):
         s = raw_step.strip()
         want = int(s) if re.fullmatch(r"-?[0-9]{1,18}", s) else None
-    if want is not None and want < 0:
-        want = None
-    if want is None:
+    if want is None or want < 0:
         raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
+    return want
+
+
+def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
+    """Validate optional checkpoint step; returns int or None (final adapter). 400 on bad step, 404 on missing."""
+    if raw_step is None:
+        return None
+
+    want = _parse_checkpoint_step(raw_step)
     checkpoints = _app.list_checkpoints(spec)
     if any(c["step"] == want for c in checkpoints):
         return want
@@ -1082,36 +1164,23 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     messages = _chat_messages_from_payload(payload)
     status = owned_run(run_id, key)
     adapter_revision = payload.get("adapter_revision")
-    serving_model = run_id
+    step = payload.get("step")
     verified_revisions = _verified_adapter_revisions(status)
-    if adapter_revision is not None:
-        parsed_revision = (
-            parse_adapter_revision(adapter_revision) if isinstance(adapter_revision, str) else None
-        )
-        if parsed_revision is None:
-            raise HTTPException(
-                status_code=400,
-                detail="adapter_revision must be a full immutable adapter revision",
-            )
-        if parsed_revision[0] != run_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"adapter_revision belongs to run {parsed_revision[0]}, not {run_id}",
-            )
-        serving_model = adapter_revision.strip()
-        if serving_model not in verified_revisions:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"adapter_revision {serving_model} has not passed a successful deployment smoke"
-                ),
-            )
-    spec = JobSpec.from_dict(status.spec)
     deployment = status.deployment or {}
-    deployment_state = deployment.get("state")
     ready_deployment = _previous_ready_deployment(deployment)
-    has_ready_deploy = adapter_revision is not None or ready_deployment is not None
-    if adapter_revision is None and ready_deployment is not None:
+    ready_revision = ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    pinned_revision = _resolve_explicit_chat_revision(
+        run_id,
+        adapter_revision,
+        step,
+        verified_revisions,
+        preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
+    )
+    serving_model = pinned_revision or run_id
+    spec = JobSpec.from_dict(status.spec)
+    deployment_state = deployment.get("state")
+    has_ready_deploy = pinned_revision is not None or ready_deployment is not None
+    if pinned_revision is None and ready_deployment is not None:
         ready_revision = ready_deployment.get("adapter_revision")
         parsed_ready_revision = (
             parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
