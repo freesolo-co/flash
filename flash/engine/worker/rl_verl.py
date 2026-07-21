@@ -31,6 +31,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rollout_samples import sanitize_rollout_text
 
 DATA_SOURCE = "flash_env"
 
@@ -666,11 +667,11 @@ def run_rl_verl():
                     step_box[0] = int(m.group(1))
                     # dump one sample completion per new step to the flash log (matches trl #607).
                     if step_box[0] != last_dump_step[0]:
-                        last_dump_step[0] = step_box[0]
                         with _samples_lock:
                             samp = recent_samples[-1] if recent_samples else None
                         if samp:
-                            preview = " ".join(samp[0][:300].split())
+                            last_dump_step[0] = step_box[0]
+                            preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
                             print(
                                 f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
                                 flush=True,
