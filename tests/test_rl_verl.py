@@ -56,8 +56,9 @@ def _overrides_cfg(**over):
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
-        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "reward_path": "/w/reward.py",
-        "reward_name": "compute_score", "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
+        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console",
+        "reward_path": "/w/reward.py", "reward_name": "compute_score", "total_epochs": 1,
+        "save_freq": 20, "local_dir": "/w/ckpt",
     }
     cfg.update(over)
     return cfg
@@ -81,7 +82,13 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "trainer.total_training_steps=60" in o
     assert "trainer.save_freq=20" in o
     assert "trainer.max_actor_ckpt_to_keep=1" in o
+    assert "trainer.logger=[console]" in o
     assert "data.train_batch_size=16" in o
+
+
+def test_build_verl_overrides_wandb_logger_when_enabled():
+    o = rl_verl.build_verl_overrides(_overrides_cfg(loggers="console,wandb"))
+    assert "trainer.logger=[console,wandb]" in o
 
 
 def test_build_verl_overrides_kl_off_by_default():
