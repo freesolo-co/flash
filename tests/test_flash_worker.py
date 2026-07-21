@@ -582,7 +582,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     # chunked_nll owns the output-head loss; the microbatch/grad-accum are sized up front for the chosen path.
     assert "install_chalk_kernels(" in src
     assert "fused_ce=False" in src
-    assert "_sft_fused = sft_chunked_nll_enabled(model_id)" in src
+    assert "_sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal" in src
     assert '"loss_type": "chunked_nll" if _sft_fused else "nll"' in src
     assert "_prepare_chunked_nll_model(sft_model, tok, _lora_config)" in src
     assert 'cfg_kwargs["use_liger_kernel"] = False' in src
