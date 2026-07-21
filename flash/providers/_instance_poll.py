@@ -384,6 +384,7 @@ def poll_instance_job(
             deadline_at=read_deadline,
         )
         if terminal is not None:
+            _surface_final_heartbeat()
             return terminal
         if deferred_deadline_failure is not None:
             return deferred_deadline_failure
@@ -403,11 +404,10 @@ def poll_instance_job(
             message="stall boundary; waiting for HF to expose any terminal DONE/marker before stalled",
             deadline_at=absolute_deadline,
         )
-        return (
-            terminal
-            if terminal is not None
-            else PollResult(False, failure="stalled", detail=detail)
-        )
+        if terminal is not None:
+            _surface_final_heartbeat()
+            return terminal
+        return PollResult(False, failure="stalled", detail=detail)
 
     poll_errors = PollErrorTracker(say, interval_s)
     # Seed the load/stall clocks from LAUNCH, not this poll's start: a delayed reattach has been billing
@@ -460,6 +460,7 @@ def poll_instance_job(
                     deadline_at=absolute_deadline,
                 )
                 if terminal is not None:
+                    _surface_final_heartbeat()
                     return terminal
                 return PollResult(
                     False,
@@ -524,6 +525,7 @@ def poll_instance_job(
                 deadline_at=absolute_deadline,
             )
             if terminal is not None:
+                _surface_final_heartbeat()
                 return terminal
             # Dead host, no ok-marker/DONE. Distinguish genuine host LOSS (retry on a fresh host) from a
             # worker that RAN and CRASHED early leaving error_{phase}_attempt<N>.txt (bad env/config/OOM):

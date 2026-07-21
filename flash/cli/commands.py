@@ -432,6 +432,10 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     heartbeat = (status or {}).get("last_heartbeat")
     if not isinstance(heartbeat, dict):
         return []
+    # during a retry, status.remote.attempt can already point at the replacement worker while
+    # last_heartbeat still belongs to the prior attempt; don't render that stale attempt's rows
+    if not render.heartbeat_is_current_attempt(status, heartbeat):
+        return []
     metrics_last = heartbeat.get("metrics_last")
     if not isinstance(metrics_last, list):
         return []
