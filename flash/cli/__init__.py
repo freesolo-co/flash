@@ -424,7 +424,11 @@ def _build_parser() -> argparse.ArgumentParser:
     deployments.set_defaults(func=cmd_deployments)
 
     chat = sub.add_parser("chat", help="chat with a deployed adapter")
-    chat.add_argument("run_id")
+    chat.add_argument(
+        "run_id",
+        help="a bare RUN_ID (its current deployment), RUN_ID/step-N (a specific deployed "
+        "checkpoint), or a full immutable adapter revision",
+    )
     chat.add_argument("-m", "--message", required=True)
     chat.add_argument(
         "--system",

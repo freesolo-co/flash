@@ -1138,11 +1138,25 @@ def run_opd():
                         if batch:
                             _teacher_futures[teacher_pool.submit(_score_many_timed, batch)] = batch
 
-                def _queue_or_account(p: _Pending) -> None:
+                pending_teacher_batch: list[_Pending] = []
+
+                def _queue_or_account(
+                    p: _Pending, _pending_teacher_batch=pending_teacher_batch
+                ) -> None:
                     if p.gen.skip or p.gen.truncated:
                         _account(_resolve_no_loss_sample(p.gen, None))
                         return
-                    _queue_teacher_batch([p])
+                    _pending_teacher_batch.append(p)
+                    if len(_pending_teacher_batch) >= teacher_batch_size:
+                        _queue_teacher_batch(_pending_teacher_batch[:teacher_batch_size])
+                        del _pending_teacher_batch[:teacher_batch_size]
+
+                def _flush_pending_teacher_batch(
+                    _pending_teacher_batch=pending_teacher_batch,
+                ) -> None:
+                    if _pending_teacher_batch:
+                        _queue_teacher_batch(_pending_teacher_batch)
+                        _pending_teacher_batch.clear()
 
                 def _cancel_pending_teacher_futures(
                     *, _teacher_futures: dict[Future, list[_Pending]] = teacher_futures
@@ -1237,6 +1251,7 @@ def run_opd():
                                         prompt_messages=rec["context_messages"],
                                     )
                                 )
+                            _flush_pending_teacher_batch()
                             _drain_ready_teacher_futures()
                 else:
                     contexts: list[_PromptRecord] = []
@@ -1309,6 +1324,7 @@ def run_opd():
                         _queue_teacher_batch(scorable)
                         _drain_ready_teacher_futures()
 
+                _flush_pending_teacher_batch()
                 _opd_progress(opt_steps, nseq)  # refresh entering the (bounded) network phase
                 wait_started = time.perf_counter()
                 for fut in as_completed(list(teacher_futures)):
@@ -1992,10 +2008,20 @@ def _score_many(
         (_teacher_prompt_text(p.prompt_messages, thinking_prefill), p.gen.completion_text)
         for p in pendings
     ]
+    unique_prompts: list[tuple[str, str]] = []
+    prompt_indexes: dict[tuple[str, str], int] = {}
+    scatter_indexes: list[int] = []
+    for prompt in prompts:
+        index = prompt_indexes.get(prompt)
+        if index is None:
+            index = len(unique_prompts)
+            prompt_indexes[prompt] = index
+            unique_prompts.append(prompt)
+        scatter_indexes.append(index)
     attempts = max(1, int(max_attempts))
     for attempt in range(1, attempts + 1):
         try:
-            scored = teacher.score_many(prompts)
+            scored = teacher.score_many(unique_prompts)
         except AttributeError:
             return [
                 _score_one(
@@ -2029,15 +2055,20 @@ def _score_many(
                 continue
             print(f"[opd] teacher batch failed (skipping batch, samples={len(pendings)}): {e}")
             return [_ScoreResult(status="error", error=str(e)) for _ in pendings]
-        if len(scored) != len(pendings):
+        if len(scored) != len(unique_prompts):
             return [
                 _ScoreResult(
                     status="error",
-                    error=f"teacher batch returned {len(scored)} score(s) for {len(pendings)} sample(s)",
+                    error=(
+                        f"teacher batch returned {len(scored)} score(s) for "
+                        f"{len(unique_prompts)} unique sample(s)"
+                    ),
                 )
                 for _ in pendings
             ]
-        return [_ScoreResult(teacher_toks=toks, status="ok") for toks in scored]
+        return [
+            _ScoreResult(teacher_toks=scored[index], status="ok") for index in scatter_indexes
+        ]
     return [
         _ScoreResult(status="error", error="teacher batch attempts exhausted") for _ in pendings
     ]
