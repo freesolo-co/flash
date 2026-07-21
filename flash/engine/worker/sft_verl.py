@@ -1,19 +1,20 @@
 """sft training via verl in a separate interpreter.
 
-flash writes verl ``messages`` parquet rows, launches ``verl.trainer.sft_trainer`` under torchrun,
-streams progress and checkpoints back through the normal worker helpers, and exports the final fsdp
-checkpoint as a peft adapter. verl masks every assistant-role turn. flash historically masked only the
-completion span, so prompts containing assistant history remain a known multi-turn parity risk until
-the deferred tokenizer-level mask comparison is run.
+flash prepares the exact whole-conversation token ids and completion-only loss mask, writes them to
+parquet, and injects a custom verl dataset that returns those tensors verbatim. the parent streams
+progress and checkpoints without holding a cuda context while torchrun owns the training devices.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from functools import reduce
@@ -29,10 +30,13 @@ from flash.engine.steps import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.packing import completion_mask_from_ids
 from flash.engine.worker.sft import (
     _model_arch_dims,
+    _pretokenize_completion_only,
     _reject_image_completion,
     _select_indexed_sft_examples,
+    sft_completed_train_tokens,
     sft_under_ran,
 )
 from flash.engine.worker.verl_common import (
@@ -43,9 +47,9 @@ from flash.engine.worker.verl_common import (
     stamp_adapter_dir_provenance,
 )
 
-# todo: run the deferred two-gpu SFT smoke on the exact RunPod image and command assembled below.
-# todo: compare verl's role mask with flash's completion mask using the real model tokenizer.
+# todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
 _SFT_LORAPLUS_RATIO = 16.0
+_LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 _VERL_STEP_RE = re.compile(r"(?:^|\s)step:(\d+)(?:\s|$)")
 _VERL_METRIC_RE = re.compile(r"(?:^| - )(?P<name>[^:]+):(?P<value>[^ ]+)")
 
@@ -56,6 +60,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "max_length",
     "micro_batch",
     "max_token_len_per_gpu",
+    "custom_dataset_path",
     "model_path",
     "lora_rank",
     "lora_alpha",
@@ -91,6 +96,12 @@ def _hydra_val(value) -> str:
     return str(value)
 
 
+def _optimizer_override_config(cfg: dict) -> dict:
+    override = dict(cfg.get("optimizer_kwargs") or {})
+    override.setdefault("eps", cfg.get("eps", 1e-8))
+    return override
+
+
 def build_sft_verl_overrides(cfg: dict) -> list[str]:
     """build hydra overrides for verl's ``sft_trainer_engine.yaml`` config."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in cfg]
@@ -100,19 +111,21 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
     epochs = cfg.get("total_epochs")
     if bool(steps) == bool(epochs):
         raise ValueError("set exactly one of cfg['total_training_steps'] or cfg['total_epochs']")
+    optimizer_override = _optimizer_override_config(cfg)
 
     overrides = [
         f"data.train_files={_hydra_val(cfg['train_files'])}",
         f"data.val_files={_hydra_val(cfg['val_files'])}",
         f"data.train_batch_size={_hydra_val(cfg['train_batch_size'])}",
         f"data.max_length={_hydra_val(cfg['max_length'])}",
-        "data.messages_key=messages",
         f"data.micro_batch_size_per_gpu={_hydra_val(cfg['micro_batch'])}",
         "data.use_dynamic_bsz=true",
         f"data.max_token_len_per_gpu={_hydra_val(cfg['max_token_len_per_gpu'])}",
         "data.truncation=right",
         f"data.num_workers={_hydra_val(cfg.get('num_workers', 4))}",
-        f"data.ignore_input_ids_mismatch={_hydra_val(cfg.get('ignore_input_ids_mismatch', False))}",
+        "data.ignore_input_ids_mismatch=false",
+        f"data.custom_cls.path={_hydra_val(cfg['custom_dataset_path'])}",
+        "data.custom_cls.name=FlashTokenizedSFTDataset",
         f"model.path={_hydra_val(cfg['model_path'])}",
         "model.trust_remote_code=true",
         f"model.lora_rank={_hydra_val(cfg['lora_rank'])}",
@@ -128,13 +141,11 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
         f"engine.ulysses_sequence_parallel_size={_hydra_val(cfg['ulysses_sp_size'])}",
         f"optim.lr={_hydra_val(cfg['lr'])}",
         f"optim.lr_warmup_steps_ratio={_hydra_val(cfg['warmup_ratio'])}",
-        "optim.lr_scheduler_type=linear",
         f"optim.optimizer_impl={_hydra_val(cfg['optimizer_impl'])}",
         f"optim.optimizer={_hydra_val(cfg['optimizer_name'])}",
         f"optim.weight_decay={_hydra_val(cfg.get('weight_decay', 0.0))}",
         f"optim.betas={_hydra_val(cfg.get('betas', [0.9, 0.999]))}",
-        f"optim.eps={_hydra_val(cfg.get('eps', 1e-8))}",
-        f"optim.override_optimizer_config={_hydra_val(cfg.get('optimizer_kwargs'))}",
+        f"optim.override_optimizer_config={_hydra_val(optimizer_override)}",
         f"trainer.default_local_dir={_hydra_val(cfg['local_dir'])}",
         f"trainer.save_freq={_hydra_val(cfg['save_freq'])}",
         f"trainer.n_gpus_per_node={_hydra_val(cfg['n_gpus_per_node'])}",
@@ -155,24 +166,213 @@ def build_sft_verl_overrides(cfg: dict) -> list[str]:
     return overrides
 
 
-def build_sft_verl_messages_rows(
-    prompt_completion_rows, *, enable_thinking: bool | None = None
-) -> list[dict]:
-    """turn flash prompt/completion pairs into verl ``messages`` rows.
+def _serialize_multimodal_inputs(values: dict) -> bytes:
+    if not values:
+        return b""
+    import numpy as np
 
-    empty completions are dropped. verl trains every assistant-role message, while flash's prior
-    completion mask trained only the appended completion span. those masks agree for ordinary
-    single-turn prompts but may differ when the prompt already contains assistant history.
-    """
-    rows: list[dict] = []
-    for prompt_messages, completion_messages in prompt_completion_rows:
-        if not completion_messages:
+    arrays = {}
+    for key, value in values.items():
+        if value is None:
             continue
-        row = {"messages": [*prompt_messages, *completion_messages]}
-        if enable_thinking is not None:
-            row["enable_thinking"] = bool(enable_thinking)
-        rows.append(row)
-    return rows
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        arrays[key] = np.asarray(value)
+    if not arrays:
+        return b""
+    payload = io.BytesIO()
+    np.savez(payload, **arrays)
+    return payload.getvalue()
+
+
+def _sft_parquet_features():
+    from datasets import Features, Sequence, Value
+
+    return Features(
+        {
+            "input_ids": Sequence(Value("int64")),
+            "loss_mask": Sequence(Value("int8")),
+            "images": Sequence(Value("string")),
+            "multimodal_inputs": Value("binary"),
+        }
+    )
+
+
+def _write_sft_parquet(rows: list[dict], path: str) -> None:
+    from datasets import Dataset
+
+    Dataset.from_list(rows, features=_sft_parquet_features()).to_parquet(path)
+
+
+def _render_sft_dataset_module() -> str:
+    """return the standalone custom dataset loaded by verl 0.8's data.custom_cls hook."""
+    return '''from __future__ import annotations
+
+import io
+
+import numpy as np
+import pandas as pd
+
+
+class FlashTokenizedSFTDataset:
+    def __init__(self, parquet_files, tokenizer, config, processor=None, max_samples=-1):
+        if not isinstance(parquet_files, (list, tuple)):
+            parquet_files = [parquet_files]
+        frames = [pd.read_parquet(path, dtype_backend="pyarrow") for path in parquet_files]
+        self.dataframe = pd.concat(frames, ignore_index=True)
+        if max_samples > 0:
+            self.dataframe = self.dataframe.iloc[:max_samples]
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.max_length = int(config.get("max_length", 1024))
+        self.truncation = config.get("truncation", "error")
+        if config.get("ignore_input_ids_mismatch", False):
+            raise ValueError("flash tokenized sft requires input-id mismatch checks to stay enabled")
+        if self.truncation not in {"error", "right"}:
+            raise ValueError("flash tokenized sft supports error or right truncation only")
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    @staticmethod
+    def _list(value):
+        if hasattr(value, "to_pylist"):
+            value = value.to_pylist()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        return [int(item) for item in value]
+
+    @staticmethod
+    def _multimodal_inputs(payload):
+        if payload is None:
+            return {}
+        if hasattr(payload, "as_py"):
+            payload = payload.as_py()
+        payload = bytes(payload)
+        if not payload:
+            return {}
+        import torch
+
+        with np.load(io.BytesIO(payload), allow_pickle=False) as arrays:
+            return {key: torch.from_numpy(arrays[key].copy()) for key in arrays.files}
+
+    def __getitem__(self, index):
+        import torch
+
+        row = self.dataframe.iloc[index]
+        input_ids = self._list(row["input_ids"])
+        loss_mask = self._list(row["loss_mask"])
+        if len(input_ids) != len(loss_mask):
+            raise ValueError("input_ids and loss_mask must have identical lengths")
+        if len(input_ids) > self.max_length:
+            if self.truncation == "error":
+                raise ValueError("pretokenized row exceeds data.max_length")
+            input_ids = input_ids[: self.max_length]
+            loss_mask = loss_mask[: self.max_length]
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        loss_mask_tensor = torch.tensor(loss_mask, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids_tensor)
+        multi_modal_inputs = self._multimodal_inputs(row["multimodal_inputs"])
+        if (
+            self.processor is not None
+            and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+        ):
+            from verl.models.transformers.qwen2_vl import get_rope_index
+
+            vision_position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids_tensor,
+                image_grid_thw=multi_modal_inputs.get("image_grid_thw"),
+                video_grid_thw=multi_modal_inputs.get("video_grid_thw"),
+                second_per_grid_ts=multi_modal_inputs.get("second_per_grid_ts"),
+                attention_mask=attention_mask,
+            )
+            text_position_ids = torch.arange(len(input_ids), dtype=torch.long).unsqueeze(0)
+            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)
+        else:
+            position_ids = torch.arange(len(input_ids), dtype=torch.long)
+        return {
+            "input_ids": input_ids_tensor,
+            "position_ids": position_ids,
+            "loss_mask": loss_mask_tensor,
+            "multi_modal_inputs": multi_modal_inputs,
+        }
+'''
+
+
+def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
+    image_iter = iter(images)
+    prepared = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                block = dict(block)
+                if block.get("type") == "image":
+                    block["image"] = next(image_iter)
+                blocks.append(block)
+            copied["content"] = blocks
+        prepared.append(copied)
+    try:
+        next(image_iter)
+    except StopIteration:
+        return prepared
+    raise ValueError("unused decoded image while preparing multimodal sft tokens")
+
+
+def _processor_tokenized_row(
+    processor,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    images: list[object],
+    *,
+    max_length: int,
+    thinking: bool,
+) -> tuple[list[int], list[int], bytes]:
+    prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
+    full_messages = [*prepared_prompt, *completion_messages]
+    common = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "enable_thinking": thinking,
+    }
+    full = dict(
+        processor.apply_chat_template(
+            full_messages,
+            add_generation_prompt=False,
+            **common,
+        )
+    )
+    prompt = dict(
+        processor.apply_chat_template(
+            prepared_prompt,
+            add_generation_prompt=True,
+            **common,
+        )
+    )
+
+    def ids(value) -> list[int]:
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if value and isinstance(value[0], list):
+            value = value[0]
+        return [int(item) for item in value]
+
+    input_ids = ids(full.pop("input_ids"))[:max_length]
+    prompt_ids = ids(prompt["input_ids"])[:max_length]
+    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
+    full.pop("attention_mask", None)
+    return input_ids, loss_mask, _serialize_multimodal_inputs(full)
+
+
+def _has_real_target(row: dict, special_ids: set[int]) -> bool:
+    return any(
+        mask and token_id not in special_ids
+        for token_id, mask in zip(row["input_ids"], row["loss_mask"], strict=True)
+    )
 
 
 def render_loraplus_shim(ratio: float) -> str:
@@ -185,41 +385,34 @@ from importlib import import_module as _flash_import_module
 from peft.optimizers import create_loraplus_optimizer as _flash_create_loraplus_optimizer
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine as _FlashFSDPEngine
 
-_flash_original_build_optimizer = _FlashFSDPEngine._build_optimizer
-
 def _flash_build_loraplus_optimizer(self, module):
+    config = self.optimizer_config
+    optimizer_cls = getattr(_flash_import_module(config.optimizer_impl), config.optimizer)
+    optimizer_kwargs = {{"lr": config.lr, "weight_decay": config.weight_decay}}
+    if "adam" in config.optimizer.lower() or "ademamix" in config.optimizer.lower():
+        optimizer_kwargs["betas"] = config.betas
+    if config.override_optimizer_config:
+        optimizer_kwargs.update(config.override_optimizer_config)
     try:
-        config = self.optimizer_config
-        optimizer_cls = getattr(_flash_import_module(config.optimizer_impl), config.optimizer)
-        optimizer_kwargs = {{"lr": config.lr, "weight_decay": config.weight_decay}}
-        if "adam" in config.optimizer.lower() or "ademamix" in config.optimizer.lower():
-            optimizer_kwargs["betas"] = config.betas
-        if config.override_optimizer_config:
-            optimizer_kwargs.update(config.override_optimizer_config)
-        try:
-            optimizer = _flash_create_loraplus_optimizer(
-                model=module,
-                optimizer_cls=optimizer_cls,
-                optimizer_kwargs=optimizer_kwargs,
-                loraplus_lr_ratio={ratio!r},
-                loraplus_weight_decay=config.weight_decay,
-            )
-        except TypeError:
-            optimizer = _flash_create_loraplus_optimizer(
-                model=module,
-                optimizer_cls=optimizer_cls,
-                lr=config.lr,
-                loraplus_lr_ratio={ratio!r},
-                loraplus_weight_decay=config.weight_decay,
-                **{{key: value for key, value in optimizer_kwargs.items() if key != "lr"}},
-            )
-        self._flash_loraplus_applied = True
-        print("[lora+] optimizer enabled (B-matrix LR ratio={ratio:g}, cls=" + optimizer_cls.__name__ + ")", flush=True)
-        return optimizer
-    except Exception as error:
-        self._flash_loraplus_applied = False
-        print("[lora+] setup failed, falling back to default optimizer: " + str(error), flush=True)
-        return _flash_original_build_optimizer(self, module)
+        optimizer = _flash_create_loraplus_optimizer(
+            model=module,
+            optimizer_cls=optimizer_cls,
+            optimizer_kwargs=optimizer_kwargs,
+            loraplus_lr_ratio={ratio!r},
+            loraplus_weight_decay=config.weight_decay,
+        )
+    except TypeError:
+        optimizer = _flash_create_loraplus_optimizer(
+            model=module,
+            optimizer_cls=optimizer_cls,
+            lr=config.lr,
+            loraplus_lr_ratio={ratio!r},
+            loraplus_weight_decay=config.weight_decay,
+            **{{key: value for key, value in optimizer_kwargs.items() if key != "lr"}},
+        )
+    self._flash_loraplus_applied = True
+    print("{_LORAPLUS_READY_MARKER} ratio={ratio:g} optimizer=" + optimizer_cls.__name__, flush=True)
+    return optimizer
 
 _FlashFSDPEngine._build_optimizer = _flash_build_loraplus_optimizer
 '''
@@ -248,6 +441,9 @@ _flash_seed = {int(seed)}
 _flash_random.seed(_flash_seed)
 _flash_numpy.random.seed(_flash_seed % (2**32))
 _flash_torch.manual_seed(_flash_seed)
+_flash_torch.set_float32_matmul_precision("high")
+_flash_torch.backends.cuda.matmul.allow_tf32 = True
+_flash_torch.backends.cudnn.allow_tf32 = True
 
 _flash_original_loader = _flash_sft_trainer.StatefulDataLoader
 
@@ -268,12 +464,8 @@ def _flash_seeded_build_dataloader(self):
 
 _flash_sft_trainer.SFTTrainer._build_dataloader = _flash_seeded_build_dataloader
 
-_flash_original_scheduler = _FlashFSDPEngine._build_lr_scheduler
-
 def _flash_build_lr_scheduler(self, optimizer):
     config = self.optimizer_config
-    if config.lr_scheduler_type != "linear":
-        return _flash_original_scheduler(self, optimizer)
     warmup_steps = config.lr_warmup_steps
     if warmup_steps <= 0:
         warmup_steps = int(config.lr_warmup_steps_ratio * config.total_training_steps)
@@ -550,16 +742,16 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _materialize_verl_images(descriptors: list[str], package_root, image_dir: str, row_index: int) -> list[dict]:
+def _materialize_verl_images(descriptors: list[str], package_root, image_dir: str, row_index: int) -> list[str]:
     from flash.multimodal import decode_image_descriptors
 
     os.makedirs(image_dir, exist_ok=True)
     images = decode_image_descriptors(descriptors, package_root)
-    rows: list[dict] = []
+    rows: list[str] = []
     for image_index, image in enumerate(images):
         path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
         image.save(path, format="PNG")
-        rows.append({"image": path.as_uri()})
+        rows.append(path.as_uri())
     return rows
 
 
@@ -602,27 +794,155 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     return durable
 
 
-def run_sft_verl(spec=None) -> None:
-    """run flash SFT through verl's out-of-process fsdp trainer.
+_CHILD_ENV_EXACT = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LD_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "XDG_CACHE_HOME",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_DATASETS_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+        "HF_HUB_OFFLINE",
+        "HF_HUB_ENABLE_HF_TRANSFER",
+        "HF_HUB_DISABLE_XET",
+        "TRANSFORMERS_OFFLINE",
+        "TOKENIZERS_PARALLELISM",
+        "FLASH_VERL_PYTHON",
+    }
+)
+_CHILD_ENV_PREFIXES = (
+    "CUDA_",
+    "NCCL_",
+    "TORCH_",
+    "PYTORCH_",
+    "VERL_",
+    "OMP_",
+    "MKL_",
+    "OPENBLAS_",
+    "LC_",
+)
 
-    completion-only supervision is represented with role-masked ``messages`` rows. this is equivalent
-    for single-turn prompts, but verl also trains assistant turns already present in prompt history.
-    the deferred tokenizer-level mask-parity test must cover that multi-turn difference before claiming
-    exact token-mask parity. the actual two-gpu execution remains a deferred real-gpu smoke.
-    """
+
+def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, str]:
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CHILD_ENV_EXACT or key.startswith(_CHILD_ENV_PREFIXES)
+    }
+    if wandb_enabled:
+        child.update({key: value for key, value in os.environ.items() if key.startswith("WANDB_")})
+    child["PYTHONPATH"] = os.pathsep.join(
+        item for item in (shim_dir, os.environ.get("PYTHONPATH", "")) if item
+    )
+    child["PYTHONUNBUFFERED"] = "1"
+    child["HYDRA_FULL_ERROR"] = "1"
+    child["HF_HUB_OFFLINE"] = "1"
+    child["TRANSFORMERS_OFFLINE"] = "1"
+    return child
+
+
+def _probe_gpu_in_subprocess(requested_gpu: str | None, exact_type: str = "") -> dict:
+    script = r'''
+import json
+import sys
+
+from flash.engine.worker.perf.lifecycle import wait_for_gpu
+
+requested, exact = json.loads(sys.argv[1])
+wait_for_gpu(requested, exact_type=exact)
+import torch
+print("FLASH_GPU_PROBE=" + json.dumps({
+    "name": torch.cuda.get_device_name(0),
+    "memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
+    "capability": list(torch.cuda.get_device_capability(0)),
+}), flush=True)
+'''
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, json.dumps([requested_gpu, exact_type])],
+            capture_output=True,
+            text=True,
+            timeout=150,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise _w.RetriableInfraError("gpu readiness probe failed in its subprocess") from error
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if result.returncode != 0:
+        raise _w.RetriableInfraError(
+            f"gpu readiness probe exited with status {result.returncode}"
+        )
+    for line in result.stdout.splitlines():
+        if line.startswith("FLASH_GPU_PROBE="):
+            return json.loads(line.split("=", 1)[1])
+    raise _w.RetriableInfraError("gpu readiness probe returned no device metadata")
+
+
+class _NvidiaSmiPeakSampler:
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self.peak_mib = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                if result.returncode == 0:
+                    values = [float(value.strip()) for value in result.stdout.splitlines() if value.strip()]
+                    if values:
+                        self.peak_mib = max(self.peak_mib, max(values))
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop_gb(self) -> float:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        return round(self.peak_mib / 1024, 3)
+
+
+def run_sft_verl(spec=None) -> None:
+    """run flash sft through verl's out-of-process fsdp trainer."""
     from flash.catalog import MODELS, resolve_vocab_size
     from flash.engine.vram import sft_grad_accum
 
     spec = spec or _w.JOB_SPEC
-    _w.seed_training_rngs(_w.SEED)
     env = _w.require_active_env()
     started_at = time.time()
-    _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics())
-    _w.wait_for_gpu(
+    _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
+    gpu_probe = _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.exact_type if spec else "",
     )
-    _w.setup_perf_backends()
 
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
@@ -659,9 +979,10 @@ def run_sft_verl(spec=None) -> None:
     os.makedirs(local_dir, exist_ok=True)
 
     with liveness_heartbeat("sft_data_loading"):
-        from datasets import Dataset
+        from transformers import AutoProcessor
 
         from flash.multimodal import (
+            decode_image_descriptors,
             normalize_prompt_images,
             record_has_images,
             text_only_prompt_messages,
@@ -670,47 +991,119 @@ def run_sft_verl(spec=None) -> None:
 
         indexed_train = _select_indexed_sft_examples(env.dataset(), max_examples, _w.SEED)
         selected = [example for _, example in indexed_train]
+        prompt_rows = [
+            (example, env.prompt_messages(example), env.sft_completion(example))
+            for example in selected
+        ]
         package_root = getattr(env, "package_root", None)
-        rows: list[dict] = []
+        multimodal = any(
+            record_has_images(example, prompt_messages)
+            for example, prompt_messages, _completion in prompt_rows
+        )
+        processor = None
+        if multimodal:
+            validate_multimodal_training(model_id, "sft")
+            processor = AutoProcessor.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **_w.model_revision_kwargs(model_revision),
+            )
+            tokenizer = processor.tokenizer
+        else:
+            tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        row_by_index: dict[int, dict] = {}
+        text_specs: list[dict] = []
+        sampled_texts: list[str] = []
         multiturn_targets = 0
-        multimodal = False
-        for row_index, example in enumerate(selected):
-            prompt_messages = env.prompt_messages(example)
-            completion_messages = env.sft_completion(example)
+        for row_index, (example, prompt_messages, completion_messages) in enumerate(prompt_rows):
             _reject_image_completion(completion_messages)
-            if not completion_messages:
-                continue
             if len(completion_messages) > 1:
                 multiturn_targets += 1
-            row_is_multimodal = record_has_images(example, prompt_messages)
-            multimodal = multimodal or row_is_multimodal
-            if row_is_multimodal:
-                validate_multimodal_training(model_id, "sft")
+            if record_has_images(example, prompt_messages):
+                assert processor is not None
                 normalized = normalize_prompt_images(example, prompt_messages, package_root)
                 completion_messages = text_only_prompt_messages(completion_messages)
-                combined = [*normalized.messages, *completion_messages]
-                messages = [
-                    {**message, "content": _verl_image_message_content(message.get("content"))}
-                    for message in combined
-                ]
-                row = {"messages": messages, "enable_thinking": bool(_w.THINKING)}
-                row["images"] = _materialize_verl_images(
-                    normalized.descriptors,
-                    package_root,
-                    image_dir,
-                    row_index,
+                decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
+                input_ids, loss_mask, multimodal_inputs = _processor_tokenized_row(
+                    processor,
+                    normalized.messages,
+                    completion_messages,
+                    decoded_images,
+                    max_length=max_length,
+                    thinking=bool(_w.THINKING),
                 )
-                rows.append(row)
-            else:
-                rows.extend(
-                    build_sft_verl_messages_rows(
-                        [(prompt_messages, completion_messages)],
+                row_by_index[row_index] = {
+                    "input_ids": input_ids,
+                    "loss_mask": loss_mask,
+                    "images": _materialize_verl_images(
+                        normalized.descriptors,
+                        package_root,
+                        image_dir,
+                        row_index,
+                    ),
+                    "multimodal_inputs": multimodal_inputs,
+                }
+                sampled_texts.append(
+                    tokenizer.apply_chat_template(
+                        [*normalized.messages, *completion_messages],
+                        tokenize=False,
+                        add_generation_prompt=False,
                         enable_thinking=_w.THINKING,
                     )
                 )
+            else:
+                text = tokenizer.apply_chat_template(
+                    [*prompt_messages, *completion_messages],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    enable_thinking=_w.THINKING,
+                )
+                prompt_text = tokenizer.apply_chat_template(
+                    prompt_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=_w.THINKING,
+                )
+                sampled_texts.append(text)
+                text_specs.append(
+                    {"text": text, "prompt_text": prompt_text, "row_index": row_index}
+                )
 
+        dropped = 0
+        if text_specs:
+            kept_specs, tokenized_rows, text_dropped = _pretokenize_completion_only(
+                text_specs, tokenizer, max_length
+            )
+            dropped += text_dropped
+            for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
+                row_by_index[spec_row["row_index"]] = {
+                    "input_ids": tokenized["input_ids"],
+                    "loss_mask": tokenized["completion_mask"],
+                    "images": [],
+                    "multimodal_inputs": b"",
+                }
+
+        special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+        rows = []
+        for row_index in sorted(row_by_index):
+            row = row_by_index[row_index]
+            if _has_real_target(row, special_ids):
+                rows.append(row)
+            else:
+                dropped += 1
         if not rows:
-            raise ValueError("every selected SFT example has an empty completion (nothing to train on)")
+            raise ValueError(
+                "every SFT example has an empty completion after sft_max_len truncation "
+                "(nothing to train on); increase sft_max_len or shorten the prompts"
+            )
+        if dropped:
+            print(
+                f"[sft] dropped {dropped} rows with no real completion target "
+                "(sft_max_len truncated away the whole completion, or it was content-free)"
+            )
         if multiturn_targets:
             print(
                 f"[sft] multi-turn SFT: {multiturn_targets}/{len(selected)} rows train on a full "
@@ -718,24 +1111,33 @@ def run_sft_verl(spec=None) -> None:
             )
         elif getattr(env, "multi_turn", False):
             print(
-                "[sft][warn] this is a multi-turn environment but no row ships a multi-turn target; "
-                "verl trains the appended assistant turn and any assistant history in the prompt"
+                "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
+                "target completion"
             )
-        if _w.THINKING and not any(
-            _message_contains_text(row["messages"], "<think>") for row in rows[:256]
-        ):
+        if _w.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
             print(
                 "WARN: thinking mode is ON but no sampled SFT target contains a <think> trace; "
                 "training on non-reasoning targets teaches the model to skip thinking"
             )
 
+        masked_tokens = sum(mask.count(0) for mask in (row["loss_mask"] for row in rows))
+        total_tokens_per_epoch = sum(len(row["input_ids"]) for row in rows)
+        realized_max_length = max(len(row["input_ids"]) for row in rows)
+        print(
+            f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
+            f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
+        )
         train_file = os.path.join(data_dir, "train.parquet")
         val_file = os.path.join(data_dir, "val.parquet")
-        Dataset.from_list(rows).to_parquet(train_file)
-        Dataset.from_list([rows[0]]).to_parquet(val_file)
+        _write_sft_parquet(rows, train_file)
+        _write_sft_parquet([rows[0]], val_file)
 
     setup_seconds = time.time() - started_at
-    _w.heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=_w.gpu_diagnostics())
+    _w.heartbeat(
+        "sft_model_load",
+        setup_seconds=setup_seconds,
+        gpu=_w.gpu_diagnostics(include_torch=False),
+    )
 
     lora_config = _w.make_lora(model_id)
     lora_rank = int(lora_config.r)
@@ -765,16 +1167,9 @@ def run_sft_verl(spec=None) -> None:
     loop_epochs = max(epochs, math.ceil(update_horizon / steps_per_epoch))
     save_freq = reduce(gcd, save_at_steps) if save_at_steps else save_every
 
-    card_vram_gb = 0.0
-    capability = None
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            card_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            capability = torch.cuda.get_device_capability(0)
-    except Exception:
-        pass
+    card_vram_gb = float(gpu_probe.get("memory_gb") or 0.0)
+    raw_capability = gpu_probe.get("capability")
+    capability = tuple(raw_capability) if raw_capability else None
     hidden, layers = _model_arch_dims(model_id, revision=model_revision)
     info = MODELS.get(model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
@@ -806,6 +1201,9 @@ def run_sft_verl(spec=None) -> None:
         (spec.wandb.project if spec and spec.wandb else None) or "flash"
     )
     experiment_name = _w.wandb_run_name()
+    shim_dir = os.path.join(workdir, "shim")
+    os.makedirs(shim_dir, exist_ok=True)
+    custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
 
     config = {
         "train_files": train_file,
@@ -814,6 +1212,7 @@ def run_sft_verl(spec=None) -> None:
         "max_length": max_length,
         "micro_batch": micro_batch,
         "max_token_len_per_gpu": max_length * micro_batch,
+        "custom_dataset_path": custom_dataset_path,
         "model_path": model_path,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
@@ -835,14 +1234,11 @@ def run_sft_verl(spec=None) -> None:
         "loggers": loggers,
         "use_liger": True,
         "gradient_checkpointing": gradient_checkpointing and not reentrant_gradient_checkpointing,
-        "ignore_input_ids_mismatch": bool(_w.THINKING),
         "total_training_steps": update_horizon if max_steps > 0 else None,
         "total_epochs": epochs if max_steps <= 0 else None,
     }
     overrides = build_sft_verl_overrides(config)
 
-    shim_dir = os.path.join(workdir, "shim")
-    os.makedirs(shim_dir, exist_ok=True)
     shim_source = _render_sft_sitecustomize(
         seed=config["seed"],
         loraplus_ratio=_SFT_LORAPLUS_RATIO,
@@ -852,6 +1248,8 @@ def run_sft_verl(spec=None) -> None:
     )
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
         file.write(shim_source)
+    with open(custom_dataset_path, "w", encoding="utf-8") as file:
+        file.write(_render_sft_dataset_module())
 
     resume_step = _restore_verl_resume(local_dir)
     watcher = _VerlCheckpointWatcher(
@@ -868,14 +1266,10 @@ def run_sft_verl(spec=None) -> None:
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
 
-    child_env = dict(os.environ)
-    child_env["PYTHONPATH"] = os.pathsep.join(
-        item for item in (shim_dir, child_env.get("PYTHONPATH", "")) if item
+    child_env = _build_verl_child_env(
+        shim_dir=shim_dir,
+        wandb_enabled="wandb" in loggers,
     )
-    child_env["PYTHONUNBUFFERED"] = "1"
-    child_env["HYDRA_FULL_ERROR"] = "1"
-    child_env["HF_HUB_OFFLINE"] = "1"
-    child_env["TRANSFORMERS_OFFLINE"] = "1"
     command = [
         python_bin,
         "-m",
@@ -890,21 +1284,27 @@ def run_sft_verl(spec=None) -> None:
 
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     loss_curve: list[float] = []
-    train_tokens = 0
-    loraplus_applied = False
+    train_tokens = sft_completed_train_tokens(
+        total_tokens_per_epoch,
+        epochs,
+        derived_steps,
+        resume_step,
+    )
+    loraplus_applied = resume_step >= update_horizon
 
     def on_line(line: str) -> None:
-        nonlocal train_tokens, loraplus_applied
+        nonlocal loraplus_applied
         watcher.raise_if_failed()
-        if "[lora+] optimizer enabled" in line:
+        if _LORAPLUS_READY_MARKER in line:
             loraplus_applied = True
         step_match = _VERL_STEP_RE.search(line)
         if step_match is None:
             return
+        if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
+            raise RuntimeError("verl reached an optimizer step before the required lora+ shim succeeded")
         loss = _metric_value(line, "train/loss")
         grad_norm = _metric_value(line, "train/grad_norm")
         learning_rate_value = _metric_value(line, "train/lr")
-        tokens = _metric_value(line, "train/global_tokens")
         if loss is not None:
             loss_curve.append(round(loss, 4))
             progress["loss"] = loss
@@ -912,8 +1312,6 @@ def run_sft_verl(spec=None) -> None:
             progress["grad_norm"] = grad_norm
         if learning_rate_value is not None:
             progress["lr"] = learning_rate_value
-        if tokens is not None:
-            train_tokens += int(tokens)
 
     def on_step(step: int) -> None:
         progress["step"] = step
@@ -928,8 +1326,7 @@ def run_sft_verl(spec=None) -> None:
     def child_heartbeat() -> None:
         _w.heartbeat("sft_step", liveness=True, step=int(progress["step"] or 0))
 
-    _w._reset_peak_gpu()
-    gpu_sampler = _w._GpuPeakSampler().start()
+    gpu_sampler = _NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
     return_code = 0
     if resume_step < update_horizon:
@@ -953,10 +1350,18 @@ def run_sft_verl(spec=None) -> None:
     device_peak_gpu_gb = gpu_sampler.stop_gb()
     if return_code != 0:
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
+    if _SFT_LORAPLUS_RATIO > 1 and not loraplus_applied:
+        raise RuntimeError("required lora+ shim did not emit its success marker")
 
     actor_dir, final_step = latest_global_step_dir(local_dir)
     if sft_under_ran(final_step, update_horizon, max_steps):
         raise RuntimeError(f"sft completed {final_step}/{update_horizon} requested optimizer updates")
+    train_tokens = sft_completed_train_tokens(
+        total_tokens_per_epoch,
+        epochs,
+        derived_steps,
+        final_step,
+    )
 
     with liveness_heartbeat(
         "sft_finalizing",
@@ -976,7 +1381,12 @@ def run_sft_verl(spec=None) -> None:
         if final_save_due(final_step, save_at_steps) and final_step not in watcher.processed_steps:
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
 
-    _w.heartbeat("sft_trained", train_wall=train_wall, step=final_step, gpu=_w.gpu_diagnostics())
+    _w.heartbeat(
+        "sft_trained",
+        train_wall=train_wall,
+        step=final_step,
+        gpu=_w.gpu_diagnostics(include_torch=False),
+    )
     _w.write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,
@@ -997,7 +1407,7 @@ def run_sft_verl(spec=None) -> None:
             "gradient_checkpointing": gradient_checkpointing,
             "gradient_checkpointing_reentrant": reentrant_gradient_checkpointing,
             "configured_max_length": max_length,
-            "realized_max_length": None,
+            "realized_max_length": realized_max_length,
             "runtime_max_length": max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": math.ceil(train_batch_size / micro_batch),
@@ -1014,4 +1424,3 @@ def run_sft_verl(spec=None) -> None:
             "wandb_run_name": experiment_name if "wandb" in loggers else None,
         },
     )
-    _w.free_gpu()

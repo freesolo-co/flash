@@ -536,33 +536,32 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
         _reject_image_completion(completion)
 
 
-def test_sft_mixed_text_completion_shapes_are_arrow_safe():
-    import inspect
+@pytest.mark.parametrize("image_first", [False, True])
+def test_sft_mixed_text_and_image_rows_use_an_explicit_arrow_schema(tmp_path, image_first):
+    datasets = pytest.importorskip("datasets")
+    from flash.engine.worker.sft_verl import _write_sft_parquet
 
-    pytest.importorskip("datasets")
-    from datasets import Dataset
+    text = {
+        "input_ids": [1, 2],
+        "loss_mask": [0, 1],
+        "images": [],
+        "multimodal_inputs": b"",
+    }
+    image = {
+        "input_ids": [3, 4],
+        "loss_mask": [0, 1],
+        "images": ["file:///tmp/image.png"],
+        "multimodal_inputs": b"vision",
+    }
+    expected = [image, text] if image_first else [text, image]
+    parquet = tmp_path / "mixed.parquet"
 
-    from flash.engine.worker import sft_verl
+    _write_sft_parquet(expected, str(parquet))
+    dataset = datasets.Dataset.from_parquet(str(parquet))
 
-    completions = [
-        [{"role": "assistant", "content": "red"}],
-        [{"role": "assistant", "content": [{"type": "text", "text": "blue"}]}],
-    ]
-    rows = [
-        {
-            "prompt": [{"role": "user", "content": [{"type": "text", "text": "color?"}]}],
-            "completion": mm.text_only_prompt_messages(completion),
-            "images": [],
-        }
-        for completion in completions
-    ]
-
-    dataset = Dataset.from_list(rows)
-
-    assert [row["completion"][0]["content"] for row in dataset] == ["red", "blue"]
-    source = inspect.getsource(sft_verl.run_sft_verl)
-    assert "completion_messages = text_only_prompt_messages(completion_messages)" in source
-    assert "_materialize_verl_images(" in source
+    assert dataset[0]["images"] == expected[0]["images"]
+    assert dataset[1]["images"] == expected[1]["images"]
+    assert dataset.features["images"].feature.dtype == "string"
 
 
 def test_image_content_key_is_stable_and_pixel_sensitive():
