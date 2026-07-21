@@ -8,7 +8,7 @@ TRAINING_MD = r"""# TRAINING.md — how to actually improve a model with Flash
 > `flash env setup` dropped this file next to your `environment.py` and `configs/`.
 > It is the playbook Freesolo's own training agents follow to turn a *finished*
 > run into a model that *measurably improved*. The mechanics live in the hosted
-> docs (https://freesolo.co/docs); this file is the judgment that sits on top of them.
+> docs (https://docs.freesolo.co); this file is the judgment that sits on top of them.
 
 A run that reaches `done` is **not** the same as a run that worked. Submitting a run
 is not a result. The whole job is to design the learning signal, read what the run
@@ -713,5 +713,5 @@ flash export --adapter-id <run-id> --repository <you>/<repo>  # export final ada
 flash export --adapter-id <run-id>/step-N --repository <you>/<repo>  # export a checkpoint
 ```
 
-See the full reference at https://freesolo.co/docs.
+See the full reference at https://docs.freesolo.co.
 """
