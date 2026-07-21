@@ -1,0 +1,150 @@
+"""verl grpo backend: dispatch, data/config/reward glue, and reward parity (cpu-only, no verl)."""
+
+from __future__ import annotations
+
+import json
+import urllib.request
+
+import pytest
+
+import flash.engine.worker as W
+from flash.engine.worker import rl, rl_verl
+
+
+# ------------------------------- dispatch -------------------------------
+def test_run_rl_delegates_to_verl_backend(monkeypatch):
+    """FLASH_RL_BACKEND=verl delegates to run_rl_verl without touching the trl body."""
+    called = []
+    monkeypatch.setattr(rl_verl, "run_rl_verl", lambda: called.append(True))
+    monkeypatch.setenv("FLASH_RL_BACKEND", "verl")
+    # if the trl body ran instead of delegating, it would fail hard before returning.
+    rl.run_rl()
+    assert called == [True]
+
+
+def test_run_rl_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setenv("FLASH_RL_BACKEND", "megatron")
+    with pytest.raises(RuntimeError, match="not a known grpo backend"):
+        rl.run_rl()
+
+
+# ------------------------------- data conversion -------------------------------
+def test_build_verl_dataset_rows_schema_and_index():
+    rows = rl_verl.build_verl_dataset_rows(
+        [[{"role": "user", "content": "q0"}], [{"role": "user", "content": "q1"}]],
+        [5, 9],
+        ["42", ""],
+    )
+    assert rows[0]["prompt"] == [{"role": "user", "content": "q0"}]
+    assert rows[0]["reward_model"] == {"style": "rule", "ground_truth": "42"}
+    # the flash rollout index must round-trip through verl's extra_info so the reward maps back.
+    assert [r["extra_info"]["index"] for r in rows] == [5, 9]
+    assert all(r["data_source"] == rl_verl.DATA_SOURCE for r in rows)
+
+
+def test_build_verl_dataset_rows_length_mismatch_raises():
+    with pytest.raises(ValueError, match="length mismatch"):
+        rl_verl.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [1, 2], ["a", "b"])
+
+
+# ------------------------------- override generation -------------------------------
+def test_build_verl_overrides_carries_grpo_lora_and_ref_logprob():
+    cfg = {
+        "train_files": "/w/train.parquet", "val_files": "/w/val.parquet",
+        "model_id": "Qwen/Qwen3-4B", "lora_rank": 32, "lora_alpha": 64,
+        "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
+        "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
+        "max_completion": 320, "temperature": 1.0, "kl_loss_coef": 0.001,
+        "gpu_mem_util": 0.5, "tp_size": 1, "reward_path": "/w/reward.py",
+        "reward_name": "compute_score", "total_epochs": 1, "save_freq": 1,
+        "local_dir": "/w/ckpt",
+    }
+    o = rl_verl.build_verl_overrides(cfg)
+    assert "algorithm.adv_estimator=grpo" in o
+    assert "actor_rollout_ref.model.lora_rank=32" in o
+    assert "actor_rollout_ref.rollout.n=8" in o
+    assert "actor_rollout_ref.rollout.load_format=safetensors" in o
+    # a reference policy requires ref + rollout log-prob micro-batch, else verl fails config validation.
+    assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
+    assert "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2" in o
+    assert "data.train_batch_size=16" in o
+    assert f"data.train_files={cfg['train_files']}" in o
+
+
+# ------------------------------- reward module render -------------------------------
+def test_render_reward_module_is_valid_and_defines_compute_score():
+    src = rl_verl.render_reward_module()
+    ns: dict = {}
+    exec(compile(src, "<reward>", "exec"), ns)  # compiles + defines, no network call made
+    assert callable(ns["compute_score"])
+    # no flash import leaks into the verl-side shim.
+    assert "import flash" not in src
+
+
+# ------------------------------- reward parity -------------------------------
+class _BreakdownEnv:
+    def scores_breakdown(self, graded, ex, state):
+        return {"total": 1.0 if graded.strip() == ex["gt"] else 0.0}
+
+
+class _RewardOnlyEnv:
+    def reward(self, graded, ex, state):
+        return 2.5 if ex["gt"] in graded else 0.0
+
+
+class _RaisingEnv:
+    def scores_breakdown(self, graded, ex, state):
+        raise ValueError("boom")
+
+
+@pytest.fixture
+def _identity_graded(monkeypatch):
+    monkeypatch.setattr(W, "graded_text", lambda text, prompt_opened_thinking=False: text)
+    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
+    monkeypatch.setattr(W, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3)
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_breakdown_and_reward_env():
+    s = rl_verl.score_single_turn(
+        _BreakdownEnv(), "7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0,
+    )
+    assert s == 1.0
+    s2 = rl_verl.score_single_turn(
+        _RewardOnlyEnv(), "the answer is 7", {"gt": "7"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0,
+    )
+    assert s2 == 2.5
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_applies_thinking_penalty():
+    # base reward 1.0 minus think_penalty(0.1) * think_token_count(3) = 0.7
+    s = rl_verl.score_single_turn(
+        _BreakdownEnv(), "7", {"gt": "7"}, tok=object(), thinking=True,
+        prompt_opened_thinking=True, think_penalty=0.1,
+    )
+    assert abs(s - 0.7) < 1e-9
+
+
+@pytest.mark.usefixtures("_identity_graded")
+def test_score_single_turn_env_error_is_zero():
+    s = rl_verl.score_single_turn(
+        _RaisingEnv(), "x", {"gt": "1"}, tok=None, thinking=False,
+        prompt_opened_thinking=False, think_penalty=0.0,
+    )
+    assert s == 0.0
+
+
+# ------------------------------- reward rpc bridge -------------------------------
+def test_reward_server_round_trip():
+    server, url = rl_verl.start_reward_server(lambda idx, s: float(idx) + len(s))
+    try:
+        body = json.dumps({"index": 3, "solution_str": "abcd"}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            got = json.loads(r.read().decode())
+        assert got["score"] == 7.0  # 3 + len("abcd")
+    finally:
+        server.shutdown()
