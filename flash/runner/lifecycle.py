@@ -22,6 +22,7 @@ INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _RECOVERY_MARKER_GRACE_S = 120.0
+_RECOVERY_METRICS_POLL_S = 5.0
 
 
 class _CompletedAttemptPending(RuntimeError):
@@ -393,6 +394,19 @@ def _oom_escalated(candidates, oom_vram_floor: int):
     return [c for c in candidates if c.vram_gb > oom_vram_floor]
 
 
+def _await_runpod_completed_metrics(last_handle, deadline_at) -> dict | None:
+    # a terminal-ok runpod job whose output metrics are not decodable yet raises
+    # _CompletedAttemptPending within the grace window; keep reconciling (like attach_run
+    # and background reconciliation) instead of letting it escape the supervisor and fail
+    # a job that already completed. _runpod_completed_metrics returns None once the grace
+    # window expires, so this poll is bounded.
+    while True:
+        try:
+            return _runpod_completed_metrics(last_handle, deadline_at=deadline_at)
+        except _CompletedAttemptPending:
+            time.sleep(_RECOVERY_METRICS_POLL_S)
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -541,10 +555,7 @@ def _submit_seed_supervised(
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            completed_metrics = _runpod_completed_metrics(
-                last_handle,
-                deadline_at=_load_run_deadline_at(spec.run_id),
-            )
+            completed_metrics = _await_runpod_completed_metrics(last_handle, _load_run_deadline_at(spec.run_id))
             if completed_metrics is not None:
                 return _return_completed_runpod_metrics(completed_metrics)
             resource_deleted = False
@@ -784,10 +795,7 @@ def _submit_seed_supervised(
                 raise _cancel()
         except FileNotFoundError:
             pass
-        completed_metrics = _runpod_completed_metrics(
-            last_handle,
-            deadline_at=_load_run_deadline_at(spec.run_id),
-        )
+        completed_metrics = _await_runpod_completed_metrics(last_handle, _load_run_deadline_at(spec.run_id))
         if completed_metrics is not None:
             return _return_completed_runpod_metrics(completed_metrics)
         last_detail = f"{res.failure}: {res.detail}"
