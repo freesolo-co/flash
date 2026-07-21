@@ -14,6 +14,7 @@ scope raises rather than silently training on a different contract.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
@@ -121,7 +122,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "trainer.max_actor_ckpt_to_keep=1",
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
-        "trainer.logger=console",
+        f"trainer.logger=[{cfg['loggers']}]",
         "trainer.project_name=flash_verl",
         "trainer.experiment_name=grpo",
         f"trainer.default_local_dir={cfg['local_dir']}",
@@ -387,6 +388,23 @@ def _resolve_single_turn_inputs():
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
             "no stop-string field here); use the trl backend (unset FLASH_RL_BACKEND) for it."
         )
+    if _t and getattr(_t, "save_at_steps", ()):
+        raise RuntimeError(
+            "train.save_at_steps is not yet supported on the verl backend (verl saves on a fixed "
+            "save_freq interval, not arbitrary steps); use the trl backend for it."
+        )
+    if model_revision:
+        raise RuntimeError(
+            "model_revision pinning is not yet supported on the verl backend (verl loads the model "
+            "at its default revision); use the trl backend for revision-pinned runs."
+        )
+    # flash's lora dropout is fixed at 0.0; verl matches (peft default). guard defensively so a future
+    # non-zero recipe value can never be silently ignored.
+    if float(RECIPE.lora.dropout) != 0.0:
+        raise RuntimeError(
+            f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not yet wired on the verl backend; "
+            "use the trl backend or add actor_rollout_ref.model.lora_dropout support."
+        )
     gcfg = _w.grpo_overrides()
     prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
     group_size = int(gcfg.get("group_size") or rl.group_size)
@@ -395,6 +413,14 @@ def _resolve_single_turn_inputs():
     think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # flash defaults kl_penalty_coef to 0 (dr-grpo, no kl term); honor it rather than forcing a kl.
     kl_coef = float(gcfg.get("kl_penalty_coef") or 0.0)
+    # advantage_clip is recorded but not applied (the trl path centers advantages without a value
+    # clip; verl's grpo advantage is likewise group-centered). log it for parity, do not apply.
+    if float(gcfg.get("advantage_clip") or 0.0) > 0:
+        print(
+            f"[rl-verl] advantage_clip={gcfg['advantage_clip']} recorded; verl centers grpo "
+            "advantages (no value clip), matching the trl path",
+            flush=True,
+        )
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
@@ -539,6 +565,8 @@ def run_rl_verl():
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
+        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
+        loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
             "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
@@ -549,7 +577,7 @@ def run_rl_verl():
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
-            "gpu_mem_util": 0.5, "tp_size": 1,
+            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers,
             "reward_path": reward_py, "reward_name": "compute_score",
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }
@@ -568,6 +596,10 @@ def run_rl_verl():
         env_for_verl["TRANSFORMERS_OFFLINE"] = "1"
         env_for_verl["HF_HUB_DISABLE_XET"] = "1"
         step_re = re.compile(r"step:\s*(\d+)")
+        reward_re = re.compile(r"critic/rewards/mean:([-\d.eE+]+)")
+        loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
+        reward_history: list[float] = []
+        loss_curve: list[float] = []
         with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
@@ -578,6 +610,12 @@ def run_rl_verl():
                 m = step_re.search(line)
                 if m:
                     step_box[0] = int(m.group(1))
+                # capture verl's per-step reward + policy loss for train_meta observability parity.
+                for pat, sink in ((reward_re, reward_history), (loss_re, loss_curve)):
+                    hit = pat.search(line)
+                    if hit:
+                        with contextlib.suppress(ValueError):
+                            sink.append(float(hit.group(1)))
             rc = proc.wait()
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
@@ -616,5 +654,16 @@ def run_rl_verl():
             "epochs": inp["epochs"],
             "retained_prompts": len(prompts),
             "group_size": inp["group_size"],
+            "reward_history": reward_history,
+            "loss_curve": loss_curve,
+            "grpo_recipe": {
+                "kl_coef": inp["kl_coef"],
+                "temperature": inp["temperature"],
+                "top_p": inp["top_p"],
+                "num_iterations": inp["num_iterations"],
+                "seed": inp["seed"],
+                "loss_agg_mode": "seq-mean-token-sum-norm",
+                "norm_adv_by_std_in_grpo": False,
+            },
         },
     )
