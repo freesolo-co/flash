@@ -88,19 +88,17 @@ def _on_policy_prompts_per_step(spec, examples: int) -> int:
 def _sft_realized_batch(spec) -> int:
     from flash.catalog import resolve_vocab_size
     from flash.engine.recipe import RECIPE
-    from flash.engine.vram import resolve_params_b, sft_logits_fused, sft_realized_batch
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_realized_batch
 
     t = spec.train
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
     sft_seq = _sft_seq_len(spec)
-    # Resolve params_b via the shared helper (catalog stat else HF safetensors for an open model) —
-    # the SAME resolution the worker's run_sft uses. The fused-CE decision (and thus the big-vocab
-    # micro-batch cap) hinges on the >=3B threshold, so an uncataloged >=3B model must not be priced
-    # as <3B (which would flip fused off, change the realized batch via the cap, and misprice the
-    # step count). Best-effort: no network -> None -> the prior <3B (cap-on) behavior.
-    sft_fused = sft_logits_fused(
-        resolve_params_b(spec.model, revision=spec.model_revision), sft_seq
-    )
+    # mirror the worker's validated chunked-nll model set so pricing uses the same realized batch.
+    # every allowlisted model is a gdn hybrid; at packable context lengths the worker may force
+    # per-device=1, so price the requested batch rather than the larger chunked-nll rounded batch.
+    sft_fused = sft_chunked_nll_enabled(spec.model)
+    if sft_fused and sft_seq <= 16_384:
+        return requested_batch
     return sft_realized_batch(
         requested_batch,
         seq_len=sft_seq,
@@ -167,6 +165,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         exact_type=g.exact_type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
+        gpu_count=g.count,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

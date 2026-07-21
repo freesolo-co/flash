@@ -92,6 +92,11 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"train.rollout_request_timeout_seconds": 600}, "unknown key"),
         ({"train.rollout_request_max_attempts": 2}, "unknown key"),
         ({"train.rollout_stall_timeout_seconds": 60}, "unknown key"),
+        # gpu.count: cards per job, validated to 1..8; bools/non-ints/out-of-range are rejected.
+        ({"gpu.count": 0}, "gpu.count must be between 1 and 8"),
+        ({"gpu.count": 9}, "gpu.count must be between 1 and 8"),
+        ({"gpu.count": True}, "gpu.count must be an integer"),
+        ({"gpu.count": "two"}, "gpu.count must be an integer"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
@@ -1070,3 +1075,49 @@ def test_coerce_bool(value, expected) -> None:
     from flash.spec import coerce_bool
 
     assert coerce_bool(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# gpu.count (multi-gpu job spec)
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_count_defaults_to_one() -> None:
+    assert spec_from_dict(_raw()).gpu.count == 1
+    assert GpuSpec().count == 1
+
+
+def test_gpu_count_parses_and_roundtrips() -> None:
+    parsed = spec_from_dict(_raw(**{"gpu.count": 4}))
+    assert parsed.gpu.count == 4
+    # count survives both serialization hops (asdict-based to_dict / to_json).
+    assert JobSpec.from_dict(parsed.to_dict()).gpu.count == 4
+    assert JobSpec.from_json(parsed.to_json()).gpu.count == 4
+
+
+@pytest.mark.parametrize("good", [1, 8])
+def test_gpu_spec_direct_construction_accepts_valid_count(good: int) -> None:
+    assert GpuSpec(count=good).count == good
+
+
+@pytest.mark.parametrize(
+    ("bad", "exc"),
+    [
+        (0, ValueError),
+        (-1, ValueError),
+        (9, ValueError),
+        (True, TypeError),  # bool is an int subclass; must be rejected
+        ("two", TypeError),
+    ],
+)
+def test_gpu_spec_direct_construction_rejects_bad_count(bad: object, exc: type) -> None:
+    with pytest.raises(exc):
+        GpuSpec(count=bad)
+
+
+def test_gpu_count_of_reads_spec_and_defaults() -> None:
+    from flash.spec import gpu_count_of
+
+    assert gpu_count_of(None) == 1  # no spec -> single gpu
+    assert gpu_count_of(JobSpec()) == 1  # default spec
+    assert gpu_count_of(JobSpec(gpu=GpuSpec(count=3))) == 3

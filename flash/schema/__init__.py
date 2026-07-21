@@ -360,6 +360,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"gpu.keep_alive_seconds must be <= {KEEP_ALIVE_SECONDS_MAX} "
             f"({KEEP_ALIVE_SECONDS_MAX // 3600}h); got {gpu_keep_alive_seconds}"
         )
+    # cards a single training worker occupies (1..8); count > 1 provisions a multi-gpu pod.
+    gpu_count = _section_int(gpu_raw, "gpu", "count", minimum=1, maximum=8)
     gpu_options = {}
     if gpu_max_retries is not None:
         gpu_options["max_retries"] = gpu_max_retries
@@ -367,6 +369,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
     if gpu_keep_alive_seconds is not None:
         gpu_options["keep_alive_seconds"] = gpu_keep_alive_seconds
+    if gpu_count is not None:
+        gpu_options["count"] = gpu_count
 
     provider_raw = gpu_raw.get("provider", "")
     if not isinstance(provider_raw, str):
