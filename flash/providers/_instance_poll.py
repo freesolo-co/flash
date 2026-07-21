@@ -356,11 +356,21 @@ def poll_instance_job(
             return None
         return failure
 
+    def _surface_final_heartbeat() -> None:
+        # persist the latest metrics before any terminal give-up so `flash log -f` still shows the final
+        # per-step metrics for runs that end via deadline / dead-host / poll-outage / stall, not only the
+        # per-iteration terminal path below.
+        forced_reader = (
+            (lambda: heartbeat_reader(force=True)) if heartbeat_reader is not None else None
+        )
+        surface_heartbeat(forced_reader, last_hb_key, say)
+
     def deadline_unless_terminal() -> PollResult:
         nonlocal deferred_deadline_failure
         # the run deadline stops worker compute, not bounded observation of artifacts already committed
         # at the boundary. share one fixed reread budget across terminal and metrics visibility lag.
         deferred_deadline_failure = None
+        _surface_final_heartbeat()
         read_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
         terminal = _read_with_retries(
             lambda: terminal_artifact_result(
@@ -384,6 +394,7 @@ def poll_instance_job(
         # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
         # DONE/marker not yet visible under HF read-after-write lag isn't missed and mis-classified stalled
         # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
+        _surface_final_heartbeat()
         terminal = _read_with_retries(
             terminal_artifact_result,
             tries=_TERMINAL_REREAD_RETRIES,
@@ -433,6 +444,7 @@ def poll_instance_job(
             # decode / incomplete-read error rather than the api's own error type): count it against the
             # budget and keep polling — a read blip must not look like a gone instance.
             if poll_errors.record(e, deadline_at=absolute_deadline):
+                _surface_final_heartbeat()
                 # The status endpoint is down, but the worker may have COMPLETED during the outage and
                 # written its terminal DONE/marker to HF (a different endpoint). Do the BOUNDED terminal
                 # read (same as the deadline / dead-host paths) before giving up: a prolonged outage can
@@ -499,6 +511,7 @@ def poll_instance_job(
             or (became_running and status == "unknown")
         )
         if dead:
+            _surface_final_heartbeat()
             # The worker may have finished just before the box self-destroyed, with its DONE/marker not
             # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
             # times before concluding loss.

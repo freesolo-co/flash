@@ -1275,6 +1275,14 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
+        # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
+        # the existing per-step backlog forward so `flash log -f` doesn't drop it mid-save until the next
+        # metrics-bearing heartbeat lands.
+        if isinstance(hb, dict) and "metrics_last" not in hb:
+            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+            prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
+            if isinstance(prev_metrics, list) and prev_metrics:
+                hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
