@@ -50,9 +50,10 @@ def probe_chalk_grpo(
         with torch.random.fork_rng(devices=devices):
             hidden = torch.randn(2, 3, 8, device=device, dtype=dtype, requires_grad=True)
             weight = torch.randn(17, 8, device=device, dtype=dtype, requires_grad=True)
+            bias = torch.randn(17, device=device, dtype=dtype, requires_grad=True)
             targets = torch.tensor([[1, 5, 9], [2, 7, 16]], device=device, dtype=torch.long)
-            actual = selective_log_softmax(hidden, weight, targets, temperature=0.7)
-            expected = torch.log_softmax((hidden @ weight.t()).float() / 0.7, dim=-1)
+            actual = selective_log_softmax(hidden, weight, targets, bias=bias, temperature=0.7)
+            expected = torch.log_softmax(((hidden @ weight.t()) + bias).float() / 0.7, dim=-1)
             expected = expected.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
             tolerance = 2e-2 if use_cuda else 1e-5
             if actual.shape != targets.shape or not torch.isfinite(actual).all():
@@ -60,9 +61,13 @@ def probe_chalk_grpo(
             if not torch.allclose(actual.float(), expected, rtol=tolerance, atol=tolerance):
                 return None
             actual.sum().backward()
-            if hidden.grad is None or weight.grad is None:
+            if hidden.grad is None or weight.grad is None or bias.grad is None:
                 return None
-            if not torch.isfinite(hidden.grad).all() or not torch.isfinite(weight.grad).all():
+            if not (
+                torch.isfinite(hidden.grad).all()
+                and torch.isfinite(weight.grad).all()
+                and torch.isfinite(bias.grad).all()
+            ):
                 return None
             if use_cuda:
                 torch.cuda.synchronize()
@@ -85,7 +90,9 @@ def _chunked_entropy(
 
     flat_hidden = hidden.reshape(-1, hidden.shape[-1])
     entropies = torch.empty(flat_hidden.shape[0], device=hidden.device, dtype=torch.float32)
-    inv_temperature = 1.0 / float(temperature)
+    # run_rl honors temperature=0.0 for greedy sampling; avoid a ZeroDivisionError that would
+    # otherwise trip the permanent TRL fallback (temperature scaling is a no-op at the limit).
+    inv_temperature = 1.0 / float(temperature) if temperature else 1.0
     with torch.no_grad():
         for seq_start in range(0, flat_hidden.shape[0], seq_chunk_size):
             seq_end = min(seq_start + seq_chunk_size, flat_hidden.shape[0])
@@ -173,7 +180,7 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
                 raise ValueError("The GRPOTrainer does not support returning outputs")
             if self._flash_chalk_failed:
                 return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
-            unwrapped_model = self.accelerator.unwrap_model(model)
+            unwrapped_model = self.accelerator.unwrap_model(model, keep_torch_compile=True)
             return self._flash_forward_redirection(
                 model, unwrapped_model, self._compute_loss, unwrapped_model, inputs
             )
@@ -274,12 +281,19 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
             if pixel_values is not None:
                 raise RuntimeError("Chalk GRPO cannot bypass multimodal model preprocessing")
 
+            plugin = getattr(getattr(self.accelerator, "state", None), "deepspeed_plugin", None)
+            if plugin is not None and getattr(plugin, "zero_stage", None) == 3:
+                # autograd re-reads the full output projection during loss.backward(), which runs
+                # after this method returns; a per-call GatheredParameters context cannot stay open
+                # that long, so defer to trl rather than risk backward seeing a sharded weight.
+                raise RuntimeError("Chalk GRPO cannot span the ZeRO-3 output projection backward")
+
             import torch
 
             batch_size = batch_size or input_ids.size(0)
             all_logps = []
             all_entropies = []
-            unwrapped_model = self.accelerator.unwrap_model(model)
+            unwrapped_model = self.accelerator.unwrap_model(model, keep_torch_compile=True)
             core_model = _core_model(unwrapped_model)
             backbone = core_model.base_model
             weight, bias = _output_projection(core_model)
