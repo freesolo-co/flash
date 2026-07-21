@@ -537,21 +537,76 @@ def _humanize_ts(value) -> str | None:
     return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _humanize_age(value) -> str | None:
-    """Format an epoch seconds value as a compact age ("3m ago"), None for non-numbers."""
+def _heartbeat_age_seconds(value: object) -> float | None:
+    """Return heartbeat age in seconds, or None for an unusable timestamp."""
     if not isinstance(value, (int, float)) or value <= 0:
         return None
-    secs = max(0.0, time.time() - value)
-    if secs < 90:
-        return f"{int(secs)}s ago"
-    if secs < 5400:
-        return f"{int(secs // 60)}m ago"
-    return f"{secs / 3600:.1f}h ago"
+    return max(0.0, time.time() - value)
+
+
+def _humanize_age_seconds(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    if seconds < 90:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m ago"
+    return f"{seconds / 3600:.1f}h ago"
+
+
+def _humanize_age(value) -> str | None:
+    """Format an epoch seconds value as a compact age ("3m ago"), None for non-numbers."""
+    return _humanize_age_seconds(_heartbeat_age_seconds(value))
 
 
 # heartbeat age past which the panel reminds that quiet is normal: worker uploads are throttled
-# (240s quiet phases, up to 900s mid-training), so a frozen ts is usually NOT a dead worker.
+# (240s quiet phases, up to 900s mid-training), so a frozen ts is usually not a dead worker.
 _HB_QUIET_HINT_AFTER_S = 300.0
+_WARMUP_HEARTBEAT_FRESH_FOR_S = 1200.0
+_WARMUP_STAGES = frozenset({"rl_train_start", "rl_initializing"})
+
+
+def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
+    """False only when the heartbeat provably belongs to a superseded retry attempt.
+
+    Retries reuse the seed's heartbeat path, so a recovered run flips back to ``running`` for the
+    replacement worker while ``last_heartbeat`` can still be the previous attempt's setup ping until
+    the new worker publishes one. ``remote.attempt`` is the live attempt; ``last_heartbeat.attempt``
+    is the one that produced the ping. When the live attempt is known, keep the reassurance only for a
+    heartbeat whose attempt matches it. When it is unknown (e.g. a managed status payload that omits
+    ``remote``), fall back to ``warmup_message``'s age gating rather than suppress, so warmup still
+    reassures on planes that do not surface a live attempt.
+    """
+    # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
+    # or float) so the status display and stall detection agree on what a valid attempt is.
+    from flash.providers._poll import _attempt_int
+
+    remote = obj.get("remote")
+    current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
+    if current_attempt is None:
+        return True
+    return _attempt_int(heartbeat.get("attempt")) == current_attempt
+
+
+def warmup_message(
+    stage: object,
+    heartbeat_age_seconds: float | None,
+    from_current_attempt: bool = True,
+) -> str | None:
+    """Explain healthy RL setup stages only while the heartbeat is fresh and from the live attempt."""
+    stage_name = str(stage)
+    if stage_name not in _WARMUP_STAGES:
+        return None
+    if not from_current_attempt:
+        return None
+    if heartbeat_age_seconds is None:
+        return None
+    if heartbeat_age_seconds > _WARMUP_HEARTBEAT_FRESH_FOR_S:
+        return None
+    return (
+        f"warming up (stage={stage_name}): initializing model, vLLM, and training kernels - "
+        "typically several minutes, sometimes 15-20 min; setup is not billed; do not cancel"
+    )
 
 
 def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
@@ -566,11 +621,19 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
     if hb.get("liveness"):
         worker += " · alive ping"
     pairs = [("worker", worker)]
-    ts = hb.get("ts")
-    age = _humanize_age(ts)
+    heartbeat_age_seconds = _heartbeat_age_seconds(hb.get("ts"))
+    running = str(obj.get("state") or "") == "running"
+    if running:
+        warmup = warmup_message(
+            hb.get("stage"),
+            heartbeat_age_seconds,
+            heartbeat_is_current_attempt(obj, hb),
+        )
+        if warmup:
+            pairs.append(("warmup", warmup))
+    age = _humanize_age_seconds(heartbeat_age_seconds)
     if age:
-        running = str(obj.get("state") or "") == "running"
-        if running and isinstance(ts, (int, float)) and (time.time() - ts) > _HB_QUIET_HINT_AFTER_S:
+        if running and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
             age += _dim(
                 "  (heartbeat uploads are throttled; quiet is not dead - check flash log -f <run-id>)"
             )
