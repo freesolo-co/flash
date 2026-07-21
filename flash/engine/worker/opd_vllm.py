@@ -232,14 +232,31 @@ def opd_vllm_kwargs(
                         f"protected={protected_gb:.1f} GiB)"
                     )
                 if util > max_startup_util:
-                    startup_oom = _startup_oom_error(
-                        free_gb=free_gb,
-                        total_gb=card_gb,
-                        requested_util=util,
-                        reserve_gb=protected_gb,
-                        rollout_batch_size=rollout_concurrency,
-                    )
-                elif _rollout_uplift_validated(params_b, resolved_lora_rank):
+                    # concurrency bottomed out but the resident-KV floor (vLLM weight copy + _KV_CAP)
+                    # keeps the minimal executor above the protected budget. before hard-OOMing, trim
+                    # the allocator slack to the old ~1 GiB startup margin so configs that fit before
+                    # the protected-budget change are not newly rejected; the modeled training peak and
+                    # post-init reserve stay intact.
+                    lean_protected_gb = training_reserve_gb + post_init_reserve_gb + 1.0
+                    lean_startup_util = max(0.0, free_gb - lean_protected_gb) / max(1.0, card_gb)
+                    if util <= lean_startup_util:
+                        print(
+                            "[opd] trimmed allocator margin "
+                            f"{allocator_margin_gb:.1f}->1.0 GiB to fit rollout executor at "
+                            f"concurrency {rollout_concurrency} "
+                            f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB)"
+                        )
+                        protected_gb = lean_protected_gb
+                        max_startup_util = lean_startup_util
+                    else:
+                        startup_oom = _startup_oom_error(
+                            free_gb=free_gb,
+                            total_gb=card_gb,
+                            requested_util=util,
+                            reserve_gb=protected_gb,
+                            rollout_batch_size=rollout_concurrency,
+                        )
+                if startup_oom is None and _rollout_uplift_validated(params_b, resolved_lora_rank):
                     # 0.80 is a final ceiling for the validated qwen3.5-4b/rank-32 size class; larger
                     # or higher-rank models keep the existing colocate ceiling until gpu validation.
                     util = max(util, min(0.80, max_startup_util))
