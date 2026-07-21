@@ -416,7 +416,7 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
     [(3500, 400), (3000, 200)],
 )
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
-    api, monkeypatch, max_completion_tokens, status_code
+    api, monkeypatch, tmp_path, max_completion_tokens, status_code
 ) -> None:
     import flash.envs.loader as envs_loader
     import flash.schema as schema
@@ -426,6 +426,17 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     # offline: the valid-context path pins the github env ref to a sha; stub it so the
     # test never makes a real github request (the api fixture only sets a fake token)
     monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
+    # the valid-context path also runs the image-opd preflight, which resolves the env
+    # reference to inspect its dataset for images. point it at an empty local dir so the
+    # preflight finds no packaged dataset and returns without a real github request.
+    _offline_env_dir = tmp_path / "env"
+    _offline_env_dir.mkdir()
+    (_offline_env_dir / "environment.py").write_text("")
+    monkeypatch.setattr(
+        envs_loader,
+        "_resolve_environment_reference",
+        lambda *_a, **_k: str(_offline_env_dir / "environment.py"),
+    )
     if status_code == 400:
         monkeypatch.setattr(
             runs_route._app,
