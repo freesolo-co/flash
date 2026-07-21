@@ -46,6 +46,9 @@ class RunConfig:
     # Spec gpu.disk_gb, carried so an exact-auto quote allocates at the run's real disk floor (parity
     # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
     disk_gb: float = 0.0
+    # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
+    # billed training wall); 1 = the historical single-gpu quote.
+    gpu_count: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -71,6 +74,10 @@ class RunConfig:
         object.__setattr__(self, "model_revision", self.model_revision.strip())
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
+        if isinstance(self.gpu_count, bool) or not isinstance(self.gpu_count, int):
+            raise TypeError("gpu_count must be an integer")
+        if self.gpu_count < 1:
+            raise ValueError(f"gpu_count must be >= 1, got {self.gpu_count}")
         # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
         # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
         # is accepted (floored to 60s), not rejected.
@@ -173,6 +180,8 @@ class CostEstimate:
     wall_clock_seconds: float
     wall_capped: bool
     total_usd: float
+    # cards the job occupies; total_usd already reflects n-card billing. 1 = single-gpu quote.
+    gpu_count: int = 1
     # opd only: external fireworks teacher token spend (0.0 for sft/grpo). billed by fireworks
     # to the platform-managed teacher key (users don't supply one), tracked separately from the
     # platform-billed gpu charge, so it is not part of total_usd and is shown as its own itemized
@@ -192,9 +201,9 @@ class CostEstimate:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
-            f"GPU        : {self.gpu} "
+            f"GPU        : {f'{self.gpu_count}x ' if self.gpu_count > 1 else ''}{self.gpu} "
             f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
-            f"@ ${self.gpu_hourly_usd:.2f}/hr",
+            f"@ ${self.gpu_hourly_usd:.2f}/hr{' per card' if self.gpu_count > 1 else ''}",
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
             + (" + vLLM init" if self.method == "grpo" else "")
             + "; not billed)",
