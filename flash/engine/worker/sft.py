@@ -379,7 +379,10 @@ def run_sft():
     # tensor is materialized. unsupported model structures keep plain nll and the conservative
     # vocab-sized micro-batch cap. resolve vocab once so worker and cost quote use the same revision.
     _sft_vocab = resolve_vocab_size(model_id, model_revision)
-    _sft_chunked = sft_chunked_nll_enabled(model_id)
+    # chunked_nll's prep (_prepare_chunked_nll_model) and parity tests are text-only and require
+    # flash's text tokenizer; a multimodal run's SFTTrainer uses the vision processor, so gate
+    # chunked_nll off for image runs (they use standard nll) to avoid the prep/processing mismatch.
+    _sft_chunked = sft_chunked_nll_enabled(model_id) and not multimodal
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_chunked
     )
