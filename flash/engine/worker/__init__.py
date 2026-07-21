@@ -71,6 +71,7 @@ from flash.engine.worker.hf import (
     _hf_upload,
     _latest_checkpoint_dir,
     error_artifact_name,
+    flush_optional_uploads,
     hf_api,
     hf_prefix,
     hf_resume_checkpoint,
@@ -262,6 +263,8 @@ THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
 def _finalize(metrics: RunMetrics):
+    if not flush_optional_uploads():
+        print("optional upload flush timed out before final publication")
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -374,6 +377,8 @@ def main():
         os._exit(0)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
+        if not flush_optional_uploads():
+            print("optional upload flush timed out on worker error")
         try:
             err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
@@ -468,6 +473,7 @@ __all__ = [
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
+    "flush_optional_uploads",
     "force_vit_sdpa_on_blackwell",
     "force_vllm_backend_for_sm120",
     "free_gpu",
