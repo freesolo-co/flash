@@ -503,9 +503,11 @@ def poll_instance_job(
         terminal = terminal_artifact_result(force=False)
         if terminal is not None:
             forced_reader = (
-                (lambda: heartbeat_reader(force=True)) if heartbeat_reader is not None else None
+                (lambda: heartbeat_reader(force=True, deadline_at=None))
+                if heartbeat_reader is not None
+                else None
             )
-            surface_heartbeat(forced_reader, last_hb_key, say)
+            last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
             return terminal
 
         # ``unknown`` = "host has no recent heartbeat and won't progress" (host loss) -> dead for fast

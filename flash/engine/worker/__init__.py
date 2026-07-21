@@ -63,6 +63,7 @@ from flash.engine.worker.heartbeat import (
     _HB_UPLOAD_LOCK,
     _SFT_HEARTBEAT_INTERVAL_S,
     _STEP_GPU_DIAG_INTERVAL_S,
+    LATEST_GRPO_METRICS_LAST,
     heartbeat,
     make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
@@ -404,7 +405,12 @@ def main():
         hb_flags = _worker_failure_flags(e)
         try:
             detail = sanitize_diagnostic(e, limit=500)
-            heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, diag=gpu_diagnostics())
+            _err_metrics = (
+                {"metrics_last": list(LATEST_GRPO_METRICS_LAST)} if LATEST_GRPO_METRICS_LAST else {}
+            )
+            heartbeat(
+                f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics, diag=gpu_diagnostics()
+            )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=sanitize_diagnostic(e, limit=500), **hb_flags)
         wandb_finish(exit_code=1)

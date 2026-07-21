@@ -1323,7 +1323,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
-        if isinstance(hb, dict) and "metrics_last" not in hb:
+        if isinstance(hb, dict) and not hb.get("metrics_last"):
             prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
             # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a

@@ -50,6 +50,10 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
 _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
+
+# latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
+# for `flash log -f` when a short run raises before the throttled rl_step ping committed
+LATEST_GRPO_METRICS_LAST: list = []
 # Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
 # tight-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
 # emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
@@ -410,6 +414,7 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
             self.metrics_last = [item for item in self.metrics_last if item["step"] != step]
             self.metrics_last.append(metrics)
             self.metrics_last = self.metrics_last[-_GRPO_METRIC_HISTORY_LIMIT:]
+            LATEST_GRPO_METRICS_LAST[:] = self.metrics_last
             payload = {
                 **metrics,
                 "reward_last": self.reward_history[-8:],
