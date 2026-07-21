@@ -78,6 +78,15 @@ def _latest_named_reward_metrics(
         latest.clear()
         latest.update(metrics)
     return dict(latest)
+def select_grpo_trainer_class(
+    base_trainer: type, *, multimodal: bool, is_multi_turn: bool, tools: object
+) -> type:
+    """select the guarded trainer only for single-turn multimodal grpo."""
+    if multimodal and not is_multi_turn and not tools:
+        from flash.engine.worker.grpo_multimodal import single_turn_multimodal_grpo_trainer
+
+        return single_turn_multimodal_grpo_trainer(base_trainer)
+    return base_trainer
 
 
 def run_rl():
@@ -778,7 +787,13 @@ def run_rl():
             )
             if not isinstance(trainer_model, str):
                 cfg.model_init_kwargs = None
-        trainer = GRPOTrainer(
+        trainer_cls = select_grpo_trainer_class(
+            GRPOTrainer,
+            multimodal=multimodal,
+            is_multi_turn=is_multi_turn,
+            tools=tools,
+        )
+        trainer = trainer_cls(
             model=trainer_model,
             args=cfg,
             train_dataset=ds,

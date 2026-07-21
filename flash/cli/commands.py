@@ -746,18 +746,11 @@ def cmd_chat(args) -> int:
     if revision is None and parsed is None:
         print(
             f"invalid chat target {args.run_id!r} "
-            "(expected a bare <run_id> or full immutable adapter revision)",
+            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)",
             file=sys.stderr,
         )
         return 1
-    if revision is None and parsed[1] is not None:
-        print(
-            "RUN_ID/step-N is not a valid chat target because it would route through the mutable "
-            "run alias; use the full immutable adapter revision returned by `flash deployments`",
-            file=sys.stderr,
-        )
-        return 1
-    chat_target = args.run_id if revision is not None else parsed[0]
+    chat_target = args.run_id
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
     system = getattr(args, "system", None)
