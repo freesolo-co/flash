@@ -130,7 +130,7 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.rl import run_rl
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.sft import run_sft
+from flash.engine.worker.sft_verl import run_sft_verl as run_sft
 from flash.engine.worker.wandb_log import (
     wandb_finish,
     wandb_report_to,
@@ -306,11 +306,6 @@ def main():
         remaining = _remaining_worker_wall_seconds()
         if remaining is not None and remaining <= 0:
             raise RuntimeError("worker run wall deadline exceeded")
-        if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
-            raise ValueError(
-                "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-                "SFT adapter continuation is not supported"
-            )
         # Idempotency: check DONE before any env-mutating pip install (fla fast path).
         if HF_REPO:
             from huggingface_hub import hf_hub_download

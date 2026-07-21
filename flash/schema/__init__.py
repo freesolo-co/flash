@@ -468,11 +468,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             file=sys.stderr,
         )
     init_from_adapter = _init_from_adapter_ref(train_raw)
-    if algorithm == "sft" and init_from_adapter:
-        raise ConfigError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
     if init_from_adapter and "lora_rank" in train_raw:
         raise ConfigError(
             "train.lora_rank cannot be set with train.init_from_adapter because source adapter "

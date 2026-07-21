@@ -122,15 +122,17 @@ def run_verl_training(
     *,
     env: dict[str, str],
     on_step: Callable[[int], None] | None = None,
+    on_line: Callable[[str], None] | None = None,
     heartbeat: Callable[[], None] | None = None,
     step_pattern: str = r"step:\s*(\d+)",
     heartbeat_interval_s: float = 20.0,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
-    returns the process exit code. stdout+stderr are merged and scanned line by line: ``on_step`` is
-    called with each parsed training step, and ``heartbeat`` is called at most once per
-    ``heartbeat_interval_s`` so the control plane sees liveness across the (long) verl run.
+    returns the process exit code. stdout+stderr are merged and scanned line by line: ``on_line``
+    receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
+    at most once per ``heartbeat_interval_s``. callback failures terminate the child before they are
+    re-raised so a failed required checkpoint upload cannot leave paid training running unattended.
     """
     step_re = re.compile(step_pattern)
     proc = subprocess.Popen(
@@ -140,6 +142,9 @@ def run_verl_training(
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            print(line, end="", flush=True)
+            if on_line is not None:
+                on_line(line)
             m = step_re.search(line)
             if m and on_step is not None:
                 on_step(int(m.group(1)))
@@ -148,6 +153,15 @@ def run_verl_training(
                 if now - last_hb >= heartbeat_interval_s:
                     heartbeat()
                     last_hb = now
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
     finally:
-        proc.wait()
+        if proc.poll() is None:
+            proc.wait()
     return int(proc.returncode)

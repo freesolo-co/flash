@@ -7,6 +7,7 @@ import pytest
 from flash.engine.worker.sft_verl import (
     build_sft_verl_messages_rows,
     build_sft_verl_overrides,
+    render_loraplus_shim,
 )
 
 
@@ -14,6 +15,7 @@ def _cfg(**over):
     base = {
         "train_files": "/w/train.parquet",
         "val_files": "/w/val.parquet",
+        "train_batch_size": 32,
         "max_length": 32768,
         "micro_batch": 1,
         "max_token_len_per_gpu": 8192,
@@ -23,11 +25,16 @@ def _cfg(**over):
         "target_modules": "all-linear",
         "ulysses_sp_size": 2,
         "lr": 1e-4,
+        "warmup_ratio": 0.03,
+        "optimizer_impl": "bitsandbytes.optim",
+        "optimizer_name": "PagedAdamW8bit",
         "local_dir": "/w/ckpt",
         "save_freq": 50,
         "n_gpus_per_node": 2,
+        "seed": 42,
         "project_name": "flash-sft",
         "experiment_name": "run-xyz",
+        "loop_epochs": 4,
         "total_training_steps": 120,
     }
     base.update(over)
@@ -41,6 +48,7 @@ def _as_map(ov):
 def test_overrides_cover_the_32k_lora_sp_surface():
     m = _as_map(build_sft_verl_overrides(_cfg()))
     # long context + packing + sequence parallel + liger are the 32k-enabling knobs.
+    assert m["data.train_batch_size"] == "32"
     assert m["data.max_length"] == "32768"
     assert m["model.use_remove_padding"] == "true"
     assert m["engine.ulysses_sequence_parallel_size"] == "2"
@@ -57,6 +65,11 @@ def test_overrides_cover_the_32k_lora_sp_surface():
     assert m["model.lora_rank"] == "16"
     # lr renders as a plain decimal hydra parses as a float (1e-4 -> "0.0001", not scientific).
     assert m["optim.lr"] == "0.0001"
+    assert m["optim.lr_warmup_steps_ratio"] == "0.03"
+    assert m["optim.lr_scheduler_type"] == "linear"
+    assert m["optim.optimizer"] == "PagedAdamW8bit"
+    assert m["trainer.seed"] == "42"
+    assert m["trainer.total_epochs"] == "4"
     assert "data.train_files=/w/train.parquet" in build_sft_verl_overrides(_cfg())
 
 
@@ -72,9 +85,13 @@ def test_target_modules_list_renders_as_hydra_list():
 
 
 def test_epochs_path_when_no_steps():
-    m = _as_map(build_sft_verl_overrides(_cfg(total_training_steps=None, total_epochs=3)))
+    m = _as_map(
+        build_sft_verl_overrides(
+            _cfg(total_training_steps=None, total_epochs=3, loop_epochs=3)
+        )
+    )
     assert m["trainer.total_epochs"] == "3"
-    assert "trainer.total_training_steps" not in m
+    assert m["trainer.total_training_steps"] == "null"
 
 
 def test_steps_xor_epochs_is_enforced():
@@ -104,7 +121,21 @@ def test_messages_rows_drop_empty_completion():
         [
             (prompt, [{"role": "assistant", "content": "a"}]),
             (prompt, []),
-        ]
+        ],
+        enable_thinking=True,
     )
     assert len(rows) == 1
     assert rows[0]["messages"][-1]["role"] == "assistant"
+    assert rows[0]["enable_thinking"] is True
+
+
+def test_loraplus_shim_patches_verl_fsdp_optimizer_with_ratio():
+    source = render_loraplus_shim(16)
+    assert "create_loraplus_optimizer" in source
+    assert "loraplus_lr_ratio=16.0" in source
+    assert "FSDPEngine._build_optimizer" in source
+    assert "_FlashFSDPEngine._build_optimizer = _flash_build_loraplus_optimizer" in source
+
+
+def test_loraplus_shim_is_absent_when_ratio_is_not_greater_than_one():
+    assert render_loraplus_shim(1) == ""

@@ -687,11 +687,7 @@ def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
 
 
 def _require_supported_adapter_continuation(spec: JobSpec) -> None:
-    if spec.algorithm == "sft" and spec.train.init_from_adapter:
-        raise ValueError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
+    """validate algorithm-specific adapter continuation constraints."""
 
 
 def _prepare_init_from_adapter(
@@ -1033,7 +1029,7 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
 # per-algorithm multi-gpu trainers land (the sft/opd verl migrations add themselves here). keeping
 # this empty makes the multi-gpu *plumbing* landable now while multi-gpu *training* stays impossible
 # to trigger, so a count > 1 job can never silently provision and bill idle cards.
-_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset()
+_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset({"sft"})
 
 
 def _require_supported_gpu_count(spec: JobSpec) -> None:
