@@ -57,8 +57,8 @@ def _overrides_cfg(**over):
         "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
         "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
         "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "loggers": "console", "fp8_kv": False,
-        "reward_path": "/w/reward.py", "reward_name": "compute_score", "total_epochs": 1,
-        "save_freq": 20, "local_dir": "/w/ckpt",
+        "warmstart_adapter": "", "reward_path": "/w/reward.py", "reward_name": "compute_score",
+        "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
     }
     cfg.update(over)
     return cfg
@@ -92,6 +92,15 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
 def test_build_verl_overrides_wandb_logger_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(loggers="console,wandb"))
     assert "trainer.logger=[console,wandb]" in o
+
+
+def test_build_verl_overrides_warmstart_adapter_path():
+    # fresh run: no lora_adapter_path override.
+    fresh = rl_verl.build_verl_overrides(_overrides_cfg(warmstart_adapter=""))
+    assert not any("lora_adapter_path" in x for x in fresh)
+    # warm-start: point verl's lora init at the downloaded source adapter dir.
+    warm = rl_verl.build_verl_overrides(_overrides_cfg(warmstart_adapter="/tmp/sft_adapter"))
+    assert "actor_rollout_ref.model.lora_adapter_path=/tmp/sft_adapter" in warm
 
 
 def test_build_verl_overrides_fp8_kv_gated_on_hardware():

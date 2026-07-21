@@ -99,6 +99,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
         # memory: match the trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        *(
+            [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
+            if cfg.get("warmstart_adapter")
+            else []
+        ),
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
         # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
@@ -388,11 +393,6 @@ def _resolve_single_turn_inputs():
             "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
             "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
         )
-    if _t and getattr(_t, "init_from_adapter", ""):
-        raise RuntimeError(
-            "train.init_from_adapter (warm-start) is not yet supported on the verl backend; use the "
-            "trl backend (unset FLASH_RL_BACKEND) for warm-start runs."
-        )
     if _t and getattr(_t, "stop_sequences", ()):
         raise RuntimeError(
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
@@ -436,6 +436,32 @@ def _resolve_single_turn_inputs():
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
     lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
+    # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
+    # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
+    warmstart_adapter = ""
+    if _t and getattr(_t, "init_from_adapter", ""):
+        if kl_coef > 0:
+            raise RuntimeError(
+                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
+                "the sft adapter; the verl backend's reference is the base, so this is not yet "
+                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
+            )
+        from flash.engine.worker.adapter import _download_adapter
+
+        warmstart_adapter = _download_adapter(_t.init_from_adapter)
+        if not warmstart_adapter:
+            raise RuntimeError(
+                "warm-start source adapter could not be downloaded; refusing to start from the base."
+            )
+        with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
+            _src_cfg = json.load(f)
+        lora_rank = int(_src_cfg.get("r", lora_rank))
+        lora_alpha = int(_src_cfg.get("lora_alpha", lora_alpha))
+        print(
+            f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
+            f"from {_t.init_from_adapter}",
+            flush=True,
+        )
 
     train = env.dataset()
     _max_examples = getattr(_t, "max_examples", None) if _t else None
@@ -506,6 +532,7 @@ def _resolve_single_turn_inputs():
         "lr": learning_rate,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
+        "warmstart_adapter": warmstart_adapter,
         "epochs": epochs,
         "steps": int(steps),
         "save_every": save_every,
@@ -593,6 +620,7 @@ def run_rl_verl():
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
+            "warmstart_adapter": inp["warmstart_adapter"],
             "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers, "fp8_kv": fp8_kv,
             "reward_path": reward_py, "reward_name": "compute_score",
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
