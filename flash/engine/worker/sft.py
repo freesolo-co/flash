@@ -426,6 +426,46 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         return c_hidden, c_layers
 
 
+_CHUNKED_NLL_TEXT_CONFIG_FIELDS = (
+    "final_logit_softcapping",
+    "logit_scale",
+)
+
+
+def _prepare_chunked_nll_model(model, processing_class, peft_config) -> None:
+    """validate trl's chunked-nll traversal and expose nested text-loss config on vl qwen models."""
+    from transformers import PreTrainedTokenizerBase
+
+    if isinstance(model, str):
+        raise RuntimeError("chunked_nll requires a preloaded model so its lm head can be validated")
+    if not isinstance(processing_class, PreTrainedTokenizerBase):
+        raise RuntimeError("chunked_nll expects flash's text tokenizer processing path")
+
+    output_head = model.get_output_embeddings()
+    if output_head is None or not hasattr(output_head, "weight"):
+        raise RuntimeError("chunked_nll requires a directly accessible output embedding weight")
+    if model.base_model is model:
+        raise RuntimeError("chunked_nll requires a distinct backbone that bypasses the lm head")
+
+    targets = getattr(peft_config, "target_modules", None)
+    modules_to_save = set(getattr(peft_config, "modules_to_save", None) or ())
+    if targets != "all-linear" or "lm_head" in modules_to_save:
+        raise RuntimeError(
+            "chunked_nll requires PEFT all-linear targeting with the output layer excluded"
+        )
+
+    # flash intentionally passes an autotokenizer for text-only qwen training, so trl classifies the
+    # full multimodal checkpoint as a text model. transformers 5 still traverses model.base_model
+    # correctly, but trl reads logit transforms from the top-level config in that classification.
+    # mirror only those transforms. the full qwen moe wrapper does not add router auxiliary loss on
+    # the plain-nll path, so copying its nested router flag would change the training objective.
+    text_config = getattr(model.config, "text_config", None)
+    if text_config is not None:
+        for name in _CHUNKED_NLL_TEXT_CONFIG_FIELDS:
+            if hasattr(text_config, name):
+                setattr(model.config, name, getattr(text_config, name))
+
+
 def _select_indexed_sft_examples(train, max_examples, seed):
     if max_examples > 0:
         train = train[:max_examples]
@@ -716,7 +756,7 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     from flash.catalog import MODELS, resolve_vocab_size
-    from flash.engine.vram import sft_grad_accum
+    from flash.engine.vram import sft_chunked_nll_enabled, sft_grad_accum
 
     sft_lr = _train_opt("learning_rate", RECIPE.sft.learning_rate)
     if multimodal:
@@ -747,10 +787,16 @@ def run_sft():
             f"({_masked_tok / _total_tok:.0%}) prompt tokens; training on the completion only"
         )
     effective_batch = _train_opt("batch_size", RECIPE.sft.effective_batch)
-    # the trl sft path materializes full fp32 logits, so size the final microbatch from the
-    # longest realized row or packed block after the packing backend has been selected.
+    # validated qwen models use trl 1.6 chunked_nll: ignored prompt positions are removed before
+    # the lm head and valid tokens are projected in bounded chunks, so no dense [batch, seq, vocab]
+    # tensor is materialized. unsupported model structures keep plain nll (which materializes full
+    # fp32 logits). resolve vocab once so worker and cost quote use the same revision.
     _sft_vocab = resolve_vocab_size(model_id, model_revision)
-    _sft_fused = False
+    # chunked_nll's prep (_prepare_chunked_nll_model) and parity tests are text-only and require
+    # flash's text tokenizer; a multimodal run's SFTTrainer uses the vision processor, so gate
+    # chunked_nll off for image runs (they use standard nll) to avoid the prep/processing mismatch.
+    # per_device/grad_accum are sized below in the unified packing-aware block using fused=_sft_fused.
+    _sft_fused = sft_chunked_nll_enabled(model_id) and not multimodal
     sft_save_default = _train_opt("save_every", 50)
     out_dir = f"/tmp/sft_seed{_w.SEED}"
     resume_ckpt = _w.hf_resume_checkpoint()
@@ -783,6 +829,7 @@ def run_sft():
         # and pick REENTRANT recompute for those; dense models keep the faster non-reentrant path.
         "gradient_checkpointing_kwargs": {"use_reentrant": grpo_use_reentrant(model_id)},
         "completion_only_loss": True,
+        "loss_type": "chunked_nll" if _sft_fused else "nll",
         # remove_unused_columns=False: HF Trainer would otherwise drop completion_mask before
         # collation, silently reverting all paths to full-transcript loss.
         "remove_unused_columns": False,
@@ -1103,42 +1150,51 @@ def run_sft():
                     self._flash_total_train_tokens += local_tokens
 
                 if _sft_step_will_log(self.state, self.args):
-                    with torch.no_grad():
-                        if "shift_labels" in inputs:
-                            shift_logits = outputs.logits
-                            shift_labels = inputs["shift_labels"]
-                        else:
-                            shift_logits = outputs.logits[..., :-1, :]
-                            shift_labels = labels[..., 1:]
-                        if (
-                            self.num_virtual_tokens > 0
-                            and model.peft_config[model.active_adapter].peft_type
-                            != PeftType.PREFIX_TUNING
-                        ):
-                            shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
-
-                        mask = shift_labels != -100
-                        entropy_sum_mb = (entropy_from_logits(shift_logits) * mask).sum()
-                        total_tokens_mb = mask.sum()
-                        correct_tokens_mb = (
-                            (shift_logits.argmax(dim=-1) == shift_labels) & mask
-                        ).sum()
-                    # accumulate the token-weighted sums across every microbatch of this logging step
-                    # (keyed on global_step) so logged entropy/accuracy reflect the whole optimizer
-                    # step, not only its final microbatch. reset when a new logging step begins.
+                    # chunked_nll does not materialize outputs.logits, so the logits-based quality
+                    # metrics (entropy / token accuracy) are skipped in that case; loss, num_tokens
+                    # and aux_loss are still logged.
+                    logits_available = outputs.logits is not None
+                    # reset the per-logging-step accumulators when a new logging step begins (keyed on
+                    # global_step) so logged metrics reflect the whole optimizer step, not only its
+                    # final microbatch.
                     if self._flash_qm_step != int(self.state.global_step):
                         self._flash_qm_step = int(self.state.global_step)
-                        self._flash_qm_entropy_sum = entropy_sum_mb
-                        self._flash_qm_total_tokens = total_tokens_mb
-                        self._flash_qm_correct_tokens = correct_tokens_mb
+                        self._flash_qm_entropy_sum = None
+                        self._flash_qm_total_tokens = None
+                        self._flash_qm_correct_tokens = None
                         self._flash_qm_aux_sum = None
                         self._flash_qm_aux_count = 0
-                    else:
-                        self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
-                        self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
-                        self._flash_qm_correct_tokens = (
-                            self._flash_qm_correct_tokens + correct_tokens_mb
-                        )
+                    if logits_available:
+                        with torch.no_grad():
+                            if "shift_labels" in inputs:
+                                shift_logits = outputs.logits
+                                shift_labels = inputs["shift_labels"]
+                            else:
+                                shift_logits = outputs.logits[..., :-1, :]
+                                shift_labels = labels[..., 1:]
+                            if (
+                                self.num_virtual_tokens > 0
+                                and model.peft_config[model.active_adapter].peft_type
+                                != PeftType.PREFIX_TUNING
+                            ):
+                                shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
+
+                            mask = shift_labels != -100
+                            entropy_sum_mb = (entropy_from_logits(shift_logits) * mask).sum()
+                            total_tokens_mb = mask.sum()
+                            correct_tokens_mb = (
+                                (shift_logits.argmax(dim=-1) == shift_labels) & mask
+                            ).sum()
+                        if self._flash_qm_entropy_sum is None:
+                            self._flash_qm_entropy_sum = entropy_sum_mb
+                            self._flash_qm_total_tokens = total_tokens_mb
+                            self._flash_qm_correct_tokens = correct_tokens_mb
+                        else:
+                            self._flash_qm_entropy_sum = self._flash_qm_entropy_sum + entropy_sum_mb
+                            self._flash_qm_total_tokens = self._flash_qm_total_tokens + total_tokens_mb
+                            self._flash_qm_correct_tokens = (
+                                self._flash_qm_correct_tokens + correct_tokens_mb
+                            )
                     if self.aux_loss_enabled:
                         aux_mb = outputs.aux_loss.detach()
                         self._flash_qm_aux_sum = (
@@ -1148,21 +1204,22 @@ def run_sft():
                         )
                         self._flash_qm_aux_count += 1
                     if self.accelerator.sync_gradients:
-                        entropy_sum = self.accelerator.gather_for_metrics(
-                            self._flash_qm_entropy_sum
-                        ).sum()
-                        total_tokens = self.accelerator.gather_for_metrics(
-                            self._flash_qm_total_tokens
-                        ).sum()
-                        correct_tokens = self.accelerator.gather_for_metrics(
-                            self._flash_qm_correct_tokens
-                        ).sum()
-                        entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
-                        accuracy = (
-                            (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
-                        )
-                        self._metrics["train"]["entropy"].append(entropy)
-                        self._metrics["train"]["mean_token_accuracy"].append(accuracy)
+                        if self._flash_qm_entropy_sum is not None:
+                            entropy_sum = self.accelerator.gather_for_metrics(
+                                self._flash_qm_entropy_sum
+                            ).sum()
+                            total_tokens = self.accelerator.gather_for_metrics(
+                                self._flash_qm_total_tokens
+                            ).sum()
+                            correct_tokens = self.accelerator.gather_for_metrics(
+                                self._flash_qm_correct_tokens
+                            ).sum()
+                            entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
+                            accuracy = (
+                                (correct_tokens / total_tokens).item() if total_tokens > 0 else 0.0
+                            )
+                            self._metrics["train"]["entropy"].append(entropy)
+                            self._metrics["train"]["mean_token_accuracy"].append(accuracy)
                         total_train_tokens = (
                             self.accelerator.gather_for_metrics(self._flash_total_train_tokens)
                             .sum()
@@ -1247,16 +1304,20 @@ def run_sft():
             model_id,
             model_id,
             model_init_kwargs,
+            force=_sft_fused,
             phase="sft",
             model_revision=model_revision,
         )
         if not isinstance(sft_model, str):
             cfg.model_init_kwargs = None
+        _lora_config = _w.make_lora(model_id)
+        if _sft_fused:
+            _prepare_chunked_nll_model(sft_model, tok, _lora_config)
         trainer = _SFT(
             model=sft_model,
             args=cfg,
             train_dataset=ds,
-            peft_config=_w.make_lora(model_id),
+            peft_config=_lora_config,
             processing_class=processor if multimodal else tok,
             data_collator=_collator,
             callbacks=trainer_callbacks,
@@ -1264,15 +1325,15 @@ def run_sft():
         if not multimodal and _collator is None:
             # trl rejects custom collators for padding-free bfd, so wrap its generated collator here.
             trainer.data_collator = _SFTTokenCountingCollator(trainer.data_collator)
-        # fused_ce=False: flce returns logits=None, but trl's SFTTrainer.compute_loss reads outputs.logits
-        # (it only skips them under use_liger_kernel=True, which would make trl apply Liger and clash with
-        # chalk). So the trl SFT path keeps flce OFF and materialises [micro_batch, seq, vocab] logits —
-        # otherwise every large-vocab Qwen3.5 SFT crashes with "'NoneType' object is not subscriptable" once
-        # chalk actually applies flce (#421). Because flce is ALWAYS off here, _sft_fused is False above and
-        # the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were already sized
-        # for the materialised-logits path UP FRONT — no post-init batch/grad-accum fixup is needed, which
-        # would otherwise mutate grad_accum after the trainer's Accelerator was built from the old value
-        # (codex[bot]). The custom GRPO/opd loops read the fused loss directly, so they keep flce on.
+        # chalk flce (fused_ce) stays OFF here regardless of _sft_fused: trl's SFTTrainer.compute_loss reads
+        # outputs.logits (it only skips them under use_liger_kernel=True, which would make trl apply Liger
+        # and clash with chalk), so chalk flce returning logits=None would crash large-vocab Qwen3.5 SFT with
+        # "'NoneType' object is not subscriptable" (#421). When _sft_fused is True, trl's OWN chunked_nll
+        # (loss_type="chunked_nll") owns the output-head loss through its supported logits=None path instead.
+        # Either way the micro-batch / grad-accum / grad-checkpointing (and the allocator, vram.py) were sized
+        # UP FRONT for the chosen path (fused=_sft_fused) — no post-init grad-accum fixup that would mutate it
+        # after the trainer's Accelerator was built (codex[bot]). The custom GRPO/opd loops read the fused
+        # loss directly, so they keep flce on.
         # inside the liveness wrap: chalk's kernel install can JIT-compile, silent for minutes.
         _chalk_report = install_chalk_kernels(getattr(trainer, "model", None), fused_ce=False)
     _chalk_active = active_kernels(_chalk_report)
