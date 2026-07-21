@@ -153,6 +153,12 @@ def run_rl():
             record_has_images(ex, messages)
             for ex, messages in zip(train, message_prompts, strict=True)
         )
+        if multimodal and _chalk_grpo_fused:
+            # fused selected-token logprobs can't consume pixel_values; a vl+image run falls back to
+            # the trl full-logits path every batch, so drop the fused flag here (before it wrongly
+            # lifts the full-logits cap below) now that the dataset is known to carry images.
+            _chalk_grpo_fused = False
+            print("[rl] multimodal image run detected; chalk fused grpo disabled, using trl full-logits path")
         processor = None
         if multimodal:
             validate_multimodal_training(model_id, "grpo", multi_turn=is_multi_turn)
