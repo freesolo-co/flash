@@ -2392,7 +2392,11 @@ def test_opd_nondue_step_syncs_before_next_rollout(monkeypatch):
 
     opd_mod.run_opd()
 
-    assert events == ["sync", "generate", "sync", "generate"]
+    # Generate-ahead (default for single-turn text) prefetches the next step's rollouts from the
+    # current pre-sync (1-step-stale) student, so step 0 generates its own slice AND prefetches slice 1
+    # before the optimizer sync. The final step reuses the prefetched slice (no generate) and skips the
+    # sync (no rollout remains): sync, generate(slice0), generate(prefetch slice1), sync.
+    assert events == ["sync", "generate", "generate", "sync"]
 
 
 def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
@@ -2515,8 +2519,10 @@ def test_opd_rollout_chunking_scales_for_heavy_steps():
 
 
 def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
-    """Default OPD steps have 8 rollouts. Generate them in chunks so teacher scoring for the first
-    chunk can run while vLLM generates the later chunk."""
+    """Default OPD steps have 8 rollouts. Generate-ahead (default for single-turn text) still splits them
+    into the same moderate vLLM chunks (not one request per prompt); teacher/generation overlap is now
+    cross-step (this step's echo scoring runs while the NEXT step's rollouts prefetch), covered by the
+    generate-ahead prefetch tests."""
     import threading
 
     torch = pytest.importorskip("torch")
@@ -2577,10 +2583,9 @@ def test_opd_chunks_single_turn_rollout_to_overlap_teacher(monkeypatch):
 
     opd_mod.run_opd()
 
+    # 8 rollouts generated as two moderate chunks of 4 (not one request per prompt). Overlap is cross-
+    # step under generate-ahead, so there is no intra-step score-before-second-chunk ordering to assert.
     assert [e[2] for e in events if e[0] == "generate"] == [4, 4]
-    first_score = next(i for i, e in enumerate(events) if e[0] == "score")
-    second_generate = events.index(("generate", 1, 4))
-    assert first_score < second_generate
 
 
 def test_opd_teacher_batch_workers_and_loss_microbatch_defaults():
@@ -5645,3 +5650,119 @@ def test_opd_loss_coefficient_tracks_student_minus_teacher_logprob():
     assert hi is not None
     assert lo is not None
     assert float(hi.detach()) < float(lo.detach())
+
+
+def _generate_ahead_ok_score_many(pendings, opd_mod):
+    return [opd_mod._ScoreResult(teacher_toks=[], status="ok") for _ in pendings]
+
+
+def test_opd_generate_ahead_on_by_default_for_single_turn_text(monkeypatch):
+    """Generate-ahead is unconditional for single-turn text OPD — no env flag/opt-in. With nothing set,
+    each non-final, non-checkpoint step still prefetches the next slice."""
+    monkeypatch.delenv("FLASH_OPD_GENERATE_AHEAD", raising=False)
+
+    def _trained(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    metas = []
+    opd_mod = _opd_harness(monkeypatch, sample_result=_trained, epochs=3, metas=metas)
+    monkeypatch.setattr(
+        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+    )
+    gen_calls = []
+    orig = opd_mod._generate_many_vllm
+    monkeypatch.setattr(
+        opd_mod,
+        "_generate_many_vllm",
+        lambda vllm, tok, prompt_ids_batch, *a, **k: (
+            gen_calls.append(len(prompt_ids_batch)) or orig(vllm, tok, prompt_ids_batch, *a, **k)
+        ),
+    )
+
+    opd_mod.run_opd()
+
+    notes = metas[-1]["notes"]
+    assert notes["opd_generate_ahead"] is True
+    assert notes["opd_phase_optimizer_steps"] == 3
+    # default-on: steps 0 and 1 prefetch slices 1 and 2; the final update skips prefetch.
+    assert notes["opd_phase_prefetch_generates"] == 2
+    assert notes["opd_phase_rollout_generate_calls"] == 1
+    assert len(gen_calls) == 3
+
+
+def test_opd_generate_ahead_prefetches_and_generates_each_slice_once(monkeypatch):
+    """FLASH_OPD_GENERATE_AHEAD=1: each non-final, non-checkpoint step prefetches the next slice, so
+    only the first step generates fresh and every slice is generated exactly once (no duplicated seeds)."""
+    monkeypatch.delenv("FLASH_OPD_GENERATE_AHEAD", raising=False)
+
+    def _trained(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    metas = []
+    opd_mod = _opd_harness(monkeypatch, sample_result=_trained, epochs=3, metas=metas)
+    monkeypatch.setattr(
+        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+    )
+    gen_calls = []
+    orig = opd_mod._generate_many_vllm
+    monkeypatch.setattr(
+        opd_mod,
+        "_generate_many_vllm",
+        lambda vllm, tok, prompt_ids_batch, *a, **k: (
+            gen_calls.append(len(prompt_ids_batch)) or orig(vllm, tok, prompt_ids_batch, *a, **k)
+        ),
+    )
+
+    opd_mod.run_opd()
+
+    notes = metas[-1]["notes"]
+    assert notes["opd_generate_ahead"] is True
+    assert notes["opd_phase_optimizer_steps"] == 3
+    # steps 0 and 1 prefetch slices 1 and 2; the final update (== steps) skips prefetch.
+    assert notes["opd_phase_prefetch_generates"] == 2
+    # only step 0 generates fresh; steps 1 and 2 reuse the prefetched rollouts.
+    assert notes["opd_phase_rollout_generate_calls"] == 1
+    # every one of the 3 data slices is generated exactly once.
+    assert len(gen_calls) == 3
+
+
+def test_opd_generate_ahead_skips_prefetch_at_checkpoint_boundary(monkeypatch):
+    """FLASH_OPD_GENERATE_AHEAD=1 with save_every=1: every step is a checkpoint boundary, so prefetch is
+    always gated off and no un-consumed prefetched slice can be persisted in a resume checkpoint."""
+    monkeypatch.delenv("FLASH_OPD_GENERATE_AHEAD", raising=False)
+
+    def _trained(*, model, **_kwargs):
+        return opd_mod.SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    metas = []
+    opd_mod = _opd_harness(
+        monkeypatch, sample_result=_trained, epochs=3, metas=metas, save_every=1
+    )
+    monkeypatch.setattr(
+        opd_mod, "_score_many", lambda _t, pendings, **_k: _generate_ahead_ok_score_many(pendings, opd_mod)
+    )
+
+    opd_mod.run_opd()
+
+    notes = metas[-1]["notes"]
+    assert notes["opd_generate_ahead"] is True
+    assert notes["opd_phase_prefetch_generates"] == 0
+    assert notes["opd_phase_rollout_generate_calls"] == 3
