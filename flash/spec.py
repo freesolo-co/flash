@@ -127,6 +127,32 @@ def _opt_float(value: Any) -> float | None:
     return float(value)
 
 
+_MAX_GPU_COUNT = 8
+
+
+def _gpu_count(value: Any, *, field_name: str = "gpu.count") -> int:
+    """Parse the per-job gpu count (1..8); rejects bools and out-of-range values.
+
+    one job occupies ``count`` cards of the chosen class on a single worker; count == 1 is the
+    historical single-gpu behavior. sharded-fit sizing lands with the multi-gpu training paths.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer, got bool {value!r}")
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{field_name} must be an integer") from exc
+    if count < 1 or count > _MAX_GPU_COUNT:
+        raise ValueError(f"{field_name} must be between 1 and {_MAX_GPU_COUNT}, got {count}")
+    return count
+
+
+def gpu_count_of(spec: Any) -> int:
+    """Best-effort per-job gpu count from a JobSpec-like value; defaults to 1 when absent/None."""
+    count = getattr(getattr(spec, "gpu", None), "count", 1)
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 1 else 1
+
+
 def parse_seed(value: Any = FIXED_SEED) -> int:
     """Parse one bounded nonnegative per-run seed without coercing floats or bools."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -289,6 +315,13 @@ class GpuSpec:
     network_volume_gb: int = 100
     provider: str = ""
     exact_type: str = ""
+    # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
+    # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        # coerce/validate here so every path (from_dict and direct construction) is guarded.
+        object.__setattr__(self, "count", _gpu_count(self.count))
 
 
 @dataclass(frozen=True)
@@ -441,6 +474,7 @@ class JobSpec:
                 # _assign_managed_hf_repo before deploy.
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=_volume_gb(gpu.get("network_volume_gb")),
+                count=gpu.get("count", 1),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
