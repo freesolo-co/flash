@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from flash.serve.deploy import (
@@ -10,6 +12,18 @@ from flash.serve.deploy import (
     serving_base_url,
     undeploy_adapter,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_shared_http_client(monkeypatch):
+    import flash.serve.deploy as deploy
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            return getattr(deploy.httpx, method.lower())(url, **kwargs)
+
+    client = _Client()
+    monkeypatch.setattr(deploy, "_http_client", lambda: client)
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
@@ -495,8 +509,8 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
     mismatched = {**expected, "repo_id": "other/repo"}
     monkeypatch.setattr(
         deploy,
-        "_registered_adapter",
-        lambda adapter_id, **_kwargs: mismatched,
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (mismatched, types.SimpleNamespace(headers={})),
     )
 
     with pytest.raises(deploy.ServingError, match="different immutable identity"):
@@ -531,8 +545,11 @@ def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypat
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
         deploy,
-        "_registered_adapter",
-        lambda adapter_id, **_kwargs: readback["record"],
+        "_registered_adapter_response",
+        lambda adapter_id, **_kwargs: (
+            readback["record"],
+            types.SimpleNamespace(headers={}),
+        ),
     )
 
     assert (
