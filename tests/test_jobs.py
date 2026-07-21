@@ -4498,6 +4498,72 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
 
 
+def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
+    """An out-of-balance account fails the deploy over to the next account WITHOUT sweeping idle
+    endpoints (sweeping can't add balance)."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+    swept = {"count": 0}
+
+    class FakeResource:
+        id = "ep-on-kB"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            if keys.active_key() == "kA":
+                raise RuntimeError(
+                    "GraphQL errors: You must have at least $0.01 in your account "
+                    "balance to create an endpoint."
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
+        swept["count"] += 1
+        return 0
+
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", fake_sweep)
+
+    ep_id, _name, _fingerprint = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kB"
+    assert keys.active_key() == "kB"
+    assert swept["count"] == 0, "balance failover must not sweep idle endpoints (can't add balance)"
+
+
+def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
+    """A balance error on the only account re-raises (not swallowed) and fails fast without
+    sweep-and-retry on the same broke account."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "solo-key")
+    keys.reset()
+    attempts = {"count": 0}
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            attempts["count"] += 1
+            raise RuntimeError(
+                "GraphQL errors: You must have at least $0.01 in your account "
+                "balance to create an endpoint."
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    with pytest.raises(RuntimeError, match="account balance"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert attempts["count"] == 1, "balance error must fail fast, not sweep-retry the broke account"
+
+
 def test_deploy_captures_owner_before_concurrent_failover_after_sdk_create(monkeypatch):
     """A second deploy may fail over immediately after account A creates its endpoint. The returned
     fingerprint must remain account A's, never the newly active account B's."""
@@ -4855,3 +4921,68 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
         assert not done.wait(0.2)
     t.join(timeout=2)
     assert done.is_set()  # completes as soon as the lock is released
+
+
+def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):
+    """gpu.count from the job spec becomes the runpod Endpoint gpu_count (multi-gpu pod)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+    from flash.spec import GpuSpec, JobSpec
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-multi"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    spec = JobSpec(gpu=GpuSpec(count=2))
+    # endpoint_kwargs={} bypasses weight_cache_endpoint_kwargs so the base gpu_count is asserted directly.
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", spec=spec, endpoint_kwargs={})
+    assert captured["gpu_count"] == 2
+
+
+def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
+    """No spec keeps the historical single-gpu Endpoint payload (count == 1)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-single"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", endpoint_kwargs={})
+    assert captured["gpu_count"] == 1

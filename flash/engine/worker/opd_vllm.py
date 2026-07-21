@@ -92,7 +92,7 @@ def _startup_oom_error(
     free_gb: float,
     total_gb: float,
     requested_util: float,
-    margin_gb: float,
+    reserve_gb: float,
     rollout_batch_size: int,
 ) -> BaseException:
     requested_gb = float(requested_util) * float(total_gb)
@@ -100,8 +100,8 @@ def _startup_oom_error(
         "Free memory on device cuda:0 "
         f"({free_gb:.2f}/{total_gb:.2f} GiB) on startup is less than desired GPU "
         f"memory utilization ({requested_util:.6f} -> {requested_gb:.2f} GiB) "
-        f"with {margin_gb:.2f} GiB startup margin after reducing OPD rollout_batch_size "
-        f"to {rollout_batch_size}. Retry on a larger GPU."
+        f"with {reserve_gb:.2f} GiB reserved for the OPD training peak and allocator "
+        f"after reducing OPD rollout_batch_size to {rollout_batch_size}. Retry on a larger GPU."
     )
     try:
         import torch
@@ -118,8 +118,34 @@ def _decode_only_compilation_config() -> dict[str, Any]:
     }
 
 
+def _sizing_lora_rank(knobs: Any, default: int = 32) -> int:
+    rank = getattr(knobs, "lora_rank", None)
+    if rank is None:
+        try:
+            from flash.engine.worker._pkg import W as _w
+
+            train = getattr(getattr(_w, "JOB_SPEC", None), "train", None)
+            rank = getattr(train, "lora_rank", None)
+        except Exception:
+            rank = None
+    try:
+        return max(1, int(rank if rank is not None else default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rollout_uplift_validated(params_b: float | None, lora_rank: int) -> bool:
+    return params_b is not None and float(params_b) <= 4.7 and int(lora_rank) <= 32
+
+
 def opd_vllm_kwargs(
-    model_id: str, knobs: Any, seq_cap: int, *, model_revision: str = ""
+    model_id: str,
+    knobs: Any,
+    seq_cap: int,
+    *,
+    prompts_per_step: int | None = None,
+    lora_rank: int | None = None,
+    model_revision: str = "",
 ) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
@@ -157,10 +183,13 @@ def opd_vllm_kwargs(
 
     if card_gb > 0:
         try:
-            from flash.catalog import MODELS
+            from flash.catalog import MODELS, vocab_size_for
             from flash.engine.vram import (
                 colocate_kv_util,
+                opd_allocator_margin_gb,
+                opd_post_init_reserve_gb,
                 opd_rollout_concurrency,
+                opd_training_reserve_gb,
                 resolve_params_b,
             )
 
@@ -170,9 +199,20 @@ def opd_vllm_kwargs(
                 if model_revision
                 else resolve_params_b(model_id)
             )
+            sizing_params_b = float(params_b or 1.0)
+            resolved_lora_rank = (
+                _sizing_lora_rank(knobs)
+                if lora_rank is None
+                else max(1, int(lora_rank))
+            )
+            resolved_prompts_per_step = (
+                getattr(knobs, "prompts_per_step", 1)
+                if prompts_per_step is None
+                else prompts_per_step
+            )
             active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
             target_concurrency = opd_rollout_concurrency(
-                getattr(knobs, "prompts_per_step", 1),
+                resolved_prompts_per_step,
                 getattr(knobs, "group_size", 1),
             )
             rollout_concurrency = target_concurrency
@@ -192,12 +232,26 @@ def opd_vllm_kwargs(
 
             util = _util_for(rollout_concurrency)
             if free_gb > 0:
-                # vLLM rejects startup unless its whole executor budget is free right now. OPD builds
-                # the rollout engine after the student + warm-start adapter are resident, so choose the
-                # largest rollout chunk that fits the observed residual memory instead of reserving for
-                # every prompt in the optimizer step.
-                startup_margin_gb = max(1.0, min(4.0, card_gb * 0.03))
-                max_startup_util = max(0.0, (free_gb - startup_margin_gb) / max(1.0, card_gb))
+                # free memory is measured after the student and adapter are resident. protect the
+                # modeled loss forward/backward peak plus allocator slack, then give the remaining
+                # memory to the rollout executor instead of leaving it idle behind the generic cap.
+                training_reserve_gb = opd_training_reserve_gb(
+                    sizing_params_b,
+                    int(seq_cap),
+                    max_tokens=getattr(knobs, "max_completion", None),
+                    prompts_per_step=resolved_prompts_per_step,
+                    group_size=getattr(knobs, "group_size", 1),
+                    vocab=vocab_size_for(model_id),
+                    active_params_b=active_b,
+                )
+                post_init_reserve_gb = opd_post_init_reserve_gb(
+                    sizing_params_b, resolved_lora_rank
+                )
+                allocator_margin_gb = opd_allocator_margin_gb(card_gb)
+                protected_gb = training_reserve_gb + post_init_reserve_gb + allocator_margin_gb
+                rollout_budget_gb = max(0.0, free_gb - protected_gb)
+                max_startup_util = rollout_budget_gb / max(1.0, card_gb)
+                lean_trimmed = False
                 while rollout_concurrency > 1 and util > max_startup_util:
                     rollout_concurrency -= 1
                     util = _util_for(rollout_concurrency)
@@ -206,16 +260,61 @@ def opd_vllm_kwargs(
                         "[opd] reduced vLLM rollout batch "
                         f"{target_concurrency}->{rollout_concurrency} to fit startup memory "
                         f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB, "
-                        f"margin={startup_margin_gb:.1f} GiB)"
+                        f"protected={protected_gb:.1f} GiB)"
                     )
                 if util > max_startup_util:
-                    startup_oom = _startup_oom_error(
-                        free_gb=free_gb,
-                        total_gb=card_gb,
-                        requested_util=util,
-                        margin_gb=startup_margin_gb,
-                        rollout_batch_size=rollout_concurrency,
-                    )
+                    # concurrency bottomed out but the resident-KV floor (vLLM weight copy + _KV_CAP)
+                    # keeps the minimal executor above the protected budget. before hard-OOMing, trim
+                    # the allocator slack to the old ~1 GiB startup margin so configs that fit before
+                    # the protected-budget change are not newly rejected; the modeled training peak and
+                    # post-init reserve stay intact.
+                    lean_protected_gb = training_reserve_gb + post_init_reserve_gb + 1.0
+                    lean_startup_util = max(0.0, free_gb - lean_protected_gb) / max(1.0, card_gb)
+                    if util <= lean_startup_util:
+                        print(
+                            "[opd] trimmed allocator margin "
+                            f"{allocator_margin_gb:.1f}->1.0 GiB to fit rollout executor at "
+                            f"concurrency {rollout_concurrency} "
+                            f"(free={free_gb:.1f} GiB, request={util * card_gb:.1f} GiB)"
+                        )
+                        protected_gb = lean_protected_gb
+                        max_startup_util = lean_startup_util
+                        lean_trimmed = True
+                        # the concurrency loop above bottomed out against the stricter full
+                        # budget; re-seek how many sequences now fit under the relaxed lean
+                        # ceiling so the lean path is not frozen at the reduced floor.
+                        while (
+                            rollout_concurrency < target_concurrency
+                            and _util_for(rollout_concurrency + 1) <= max_startup_util
+                        ):
+                            rollout_concurrency += 1
+                            util = _util_for(rollout_concurrency)
+                    else:
+                        startup_oom = _startup_oom_error(
+                            free_gb=free_gb,
+                            total_gb=card_gb,
+                            requested_util=util,
+                            reserve_gb=protected_gb,
+                            rollout_batch_size=rollout_concurrency,
+                        )
+                if (
+                    startup_oom is None
+                    and not lean_trimmed
+                    and _rollout_uplift_validated(params_b, resolved_lora_rank)
+                ):
+                    # 0.80 is a final ceiling for the validated qwen3.5-4b/rank-32 size class; larger
+                    # or higher-rank models keep the existing colocate ceiling until gpu validation.
+                    # skip uplift when we had to lean-trim: the lean budget only leaves ~1 GiB of
+                    # headroom for the training peak, so spending it on the rollout executor risks OOM.
+                    util = max(util, min(0.80, max_startup_util))
+                print(
+                    "[opd] vLLM memory budget "
+                    f"free={free_gb:.1f}/{card_gb:.1f} GiB "
+                    f"training_reserve={training_reserve_gb:.1f} GiB "
+                    f"post_init_reserve={post_init_reserve_gb:.1f} GiB "
+                    f"allocator_margin={allocator_margin_gb:.1f} GiB "
+                    f"rollout={util * card_gb:.1f} GiB util={util:.3f}"
+                )
             kwargs["gpu_memory_utilization"] = util
             kwargs["max_num_seqs"] = rollout_concurrency
             kwargs["rollout_batch_size"] = rollout_concurrency

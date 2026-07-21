@@ -1,45 +1,86 @@
-# GRPO decode-only CUDA graph A/B plan
+# OPD rollout-memory utilization A/B plan
 
-## Objective
+## Question
 
-Measure whether decode-only CUDA graphs speed up the colocated GRPO rollout engine without changing training behavior. This plan does not authorize a paid run.
+Does sizing the colocated vLLM executor from measured post-load free VRAM, while reserving the modeled OPD training peak and allocator margin, eliminate the Qwen3.5 4B negative-KV startup failure and improve rollout throughput without changing training behavior or causing an OOM?
+
+No paid GPU run is part of this change.
 
 ## Frozen comparison
 
-- Control: `origin/dev` at `8fdfc8580b9058d8c40289d4fa1a2e6e3b7bced2`. On RTX 5090/sm120 with vLLM 0.19.1, this selects `enforce_eager=True`.
-- Treatment: the committed head of `perf/grpo-cudagraphs`. On the same GPU and vLLM version, this selects `enforce_eager=False` with `mode=0` and `cudagraph_mode=FULL_DECODE_ONLY`.
-- Hardware: two separate, matched RunPod RTX 5090 workers from the same GPU offer, image, region, CPU/RAM class, and storage configuration. Do not substitute unmatched cards between arms.
-- Model: `Qwen/Qwen3.5-0.8B`, which fits within an RTX 4090-class memory budget.
-- Environment: the real `entropy-R1` hub environment, pinned to one immutable `freesolo-co/environment-hub` commit before launch.
-- Seed: 42 for both arms.
-- Budget: 30 optimizer updates after a two-update exact-path smoke. Use the same prompts per step, group size, maximum context, maximum completion length, LoRA settings, optimizer settings, reward implementation, dataset order, and checkpoint schedule.
-- Concurrency: launch both paid arms together only after both two-update smokes pass. Do not reuse a worker across arms.
+- control: `origin/dev` at `8fdfc858`
+- treatment: branch `perf/opd-rollout-util`
+- hardware: one H100 80 GB for each arm, from the same RunPod GPU type and image
+- launch both arms concurrently on separate matched GPUs
+- use the same base checkpoint, dataset revision, environment revision, seed, teacher, token budget, batch order, and worker image inputs
+- use immutable commits for both arms
 
-## Preflight and token-parity gate
+An H100 80 GB is the smallest card for this A/B. The reported failure is a large-card utilization defect, with roughly 60 GB left idle and a negative-KV startup failure for Qwen3.5 4B. An RTX 4090 24 GB does not have enough residual memory to expose the intended utilization increase and therefore cannot demonstrate the optimization.
 
-1. Resolve and record the exact Flash commit, environment-hub commit, model revision, container digest, vLLM version, CUDA/driver versions, and RunPod machine identifiers for each arm.
-2. Run the same fixed prompt batch through both immutable rollout engines with greedy decoding and the same maximum token count.
-3. Require identical token IDs, finish reasons, and decoded text for every fixed prompt. Any difference is a correctness failure and stops the A/B.
-4. Run two GRPO updates per arm. Require successful graph capture or vLLM's eager fallback, finite loss/reward values, and no OOM before scaling to 30 updates.
+## OPD configuration
 
-## Metrics
+Use the existing reproducing environment and dataset with this training shape held constant:
 
-Measure rollout work separately from training work where telemetry permits.
+```toml
+model = "Qwen/Qwen3.5-4B"
+algorithm = "opd"
+seed = 42
 
-- Primary performance: generated rollout tokens per rollout-engine second, excluding engine startup, graph capture, checkpointing, reward evaluation, and optimizer time.
-- Secondary performance: median rollout wall time per update and end-to-end median step wall time. Report graph-capture startup time separately rather than amortizing it away.
-- Correctness: fixed-prompt rollout token parity, reward curve, training loss curve, completion length, finish-reason distribution, and invalid/empty completion rate.
-- Safety: peak allocated and reserved GPU memory, OOM count, graph-capture failures, eager-fallback events, worker restarts, and failed updates.
+[environment]
+id = "<frozen-reproduction-environment>"
 
-## Decision thresholds
+[train]
+epochs = 1
+batch_size = 8
+group_size = 1
+max_context_tokens = 1536
+max_completion_tokens = 512
+lora_rank = 32
+teacher_model = "glm-5.2"
+```
 
-The expected direction is faster treatment decode with unchanged learning behavior.
+Use the same bounded number of optimizer steps in both arms. Do not tune either arm after launch.
 
-- Performance works: treatment improves steady-state rollout tokens/second by at least 10% over control. A 10% to 40% improvement is the expected range. Confirm the direction with at least a 9% reduction in median rollout wall time over updates 3 through 30.
-- End-to-end value: treatment reduces median total step wall time by at least 5%. Report a decode-only win below this threshold as technically real but operationally marginal.
-- Reward parity: treatment reward AUC over the 30 matched updates must remain within 5% relative or 0.02 absolute of control, whichever tolerance is larger. There must be no sustained three-update reward regression larger than 0.05 absolute.
-- Loss parity: treatment loss AUC must remain within 5% relative of control, with finite values at every update and no new divergence pattern.
-- Rollout parity: the fixed greedy prompt batch must have exact token-ID parity. During stochastic training, completion length, finish-reason, and empty/invalid-rate differences must each remain within 5% relative or one sample, whichever is larger.
-- Memory and reliability: no OOM, no worker restart, no failed update, and treatment peak reserved memory no more than 5% above control after graph capture.
+## Measurements
 
-The treatment passes only if all correctness and reliability gates pass and the primary performance threshold is met. If vLLM falls back to eager, report the fallback and classify the performance result as inconclusive rather than a decode-graph success.
+Record at vLLM initialization and for every rollout step:
+
+1. measured free and total VRAM immediately before vLLM construction
+2. modeled OPD training peak reserve, allocator margin, rollout budget, and final `gpu_memory_utilization`
+3. vLLM executor budget in GiB and available KV-cache budget or cache blocks
+4. rollout batch size and generated tokens per second
+5. peak allocated and peak reserved VRAM across the OPD loss forward/backward
+6. initialization outcome, negative-KV/cache-block errors, CUDA OOMs, and worker health
+7. per-step OPD loss, reward or task metric already emitted by the environment, and completed optimizer steps
+
+## Gates
+
+### Feasibility and memory safety
+
+- treatment must initialize vLLM and complete every planned optimizer step with zero negative-KV/cache-block failures and zero CUDA OOMs
+- treatment executor budget must never exceed measured free VRAM minus the logged training reserve and allocator margin
+- treatment loss forward/backward peak must retain at least the allocator margin after accounting for the executor budget
+- if the control reproduces the startup crash, treatment must complete the same configuration; otherwise the A/B is inconclusive on crash recovery but can still evaluate utilization and throughput
+
+### Utilization and throughput
+
+- direction: treatment `gpu_memory_utilization` and KV budget must be higher than control on the H100
+- threshold: treatment executor budget must increase by at least 16 GiB or utilization by at least 0.20 absolute
+- direction: treatment rollout generated tokens per second must be no worse than control
+- threshold: when both arms complete, treatment median steady-state rollout throughput must improve by at least 10 percent; if control crashes, report treatment throughput without claiming a relative speedup
+
+### Training parity
+
+- both arms must consume the same prompts and completion-token budget and complete the same optimizer-step count
+- per-checkpoint OPD loss curves must remain within normal deterministic/runtime noise, with no sustained treatment regression above 2 percent relative to control
+- final task metric must not regress by more than 1 percentage point absolute
+- any change in gradients, optimizer state, sampled inputs, or training math invalidates the A/B
+
+## Decision
+
+Accept the optimization only if the treatment passes all memory-safety and training-parity gates and either:
+
+1. recovers the exact control startup failure, or
+2. meets both the executor-budget and throughput thresholds when both arms complete.
+
+Reject or revise if treatment OOMs, violates the protected-memory budget, changes the training curve beyond the parity threshold, or fails to increase the H100 rollout budget materially.
