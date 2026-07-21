@@ -437,7 +437,7 @@ def deploy_train_endpoint(
     # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
     failovers_left = max(0, rp_keys.key_count() - 1)
     while resource is None:
-        quota_exc: Exception | None = None
+        deploy_failover_exc: Exception | None = None
         for quota_attempt in range(_QUOTA_MAX_RETRIES):
             if quota_attempt > 0:
                 # Under acute quota pressure, sweep idle orphaned flash training endpoints on THIS
@@ -472,11 +472,11 @@ def deploy_train_endpoint(
             except Exception as exc:
                 if _is_balance_error(exc):
                     # a broke account can't be helped by sweeping idle endpoints — fail over now
-                    quota_exc = exc
+                    deploy_failover_exc = exc
                     break
                 if not _is_workers_quota_error(exc):
                     raise
-                quota_exc = exc
+                deploy_failover_exc = exc
         if resource is not None:
             break
         if failovers_left > 0:
@@ -485,7 +485,7 @@ def deploy_train_endpoint(
             failovers_left -= 1
             reason = (
                 "has insufficient balance"
-                if quota_exc is not None and _is_balance_error(quota_exc)
+                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
                 else "worker quota exhausted after sweeping"
             )
             logger.warning(
@@ -494,7 +494,7 @@ def deploy_train_endpoint(
                 rp_keys.key_count(),
             )
             continue
-        raise quota_exc or RuntimeError("deploy_train_endpoint: worker quota exhausted")
+        raise deploy_failover_exc or RuntimeError("deploy_train_endpoint: deploy failover exhausted")
 
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
