@@ -41,4 +41,9 @@ def test_health_returns_ok():
     with TestClient(app) as client:
         resp = client.get("/v1/health")
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "service": "flash", "version": __version__}
+    assert resp.json() == {
+        "ok": True,
+        "service": "flash",
+        "version": __version__,
+        "capabilities": ["chat_step_selector_v1"],
+    }
