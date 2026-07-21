@@ -228,17 +228,27 @@ _VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
-# Single source of truth for the SFT fused-CE gate. Keep the historical constant names because
-# engine.worker.perf and tests import them.
+_SFT_CHUNKED_NLL_TOKENS = 256
+# shared thresholds for the independent liger and worker memory gates.
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
+# trl 1.6 chunked_nll is validated against these model families. other models keep plain nll
+# until their output-head and backbone traversal are covered by the same parity tests.
+_SFT_CHUNKED_NLL_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
 
-def sft_logits_fused(params_b: float | None, seq_len: int) -> bool:
-    """True when the worker fuses SFT cross-entropy (>=3B model OR >=2048-token context)."""
-    if seq_len >= _LIGER_LONG_CTX_TOKENS:
-        return True
-    return (params_b or 0.0) >= _LIGER_MIN_PARAMS_B
+
+def sft_chunked_nll_enabled(model_id: str) -> bool:
+    """whether the sft worker uses trl's dense-logit-free chunked nll path."""
+    return model_id in _SFT_CHUNKED_NLL_MODELS
 
 
 def sft_logits_per_device_cap(seq_len: int, vocab: int) -> int:
@@ -384,14 +394,15 @@ def estimate_vram_gb(
         dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
         logits = max(chunked_logits, dense_image_logits)
         return base + rollout + activations + logits
-    # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
-    # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
-    # comparisons; the default must mirror the worker.
+    # direct callers default to the conservative plain-nll estimate. model_required_vram_gb passes
+    # the worker's validated chunked-nll decision explicitly when it knows the model identity.
     fused = False if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
-    # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
-    logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
+    # plain nll retains every sequence position. chunked nll retains at most one 256-token vocab
+    # projection at a time, independent of micro-batch and context once the chunk is full.
+    projected_tokens = min(pd * seq_len, _SFT_CHUNKED_NLL_TOKENS) if fused else pd * seq_len
+    logits = projected_tokens * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
 
 
@@ -465,10 +476,10 @@ def sft_gc_off_peak_gb(
     lora_rank: int = 32,
     quant: str = "bf16",
 ) -> float:
-    """Estimated peak VRAM (GB) for a FUSED-CE LoRA SFT step with gradient checkpointing OFF: the
-    resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
-    Fused CE (chalk FLCE) is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that
-    made GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
+    """Estimated peak VRAM (GB) for a dense-logit-free LoRA SFT step with gradient checkpointing OFF:
+    the resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
+    Chunked or fused CE is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that made
+    GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
 
     MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),
     NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K``. ``weights``
@@ -497,7 +508,7 @@ def sft_grad_checkpoint_can_disable(
     quant: str = "bf16",
     margin_gb: float = 18.0,
 ) -> bool:
-    """True when a FUSED-CE LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
+    """True when a dense-logit-free LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
     so GC -- a ~+33% recompute tax on every step -- can be turned off for the speed win.
 
     Conservative by construction: an unknown card / unknown architecture dims, or a peak that doesn't
@@ -716,12 +727,10 @@ def model_required_vram_gb(
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     )
-    # Worker parity: TRL SFT deliberately calls install_chalk_kernels(..., fused_ce=False), because
-    # SFTTrainer.compute_loss reads outputs.logits and crashes when fused CE returns logits=None. So
-    # every SFT run materializes dense logits, even for long context / >=3B models where the old
-    # allocator assumed a fused CE path. Size SFT with fused CE OFF up front or long-context Qwen SFT
-    # routes to consumer cards and OOMs on the first backward.
-    sft_fused_ce = None if is_grpo else False
+    # trl chunked_nll removes ignored positions before the lm head and projects valid tokens in
+    # bounded chunks. size validated qwen sft jobs without a dense [batch, seq, vocab] term; models
+    # outside that validated set keep the conservative plain-nll estimate and micro-batch cap.
+    sft_fused_ce = None if is_grpo else sft_chunked_nll_enabled(model_id)
     if info is not None:
         params_b = info.params_b
         if model_revision:
