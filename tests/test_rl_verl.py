@@ -48,27 +48,55 @@ def test_build_verl_dataset_rows_length_mismatch_raises():
 
 
 # ------------------------------- override generation -------------------------------
-def test_build_verl_overrides_carries_grpo_lora_and_ref_logprob():
+def _overrides_cfg(**over):
     cfg = {
         "train_files": "/w/train.parquet", "val_files": "/w/val.parquet",
         "model_id": "Qwen/Qwen3-4B", "lora_rank": 32, "lora_alpha": 64,
         "target_modules": "all-linear", "lr": 1e-5, "group_size": 8,
         "prompts_per_step": 16, "micro_batch": 2, "max_prompt_len": 2048,
-        "max_completion": 320, "temperature": 1.0, "kl_loss_coef": 0.001,
-        "gpu_mem_util": 0.5, "tp_size": 1, "reward_path": "/w/reward.py",
-        "reward_name": "compute_score", "total_epochs": 1, "save_freq": 1,
-        "local_dir": "/w/ckpt",
+        "max_completion": 320, "temperature": 1.0, "top_p": 0.95, "kl_coef": 0.0,
+        "loss_agg_mode": "seq-mean-token-sum-norm", "seed": 42, "num_iterations": 2,
+        "steps": 60, "gpu_mem_util": 0.5, "tp_size": 1, "reward_path": "/w/reward.py",
+        "reward_name": "compute_score", "total_epochs": 1, "save_freq": 20, "local_dir": "/w/ckpt",
     }
-    o = rl_verl.build_verl_overrides(cfg)
+    cfg.update(over)
+    return cfg
+
+
+def test_build_verl_overrides_carries_dr_grpo_recipe():
+    o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert "algorithm.adv_estimator=grpo" in o
+    # dr-grpo: no std normalization + constant-length loss aggregation.
+    assert "algorithm.norm_adv_by_std_in_grpo=False" in o
+    assert "actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum-norm" in o
     assert "actor_rollout_ref.model.lora_rank=32" in o
     assert "actor_rollout_ref.rollout.n=8" in o
     assert "actor_rollout_ref.rollout.load_format=safetensors" in o
-    # a reference policy requires ref + rollout log-prob micro-batch, else verl fails config validation.
-    assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
-    assert "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2" in o
+    assert "actor_rollout_ref.rollout.top_p=0.95" in o
+    # constant lr, num_iterations, gradient checkpointing, seed, max-steps horizon, save schedule.
+    assert "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0" in o
+    assert "actor_rollout_ref.actor.ppo_epochs=2" in o
+    assert "actor_rollout_ref.model.enable_gradient_checkpointing=True" in o
+    assert "data.seed=42" in o
+    assert "trainer.total_training_steps=60" in o
+    assert "trainer.save_freq=20" in o
+    assert "trainer.max_actor_ckpt_to_keep=1" in o
     assert "data.train_batch_size=16" in o
-    assert f"data.train_files={cfg['train_files']}" in o
+
+
+def test_build_verl_overrides_kl_off_by_default():
+    # flash default kl_penalty_coef=0 (dr-grpo, no kl term) -> no reference policy.
+    o = rl_verl.build_verl_overrides(_overrides_cfg(kl_coef=0.0))
+    assert "actor_rollout_ref.actor.use_kl_loss=False" in o
+    assert not any("kl_loss_coef" in x for x in o)
+    assert not any("ref.log_prob_micro_batch" in x for x in o)
+
+
+def test_build_verl_overrides_kl_on_when_requested():
+    o = rl_verl.build_verl_overrides(_overrides_cfg(kl_coef=0.02))
+    assert "actor_rollout_ref.actor.use_kl_loss=True" in o
+    assert "actor_rollout_ref.actor.kl_loss_coef=0.02" in o
+    assert "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2" in o
 
 
 # ------------------------------- reward module render -------------------------------
