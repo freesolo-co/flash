@@ -966,9 +966,18 @@ def prepare_job(
 
         preflight_serving_path(spec)
     else:
-        from flash.lora_rank import preflight_train_context_within_serving
+        from flash.lora_rank import (
+            ServingPreflightError,
+            preflight_train_context_within_serving,
+        )
 
-        preflight_train_context_within_serving(spec)
+        # mirror preflight_serving_path: surface the specific context error as a
+        # ServingPreflightError so create_run re-raises it unchanged instead of the
+        # warm-start path masking it with a generic preparation message
+        try:
+            preflight_train_context_within_serving(spec)
+        except ValueError as exc:
+            raise ServingPreflightError(str(exc)) from exc
     if spec.gpu.provider or spec.gpu.exact_type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for
