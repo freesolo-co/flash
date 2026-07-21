@@ -238,6 +238,11 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     from huggingface_hub import snapshot_download
 
     adir = os.path.join("/tmp/evdl", prefix, "adapter")
+    # start from a clean path so the loadable-check can only ever accept files THIS download
+    # materialized -- leftover materialization from an earlier worker subprocess, attempt, or a
+    # different run sharing the same prefix must not satisfy the post-exception loadable check and
+    # mask a terminal 404/403/429 for the current repo/revision.
+    shutil.rmtree(adir, ignore_errors=True)
     for attempt in range(_ADAPTER_DOWNLOAD_RETRIES):
         _require_hf_deadline_allowance()
         try:
