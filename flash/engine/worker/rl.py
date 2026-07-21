@@ -126,6 +126,19 @@ def select_grpo_trainer_class(
 
 
 def run_rl():
+    # backend selector (private worker env): default trl. the verl path imports nothing here so the
+    # default trl path is completely unchanged; verl runs out-of-process against its own interpreter.
+    backend = os.environ.get("FLASH_RL_BACKEND", "trl").strip().lower()
+    if backend == "verl":
+        from flash.engine.worker.rl_verl import run_rl_verl
+
+        run_rl_verl()
+        return
+    if backend != "trl":
+        raise RuntimeError(
+            f"FLASH_RL_BACKEND={backend!r} is not a known grpo backend (expected 'trl' or 'verl')"
+        )
+
     from datasets import Dataset
     from transformers import AutoProcessor
     from trl import GRPOConfig, GRPOTrainer
