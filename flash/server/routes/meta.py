@@ -13,6 +13,8 @@ from flash.server.auth import _IDENTITY_PASSTHROUGH_FIELDS
 
 router = APIRouter()
 
+_CONTROL_PLANE_CAPABILITIES = ("chat_step_selector_v1",)
+
 
 # NOTE: must stay `async def`. As a coroutine this runs directly on the event loop and never
 # acquires an anyio threadpool token. Sync (`def`) route handlers share one CapacityLimiter
@@ -22,7 +24,12 @@ router = APIRouter()
 # makes the liveness probe structurally immune to that starvation. (See ISSUE.md 2026-07-02.)
 @router.get("/v1/health")
 async def health():
-    return {"ok": True, "service": "flash", "version": __version__}
+    return {
+        "ok": True,
+        "service": "flash",
+        "version": __version__,
+        "capabilities": list(_CONTROL_PLANE_CAPABILITIES),
+    }
 
 
 @router.get("/v1/me")
