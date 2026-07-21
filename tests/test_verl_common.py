@@ -61,6 +61,13 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "verl==0.8.0" in install
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
+    assert "qwen-vl-utils" in install
+    assert "torchvision" in install
+    assert calls[2] == [
+        python_bin,
+        "-c",
+        "import qwen_vl_utils; import torchvision",
+    ]
 
 
 def test_run_verl_training_streams_steps_and_returns_code():

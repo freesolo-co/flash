@@ -93,6 +93,68 @@ class FlashTeacherBridgeError(RuntimeError):
         self.classification = classification
 
 
+def _multi_modal_image_count(multi_modal_data) -> int:
+    if not multi_modal_data:
+        return 0
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError("verl multimodal data must be a mapping")
+    images = multi_modal_data.get("images")
+    if images is None:
+        return 0
+    try:
+        return len(images)
+    except TypeError as error:
+        raise TypeError("verl multimodal images must be a sized collection") from error
+
+
+def _teacher_bridge_payload(routing_key, sequence_ids, multi_modal_data) -> dict:
+    return {
+        "index": int(routing_key),
+        "sequence_ids": [int(token_id) for token_id in sequence_ids],
+        "image_count": _multi_modal_image_count(multi_modal_data),
+    }
+
+
+def _raw_prompt_has_image_block(raw_prompt) -> bool:
+    for message in raw_prompt or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "image" for block in content
+        ):
+            return True
+    return False
+
+
+def _resolve_image_token_id(processor, tokenizer) -> int:
+    def valid(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            token_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return token_id if token_id >= 0 else None
+
+    token_id = valid(getattr(processor, "image_token_id", None))
+    if token_id is not None:
+        return token_id
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        image_token = getattr(processor, "image_token", None)
+        candidates = [image_token] if isinstance(image_token, str) else []
+        candidates.append("<|image_pad|>")
+        for token in candidates:
+            try:
+                token_id = valid(convert(token))
+            except Exception:
+                token_id = None
+            if token_id is not None:
+                return token_id
+    raise ValueError("could not resolve a valid image token id from the processor or tokenizer")
+
+
 def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -228,8 +290,6 @@ def _install_verl_extensions() -> None:
             mm_processor_kwargs=None,
             routing_key=None,
         ):
-            if multi_modal_data:
-                raise RuntimeError("flash OPD bridge does not accept child-side multimodal payloads")
             if routing_key is None:
                 raise RuntimeError("flash OPD bridge requires the indexed dataset row")
             try:
@@ -238,10 +298,7 @@ def _install_verl_extensions() -> None:
                     self.bridge_url,
                     self.bridge_token,
                     "/score",
-                    {
-                        "index": int(routing_key),
-                        "sequence_ids": [int(token_id) for token_id in sequence_ids],
-                    },
+                    _teacher_bridge_payload(routing_key, sequence_ids, multi_modal_data),
                 )
             except FlashTeacherBridgeError as error:
                 exit_code = (
@@ -270,6 +327,11 @@ def _install_verl_extensions() -> None:
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             params = dict(sampling_params)
+            if _raw_prompt_has_image_block(kwargs.get("raw_prompt")):
+                image_token_id = _resolve_image_token_id(self.processor, self.tokenizer)
+                logit_bias = dict(params.get("logit_bias") or {})
+                logit_bias[image_token_id] = -100.0
+                params["logit_bias"] = logit_bias
             flash_seed = int(os.environ["FLASH_OPD_SEED"])
             global_step = int(kwargs["global_steps"])
             example_index = int(kwargs["index"])

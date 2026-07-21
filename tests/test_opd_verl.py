@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+import os
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +19,13 @@ from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
     _OpdProgressState,
+    _processor_expanded_prompt_ids,
+    _prompt_pool_fingerprint,
     _raise_verl_failure,
     _restore_verl_resume,
     _stage_retry_contract,
     _TeacherAlignmentBridge,
+    _write_opd_parquet,
     build_opd_verl_overrides,
     encode_shifted_group_metadata,
 )
@@ -22,12 +33,54 @@ from flash.engine.worker.opd_verl_plugin import (
     FlashTeacherBridgeError,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
+    _multi_modal_image_count,
     _post_json,
+    _raw_prompt_has_image_block,
+    _resolve_image_token_id,
     _set_current_global_batch_info,
     _signal_sequences,
+    _teacher_bridge_payload,
     deterministic_rollout_seed,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
+
+
+def _load_verl_rl_dataset(monkeypatch):
+    test_root = os.environ.get("FLASH_VERL_TEST_ROOT", "").strip()
+    if test_root:
+        target = Path(test_root).resolve()
+        root = target / "verl"
+        monkeypatch.syspath_prepend(str(target))
+    else:
+        package_spec = importlib.util.find_spec("verl")
+        if package_spec is None or not package_spec.submodule_search_locations:
+            pytest.skip("verl 0.8.0 is not installed")
+        root = Path(next(iter(package_spec.submodule_search_locations)))
+    for name, path in {
+        "verl": root,
+        "verl.utils": root / "utils",
+        "verl.utils.dataset": root / "utils" / "dataset",
+    }.items():
+        package = types.ModuleType(name)
+        package.__path__ = [str(path)]
+        monkeypatch.setitem(sys.modules, name, package)
+    try:
+        import omegaconf  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(
+            sys.modules,
+            "omegaconf",
+            types.SimpleNamespace(DictConfig=dict, ListConfig=list),
+        )
+    module_spec = importlib.util.spec_from_file_location(
+        "verl.utils.dataset.rl_dataset", root / "utils" / "dataset" / "rl_dataset.py"
+    )
+    assert module_spec is not None
+    assert module_spec.loader is not None
+    module = importlib.util.module_from_spec(module_spec)
+    monkeypatch.setitem(sys.modules, module_spec.name, module)
+    module_spec.loader.exec_module(module)
+    return module
 
 
 def _aggregate_seq_mean_token_mean(values, response_mask):
@@ -203,6 +256,145 @@ def test_shifted_group_metadata_uses_verl_prediction_layout():
     assert teacher_ids[2:6] == [0, 1, 1, -1]
 
 
+def test_image_prompt_positions_remain_outside_alignment_groups():
+    prompt_ids = [1, 151655, 151655, 2]
+    teacher_ids, _teacher_logprobs = encode_shifted_group_metadata(
+        prompt_length=len(prompt_ids),
+        response_length=2,
+        groups=[([0], -0.4)],
+    )
+    assert teacher_ids[: len(prompt_ids) - 1] == [-1, -1, -1]
+    assert teacher_ids[len(prompt_ids) - 1] == 0
+
+
+@pytest.mark.parametrize("image_first", [False, True])
+def test_multimodal_opd_parquet_round_trip_preserves_image_dicts(tmp_path, image_first):
+    image_row = {
+        "prompt": [{"role": "user", "content": "<image>describe"}],
+        "images": [{"image": "file:///tmp/first.png"}],
+        "data_source": "flash_opd",
+        "reward_model": {"style": "rule", "ground_truth": ""},
+        "extra_info": {"index": 1},
+    }
+    text_row = {
+        "prompt": [{"role": "user", "content": "text only"}],
+        "images": [],
+        "data_source": "flash_opd",
+        "reward_model": {"style": "rule", "ground_truth": ""},
+        "extra_info": {"index": 0},
+    }
+    rows = [image_row, text_row] if image_first else [text_row, image_row]
+    path = tmp_path / "mixed.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[0]["images"] == rows[0]["images"]
+    assert restored[1]["images"] == rows[1]["images"]
+    assert restored.features["images"].feature["image"].dtype == "string"
+
+
+@pytest.mark.parametrize("image_first", [False, True])
+def test_verl_0_8_rlhf_dataset_builds_one_structured_block_per_image(
+    monkeypatch, tmp_path, image_first
+):
+    rl_dataset = _load_verl_rl_dataset(monkeypatch)
+    assert importlib.metadata.version("verl") == "0.8.0"
+    image_row = {
+        "prompt": [{"role": "user", "content": "before<image>after"}],
+        "images": [{"image": "file:///tmp/only.png"}],
+        "data_source": "flash_opd",
+        "reward_model": {"style": "rule", "ground_truth": ""},
+        "extra_info": {"index": 1},
+    }
+    text_row = {
+        "prompt": [{"role": "user", "content": "text only"}],
+        "images": [],
+        "data_source": "flash_opd",
+        "reward_model": {"style": "rule", "ground_truth": ""},
+        "extra_info": {"index": 0},
+    }
+    rows = [image_row, text_row] if image_first else [text_row, image_row]
+    path = tmp_path / "verl-row.parquet"
+    _write_opd_parquet(rows, str(path))
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(str(path))
+    row = dict(restored[0 if image_first else 1])
+    dataset = object.__new__(rl_dataset.RLHFDataset)
+    dataset.image_key = "images"
+    dataset.video_key = "videos"
+    dataset.audio_key = "audios"
+    dataset.processor = object()
+
+    messages = dataset._build_messages(row, key="prompt")
+
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "image": "file:///tmp/only.png"},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+
+
+class _MockMultimodalProcessor:
+    image_token_id = 151655
+
+    def __init__(self):
+        self.rendered = None
+        self.images = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs == {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        self.rendered = messages
+        return "<vision>describe"
+
+    def __call__(self, **kwargs):
+        self.images = kwargs["images"]
+        assert kwargs["text"] == ["<vision>describe"]
+        assert kwargs["videos"] is None
+        assert kwargs["return_tensors"] == "pt"
+        return {"input_ids": [[10, self.image_token_id, self.image_token_id, 11]]}
+
+
+def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
+    image_module = pytest.importorskip("PIL.Image")
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    image_path = dataset_dir / "image.png"
+    image_module.new("RGB", (2, 2), "red").save(image_path)
+    processor = _MockMultimodalProcessor()
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
+        }
+    ]
+
+    from flash.multimodal import normalize_image_source
+
+    prompt_ids = _processor_expanded_prompt_ids(
+        processor,
+        messages,
+        (normalize_image_source("dataset/image.png", tmp_path),),
+        str(tmp_path),
+        enable_thinking=False,
+    )
+
+    assert prompt_ids == (10, 151655, 151655, 11)
+    assert len(prompt_ids) > 3
+    assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
+    assert [image.size for image in processor.images] == [(2, 2)]
+
+
 class _BridgeTokenizer:
     eos_token_id = 99
 
@@ -258,8 +450,11 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                messages=[{"role": "user", "content": "question"}],
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
                 prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
             )
         ],
         tokenizer=_BridgeTokenizer(),
@@ -276,6 +471,137 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, [10, 12, 65, 99])
+
+
+class _ScoredImageTokens(list):
+    input_tokens = 17
+
+
+class _ImageBridgeTeacher:
+    def __init__(self):
+        self.items = None
+
+    def score_many_multimodal(self, items):
+        self.items = items
+        return [
+            _ScoredImageTokens(
+                [
+                    TeacherToken(text="A", logprob=-0.4, start=0, end=1),
+                    TeacherToken(text="B", logprob=-0.7, start=1, end=2),
+                ]
+            )
+        ]
+
+
+def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_echo(tmp_path):
+    image_module = pytest.importorskip("PIL.Image")
+    from flash.multimodal import image_descriptors_to_data_uris, normalize_image_source
+
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    red = dataset_dir / "red.png"
+    blue = dataset_dir / "blue.png"
+    image_module.new("RGB", (2, 2), "red").save(red)
+    image_module.new("RGB", (2, 2), "blue").save(blue)
+    descriptors = (
+        normalize_image_source("dataset/red.png", tmp_path),
+        normalize_image_source("dataset/blue.png", tmp_path),
+    )
+    teacher = _ImageBridgeTeacher()
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": " then "},
+                            {"type": "image"},
+                        ],
+                    }
+                ],
+                teacher_messages=[
+                    {"role": "user", "content": "<|media_pad|> then <|media_pad|>"}
+                ],
+                prompt_ids=(10, 11),
+                image_descriptors=descriptors,
+                package_root=str(tmp_path),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+
+    encoded = bridge.score(0, [10, 11, 65, 66, 99], image_count=2)
+
+    expected_uris = image_descriptors_to_data_uris(descriptors, tmp_path)
+    assert teacher.items == [
+        ("User: <|media_pad|> then <|media_pad|>\nAssistant: ", "AB", expected_uris)
+    ]
+    assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
+    assert bridge.teacher_input_tokens == 17
+
+
+def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": [{"type": "image"}]}],
+                teacher_messages=[{"role": "user", "content": "<|media_pad|>"}],
+                prompt_ids=(10, 11),
+                image_descriptors=("frozen-descriptor",),
+                package_root=None,
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=object(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+
+    with pytest.raises(ValueError, match=r"reported 0 image.*frozen prompt has 1"):
+        bridge.score(0, [10, 11, 65, 99], image_count=0)
+
+
+def test_prompt_pool_fingerprint_freezes_image_descriptor_order_and_preserves_text():
+    def fingerprint(descriptors):
+        return _prompt_pool_fingerprint(
+            [
+                _BridgePrompt(
+                    student_messages=[{"role": "user", "content": [{"type": "image"}]}],
+                    teacher_messages=[{"role": "user", "content": "<|media_pad|>"}],
+                    prompt_ids=(10, 11),
+                    image_descriptors=descriptors,
+                    package_root="/package",
+                )
+            ]
+        )
+
+    assert fingerprint(("red", "blue")) != fingerprint(("blue", "red"))
+
+    text_messages = [{"role": "user", "content": "question"}]
+    prompt = _BridgePrompt(
+        student_messages=text_messages,
+        teacher_messages=text_messages,
+        prompt_ids=(10, 11),
+        image_descriptors=(),
+        package_root=None,
+    )
+    payload = json.dumps(
+        [text_messages, [10, 11]],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    expected = hashlib.sha256(len(payload).to_bytes(8, "big") + payload).hexdigest()
+    assert _prompt_pool_fingerprint([prompt]) == expected
 
 
 def test_retry_sidecar_persists_real_accumulated_accounting(tmp_path):
@@ -319,8 +645,11 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                messages=[{"role": "user", "content": "question"}],
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
                 prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
             )
         ],
         tokenizer=_BridgeTokenizer(),
@@ -391,8 +720,11 @@ def test_bridge_returns_typed_teacher_failures_and_records_classification(
     bridge = _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                messages=[{"role": "user", "content": "question"}],
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
                 prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
             )
         ],
         tokenizer=_BridgeTokenizer(),
@@ -495,8 +827,42 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["distillation.n_gpus_per_node"] == "0"
     assert overrides["distillation.nnodes"] == "0"
     assert overrides["distillation.teacher_key"] == "index"
+    assert overrides["data.image_key"] == "images"
+    assert overrides["data.return_raw_chat"] == "true"
+    assert overrides["data.return_multi_modal_inputs"] == "false"
+    assert overrides["actor_rollout_ref.rollout.limit_images"] == "8"
     assert "actor.engine.ulysses_sequence_parallel_size" not in overrides
     assert "ref_log_prob" not in " ".join(overrides)
+
+
+def test_child_teacher_bridge_payload_sends_image_count_without_pixels():
+    pixel_marker = "raw-image-pixels-must-not-cross-localhost"
+    payload = _teacher_bridge_payload(
+        7,
+        [10, 11, 12],
+        {"images": [pixel_marker, pixel_marker], "videos": [pixel_marker]},
+    )
+
+    assert payload == {"index": 7, "sequence_ids": [10, 11, 12], "image_count": 2}
+    assert pixel_marker not in json.dumps(payload)
+    assert _multi_modal_image_count(None) == 0
+
+
+def test_image_token_suppression_is_gated_on_structured_image_blocks():
+    image_prompt = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": object()}, {"type": "text", "text": "x"}],
+        }
+    ]
+    assert _raw_prompt_has_image_block(image_prompt)
+    assert not _raw_prompt_has_image_block([{"role": "user", "content": "<image> text"}])
+    processor = SimpleNamespace(image_token_id=151655)
+    assert _resolve_image_token_id(processor, SimpleNamespace()) == 151655
+    fallback = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: 42 if token == "<|image_pad|>" else None
+    )
+    assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
 def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tmp_path):
@@ -552,12 +918,6 @@ def test_runner_rejects_multiturn_tool_flags_before_preparation():
     [
         (True, False, [], "multi-turn and tool-calling"),
         (False, True, [], "multi-turn and tool-calling"),
-        (
-            False,
-            False,
-            [{"input": [{"role": "user", "content": "look"}], "image": "image.png"}],
-            "multimodal OPD",
-        ),
     ],
 )
 def test_runner_environment_gate_rejects_before_provisioning(
@@ -594,6 +954,68 @@ def test_runner_environment_gate_rejects_before_provisioning(
     with pytest.raises(ValueError, match=message):
         lifecycle._preflight_opd_verl_environment(spec)
     assert calls == ["load"]
+
+
+def test_runner_environment_gate_accepts_supported_image_opd_with_kimi(monkeypatch):
+    from flash.envs import registry
+    from flash.runner import lifecycle
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    class FakeEnvironment:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"input": [{"role": "user", "content": "look"}], "image": "image.png"}]
+
+        def prompt_messages(self, record):
+            return record["input"]
+
+    monkeypatch.setattr(registry, "load_environment", lambda *_args, **_kwargs: FakeEnvironment())
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="local"),
+        train=TrainSpec(max_examples=1, teacher_model="kimi-k2.6"),
+    )
+
+    lifecycle._preflight_opd_verl_environment(spec)
+
+
+@pytest.mark.parametrize(
+    ("model", "teacher_model", "message"),
+    [
+        ("openbmb/MiniCPM5-1B", "kimi-k2.6", "does not support image-bearing"),
+        ("Qwen/Qwen3.5-4B", "glm-5.2", r"requires .*kimi-k2\.6"),
+    ],
+)
+def test_runner_environment_gate_rejects_unsupported_image_contract(
+    monkeypatch, model, teacher_model, message
+):
+    from flash.envs import registry
+    from flash.runner import lifecycle
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    class FakeEnvironment:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"input": [{"role": "user", "content": "look"}], "image": "image.png"}]
+
+        def prompt_messages(self, record):
+            return record["input"]
+
+    monkeypatch.setattr(registry, "load_environment", lambda *_args, **_kwargs: FakeEnvironment())
+    spec = JobSpec(
+        model=model,
+        algorithm="opd",
+        environment=EnvironmentSpec(id="local"),
+        train=TrainSpec(max_examples=1, teacher_model=teacher_model),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        lifecycle._preflight_opd_verl_environment(spec)
 
 
 def test_deterministic_seed_uses_every_rollout_identity_component():

@@ -44,7 +44,13 @@ def resolve_verl_python(workdir: str) -> str:
                 "verl==0.8.0",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
+                "qwen-vl-utils",
+                "torchvision",
             ],
+            check=True,
+        )
+        subprocess.run(
+            [py, "-c", "import qwen_vl_utils; import torchvision"],
             check=True,
         )
     return py
