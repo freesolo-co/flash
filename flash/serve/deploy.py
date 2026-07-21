@@ -695,10 +695,13 @@ def _wait_revision_ready(
             retry_after = exc.retry_after
             attempt += 1
             continue
+        # a read that only completes once the whole budget is spent was not confirmed ready in
+        # time; do not honor it, and leave last_state untouched so the timeout is reported.
+        if deadline - time.monotonic() <= 0:
+            break
         retry_after = response.headers.get("Retry-After")
         attempt += 1
-        # a record fetched within the deadline must be inspected for readiness before giving up; the
-        # top-of-loop and post-sleep deadline checks already prevent starting a NEW poll past it.
+        # a record fetched within the deadline is still inspected for readiness before giving up.
         if record is None:
             continue
         last_read_error = None
