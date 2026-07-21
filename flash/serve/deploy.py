@@ -24,7 +24,7 @@ from flash.serve.urls import openai_base_url, serving_control_url
 
 logger = get_logger(__name__)
 
-DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
+DEFAULT_FREESOLO_SERVING_URL = "https://serve.freesolo.co"
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
 REVISION_READY_BUDGET_SECONDS = 5 * 60.0
