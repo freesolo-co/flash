@@ -126,6 +126,6 @@ def test_help_page_is_ascii_locale_safe(monkeypatch) -> None:
         f"{cli.CLI_NAME} [--debug] [-v] <command> [args]",
         cli._HELP_GROUPS,
         cli._HELP_OPTIONS,
-        ["docs: https://freesolo.co/docs"],
+        ["docs: https://docs.freesolo.co"],
     )
     page.encode("ascii")  # raises if any non-ASCII glyph slipped through

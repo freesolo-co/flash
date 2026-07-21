@@ -162,7 +162,7 @@ class _FlashParser(_ThemedParser):
             f"train after publishing: `{CLI_NAME} env push --name my-env .`, "
             f"then `{CLI_NAME} train configs/sft.toml`",
             f"any command in depth: `{CLI_NAME} <command> --help`",
-            "docs: https://freesolo.co/docs",
+            "docs: https://docs.freesolo.co",
         ]
         return render.help_page(
             "managed LoRA post-training", usage, _HELP_GROUPS, _HELP_OPTIONS, footers
