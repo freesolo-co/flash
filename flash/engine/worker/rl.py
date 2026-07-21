@@ -396,9 +396,14 @@ def run_rl():
         sample_triples = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             is_message_completion = isinstance(comp, list)
+            # single-turn multimodal completions arrive as message lists but are converted to
+            # plain text below and scored like text, so they must still get the thinking-length
+            # penalty. only genuine multi-turn / tool-loop transcripts are scored as whole
+            # episodes (and are excluded from the per-completion thinking penalty).
+            scored_as_episode = is_message_completion and (is_multi_turn or is_tool_env)
             scoring_failed = False
             try:
-                if is_message_completion and (is_multi_turn or is_tool_env):
+                if scored_as_episode:
                     # multi-turn and native tool-loop transcripts are scored as complete episodes.
                     r = env.reward_from_messages(comp, ex)
                 else:
@@ -436,7 +441,7 @@ def run_rl():
                 r = 0.0
                 scoring_failed = True
             if (
-                not is_message_completion
+                not scored_as_episode
                 and not scoring_failed
                 and _think_penalty > 0
                 and _w.THINKING
