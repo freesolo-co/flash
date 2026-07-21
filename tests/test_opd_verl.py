@@ -239,9 +239,9 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
     group_ids = torch.tensor([[0, -1, -1], [-1, -1, -1], [2, 2, -1]])
     response_mask = torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
     assert _signal_sequences(group_ids, response_mask).tolist() == [True, False, True]
-    full_sequence_ids = torch.tensor([[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]).unsqueeze(
-        -1
-    )
+    full_sequence_ids = torch.tensor(
+        [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
+    ).unsqueeze(-1)
     assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
 
 
@@ -521,7 +521,9 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
                         ],
                     }
                 ],
-                teacher_messages=[{"role": "user", "content": "<|media_pad|> then <|media_pad|>"}],
+                teacher_messages=[
+                    {"role": "user", "content": "<|media_pad|> then <|media_pad|>"}
+                ],
                 prompt_ids=(10, 11),
                 image_descriptors=descriptors,
                 package_root=str(tmp_path),
@@ -811,9 +813,7 @@ def _config(**overrides):
 
 def test_overrides_match_verl_0_8_sync_distillation_contract():
     overrides = dict(value.split("=", 1) for value in build_opd_verl_overrides(_config()))
-    assert (
-        overrides["distillation._target_"] == "flash_opd_verl_plugin.FlashRemoteDistillationConfig"
-    )
+    assert overrides["distillation._target_"] == "flash_opd_verl_plugin.FlashRemoteDistillationConfig"
     assert overrides["distillation.distillation_loss.loss_mode"] == "flash_groupwise_reverse_kl"
     assert overrides["distillation.distillation_loss.use_policy_gradient"] == "false"
     assert overrides["distillation.distillation_loss.use_task_rewards"] == "false"
@@ -1021,18 +1021,15 @@ def test_runner_environment_gate_rejects_unsupported_image_contract(
 def test_deterministic_seed_uses_every_rollout_identity_component():
     baseline = deterministic_rollout_seed(42, 3, 7, 1)
     assert baseline == deterministic_rollout_seed(42, 3, 7, 1)
-    assert (
-        len(
-            {
-                baseline,
-                deterministic_rollout_seed(43, 3, 7, 1),
-                deterministic_rollout_seed(42, 4, 7, 1),
-                deterministic_rollout_seed(42, 3, 8, 1),
-                deterministic_rollout_seed(42, 3, 7, 2),
-            }
-        )
-        == 5
-    )
+    assert len(
+        {
+            baseline,
+            deterministic_rollout_seed(43, 3, 7, 1),
+            deterministic_rollout_seed(42, 4, 7, 1),
+            deterministic_rollout_seed(42, 3, 8, 1),
+            deterministic_rollout_seed(42, 3, 7, 2),
+        }
+    ) == 5
     assert 0 <= baseline < 2**63
 
 
@@ -1054,10 +1051,10 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     import flash.engine.worker.opd_verl_plugin as plugin
 
     source = inspect.getsource(plugin)
-    assert "@register_distillation_loss(" in source
+    assert '@register_distillation_loss(' in source
     assert 'names=["flash_groupwise_reverse_kl"]' in source
-    assert "main_ppo_sync.TaskRunner = FlashTaskRunner" in source
-    assert "resource_pool_spec = {" in source
+    assert 'main_ppo_sync.TaskRunner = FlashTaskRunner' in source
+    assert 'resource_pool_spec = {' in source
     assert '"global_pool"' in source
     assert "teacher_pool" not in source
     assert "Role.TeacherModel" not in source
