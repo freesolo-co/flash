@@ -174,8 +174,8 @@ def test_dynamic_microbatches_refresh_global_batch_info_and_match_flash_sequence
         }
         assert torch.allclose(actual, legacy, atol=1e-12, rtol=1e-12)
         assert torch.allclose(actual_gradient, legacy_gradient, atol=1e-12, rtol=1e-12)
-        observed.append(float(actual))
-        expected.append(float(legacy))
+        observed.append(float(actual.detach()))
+        expected.append(float(legacy.detach()))
 
     assert observed == pytest.approx(expected, abs=1e-12, rel=1e-12)
     assert len(steps[0]["student"]) != len(steps[1]["student"])
@@ -604,6 +604,21 @@ def test_worker_dispatch_and_multi_gpu_route_to_verl():
     assert worker.run_opd.__name__ == "run_opd_verl"
     assert "opd" in runner._MULTI_GPU_ALGORITHMS
     assert "run_verl_training" in inspect.getsource(worker.run_opd)
+
+
+def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
+    import inspect
+
+    import flash.engine.worker.opd_verl_plugin as plugin
+
+    source = inspect.getsource(plugin)
+    assert '@register_distillation_loss(' in source
+    assert 'names=["flash_groupwise_reverse_kl"]' in source
+    assert 'main_ppo_sync.TaskRunner = FlashTaskRunner' in source
+    assert 'resource_pool_spec = {' in source
+    assert '"global_pool"' in source
+    assert "teacher_pool" not in source
+    assert "Role.TeacherModel" not in source
 
 
 def test_plugin_identifiers_remain_provider_neutral():
