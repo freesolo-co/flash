@@ -10,13 +10,16 @@ from flash.engine.worker.opd import _gkd_loss_from_logps
 from flash.engine.worker.opd_verl import (
     _BridgePrompt,
     _build_opd_child_env,
+    _raise_verl_failure,
     _TeacherAlignmentBridge,
     build_opd_verl_overrides,
     encode_shifted_group_metadata,
 )
 from flash.engine.worker.opd_verl_plugin import (
+    FlashTeacherBridgeError,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
+    _post_json,
     _set_current_global_batch_info,
     _signal_sequences,
     deterministic_rollout_seed,
@@ -237,6 +240,63 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
         bridge.score(0, [10, 12, 65, 99])
+
+
+@pytest.mark.parametrize(
+    ("permanent", "classification"), [(True, "permanent"), (False, "transient")]
+)
+def test_bridge_returns_typed_teacher_failures_and_records_classification(
+    permanent, classification
+):
+    from flash.engine.worker.teacher import TeacherError
+
+    class FailingTeacher:
+        def score(self, _prompt_text, _completion_text):
+            raise TeacherError(f"{classification} teacher failure", permanent=permanent)
+
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=FailingTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError) as error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                {"index": 0, "sequence_ids": [10, 11, 65, 66, 99]},
+            )
+    finally:
+        bridge.close()
+
+    assert error.value.classification == classification
+    assert str(error.value) == f"{classification} teacher failure"
+    assert bridge.teacher_failure == (classification, f"{classification} teacher failure")
+    assert bridge.teacher_error == int(permanent)
+    assert bridge.teacher_transient == int(not permanent)
+    assert bridge.teacher_ok == 0
+
+
+def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
+    from flash.engine.worker.perf import RetriableInfraError
+
+    with pytest.raises(RuntimeError, match="permanent teacher failure"):
+        _raise_verl_failure(86, ("permanent", "bad credentials"))
+    with pytest.raises(RetriableInfraError, match="transient teacher failure"):
+        _raise_verl_failure(87, ("transient", "service unavailable"))
+    with pytest.raises(RuntimeError, match="subprocess exited with status 9"):
+        _raise_verl_failure(9, None)
 
 
 def _config(**overrides):

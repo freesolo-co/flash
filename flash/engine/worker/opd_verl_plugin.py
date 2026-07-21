@@ -13,9 +13,13 @@ import hashlib
 import importlib.util
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+_PERMANENT_TEACHER_EXIT = 86
+_TRANSIENT_TEACHER_EXIT = 87
 
 
 def deterministic_rollout_seed(
@@ -83,6 +87,12 @@ def _set_current_global_batch_info(config, data) -> None:
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
 
+class FlashTeacherBridgeError(RuntimeError):
+    def __init__(self, message: str, *, classification: str) -> None:
+        super().__init__(message)
+        self.classification = classification
+
+
 def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
     request = urllib.request.Request(
         url.rstrip("/") + path,
@@ -93,8 +103,24 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=600) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+            details = payload["error"]
+            classification = str(details["classification"])
+            message = str(details["message"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as decode_error:
+            raise RuntimeError(
+                f"flash OPD bridge returned unclassified HTTP {error.code}"
+            ) from decode_error
+        if classification not in {"permanent", "transient"}:
+            raise RuntimeError(
+                f"flash OPD bridge returned unknown teacher failure classification {classification!r}"
+            ) from error
+        raise FlashTeacherBridgeError(message, classification=classification) from error
 
 
 def _install_verl_extensions() -> None:
@@ -192,16 +218,24 @@ def _install_verl_extensions() -> None:
                 raise RuntimeError("flash OPD bridge does not accept child-side multimodal payloads")
             if routing_key is None:
                 raise RuntimeError("flash OPD bridge requires the indexed dataset row")
-            payload = await asyncio.to_thread(
-                _post_json,
-                self.bridge_url,
-                self.bridge_token,
-                "/score",
-                {
-                    "index": int(routing_key),
-                    "sequence_ids": [int(token_id) for token_id in sequence_ids],
-                },
-            )
+            try:
+                payload = await asyncio.to_thread(
+                    _post_json,
+                    self.bridge_url,
+                    self.bridge_token,
+                    "/score",
+                    {
+                        "index": int(routing_key),
+                        "sequence_ids": [int(token_id) for token_id in sequence_ids],
+                    },
+                )
+            except FlashTeacherBridgeError as error:
+                exit_code = (
+                    _PERMANENT_TEACHER_EXIT
+                    if error.classification == "permanent"
+                    else _TRANSIENT_TEACHER_EXIT
+                )
+                os._exit(exit_code)
             teacher_ids = torch.tensor(payload["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
             teacher_logprobs = torch.tensor(
                 payload["teacher_logprobs"], dtype=torch.float32

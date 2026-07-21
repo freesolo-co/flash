@@ -43,6 +43,7 @@ from flash.engine.worker.sft_verl import (
     _VerlCheckpointWatcher,
     _warmstart_adapter_path,
 )
+from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 from flash.engine.worker.verl_common import (
     latest_global_step_dir,
@@ -131,6 +132,24 @@ class _TeacherAlignmentBridge:
         self.empty_alignments = 0
         self.truncated_rollouts = 0
         self.coverage_sum = 0.0
+        self.teacher_ok = 0
+        self.teacher_transient = 0
+        self.teacher_error = 0
+        self._teacher_failure: tuple[str, str] | None = None
+
+    def _record_teacher_failure(self, classification: str, message: str) -> None:
+        with self._stats_lock:
+            if classification == "transient":
+                self.teacher_transient += 1
+            else:
+                self.teacher_error += 1
+            if self._teacher_failure is None or classification == "permanent":
+                self._teacher_failure = (classification, message)
+
+    @property
+    def teacher_failure(self) -> tuple[str, str] | None:
+        with self._stats_lock:
+            return self._teacher_failure
 
     def _empty(self, prompt_length: int, response_length: int) -> dict:
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
@@ -165,6 +184,8 @@ class _TeacherAlignmentBridge:
             return self._empty(len(prompt_ids), len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.messages, self.thinking_prefill)
         teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+        with self._stats_lock:
+            self.teacher_ok += 1
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer, kept_ids, completion_text
         )
@@ -197,11 +218,18 @@ class _TeacherAlignmentBridge:
             def log_message(self, *_args):
                 return
 
+            def _send_json(self, status: int, payload: dict) -> None:
+                encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
             def do_POST(self):
                 try:
                     if self.headers.get("Authorization") != f"Bearer {bridge.token}":
-                        self.send_error(403)
-                        return
+                        raise PermissionError("flash OPD bridge authorization failed")
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                     if self.path == "/score":
@@ -210,21 +238,24 @@ class _TeacherAlignmentBridge:
                         bridge.notify_mutation()
                         result = {"ok": True}
                     else:
-                        self.send_error(404)
-                        return
-                    encoded = json.dumps(result, separators=(",", ":")).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(encoded)))
-                    self.end_headers()
-                    self.wfile.write(encoded)
+                        raise ValueError("flash OPD bridge path is unknown")
+                    self._send_json(200, result)
                 except Exception as error:
-                    encoded = json.dumps({"error": str(error)}).encode("utf-8")
-                    self.send_response(500)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(encoded)))
-                    self.end_headers()
-                    self.wfile.write(encoded)
+                    classification = (
+                        "transient"
+                        if isinstance(error, TeacherError) and not error.permanent
+                        else "permanent"
+                    )
+                    bridge._record_teacher_failure(classification, str(error))
+                    self._send_json(
+                        503 if classification == "transient" else 422,
+                        {
+                            "error": {
+                                "classification": classification,
+                                "message": str(error),
+                            }
+                        },
+                    )
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -395,6 +426,21 @@ def _metric_value(line: str, name: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _raise_verl_failure(
+    return_code: int, teacher_failure: tuple[str, str] | None
+) -> None:
+    if return_code == 0:
+        return
+    if teacher_failure is not None:
+        classification, message = teacher_failure
+        if classification == "transient":
+            raise _w.RetriableInfraError(
+                f"transient teacher failure after bounded retries: {message}"
+            )
+        raise RuntimeError(f"permanent teacher failure: {message}")
+    raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
 
 
 def _find_checkpoint_file(checkpoint_dir: str, needles: tuple[str, ...]) -> str | None:
@@ -819,8 +865,7 @@ def run_opd_verl(spec=None) -> None:
                 watcher.stop(require_complete=return_code == 0)
         train_wall = time.time() - train_started_at
         peak_gpu_gb = gpu_sampler.stop_gb()
-        if return_code != 0:
-            raise RuntimeError(f"verl OPD subprocess exited with status {return_code}")
+        _raise_verl_failure(return_code, bridge.teacher_failure)
 
         actor_dir, final_step = latest_global_step_dir(local_dir)
         if final_step < update_horizon:
