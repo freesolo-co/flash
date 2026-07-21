@@ -14,6 +14,13 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    # peft writes adapter_model.safetensors, so a full /dev/shm during the weight write surfaces as
+    # SafetensorError (an OSError sibling, not subclass). ships with peft in real runs; keep optional.
+    from safetensors import SafetensorError
+except ImportError:  # pragma: no cover
+    SafetensorError = ()
+
 _ADAPTER_TMPFS_ROOT = "/dev/shm"
 
 
@@ -414,9 +421,10 @@ class OpdVllmRolloutEngine:
         next_version = self._version + 1
         try:
             staging_dir = self._save_adapter_staging(model, next_version)
-        except OSError as exc:
-            # only I/O failures mean tmpfs is unavailable (matching _make_adapter_root); a non-I/O
-            # error from save_pretrained must propagate, not permanently abandon tmpfs.
+        except (OSError, SafetensorError) as exc:
+            # I/O failures mean tmpfs is unavailable (matching _make_adapter_root). safetensors raises
+            # SafetensorError (not OSError) on a full /dev/shm during the weight write, so catch it too;
+            # a genuine non-I/O failure re-raises from the filesystem retry below rather than being lost.
             if not self._adapter_root_is_tmpfs:
                 raise
             self.adapter_root = tempfile.mkdtemp(prefix="flash_opd_vllm_lora_")
