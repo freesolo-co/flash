@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import urllib.request
 
 import pytest
@@ -200,5 +201,28 @@ def test_reward_server_round_trip():
         with urllib.request.urlopen(req, timeout=10) as r:
             got = json.loads(r.read().decode())
         assert got["score"] == 7.0  # 3 + len("abcd")
+    finally:
+        server.shutdown()
+
+
+def test_reward_server_scorer_can_capture_samples():
+    # the #607 per-step dump relies on the scoring closure capturing recent completions; verify the
+    # reward-server -> scorer -> rolling-buffer path populates in order.
+    captured: list = []
+    lock = threading.Lock()
+
+    def scorer(idx, sol):
+        with lock:
+            captured.append((sol, float(len(sol))))
+            del captured[:-64]
+        return float(len(sol))
+
+    server, url = rl_verl.start_reward_server(scorer)
+    try:
+        for i in range(3):
+            body = json.dumps({"index": i, "solution_str": f"c{i}"}).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+        assert [c[0] for c in captured] == ["c0", "c1", "c2"]
     finally:
         server.shutdown()

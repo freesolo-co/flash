@@ -587,15 +587,24 @@ def run_rl_verl():
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring.
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
+    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
+    # to the flash log, matching the trl path's #607 per-step completion dump.
+    recent_samples: list[tuple[str, float]] = []
+    _samples_lock = threading.Lock()
+
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
-        return score_single_turn(
+        score = score_single_turn(
             env, solution_str, ex,
             tok=tok, thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
         )
+        with _samples_lock:
+            recent_samples.append((solution_str, score))
+            del recent_samples[:-64]
+        return score
 
     server, reward_url = start_reward_server(_score)
     try:
@@ -644,6 +653,7 @@ def run_rl_verl():
         loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
         loss_curve: list[float] = []
+        last_dump_step = [-1]
         with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
@@ -654,6 +664,17 @@ def run_rl_verl():
                 m = step_re.search(line)
                 if m:
                     step_box[0] = int(m.group(1))
+                    # dump one sample completion per new step to the flash log (matches trl #607).
+                    if step_box[0] != last_dump_step[0]:
+                        last_dump_step[0] = step_box[0]
+                        with _samples_lock:
+                            samp = recent_samples[-1] if recent_samples else None
+                        if samp:
+                            preview = " ".join(samp[0][:300].split())
+                            print(
+                                f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                flush=True,
+                            )
                 # capture verl's per-step reward + policy loss for train_meta observability parity.
                 for pat, sink in ((reward_re, reward_history), (loss_re, loss_curve)):
                     hit = pat.search(line)
