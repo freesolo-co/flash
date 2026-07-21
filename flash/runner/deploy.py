@@ -1048,6 +1048,24 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             ):
                 print(f"attach: {run_id} adopted completed RunPod work", file=log)
                 return status_for_return()
+            if completed_metrics is not None:
+                # the job completed but adoption transiently failed (e.g. a cleanup-remote CAS
+                # lost); never tear down completed work -- defer to background reconciliation,
+                # which retries adoption until the deadline like _reconcile_attached_remote.
+                _schedule_attach_reconciliation(
+                    run_id,
+                    persisted_remote,
+                    worker_spec,
+                    next_attempt,
+                    code_prefix,
+                    log,
+                    failure,
+                )
+                print(
+                    f"attach: {run_id} completed RunPod work; deferring adoption to reconciliation",
+                    file=log,
+                )
+                return status_for_return()
             try:
                 resource_deleted = _strict_teardown_handle(handle, run_id)
                 worker_gone = True
