@@ -556,19 +556,18 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     from flash.engine.worker import sft
 
     src = inspect.getsource(sft.run_sft)
-    # The {input_ids, completion_mask} representation is built by the extracted pre-tokenizer; inspect
-    # it for the boundary/representation, and run_sft for the wiring + surviving optimizations.
-    pre_src = inspect.getsource(sft._pretokenize_completion_only)
+    prep_src = inspect.getsource(sft._render_tokenize_sft_batch)
+    output_src = inspect.getsource(sft._prepare_sft_examples)
 
-    # completion-only loss is ON (and the old `False` literal for that key is gone)
+    # completion-only loss is on and the old false literal for that key is gone
     assert '"completion_only_loss": True' in src
     assert '"completion_only_loss": False' not in src
-    # the prompt boundary + pre-tokenized {input_ids, completion_mask} representation lives in the
-    # helper; run_sft consumes it and turns it into the dataset
-    assert "completion_mask_from_ids(" in pre_src
-    assert '"completion_mask":' in pre_src
-    assert "tokenize_for_packing(" in pre_src  # EOS-append parity tokenization
-    assert "_pretokenize_completion_only(" in src
+    # the parallel prep path preserves the prompt boundary and pre-tokenized representation
+    assert "completion_mask_from_ids(" in prep_src
+    assert '"completion_mask":' in prep_src
+    assert "tokenize_for_packing(" in prep_src
+    assert '"completion_mask": row["completion_mask"]' in output_src
+    assert "_prepare_sft_examples(" in src
     assert "Dataset.from_list(_pretok)" in src
     # both flash custom-packing paths thread the completion mask through the packer
     assert src.count("pack_token_ids(_ids, sft_max_len, completion_masks=_cmask)") == 2
@@ -580,7 +579,7 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "emit_varlen=True" in src  # GDN varlen
     assert "model_is_pure_attention" in src
     assert "gdn_packing_available" in src
-    # (tokenize_for_packing now lives in _pretokenize_completion_only, asserted via pre_src above)
+    # tokenize_for_packing stays in the parallel prep path asserted above
     # chalk standalone RMSNorm/SwiGLU/RoPE; flce is OFF on the trl SFT path (returns logits=None, which
     # trl's SFTTrainer.compute_loss can't consume) — so SFT materialises logits and is sized UNFUSED
     # (_sft_fused = False) up front, no post-init batch/grad-accum fixup.
@@ -601,10 +600,9 @@ def test_run_sft_completion_only_loss_wired_without_dropping_optimizations():
     assert "_sft_vocab = resolve_vocab_size(model_id, model_revision)" in src
     assert "vocab=_sft_vocab" in src
     assert "vocab_size_for(model_id)" not in src
-    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. The GC decision now runs through
-    # the SFT GC-off gate (grad_checkpointing_on(model_id, sft_max_len, allow_disable=True, ...)) and is
-    # wired in via the _grad_ckpt result — still on by default, droppable only when the GC-off peak fits.
-    assert "grad_checkpointing_on(\n        model_id,\n        sft_max_len," in src
+    # gradient checkpointing (non-reentrant) + 8-bit paged optimizer. the gc decision uses the safe
+    # realized maximum after packing, not the configured cap, and remains conservative on unknown memory.
+    assert "grad_checkpointing_on(\n        model_id,\n        _runtime_max_len," in src
     assert '"gradient_checkpointing": _grad_ckpt' in src
     # Reentrant recompute for MoE / GatedDeltaNet (same rule as GRPO's rl.py, #429/#432): those
     # architectures re-dispatch tokens / lay out saved tensors differently on recompute, so
@@ -618,32 +616,18 @@ def test_bfd_packing_rederives_grad_accum_to_keep_effective_batch():
     the effective batch stays in EXAMPLES — otherwise bfd bins ~ex_per_block examples per row and
     inflates the effective batch ~ex_per_block-fold (undertraining). The SDPA/GDN packing paths
     already do this; pin that the bfd path does too, AFTER the packing-finalization block."""
-    import ast
     import inspect
 
     from flash.engine.worker import sft
 
     src = inspect.getsource(sft.run_sft)
-    # The re-derivation is guarded on packing still being ON post-finalization and uses a bfd ex/block
-    # estimate (a separate pack_token_ids call from the two SDPA/GDN ones).
-    assert "pack_token_ids(_bfd_ids, sft_max_len)" in src
-    assert "[sft] bfd packing:" in src
-    tree = ast.parse(src)
-
-    # The bfd-rederive block assigns cfg_kwargs["gradient_accumulation_steps"] guarded by a
-    # cfg_kwargs.get("packing") test — assert such a guarded assignment exists.
-    def _stores_grad_accum(node):
-        return any(
-            isinstance(sub, ast.Subscript)
-            and isinstance(sub.ctx, ast.Store)
-            and "gradient_accumulation_steps" in ast.dump(sub)
-            for sub in ast.walk(node)
-        )
-
-    assert any(
-        isinstance(node, ast.If) and "packing" in ast.dump(node.test) and _stores_grad_accum(node)
-        for node in ast.walk(tree)
-    ), "bfd path must re-derive gradient_accumulation_steps under a packing guard"
+    # the shared packed-path re-derivation uses the bfd ex/block estimate after backend selection.
+    assert "_bfd_preview = pack_dataset(" in src
+    assert 'strategy="bfd"' in src
+    assert 'f"[sft] {_packing_kind} packing:' in src
+    assert "if _packed_examples_per_block is not None:" in src
+    assert "per_device_bs * _packed_examples_per_block" in src
+    assert 'cfg_kwargs["gradient_accumulation_steps"] = grad_accum' in src
 
 
 def test_trl_collator_masks_prompt_from_pretokenized_rows():

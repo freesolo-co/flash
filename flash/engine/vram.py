@@ -30,6 +30,8 @@ _SFT_PER_DEVICE_BS_DEFAULT = 4
 _VOCAB_DEFAULT = 248_320
 _OPD_TRAINING_RESERVE_MULTIPLIER = 1.15
 _OPD_ALLOCATOR_MARGIN_MAX_GB = 6.0
+OPD_CE_CHUNK_SIZE = 64
+_OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
 
 def _sft_per_device_bs() -> int:
@@ -115,7 +117,7 @@ def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> i
 
 
 def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
-    """Loss microbatch size used by OPD's dense-logit GKD backward.
+    """Loss microbatch size used by OPD's GKD backward.
 
     Keep this in lockstep with worker.opd._opd_loss_microbatch_size without importing the worker from
     the sizing path. Small/medium catalog models run up to four loss samples per forward; 35B-class
@@ -441,34 +443,18 @@ def estimate_vram_gb(
         rollout = weights + max(
             _KV_CAP, _resident_kv_gb(eff_b, seq_len, rollout_concurrency, fp8_kv=fp8_kv)
         )
-        # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
-        # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
-        # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
-        # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
-        # sized for an under-capacity card and OOM.
-        #
-        # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
-        # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
-        # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
-        # keep the runtime reserve and the allocator's total estimate on the same loss-peak model.
-        training_reserve = opd_training_reserve_gb(
-            params_b,
-            seq_len,
-            max_tokens=max_tokens,
-            prompts_per_step=batch_size,
-            group_size=group_size,
-            thinking=thinking,
-            vocab=vocab,
-            active_params_b=active_params_b,
-        )
-        post_init_reserve = opd_post_init_reserve_gb(params_b, lora_rank)
-        return (
-            base
-            + rollout
-            + training_reserve
-            + post_init_reserve
-            + _OPD_ALLOCATOR_MARGIN_MAX_GB
-        )
+        # text opd projects only completion-prediction hidden states and computes exact full-vocabulary
+        # ce in checkpointed chunks. image samples still use the dense full-sequence logits path and are
+        # processed one at a time. allocation does not know the dataset modality, so reserve the larger
+        # of one text ce chunk and one dense image loss forward/backward peak.
+        completion = opd_completion_len(max_tokens, thinking)
+        loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
+        activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
+        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
+        chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+        dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
+        logits = max(chunked_logits, dense_image_logits)
+        return base + rollout + activations + logits
     # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
     # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
     # comparisons; the default must mirror the worker.
@@ -755,9 +741,7 @@ def model_required_vram_gb(
             fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
         )
-        # opd carries explicit loss-peak, post-init, and allocator reserves in the estimate itself;
-        # applying the generic multiplier again would double-count safety margin and reject fitting b200s.
-        return math.ceil(est if (algorithm or "").lower() == "opd" else est * headroom)
+        return math.ceil(est * headroom)
 
     def _opd_fp8_adjust(
         need: int,

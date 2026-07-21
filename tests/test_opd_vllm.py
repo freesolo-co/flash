@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -871,6 +873,146 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
     monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
     return _SamplingParams, _StructuredOutputsParams
+
+
+def test_opd_vllm_sync_atomically_publishes_before_dropping_old_adapter(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    events = []
+
+    class _Model:
+        def save_pretrained(self, path):
+            events.append(("save", os.path.basename(path)))
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    events.clear()
+
+    real_replace = opd_vllm.os.replace
+
+    def _replace(source, destination):
+        real_replace(source, destination)
+        events.append(("replace", os.path.basename(destination)))
+
+    def _remove(old_lora_id):
+        events.append(
+            (
+                "remove",
+                old_lora_id,
+                engine._lora_request.lora_int_id,
+                Path(engine._lora_request.lora_path, "adapter_config.json").is_file(),
+            )
+        )
+        return True
+
+    monkeypatch.setattr(opd_vllm.os, "replace", _replace)
+    monkeypatch.setattr(engine, "_remove_lora", _remove)
+
+    engine.sync_from_model(_Model())
+
+    assert events[0][0] == "save"
+    assert events[0][1].startswith(".adapter-000002-")
+    assert events[1] == ("replace", "adapter-000002")
+    assert events[2] == ("remove", 1, 2, True)
+    assert engine.sync_count == 2
+    assert engine._sync_dirs == [str(tmp_path / "sync" / "adapter-000002")]
+    assert not any(path.name.startswith(".adapter-") for path in (tmp_path / "sync").iterdir())
+
+
+def test_opd_vllm_sync_replaces_stale_version_directory(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    adapter_root = tmp_path / "sync"
+    stale_dir = adapter_root / "adapter-000001"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+    class _Model:
+        def save_pretrained(self, path):
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        adapter_root=str(adapter_root),
+    )
+    engine.sync_from_model(_Model())
+
+    assert engine.sync_count == 1
+    assert not (stale_dir / "stale.txt").exists()
+    assert (stale_dir / "adapter_config.json").is_file()
+
+
+def test_opd_vllm_adapter_store_prefers_tmpfs(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    expected = tmp_path / "memory-backed"
+    seen = []
+
+    def _mkdtemp(*, prefix, dir=None):
+        seen.append((prefix, dir))
+        return str(expected)
+
+    monkeypatch.setattr(opd_vllm.tempfile, "mkdtemp", _mkdtemp)
+
+    assert opd_vllm._make_adapter_root() == (str(expected), True)
+    assert seen == [("flash_opd_vllm_lora_", opd_vllm._ADAPTER_TMPFS_ROOT)]
+
+
+def test_opd_vllm_adapter_store_falls_back_when_tmpfs_save_fails(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    tmpfs_root = tmp_path / "tmpfs"
+    tmpfs_root.mkdir()
+    fallback_parent = tmp_path / "fallback"
+    fallback_parent.mkdir()
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _mkdtemp(*, prefix, dir=None):
+        if dir is None:
+            dir = fallback_parent
+        return real_mkdtemp(prefix=prefix, dir=dir)
+
+    saved = []
+
+    class _Model:
+        def save_pretrained(self, path):
+            saved.append(path)
+            if Path(path).parent == tmpfs_root:
+                raise OSError("tmpfs full")
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(opd_vllm, "_make_adapter_root", lambda: (str(tmpfs_root), True))
+    monkeypatch.setattr(opd_vllm.tempfile, "mkdtemp", _mkdtemp)
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+    )
+    engine.sync_from_model(_Model())
+
+    assert len(saved) == 2
+    assert Path(saved[0]).parent == tmpfs_root
+    assert Path(engine.adapter_root).parent == fallback_parent
+    assert Path(saved[1]).parent == Path(engine.adapter_root)
+    assert Path(engine._lora_request.lora_path, "adapter_config.json").is_file()
+    assert engine.sync_count == 1
+    assert engine._adapter_root_is_tmpfs is False
 
 
 def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypatch, tmp_path):

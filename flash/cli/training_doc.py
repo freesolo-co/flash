@@ -109,6 +109,8 @@ epochs = 1                  # one pass over the retained train rows
 max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
+# multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
+# credit_assignment = "per_episode"
 lora_rank = 32
 lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
@@ -275,13 +277,16 @@ spending another GPU run:
 - **Judge the trend, not a single number.** The proof of training is the curve:
   loss falling (SFT) or `reward` rising over steps (GRPO). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
-- **Read the model's outputs, not just the metrics.** A rising reward can come from
-  reward-hacking or a degenerate output the reward still credits — metrics alone never
-  establish that the model got better. Flash does not expose training-time rollouts
-  through the CLI (`flash log` gives you the metric trend and the worker's console/error
-  logs, not the sampled generations), so to read real outputs **deploy the adapter and
-  probe it**: `flash deploy <run-id>` then `flash chat <run-id> -m "..."` on at least a
-  few real inputs, including ones it should get wrong.
+- **Read the model's outputs, not just the metrics.** A rising reward (or falling loss)
+  can come from reward-hacking or a degenerate output the metric still credits — metrics
+  alone never establish that the model got better. For GRPO and OPD, `flash log` surfaces a
+  handful of full (untruncated) sample completions at the heartbeat cadence — GRPO shows
+  each completion's reward, OPD its distillation loss — with the first sample-bearing update
+  forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
+  step 1-2. These are bounded diagnostics, not every rollout or a held-out
+  evaluation, so still **deploy the adapter and probe it**: `flash deploy <run-id>` then
+  `flash chat <run-id> -m "..."` on at least a few real inputs, including ones it should
+  get wrong.
 
   ```bash
   flash status <run-id>            # state + accrued cost
@@ -339,10 +344,12 @@ def score_response(self, example, response_text) -> RewardResult:
     )
 ```
 
-`score` is what GRPO optimizes (it becomes the run's `total`). Each `RewardMetric` you
-attach is logged by name in the per-scorer breakdown — that is how the clean success
-rate becomes visible. Use the shaped `score` to confirm the model is learning *at all*,
-and judge the run on the explicit `success` metric.
+`score` is what GRPO optimizes (it becomes the run's `total`). In standard (single-turn)
+GRPO, each `RewardMetric` is averaged across scored completions and logged by name at
+the managed heartbeat cadence, which is not guaranteed to be every optimizer step. That
+is how the clean success rate becomes visible. Multi-turn scoring currently reports only
+the scalar reward. Use the shaped `score` to confirm the model is learning *at all*, and
+judge the run on the explicit `success` metric.
 
 When `thinking = true`, score the final answer unless you intentionally need the
 reasoning trace. Flash passes a string-compatible response object to `score_response`;
@@ -550,10 +557,9 @@ every run, the last two matter more the smaller the model:
   frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
   enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
   over-sharpening only compounds over many steps.
-- **Diagnose it in-band.** Watch the per-step **mean completion entropy** in the run's telemetry — a
-  steady decline toward zero is the collapse happening. Confirm at serving by evaluating at
-  **temperature=0** and flagging `finish_reason=length` completions that never emit your answer token,
-  and compare an early checkpoint against the final one to watch the loop emerge over steps.
+- **Diagnose it at serving.** Evaluate at **temperature=0** and flag
+  `finish_reason=length` completions that never emit your answer token. Compare an early checkpoint
+  against the final one to watch the loop emerge over steps.
 
 ### Distilling from base with no format anchor
 

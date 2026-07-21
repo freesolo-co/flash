@@ -14,8 +14,8 @@ from flash.providers.allocator import required_vram_gb, vram_headroom
 from .facts import (
     active_params_b,
     download_weight_gb,
+    effective_train_tflops,
     gpu_hourly_usd,
-    gpu_tflops,
     gpu_vram_gb,
     model_quant,
     pick_gpu,
@@ -150,7 +150,7 @@ def compile_seconds(config: RunConfig, gpu: str) -> float:
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
-    peak = gpu_tflops(gpu) * 1e12  # FLOP/s
+    peak = effective_train_tflops(gpu) * 1e12  # FLOP/s (realized training throughput; see facts)
     # An MoE's per-step wall scales with TOTAL params (routing + all-expert coordination + grouped
     # GEMM under-utilization), not the tiny active-param FLOPs; dense models keep active (== total).
     moe = _is_moe(n.model_id)
@@ -198,7 +198,7 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     moe = _is_moe(n.model_id)
     params = (total_params_b(n.model_id) if moe else active_params_b(n.model_id)) * 1e9
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
-    peak = gpu_tflops(gpu) * 1e12
+    peak = effective_train_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
     return flops / (peak * mfu)
 

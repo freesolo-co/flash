@@ -1,12 +1,44 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
+import multiprocessing
+import os
+import shutil
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from flash.server import db
+
+
+def _initialize_fresh_database_process(path: str, barrier, results) -> None:
+    from flash.server import db as process_db
+
+    real_connect = sqlite3.connect
+    synchronized = False
+
+    class SynchronizedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal synchronized
+            if sql == "PRAGMA journal_mode=WAL" and not synchronized:
+                synchronized = True
+                barrier.wait(timeout=10)
+            return super().execute(sql, parameters)
+
+    def synchronized_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=SynchronizedConnection)
+
+    process_db.DB_PATH = path
+    process_db.sqlite3.connect = synchronized_connect
+    try:
+        row = process_db.ensure_external_key(f"fslo_process_{os.getpid()}")
+        results.put(None if row is not None else "key provisioning returned no row")
+    except BaseException as exc:
+        results.put(repr(exc))
 
 
 @pytest.fixture
@@ -108,6 +140,212 @@ def test_lookup_key_updates_last_used_at_in_database(isolated_db, monkeypatch) -
             "SELECT last_used_at FROM api_keys WHERE id = ?", (row["id"],)
         ).fetchone()[0]
     assert last_used_at == 1234.0
+
+
+def test_schema_is_initialized_once_across_many_requests(isolated_db, monkeypatch) -> None:
+    executescript_calls = 0
+    journal_mode_calls = 0
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def executescript(self, sql_script):
+            nonlocal executescript_calls
+            executescript_calls += 1
+            return super().executescript(sql_script)
+
+        def execute(self, sql, parameters=()):
+            nonlocal journal_mode_calls
+            if sql == "PRAGMA journal_mode=WAL":
+                journal_mode_calls += 1
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+
+    for _ in range(20):
+        assert isolated_db.ensure_external_key("fslo_repeated") is not None
+
+    assert executescript_calls == 1
+    assert journal_mode_calls == 1
+
+
+@pytest.mark.parametrize("remove_parent", [False, True])
+def test_deleted_database_reinitializes_schema_and_replaces_pooled_connection(
+    isolated_db, remove_parent
+) -> None:
+    assert isolated_db.ensure_external_key("fslo_before_delete") is not None
+    old_connection = isolated_db._connect()
+    path = isolated_db.db_path()
+
+    if remove_parent:
+        shutil.rmtree(os.path.dirname(path))
+    else:
+        for candidate in (path, f"{path}-wal", f"{path}-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(candidate)
+
+    assert isolated_db.ensure_external_key("fslo_after_delete") is not None
+    new_connection = isolated_db._connect()
+
+    assert new_connection is not old_connection
+    with pytest.raises(sqlite3.ProgrammingError):
+        old_connection.execute("SELECT 1")
+    tables = {
+        row[0]
+        for row in new_connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert {"api_keys", "runs"} <= tables
+
+
+def test_schema_init_closes_locked_connection_before_backoff(isolated_db, monkeypatch) -> None:
+    real_connect = sqlite3.connect
+    failed_connections = []
+    sleeps = []
+
+    class LockedConnection(sqlite3.Connection):
+        closed = False
+
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA journal_mode=WAL":
+                raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, parameters)
+
+        def close(self):
+            self.closed = True
+            return super().close()
+
+    def tracking_connect(*args, **kwargs):
+        if not failed_connections:
+            connection = real_connect(*args, **kwargs, factory=LockedConnection)
+            failed_connections.append(connection)
+            return connection
+        return real_connect(*args, **kwargs)
+
+    def record_sleep(delay):
+        assert failed_connections[0].closed is True
+        sleeps.append(delay)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(isolated_db.time, "sleep", record_sleep)
+
+    assert isolated_db.ensure_external_key("fslo_retry_after_close") is not None
+    assert sleeps == [0.01]
+
+
+def test_fresh_database_initialization_retries_process_lock_contention(tmp_path) -> None:
+    context = multiprocessing.get_context("spawn")
+    process_count = 12
+    barrier = context.Barrier(process_count)
+    results = context.Queue()
+    path = str(tmp_path / "state" / "server.db")
+    processes = [
+        context.Process(
+            target=_initialize_fresh_database_process,
+            args=(path, barrier, results),
+        )
+        for _ in range(process_count)
+    ]
+
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=45)
+        assert all(not process.is_alive() for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    errors = [results.get(timeout=5) for _ in processes]
+    assert errors == [None] * process_count
+
+
+def test_connection_is_reused_per_thread(isolated_db) -> None:
+    main_connection = isolated_db._connect()
+    assert isolated_db._connect() is main_connection
+
+    barrier = threading.Barrier(3)
+    thread_connections = []
+
+    def connect_twice() -> None:
+        first = isolated_db._connect()
+        second = isolated_db._connect()
+        thread_connections.append((first, second))
+        barrier.wait(timeout=5)
+        barrier.wait(timeout=5)
+
+    threads = [threading.Thread(target=connect_twice) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+
+    barrier.wait(timeout=5)
+    assert len(thread_connections) == 2
+    assert all(first is second for first, second in thread_connections)
+    assert thread_connections[0][0] is not thread_connections[1][0]
+    assert all(first is not main_connection for first, _ in thread_connections)
+    barrier.wait(timeout=5)
+
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_last_used_at_writes_are_throttled(isolated_db, monkeypatch) -> None:
+    update_calls = 0
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal update_calls
+            if sql.startswith("UPDATE api_keys SET last_used_at"):
+                update_calls += 1
+            return super().execute(sql, parameters)
+
+    def tracking_connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", tracking_connect)
+    times = iter([1000.0, 1001.0, 1010.0, 1050.0, 1062.0])
+    monkeypatch.setattr(isolated_db.time, "time", lambda: next(times))
+
+    row = isolated_db.ensure_external_key("fslo_throttled")
+    assert row is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+    assert isolated_db.lookup_key("fslo_throttled") is not None
+
+    with real_connect(isolated_db.db_path()) as conn:
+        last_used_at = conn.execute(
+            "SELECT last_used_at FROM api_keys WHERE id = ?", (row["id"],)
+        ).fetchone()[0]
+    assert update_calls == 2
+    assert last_used_at == 1062.0
+
+
+def test_concurrent_threads_preserve_basic_read_write_correctness(isolated_db) -> None:
+    barrier = threading.Barrier(2)
+
+    def create_owned_run(index: int) -> tuple[int, int | None]:
+        barrier.wait()
+        row = isolated_db.ensure_external_key(f"fslo_thread_{index}")
+        assert row is not None
+        isolated_db.record_run(f"run-thread-{index}", row["id"])
+        return row["id"], isolated_db.run_owner(f"run-thread-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create_owned_run, range(2)))
+
+    assert all(key_id == owner_id for key_id, owner_id in results)
+    assert {row["run_id"] for row in isolated_db.all_runs()} == {
+        "run-thread-0",
+        "run-thread-1",
+    }
 
 
 def test_run_ownership_lists_in_creation_order_and_delete_is_idempotent(

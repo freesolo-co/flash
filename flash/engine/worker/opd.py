@@ -46,7 +46,7 @@ from flash.engine.structured_outputs import (
     parse_structured_outputs,
     reasoning_parser_for,
 )
-from flash.engine.vram import opd_completion_len
+from flash.engine.vram import OPD_CE_CHUNK_SIZE, opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.hf import RequiredSaveError, _deployable_adapter_on_hf
@@ -86,6 +86,7 @@ from flash.engine.worker.rng import (
     rollout_request_seed,
     seed_training_rngs,
 )
+from flash.engine.worker.rollout_samples import select_rollout_samples
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 from flash.opd_retry_contract import (
@@ -590,6 +591,7 @@ def run_opd():
             _scanned += 1
     multimodal = any(has_images for _ex, _messages, has_images in message_rows)
     if multimodal:
+        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
         from flash.multimodal import validate_image_opd_teacher
 
         try:
@@ -617,7 +619,6 @@ def run_opd():
     if multimodal:
         from transformers import AutoProcessor
 
-        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
         processor = AutoProcessor.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -1118,6 +1119,12 @@ def run_opd():
                 step_cov = 0.0
                 nseq = 0
                 step_skip_counts: Counter[str] = Counter()
+                # Distilled (prompt_messages, completion_text, loss) captured this attempt so the
+                # post-update opd_step heartbeat can surface a few student completions in `flash log`
+                # (parity with GRPO's reward samples). Reset per attempt so a resampled rollout does
+                # not carry the discarded attempt's completions. Loss is stored as a plain float, never
+                # the graph-holding tensor.
+                step_samples: list[tuple[object, str, float]] = []
                 # Step pipeline. vLLM produces on-policy rollouts, scorable completions are immediately
                 # handed to the resident teacher pool, and completed teacher futures are converted into
                 # differentiable GKD losses as soon as they finish. This preserves one optimizer update
@@ -1175,6 +1182,7 @@ def run_opd():
                     *,
                     _teacher_futures: dict[Future, list[_Pending]] = teacher_futures,
                     _accum_target=accum_target,
+                    _step_samples: list = step_samples,
                 ) -> None:
                     batch = _teacher_futures.pop(fut)
                     try:
@@ -1215,7 +1223,14 @@ def run_opd():
                         loss_microbatch_size,
                         backward_scale=1.0 / _accum_target,
                     )
-                    for r in resolved:
+                    # resolved is index-aligned with scored_samples (built from batch in order), so
+                    # each _Pending pairs with its SampleResult. Capture the completion text + loss of
+                    # distilled samples (loss is not None) for the step's heartbeat diagnostics.
+                    for p, r in zip(batch, resolved, strict=True):
+                        if r.loss is not None:
+                            _step_samples.append(
+                                (p.prompt_messages, p.gen.completion_text, float(r.loss.detach()))
+                            )
                         _account(r)
 
                 def _drain_ready_teacher_futures(
@@ -1358,6 +1373,11 @@ def run_opd():
             # each seq's grad was scaled by 1/accum_target; the mutation boundary rescales a partial
             # step, clips, publishes the first-update marker, mutates the optimizer, then increments.
             optimizer_started = time.perf_counter()
+            # Pre-update opt_steps == the policy state that GENERATED this step's rollouts. Use it as
+            # the samples' generated_at_step (parity with GRPO, which records the generation-time
+            # trainer step) so a completion is labelled with the step whose policy produced it, even
+            # though the heartbeat below reports the just-completed update.
+            generated_at_opt_steps = opt_steps
             opt_steps = _apply_opd_optimizer_update(
                 model=model,
                 optimizer=optimizer,
@@ -1372,6 +1392,16 @@ def run_opd():
             avg_cov = step_cov / nseq
             loss_curve.append(avg_loss)
             coverage_curve.append(avg_cov)
+            # Surface up to three distilled student completions (with their per-sample distillation
+            # loss) on this step's heartbeat so `flash log` shows what the student generated — the OPD
+            # analog of GRPO's reward samples, catching a collapsed/degenerate student early. Each is
+            # labelled with the pre-update step whose policy generated it (generated_at_opt_steps).
+            sampled_completions = select_rollout_samples(
+                step_samples, generated_at_step=generated_at_opt_steps, scalar="loss"
+            )
+            opd_step_kwargs = (
+                {"sampled_completions": sampled_completions} if sampled_completions else {}
+            )
             _w.heartbeat(
                 "opd_step",
                 # opt_steps (just incremented) == optimizer updates applied, so it is >=1 here: this
@@ -1385,6 +1415,7 @@ def run_opd():
                 coverage=avg_cov,
                 gpu=gpu_diagnostics(include_torch=False),
                 force=True,
+                **opd_step_kwargs,
             )
             if _wandb_on:
                 # Best-effort: a W&B network hiccup must never abort a paid training run.
@@ -1651,7 +1682,9 @@ def run_opd():
             "opd_teacher_workers": max_teacher_workers,
             "opd_teacher_batch_size": teacher_batch_size,
             "opd_loss_microbatch_size": loss_microbatch_size,
-            "opd_full_logits_batches": getattr(model, "_flash_opd_full_logits_batches", 0),
+            "opd_completion_only_batches": getattr(
+                model, "_flash_opd_completion_only_batches", 0
+            ),
             # Multi-turn: each assistant turn is distilled independently against its transcript-so-far
             # prefix, so a "sample" is a TURN, not a whole episode. Report the mode + turn ceiling and
             # the mean turns/episode so a run that collapsed to one-turn episodes (env never replied /
@@ -2199,6 +2232,88 @@ def _forward_logits(
         raise
 
 
+class _LmHeadBypass(Exception):
+    pass
+
+
+def _forward_completion_hidden_states(
+    model, input_ids, attention_mask, position_ids, *, logits_to_keep: int
+):
+    """Run the causal body through the normal model boundary but stop before the LM-head matmul."""
+    output_embeddings = model.get_output_embeddings()
+    input_embeddings = model.get_input_embeddings()
+    if output_embeddings is None or output_embeddings is input_embeddings:
+        raise RuntimeError("opd chunked ce requires a distinct output embedding module")
+
+    captured = {}
+    marker = object()
+
+    def _capture_hidden(_module, args):
+        if not args:
+            raise RuntimeError("opd lm head received no hidden states")
+        captured["hidden_states"] = args[0]
+        raise _LmHeadBypass(marker)
+
+    handle = output_embeddings.register_forward_pre_hook(_capture_hidden)
+    try:
+        _forward_logits(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids=position_ids,
+            logits_to_keep=logits_to_keep,
+        )
+    except _LmHeadBypass as exc:
+        if not exc.args or exc.args[0] is not marker:
+            raise
+    else:
+        raise RuntimeError("opd could not intercept the lm head for chunked ce")
+    finally:
+        handle.remove()
+
+    hidden_states = captured.get("hidden_states")
+    if hidden_states is None or hidden_states.shape[1] != logits_to_keep:
+        raise RuntimeError("opd model did not honor completion-only logits_to_keep")
+    return hidden_states, output_embeddings
+
+
+def _chunked_token_logps(lm_head, hidden_states, token_ids, *, chunk_size=OPD_CE_CHUNK_SIZE):
+    """Compute exact realized-token logprobs with checkpointed vocabulary chunks."""
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
+
+    if hidden_states.ndim != 2 or token_ids.ndim != 1:
+        raise ValueError("opd chunked ce expects [tokens, hidden] states and [tokens] ids")
+    if hidden_states.shape[0] != token_ids.shape[0]:
+        raise ValueError("opd chunked ce hidden-state and token counts differ")
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty((0,), dtype=torch.float32)
+
+    size = max(1, int(chunk_size))
+
+    def _logps(hidden_chunk, ids_chunk):
+        logits = lm_head(hidden_chunk).float()
+        return -F.cross_entropy(logits, ids_chunk, reduction="none")
+
+    chunks = []
+    for start in range(0, hidden_states.shape[0], size):
+        hidden_chunk = hidden_states[start : start + size]
+        ids_chunk = token_ids[start : start + size]
+        if torch.is_grad_enabled():
+            chunks.append(
+                checkpoint(
+                    _logps,
+                    hidden_chunk,
+                    ids_chunk,
+                    use_reentrant=False,
+                )
+            )
+        else:
+            chunks.append(_logps(hidden_chunk, ids_chunk))
+    return torch.cat(chunks)
+
+
 def _bump_model_counter(model, name: str, inc: int = 1) -> None:
     with contextlib.suppress(Exception):
         setattr(model, name, int(getattr(model, name, 0) or 0) + int(inc))
@@ -2292,23 +2407,46 @@ def _resolve_samples_batched(
         mb = max(1, int(microbatch))
         for start in range(0, len(text_prepared), mb):
             chunk = text_prepared[start : start + mb]
-            _bump_model_counter(model, "_flash_opd_full_logits_batches")
+            _bump_model_counter(model, "_flash_opd_completion_only_batches")
             seqs = [list(p.prompt_ids) + list(p.student_ids) for p in chunk]
             max_len = max(len(seq) for seq in seqs)
+            max_completion = max(len(p.student_ids) for p in chunk)
+            logits_to_keep = max_completion + 1
             input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
             attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
             for row, seq in enumerate(seqs):
-                input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                attention_mask[row, : len(seq)] = 1
-            logits = _forward_logits(model, input_ids, attention_mask)
-            losses = []
+                offset = max_len - len(seq)
+                input_ids[row, offset:] = torch.tensor(seq, dtype=torch.long, device=device)
+                attention_mask[row, offset:] = 1
+            position_ids = attention_mask.cumsum(dim=-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            hidden_tail, lm_head = _forward_completion_hidden_states(
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                logits_to_keep=logits_to_keep,
+            )
+            selected_hidden = []
+            selected_ids = []
             for row, p in enumerate(chunk):
-                prompt_len = len(p.prompt_ids)
                 comp_len = len(p.student_ids)
-                rows = logits[row, prompt_len - 1 : prompt_len - 1 + comp_len]
-                loss = _gkd_loss_from_logits_rows(
-                    rows, p.student_ids, p.groups, kl_coef=knobs.kl_coef
+                selected_hidden.append(
+                    hidden_tail[row, logits_to_keep - comp_len - 1 : logits_to_keep - 1]
                 )
+                selected_ids.extend(int(token_id) for token_id in p.student_ids)
+            flat_logps = _chunked_token_logps(
+                lm_head,
+                torch.cat(selected_hidden, dim=0),
+                torch.tensor(selected_ids, dtype=torch.long, device=device),
+            )
+            losses = []
+            token_offset = 0
+            for p in chunk:
+                comp_len = len(p.student_ids)
+                sp_t = flat_logps[token_offset : token_offset + comp_len]
+                token_offset += comp_len
+                loss = _gkd_loss_from_logps(sp_t, p.groups, kl_coef=knobs.kl_coef)
                 if loss is None:
                     results[p.idx] = SampleResult(
                         teacher_status="ok",
