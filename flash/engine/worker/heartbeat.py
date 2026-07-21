@@ -18,6 +18,7 @@ import time
 
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.perf import gpu_diagnostics
+from flash.engine.worker.rollout_samples import sanitize_rollout_text
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -151,26 +152,20 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             if stage in _HB_TIGHT_LIVENESS_STAGES:
                 interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
             upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
-            # ``force`` bypasses the per-stage throttle (but not TERMINAL_ONLY mode, handled above) when
-            # THIS heartbeat's payload must be the one on record and a throttled drop would leave a STALE
-            # value committed -- opd's post-optimizer-step ping forces so a mid-step progress ping
-            # (carrying the previous opt_steps) that just claimed the slot can't suppress the stepped
-            # commit (else a cancel is billed from the stale step). Force is gated on STEP ADVANCE (this
-            # payload's ``step`` exceeds the last committed step) AND a per-force time floor measured from
-            # the last FORCED commit. The floor throttles only a SUB-FLOOR BURST of step advances (a
-            # tiny/fast OPD config landing many optimizer updates per minute, which unthrottled would blow
-            # the HF per-repo commit cap before the final adapter/DONE upload, codex[bot]); because the
-            # floor keys off the last forced commit -- not the last upload of any kind -- a force still
-            # punches through IMMEDIATELY after a liveness/mid-step ping stole the slot, and steps spaced
-            # farther apart than the floor (the normal teacher-round-trip-gated regime) each still commit
-            # exactly once, so a cancel there still bills the true latest step. The bounded cost is that a
-            # cancel DURING a sub-floor burst under-bills by up to one floor-window of steps -- acceptable
-            # (it favours the customer) and unavoidable once steps outrun the commit cap.
+            # ``force`` bypasses the per-stage throttle when this payload must be on record. it normally
+            # requires a step advance, but a sample-bearing payload may match the committed step because
+            # the liveness daemon can commit that step first without the samples. the per-force floor still
+            # coalesces fast bursts to protect the hf commit cap, while an unrelated liveness commit does
+            # not arm the floor and therefore cannot suppress the first sample-bearing payload.
             if force and not upload_due:
                 fstep = kw.get("step")
+                has_samples = bool(kw.get("sampled_completions"))
+                force_step_due = isinstance(fstep, (int, float)) and (
+                    fstep > _w._HB_LAST_COMMITTED_STEP
+                    or (has_samples and fstep == _w._HB_LAST_COMMITTED_STEP)
+                )
                 if (
-                    isinstance(fstep, (int, float))
-                    and fstep > _w._HB_LAST_COMMITTED_STEP
+                    force_step_due
                     and (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
                 ):
                     upload_due = True
@@ -193,6 +188,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
             _committed_step = kw.get("step")
             if isinstance(_committed_step, (int, float)) and _committed_step > _w._HB_LAST_COMMITTED_STEP:
                 _w._HB_LAST_COMMITTED_STEP = int(_committed_step)
+    payload_committed = False
     if upload_due:
         critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
@@ -210,19 +206,27 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
                     # ``is False`` (not falsy) so a mock/None never trips the rollback.
                     _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
                     print(f"HEARTBEAT upload failed; rolled back throttle slot for {stage}")
-                elif not liveness:
-                    # this committed snapshot carried real progress; settle the progress-carry
-                    # latch up to the seq captured when the snapshot was built (max: a concurrent
-                    # newer real heartbeat that lost the upload race must stay pending).
-                    with _HB_LOCK:
-                        if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
-                            _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
+                else:
+                    payload_committed = True
+                    if not liveness:
+                        # this committed snapshot carried real progress; settle the progress-carry
+                        # latch up to the seq captured when the snapshot was built (max: a concurrent
+                        # newer real heartbeat that lost the upload race must stay pending).
+                        with _HB_LOCK:
+                            if my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
+                                _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
             finally:
                 _HB_UPLOAD_LOCK.release()
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    print("HEARTBEAT", snapshot)
+    console_payload = payload
+    if not payload_committed and payload.get("sampled_completions"):
+        console_payload = {
+            key: value for key, value in payload.items() if key != "sampled_completions"
+        }
+    print("HEARTBEAT", json.dumps(console_payload))
+    return payload_committed
 
 
 def _maybe_attach_gpu_diag(payload: dict, last_gpu_diag_at: float, now: float) -> float:
@@ -290,7 +294,58 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
     return {n: surviving[n] for n in sorted(priority + rest)}
 
 
-def make_reward_heartbeat_callback(reward_metrics=None):
+# Exactly three samples per heartbeat, always. Mirrors rollout_samples._SAMPLE_LIMIT.
+_SAMPLE_LIMIT = 3
+
+
+def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
+    """Return the (key, finite value) of a sample's scalar: GRPO ``reward`` or OPD ``loss``."""
+    for key in ("reward", "loss"):
+        if key not in sample:
+            continue
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            return None
+        return (key, value) if math.isfinite(value) else None
+    return None
+
+
+def _bounded_sampled_completions(samples) -> list[dict]:
+    if not isinstance(samples, (list, tuple)):
+        return []
+    bounded: list[dict] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        prompt_tail = sample.get("prompt_tail")
+        completion = sample.get("completion")
+        if not isinstance(prompt_tail, str) or not isinstance(completion, str):
+            continue
+        scalar = _sampled_completion_scalar(sample)
+        if scalar is None:
+            continue
+        generated_at_step = sample.get("generated_at_step")
+        if generated_at_step is not None:
+            try:
+                generated_at_step = int(generated_at_step)
+            except (TypeError, ValueError):
+                continue
+        scalar_key, scalar_value = scalar
+        bounded.append(
+            {
+                "prompt_tail": sanitize_rollout_text(prompt_tail),
+                "completion": sanitize_rollout_text(completion),
+                scalar_key: scalar_value,
+                "generated_at_step": generated_at_step,
+            }
+        )
+        if len(bounded) >= _SAMPLE_LIMIT:
+            break
+    return bounded
+
+
+def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
     """Return a TRL callback that streams per-step reward to the HF heartbeat channel."""
     from transformers import TrainerCallback
 
@@ -298,6 +353,7 @@ def make_reward_heartbeat_callback(reward_metrics=None):
         def __init__(self):
             self.reward_history = []
             self.last_gpu_diag_at = 0.0
+            self.sent_first_sample_heartbeat = False
             self.latest_reward_metrics: dict[str, float] = {}
 
         def latest_fields(self) -> dict:
@@ -326,9 +382,19 @@ def make_reward_heartbeat_callback(reward_metrics=None):
             self.latest_reward_metrics = _bounded_reward_metrics(latest_metrics)
             if self.latest_reward_metrics:
                 payload["reward_metrics"] = dict(self.latest_reward_metrics)
+            latest_samples = samples() if callable(samples) else samples
+            bounded_samples = _bounded_sampled_completions(latest_samples)
+            if bounded_samples:
+                payload["sampled_completions"] = bounded_samples
             now = time.monotonic()
             self.last_gpu_diag_at = _maybe_attach_gpu_diag(payload, self.last_gpu_diag_at, now)
-            _w.heartbeat("rl_step", **payload)
+            force_first_samples = bool(bounded_samples) and not self.sent_first_sample_heartbeat
+            if force_first_samples:
+                committed = _w.heartbeat("rl_step", force=True, **payload)
+                if committed:
+                    self.sent_first_sample_heartbeat = True
+            else:
+                _w.heartbeat("rl_step", **payload)
 
     return _RewardHeartbeat()
 
