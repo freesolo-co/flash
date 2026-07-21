@@ -681,6 +681,10 @@ def run_rl():
         _attn = optimal_attn_impl()
     # vLLM sampler stop: truncate each rollout at the delimiter so the reward sees the same text.
     _gen_kwargs: dict = {}
+    if multimodal and not is_multi_turn:
+        from flash.multimodal import resolve_image_pad_token_id
+
+        _gen_kwargs["logit_bias"] = {resolve_image_pad_token_id(processor, tok): -100.0}
     if _t and _t.stop_sequences:
         _gen_kwargs["stop"] = list(_t.stop_sequences)
     # [train] structured_outputs: pass the spec as a plain dict — TRL's colocate path wraps it
