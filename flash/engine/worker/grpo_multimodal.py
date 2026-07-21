@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from typing import Any
 
 from flash.multimodal import resolve_image_pad_token_id
@@ -79,17 +80,44 @@ def _as_int_list(values: Any) -> list[int]:
     return [int(value) for value in values]
 
 
-def _active_image_token_counts(input_ids: Any, attention_mask: Any, image_pad_token_id: int) -> list[int]:
+def _active_image_token_runs(
+    input_ids: Any, attention_mask: Any, image_pad_token_id: int
+) -> list[list[int]]:
     if hasattr(input_ids, "dim"):
-        counts = ((input_ids == image_pad_token_id) & attention_mask.bool()).sum(dim=1)
-        return _as_int_list(counts)
-    return [
-        sum(
-            int(token_id == image_pad_token_id and bool(active))
-            for token_id, active in zip(ids, mask, strict=True)
-        )
-        for ids, mask in zip(input_ids, attention_mask, strict=True)
-    ]
+        active_image_tokens = (input_ids == image_pad_token_id) & attention_mask.bool()
+        batch_runs = []
+        for row in active_image_tokens:
+            if row.numel() == 0:
+                batch_runs.append([])
+                continue
+            previous = row.roll(1)
+            previous[0] = False
+            following = row.roll(-1)
+            following[-1] = False
+            starts = (row & ~previous).nonzero(as_tuple=False).flatten()
+            ends = (row & ~following).nonzero(as_tuple=False).flatten()
+            batch_runs.append(_as_int_list(ends - starts + 1))
+        return batch_runs
+
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if hasattr(attention_mask, "tolist"):
+        attention_mask = attention_mask.tolist()
+
+    batch_runs = []
+    for ids, mask in zip(input_ids, attention_mask, strict=True):
+        runs = []
+        run_length = 0
+        for token_id, active in zip(ids, mask, strict=True):
+            if bool(active) and int(token_id) == image_pad_token_id:
+                run_length += 1
+            elif run_length:
+                runs.append(run_length)
+                run_length = 0
+        if run_length:
+            runs.append(run_length)
+        batch_runs.append(runs)
+    return batch_runs
 
 
 def _grid_feature_counts(image_grid_thw: Any, merge_length: int) -> list[int]:
@@ -122,13 +150,15 @@ def validate_image_token_grid_invariant(
 ) -> None:
     """reject samples whose active image tokens disagree with their processor grids."""
     if num_images is None:
-        raise ValueError("single-turn multimodal grpo requires num_images for image-grid validation")
+        raise ValueError(
+            "single-turn multimodal grpo requires num_images for image-grid validation"
+        )
     images_per_sample = _as_int_list(num_images)
-    active_tokens = _active_image_token_counts(input_ids, attention_mask, image_pad_token_id)
-    if len(images_per_sample) != len(active_tokens):
+    active_runs = _active_image_token_runs(input_ids, attention_mask, image_pad_token_id)
+    if len(images_per_sample) != len(active_runs):
         raise ValueError(
             "single-turn multimodal grpo image counts do not match the forward batch: "
-            f"images={len(images_per_sample)}, samples={len(active_tokens)}"
+            f"images={len(images_per_sample)}, samples={len(active_runs)}"
         )
 
     merge_length = int(merge_size) ** 2
@@ -140,17 +170,36 @@ def validate_image_token_grid_invariant(
         )
 
     grid_offset = 0
-    for sample_index, (sample_tokens, image_count) in enumerate(
-        zip(active_tokens, images_per_sample, strict=True)
+    for sample_index, (sample_runs, image_count) in enumerate(
+        zip(active_runs, images_per_sample, strict=True)
     ):
-        sample_features = sum(feature_counts[grid_offset : grid_offset + image_count])
-        if sample_tokens != sample_features:
+        if len(sample_runs) != image_count:
             raise ValueError(
                 "single-turn multimodal grpo image-token/grid invariant failed before forward for "
-                f"sample {sample_index}: active_image_tokens={sample_tokens}, "
-                f"grid_features={sample_features}"
+                f"sample {sample_index}: image_token_runs={len(sample_runs)}, images={image_count}"
             )
+        sample_features = feature_counts[grid_offset : grid_offset + image_count]
+        for image_index, (run_length, feature_count) in enumerate(
+            zip(sample_runs, sample_features, strict=True)
+        ):
+            if run_length != feature_count:
+                raise ValueError(
+                    "single-turn multimodal grpo image-token/grid invariant failed before forward for "
+                    f"sample {sample_index}, image {image_index}: "
+                    f"active_image_tokens={run_length}, grid_features={feature_count}"
+                )
         grid_offset += image_count
+
+
+def _processor_merge_size(processing_class: Any) -> int:
+    image_processor = getattr(processing_class, "image_processor", None)
+    merge_size = getattr(image_processor, "merge_size", None)
+    if isinstance(merge_size, bool) or not isinstance(merge_size, Integral) or merge_size <= 0:
+        raise RuntimeError(
+            "single-turn multimodal grpo requires image_processor.merge_size "
+            "to be a positive integer"
+        )
+    return int(merge_size)
 
 
 class SingleTurnMultimodalGRPOMixin:
@@ -183,7 +232,7 @@ class SingleTurnMultimodalGRPOMixin:
         image_position_ids: Any = None,
     ) -> Any:
         if image_grid_thw is not None:
-            merge_size = getattr(self.processing_class.image_processor, "merge_size", 2)
+            merge_size = _processor_merge_size(self.processing_class)
             validate_image_token_grid_invariant(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
