@@ -458,3 +458,111 @@ def test_run_status_surfaces_heartbeat_stage_and_age(monkeypatch) -> None:
     out = render.run_status(weird)
     assert "123" in out  # non-string stage still shown
     assert "ago" not in out.split("details")[0]  # unusable ts -> no age row
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_explains_rl_warmup(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time()},
+    }
+
+    out = render.run_status(status)
+
+    assert f"warming up (stage={stage})" in out
+    assert "typically several minutes, sometimes 15-20 min" in out
+    assert "setup is not billed" in out
+    assert "do not cancel" in out
+
+    status["state"] = "done"
+    assert "warming up" not in render.run_status(status).split("details")[0]
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_omits_warmup_claim_for_stale_heartbeat(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+
+    out = render.run_status(status)
+
+    assert stage in out
+    assert "20m ago" in out
+    assert "quiet is not dead" in out
+    assert "warming up" not in out
+    assert "do not cancel" not in out
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_omits_warmup_claim_for_prior_attempt_heartbeat(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a recovered run flips back to running for attempt 1, but last_heartbeat is the fresh-looking
+    # setup ping the dead attempt 0 left behind (retries reuse the seed heartbeat path). reassuring
+    # "do not cancel" against it would mislabel a retry stall as healthy warmup.
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
+    }
+
+    out = render.run_status(status).split("details")[0]
+
+    assert stage in out  # the stage is still reported factually
+    assert "warming up" not in out
+    assert "do not cancel" not in out
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_run_status_explains_warmup_when_heartbeat_matches_attempt(monkeypatch, stage: str) -> None:
+    import time as _time
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    # a fresh heartbeat from the live attempt keeps the reassurance: the gate must not over-suppress.
+    status = {
+        "run_id": "flash-warmup",
+        "state": "running",
+        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "remote": {"attempt": 2},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 2},
+    }
+
+    out = render.run_status(status)
+
+    assert f"warming up (stage={stage})" in out
+    assert "do not cancel" in out
+
+
+def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
+    is_current = render.heartbeat_is_current_attempt
+
+    # a malformed heartbeat attempt cannot prove it is the live attempt, so it earns no reassurance
+    # and must never crash the display path (e.g. on inf, which the old int() coercion raised on).
+    for bad in ["1", " 1 ", True, 2.7, float("inf"), -1, object()]:
+        assert is_current({"remote": {"attempt": 1}}, {"attempt": bad}) is False
+
+    # a malformed live attempt reads as unknown -> fall back to age gating (keep showing the note)
+    for bad in ["1", True, 2.7, float("inf"), -1]:
+        assert is_current({"remote": {"attempt": bad}}, {"attempt": 1}) is True
+
+    # canonical int identities: exact match shows, mismatch suppresses
+    assert is_current({"remote": {"attempt": 2}}, {"attempt": 2}) is True
+    assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
