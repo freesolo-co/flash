@@ -267,8 +267,8 @@ def test_chunked_nll_forces_preload_before_model_validation():
     from flash.engine.worker.sft import run_sft
 
     source = inspect.getsource(run_sft)
-    assert "force=_sft_chunked" in source
-    assert source.index("force=_sft_chunked") < source.index("_prepare_chunked_nll_model(")
+    assert "force=_sft_fused" in source
+    assert source.index("force=_sft_fused") < source.index("_prepare_chunked_nll_model(")
 
 
 def test_chunked_nll_rejects_trainable_output_head():
