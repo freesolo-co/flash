@@ -193,6 +193,10 @@ def start_reward_server(score_by_index):
 
     returns (server, url). the server runs in a daemon thread; call server.shutdown() when done.
     """
+    # serialize scoring so the flash env sees sequential calls, matching the trl reward path's
+    # contract; verl's reward manager may otherwise call the reward with several workers at once.
+    score_lock = threading.Lock()
+
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -205,7 +209,8 @@ def start_reward_server(score_by_index):
             n = int(self.headers.get("Content-Length", "0"))
             try:
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
-                score = float(score_by_index(int(payload["index"]), payload.get("solution_str", "")))
+                with score_lock:
+                    score = float(score_by_index(int(payload["index"]), payload.get("solution_str", "")))
             except Exception as exc:  # never 500 the trainer; score 0
                 print(f"[rl-verl] reward server error: {exc}", flush=True)
                 score = 0.0
@@ -438,8 +443,9 @@ def run_rl_verl():
     ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
     message_prompts = [p["prompt"] for p in prompts]
     indices = [int(r["example_idx"]) for r in ds_rows]
-    ground_truths = [str(getattr(ex, "get", lambda *_: "")("answer", "") if isinstance(ex, dict) else "")
-                     for ex in rollout_examples]
+    # ground_truth is a verl-schema placeholder only; the reward bridge scores by example_idx
+    # against the live env and never reads it.
+    ground_truths = [str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples]
 
     workdir = f"/tmp/rl_verl_seed{_w.SEED}"
     os.makedirs(workdir, exist_ok=True)
