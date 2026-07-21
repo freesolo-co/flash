@@ -695,6 +695,7 @@ def _reconcile_attached_remote(
         get_status,
     )
     from flash.runner.lifecycle import (
+        _RECOVERY_MARKER_GRACE_S,
         _adopt_completed_attempt,
         _completed_attempt_metrics,
         _CompletedAttemptPending,
@@ -747,8 +748,26 @@ def _reconcile_attached_remote(
                     return
             except Exception:
                 pass
-            # the job completed with metrics; never tear it down — keep retrying
-            # adoption (e.g. across a transient cleanup failure) until it sticks.
+            # the job completed with metrics; keep retrying adoption (e.g. across a
+            # transient cleanup failure) until it sticks -- but never past the wall
+            # deadline plus the recovery grace, or a persistently failing adoption
+            # would leave the run non-terminal forever. past the grace, preserve the
+            # remote for cost reconciliation and fail the run.
+            if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
+                try:
+                    cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
+                except Exception:
+                    cleanup_preserved = False
+                if cleanup_preserved:
+                    try:
+                        if _compare_and_fail_remote(
+                            run_id,
+                            expected_remote,
+                            "completed attempt could not be adopted within the recovery grace window",
+                        ):
+                            return
+                    except Exception:
+                        pass
             time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
             continue
         if time.time() >= deadline_at:
