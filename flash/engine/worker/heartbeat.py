@@ -253,6 +253,8 @@ _REWARD_METRIC_RESERVED_NAMES = frozenset(
     }
 )
 _REWARD_METRIC_LIMIT = 12
+# names TRAINING.md tells users to judge on: never dropped by the alphabetical cap.
+_REWARD_METRIC_PRIORITY_NAMES = ("success",)
 
 
 def _bounded_reward_metrics(metrics) -> dict[str, float]:
@@ -267,9 +269,25 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
             score = float(value)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(score):
-            surviving[sanitized_name] = score
-    return dict(sorted(surviving.items())[:_REWARD_METRIC_LIMIT])
+        if not math.isfinite(score):
+            continue
+        # distinct source names that sanitize to the same key must not silently overwrite each
+        # other; disambiguate with a numeric suffix (kept within the 64-char bound, allowed chars).
+        unique_name = sanitized_name
+        suffix = 2
+        while unique_name in surviving:
+            tail = f"_{suffix}"
+            unique_name = sanitized_name[: 64 - len(tail)] + tail
+            suffix += 1
+        surviving[unique_name] = score
+    if len(surviving) <= _REWARD_METRIC_LIMIT:
+        return dict(sorted(surviving.items()))
+    # the cap must not drop metrics users are told to judge on (e.g. success); keep those first,
+    # then fill the remaining slots alphabetically.
+    priority = [n for n in _REWARD_METRIC_PRIORITY_NAMES if n in surviving]
+    remaining = max(0, _REWARD_METRIC_LIMIT - len(priority))
+    rest = sorted(n for n in surviving if n not in priority)[:remaining]
+    return {n: surviving[n] for n in sorted(priority + rest)}
 
 
 def make_reward_heartbeat_callback(reward_metrics=None):
