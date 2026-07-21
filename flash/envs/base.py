@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class RolloutReward:
+    episode: float
+    turns: tuple[float, ...] | None = None
 
 
 class Environment(Protocol):
@@ -20,6 +27,9 @@ class Environment(Protocol):
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         """Scalar RL reward for a completion."""
+
+    def rollout_rewards_many(self, items: list[tuple[dict, dict]]) -> list[RolloutReward]:
+        """Return typed episode and optional per-turn rewards in input order."""
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         """Boolean correctness scorer the reward can build on."""
@@ -40,6 +50,36 @@ class BaseEnvironment:
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
+
+    def rollout_rewards_many(self, items: list[tuple[dict, dict]]) -> list[RolloutReward]:
+        """Return typed rewards, using batched or bounded scalar scoring as available."""
+        reward_many = getattr(self, "reward_many", None)
+        if callable(reward_many):
+            episode_rewards = reward_many(items)
+        else:
+
+            def score_one(item: tuple[dict, dict]) -> float:
+                example, state = item
+                return float(self.reward("", example, state))
+
+            if len(items) <= 1 or not getattr(self, "reward_thread_safe", True):
+                episode_rewards = [score_one(item) for item in items]
+            else:
+                pool = ThreadPoolExecutor(max_workers=min(16, len(items)))
+                try:
+                    futures = {
+                        pool.submit(score_one, item): index for index, item in enumerate(items)
+                    }
+                    episode_rewards = [0.0] * len(items)
+                    for future in as_completed(futures):
+                        episode_rewards[futures[future]] = future.result()
+                finally:
+                    pool.shutdown(wait=True, cancel_futures=True)
+
+        return [
+            RolloutReward(episode=float(episode_reward), turns=None)
+            for episode_reward in episode_rewards
+        ]
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         gold = str(example.get("output") or "").strip()
