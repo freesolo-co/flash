@@ -480,3 +480,33 @@ def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monke
     assert seen["disk_gb"] == 200.0
     # and the quote reflects the live allocation rather than a static gpu_hourly_usd lookup.
     assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
+
+
+def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
+    # regression: the estimator must not advertise b200 as faster/cheaper than h200 on peak flops.
+    # b200/sm100 training is h200-class (portable kernels), so at its higher $/hr b200 must never
+    # come out cheaper, and never faster, than h200 for the same run.
+    from types import SimpleNamespace
+
+    import flash.providers.allocator as allocator_mod
+    from flash.cost.facts import gpu_hourly_usd
+
+    def alloc_as(gpu):
+        rate = gpu_hourly_usd(gpu)
+
+        def fake_allocate(model_id, method, **kwargs):
+            return SimpleNamespace(gpu=gpu, provider="runpod", hourly_usd=rate, min_vram_gb=80)
+
+        return fake_allocate
+
+    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("H200"))
+    h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, exact_type="H200"))
+    monkeypatch.setattr(allocator_mod, "allocate", alloc_as("B200"))
+    b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, exact_type="B200"))
+
+    assert gpu_hourly_usd("B200") > gpu_hourly_usd("H200")  # b200 is the pricier card
+    # same effective training throughput => b200 is no faster than h200 ...
+    assert b200.seconds_per_step == pytest.approx(h200.seconds_per_step)
+    assert b200.train_seconds == pytest.approx(h200.train_seconds)
+    # ... and at its higher $/hr, never cheaper.
+    assert b200.total_usd > h200.total_usd
