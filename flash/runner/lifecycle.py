@@ -59,9 +59,36 @@ class _RetryBudget:
             self.infra_used += 1
 
 
+def _preflight_opd_verl_environment(spec: JobSpec) -> None:
+    if spec.algorithm != "opd":
+        return
+    from flash.envs.registry import load_environment
+    from flash.multimodal import record_has_images
+    from flash.runner import _require_supported_opd_verl_spec
+
+    _require_supported_opd_verl_spec(spec)
+    environment = load_environment(
+        spec.environment.id,
+        dict(spec.environment.params or {}),
+        spec.environment.resolved_sha or None,
+    )
+    unsupported_backend = "not yet supported on the verl OPD backend"
+    if getattr(environment, "is_tool_env", False) or getattr(environment, "multi_turn", False):
+        raise ValueError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+    records = list(environment.dataset())
+    max_examples = int(spec.train.max_examples or 0)
+    if max_examples > 0:
+        records = records[:max_examples]
+    for record in records:
+        messages = environment.prompt_messages(record)
+        if record_has_images(record, messages):
+            raise ValueError(f"multimodal OPD is {unsupported_backend}")
+
+
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     from flash.multimodal import preflight_validate_image_opd
 
+    _preflight_opd_verl_environment(spec)
     preflight_validate_image_opd(spec)
 
     # Lazy import: dry-run / unit tests never construct a Flash endpoint.

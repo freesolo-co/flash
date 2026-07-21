@@ -234,12 +234,6 @@ def _install_verl_extensions() -> None:
             eos_ids = json.loads(os.environ.get("FLASH_OPD_EOS_TOKEN_IDS", "[]"))
             if eos_ids:
                 params["stop_token_ids"] = eos_ids
-            structured = json.loads(os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS", "null"))
-            if structured:
-                from vllm.sampling_params import StructuredOutputsParams
-
-                params["structured_outputs"] = StructuredOutputsParams(**structured)
-                params["logprobs"] = True
             output = await super().run(params, **kwargs)
             output.reward_score = 0.0
             return output

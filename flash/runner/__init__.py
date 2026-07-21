@@ -128,6 +128,20 @@ def _require_priced_sft_examples(spec: JobSpec) -> None:
         )
 
 
+def _require_supported_opd_verl_spec(spec: JobSpec) -> None:
+    if spec.algorithm != "opd":
+        return
+    unsupported_backend = "not yet supported on the verl OPD backend"
+    if spec.train.structured_outputs:
+        raise ValueError(
+            f"structured_outputs is {unsupported_backend} because forced-position metadata "
+            "is not yet threaded"
+        )
+    params = dict(spec.environment.params or {})
+    if params.get("multi_turn") or params.get("is_tool_env") or params.get("tool_calling"):
+        raise ValueError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+
+
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is not None:
@@ -943,6 +957,7 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    _require_supported_opd_verl_spec(spec)
     spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)

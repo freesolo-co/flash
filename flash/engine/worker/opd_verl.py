@@ -365,7 +365,6 @@ def _build_opd_child_env(
     seed: int,
     stop_sequences: tuple,
     eos_token_ids: frozenset[int],
-    structured_outputs,
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -376,7 +375,6 @@ def _build_opd_child_env(
             "FLASH_OPD_SEED": str(int(seed)),
             "FLASH_OPD_STOP_SEQUENCES": json.dumps(list(stop_sequences)),
             "FLASH_OPD_EOS_TOKEN_IDS": json.dumps(sorted(eos_token_ids)),
-            "FLASH_OPD_STRUCTURED_OUTPUTS": json.dumps(structured_outputs),
         }
     )
     return child
@@ -570,15 +568,31 @@ def _generation_eos_from_cached_config(model_id: str, model_revision: str, token
 
 def run_opd_verl(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
-    from flash.engine.structured_outputs import parse_structured_outputs
     from flash.engine.worker.teacher import TeacherClient
+    from flash.multimodal import record_has_images
 
     spec = spec or _w.JOB_SPEC
     env = _w.require_active_env()
-    if getattr(env, "is_tool_env", False):
-        raise RuntimeError("opd does not support tool-calling environments")
-    if getattr(env, "multi_turn", False):
-        raise RuntimeError("verl OPD currently requires a single-turn environment")
+    unsupported_backend = "not yet supported on the verl OPD backend"
+    if getattr(env, "is_tool_env", False) or getattr(env, "multi_turn", False):
+        raise RuntimeError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+    knobs = _resolve_opd_knobs()
+    if knobs.structured_outputs:
+        raise RuntimeError(
+            f"structured_outputs is {unsupported_backend} because forced-position metadata "
+            "is not yet threaded"
+        )
+    train = list(env.dataset())
+    if not train:
+        raise RuntimeError("opd environment dataset is empty")
+    max_examples = int(getattr(spec.train, "max_examples", 0) or 0) if spec else 0
+    if max_examples > 0:
+        train = train[:max_examples]
+    for example in train:
+        messages = env.prompt_messages(example)
+        if record_has_images(example, messages):
+            raise RuntimeError(f"multimodal OPD is {unsupported_backend}")
+    random.Random(_w.SEED).shuffle(train)
 
     started_at = time.time()
     _w.heartbeat("opd_start", gpu=_w.gpu_diagnostics(include_torch=False))
@@ -586,7 +600,6 @@ def run_opd_verl(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.exact_type if spec else "",
     )
-    knobs = _resolve_opd_knobs()
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
@@ -600,28 +613,16 @@ def run_opd_verl(spec=None) -> None:
         tokenizer.pad_token = tokenizer.eos_token
     thinking_prefill = _thinking_prefill_text(tokenizer)
     eos_token_ids = _generation_eos_from_cached_config(model_id, model_revision, tokenizer)
-
-    train = list(env.dataset())
-    if not train:
-        raise RuntimeError("opd environment dataset is empty")
-    max_examples = int(getattr(spec.train, "max_examples", 0) or 0) if spec else 0
-    if max_examples > 0:
-        train = train[:max_examples]
-    random.Random(_w.SEED).shuffle(train)
     prompt_budget = (
         knobs.max_length - knobs.max_completion if knobs.max_length else RECIPE.opd.max_prompt_len
     )
     if prompt_budget < 1:
         raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
 
-    from flash.multimodal import record_has_images
-
     prompts: list[_BridgePrompt] = []
     dropped_long = 0
     for example in train:
         messages = env.prompt_messages(example)
-        if record_has_images(example, messages):
-            raise RuntimeError("verl OPD multimodal bridge support is not enabled")
         prompt_ids = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -710,7 +711,6 @@ def run_opd_verl(spec=None) -> None:
     )
     bridge.start()
     try:
-        structured_outputs = parse_structured_outputs(knobs.structured_outputs)
         config = {
             "train_files": [train_file],
             "val_files": [val_file],
@@ -770,7 +770,6 @@ def run_opd_verl(spec=None) -> None:
             seed=int(_w.SEED),
             stop_sequences=knobs.stop_sequences,
             eos_token_ids=eos_token_ids,
-            structured_outputs=structured_outputs,
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}

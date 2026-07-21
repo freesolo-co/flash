@@ -300,7 +300,6 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
         seed=42,
         stop_sequences=("</answer>",),
         eos_token_ids=frozenset({1, 2}),
-        structured_outputs=None,
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -308,6 +307,82 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_key(monkeypatch, tm
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert "FIREWORKS_API_KEY" not in child
     assert "HF_TOKEN" not in child
+
+
+def test_runner_rejects_structured_outputs_before_preparation():
+    from flash import runner
+    from flash.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(structured_outputs='{"json":{"type":"object"}}'),
+    )
+    with pytest.raises(ValueError, match="forced-position metadata"):
+        runner._require_supported_opd_verl_spec(spec)
+
+
+def test_runner_rejects_multiturn_tool_flags_before_preparation():
+    from flash import runner
+    from flash.spec import EnvironmentSpec, JobSpec
+
+    for flag in ("multi_turn", "is_tool_env", "tool_calling"):
+        spec = JobSpec(
+            model="Qwen/Qwen3.5-4B",
+            algorithm="opd",
+            environment=EnvironmentSpec(id="local", params={flag: True}),
+        )
+        with pytest.raises(ValueError, match="not yet supported on the verl OPD backend"):
+            runner._require_supported_opd_verl_spec(spec)
+
+
+@pytest.mark.parametrize(
+    ("multi_turn", "is_tool_env", "records", "message"),
+    [
+        (True, False, [], "multi-turn and tool-calling"),
+        (False, True, [], "multi-turn and tool-calling"),
+        (
+            False,
+            False,
+            [{"input": [{"role": "user", "content": "look"}], "image": "image.png"}],
+            "multimodal OPD",
+        ),
+    ],
+)
+def test_runner_environment_gate_rejects_before_provisioning(
+    monkeypatch, multi_turn, is_tool_env, records, message
+):
+    from flash.envs import registry
+    from flash.runner import lifecycle
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    class FakeEnvironment:
+        def __init__(self):
+            self.multi_turn = multi_turn
+            self.is_tool_env = is_tool_env
+
+        def dataset(self):
+            return records
+
+        def prompt_messages(self, record):
+            return record.get("input", [])
+
+    calls = []
+    monkeypatch.setattr(
+        registry,
+        "load_environment",
+        lambda *_args, **_kwargs: calls.append("load") or FakeEnvironment(),
+    )
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="local"),
+        train=TrainSpec(max_examples=1),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        lifecycle._preflight_opd_verl_environment(spec)
+    assert calls == ["load"]
 
 
 def test_deterministic_seed_uses_every_rollout_identity_component():
