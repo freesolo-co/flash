@@ -21,6 +21,7 @@ from flash.engine.multiturn_rollout import (
     rollout_one,
     rollout_one_records,
 )
+from flash.envs.base import BaseEnvironment, RolloutReward
 
 # --- Fake prefix-preserving chat scheme (mirrors the sibling test's vocab) ----------------------
 HDR = {"user": 100, "assistant": 101, "system": 102}
@@ -89,6 +90,7 @@ class FakeEnv:
     """One env (user) turn; stops after 2 assistant turns."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {"prompt": [{"role": "user", "content": "u1"}], "completion": []}
@@ -112,6 +114,7 @@ class _VarTurnEnv:
     """Stops after a per-example number of model turns; reward == #model turns."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {
@@ -162,6 +165,7 @@ class _DoneAfterReplyEnv:
     """rollout_done flips True only AFTER env_reply runs (exercises the post-reply break)."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {"prompt": [{"role": "user", "content": "u1"}], "completion": [], "phase": 0}
@@ -470,8 +474,8 @@ def test_rollout_async_raises_without_prompt_or_messages():
 
 def test_rollout_async_reward_many_wrong_count_raises():
     class _BadRewardManyEnv(_VarTurnEnv):
-        def reward_many(self, items):
-            return [1.0]  # deliberately the wrong length for a 2-rollout batch
+        def rollout_rewards_many(self, items):
+            return [RolloutReward(episode=1.0)]  # wrong length for a 2-rollout batch
 
     with pytest.raises(RuntimeError, match="wrong number of rewards"):
         _run_async([{"max_model": 1}, {"max_model": 1}], _BadRewardManyEnv())
