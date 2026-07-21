@@ -88,7 +88,7 @@ def test_runpod_allocation_lands_on_full_validated_cards():
     assert a27_sft.gpu == "A100 PCIe"
     a27_grpo = allocator.allocate("Qwen/Qwen3.6-27B", "grpo")
     assert a27_grpo.provider == "runpod"
-    assert a27_grpo.gpu == "H200"  # arch-aware sizing fits 27B grpo in 141 GB (cheaper than B200)
+    assert a27_grpo.gpu == "B200"  # colocated GRPO (trainer + vLLM rollout = two ~54GB copies) needs B200
 
 
 def test_default_max_retries():
@@ -405,7 +405,7 @@ def test_required_vram_policy_floors_and_downrouting():
     need_27b_sft = need("Qwen/Qwen3.6-27B", "sft")
     need_27b_grpo = need("Qwen/Qwen3.6-27B", "grpo")
     assert need_27b_sft == 80
-    assert need_27b_grpo == 136
+    assert need_27b_grpo == 150  # colocated-GRPO resident peak -> B200
     # group size and thinking never DECREASE the requirement
     base = need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4})
     assert need(m4, "grpo", train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16}) >= base

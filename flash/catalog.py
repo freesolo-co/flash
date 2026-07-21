@@ -455,6 +455,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         algos=("sft", "grpo", "opd"),
         min_vram_gb=80,
+        grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
         quant="bf16",
         recommended_gpu="A100 PCIe",
