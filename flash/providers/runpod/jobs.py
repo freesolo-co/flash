@@ -214,6 +214,16 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
+def _is_balance_error(exc: Exception) -> bool:
+    """True when RunPod refuses to create an endpoint because the account is out of balance.
+
+    Like a worker-quota error this is account-specific (another pool account may have funds), so it
+    must trigger failover to the next key — but unlike a quota error, sweeping idle endpoints on the
+    broke account can't help, so the caller fails over immediately instead of sweeping and retrying.
+    """
+    return "account balance" in str(exc).lower()
+
+
 # {endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)} — grace timer per endpoint.
 # Serialized by _idle_since_lock; two threads (periodic reaper + deploy-time quota sweep) can race.
 _idle_since: dict[str, tuple[float, str]] = {}
@@ -378,6 +388,8 @@ def deploy_train_endpoint(
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
+        from flash.spec import gpu_count_of
+
         if deadline_at is not None:
             require_create_allowance(deadline_at)
         with FLASH_SDK_LOCK:
@@ -387,7 +399,8 @@ def deploy_train_endpoint(
             kwargs = {
                 "name": name,
                 "gpu": flash_gpu(friendly),
-                "gpu_count": 1,
+                # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
+                "gpu_count": gpu_count_of(spec),
                 "min_cuda_version": min_cuda_for(friendly),
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
@@ -424,7 +437,7 @@ def deploy_train_endpoint(
     # Bound by count, not advance_key() return value — advance_key() always wraps so can't signal exhaustion.
     failovers_left = max(0, rp_keys.key_count() - 1)
     while resource is None:
-        quota_exc: Exception | None = None
+        deploy_failover_exc: Exception | None = None
         for quota_attempt in range(_QUOTA_MAX_RETRIES):
             if quota_attempt > 0:
                 # Under acute quota pressure, sweep idle orphaned flash training endpoints on THIS
@@ -457,22 +470,31 @@ def deploy_train_endpoint(
                 resource, owning_fingerprint = _deploy_once()
                 break  # success
             except Exception as exc:
+                if _is_balance_error(exc):
+                    # a broke account can't be helped by sweeping idle endpoints — fail over now
+                    deploy_failover_exc = exc
+                    break
                 if not _is_workers_quota_error(exc):
                     raise
-                quota_exc = exc
+                deploy_failover_exc = exc
         if resource is not None:
             break
         if failovers_left > 0:
             with FLASH_SDK_LOCK:
                 rp_keys.advance_key()
             failovers_left -= 1
+            reason = (
+                "has insufficient balance"
+                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
+                else "worker quota exhausted after sweeping"
+            )
             logger.warning(
-                "RunPod worker quota exhausted on this account after sweeping; failing over to "
-                "the next RUNPOD_API_KEY account (%d configured)",
+                "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
+                reason,
                 rp_keys.key_count(),
             )
             continue
-        raise quota_exc or RuntimeError("deploy_train_endpoint: worker quota exhausted")
+        raise deploy_failover_exc or RuntimeError("deploy_train_endpoint: deploy failover exhausted")
 
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
@@ -678,7 +700,9 @@ def poll_job(
                 h = runpod_api.endpoint_health_for_fingerprint(
                     handle.endpoint_id,
                     handle.key_fingerprint,
-                    **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, absolute_deadline),
+                    **deadline_kwargs(
+                        runpod_api.endpoint_health_for_fingerprint, absolute_deadline
+                    ),
                 )
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
@@ -731,9 +755,7 @@ def poll_job(
                     last_hb_ts = hb_ts or 0.0
                     last_progress = time.time()
                     seen_training_hb = is_training_hb
-                elif hb_attempt == last_hb_attempt and (
-                    hb_ts is None or hb_ts > last_hb_ts
-                ):
+                elif hb_attempt == last_hb_attempt and (hb_ts is None or hb_ts > last_hb_ts):
                     # Gate progress on ts advancing — a stale late upload must not buy a fresh stall window.
                     if hb_ts is not None:
                         last_hb_ts = hb_ts

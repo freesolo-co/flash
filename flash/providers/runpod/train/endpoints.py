@@ -211,7 +211,9 @@ def _train_body(input_data: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     def _safe_detail(value, secrets=None, limit=1000):
-        text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        text = (
+            f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+        )
         values = {**os.environ, **(secrets or {})}
         for key, secret in values.items():
             upper = str(key).upper()
@@ -670,6 +672,7 @@ def get_train_endpoint(
     from runpod_flash import Endpoint
 
     from flash.providers.runpod.auth import ensure_auth
+    from flash.spec import gpu_count_of
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -691,7 +694,8 @@ def get_train_endpoint(
             kwargs = {
                 "name": name,
                 "gpu": flash_gpu(friendly),
-                "gpu_count": 1,
+                # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
+                "gpu_count": gpu_count_of(spec),
                 "min_cuda_version": min_cuda_for(friendly),
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
@@ -758,7 +762,10 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
     canonical = str(name or "").removeprefix("live-")
-    return canonical == target or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
+    return (
+        canonical == target
+        or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
+    )
 
 
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:

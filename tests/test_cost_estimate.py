@@ -117,9 +117,7 @@ def test_estimate_reports_the_runs_provider():
 
 def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10))
-    exact = estimate_cost(
-        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
-    )
+    exact = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
 
     assert unconstrained.gpu == "RTX 4090"
     assert exact.gpu == "H100"
@@ -188,9 +186,7 @@ def test_estimate_exact_gpu_enforces_provider_support_and_vram():
             exact_type="RTX 4090",
         )
     with pytest.raises(ValueError, match="requires at least"):
-        estimate_cost(
-            RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, exact_type="RTX 4090")
-        )
+        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, exact_type="RTX 4090"))
 
 
 def test_runconfig_from_spec_preserves_gpu_constraints():
@@ -510,3 +506,32 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
     assert b200.train_seconds == pytest.approx(h200.train_seconds)
     # ... and at its higher $/hr, never cheaper.
     assert b200.total_usd > h200.total_usd
+
+
+# ---------------------------------------------------------------------------
+# multi-gpu: total scales linearly with gpu_count
+# ---------------------------------------------------------------------------
+
+
+def test_total_usd_scales_linearly_with_gpu_count():
+    single = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150))
+    dual = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
+    assert single.gpu_count == 1
+    assert dual.gpu_count == 2
+    # per-card rate and training time are unchanged; only the card-count multiplier moves the total.
+    assert dual.gpu_hourly_usd == single.gpu_hourly_usd
+    assert dual.train_seconds == pytest.approx(single.train_seconds)
+    assert dual.total_usd == pytest.approx(2 * single.total_usd)
+
+
+def test_gpu_count_defaults_and_renders_in_breakdown():
+    est = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 150, gpu_count=2))
+    # the breakdown surfaces the multi-gpu shape (Nx prefix + per-card rate).
+    assert "2x" in est.breakdown()
+    assert "per card" in est.breakdown()
+
+
+@pytest.mark.parametrize(("bad", "exc"), [(0, ValueError), (-1, ValueError), (True, TypeError)])
+def test_runconfig_rejects_bad_gpu_count(bad, exc):
+    with pytest.raises(exc):
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, gpu_count=bad)
