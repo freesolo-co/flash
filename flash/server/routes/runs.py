@@ -17,6 +17,7 @@ from flash.runner import (
     runs_file_path,
 )
 from flash.schema import train_schema_metadata
+from flash.serve.preflight import ServingPreflightError
 from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import (
@@ -166,6 +167,8 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                 platform_context=platform_context or None,
                 owner_key_id=key["id"],
             )
+        except ServingPreflightError:
+            raise
         except Exception as exc:
             source_ref = spec.train.init_from_adapter
             if source_ref:
