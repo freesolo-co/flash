@@ -207,7 +207,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "job_status",
         lambda _endpoint_id, _job_id, **_kwargs: {"status": "COMPLETED", "output": {}},
     )
-    def read_heartbeat(force=False):
+    def read_heartbeat(force=False, **_kwargs):
         forces.append(force)
         return heartbeat
 
