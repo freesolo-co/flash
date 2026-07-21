@@ -214,6 +214,12 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
+# RunPod caps a serverless endpoint's idle_timeout (how long a worker stays warm after its last job
+# before scaling to zero) at 3600s. keep_alive_seconds above this holds the endpoint registered for
+# FlashBoot reuse past the warm-worker window, reclaimed by the keep-warm reaper at its own expiry.
+RUNPOD_IDLE_TIMEOUT_MAX = 3600
+
+
 # {endpoint_id: (first_observed_idle_ts, owning_key_fingerprint)} — grace timer per endpoint.
 # Serialized by _idle_since_lock; two threads (periodic reaper + deploy-time quota sweep) can race.
 _idle_since: dict[str, tuple[float, str]] = {}
@@ -392,6 +398,13 @@ def deploy_train_endpoint(
                 "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
             }
+            # keep_alive_seconds holds the worker warm after each job (skipping the container cold
+            # start on the next reused run) instead of scaling to zero at the 60s default. RunPod caps
+            # serverless idle_timeout at RUNPOD_IDLE_TIMEOUT_MAX; beyond that the endpoint stays
+            # registered for FlashBoot reuse until the keep-warm reaper reclaims it.
+            keep_alive_s = int(getattr(getattr(spec, "gpu", None), "keep_alive_seconds", 0) or 0)
+            if keep_alive_s > 0:
+                kwargs["idle_timeout"] = min(keep_alive_s, RUNPOD_IDLE_TIMEOUT_MAX)
             if image:
                 kwargs["image"] = image
             else:
@@ -794,14 +807,38 @@ def submit_run(
         runtime_secrets=runtime_secrets,
     )
     worker_env["ATTEMPT"] = str(attempt_id)
-    endpoint_id, name, key_fingerprint = deploy_train_endpoint(
-        spec.gpu.type,
-        execution_timeout_ms=timeout_s * 1000,
-        name_suffix=suffix,
-        disk_gb=spec.gpu.disk_gb,
-        spec=spec,
-        **deadline_kwargs(deploy_train_endpoint, deadline_at),
-    )
+    # Reuse a compatible, same-owner warm endpoint (skips deploy + cold start) on the FIRST attempt
+    # only -- a retry means the prior host was sick/throttled, so it must land somewhere fresh.
+    resolved_code_prefix = code_prefix or flash_code_prefix()
+    warm = None
+    if attempt_id == 0:
+        from flash.providers.runpod import warm_pool
+
+        owner_key_id, owner_org_id = warm_pool.keep_warm_owner(spec.run_id)
+        warm = warm_pool.try_acquire(
+            spec,
+            owner_key_id=owner_key_id,
+            owner_org_id=owner_org_id,
+            code_digest=resolved_code_prefix,
+            worker_image=worker_image_for_gpu(spec.gpu.type, allow_default=True) or "",
+            run_id=spec.run_id,
+            now=time.time(),
+        )
+    if warm is not None:
+        endpoint_id, name, key_fingerprint = (
+            warm["endpoint_id"],
+            warm["name"],
+            warm["owning_fingerprint"],
+        )
+    else:
+        endpoint_id, name, key_fingerprint = deploy_train_endpoint(
+            spec.gpu.type,
+            execution_timeout_ms=timeout_s * 1000,
+            name_suffix=suffix,
+            disk_gb=spec.gpu.disk_gb,
+            spec=spec,
+            **deadline_kwargs(deploy_train_endpoint, deadline_at),
+        )
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),

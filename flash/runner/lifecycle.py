@@ -966,8 +966,24 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     if status is not None:
         with contextlib.suppress(Exception):
             spec = effective_spec_from_status(status)
+    # A run that finished cleanly with gpu.keep_alive_seconds > 0 leaves its endpoint warm for a
+    # compatible, same-owner next run instead of tearing it down here; the keep-warm reaper reclaims
+    # it at expiry. Only "done" qualifies -- failed/cancelled endpoints still tear down immediately.
+    kept_warm = False
     if (
         status is not None
+        and getattr(status, "state", None) == "done"
+        and status.remote
+        and status.remote.get("provider") == "runpod"
+        and int(getattr(spec.gpu, "keep_alive_seconds", 0) or 0) > 0
+    ):
+        from flash.providers.runpod import warm_pool
+
+        with contextlib.suppress(Exception):
+            kept_warm = warm_pool.keep_warm_after_run_from_status(spec, status, now=time.time())
+    if (
+        not kept_warm
+        and status is not None
         and status.remote
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):

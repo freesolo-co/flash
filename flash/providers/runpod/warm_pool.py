@@ -26,6 +26,57 @@ from flash.server import db
 logger = logging.getLogger(__name__)
 
 
+def keep_warm_owner(run_id: str) -> tuple[int | None, str]:
+    """The authenticated (owner_key_id, owner_org_id) security domain for a run, from control-plane
+    state only -- never from the worker payload. Defaults to the null/local domain on any lookup
+    failure (local runs, tests), which reuses only within that same null domain."""
+    owner_key_id: int | None = None
+    owner_org_id = ""
+    try:
+        from flash.server import db
+
+        owner_key_id = db.run_owner(run_id)
+    except Exception:
+        owner_key_id = None
+    try:
+        from flash.runner import _status_org_id, get_status
+
+        owner_org_id = _status_org_id(get_status(run_id)) or ""
+    except Exception:
+        owner_org_id = ""
+    return owner_key_id, owner_org_id
+
+
+def keep_warm_after_run_from_status(spec: Any, status: Any, *, now: float) -> bool:
+    """Register a finished RunPod run's endpoint to stay warm, reading its identity from the persisted
+    handle + control-plane owner. Returns True iff the caller must NOT tear the endpoint down."""
+    remote = getattr(status, "remote", None) or {}
+    endpoint_id = remote.get("endpoint_id")
+    if not endpoint_id or remote.get("provider") != "runpod":
+        return False
+    owner_key_id, owner_org_id = keep_warm_owner(spec.run_id)
+    return keep_warm_after_run(
+        spec,
+        endpoint_id=endpoint_id,
+        name=remote.get("name") or endpoint_id,
+        owning_fingerprint=remote.get("key_fingerprint") or "",
+        owner_key_id=owner_key_id,
+        owner_org_id=owner_org_id,
+        code_digest=remote.get("code_prefix") or "",
+        worker_image=_worker_image_for(spec),
+        now=now,
+    )
+
+
+def _worker_image_for(spec: Any) -> str:
+    try:
+        from flash.providers.runpod.jobs import worker_image_for_gpu
+
+        return worker_image_for_gpu(spec.gpu.type, allow_default=True) or ""
+    except Exception:
+        return ""
+
+
 def compat_signature(spec: Any, *, code_digest: str, worker_image: str) -> str:
     """A stable hash of everything that must match for a warm endpoint to be safely reused.
 

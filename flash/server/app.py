@@ -149,13 +149,30 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
 
 def _reap_idle_endpoints_once(min_idle_s: float) -> int:
     """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
-    from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints
+    import time
 
+    from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints, canonical_endpoint_name
+
+    protected = _protected_train_endpoint_names()
+    # Endpoints intentionally held warm (gpu.keep_alive_seconds) must survive the idle sweep until
+    # their window expires; the keep-warm reaper then reclaims them.
+    protected |= {
+        canonical_endpoint_name(name) for name in db.unexpired_warm_endpoint_names(time.time())
+    }
     return _sweep_idle_flash_endpoints(
-        _protected_train_endpoint_names(),
+        protected,
         min_idle_s=min_idle_s,
         known=_known_train_endpoint_names(),
     )
+
+
+def _reap_expired_warm_endpoints_once() -> int:
+    """Tear down keep-warm endpoints whose window has elapsed and drop their records."""
+    import time
+
+    from flash.providers.runpod import warm_pool
+
+    return warm_pool.reap_expired(time.time())
 
 
 async def _reap_idle_endpoints_loop() -> None:
@@ -183,6 +200,14 @@ async def _reap_idle_endpoints_loop() -> None:
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
             _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
+        try:
+            expired = await asyncio.to_thread(_reap_expired_warm_endpoints_once)
+            if expired:
+                _log.info("reaped %d expired keep-warm endpoint(s)", expired)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.debug("keep-warm reaper sweep failed; retrying next cycle", exc_info=True)
 
 
 # Run states that may still OWN a live, billing training instance, so their provider instances must

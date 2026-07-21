@@ -355,6 +355,16 @@ def unexpired_warm_endpoint_names(now: float) -> set[str]:
         return {r["name"] for r in rows}
 
 
+def unexpired_warm_endpoint_ids(now: float) -> set[str]:
+    """Endpoint IDs the idle reaper must PROTECT (id-based, robust to a reused endpoint whose name
+    was minted for an earlier run)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT endpoint_id FROM warm_endpoints WHERE expiry_ts > ?", (now,)
+        ).fetchall()
+        return {r["endpoint_id"] for r in rows}
+
+
 def expired_warm_endpoints(now: float) -> list[dict]:
     """Records past their keep-alive window: the reaper tears these down and drops the rows."""
     with _connect() as conn:
