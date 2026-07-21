@@ -32,9 +32,16 @@ _REQUIRED_OVERRIDE_KEYS = (
 
 
 def _hydra_val(v) -> str:
-    """render a python value as a hydra override rhs (lowercase bools, bracketed lists)."""
+    """render a python value as a hydra override rhs (lowercase bools, bracketed lists).
+
+    floats are rendered fixed-point (e.g. 5e-5 -> "0.00005") so hydra parses them as floats
+    regardless of magnitude; str() would emit scientific notation ("5e-05") for common small lrs.
+    """
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, float):
+        s = f"{v:.12f}".rstrip("0")
+        return s + "0" if s.endswith(".") else s
     if isinstance(v, (list, tuple)):
         return "[" + ",".join(str(x) for x in v) + "]"
     return str(v)

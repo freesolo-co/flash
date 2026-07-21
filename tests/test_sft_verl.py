@@ -55,7 +55,15 @@ def test_overrides_cover_the_32k_lora_sp_surface():
     # lora on the immutable base; path key is model.path (not partial_pretrain).
     assert m["model.path"] == "Qwen/Qwen3-4B"
     assert m["model.lora_rank"] == "16"
+    # lr renders as a plain decimal hydra parses as a float (1e-4 -> "0.0001", not scientific).
+    assert m["optim.lr"] == "0.0001"
     assert "data.train_files=/w/train.parquet" in build_sft_verl_overrides(_cfg())
+
+
+def test_small_lr_renders_fixed_point_not_scientific():
+    # 5e-5 would str() as "5e-05"; hydra should get plain decimal.
+    m = _as_map(build_sft_verl_overrides(_cfg(lr=5e-5)))
+    assert m["optim.lr"] == "0.00005"
 
 
 def test_target_modules_list_renders_as_hydra_list():
