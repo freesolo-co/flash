@@ -453,7 +453,9 @@ def _rollout_kv_floor_gb(
         model_info=model_info,
         preserve_legacy_floor=preserve_legacy_floor,
     )
-    return fp8_floor if fp8_floor > ceiling else floor
+    # bf16 floor already exceeds the non-fp8 ceiling, so the run must use fp8 kv: return the fp8
+    # floor even when it fits under the ceiling, otherwise the oversized bf16 floor over-routes.
+    return fp8_floor
 
 
 @dataclass(frozen=True)

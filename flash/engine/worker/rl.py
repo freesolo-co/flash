@@ -366,7 +366,7 @@ def run_rl():
 
     from flash.engine.vram import resolve_params_b
 
-    _params_b = resolve_params_b(model_id)
+    _params_b = resolve_params_b(model_id, revision=model_revision) if model_revision else resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
