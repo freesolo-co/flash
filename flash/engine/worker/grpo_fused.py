@@ -321,7 +321,9 @@ def make_chalk_grpo_trainer(base_trainer, runtime: ChalkGrpoRuntime):
                         weight,
                         targets,
                         bias=bias,
-                        temperature=self.temperature,
+                        # greedy (temperature=0.0) would divide by zero in the fused kernel and
+                        # trip the permanent TRL fallback; treat it as unscaled like _chunked_entropy.
+                        temperature=self.temperature or 1.0,
                     )
                     all_logps.append(logps)
                     if compute_entropy:
