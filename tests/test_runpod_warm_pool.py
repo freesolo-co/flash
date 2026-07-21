@@ -48,6 +48,7 @@ def test_compat_signature_is_stable():
         {"train": {"max_context_tokens": 4096}},
         {"gpu": {"type": "H200"}},
         {"algorithm": "grpo"},
+        {"environment": {"id": "env/other"}},  # environment name is a match key
     ],
 )
 def test_compat_signature_changes_when_gpu_or_env_determinant_changes(overrides):
@@ -60,6 +61,7 @@ def test_compat_signature_changes_when_gpu_or_env_determinant_changes(overrides)
         {"train": {"learning_rate": 5e-6}},
         {"train": {"epochs": 3}},
         {"run_id": "run-99"},
+        {"environment": {"pip": ["cowsay"]}},  # extra pip changes neither gpu nor environment code
     ],
 )
 def test_compat_signature_ignores_non_resource_config(overrides):

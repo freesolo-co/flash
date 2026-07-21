@@ -81,13 +81,16 @@ def compat_signature(spec: Any, *, code_digest: str, worker_image: str) -> str:
     """A stable hash of everything that must match for a warm endpoint to be safely reused.
 
     Captures the resolved gpu resource (type/provider/disk/image), the base-model identity
-    (id + immutable revision), the environment CODE identity (``code_digest`` = the immutable
-    ``code/<digest>/flash`` prefix), and the resource-sizing inputs the user is allowed to hold
-    fixed (context length, lora rank, algorithm). Everything the user may vary without changing the
-    gpu or the environment code (learning rate, epochs, batch size, seed, temperature, ...) is
-    deliberately excluded, so those runs still reuse the warm box.
+    (id + immutable revision), the ENVIRONMENT identity (id + resolved commit -- the user's
+    "environment name" match key; a warm worker retains the prior run's env code and on-disk
+    secrets, so reuse must stay within the same environment), the flash code identity
+    (``code_digest`` = the immutable ``code/<digest>/flash`` prefix), and the resource-sizing inputs
+    the user holds fixed (context length, lora rank, algorithm). Everything the user may vary without
+    changing the gpu or the environment (learning rate, epochs, batch size, seed, temperature, extra
+    pip, ...) is deliberately excluded, so those runs still reuse the warm box.
     """
     gpu = spec.gpu
+    env = spec.environment
     payload = {
         "model": spec.model,
         "model_revision": getattr(spec, "model_revision", "") or "",
@@ -98,6 +101,8 @@ def compat_signature(spec: Any, *, code_digest: str, worker_image: str) -> str:
         "disk_gb": int(gpu.disk_gb),
         "max_context_tokens": spec.train.max_context_tokens,
         "lora_rank": int(spec.train.lora_rank),
+        "env_id": getattr(env, "id", "") or "",
+        "env_sha": getattr(env, "resolved_sha", "") or "",
         "code_digest": code_digest,
         "worker_image": worker_image or "",
     }
