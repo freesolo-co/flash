@@ -428,11 +428,20 @@ def _await_runpod_completed_metrics(last_handle, deadline_at) -> dict | None:
     # a terminal-ok runpod job whose output metrics are not decodable yet raises
     # _CompletedAttemptPending within the grace window; keep reconciling (like attach_run
     # and background reconciliation) instead of letting it escape the supervisor and fail
-    # a job that already completed. _runpod_completed_metrics returns None once the grace
-    # window expires, so this poll is bounded.
+    # a job that already completed.
+    #
+    # bound the wait to a short observation window measured from first observation (never past the
+    # run wall), NOT the full run wall deadline. callers pass the run wall deadline, up to
+    # max_wall_seconds (default 24h); passing it straight through let a terminal-ok job whose output
+    # never became readable pin the supervisor for the remainder of the run instead of failing over
+    # to a retry. _runpod_completed_metrics returns None once time >= observation_floor +
+    # _RECOVERY_MARKER_GRACE_S, so this synchronous poll is bounded to ~the grace window.
+    observation_floor = time.time()
+    if deadline_at is not None:
+        observation_floor = min(observation_floor, deadline_at)
     while True:
         try:
-            return _runpod_completed_metrics(last_handle, deadline_at=deadline_at)
+            return _runpod_completed_metrics(last_handle, deadline_at=observation_floor)
         except _CompletedAttemptPending:
             time.sleep(_RECOVERY_METRICS_POLL_S)
 
