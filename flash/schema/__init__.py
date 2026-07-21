@@ -25,6 +25,7 @@ from flash.schema.fields import (
     _environment_secrets,
     _require_environment_ref,
     _section_int,
+    _train_credit_assignment,
     _train_float,
     _train_int,
     _train_stops,
@@ -396,9 +397,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # exact_type it suggests might not be provisionable there.
         if "type" in gpu_raw and not exact_type and not gpu_provider:
             authored_type_raw = gpu_raw["type"]
-            # only an active validated class is a usable exact_type pin; an unrecognized string or a
-            # retired-but-known class (e.g. RTX A6000) must not be echoed back as an exact_type, since
-            # the exact_type validation above would then reject the very config the note suggested.
+            # only an active validated class is a usable exact_type pin; an unrecognized string must
+            # not be echoed back as an exact_type, since the exact_type validation above would then
+            # reject the very config the note suggested.
             pinnable: str | None = None
             if isinstance(authored_type_raw, str):
                 try:
@@ -508,6 +509,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
+            credit_assignment=_train_credit_assignment(train_raw),
             # minimum=0: explicit 0 means "no cap" per trainspec contract
             max_steps=train_raw.get("max_steps"),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),

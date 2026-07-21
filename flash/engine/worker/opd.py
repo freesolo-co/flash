@@ -590,6 +590,7 @@ def run_opd():
             _scanned += 1
     multimodal = any(has_images for _ex, _messages, has_images in message_rows)
     if multimodal:
+        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
         from flash.multimodal import validate_image_opd_teacher
 
         try:
@@ -617,7 +618,6 @@ def run_opd():
     if multimodal:
         from transformers import AutoProcessor
 
-        validate_multimodal_training(model_id, "opd", multi_turn=multi_turn)
         processor = AutoProcessor.from_pretrained(
             model_id,
             trust_remote_code=True,
