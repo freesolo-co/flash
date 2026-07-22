@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import hashlib
 import os
 import shutil
@@ -30,6 +32,13 @@ class RunOptimizerConfig:
     weight_decay: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingAdapterPublication:
+    adapter_dir: Path | None
+    target_version: int
+    target_global_step: int
+
+
 @dataclass(slots=True)
 class TrainingRunState:
     """mutable training state owned by one logical run."""
@@ -45,6 +54,7 @@ class TrainingRunState:
     dataloader: Any
     prompt_cursor: int = 0
     global_step: int = 0
+    pending_publication: _PendingAdapterPublication | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +231,11 @@ class SharedMultiLoRATrainingActor:
             adapter_name = _adapter_name(normalized_run_id)
             before = {id(parameter) for parameter in self._model.parameters()}
             config = lora_config if lora_config is not None else make_lora(self._model_id)
-            self._model = self._adapter_attacher(self._model, adapter_name, config)
+            try:
+                self._model = self._adapter_attacher(self._model, adapter_name, config)
+            except BaseException:
+                self._cleanup_failed_attachment(adapter_name)
+                raise
             adapter_dir: Path | None = None
             try:
                 named_parameters = tuple(self._model.named_parameters())
@@ -278,6 +292,7 @@ class SharedMultiLoRATrainingActor:
 
         async with self._training_lease:
             state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
             self._assert_registry_isolation()
             self._activate_adapter(state)
             optimizer = state.optimizer
@@ -300,24 +315,31 @@ class SharedMultiLoRATrainingActor:
                 self._clear_all_gradients()
                 self._freeze_all_parameters()
 
-            old_version = state.adapter_version
-            new_version = old_version + 1
-            adapter_dir = self._export_version(state.adapter_name, state.run_id, new_version)
-            new_handle = await self._rollout_engine.publish_adapter(
-                state.run_id,
-                expected_old_version=old_version,
-                new_version=new_version,
-                adapter_dir=adapter_dir,
+            loss_value = float(loss.detach().cpu().item())
+            new_version = state.adapter_version + 1
+            state.pending_publication = _PendingAdapterPublication(
+                adapter_dir=None,
+                target_version=new_version,
+                target_global_step=state.global_step + 1,
             )
-            state.adapter_version = new_version
-            state.handle = new_handle
-            state.global_step += 1
+            new_handle = await self._publish_pending_adapter(state)
             return TrainingStepResult(
                 run_id=state.run_id,
                 global_step=state.global_step,
-                loss=float(loss.detach().cpu().item()),
+                loss=loss_value,
                 handle=new_handle,
             )
+
+    async def publish_pending_adapter(self, run_id: str) -> AdapterHandle:
+        """retry a failed post-step publication without another optimizer update."""
+
+        async with self._training_lease:
+            state = self.run_state(run_id)
+            if state.pending_publication is None:
+                raise TrainingIsolationError(
+                    f"training run {run_id} has no pending adapter publication"
+                )
+            return await self._publish_pending_adapter(state)
 
     def advance_prompt_cursor(self, run_id: str, count: int = 1) -> int:
         """advance and return one run's independent prompt cursor."""
@@ -325,6 +347,7 @@ class SharedMultiLoRATrainingActor:
         if count < 0:
             raise ValueError("prompt cursor advance must be non-negative")
         state = self.run_state(run_id)
+        self._require_no_pending_publication(state)
         state.prompt_cursor += count
         return state.prompt_cursor
 
@@ -336,6 +359,7 @@ class SharedMultiLoRATrainingActor:
         path = _resolved_path(checkpoint_path)
         async with self._training_lease:
             state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
             checkpoint = {
                 "format_version": 1,
                 "run_id": state.run_id,
@@ -363,6 +387,7 @@ class SharedMultiLoRATrainingActor:
         path = _resolved_path(checkpoint_path)
         async with self._training_lease:
             state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
             checkpoint = await asyncio.to_thread(_load_checkpoint_file, path)
             self._validate_checkpoint_identity(state, checkpoint)
             saved_names = tuple(checkpoint["adapter_parameter_names"])
@@ -375,33 +400,59 @@ class SharedMultiLoRATrainingActor:
                 raise TrainingIsolationError(
                     "checkpoint adapter parameter count does not match the run"
                 )
+            for parameter, saved in zip(state.adapter_parameters, saved_parameters, strict=True):
+                if parameter.shape != saved.shape:
+                    raise TrainingIsolationError(
+                        "checkpoint adapter parameter shape does not match the run"
+                    )
 
-            with torch.no_grad():
-                for parameter, saved in zip(
-                    state.adapter_parameters, saved_parameters, strict=True
-                ):
-                    if parameter.shape != saved.shape:
-                        raise TrainingIsolationError(
-                            "checkpoint adapter parameter shape does not match the run"
-                        )
-                    parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
-            state.optimizer.load_state_dict(checkpoint["optimizer"])
-            state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            state.prompt_cursor = int(checkpoint["prompt_cursor"])
-            state.global_step = int(checkpoint["global_step"])
-            self._clear_all_gradients()
-            self._freeze_all_parameters()
-            self._assert_registry_isolation()
-
-            old_version = state.adapter_version
-            new_version = old_version + 1
-            adapter_dir = self._export_version(state.adapter_name, state.run_id, new_version)
-            new_handle = await self._rollout_engine.publish_adapter(
-                state.run_id,
-                expected_old_version=old_version,
-                new_version=new_version,
-                adapter_dir=adapter_dir,
+            live_parameters = tuple(
+                parameter.detach().clone() for parameter in state.adapter_parameters
             )
+            live_optimizer = copy.deepcopy(state.optimizer.state_dict())
+            live_scheduler = copy.deepcopy(state.lr_scheduler.state_dict())
+            live_prompt_cursor = state.prompt_cursor
+            live_global_step = state.global_step
+            adapter_dir: Path | None = None
+            try:
+                with torch.no_grad():
+                    for parameter, saved in zip(
+                        state.adapter_parameters, saved_parameters, strict=True
+                    ):
+                        parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+                state.optimizer.load_state_dict(checkpoint["optimizer"])
+                state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+                state.prompt_cursor = int(checkpoint["prompt_cursor"])
+                state.global_step = int(checkpoint["global_step"])
+                self._clear_all_gradients()
+                self._freeze_all_parameters()
+                self._assert_registry_isolation()
+
+                old_version = state.adapter_version
+                new_version = old_version + 1
+                adapter_dir = self._export_version(state.adapter_name, state.run_id, new_version)
+                new_handle = await self._rollout_engine.publish_adapter(
+                    state.run_id,
+                    expected_old_version=old_version,
+                    new_version=new_version,
+                    adapter_dir=adapter_dir,
+                )
+            except BaseException:
+                with torch.no_grad():
+                    for parameter, live in zip(
+                        state.adapter_parameters, live_parameters, strict=True
+                    ):
+                        parameter.copy_(live)
+                state.optimizer.load_state_dict(live_optimizer)
+                state.lr_scheduler.load_state_dict(live_scheduler)
+                state.prompt_cursor = live_prompt_cursor
+                state.global_step = live_global_step
+                self._clear_all_gradients()
+                self._freeze_all_parameters()
+                if adapter_dir is not None:
+                    shutil.rmtree(adapter_dir, ignore_errors=True)
+                raise
+
             state.adapter_version = new_version
             state.handle = new_handle
             return new_handle
@@ -417,10 +468,69 @@ class SharedMultiLoRATrainingActor:
             for parameter in state.adapter_parameters
         )
 
+    async def _publish_pending_adapter(self, state: TrainingRunState) -> AdapterHandle:
+        pending = state.pending_publication
+        if pending is None:
+            raise TrainingIsolationError(
+                f"training run {state.run_id} has no pending adapter publication"
+            )
+        if pending.adapter_dir is None:
+            adapter_dir = self._export_version(
+                state.adapter_name, state.run_id, pending.target_version
+            )
+            pending = _PendingAdapterPublication(
+                adapter_dir=adapter_dir,
+                target_version=pending.target_version,
+                target_global_step=pending.target_global_step,
+            )
+            state.pending_publication = pending
+        new_handle = await self._rollout_engine.publish_adapter(
+            state.run_id,
+            expected_old_version=state.adapter_version,
+            new_version=pending.target_version,
+            adapter_dir=pending.adapter_dir,
+        )
+        state.adapter_version = pending.target_version
+        state.handle = new_handle
+        state.global_step = pending.target_global_step
+        state.pending_publication = None
+        return new_handle
+
+    @staticmethod
+    def _require_no_pending_publication(state: TrainingRunState) -> None:
+        pending = state.pending_publication
+        if pending is not None:
+            raise TrainingIsolationError(
+                f"training run {state.run_id} must publish adapter version "
+                f"{pending.target_version} before continuing"
+            )
+
+    def _cleanup_failed_attachment(self, adapter_name: str) -> None:
+        with contextlib.suppress(BaseException):
+            self._delete_adapter(adapter_name)
+        for module in tuple(self._model.modules()):
+            if module is self._model:
+                continue
+            delete_adapter = getattr(module, "delete_adapter", None)
+            if delete_adapter is not None:
+                with contextlib.suppress(BaseException):
+                    delete_adapter(adapter_name)
+        self._freeze_all_parameters()
+        configs = getattr(self._model, "peft_config", None)
+        config_remains = isinstance(configs, Mapping) and adapter_name in configs
+        parameter_remains = any(
+            adapter_name in name for name, _parameter in self._model.named_parameters()
+        )
+        if config_remains or parameter_remains:
+            raise TrainingIsolationError(
+                f"failed attachment left adapter {adapter_name} on the shared base"
+            )
+
     def _activate_adapter(self, state: TrainingRunState) -> None:
         set_adapter = getattr(self._model, "set_adapter", None)
         if set_adapter is None:
             raise TrainingIsolationError("shared training model has no set_adapter method")
+        self._model.train()
         set_adapter(state.adapter_name)
         active_ids = self._adapter_parameter_ids[state.run_id]
         for parameter in self._model.parameters():

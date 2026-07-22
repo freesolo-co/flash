@@ -19,6 +19,7 @@ from flash.engine.worker.openrlhf_shared_engine import (
 from flash.engine.worker.openrlhf_shared_training import (
     RunOptimizerConfig,
     SharedMultiLoRATrainingActor,
+    TrainingIsolationError,
 )
 
 requires_torch = pytest.mark.skipif(
@@ -38,8 +39,12 @@ class _FakeRolloutEngine:
     def __init__(self) -> None:
         self.added: list[_FakeLoRARequest] = []
         self.removed: list[int] = []
+        self.fail_adds = 0
 
     async def add_lora(self, request: _FakeLoRARequest) -> bool:
+        if self.fail_adds:
+            self.fail_adds -= 1
+            raise RuntimeError("adapter publish failed")
         self.added.append(request)
         return True
 
@@ -51,9 +56,11 @@ class _FakeRolloutEngine:
         return True
 
 
-def _rollout_manager(capacity: int) -> SharedMultiLoRARolloutEngine:
+def _rollout_manager(
+    capacity: int, engine: _FakeRolloutEngine | None = None
+) -> SharedMultiLoRARolloutEngine:
     return SharedMultiLoRARolloutEngine(
-        _FakeRolloutEngine(),
+        engine or _FakeRolloutEngine(),
         run_capacity=capacity,
         lora_request_factory=_FakeLoRARequest,
     )
@@ -73,7 +80,13 @@ def _parameter_bytes(parameters: tuple[Any, ...]) -> tuple[bytes, ...]:
     )
 
 
-def _build_actor(tmp_path: Path, capacity: int = 3):
+def _build_actor(
+    tmp_path: Path,
+    capacity: int = 3,
+    *,
+    rollout_manager: SharedMultiLoRARolloutEngine | None = None,
+    fail_first_attach: bool = False,
+):
     import torch
 
     class _TinyAdapter(torch.nn.Module):
@@ -94,6 +107,7 @@ def _build_actor(tmp_path: Path, capacity: int = 3):
             torch.nn.init.zeros_(self.base.weight)
             self.adapters = torch.nn.ModuleDict()
             self.active_adapter: str | None = None
+            self.eval()
 
         def add_adapter(self, adapter_name: str) -> None:
             self.adapters[adapter_name] = _TinyAdapter()
@@ -110,6 +124,7 @@ def _build_actor(tmp_path: Path, capacity: int = 3):
             return self.base(inputs) + self.adapters[self.active_adapter](inputs)
 
     load_count = 0
+    attach_failures = int(fail_first_attach)
 
     def load_base():
         nonlocal load_count
@@ -117,7 +132,11 @@ def _build_actor(tmp_path: Path, capacity: int = 3):
         return _TinySharedModel()
 
     def attach_adapter(model, adapter_name, _config):
+        nonlocal attach_failures
         model.add_adapter(adapter_name)
+        if attach_failures:
+            attach_failures -= 1
+            raise RuntimeError("adapter attach failed")
         return model
 
     def export_adapter(model, adapter_name, output_dir):
@@ -136,7 +155,7 @@ def _build_actor(tmp_path: Path, capacity: int = 3):
             weight_decay=config.weight_decay,
         )
 
-    rollout_manager = _rollout_manager(capacity)
+    rollout_manager = rollout_manager or _rollout_manager(capacity)
     actor = SharedMultiLoRATrainingActor(
         load_base,
         rollout_manager,
@@ -193,6 +212,25 @@ def test_registering_n_runs_loads_one_frozen_base_and_attaches_n_adapters(tmp_pa
 
 
 @requires_torch
+def test_failed_adapter_attach_removes_partial_adapter_and_allows_retry(tmp_path):
+    async def scenario():
+        actor, _load_count, _rollout_manager = _build_actor(
+            tmp_path, capacity=1, fail_first_attach=True
+        )
+
+        with pytest.raises(RuntimeError, match="adapter attach failed"):
+            await _register(actor, "run-a")
+
+        assert actor.run_ids == ()
+        assert len(actor.model.adapters) == 0
+        state = await _register(actor, "run-a")
+        assert state.run_id == "run-a"
+        assert len(actor.model.adapters) == 1
+
+    asyncio.run(scenario())
+
+
+@requires_torch
 def test_step_mutates_only_active_adapter_and_optimizer_then_publishes(tmp_path):
     async def scenario():
         actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
@@ -214,11 +252,59 @@ def test_step_mutates_only_active_adapter_and_optimizer_then_publishes(tmp_path)
         assert _parameter_bytes(tuple(actor.model.base.parameters())) == base_before
         assert all(parameter.grad is None for parameter in run_b.adapter_parameters)
         assert all(not parameter.requires_grad for parameter in actor.model.parameters())
+        assert actor.model.training is True
         assert isinstance(result.handle, AdapterHandle)
         assert result.handle.run_id == "run-a"
         assert result.handle.version == 1
         assert run_a.handle == result.handle
         assert await rollout_manager.current_handle("run-a") == result.handle
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_failed_publish_retries_same_update_without_cross_run_mutation(tmp_path):
+    async def scenario():
+        rollout_engine = _FakeRolloutEngine()
+        rollout_manager = _rollout_manager(2, rollout_engine)
+        actor, _load_count, _manager = _build_actor(
+            tmp_path, capacity=2, rollout_manager=rollout_manager
+        )
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        old_a_handle = run_a.handle
+        base_before = _parameter_bytes(tuple(actor.model.base.parameters()))
+        b_parameters_before = actor.adapter_parameter_snapshot("run-b")
+        b_optimizer_before = _serialized_state(run_b.optimizer.state_dict())
+        rollout_engine.fail_adds = 1
+
+        with pytest.raises(RuntimeError, match="adapter publish failed"):
+            await actor.step("run-a", _loss_for(1.0))
+
+        a_parameters_after_update = actor.adapter_parameter_snapshot("run-a")
+        a_optimizer_after_update = _serialized_state(run_a.optimizer.state_dict())
+        assert run_a.adapter_version == 0
+        assert run_a.global_step == 0
+        assert run_a.handle == old_a_handle
+        assert run_a.pending_publication is not None
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert _parameter_bytes(tuple(actor.model.base.parameters())) == base_before
+        with pytest.raises(TrainingIsolationError, match="must publish adapter version 1"):
+            await actor.step("run-a", _loss_for(-1.0))
+
+        new_handle = await actor.publish_pending_adapter("run-a")
+
+        assert new_handle.version == 1
+        assert run_a.adapter_version == 1
+        assert run_a.global_step == 1
+        assert run_a.pending_publication is None
+        assert actor.adapter_parameter_snapshot("run-a") == a_parameters_after_update
+        assert _serialized_state(run_a.optimizer.state_dict()) == a_optimizer_after_update
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert _parameter_bytes(tuple(actor.model.base.parameters())) == base_before
+        assert await rollout_manager.current_handle("run-a") == new_handle
 
     asyncio.run(scenario())
 
@@ -257,6 +343,98 @@ def test_checkpoint_restore_is_independent_per_run(tmp_path):
         assert restored_handle.version == a_version_before_restore + 1
         assert await rollout_manager.current_handle("run-a") == restored_handle
         assert await rollout_manager.current_handle("run-b") == b_handle_before_restore
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_invalid_checkpoint_state_rolls_back_live_run_without_touching_peer(tmp_path):
+    import torch
+
+    async def scenario():
+        actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        await actor.step("run-a", _loss_for(1.0))
+        checkpoint = await actor.save_run_checkpoint("run-a", tmp_path / "invalid-run-a.pt")
+        await actor.step("run-a", _loss_for(-1.0))
+        await actor.step("run-b", _loss_for(0.5))
+
+        checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        checkpoint_state["optimizer"]["param_groups"] = []
+        torch.save(checkpoint_state, checkpoint)
+        a_parameters_before = actor.adapter_parameter_snapshot("run-a")
+        a_optimizer_before = _serialized_state(run_a.optimizer.state_dict())
+        a_scheduler_before = _serialized_state(run_a.lr_scheduler.state_dict())
+        a_cursor_before = run_a.prompt_cursor
+        a_step_before = run_a.global_step
+        a_handle_before = run_a.handle
+        b_parameters_before = actor.adapter_parameter_snapshot("run-b")
+        b_optimizer_before = _serialized_state(run_b.optimizer.state_dict())
+        b_handle_before = run_b.handle
+
+        with pytest.raises(ValueError, match="different number of parameter groups"):
+            await actor.restore_run_checkpoint("run-a", checkpoint)
+
+        assert actor.adapter_parameter_snapshot("run-a") == a_parameters_before
+        assert _serialized_state(run_a.optimizer.state_dict()) == a_optimizer_before
+        assert _serialized_state(run_a.lr_scheduler.state_dict()) == a_scheduler_before
+        assert run_a.prompt_cursor == a_cursor_before
+        assert run_a.global_step == a_step_before
+        assert run_a.handle == a_handle_before
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert run_b.handle == b_handle_before
+        assert await rollout_manager.current_handle("run-a") == a_handle_before
+        assert await rollout_manager.current_handle("run-b") == b_handle_before
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_failed_restore_publish_rolls_back_and_can_retry(tmp_path):
+    async def scenario():
+        rollout_engine = _FakeRolloutEngine()
+        rollout_manager = _rollout_manager(2, rollout_engine)
+        actor, _load_count, _manager = _build_actor(
+            tmp_path, capacity=2, rollout_manager=rollout_manager
+        )
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        await actor.step("run-a", _loss_for(1.0))
+        checkpoint = await actor.save_run_checkpoint("run-a", tmp_path / "restore-run-a.pt")
+        await actor.step("run-a", _loss_for(-1.0))
+        await actor.step("run-b", _loss_for(0.5))
+        a_parameters_before = actor.adapter_parameter_snapshot("run-a")
+        a_optimizer_before = _serialized_state(run_a.optimizer.state_dict())
+        a_scheduler_before = _serialized_state(run_a.lr_scheduler.state_dict())
+        a_cursor_before = run_a.prompt_cursor
+        a_step_before = run_a.global_step
+        a_handle_before = run_a.handle
+        b_parameters_before = actor.adapter_parameter_snapshot("run-b")
+        b_optimizer_before = _serialized_state(run_b.optimizer.state_dict())
+        b_handle_before = run_b.handle
+        rollout_engine.fail_adds = 1
+
+        with pytest.raises(RuntimeError, match="adapter publish failed"):
+            await actor.restore_run_checkpoint("run-a", checkpoint)
+
+        assert actor.adapter_parameter_snapshot("run-a") == a_parameters_before
+        assert _serialized_state(run_a.optimizer.state_dict()) == a_optimizer_before
+        assert _serialized_state(run_a.lr_scheduler.state_dict()) == a_scheduler_before
+        assert run_a.prompt_cursor == a_cursor_before
+        assert run_a.global_step == a_step_before
+        assert run_a.handle == a_handle_before
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert run_b.handle == b_handle_before
+        assert await rollout_manager.current_handle("run-a") == a_handle_before
+
+        restored_handle = await actor.restore_run_checkpoint("run-a", checkpoint)
+
+        assert restored_handle.version == a_handle_before.version + 1
+        assert await rollout_manager.current_handle("run-a") == restored_handle
+        assert await rollout_manager.current_handle("run-b") == b_handle_before
 
     asyncio.run(scenario())
 
