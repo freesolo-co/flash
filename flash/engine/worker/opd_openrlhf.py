@@ -996,6 +996,7 @@ def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_s
         or periodic_due
     )
     self.args.ckpt.save_steps = global_step if save_due else float("inf")
+    save_succeeded = False
     try:
         result = _original_save_logs_and_checkpoints(
             self,
@@ -1003,9 +1004,10 @@ def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_s
             logs_dict=logs_dict,
             client_states=client_states,
         )
+        save_succeeded = True
     finally:
         self.args.ckpt.save_steps = original_save_steps
-    if save_due:
+    if save_due and save_succeeded:
         _flash_post_teacher({"checkpoint": global_step})
     return result
 
@@ -1265,6 +1267,14 @@ def _checkpoint_state(
         expected_seed=int(seed),
         checkpoint_step=int(step),
     )
+
+
+def _initial_checkpoint_step_states(
+    resume_state: dict[str, Any] | None,
+) -> dict[int, dict[str, Any]]:
+    if resume_state is None:
+        return {}
+    return {int(resume_state["opt_steps"]): dict(resume_state)}
 
 
 def _find_checkpoint_state_file(root: str, marker: str) -> str:
@@ -1782,7 +1792,7 @@ def run_opd_openrlhf() -> None:
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("opd_train_start", gpu=gpu_diagnostics())
 
-        step_states: dict[int, dict[str, Any]] = {}
+        step_states = _initial_checkpoint_step_states(resume_state)
         step_states_condition = threading.Condition()
 
         def state_for_step(step: int) -> dict[str, Any]:

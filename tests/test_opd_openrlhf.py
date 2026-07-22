@@ -606,6 +606,19 @@ def test_resume_reconciles_missing_required_deployable(monkeypatch):
     ]
 
 
+def test_resume_replayed_step_checkpoint_reuses_restored_metrics():
+    resume_state = {
+        "opt_steps": 2,
+        "loss_curve": [0.4, 0.3],
+        "coverage_curve": [0.7, 0.8],
+    }
+
+    step_states = opd_openrlhf._initial_checkpoint_step_states(resume_state)
+
+    assert step_states == {2: resume_state}
+    assert step_states[2] is not resume_state
+
+
 @pytest.mark.parametrize(
     ("returncode", "expected"),
     [
@@ -648,6 +661,26 @@ def test_ray_modified_class_checkpoint_and_warmstart_fit_hooks_execute(monkeypat
     ]
     assert trainer.original_fit_calls == [((), {})]
     assert result == "fit-result"
+
+
+def test_checkpoint_hook_does_not_post_after_save_failure(monkeypatch):
+    namespace, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch)
+    callbacks = []
+    namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("checkpoint save failed")
+
+    namespace["_original_save_logs_and_checkpoints"] = fail_save
+    trainer = runtime()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=1, load_enable=False))
+    logs = {"policy_loss": 0.2, "teacher_coverage": 0.75}
+
+    with pytest.raises(RuntimeError, match="checkpoint save failed"):
+        trainer.save_logs_and_checkpoints(1, logs, {"global_step": 1})
+
+    assert callbacks == [{"metrics": {"step": 1, "loss": 0.2, "coverage": 0.75}}]
+    assert trainer.args.ckpt.save_steps == 1
 
 
 def test_checkpoint_hook_uses_exact_steps_plus_final_boundary(monkeypatch):
