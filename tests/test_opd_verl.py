@@ -51,6 +51,7 @@ from flash.engine.worker.opd_verl_structured import (
     canonical_structured_spec,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
+from flash.opd_verl_validation import validate_opd_verl_structured_outputs
 
 
 def _load_verl_rl_dataset(monkeypatch):
@@ -265,9 +266,8 @@ def test_shifted_group_metadata_uses_verl_prediction_layout():
 
 
 def _structured_test_tokenizer():
-    pytest.importorskip("xgrammar")
-    tokenizers = pytest.importorskip("tokenizers")
-    transformers = pytest.importorskip("transformers")
+    import tokenizers
+    import transformers
     characters = list('{}[]":,0123456789truefalsenullabc xyz')
     vocab = {"[UNK]": 0, "</think>": 1, "<eos>": 2}
     for character in characters:
@@ -363,6 +363,45 @@ def test_xgrammar_replay_masks_only_positions_after_thinking_boundary():
     assert generated_boundary[:2] == [False, False]
     assert all(generated_boundary[2:])
     assert all(prompt_boundary)
+
+
+@pytest.mark.parametrize(
+    ("spec", "text"),
+    [
+        ({"choice": ["4"]}, "4"),
+        ({"regex": "[0-9]+"}, "42"),
+        (
+            {
+                "json": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                }
+            },
+            '{"answer":"4"}',
+        ),
+    ],
+)
+def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
+    from transformers import AutoConfig, AutoTokenizer
+
+    model_id = "Qwen/Qwen3.5-0.8B"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    assert len(tokenizer.get_vocab()) == 248077
+    assert config.text_config.vocab_size == 248320
+
+    replay = StructuredOutputReplay(tokenizer, config.text_config.vocab_size)
+    response_ids = tokenizer.encode(text, add_special_tokens=False)
+    forced = replay.forced_mask(
+        [],
+        response_ids,
+        canonical_structured_spec(spec),
+        thinking=False,
+    )
+
+    assert len(forced) == len(response_ids)
+    assert tuple(replay._bitmask.shape) == (1, 248320 // 32)
 
 
 def test_image_prompt_positions_remain_outside_alignment_groups():
@@ -1215,8 +1254,8 @@ def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_p
     assert child["FLASH_OPD_THINKING"] == "1"
 
 
-def test_runner_accepts_supported_structured_outputs_before_preparation():
-    from flash import runner
+def test_runner_accepts_supported_structured_outputs_before_preparation(monkeypatch):
+    from flash import opd_verl_validation, runner
     from flash.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
@@ -1224,8 +1263,13 @@ def test_runner_accepts_supported_structured_outputs_before_preparation():
         algorithm="opd",
         train=TrainSpec(structured_outputs='{"json":{"type":"object"}}'),
     )
+    monkeypatch.setattr(
+        opd_verl_validation,
+        "_resolve_structured_model_metadata",
+        lambda *_args: (248320, ("tokenizer.json",)),
+    )
 
-    runner._require_supported_opd_verl_spec(spec)
+    runner._require_supported_opd_verl_spec(spec, compiler_vocab_size=248320)
 
 
 @pytest.mark.parametrize(
@@ -1266,9 +1310,7 @@ def test_runner_rejects_structured_exactness_gaps_before_preparation(
 
 
 def test_runner_rejects_model_vocab_mismatch_before_preparation(monkeypatch):
-    from flash import runner
-    from flash.catalog import resolve_model
-    from flash.engine import vram
+    from flash import opd_verl_validation, runner
     from flash.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
@@ -1276,23 +1318,112 @@ def test_runner_rejects_model_vocab_mismatch_before_preparation(monkeypatch):
         algorithm="opd",
         train=TrainSpec(structured_outputs='{"choice":["4"]}'),
     )
-    info = resolve_model(spec.model, spec.algorithm)
     monkeypatch.setattr(
-        vram,
-        "fetch_hf_model_geometry",
-        lambda *_args, **_kwargs: (4.0, info.vocab_size + 1, 0, 0),
+        opd_verl_validation,
+        "_resolve_structured_model_metadata",
+        lambda *_args: (248321, ("tokenizer.json",)),
     )
 
     with pytest.raises(ValueError, match="xgrammar compiler vocabulary"):
-        runner._require_opd_structured_vocab_match(spec, info)
+        runner._require_supported_opd_verl_spec(spec, compiler_vocab_size=248320)
+
+
+def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
+    from flash import opd_verl_validation
+
+    monkeypatch.setattr(
+        opd_verl_validation,
+        "_resolve_structured_model_metadata",
+        lambda *_args: (32000, ("config.json", "tokenizer.model.v3")),
+    )
+
+    with pytest.raises(ValueError, match="does not support vLLM MistralTokenizer"):
+        validate_opd_verl_structured_outputs(
+            '{"choice":["4"]}',
+            model_id="mistralai/Mistral-7B-Instruct-v0.3",
+            compiler_vocab_size=32000,
+        )
+
+
+def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
+    from flash import opd_verl_validation
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("unstructured OPD must not resolve structured model metadata")
+
+    monkeypatch.setattr(opd_verl_validation, "_resolve_compiler_vocab_size", unexpected)
+    monkeypatch.setattr(opd_verl_validation, "_resolve_structured_model_metadata", unexpected)
+
+    result = validate_opd_verl_structured_outputs(
+        None,
+        model_id="open-org/cached-model",
+        model_revision="d" * 40,
+        model_policy="allow",
+    )
+
+    assert result.constraint is None
+    assert result.model_vocab_size == 0
+
+
+def test_submit_rejects_unsupported_prepared_worker_structured_option():
+    from flash import runner
+    from flash.runner import PreparedJob
+    from flash.spec import JobSpec, TrainSpec
+
+    public_spec = JobSpec(model="Qwen/Qwen3.5-4B", algorithm="opd")
+    worker_spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        train=TrainSpec(
+            structured_outputs='{"json_object":true,"whitespace_pattern":"\\\\s*"}'
+        ),
+    )
+    prepared = PreparedJob(
+        public_spec=public_spec,
+        worker_spec=worker_spec,
+        estimated_cost_usd=0.0,
+    )
+
+    with pytest.raises(ValueError, match="whitespace_pattern is unsupported"):
+        runner.submit_job(public_spec, dry_run=True, prepared_job=prepared)
 
 
 def test_structured_runtime_version_mismatch_fails_before_generation(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.11.1"}
+    versions = {"verl": "0.8.0", "vllm": "0.11.1", "xgrammar": "0.1.25"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
     with pytest.raises(RuntimeError, match=r"vllm 0\.11\.0 exactly"):
         _require_structured_runtime_versions()
+
+
+def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
+    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
+        _require_structured_runtime_versions()
+
+
+def test_plugin_initialization_checks_structured_versions_before_verl_install(monkeypatch):
+    import importlib as importlib_module
+
+    from flash.engine.worker import opd_verl_plugin as plugin
+
+    versions = {"verl": "0.8.0", "vllm": "0.11.0", "xgrammar": "0.1.26"}
+    monkeypatch.setenv("FLASH_OPD_STRUCTURED_OUTPUTS", '{"choice":["4"]}')
+    monkeypatch.setattr(plugin.importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(
+        plugin.importlib.util,
+        "find_spec",
+        lambda _name: pytest.fail("verl discovery must follow the structured version gate"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
+        importlib_module.reload(plugin)
+
+    monkeypatch.delenv("FLASH_OPD_STRUCTURED_OUTPUTS")
+    monkeypatch.setattr(plugin.importlib.util, "find_spec", lambda _name: None)
+    importlib_module.reload(plugin)
 
 
 def test_runner_rejects_multiturn_tool_flags_before_preparation():
@@ -1439,6 +1570,18 @@ def test_worker_dispatch_and_multi_gpu_route_to_verl():
     assert worker.run_opd.__name__ == "run_opd_verl"
     assert "opd" in runner._MULTI_GPU_ALGORITHMS
     assert "run_verl_training" in inspect.getsource(worker.run_opd)
+
+
+def test_worker_structured_validator_runs_before_model_download():
+    import inspect
+
+    from flash.engine.worker.opd_verl import run_opd_verl
+
+    source = inspect.getsource(run_opd_verl)
+    assert source.index("validate_opd_verl_structured_outputs(") < source.index(
+        "_w.prefetch_model("
+    )
+    assert "resolve_vocab_size" not in source
 
 
 def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
