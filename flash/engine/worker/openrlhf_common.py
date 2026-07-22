@@ -30,6 +30,13 @@ _DEFAULT_OPENRLHF_ENTRYPOINT = "openrlhf.cli.train_ppo_ray"
 _PROCESS_GROUP_TERM_TIMEOUT_S = 10.0
 _PROCESS_GROUP_POLL_INTERVAL_S = 0.05
 _OUTPUT_EOF = object()
+_KERNEL_CACHE_ENV_VARS = (
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "FLASHINFER_CUBIN_DIR",
+    "FLASHINFER_CACHE_DIR",
+    "FLASHINFER_WORKSPACE_BASE",
+)
 _BIN_TO_SAFETENSORS = """
 import sys
 
@@ -104,7 +111,7 @@ def run_openrlhf_training(
     on_step: Callable[[int], None] | None = None,
     on_line: Callable[[str], None] | None = None,
     heartbeat: Callable[[], None] | None = None,
-    step_pattern: str = r"(?:global[_ ]step|step)[:=\s]+(\d+)",
+    step_pattern: str = r"(?<![\w])(?:global[_ ]step|step)[:=\s]+(\d+)\b",
     heartbeat_interval_s: float = 20.0,
     torchrun_args: list[str] | None = None,
 ) -> int:
@@ -135,6 +142,10 @@ def run_openrlhf_training(
         ]
     child_env = dict(env)
     child_env["PYTHONUNBUFFERED"] = "1"
+    for name in _KERNEL_CACHE_ENV_VARS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            child_env.setdefault(name, value)
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -160,6 +171,7 @@ def run_openrlhf_training(
     reader = threading.Thread(target=read_output, name="openrlhf-output", daemon=True)
     reader.start()
     next_heartbeat = time.monotonic() + heartbeat_interval_s
+    last_step: int | None = None
     try:
         while True:
             timeout = None
@@ -183,7 +195,10 @@ def run_openrlhf_training(
                 on_line(line)
             match = step_re.search(line)
             if match and on_step is not None:
-                on_step(int(match.group(1)))
+                step = int(match.group(1))
+                if step != last_step:
+                    on_step(step)
+                    last_step = step
     except BaseException:
         _terminate_process_group(proc)
         raise
@@ -223,18 +238,23 @@ def _openrlhf_adapter_source(ckpt_dir: str) -> str:
     candidates: list[str] = []
     parent = os.path.dirname(ckpt_dir)
     tag = os.path.basename(ckpt_dir)
-    if os.path.basename(parent) == "_actor":
-        candidates.append(os.path.join(os.path.dirname(parent), f"{tag}_hf"))
+    checkpoint_root = os.path.dirname(parent) if os.path.basename(parent) == "_actor" else parent
+    candidates.append(os.path.join(checkpoint_root, f"{tag}_hf"))
 
-    actor_dir = os.path.join(ckpt_dir, "_actor")
-    latest_path = os.path.join(actor_dir, "latest")
-    if os.path.isfile(latest_path):
-        with open(latest_path) as latest_file:
-            latest_tag = latest_file.read().strip()
-        if latest_tag:
-            candidates.append(os.path.join(ckpt_dir, f"{latest_tag}_hf"))
+    for latest_path in (
+        os.path.join(ckpt_dir, "_actor", "latest"),
+        os.path.join(ckpt_dir, "latest"),
+    ):
+        if os.path.isfile(latest_path):
+            with open(latest_path) as latest_file:
+                latest_tag = latest_file.read().strip()
+            if latest_tag:
+                candidates.append(os.path.join(ckpt_dir, f"{latest_tag}_hf"))
 
-    resolved = [path for path in candidates if os.path.isfile(os.path.join(path, "adapter_config.json"))]
+    candidates = list(dict.fromkeys(candidates))
+    resolved = [
+        path for path in candidates if os.path.isfile(os.path.join(path, "adapter_config.json"))
+    ]
     if len(resolved) == 1:
         return resolved[0]
     if len(resolved) > 1:
@@ -261,7 +281,8 @@ def export_openrlhf_adapter(
 ) -> None:
     """export an OpenRLHF PEFT checkpoint as a flash-servable safetensors adapter.
 
-    ``base_model_revision`` is the externally validated immutable revision from the job spec.
+    ``base_model_revision`` is the externally validated immutable revision from the job spec when
+    the run pins one; unpinned runs leave it empty and stamp ``revision`` as null.
     OpenRLHF's final ``save_model`` consolidates ZeRO-3 state before PEFT export. with ZeRO-3 it
     writes authoritative ``adapter_model.bin`` after PEFT's safetensors output and then removes the
     safetensors file, so a crash state containing both is converted from the bin. conversion runs in
@@ -269,14 +290,19 @@ def export_openrlhf_adapter(
     DeepSpeed recovery checkpoint is accepted only when its matching ``<tag>_hf`` export exists.
     """
     expected_revision = base_model_revision.strip()
-    if not expected_revision:
-        raise ValueError("OpenRLHF adapter export requires a validated base model revision")
-
     source_dir = _openrlhf_adapter_source(ckpt_dir)
-    if os.path.realpath(source_dir) == os.path.realpath(out_adapter_dir):
-        raise ValueError("OpenRLHF checkpoint and adapter output directories must differ")
+    source_realpath = os.path.realpath(source_dir)
+    output_realpath = os.path.realpath(os.path.abspath(out_adapter_dir))
+    common_path = os.path.commonpath((source_realpath, output_realpath))
+    if common_path in {source_realpath, output_realpath}:
+        raise ValueError("OpenRLHF checkpoint and adapter output directories must not overlap")
 
     source_config = os.path.join(source_dir, "adapter_config.json")
+    with open(source_config) as config_file:
+        adapter_config = json.load(config_file)
+    if adapter_config.get("peft_type") != "LORA":
+        raise RuntimeError(f"OpenRLHF PEFT export is not a LoRA adapter: {source_dir}")
+
     source_safetensors = os.path.join(source_dir, "adapter_model.safetensors")
     source_bin = os.path.join(source_dir, "adapter_model.bin")
     if not os.path.isfile(source_safetensors) and not os.path.isfile(source_bin):
@@ -292,7 +318,9 @@ def export_openrlhf_adapter(
             check=True,
         )
         if not os.path.isfile(output_weights):
-            raise RuntimeError("OpenRLHF adapter conversion did not produce adapter_model.safetensors")
+            raise RuntimeError(
+                "OpenRLHF adapter conversion did not produce adapter_model.safetensors"
+            )
     else:
         shutil.copy2(source_safetensors, output_weights)
 
@@ -337,14 +365,14 @@ def stamp_adapter_dir_provenance(
             raise RuntimeError(
                 f"adapter base model {snapshot_model_id!r} does not match validated target {model_id!r}"
             )
-        if model_revision and snapshot_revision != model_revision:
+        if snapshot_revision != model_revision:
             raise RuntimeError("adapter base revision does not match the validated target commit")
     elif current_base and current_base != model_id:
         raise RuntimeError(
             f"adapter base model {current_base!r} does not match validated target {model_id!r}"
         )
     current_revision = str(config.get("revision", "") or "").strip()
-    if current_revision and model_revision and current_revision != model_revision:
+    if current_revision and current_revision != model_revision:
         raise RuntimeError("adapter base revision does not match the validated target commit")
     config["base_model_name_or_path"] = model_id
     config["revision"] = model_revision or None

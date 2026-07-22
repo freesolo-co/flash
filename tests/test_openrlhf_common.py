@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -14,24 +13,16 @@ from flash.engine.worker import openrlhf_common
 
 
 def _resolve_tensor_python() -> str | None:
-    candidates = (sys.executable, "/usr/bin/python3", shutil.which("python3"))
-    seen = set()
-    for candidate in candidates:
-        if candidate is None or candidate in seen:
-            continue
-        seen.add(candidate)
-        try:
-            result = subprocess.run(
-                [candidate, "-c", "import torch, safetensors"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
-            continue
-        if result.returncode == 0:
-            return candidate
-    return None
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch, safetensors"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    return sys.executable if result.returncode == 0 else None
 
 
 _TENSOR_PYTHON = _resolve_tensor_python()
@@ -59,7 +50,8 @@ class _FakeProcess:
 
 def _write_adapter(directory, *, config=None, weight_name="adapter_model.safetensors"):
     directory.mkdir(parents=True)
-    directory.joinpath("adapter_config.json").write_text(json.dumps(config or {}))
+    adapter_config = {"peft_type": "LORA", **(config or {})}
+    directory.joinpath("adapter_config.json").write_text(json.dumps(adapter_config))
     directory.joinpath(weight_name).write_bytes(b"weights")
 
 
@@ -163,6 +155,8 @@ def test_resolve_openrlhf_python_falls_back_to_current_interpreter(monkeypatch, 
 def test_run_openrlhf_training_builds_explicit_entrypoint_and_streams_callbacks(
     monkeypatch, capsys
 ):
+    for name in openrlhf_common._KERNEL_CACHE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
     process = _FakeProcess(["global_step: 3 loss=1.0\n", "done\n"], returncode=7)
     popen_calls = []
 
@@ -210,6 +204,46 @@ def test_run_openrlhf_training_builds_explicit_entrypoint_and_streams_callbacks(
     assert lines == ["global_step: 3 loss=1.0\n", "done\n"]
     assert steps == [3]
     assert capsys.readouterr().out == "global_step: 3 loss=1.0\ndone\n"
+
+
+def test_run_openrlhf_training_ignores_false_step_matches_and_deduplicates(monkeypatch):
+    process = _FakeProcess(
+        [
+            "timestep: 1\n",
+            "micro_batch_step=2\n",
+            "global_step: 3 loss=1.0\n",
+            "step 3 metrics\n",
+            "step=4 metrics\n",
+        ]
+    )
+    monkeypatch.setattr(openrlhf_common.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    steps = []
+
+    assert openrlhf_common.run_openrlhf_training("python", [], env={}, on_step=steps.append) == 0
+    assert steps == [3, 4]
+
+
+def test_run_openrlhf_training_forwards_parent_kernel_cache_env(monkeypatch):
+    process = _FakeProcess([])
+    popen_kwargs = {}
+    for index, name in enumerate(openrlhf_common._KERNEL_CACHE_ENV_VARS):
+        monkeypatch.setenv(name, f"/cache/{index}")
+
+    def fake_popen(_cmd, **kwargs):
+        popen_kwargs.update(kwargs)
+        return process
+
+    monkeypatch.setattr(openrlhf_common.subprocess, "Popen", fake_popen)
+
+    openrlhf_common.run_openrlhf_training(
+        "python",
+        [],
+        env={"TRITON_CACHE_DIR": "/explicit/triton"},
+    )
+
+    assert popen_kwargs["env"]["TRITON_CACHE_DIR"] == "/explicit/triton"
+    for index, name in enumerate(openrlhf_common._KERNEL_CACHE_ENV_VARS[1:], start=1):
+        assert popen_kwargs["env"][name] == f"/cache/{index}"
 
 
 def test_run_openrlhf_training_defaults_to_ppo_entrypoint(monkeypatch):
@@ -298,9 +332,7 @@ def test_run_openrlhf_training_callback_failure_kills_real_process_group(tmp_pat
     _assert_processes_stopped(pids)
 
 
-def test_run_openrlhf_training_escalates_process_group_kill_after_timeout(
-    monkeypatch, tmp_path
-):
+def test_run_openrlhf_training_escalates_process_group_kill_after_timeout(monkeypatch, tmp_path):
     pid_file = tmp_path / "pids.json"
     _write_process_tree_module(tmp_path, ignore_term=True)
     monkeypatch.setattr(openrlhf_common, "_PROCESS_GROUP_TERM_TIMEOUT_S", 0.15)
@@ -330,9 +362,7 @@ def test_run_openrlhf_training_escalates_process_group_kill_after_timeout(
 def test_run_openrlhf_training_heartbeat_aborts_silent_child(tmp_path):
     pid_file = tmp_path / "pid.txt"
     tmp_path.joinpath("silent_entry.py").write_text(
-        "import os, sys, time\n"
-        "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
-        "time.sleep(60)\n"
+        "import os, sys, time\nopen(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(60)\n"
     )
     started = time.monotonic()
 
@@ -373,17 +403,35 @@ def test_export_openrlhf_adapter_matching_revision_copies_and_stamps_base(tmp_pa
     assert output.joinpath("adapter_model.safetensors").read_bytes() == b"weights"
     config = json.loads(output.joinpath("adapter_config.json").read_text())
     assert config == {
+        "peft_type": "LORA",
         "r": 16,
         "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
         "revision": "abc123",
     }
 
 
-def test_export_openrlhf_adapter_requires_validated_expected_revision(tmp_path):
+def test_export_openrlhf_adapter_allows_unpinned_base_revision(tmp_path):
     checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "adapter"
     _write_adapter(checkpoint, config={"revision": None})
 
-    with pytest.raises(ValueError, match="requires a validated base model revision"):
+    openrlhf_common.export_openrlhf_adapter(
+        str(checkpoint),
+        str(output),
+        "Qwen/Qwen3.5-0.8B",
+        "",
+        _TENSOR_PYTHON,
+    )
+
+    config = json.loads(output.joinpath("adapter_config.json").read_text())
+    assert config["revision"] is None
+
+
+def test_export_openrlhf_adapter_rejects_non_lora_peft_export(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    _write_adapter(checkpoint, config={"peft_type": "IA3", "revision": None})
+
+    with pytest.raises(RuntimeError, match="is not a LoRA adapter"):
         openrlhf_common.export_openrlhf_adapter(
             str(checkpoint),
             str(tmp_path / "adapter"),
@@ -391,6 +439,24 @@ def test_export_openrlhf_adapter_requires_validated_expected_revision(tmp_path):
             "",
             _TENSOR_PYTHON,
         )
+
+
+@pytest.mark.parametrize("output_location", ["ancestor", "descendant"])
+def test_export_openrlhf_adapter_rejects_overlapping_output_paths(tmp_path, output_location):
+    checkpoint = tmp_path / "run" / "checkpoint"
+    _write_adapter(checkpoint, config={"revision": None})
+    output = checkpoint.parent if output_location == "ancestor" else checkpoint / "adapter"
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        openrlhf_common.export_openrlhf_adapter(
+            str(checkpoint),
+            str(output),
+            "Qwen/Qwen3.5-0.8B",
+            "",
+            _TENSOR_PYTHON,
+        )
+
+    assert checkpoint.joinpath("adapter_model.safetensors").read_bytes() == b"weights"
 
 
 def test_export_openrlhf_adapter_rejects_mismatched_revision(tmp_path):
@@ -460,7 +526,13 @@ def test_export_openrlhf_adapter_converts_real_zero3_peft_bin(tmp_path):
     output = tmp_path / "adapter"
     checkpoint.mkdir()
     checkpoint.joinpath("adapter_config.json").write_text(
-        json.dumps({"base_model_name_or_path": None, "revision": "abc123"})
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "base_model_name_or_path": None,
+                "revision": "abc123",
+            }
+        )
     )
     _create_tensor_weights(checkpoint / "adapter_model.bin", [1.5, -2.0])
 
@@ -482,7 +554,13 @@ def test_export_openrlhf_adapter_prefers_authoritative_bin_when_both_weights_exi
     output = tmp_path / "adapter"
     checkpoint.mkdir()
     checkpoint.joinpath("adapter_config.json").write_text(
-        json.dumps({"base_model_name_or_path": None, "revision": "abc123"})
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "base_model_name_or_path": None,
+                "revision": "abc123",
+            }
+        )
     )
     _create_tensor_weights(checkpoint / "adapter_model.bin", [1.0])
     _create_tensor_weights(checkpoint / "adapter_model.safetensors", [99.0], safetensors=True)
@@ -517,11 +595,49 @@ def test_export_openrlhf_adapter_resolves_matching_deepspeed_hf_export(tmp_path)
     assert output.joinpath("adapter_model.safetensors").read_bytes() == b"weights"
 
 
+def test_export_openrlhf_adapter_resolves_sft_deepspeed_hf_export(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_tag = checkpoint_root / "global_step2"
+    checkpoint_tag.mkdir(parents=True)
+    hf_export = checkpoint_root / "global_step2_hf"
+    output = tmp_path / "adapter"
+    _write_adapter(hf_export, config={"revision": "abc123"})
+
+    openrlhf_common.export_openrlhf_adapter(
+        str(checkpoint_tag),
+        str(output),
+        "Qwen/Qwen3.5-0.8B",
+        "abc123",
+        _TENSOR_PYTHON,
+    )
+
+    assert output.joinpath("adapter_model.safetensors").read_bytes() == b"weights"
+
+
 def test_export_openrlhf_adapter_resolves_checkpoint_root_latest(tmp_path):
     checkpoint_root = tmp_path / "checkpoints"
     actor_dir = checkpoint_root / "_actor"
     actor_dir.mkdir(parents=True)
     actor_dir.joinpath("latest").write_text("global_step8\n")
+    hf_export = checkpoint_root / "global_step8_hf"
+    output = tmp_path / "adapter"
+    _write_adapter(hf_export, config={"revision": "abc123"})
+
+    openrlhf_common.export_openrlhf_adapter(
+        str(checkpoint_root),
+        str(output),
+        "Qwen/Qwen3.5-0.8B",
+        "abc123",
+        _TENSOR_PYTHON,
+    )
+
+    assert output.joinpath("adapter_model.safetensors").read_bytes() == b"weights"
+
+
+def test_export_openrlhf_adapter_resolves_sft_checkpoint_root_latest(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    checkpoint_root.joinpath("latest").write_text("global_step8\n")
     hf_export = checkpoint_root / "global_step8_hf"
     output = tmp_path / "adapter"
     _write_adapter(hf_export, config={"revision": "abc123"})
@@ -579,9 +695,7 @@ def test_stamp_adapter_dir_provenance_validates_and_stamps_revision(tmp_path):
         },
     )
 
-    openrlhf_common.stamp_adapter_dir_provenance(
-        str(adapter), "Qwen/Qwen3.5-0.8B", "abc123"
-    )
+    openrlhf_common.stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", "abc123")
 
     config = json.loads(adapter.joinpath("adapter_config.json").read_text())
     assert config["base_model_name_or_path"] == "Qwen/Qwen3.5-0.8B"
@@ -611,6 +725,15 @@ def test_stamp_adapter_dir_provenance_rejects_mismatch(tmp_path, config, message
     _write_adapter(adapter, config=config)
 
     with pytest.raises(RuntimeError, match=message):
-        openrlhf_common.stamp_adapter_dir_provenance(
-            str(adapter), "Qwen/Qwen3.5-0.8B", "new"
-        )
+        openrlhf_common.stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", "new")
+
+
+def test_stamp_adapter_dir_provenance_does_not_clear_existing_revision(tmp_path):
+    adapter = tmp_path / "adapter"
+    _write_adapter(
+        adapter,
+        config={"base_model_name_or_path": "Qwen/Qwen3.5-0.8B", "revision": "abc123"},
+    )
+
+    with pytest.raises(RuntimeError, match="revision does not match"):
+        openrlhf_common.stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", "")
