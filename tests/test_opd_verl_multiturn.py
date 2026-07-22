@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import threading
+import time
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -19,7 +21,6 @@ from flash.engine.worker.opd_verl_multiturn import (
 from flash.engine.worker.opd_verl_plugin import (
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
-    _turn_outputs,
     deterministic_rollout_seed,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
@@ -241,7 +242,13 @@ def test_bridge_scores_each_turn_against_its_pre_turn_snapshot_in_one_batch():
         "messages": [{"role": "tool", "content": "obs-1"}],
         "terminal": False,
     }
-    second_prefix = [1, 2, *first["response_ids"], 70, 71]
+    glue = EnvGlueTokenizer(bridge.tokenizer, thinking=False)(reply["messages"])
+    second_prefix = [
+        1,
+        2,
+        *first["response_ids"],
+        *glue[1:],
+    ]
     second = bridge.step_multiturn(
         _step_payload("episode", 1, second_prefix, "BC")
     )
@@ -270,6 +277,103 @@ def test_bridge_scores_each_turn_against_its_pre_turn_snapshot_in_one_batch():
     ]
 
 
+def test_bridge_rejects_every_forged_or_incomplete_environment_context():
+    for case in (
+        "missing_glue",
+        "changed_glue",
+        "extra_suffix",
+        "dropped_assistant",
+        "reordered_assistant",
+    ):
+        bridge, _env, _teacher = _bridge()
+        bridge.start_multiturn(
+            index=0,
+            session_id=case,
+            prompt_ids=[1, 2],
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+        first = _step_payload(case, 0, [1, 2], "AB")
+        reply = bridge.step_multiturn(first)
+        glue = EnvGlueTokenizer(bridge.tokenizer, thinking=False)(reply["messages"])[1:]
+        valid = [1, 2, *first["response_ids"], *glue]
+        if case == "missing_glue":
+            forged = [1, 2, *first["response_ids"]]
+        elif case == "changed_glue":
+            forged = list(valid)
+            forged[-1] += 1
+        elif case == "extra_suffix":
+            forged = [*valid, 70]
+        elif case == "dropped_assistant":
+            forged = [1, 2, *glue]
+        else:
+            forged = [1, 2, *reversed(first["response_ids"]), *glue]
+        with pytest.raises(ValueError, match="exactly match the authenticated"):
+            bridge.step_multiturn(_step_payload(case, 1, forged, "C"))
+
+
+def test_per_example_turn_limit_executes_cap_turn_environment_transition_once():
+    bridge, env, _teacher = _bridge(max_turns=4)
+    bridge.prompts[0].example["turn_limit"] = 1
+    start = bridge.start_multiturn(
+        index=0,
+        session_id="one-turn",
+        prompt_ids=[1, 2],
+        raw_prompt=[{"role": "user", "content": "q"}],
+    )
+
+    result = bridge.step_multiturn(_step_payload("one-turn", 0, [1, 2], "A"))
+
+    assert start == {"max_turns": 1}
+    assert result["terminal"] is True
+    assert env.step_calls == [(id(env.states[0]), ("A",))]
+    assert env.states[0]["assistant"] == ["A"]
+
+
+def test_bridge_start_close_are_idempotent_and_closed_sessions_cannot_resurrect():
+    bridge, env, _teacher = _bridge()
+    kwargs = {
+        "index": 0,
+        "session_id": "idempotent",
+        "prompt_ids": [1, 2],
+        "raw_prompt": [{"role": "user", "content": "q"}],
+    }
+
+    assert bridge.start_multiturn(**kwargs) == {"max_turns": 2}
+    assert bridge.start_multiturn(**kwargs) == {"max_turns": 2}
+    assert len(env.states) == 1
+    assert bridge.active_session_count == 1
+    assert bridge.close_multiturn("idempotent") == {"ok": True}
+    assert bridge.close_multiturn("idempotent") == {"ok": True}
+    assert bridge.active_session_count == 0
+    with pytest.raises(ValueError, match="already closed"):
+        bridge.start_multiturn(**kwargs)
+
+
+def test_periodic_session_reaper_bounds_abandoned_sessions():
+    bridge, _env, _teacher = _bridge()
+    bridge.session_lease_s = 0.02
+    bridge.session_reap_interval_s = 0.005
+    bridge.start()
+    try:
+        bridge.start_multiturn(
+            index=0,
+            session_id="abandoned",
+            prompt_ids=[1, 2],
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with bridge._sessions_lock:
+                if not bridge._sessions:
+                    break
+            time.sleep(0.005)
+        with bridge._sessions_lock:
+            assert bridge._sessions == {}
+            assert "abandoned" in bridge._session_tombstones
+    finally:
+        bridge.close()
+
+
 def test_bridge_serializes_tool_steps_and_isolates_rollout_sessions():
     bridge, env, _teacher = _bridge(max_turns=4)
     for session_id in ("left", "right"):
@@ -286,10 +390,31 @@ def test_bridge_serializes_tool_steps_and_isolates_rollout_sessions():
     assert [state["assistant"] for state in env.states] == [["l"], ["r"]]
 
 
-def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128, max_turns=4):
+def _make_loop(
+    monkeypatch,
+    generated_turns,
+    step_replies,
+    *,
+    max_model_len=128,
+    max_turns=4,
+    phase_control=None,
+):
     tokenizer = _ChatTokenizer()
-    calls = {"steps": [], "sampling": [], "closed": 0, "registry": {}}
+    active_sessions = set()
+    calls = {
+        "steps": [],
+        "sampling": [],
+        "closed": 0,
+        "registry": {},
+        "active_sessions": active_sessions,
+    }
     sessions = {"turns": []}
+
+    def block_phase(phase):
+        if phase_control is None or phase_control["phase"] != phase:
+            return
+        phase_control["entered"].set()
+        assert phase_control["release"].wait(timeout=2.0)
 
     class Output:
         def __init__(self, **kwargs):
@@ -312,6 +437,9 @@ def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128,
 
         async def generate(self, **kwargs):
             calls["sampling"].append(dict(kwargs["sampling_params"]))
+            if phase_control is not None and phase_control["phase"] == "generation":
+                phase_control["entered"].set()
+                assert await asyncio.to_thread(phase_control["release"].wait, 2.0)
             token_ids, stop_reason = next(self.turns)
             return SimpleNamespace(
                 token_ids=list(token_ids),
@@ -330,12 +458,19 @@ def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128,
 
     def post_json(_url, _token, path, payload):
         if path == "/multiturn/start":
+            active_sessions.add(payload["session_id"])
+            block_phase("start")
+            if phase_control is not None and phase_control["phase"] == "start_error":
+                phase_control["entered"].set()
+                raise OSError("lost start response")
             return {"max_turns": max_turns}
         if path == "/multiturn/step":
+            block_phase("step")
             calls["steps"].append(payload)
             sessions["turns"].append(payload)
             return step_replies[len(calls["steps"]) - 1]
         if path == "/multiturn/score":
+            block_phase("score")
             return {
                 "turns": [
                     {
@@ -348,6 +483,7 @@ def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128,
                 ]
             }
         if path == "/multiturn/close":
+            active_sessions.discard(payload["session_id"])
             calls["closed"] += 1
             return {"ok": True}
         raise AssertionError(path)
@@ -403,6 +539,10 @@ def test_child_rollout_expands_two_turns_with_exact_order_and_seam_dedup(monkeyp
     glue = tokenizer("t:obs|a:", add_special_tokens=False).input_ids
 
     assert len(outputs) == 2
+    for output in outputs:
+        expected_length = len(output.prompt_ids) + len(output.response_ids)
+        assert tuple(output.extra_fields["teacher_ids"].shape) == (expected_length, 1)
+        assert tuple(output.extra_fields["teacher_logprobs"].shape) == (expected_length, 1)
     assert outputs[0].prompt_ids == initial
     assert outputs[0].response_ids == [ord("A"), ord("|")]
     assert outputs[0].response_mask == [1, 1]
@@ -412,6 +552,70 @@ def test_child_rollout_expands_two_turns_with_exact_order_and_seam_dedup(monkeyp
     assert ord("o") not in outputs[0].response_ids + outputs[1].response_ids
     assert calls["sampling"][0]["seed"] != calls["sampling"][1]["seed"]
     assert "<locals>" not in calls["registry"]["flash_multi_turn"]
+    assert calls["closed"] == 1
+
+
+@pytest.mark.parametrize("phase", ["start", "generation", "step", "score"])
+def test_child_cancellation_closes_active_session_after_inflight_work(monkeypatch, phase):
+    control = {
+        "phase": phase,
+        "entered": threading.Event(),
+        "release": threading.Event(),
+    }
+    loop_class, calls, _tokenizer = _make_loop(
+        monkeypatch,
+        [([ord("A"), ord("|")], "completed")],
+        [{"messages": [], "terminal": True}],
+        max_turns=1,
+        phase_control=control,
+    )
+
+    async def run_and_cancel():
+        task = asyncio.create_task(
+            loop_class().run(
+                {},
+                raw_prompt=[{"role": "user", "content": "q"}],
+                global_steps=0,
+                index=0,
+                session_id=0,
+            )
+        )
+        assert await asyncio.to_thread(control["entered"].wait, 1.0)
+        task.cancel()
+        control["release"].set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_and_cancel())
+    assert calls["active_sessions"] == set()
+    assert calls["closed"] == 1
+
+
+def test_child_lost_start_response_still_closes_session(monkeypatch):
+    control = {
+        "phase": "start_error",
+        "entered": threading.Event(),
+        "release": threading.Event(),
+    }
+    loop_class, calls, _tokenizer = _make_loop(
+        monkeypatch,
+        [],
+        [],
+        phase_control=control,
+    )
+
+    async def run():
+        with pytest.raises(OSError, match="lost start response"):
+            await loop_class().run(
+                {},
+                raw_prompt=[{"role": "user", "content": "q"}],
+                global_steps=0,
+                index=0,
+                session_id=0,
+            )
+
+    asyncio.run(run())
+    assert calls["active_sessions"] == set()
     assert calls["closed"] == 1
 
 
@@ -493,14 +697,101 @@ def test_prepare_assistant_turn_rejects_cap_only_and_trims_stop_sequence():
     assert stopped["completion_text"] == "A"
 
 
-def test_variable_turn_output_normalization_and_no_signal_filtering():
+@pytest.mark.opd_verl_backend
+def test_verl_actor_postprocess_promotes_teacher_tensors_for_every_output(monkeypatch):
+    import importlib.metadata
+
+    torch = pytest.importorskip("torch")
+    assert importlib.metadata.version("verl") == "0.8.0"
+    assert importlib.metadata.version("ray")
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+    from verl.trainer import main_ppo_sync
+
+    actor_class = main_ppo_sync.AgentLoopWorkerTQ
+    worker_class = actor_class.__ray_metadata__.modified_class
+    worker = object.__new__(worker_class)
+    captured = {}
+    teacher_calls = []
+
+    async def compute_score(_self, _outputs, kwargs):
+        assert kwargs["uid"] == "rollout"
+
+    async def compute_teacher(_self, output, **_kwargs):
+        teacher_calls.append(output)
+        assert "teacher_ids" in output.extra_fields
+        assert "teacher_logprobs" in output.extra_fields
+
+    def compute_multi_modal_inputs(_self, _output, _input_ids):
+        return None
+
+    def compute_position_ids(_self, input_ids, _attention_mask, _multi_modal_inputs):
+        return torch.arange(input_ids.shape[1], dtype=torch.int64).unsqueeze(0)
+
+    async def async_kv_batch_put(**kwargs):
+        captured.update(kwargs)
+
+    worker._compute_score = MethodType(compute_score, worker)
+    worker._compute_teacher_logprobs = MethodType(compute_teacher, worker)
+    worker._compute_multi_modal_inputs = MethodType(compute_multi_modal_inputs, worker)
+    worker._compute_position_ids = MethodType(compute_position_ids, worker)
+    monkeypatch.setattr(
+        main_ppo_sync,
+        "tq",
+        SimpleNamespace(async_kv_batch_put=async_kv_batch_put),
+    )
+
+    outputs = []
+    for offset in (0, 10):
+        teacher_ids = torch.tensor([[-1], [offset], [-1], [-1]], dtype=torch.int32)
+        teacher_logprobs = torch.tensor(
+            [[0.0], [-0.25 - offset], [0.0], [0.0]], dtype=torch.float32
+        )
+        outputs.append(
+            AgentLoopOutput(
+                prompt_ids=[1, 2],
+                response_ids=[3 + offset, 4 + offset],
+                response_mask=[1, 1],
+                num_turns=1,
+                metrics={
+                    "generate_sequences": 0.0,
+                    "tool_calls": 0.0,
+                    "compute_score": 0.0,
+                    "num_preempted": 0,
+                },
+                extra_fields={
+                    "teacher_ids": teacher_ids,
+                    "teacher_logprobs": teacher_logprobs,
+                },
+            )
+        )
+
+    asyncio.run(
+        worker_class._agent_loop_postprocess(
+            worker,
+            outputs,
+            False,
+            uid="rollout",
+            session_id=0,
+            global_steps=1,
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+
+    assert teacher_calls == [outputs[-1]]
+    fields = captured["fields"]
+    assert tuple(fields["teacher_ids"].shape) == (2, 4, 1)
+    assert tuple(fields["teacher_logprobs"].shape) == (2, 4, 1)
+    assert fields["teacher_ids"][0, 1, 0].item() == 0
+    assert fields["teacher_ids"][1, 1, 0].item() == 10
+
+
+def test_variable_turn_no_signal_filtering():
     torch = pytest.importorskip("torch")
     teacher_ids = torch.tensor(
         [[-1, 0, -1], [-1, -1, -1], [-1, 2, -1]]
     ).unsqueeze(-1)
 
-    assert _turn_outputs(["a0", "a1"]) == ["a0", "a1"]
-    assert _turn_outputs("b0") == ["b0"]
     assert _full_sequence_signal_sequences(teacher_ids).tolist() == [True, False, True]
 
 

@@ -73,10 +73,6 @@ def _full_sequence_signal_sequences(group_ids):
     return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
 
 
-def _turn_outputs(output):
-    return output if isinstance(output, list) else [output]
-
-
 def _flash_groupwise_reverse_kl_values(
     student_logprobs,
     teacher_logsums,
@@ -127,6 +123,39 @@ class FlashTeacherBridgeError(RuntimeError):
     def __init__(self, message: str, *, classification: str) -> None:
         super().__init__(message)
         self.classification = classification
+
+
+class _AllNoSignalBatch(RuntimeError):
+    def __init__(self, batch) -> None:
+        super().__init__("flash OPD rollout attempt produced no aligned teacher signal")
+        self.batch = batch
+
+
+def _run_with_no_signal_replacements(
+    run_attempt,
+    cleanup_attempt,
+    prepare_replacement,
+    record_resample,
+    record_abandoned,
+    *,
+    max_attempts: int = 3,
+):
+    """retry an all-no-signal rollout with a fresh bounded dispatch."""
+    if max_attempts <= 0:
+        raise ValueError("flash OPD no-signal attempt limit must be positive")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return run_attempt()
+        except _AllNoSignalBatch as error:
+            cleanup_attempt(error.batch)
+            if attempt == max_attempts:
+                record_abandoned()
+                raise RuntimeError(
+                    f"flash OPD produced no aligned teacher signal after {max_attempts} rollout attempts"
+                ) from error
+            record_resample()
+            prepare_replacement()
+    raise AssertionError("unreachable no-signal replacement state")
 
 
 def _multi_modal_image_count(multi_modal_data) -> int:
@@ -270,7 +299,7 @@ def _install_verl_extensions() -> None:
         DistillationLossSettings,
         register_distillation_loss,
     )
-    from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ, PPOTrainer
+    from verl.trainer.main_ppo_sync import PPOTrainer
     from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
     from verl.utils.config import omega_conf_to_dataclass
     from verl.utils.metric import AggregationType, Metric, reduce_metrics
@@ -396,24 +425,6 @@ def _install_verl_extensions() -> None:
                 if existing_ids is None or existing_logprobs is None:
                     raise RuntimeError("flash OPD teacher metadata is incomplete")
                 return
-            precomputed_ids = output.extra_fields.pop("flash_teacher_ids", None)
-            precomputed_logprobs = output.extra_fields.pop(
-                "flash_teacher_logprobs", None
-            )
-            if precomputed_ids is not None or precomputed_logprobs is not None:
-                if precomputed_ids is None or precomputed_logprobs is None:
-                    raise RuntimeError("multi-turn OPD teacher metadata is incomplete")
-                teacher_ids = torch.tensor(precomputed_ids, dtype=torch.int32).unsqueeze(-1)
-                teacher_logprobs = torch.tensor(
-                    precomputed_logprobs, dtype=torch.float32
-                ).unsqueeze(-1)
-                if teacher_ids.shape != teacher_logprobs.shape:
-                    raise RuntimeError("multi-turn OPD teacher tensors are inconsistent")
-                if teacher_ids.shape[0] != len(prompt_ids) + len(response_ids):
-                    raise RuntimeError("multi-turn OPD teacher tensors have the wrong sequence length")
-                output.extra_fields["teacher_ids"] = teacher_ids
-                output.extra_fields["teacher_logprobs"] = teacher_logprobs
-                return
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -454,22 +465,6 @@ def _install_verl_extensions() -> None:
 
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
-
-    original_tq_postprocess = AgentLoopWorkerTQ._agent_loop_postprocess
-
-    async def postprocess_all_turn_outputs(self, output, validate, **kwargs):
-        outputs = _turn_outputs(output)
-        for turn in outputs:
-            await self._compute_teacher_logprobs(
-                turn,
-                prompt_ids=turn.prompt_ids,
-                response_ids=turn.response_ids,
-                validate=validate,
-                sample_kwargs=kwargs,
-            )
-        return await original_tq_postprocess(self, outputs, validate, **kwargs)
-
-    AgentLoopWorkerTQ._agent_loop_postprocess = postprocess_all_turn_outputs
 
     @register("flash_single_turn")
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
@@ -534,7 +529,7 @@ def _install_verl_extensions() -> None:
         keys = [key for key, selected in zip(batch.keys, keep.tolist(), strict=True) if selected]
         tags = [tag for tag, selected in zip(batch.tags, keep.tolist(), strict=True) if selected]
         if not keys:
-            raise RuntimeError("flash OPD step produced no aligned teacher signal")
+            raise _AllNoSignalBatch(batch)
         return KVBatchMeta(
             keys=keys,
             tags=tags,
@@ -549,6 +544,35 @@ def _install_verl_extensions() -> None:
             super().init_workers()
             self.use_teacher_policy = True
             self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+
+        def step(self, batch_dict, metrics, timing_raw):
+            def run_attempt():
+                return super(FlashPPOTrainer, self).step(batch_dict, metrics, timing_raw)
+
+            def cleanup_attempt(batch) -> None:
+                prompt_keys = [str(uid) for uid in batch_dict["uid"]]
+                keys = list(dict.fromkeys([*batch.keys, *prompt_keys]))
+                tq.kv_clear(keys=keys, partition_id=batch.partition_id)
+                self.replay_buffer.remove(batch.partition_id, keys)
+
+            def prepare_replacement() -> None:
+                self.checkpoint_manager.update_weights()
+
+            def record(path: str) -> None:
+                _post_json(
+                    os.environ["FLASH_OPD_BRIDGE_URL"],
+                    os.environ["FLASH_OPD_BRIDGE_TOKEN"],
+                    path,
+                    {},
+                )
+
+            return _run_with_no_signal_replacements(
+                run_attempt,
+                cleanup_attempt,
+                prepare_replacement,
+                lambda: record("/no-signal/resample"),
+                lambda: record("/no-signal/abandoned"),
+            )
 
         def _compute_reward_colocate(self, batch, metrics):
             data = tq.kv_batch_get(

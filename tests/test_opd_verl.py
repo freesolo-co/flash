@@ -33,6 +33,7 @@ from flash.engine.worker.opd_verl import (
 )
 from flash.engine.worker.opd_verl_plugin import (
     FlashTeacherBridgeError,
+    _AllNoSignalBatch,
     _bridge_score_payload,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
@@ -41,6 +42,7 @@ from flash.engine.worker.opd_verl_plugin import (
     _raw_prompt_has_image_block,
     _require_structured_runtime_versions,
     _resolve_image_token_id,
+    _run_with_no_signal_replacements,
     _set_current_global_batch_info,
     _signal_sequences,
     deterministic_rollout_seed,
@@ -252,6 +254,35 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
         [[-1, -1, 0, -1], [-1, -1, -1, -1], [-1, 2, 2, -1]]
     ).unsqueeze(-1)
     assert _full_sequence_signal_sequences(full_sequence_ids).tolist() == [True, False, True]
+
+
+def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
+    attempts = []
+    cleaned = []
+    prepared = []
+    resamples = []
+    abandoned = []
+
+    def run_attempt():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise _AllNoSignalBatch("empty-batch")
+        return "usable-batch"
+
+    result = _run_with_no_signal_replacements(
+        run_attempt,
+        cleaned.append,
+        lambda: prepared.append(True),
+        lambda: resamples.append(True),
+        lambda: abandoned.append(True),
+    )
+
+    assert result == "usable-batch"
+    assert attempts == [1, 2]
+    assert cleaned == ["empty-batch"]
+    assert prepared == [True]
+    assert resamples == [True]
+    assert abandoned == []
 
 
 def test_shifted_group_metadata_uses_verl_prediction_layout():
@@ -1647,7 +1678,8 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert "Role.TeacherModel" not in source
     assert 'params["structured_outputs"]' in source
     assert "build_flash_multi_turn_agent_loop" in source
-    assert "AgentLoopWorkerTQ._agent_loop_postprocess" in source
+    assert "AgentLoopWorkerTQ._agent_loop_postprocess" not in source
+    assert "_run_with_no_signal_replacements" in source
     assert 'params["logprobs"]' not in source
 
 

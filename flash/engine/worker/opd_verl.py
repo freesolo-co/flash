@@ -39,6 +39,8 @@ from flash.engine.worker.opd_gkd import (
     student_tokens_with_offsets,
 )
 from flash.engine.worker.opd_verl_multiturn import (
+    EnvGlueTokenizer,
+    _dedup_seam_terminator,
     validate_glue_template,
     validate_teacher_messages,
 )
@@ -217,6 +219,9 @@ class _TeacherAlignmentBridge:
         active_env=None,
         multi_turn: bool = False,
         max_turns: int = 0,
+        thinking: bool = False,
+        session_lease_s: float = 1800.0,
+        session_reap_interval_s: float = 30.0,
         initial_state: dict | None = None,
     ) -> None:
         state = initial_state or {}
@@ -230,6 +235,15 @@ class _TeacherAlignmentBridge:
         self.active_env = active_env
         self.multi_turn = bool(multi_turn)
         self.max_turns = int(max_turns)
+        self._env_glue = (
+            EnvGlueTokenizer(tokenizer, thinking=bool(thinking)) if self.multi_turn else None
+        )
+        self.session_lease_s = float(session_lease_s)
+        self.session_reap_interval_s = float(session_reap_interval_s)
+        if self.multi_turn and self.session_lease_s <= 0:
+            raise ValueError("multi-turn OPD session lease must be positive")
+        if self.multi_turn and self.session_reap_interval_s <= 0:
+            raise ValueError("multi-turn OPD session reaper interval must be positive")
         self.mutation_callback = mutation_callback
         self.token = hashlib.sha256(os.urandom(32)).hexdigest()
         self._server = None
@@ -237,6 +251,9 @@ class _TeacherAlignmentBridge:
         self._env_lock = threading.Lock()
         self._sessions_lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
+        self._session_tombstones: dict[str, float] = {}
+        self._session_reaper_stop = threading.Event()
+        self._session_reaper_thread = None
         self._mutation_lock = threading.Lock()
         self._mutation_notified = False
         self._stats_lock = threading.Lock()
@@ -408,11 +425,51 @@ class _TeacherAlignmentBridge:
         if self.max_turns <= 0:
             raise ValueError("flash OPD bridge multi-turn limit is invalid")
 
-    def _session(self, session_id: str) -> dict:
+    @staticmethod
+    def _validate_session_id(session_id: str) -> str:
         if not isinstance(session_id, str) or not session_id or len(session_id) > 256:
             raise ValueError("flash OPD bridge received an invalid rollout session id")
+        return session_id
+
+    def _reap_stale_sessions_locked(self, now: float) -> None:
+        stale = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session["lease_deadline"] <= now
+        ]
+        for session_id in stale:
+            self._sessions.pop(session_id, None)
+            self._session_tombstones[session_id] = now + self.session_lease_s
+        expired_tombstones = [
+            session_id
+            for session_id, deadline in self._session_tombstones.items()
+            if deadline <= now
+        ]
+        for session_id in expired_tombstones:
+            self._session_tombstones.pop(session_id, None)
+
+    def _reap_stale_sessions(self, now: float | None = None) -> None:
         with self._sessions_lock:
+            self._reap_stale_sessions_locked(time.monotonic() if now is None else float(now))
+
+    def _session_reaper_loop(self) -> None:
+        while not self._session_reaper_stop.wait(self.session_reap_interval_s):
+            self._reap_stale_sessions()
+
+    @property
+    def active_session_count(self) -> int:
+        with self._sessions_lock:
+            self._reap_stale_sessions_locked(time.monotonic())
+            return len(self._sessions)
+
+    def _session(self, session_id: str) -> dict:
+        session_id = self._validate_session_id(session_id)
+        with self._sessions_lock:
+            now = time.monotonic()
+            self._reap_stale_sessions_locked(now)
             session = self._sessions.get(session_id)
+            if session is not None:
+                session["lease_deadline"] = now + self.session_lease_s
         if session is None:
             raise ValueError("flash OPD bridge received an unknown rollout session id")
         return session
@@ -437,39 +494,56 @@ class _TeacherAlignmentBridge:
         raw_prompt = validate_teacher_messages(raw_prompt, source="child initial prompt")
         if raw_prompt != prompt.student_messages:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
-        if not isinstance(session_id, str) or not session_id or len(session_id) > 256:
-            raise ValueError("flash OPD bridge received an invalid rollout session id")
-        with self._env_lock:
-            state = self.active_env.new_rollout_state(prompt.example)
-            initial_messages = state.get("prompt") or state.get("messages")
-            initial_messages = validate_teacher_messages(
-                initial_messages, source="environment initial prompt"
-            )
-        if initial_messages != prompt.student_messages:
-            raise ValueError("multi-turn environment initial prompt changed after prompt freezing")
-        per_example_limit = state.get("max_episode_turns")
-        if per_example_limit is not None:
-            try:
-                per_example_limit = int(per_example_limit)
-            except (TypeError, ValueError) as error:
-                raise ValueError("multi-turn environment returned an invalid per-example turn limit") from error
-            if per_example_limit <= 0:
-                raise ValueError("multi-turn environment requires a positive per-example turn limit")
-        session = {
-            "index": int(index),
-            "state": state,
-            "messages": [dict(message) for message in initial_messages],
-            "turns": [],
-            "required_prefix": list(prompt.prompt_ids),
-            "terminal": False,
-        }
+        session_id = self._validate_session_id(session_id)
+        start_identity = (
+            int(index),
+            tuple(prompt_ids),
+            json.dumps(raw_prompt, sort_keys=True, separators=(",", ":")),
+        )
         with self._sessions_lock:
-            if session_id in self._sessions:
-                raise ValueError("flash OPD bridge rollout session id was reused")
-            self._sessions[session_id] = session
+            now = time.monotonic()
+            self._reap_stale_sessions_locked(now)
+            if session_id in self._session_tombstones:
+                raise ValueError("flash OPD bridge rollout session was already closed")
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                if existing["start_identity"] != start_identity:
+                    raise ValueError("flash OPD bridge rollout session id was reused")
+                existing["lease_deadline"] = now + self.session_lease_s
+                return {"max_turns": existing["turn_limit"]}
+            with self._env_lock:
+                state = self.active_env.new_rollout_state(prompt.example)
+                initial_messages = state.get("prompt") or state.get("messages")
+                initial_messages = validate_teacher_messages(
+                    initial_messages, source="environment initial prompt"
+                )
+            if initial_messages != prompt.student_messages:
+                raise ValueError("multi-turn environment initial prompt changed after prompt freezing")
+            per_example_limit = state.get("max_episode_turns")
+            if per_example_limit is not None:
+                try:
+                    per_example_limit = int(per_example_limit)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "multi-turn environment returned an invalid per-example turn limit"
+                    ) from error
+                if per_example_limit <= 0:
+                    raise ValueError("multi-turn environment requires a positive per-example turn limit")
+            turn_limit = min(self.max_turns, per_example_limit or self.max_turns)
+            self._sessions[session_id] = {
+                "index": int(index),
+                "state": state,
+                "messages": [dict(message) for message in initial_messages],
+                "turns": [],
+                "required_prefix": list(prompt.prompt_ids),
+                "terminal": False,
+                "turn_limit": turn_limit,
+                "start_identity": start_identity,
+                "lease_deadline": now + self.session_lease_s,
+            }
         with self._stats_lock:
             self.episodes_seen += 1
-        return {"max_turns": self.max_turns}
+        return {"max_turns": turn_limit}
 
     def _validated_multiturn_response(self, payload: dict) -> tuple[list[int], list[int], str, str]:
         raw_response_ids = [int(token_id) for token_id in payload.get("raw_response_ids", [])]
@@ -534,8 +608,10 @@ class _TeacherAlignmentBridge:
             if turn_ordinal != len(session["turns"]):
                 raise ValueError("multi-turn rollout assistant turn ordinal is out of order")
             required_prefix = session["required_prefix"]
-            if accepted_prefix[: len(required_prefix)] != required_prefix:
-                raise ValueError("multi-turn rollout dropped or changed its accepted prefix")
+            if accepted_prefix != required_prefix:
+                raise ValueError(
+                    "multi-turn rollout prompt does not exactly match the authenticated environment context"
+                )
             context_messages = [dict(message) for message in session["messages"]]
             state = session["state"]
             self.active_env.record_model_turn(state, completion_text)
@@ -544,18 +620,25 @@ class _TeacherAlignmentBridge:
             )
             terminal = bool(payload.get("truncated")) or bool(skip_reason)
             messages: list[dict] = []
-            if not terminal:
-                assistant_turns = turn_ordinal + 1
-                terminal = assistant_turns >= self.max_turns or self.active_env.rollout_done(
-                    state, self.max_turns
-                )
+            next_prefix = [*accepted_prefix, *response_ids]
             if not terminal:
                 messages = self.active_env.env_reply(session["messages"], state)
                 messages = validate_teacher_messages(messages, source="environment reply")
                 session["messages"].extend(messages)
-                terminal = not messages or self.active_env.rollout_done(state, self.max_turns)
+                assistant_turns = turn_ordinal + 1
+                turn_limit = session["turn_limit"]
+                terminal = (
+                    not messages
+                    or assistant_turns >= turn_limit
+                    or self.active_env.rollout_done(state, turn_limit)
+                )
+                if not terminal:
+                    assert self._env_glue is not None
+                    next_prefix.extend(
+                        _dedup_seam_terminator(response_ids, self._env_glue(messages))
+                    )
             session["terminal"] = bool(terminal)
-            session["required_prefix"] = [*accepted_prefix, *response_ids]
+            session["required_prefix"] = next_prefix
             session["turns"].append(
                 {
                     "prompt_ids": accepted_prefix,
@@ -632,8 +715,22 @@ class _TeacherAlignmentBridge:
         return {"turns": results}
 
     def close_multiturn(self, session_id: str) -> dict:
+        session_id = self._validate_session_id(session_id)
         with self._sessions_lock:
+            now = time.monotonic()
+            self._reap_stale_sessions_locked(now)
             self._sessions.pop(session_id, None)
+            self._session_tombstones[session_id] = now + self.session_lease_s
+        return {"ok": True}
+
+    def record_no_signal_resample(self) -> dict:
+        with self._stats_lock:
+            self.no_signal_resamples += 1
+        return {"ok": True}
+
+    def record_no_signal_abandoned(self) -> dict:
+        with self._stats_lock:
+            self.no_signal_skipped_steps += 1
         return {"ok": True}
 
     def notify_mutation(self) -> None:
@@ -685,6 +782,10 @@ class _TeacherAlignmentBridge:
                         result = bridge.score_multiturn(payload["session_id"])
                     elif self.path == "/multiturn/close":
                         result = bridge.close_multiturn(payload["session_id"])
+                    elif self.path == "/no-signal/resample":
+                        result = bridge.record_no_signal_resample()
+                    elif self.path == "/no-signal/abandoned":
+                        result = bridge.record_no_signal_abandoned()
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
                         result = {"ok": True}
@@ -712,6 +813,13 @@ class _TeacherAlignmentBridge:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        if self.multi_turn:
+            self._session_reaper_stop.clear()
+            self._session_reaper_thread = threading.Thread(
+                target=self._session_reaper_loop,
+                daemon=True,
+            )
+            self._session_reaper_thread.start()
 
     @property
     def url(self) -> str:
@@ -720,8 +828,12 @@ class _TeacherAlignmentBridge:
         return f"http://127.0.0.1:{self._server.server_port}"
 
     def close(self) -> None:
+        self._session_reaper_stop.set()
+        if self._session_reaper_thread is not None:
+            self._session_reaper_thread.join(timeout=self.session_reap_interval_s + 1.0)
         with self._sessions_lock:
             self._sessions.clear()
+            self._session_tombstones.clear()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -1462,6 +1574,7 @@ def run_opd_verl(spec=None) -> None:
         active_env=env if multi_turn else None,
         multi_turn=multi_turn,
         max_turns=max_turns,
+        thinking=bool(_w.THINKING),
         mutation_callback=_w.publish_opd_optimizer_start_marker,
         initial_state=resume_state,
     )

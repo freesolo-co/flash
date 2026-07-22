@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -218,6 +219,17 @@ def _sum_preemptions(current: int, value: int | None) -> int:
     return current + int(value)
 
 
+async def _run_executor_call(loop, callback):
+    """finish a bridge request before propagating task cancellation."""
+    task = asyncio.ensure_future(loop.run_in_executor(None, callback))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(task)
+        raise
+
+
 def build_flash_multi_turn_agent_loop(
     *,
     register,
@@ -265,10 +277,11 @@ def build_flash_multi_turn_agent_loop(
             outputs = []
             generated_seconds = 0.0
             num_preempted = -1
-            started = False
+            start_attempted = False
             try:
-                start = await self.loop.run_in_executor(
-                    None,
+                start_attempted = True
+                start = await _run_executor_call(
+                    self.loop,
                     lambda: post_json(
                         bridge_url,
                         bridge_token,
@@ -281,7 +294,6 @@ def build_flash_multi_turn_agent_loop(
                         },
                     ),
                 )
-                started = True
                 turn_limit = int(start["max_turns"])
                 if turn_limit <= 0 or turn_limit > max_turns:
                     raise RuntimeError("multi-turn bridge returned an invalid per-example turn limit")
@@ -325,8 +337,8 @@ def build_flash_multi_turn_agent_loop(
                     response_logprobs = generated.log_probs
                     if response_logprobs is not None:
                         response_logprobs = list(response_logprobs[: len(response_ids)])
-                    step = await self.loop.run_in_executor(
-                        None,
+                    step = await _run_executor_call(
+                        self.loop,
                         lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): post_json(
                             bridge_url,
                             bridge_token,
@@ -376,8 +388,8 @@ def build_flash_multi_turn_agent_loop(
                     if len(prefix_ids) + len(glue_ids) > max_model_len - 8:
                         break
                     prefix_ids.extend(glue_ids)
-                score_payload = await self.loop.run_in_executor(
-                    None,
+                score_payload = await _run_executor_call(
+                    self.loop,
                     lambda: post_json(
                         bridge_url,
                         bridge_token,
@@ -388,15 +400,28 @@ def build_flash_multi_turn_agent_loop(
                 scored_turns = score_payload["turns"]
                 if len(scored_turns) != len(outputs):
                     raise RuntimeError("multi-turn bridge returned the wrong number of teacher rows")
+                import torch
+
                 for output, scored in zip(outputs, scored_turns, strict=True):
-                    output.extra_fields["flash_teacher_ids"] = scored["teacher_ids"]
-                    output.extra_fields["flash_teacher_logprobs"] = scored["teacher_logprobs"]
+                    teacher_ids = torch.tensor(scored["teacher_ids"], dtype=torch.int32).unsqueeze(-1)
+                    teacher_logprobs = torch.tensor(
+                        scored["teacher_logprobs"], dtype=torch.float32
+                    ).unsqueeze(-1)
+                    expected_length = len(output.prompt_ids) + len(output.response_ids)
+                    if teacher_ids.shape != teacher_logprobs.shape:
+                        raise RuntimeError("multi-turn OPD teacher tensors are inconsistent")
+                    if teacher_ids.shape[0] != expected_length:
+                        raise RuntimeError(
+                            "multi-turn OPD teacher tensors have the wrong sequence length"
+                        )
+                    output.extra_fields["teacher_ids"] = teacher_ids
+                    output.extra_fields["teacher_logprobs"] = teacher_logprobs
                 return outputs
             finally:
-                if started:
+                if start_attempted:
                     with contextlib.suppress(Exception):
-                        await self.loop.run_in_executor(
-                            None,
+                        await _run_executor_call(
+                            self.loop,
                             lambda: post_json(
                                 bridge_url,
                                 bridge_token,
