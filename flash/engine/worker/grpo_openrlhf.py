@@ -34,6 +34,7 @@ from flash.engine.steps import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.openrlhf_common import (
     export_openrlhf_adapter,
     resolve_openrlhf_python,
@@ -207,6 +208,9 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         _OPENRLHF_REWARD_CLIP_BOUND,
         "--actor.adam.lr",
         str(config.learning_rate),
+        "--actor.adam.betas",
+        "0.9",
+        "0.999",
         "--actor.lr_scheduler",
         "constant",
         "--actor.lr_warmup_ratio",
@@ -671,6 +675,42 @@ def _flash_training_step(self, *args, **kwargs):
 
 _ActorPPOTrainer.training_step = _flash_training_step
 
+_original_deepspeed_initialize = _ppo_actor_module.deepspeed.initialize
+
+
+@functools.wraps(_original_deepspeed_initialize)
+def _flash_deepspeed_initialize(*args, **kwargs):
+    config = kwargs.get("config")
+    optimizer_config = config.get("optimizer") if isinstance(config, dict) else None
+    if not isinstance(optimizer_config, dict) or optimizer_config.get("type") != "AdamW":
+        return _original_deepspeed_initialize(*args, **kwargs)
+    if kwargs.get("optimizer") is not None:
+        raise RuntimeError("flash OpenRLHF GRPO expected DeepSpeed to construct no optimizer")
+    model_parameters = kwargs.get("model_parameters")
+    if model_parameters is None:
+        raise RuntimeError("flash OpenRLHF GRPO received no actor parameters")
+
+    import bitsandbytes as bnb
+
+    params = optimizer_config.get("params") or {}
+    optimizer = bnb.optim.PagedAdamW8bit(
+        model_parameters,
+        lr=float(params["lr"]),
+        betas=tuple(float(value) for value in params["betas"]),
+        eps=float(params["eps"]),
+        weight_decay=float(params["weight_decay"]),
+    )
+    config = dict(config)
+    config.pop("optimizer", None)
+    config["zero_allow_untested_optimizer"] = True
+    kwargs["config"] = config
+    kwargs["optimizer"] = optimizer
+    kwargs["model_parameters"] = None
+    return _original_deepspeed_initialize(*args, **kwargs)
+
+
+_ppo_actor_module.deepspeed.initialize = _flash_deepspeed_initialize
+
 from openrlhf.trainer.ppo_utils.samples_generator import SamplesGenerator as _SamplesGenerator
 
 _original_process_response = _SamplesGenerator._process_response_into_experience
@@ -856,25 +896,28 @@ _original_actor_save_checkpoint = _PolicyModelActorImpl.save_checkpoint
 @functools.wraps(_original_actor_save_checkpoint)
 def _flash_actor_save_checkpoint(self, tag, *args, **kwargs):
     result = _original_actor_save_checkpoint(self, tag, *args, **kwargs)
-    if self.strategy.is_rank_0() and str(tag).startswith("global_step"):
-        step_text = str(tag).removeprefix("global_step")
-        if not step_text.isdigit():
-            raise RuntimeError(f"OpenRLHF emitted an invalid checkpoint tag: {tag}")
-        checkpoint_dir = os.path.abspath(self.strategy.args.ckpt.path)
-        ack_path = os.path.join(checkpoint_dir, f".flash-uploaded-{tag}")
+    tag = str(tag)
+    if not tag.startswith("global_step"):
+        return result
+    step_text = tag.removeprefix("global_step")
+    if not step_text.isdigit():
+        raise RuntimeError(f"OpenRLHF emitted an invalid checkpoint tag: {tag}")
+    checkpoint_dir = os.path.abspath(self.strategy.args.ckpt.path)
+    ack_path = os.path.join(checkpoint_dir, f".flash-uploaded-{tag}")
+    if self.strategy.is_rank_0():
         marker = {
             "step": int(step_text),
-            "tag": str(tag),
+            "tag": tag,
             "checkpoint_dir": checkpoint_dir,
             "adapter_dir": os.path.join(checkpoint_dir, f"{tag}_hf"),
             "ack_path": ack_path,
         }
         print("[flash-openrlhf-checkpoint] " + json.dumps(marker, sort_keys=True), flush=True)
-        deadline = time.monotonic() + 1800.0
-        while not os.path.isfile(ack_path):
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"timed out publishing OpenRLHF checkpoint {tag}")
-            time.sleep(0.1)
+    deadline = time.monotonic() + 1800.0
+    while not os.path.isfile(ack_path):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"timed out publishing OpenRLHF checkpoint {tag}")
+        time.sleep(0.1)
     return result
 
 
@@ -1212,14 +1255,24 @@ def _openrlhf_resume_step(checkpoint_dir: str | None) -> int:
     try:
         with open(latest_path, encoding="utf-8") as latest_file:
             tag = latest_file.read().strip()
-    except OSError:
-        return 0
+    except OSError as exc:
+        raise RuntimeError("OpenRLHF resume checkpoint is missing its latest tag") from exc
     if not tag.startswith("global_step") or not tag.removeprefix("global_step").isdigit():
         raise RuntimeError("OpenRLHF resume checkpoint has an invalid latest tag")
     step = int(tag.removeprefix("global_step"))
     if step <= 0 or not os.path.isdir(os.path.join(checkpoint_dir, "_actor", tag)):
         raise RuntimeError("OpenRLHF resume checkpoint is missing its DeepSpeed state")
     return step
+
+
+def _verified_openrlhf_published_steps(
+    save_at_steps: tuple[int, ...], resumed_step: int
+) -> set[int]:
+    return {
+        int(step)
+        for step in save_at_steps
+        if int(step) <= int(resumed_step) and _deployable_adapter_on_hf(int(step))
+    }
 
 
 def _stage_openrlhf_resume_checkpoint(checkpoint_dir: str, tag: str, step: int) -> str:
@@ -1593,9 +1646,7 @@ def run_rl_openrlhf() -> None:
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
 
-        published_steps: set[int] = {
-            int(step) for step in inputs["save_at_steps"] if int(step) <= resumed_step
-        }
+        published_steps = _verified_openrlhf_published_steps(inputs["save_at_steps"], resumed_step)
         dumped_sample_steps: set[int] = set()
         sent_first_sample_heartbeat = [False]
 

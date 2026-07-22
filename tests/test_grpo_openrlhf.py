@@ -300,6 +300,13 @@ def _install_pinned_sitecustomize_modules(monkeypatch, *, language_model_only=Fa
     deepspeed.module_inject = SimpleNamespace(
         layers=SimpleNamespace(GatherReplacedLayerParams=_GatheredParameters)
     )
+    deepspeed.initialize_calls = []
+
+    def deepspeed_initialize(*args, **kwargs):
+        deepspeed.initialize_calls.append((args, kwargs))
+        return "engine", kwargs.get("optimizer"), None, "scheduler"
+
+    deepspeed.initialize = deepspeed_initialize
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed)
 
     model_utils = types.ModuleType("openrlhf.models.utils")
@@ -515,6 +522,10 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
         "1000000000",
     ]
     assert _value(args, "--actor.adam.lr") == "1e-05"
+    assert args[args.index("--actor.adam.betas") + 1 : args.index("--actor.adam.betas") + 3] == [
+        "0.9",
+        "0.999",
+    ]
     assert _value(args, "--actor.lr_scheduler") == "constant"
     assert _value(args, "--ds.lora.rank") == "32"
     assert _value(args, "--ds.lora.alpha") == "64"
@@ -546,6 +557,7 @@ def test_pinned_openrlhf_parser_accepts_full_generated_args(monkeypatch):
     )
 
     assert parsed.reward.clip_range == [-1_000_000_000.0, 1_000_000_000.0]
+    assert parsed.actor.adam.betas == [0.9, 0.999]
     assert parsed.actor.gradient_checkpointing_reentrant is True
     assert parsed.actor.num_gpus_per_node == 2
     assert parsed.rollout.n_samples_per_prompt == 8
@@ -778,6 +790,8 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "_PPOTrainerImpl.fit = _flash_ppo_fit" in source
     assert "_PPOTrainerImpl.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints" in source
     assert "_PolicyModelActorImpl.save_checkpoint = _flash_actor_save_checkpoint" in source
+    assert "PagedAdamW8bit" in source
+    assert 'config["zero_allow_untested_optimizer"] = True' in source
     assert "self.broadcast_to_vllm()" in source
     assert "[flash-openrlhf-checkpoint]" in source
 
@@ -801,6 +815,55 @@ def test_sitecustomize_patches_sync_and_async_language_only_engine_args(monkeypa
 
     assert vllm.EngineArgs().language_model_only is True
     assert vllm.AsyncEngineArgs().language_model_only is True
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_replaces_actor_adamw_with_paged_8bit(monkeypatch):
+    pytest.importorskip("torch")
+    _install_pinned_sitecustomize_modules(monkeypatch)
+    bitsandbytes = types.ModuleType("bitsandbytes")
+
+    class _PagedAdamW8bit:
+        def __init__(self, parameters, **kwargs):
+            self.parameters = parameters
+            self.kwargs = kwargs
+
+    bitsandbytes.optim = SimpleNamespace(PagedAdamW8bit=_PagedAdamW8bit)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", bitsandbytes)
+    deepspeed = sys.modules["deepspeed"]
+    parameters = [object()]
+    config = {
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": 1e-5,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": 0.0,
+            },
+        }
+    }
+
+    _, optimizer, _, _ = deepspeed.initialize(
+        model=object(),
+        model_parameters=parameters,
+        optimizer=None,
+        config=config,
+    )
+
+    assert isinstance(optimizer, _PagedAdamW8bit)
+    assert optimizer.parameters is parameters
+    assert optimizer.kwargs == {
+        "lr": 1e-5,
+        "betas": (0.9, 0.999),
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+    }
+    forwarded = deepspeed.initialize_calls[-1][1]
+    assert forwarded["model_parameters"] is None
+    assert "optimizer" not in forwarded["config"]
+    assert forwarded["config"]["zero_allow_untested_optimizer"] is True
 
 
 @requires_openrlhf_source
@@ -1050,6 +1113,57 @@ def test_sitecustomize_exact_save_reaches_exported_policy_actor_and_acknowledges
 
 @requires_openrlhf_source
 @requires_torch
+def test_sitecustomize_nonzero_rank_waits_for_checkpoint_ack(monkeypatch, tmp_path):
+    pytest.importorskip("torch")
+    monkeypatch.setenv("FLASH_OPENRLHF_SAVE_AT_STEPS", "3")
+    namespace, _, ppo_actor_module, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    saved = []
+
+    class _Strategy:
+        def __init__(self):
+            self.args = SimpleNamespace(
+                ckpt=SimpleNamespace(path=str(checkpoint_dir), max_num=2, max_mem=0)
+            )
+
+        def save_ckpt(self, model, path, tag, max_num, max_mem, client_states, **kwargs):
+            saved.append((model, path, tag, max_num, max_mem, client_states, kwargs))
+
+        def is_rank_0(self):
+            return False
+
+    policy_class = ppo_actor_module.PolicyModelActor.__ray_metadata__.modified_class
+    policy = object.__new__(policy_class)
+    policy.strategy = _Strategy()
+    policy.actor = SimpleNamespace(model=object())
+    policy.disable_ds_ckpt = False
+    policy.save_hf_ckpt = False
+    ack_path = checkpoint_dir / ".flash-uploaded-global_step3"
+    sleeps = []
+
+    def release_rank(_seconds):
+        sleeps.append(_seconds)
+        ack_path.touch()
+
+    monotonic_values = iter((0.0, 1.0))
+    namespace["time"] = SimpleNamespace(
+        monotonic=lambda: next(monotonic_values),
+        sleep=release_rank,
+    )
+    markers = []
+    namespace["print"] = lambda *args, **kwargs: markers.append((args, kwargs))
+
+    policy.save_checkpoint("global_step3")
+
+    assert saved[0][1:3] == (str(checkpoint_dir / "_actor"), "global_step3")
+    assert sleeps == [0.1]
+    assert ack_path.is_file()
+    assert markers == []
+
+
+@requires_openrlhf_source
+@requires_torch
 def test_sitecustomize_lora_sync_emits_only_merged_base_model_keys(monkeypatch):
     torch = pytest.importorskip("torch")
     namespace, _, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
@@ -1193,6 +1307,29 @@ def test_per_step_checkpoint_publishes_deployable_and_complete_resume_sidecars(
     assert published[0][1:] == (3, {"required": True})
     assert uploaded[0][0] == 3
     assert grpo_openrlhf._openrlhf_resume_step(str(checkpoint_dir)) == 3
+
+
+def test_openrlhf_resume_step_rejects_incomplete_download(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoint-3"
+    checkpoint_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="missing its latest tag"):
+        grpo_openrlhf._openrlhf_resume_step(str(checkpoint_dir))
+
+
+def test_resume_credits_only_deployables_verified_on_hf(monkeypatch):
+    checked = []
+
+    def deployed(step):
+        checked.append(step)
+        return step == 2
+
+    monkeypatch.setattr(grpo_openrlhf, "_deployable_adapter_on_hf", deployed)
+
+    published = grpo_openrlhf._verified_openrlhf_published_steps((2, 4, 6), 4)
+
+    assert published == {2}
+    assert checked == [2, 4]
 
 
 @requires_openrlhf_source
