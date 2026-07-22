@@ -263,12 +263,18 @@ def _processor_tokenized_row(
             value = value[0]
         return [int(item) for item in value]
 
-    input_ids = ids(full.pop("input_ids"))[:max_length]
-    prompt_ids = ids(prompt["input_ids"])[:max_length]
-    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
+    full_input_ids = ids(full.pop("input_ids"))
     full.pop("attention_mask", None)
     full.pop("token_type_ids", None)
     full.pop("mm_token_type_ids", None)
+    if images and len(full_input_ids) > max_length:
+        raise ValueError(
+            "multimodal SFT example exceeds sft_max_len; truncating image tokens would desynchronize "
+            "the processor features, so increase sft_max_len or shorten the example"
+        )
+    input_ids = full_input_ids[:max_length]
+    prompt_ids = ids(prompt["input_ids"])[:max_length]
+    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
     return input_ids, loss_mask, _serialize_multimodal_inputs(full)
 
 
@@ -500,6 +506,10 @@ def _required_save_marker(checkpoint_dir: str, step: int, *, failed: bool = Fals
     return os.path.join(checkpoint_dir, f".flash-required-step-{step}{suffix}")
 
 
+def _hf_export_ready_marker(checkpoint_dir: str, step: int) -> str:
+    return os.path.join(checkpoint_dir, f".flash-hf-step-{step}.ready")
+
+
 class _OpenRLHFCheckpointWatcher:
     """publish completed DeepSpeed checkpoints and their matching PEFT exports."""
 
@@ -513,6 +523,7 @@ class _OpenRLHFCheckpointWatcher:
         model_id: str,
         model_revision: str,
         required_steps: tuple[int, ...],
+        max_num_checkpoints: int = 1,
     ) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.export_root = export_root
@@ -521,6 +532,7 @@ class _OpenRLHFCheckpointWatcher:
         self.model_id = model_id
         self.model_revision = model_revision
         self.required_steps = frozenset(required_steps)
+        self.max_num_checkpoints = max(1, int(max_num_checkpoints))
         self.processed_steps: set[int] = set()
         self._error: BaseException | None = None
         self._stop = threading.Event()
@@ -558,13 +570,29 @@ class _OpenRLHFCheckpointWatcher:
             hf_dir = os.path.join(self.checkpoint_dir, name)
             ds_dir = os.path.join(self.checkpoint_dir, f"global_step{step}")
             has_config = os.path.isfile(os.path.join(hf_dir, "adapter_config.json"))
-            has_weights = any(
-                os.path.isfile(os.path.join(hf_dir, weight))
-                for weight in ("adapter_model.safetensors", "adapter_model.bin")
-            )
-            if os.path.isdir(ds_dir) and has_config and has_weights:
+            has_authoritative_weights = os.path.isfile(os.path.join(hf_dir, "adapter_model.bin"))
+            export_ready = os.path.isfile(_hf_export_ready_marker(self.checkpoint_dir, step))
+            if os.path.isdir(ds_dir) and has_config and has_authoritative_weights and export_ready:
                 found.append((step, ds_dir, hf_dir))
         return sorted(found)
+
+    def _prune_uploaded_checkpoints(self) -> None:
+        retained = sorted(
+            step
+            for step in self.processed_steps
+            if os.path.isdir(os.path.join(self.checkpoint_dir, f"global_step{step}"))
+            or os.path.isdir(os.path.join(self.checkpoint_dir, f"global_step{step}_hf"))
+        )
+        for step in retained[: -self.max_num_checkpoints]:
+            ds_dir = os.path.join(self.checkpoint_dir, f"global_step{step}")
+            hf_dir = os.path.join(self.checkpoint_dir, f"global_step{step}_hf")
+            ready_marker = _hf_export_ready_marker(self.checkpoint_dir, step)
+            if os.path.isdir(ds_dir):
+                shutil.rmtree(ds_dir)
+            if os.path.isdir(hf_dir):
+                shutil.rmtree(hf_dir)
+            if os.path.isfile(ready_marker):
+                os.remove(ready_marker)
 
     def _publish(self, step: int, ds_dir: str, hf_dir: str) -> None:
         required = step in self.required_steps
@@ -592,15 +620,18 @@ class _OpenRLHFCheckpointWatcher:
                 ds_dir,
                 before_upload=publish_adapter,
             )
-            if required and not uploaded:
-                raise RuntimeError(
-                    f"required save step {step} full-state checkpoint was not published"
-                )
+            if not uploaded:
+                if required:
+                    raise RuntimeError(
+                        f"required save step {step} full-state checkpoint was not published"
+                    )
+                return
             self.processed_steps.add(step)
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step)
                 with open(marker, "w", encoding="utf-8") as file:
                     file.write("durable\n")
+            self._prune_uploaded_checkpoints()
         except BaseException as error:
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step, failed=True)
@@ -794,16 +825,57 @@ def _install_dataset_patch():
     openrlhf.datasets.SFTDataset = FlashTokenizedSFTDataset
 
 
+def assert_lora_applied(model, model_id):
+    count = sum(
+        1
+        for name, _ in model.named_modules()
+        if name.endswith("lora_A.default") or name.endswith("lora_B.default")
+    )
+    if count == 0:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} loaded zero LoRA modules; the adapter was not applied"
+        )
+    return count
+
+
+def assert_adapter_load_clean(load_result, model_id):
+    def lora_only(keys):
+        return [key for key in (keys or []) if "lora_" in key]
+
+    missing = lora_only(getattr(load_result, "missing_keys", None))
+    unexpected = lora_only(getattr(load_result, "unexpected_keys", None))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} did not load cleanly: "
+            f"missing={missing[:3]} unexpected={unexpected[:3]}"
+        )
+
+
+def assert_adapter_delta_nonzero(model, model_id):
+    seen = 0
+    nonzero = 0
+    for name, module in model.named_modules():
+        if not name.endswith("lora_B.default"):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        seen += 1
+        if bool(weight.detach().ne(0).any()):
+            nonzero += 1
+    if seen and nonzero == 0:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} has all-zero lora_B weights; "
+            "the adapter delta is an identity no-op"
+        )
+    return nonzero
+
+
 def _install_warmstart_actor_patch():
     warmstart = str(CONFIG.get("warmstart_adapter") or "")
     if not warmstart:
         return
     import openrlhf.models
-    from flash.engine.worker.lora import (
-        assert_adapter_delta_nonzero,
-        assert_adapter_load_clean,
-        assert_lora_applied,
-    )
     from openrlhf.models.actor import Actor as OriginalActor
     from peft import PeftModel
 
@@ -980,6 +1052,14 @@ def _iter_windows(iterable, size):
         yield window
 
 
+def _mark_hf_export_ready(checkpoint_dir, step):
+    marker = os.path.join(checkpoint_dir, f".flash-hf-step-{step}.ready")
+    temporary = f"{marker}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as file:
+        file.write("ready\n")
+    os.replace(temporary, marker)
+
+
 def _wait_for_required_save(checkpoint_dir, step):
     import time
 
@@ -1132,8 +1212,8 @@ def _install_trainer_patch():
                         self.model.model,
                         args.ckpt.path,
                         tag,
-                        args.ckpt.max_num,
-                        args.ckpt.max_mem,
+                        2**31 - 1,
+                        float("inf"),
                         client_state,
                     )
                     self.strategy.save_model(
@@ -1141,6 +1221,8 @@ def _install_trainer_patch():
                         self.tokenizer,
                         os.path.join(args.ckpt.path, f"{tag}_hf"),
                     )
+                    if self.strategy.is_rank_0():
+                        _mark_hf_export_ready(args.ckpt.path, global_step)
                     if global_step in required:
                         _wait_for_required_save(args.ckpt.path, global_step)
             consumed_in_epoch = 0
@@ -1642,7 +1724,7 @@ def run_sft_openrlhf(spec=None) -> None:
         "lora_alpha": lora_alpha,
         "lora_rank": lora_rank,
         "max_length": max_length,
-        "max_num_checkpoints": max(3, len(save_at_steps) + 1),
+        "max_num_checkpoints": 1,
         "max_norm": 1.0,
         "micro_batch_size": micro_batch,
         "model_path": model_path,
@@ -1674,6 +1756,7 @@ def run_sft_openrlhf(spec=None) -> None:
         model_id=model_id,
         model_revision=model_revision,
         required_steps=save_at_steps,
+        max_num_checkpoints=arg_config["max_num_checkpoints"],
     )
     watcher.processed_steps.update(_durable_required_save_steps(save_at_steps, resume_step))
 

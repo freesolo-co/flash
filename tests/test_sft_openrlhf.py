@@ -15,6 +15,7 @@ from flash.engine.worker.sft_openrlhf import (
     _attention_implementation,
     _OpenRLHFCheckpointWatcher,
     _probe_gpu_in_subprocess,
+    _processor_tokenized_row,
     _resolve_immutable_model_revision,
     _serialize_multimodal_inputs,
     _training_batch_shape,
@@ -241,6 +242,33 @@ def test_shifted_loss_mask_selects_literal_predicted_completion_tokens():
     assert predicted_token_ids.tolist() == [21, 22, 999]
 
 
+def test_processor_rejects_multimodal_truncation_that_would_desync_features():
+    class Processor:
+        def apply_chat_template(self, messages, *, add_generation_prompt, **kwargs):
+            del messages, kwargs
+            if add_generation_prompt:
+                return {"input_ids": [[10, 11]]}
+            return {
+                "input_ids": [[10, 11, 20, 21]],
+                "attention_mask": [[1, 1, 1, 1]],
+                "pixel_values": [[1.0, 2.0]],
+                "image_grid_thw": [[1, 2, 3]],
+            }
+
+    prompt = [{"role": "user", "content": [{"type": "image"}, {"type": "text"}]}]
+    completion = [{"role": "assistant", "content": "answer"}]
+
+    with pytest.raises(ValueError, match="desynchronize"):
+        _processor_tokenized_row(
+            Processor(),
+            prompt,
+            completion,
+            [object()],
+            max_length=3,
+            thinking=False,
+        )
+
+
 def test_filter_openrlhf_sft_rows_drops_special_only_target_and_fails_if_empty():
     rows = [
         {"input_ids": [10, 99], "loss_mask": [0, 1], "multimodal_inputs": b""},
@@ -456,6 +484,137 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
     assert (checkpoint_dir / ".flash-required-step-3.done").read_text() == "durable\n"
 
 
+def test_checkpoint_watcher_waits_for_authoritative_zero3_export(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints"
+    ds_dir = checkpoint_dir / "global_step3"
+    hf_dir = checkpoint_dir / "global_step3_hf"
+    ds_dir.mkdir(parents=True)
+    hf_dir.mkdir()
+    (hf_dir / "adapter_config.json").write_text('{"peft_type":"LORA"}', encoding="utf-8")
+    (hf_dir / "adapter_model.safetensors").write_bytes(b"transient")
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(),
+    )
+
+    assert watcher._completed_checkpoints() == []
+    (hf_dir / "adapter_model.bin").write_bytes(b"authoritative")
+    assert watcher._completed_checkpoints() == []
+    (checkpoint_dir / ".flash-hf-step-3.ready").write_text("ready\n", encoding="utf-8")
+
+    assert watcher._completed_checkpoints() == [(3, str(ds_dir), str(hf_dir))]
+
+
+def test_checkpoint_retention_waits_for_upload_before_pruning(monkeypatch, tmp_path):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    for step in (1, 2):
+        (checkpoint_dir / f"global_step{step}").mkdir()
+        (checkpoint_dir / f"global_step{step}_hf").mkdir()
+        (checkpoint_dir / f".flash-hf-step-{step}.ready").write_text("ready\n", encoding="utf-8")
+    saw_old_checkpoint_during_second_upload = []
+
+    def upload(step, ds_dir, *, before_upload):
+        before_upload()
+        if step == 2:
+            saw_old_checkpoint_during_second_upload.append(
+                (checkpoint_dir / "global_step1").is_dir()
+            )
+        return True
+
+    monkeypatch.setattr(openrlhf_mod, "_export_checkpoint_adapter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        openrlhf_mod._w, "publish_deployable_checkpoint", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(openrlhf_mod._w, "upload_resume_checkpoint", upload)
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(),
+        max_num_checkpoints=1,
+    )
+
+    watcher._publish(
+        1, str(checkpoint_dir / "global_step1"), str(checkpoint_dir / "global_step1_hf")
+    )
+    watcher._publish(
+        2, str(checkpoint_dir / "global_step2"), str(checkpoint_dir / "global_step2_hf")
+    )
+
+    assert saw_old_checkpoint_during_second_upload == [True]
+    assert not (checkpoint_dir / "global_step1").exists()
+    assert (checkpoint_dir / "global_step2").is_dir()
+
+
+def test_checkpoint_retention_keeps_periodic_save_when_upload_is_deferred(monkeypatch, tmp_path):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    for step in (1, 2):
+        (checkpoint_dir / f"global_step{step}").mkdir()
+        (checkpoint_dir / f"global_step{step}_hf").mkdir()
+        (checkpoint_dir / f".flash-hf-step-{step}.ready").write_text("ready\n", encoding="utf-8")
+    monkeypatch.setattr(openrlhf_mod, "_export_checkpoint_adapter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(openrlhf_mod._w, "upload_resume_checkpoint", lambda *args, **kwargs: False)
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(),
+        max_num_checkpoints=1,
+    )
+    watcher.processed_steps.add(1)
+
+    watcher._publish(
+        2, str(checkpoint_dir / "global_step2"), str(checkpoint_dir / "global_step2_hf")
+    )
+
+    assert watcher.processed_steps == {1}
+    assert (checkpoint_dir / "global_step1").is_dir()
+    assert (checkpoint_dir / "global_step2").is_dir()
+
+
+def test_checkpoint_retention_prunes_matching_hf_sidecar(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    for step in (1, 2):
+        (checkpoint_dir / f"global_step{step}").mkdir()
+        (checkpoint_dir / f"global_step{step}_hf").mkdir()
+        (checkpoint_dir / f".flash-hf-step-{step}.ready").write_text("ready\n", encoding="utf-8")
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(),
+        max_num_checkpoints=1,
+    )
+    watcher.processed_steps.update({1, 2})
+
+    watcher._prune_uploaded_checkpoints()
+
+    assert not (checkpoint_dir / "global_step1_hf").exists()
+    assert not (checkpoint_dir / ".flash-hf-step-1.ready").exists()
+    assert (checkpoint_dir / "global_step2_hf").is_dir()
+
+
 def test_checkpoint_watcher_stop_does_not_impose_upload_timeout(tmp_path):
     watcher = _OpenRLHFCheckpointWatcher(
         checkpoint_dir=str(tmp_path),
@@ -522,8 +681,84 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert 'kwargs["pin_memory"] = True' in source
     assert "non_blocking=True" in source
     assert "_install_attention_patch()" in source
+    assert "_mark_hf_export_ready(args.ckpt.path, global_step)" in source
     assert "_wait_for_required_save(args.ckpt.path, global_step)" in source
+    assert "2**31 - 1" in source
+    assert 'float("inf")' in source
     assert "falling back" not in source.lower()
+
+
+def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, tmp_path):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "lora_rank": 16,
+                "model_id": "org/model",
+                "warmstart_adapter": "/adapter",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    source = render_openrlhf_sft_runtime()
+    namespace = {"__name__": "flash_openrlhf_sft_warmstart_test"}
+    exec(compile(source, "runtime.py", "exec"), namespace)
+
+    class Weight:
+        def detach(self):
+            return self
+
+        def ne(self, value):
+            assert value == 0
+            return self
+
+        def any(self):
+            return True
+
+    class AdapterModel:
+        def named_modules(self):
+            return [
+                ("layer.lora_A.default", object()),
+                ("layer.lora_B.default", SimpleNamespace(weight=Weight())),
+            ]
+
+        def load_adapter(self, *args, **kwargs):
+            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+    class OriginalActor:
+        def __init__(self, pretrain_or_model, *args, lora_rank=0, **kwargs):
+            del pretrain_or_model, args, lora_rank, kwargs
+            self.model = object()
+
+    class PeftModel:
+        @staticmethod
+        def from_pretrained(base, warmstart, *, is_trainable):
+            assert base is not None
+            assert warmstart == "/adapter"
+            assert is_trainable is True
+            return AdapterModel()
+
+    openrlhf = ModuleType("openrlhf")
+    openrlhf.__path__ = []
+    models = ModuleType("openrlhf.models")
+    models.__path__ = []
+    models.Actor = OriginalActor
+    actor = ModuleType("openrlhf.models.actor")
+    actor.Actor = OriginalActor
+    peft = ModuleType("peft")
+    peft.PeftModel = PeftModel
+    openrlhf.models = models
+    monkeypatch.setitem(sys.modules, "openrlhf", openrlhf)
+    monkeypatch.setitem(sys.modules, "openrlhf.models", models)
+    monkeypatch.setitem(sys.modules, "openrlhf.models.actor", actor)
+    monkeypatch.setitem(sys.modules, "peft", peft)
+
+    namespace["_install_warmstart_actor_patch"]()
+    patched = models.Actor("base", lora_rank=16)
+
+    assert isinstance(patched.model, AdapterModel)
+    assert "from flash.engine.worker.lora import" not in source
 
 
 def test_short_accumulation_window_uses_realized_loss_norm_and_deepspeed_scale(
