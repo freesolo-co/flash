@@ -1475,8 +1475,6 @@ def _compare_and_fail_remote(
     run_id: str,
     expected_remote: dict | None,
     error: str,
-    *,
-    clear_remote: bool = True,
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
     report_status: RunStatus | None = None
@@ -1488,8 +1486,6 @@ def _compare_and_fail_remote(
             return False
         previous_updated_at = status.updated_at
         status.state = "failed"
-        if clear_remote:
-            status.remote = None
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
@@ -1497,7 +1493,7 @@ def _compare_and_fail_remote(
         _save_status_unlocked(status)
         report_status = status
     confirmed = get_status(run_id)
-    expected_after = None if clear_remote else expected_remote
+    expected_after = expected_remote
     if (
         confirmed.state != "failed"
         or not _expected_remote_matches(confirmed.remote, expected_after)
@@ -1535,7 +1531,6 @@ def _compare_and_complete_remote(
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = _status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
-        status.remote = None
         status.cost_usd = charge_usd
         status.artifacts_dir = artifacts_dir(spec)
         status.updated_at = time.time()
@@ -1544,7 +1539,9 @@ def _compare_and_complete_remote(
         _save_status_unlocked(status)
         report_status = status
     confirmed = get_status(run_id)
-    if confirmed.state != "done" or confirmed.remote is not None:
+    if confirmed.state != "done" or not _expected_remote_matches(
+        confirmed.remote, expected_remote
+    ):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         _report_status(report_status)
