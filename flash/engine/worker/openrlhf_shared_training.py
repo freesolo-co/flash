@@ -146,6 +146,16 @@ def _load_checkpoint_file(path: Path) -> Mapping[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
+async def _await_completion_on_cancel(operation: Any) -> tuple[Any, bool]:
+    """finish a rollout-registry transition and report deferred cancellation."""
+
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task), False
+    except asyncio.CancelledError:
+        return await task, True
+
+
 class SharedMultiLoRATrainingActor:
     """train named LoRA adapters over one frozen Hugging Face base.
 
@@ -261,13 +271,16 @@ class SharedMultiLoRATrainingActor:
                 lr_scheduler = selected_scheduler_factory(optimizer)
 
                 adapter_dir = self._export_version(adapter_name, normalized_run_id, adapter_version)
-                handle = await self._rollout_engine.register_run(
-                    normalized_run_id, adapter_version, adapter_dir
+                handle, registration_cancelled = await _await_completion_on_cancel(
+                    self._rollout_engine.register_run(
+                        normalized_run_id, adapter_version, adapter_dir
+                    )
                 )
             except BaseException:
-                self._delete_adapter(adapter_name)
-                if adapter_dir is not None:
-                    shutil.rmtree(adapter_dir, ignore_errors=True)
+                if normalized_run_id not in self._runs:
+                    self._delete_adapter(adapter_name)
+                    if adapter_dir is not None:
+                        shutil.rmtree(adapter_dir, ignore_errors=True)
                 raise
 
             state = TrainingRunState(
@@ -285,6 +298,8 @@ class SharedMultiLoRATrainingActor:
             self._runs[normalized_run_id] = state
             self._adapter_parameter_ids[normalized_run_id] = adapter_ids
             self._assert_registry_isolation()
+            if registration_cancelled:
+                raise asyncio.CancelledError
             return state
 
     async def step(self, run_id: str, loss_function: LossFunction) -> TrainingStepResult:
@@ -431,11 +446,13 @@ class SharedMultiLoRATrainingActor:
                 old_version = state.adapter_version
                 new_version = old_version + 1
                 adapter_dir = self._export_version(state.adapter_name, state.run_id, new_version)
-                new_handle = await self._rollout_engine.publish_adapter(
-                    state.run_id,
-                    expected_old_version=old_version,
-                    new_version=new_version,
-                    adapter_dir=adapter_dir,
+                new_handle, publication_cancelled = await _await_completion_on_cancel(
+                    self._rollout_engine.publish_adapter(
+                        state.run_id,
+                        expected_old_version=old_version,
+                        new_version=new_version,
+                        adapter_dir=adapter_dir,
+                    )
                 )
             except BaseException:
                 with torch.no_grad():
@@ -455,6 +472,8 @@ class SharedMultiLoRATrainingActor:
 
             state.adapter_version = new_version
             state.handle = new_handle
+            if publication_cancelled:
+                raise asyncio.CancelledError
             return new_handle
 
     def adapter_parameter_snapshot(self, run_id: str) -> tuple[bytes, ...]:
@@ -484,16 +503,20 @@ class SharedMultiLoRATrainingActor:
                 target_global_step=pending.target_global_step,
             )
             state.pending_publication = pending
-        new_handle = await self._rollout_engine.publish_adapter(
-            state.run_id,
-            expected_old_version=state.adapter_version,
-            new_version=pending.target_version,
-            adapter_dir=pending.adapter_dir,
+        new_handle, publication_cancelled = await _await_completion_on_cancel(
+            self._rollout_engine.publish_adapter(
+                state.run_id,
+                expected_old_version=state.adapter_version,
+                new_version=pending.target_version,
+                adapter_dir=pending.adapter_dir,
+            )
         )
         state.adapter_version = pending.target_version
         state.handle = new_handle
         state.global_step = pending.target_global_step
         state.pending_publication = None
+        if publication_cancelled:
+            raise asyncio.CancelledError
         return new_handle
 
     @staticmethod

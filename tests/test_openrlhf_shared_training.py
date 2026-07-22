@@ -40,8 +40,14 @@ class _FakeRolloutEngine:
         self.added: list[_FakeLoRARequest] = []
         self.removed: list[int] = []
         self.fail_adds = 0
+        self.add_started: asyncio.Event | None = None
+        self.block_add: asyncio.Event | None = None
 
     async def add_lora(self, request: _FakeLoRARequest) -> bool:
+        if self.add_started is not None:
+            self.add_started.set()
+        if self.block_add is not None:
+            await self.block_add.wait()
         if self.fail_adds:
             self.fail_adds -= 1
             raise RuntimeError("adapter publish failed")
@@ -72,6 +78,10 @@ def _serialized_state(value: Any) -> bytes:
     buffer = io.BytesIO()
     torch.save(value, buffer)
     return buffer.getvalue()
+
+
+def _is_directory(path: str) -> bool:
+    return Path(path).is_dir()
 
 
 def _parameter_bytes(parameters: tuple[Any, ...]) -> tuple[bytes, ...]:
@@ -231,6 +241,33 @@ def test_failed_adapter_attach_removes_partial_adapter_and_allows_retry(tmp_path
 
 
 @requires_torch
+def test_cancelled_registration_commits_matching_actor_and_rollout_state(tmp_path):
+    async def scenario():
+        rollout_engine = _FakeRolloutEngine()
+        rollout_engine.add_started = asyncio.Event()
+        rollout_engine.block_add = asyncio.Event()
+        rollout_manager = _rollout_manager(1, rollout_engine)
+        actor, _load_count, _manager = _build_actor(
+            tmp_path, capacity=1, rollout_manager=rollout_manager
+        )
+
+        registration = asyncio.create_task(_register(actor, "run-a"))
+        await rollout_engine.add_started.wait()
+        registration.cancel()
+        rollout_engine.block_add.set()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+        state = actor.run_state("run-a")
+        assert state.adapter_version == 0
+        assert state.handle == await rollout_manager.current_handle("run-a")
+        assert _is_directory(state.handle.adapter_dir)
+        assert len(actor.model.adapters) == 1
+
+    asyncio.run(scenario())
+
+
+@requires_torch
 def test_step_mutates_only_active_adapter_and_optimizer_then_publishes(tmp_path):
     async def scenario():
         actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
@@ -305,6 +342,40 @@ def test_failed_publish_retries_same_update_without_cross_run_mutation(tmp_path)
         assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
         assert _parameter_bytes(tuple(actor.model.base.parameters())) == base_before
         assert await rollout_manager.current_handle("run-a") == new_handle
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_step_publication_commits_matching_actor_and_rollout_state(tmp_path):
+    async def scenario():
+        rollout_engine = _FakeRolloutEngine()
+        rollout_manager = _rollout_manager(2, rollout_engine)
+        actor, _load_count, _manager = _build_actor(
+            tmp_path, capacity=2, rollout_manager=rollout_manager
+        )
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        base_before = _parameter_bytes(tuple(actor.model.base.parameters()))
+        b_parameters_before = actor.adapter_parameter_snapshot("run-b")
+        b_optimizer_before = _serialized_state(run_b.optimizer.state_dict())
+        rollout_engine.add_started = asyncio.Event()
+        rollout_engine.block_add = asyncio.Event()
+
+        update = asyncio.create_task(actor.step("run-a", _loss_for(1.0)))
+        await rollout_engine.add_started.wait()
+        update.cancel()
+        rollout_engine.block_add.set()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+
+        assert run_a.adapter_version == 1
+        assert run_a.global_step == 1
+        assert run_a.pending_publication is None
+        assert run_a.handle == await rollout_manager.current_handle("run-a")
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert _parameter_bytes(tuple(actor.model.base.parameters())) == base_before
 
     asyncio.run(scenario())
 
@@ -435,6 +506,51 @@ def test_failed_restore_publish_rolls_back_and_can_retry(tmp_path):
         assert restored_handle.version == a_handle_before.version + 1
         assert await rollout_manager.current_handle("run-a") == restored_handle
         assert await rollout_manager.current_handle("run-b") == b_handle_before
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_restore_publication_commits_restored_actor_and_rollout_state(tmp_path):
+    async def scenario():
+        rollout_engine = _FakeRolloutEngine()
+        rollout_manager = _rollout_manager(2, rollout_engine)
+        actor, _load_count, _manager = _build_actor(
+            tmp_path, capacity=2, rollout_manager=rollout_manager
+        )
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        await actor.step("run-a", _loss_for(1.0))
+        checkpoint = await actor.save_run_checkpoint("run-a", tmp_path / "cancel-restore-a.pt")
+        restored_parameters = actor.adapter_parameter_snapshot("run-a")
+        restored_optimizer = _serialized_state(run_a.optimizer.state_dict())
+        restored_scheduler = _serialized_state(run_a.lr_scheduler.state_dict())
+        restored_global_step = run_a.global_step
+        await actor.step("run-a", _loss_for(-1.0))
+        await actor.step("run-b", _loss_for(0.5))
+        old_version = run_a.adapter_version
+        b_parameters_before = actor.adapter_parameter_snapshot("run-b")
+        b_optimizer_before = _serialized_state(run_b.optimizer.state_dict())
+        b_handle_before = run_b.handle
+        rollout_engine.add_started = asyncio.Event()
+        rollout_engine.block_add = asyncio.Event()
+
+        restore = asyncio.create_task(actor.restore_run_checkpoint("run-a", checkpoint))
+        await rollout_engine.add_started.wait()
+        restore.cancel()
+        rollout_engine.block_add.set()
+        with pytest.raises(asyncio.CancelledError):
+            await restore
+
+        assert actor.adapter_parameter_snapshot("run-a") == restored_parameters
+        assert _serialized_state(run_a.optimizer.state_dict()) == restored_optimizer
+        assert _serialized_state(run_a.lr_scheduler.state_dict()) == restored_scheduler
+        assert run_a.global_step == restored_global_step
+        assert run_a.adapter_version == old_version + 1
+        assert run_a.handle == await rollout_manager.current_handle("run-a")
+        assert actor.adapter_parameter_snapshot("run-b") == b_parameters_before
+        assert _serialized_state(run_b.optimizer.state_dict()) == b_optimizer_before
+        assert run_b.handle == b_handle_before
 
     asyncio.run(scenario())
 
