@@ -585,6 +585,7 @@ import inspect
 import json
 import math
 import os
+import threading
 import time
 
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
@@ -786,9 +787,20 @@ _original_actor_init = _Actor.__init__
 _loading_warm_reference = contextvars.ContextVar(
     "flash_openrlhf_loading_warm_reference", default=False
 )
+_peft_load_lock = threading.Lock()
 
 
-def _flash_assert_adapter_loaded(model):
+def _flash_assert_adapter_loaded(model, load_result):
+    missing = [
+        key for key in (getattr(load_result, "missing_keys", []) or []) if "lora_" in key
+    ]
+    unexpected = [
+        key for key in (getattr(load_result, "unexpected_keys", []) or []) if "lora_" in key
+    ]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"OpenRLHF warm-start adapter load was incomplete: missing={missing}, unexpected={unexpected}"
+        )
     lora_b_parameters = [
         parameter
         for name, parameter in model.named_parameters()
@@ -819,14 +831,32 @@ def _flash_actor_init(self, *args, **kwargs):
     enable_input_require_grads = getattr(base_model, "enable_input_require_grads", None)
     if callable(enable_input_require_grads):
         enable_input_require_grads()
-    self.model = PeftModel.from_pretrained(
-        base_model,
-        _WARMSTART_ADAPTER,
-        adapter_name="default",
-        is_trainable=not is_reference,
-        key_mapping=getattr(base_model, "_checkpoint_conversion_mapping", None),
-    )
-    _flash_assert_adapter_loaded(self.model)
+    load_results = []
+    with _peft_load_lock:
+        original_load_adapter = PeftModel.load_adapter
+
+        @functools.wraps(original_load_adapter)
+        def capture_load_result(model, *load_args, **load_kwargs):
+            load_result = original_load_adapter(model, *load_args, **load_kwargs)
+            load_results.append(load_result)
+            return load_result
+
+        PeftModel.load_adapter = capture_load_result
+        try:
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                _WARMSTART_ADAPTER,
+                adapter_name="default",
+                is_trainable=not is_reference,
+                key_mapping=getattr(base_model, "_checkpoint_conversion_mapping", None),
+            )
+        finally:
+            PeftModel.load_adapter = original_load_adapter
+    if len(load_results) != 1:
+        raise RuntimeError(
+            f"OpenRLHF warm-start adapter loaded {len(load_results)} times; expected exactly once"
+        )
+    _flash_assert_adapter_loaded(self.model, load_results[0])
     if is_reference:
         self.model.requires_grad_(False)
         self.model.eval()

@@ -343,6 +343,8 @@ def _install_pinned_sitecustomize_modules(
     peft = types.ModuleType("peft")
     peft.loads = []
     peft.adapter_loads = []
+    peft.zero_adapter = False
+    peft.load_result = SimpleNamespace(missing_keys=[], unexpected_keys=[])
 
     class _FakePeftModel(torch.nn.Module):
         def __init__(self, base, *, is_trainable):
@@ -352,7 +354,7 @@ def _install_pinned_sitecustomize_modules(
             self.proj.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 1, bias=False)})
             self.proj.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 1, bias=False)})
             with torch.no_grad():
-                self.proj.lora_B["default"].weight.fill_(1.0)
+                self.proj.lora_B["default"].weight.fill_(0.0 if peft.zero_adapter else 1.0)
             self.is_trainable = is_trainable
 
         @classmethod
@@ -360,12 +362,18 @@ def _install_pinned_sitecustomize_modules(
             assert adapter_name == "default"
             assert key_mapping is None
             model = cls(base, is_trainable=is_trainable)
+            model.load_adapter(
+                path,
+                adapter_name=adapter_name,
+                is_trainable=is_trainable,
+                key_mapping=key_mapping,
+            )
             peft.loads.append((path, is_trainable, model))
             return model
 
         def load_adapter(self, path, *, adapter_name, is_trainable, key_mapping):
             peft.adapter_loads.append((path, adapter_name, is_trainable, key_mapping))
-            raise AssertionError("warm-start adapter was loaded twice")
+            return peft.load_result
 
     peft.PeftModel = _FakePeftModel
     monkeypatch.setitem(sys.modules, "peft", peft)
@@ -1090,7 +1098,10 @@ def test_sitecustomize_loads_warm_policy_and_incoming_kl_reference(monkeypatch):
     assert reference_wrapper.init_model_from_pretrained is not namespace["_flash_reference_init"]
     assert loads[0][0:2] == ("/work/incoming-adapter", True)
     assert loads[1][0:2] == ("/work/incoming-adapter", False)
-    assert sys.modules["peft"].adapter_loads == []
+    assert sys.modules["peft"].adapter_loads == [
+        ("/work/incoming-adapter", "default", True, None),
+        ("/work/incoming-adapter", "default", False, None),
+    ]
     assert policy.model.is_trainable is True
     assert reference.actor.model.is_trainable is False
     assert all(not parameter.requires_grad for parameter in reference.actor.model.parameters())
@@ -1105,6 +1116,36 @@ def test_sitecustomize_loads_warm_policy_and_incoming_kl_reference(monkeypatch):
     assert trainer_class.fit is namespace["_flash_ppo_fit"]
     assert trainer_wrapper.fit is not namespace["_flash_ppo_fit"]
     assert broadcasts == [True]
+
+
+@pytest.mark.parametrize(
+    ("load_result", "zero_adapter", "message"),
+    [
+        (
+            SimpleNamespace(missing_keys=["proj.lora_B.default.weight"], unexpected_keys=[]),
+            False,
+            "load was incomplete",
+        ),
+        (SimpleNamespace(missing_keys=[], unexpected_keys=[]), True, "all-zero LoRA delta"),
+    ],
+)
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_warmstart_validates_single_weight_load(
+    monkeypatch, load_result, zero_adapter, message
+):
+    pytest.importorskip("torch")
+    monkeypatch.setenv("FLASH_OPENRLHF_WARMSTART_ADAPTER", "/work/incoming-adapter")
+    _install_pinned_sitecustomize_modules(monkeypatch)
+    peft = sys.modules["peft"]
+    peft.load_result = load_result
+    peft.zero_adapter = zero_adapter
+    actor_class = sys.modules["openrlhf.models"].Actor
+
+    with pytest.raises(RuntimeError, match=message):
+        actor_class("base", lora_rank=8, target_modules=["all-linear"])
+
+    assert peft.adapter_loads == [("/work/incoming-adapter", "default", True, None)]
 
 
 @requires_openrlhf_source
