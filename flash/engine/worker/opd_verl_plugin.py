@@ -516,7 +516,6 @@ def _install_verl_extensions() -> None:
         post_json=_post_json,
         deterministic_seed=deterministic_rollout_seed,
     )
-    FlashMultiTurnAgentLoop.__module__ = __name__
     globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
     def filter_signal_batch(batch):

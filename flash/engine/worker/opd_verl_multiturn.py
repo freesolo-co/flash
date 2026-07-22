@@ -228,7 +228,6 @@ def build_flash_multi_turn_agent_loop(
 ):
     """build and register the child loop without importing verl in the parent interpreter."""
 
-    @register("flash_multi_turn")
     class FlashMultiTurnAgentLoop(agent_loop_base):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             raw_prompt = validate_teacher_messages(
@@ -407,4 +406,7 @@ def build_flash_multi_turn_agent_loop(
                         )
 
     FlashMultiTurnAgentLoop.__module__ = __name__
+    FlashMultiTurnAgentLoop.__qualname__ = "FlashMultiTurnAgentLoop"
+    globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
+    register("flash_multi_turn")(FlashMultiTurnAgentLoop)
     return FlashMultiTurnAgentLoop

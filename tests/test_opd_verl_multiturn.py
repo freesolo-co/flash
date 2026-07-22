@@ -288,7 +288,7 @@ def test_bridge_serializes_tool_steps_and_isolates_rollout_sessions():
 
 def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128, max_turns=4):
     tokenizer = _ChatTokenizer()
-    calls = {"steps": [], "sampling": [], "closed": 0}
+    calls = {"steps": [], "sampling": [], "closed": 0, "registry": {}}
     sessions = {"turns": []}
 
     class Output:
@@ -321,8 +321,12 @@ def _make_loop(monkeypatch, generated_turns, step_replies, *, max_model_len=128,
                 extra_fields={},
             )
 
-    def register(_name):
-        return lambda cls: cls
+    def register(name):
+        def decorate(cls):
+            calls["registry"][name] = f"{cls.__module__}.{cls.__qualname__}"
+            return cls
+
+        return decorate
 
     def post_json(_url, _token, path, payload):
         if path == "/multiturn/start":
@@ -407,6 +411,7 @@ def test_child_rollout_expands_two_turns_with_exact_order_and_seam_dedup(monkeyp
     assert ord("o") in outputs[1].prompt_ids
     assert ord("o") not in outputs[0].response_ids + outputs[1].response_ids
     assert calls["sampling"][0]["seed"] != calls["sampling"][1]["seed"]
+    assert "<locals>" not in calls["registry"]["flash_multi_turn"]
     assert calls["closed"] == 1
 
 
