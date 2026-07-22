@@ -31,8 +31,8 @@ def resolve_verl_python(workdir: str) -> str:
     venv = os.path.join(workdir, "verl-venv")
     py = os.path.join(venv, "bin", "python")
     if not os.path.exists(py):
-        # isolated env: verl brings its own torch/vllm; a full install (not --no-deps) so runtime
-        # deps are present. exact pins are validated on the gpu pod before paid launch.
+        # keep the isolated runtime on the gpu-smoke-validated verl 0.8.0 matrix. vllm 0.11.0 is
+        # the newest supported release whose metadata accepts the parent's transformers 5.10.2 pin.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(
             [
@@ -41,7 +41,9 @@ def resolve_verl_python(workdir: str) -> str:
                 "install",
                 "--python",
                 py,
-                "verl==0.8.0",
+                "verl[vllm]==0.8.0",
+                "vllm==0.11.0",
+                "transformers==5.10.2",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
             ],

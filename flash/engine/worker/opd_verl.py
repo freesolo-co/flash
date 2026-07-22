@@ -195,33 +195,34 @@ class _TeacherAlignmentBridge:
         )
         return {"teacher_ids": teacher_ids, "teacher_logprobs": teacher_logprobs}
 
-    def score(self, index: int, sequence_ids: list[int]) -> dict:
+    def score(self, index: int, prompt_length: int, sequence_ids: list[int]) -> dict:
         with self._stats_lock:
             self.score_requests += 1
         if index < 0 or index >= len(self.prompts):
             raise ValueError("flash OPD bridge received an unknown dataset index")
         prompt = self.prompts[index]
         prompt_ids = list(prompt.prompt_ids)
+        prompt_length = int(prompt_length)
         sequence_ids = [int(token_id) for token_id in sequence_ids]
-        if sequence_ids[: len(prompt_ids)] != prompt_ids:
-            raise ValueError("verl rollout prompt ids do not match the frozen flash prompt pool")
-        response_ids = sequence_ids[len(prompt_ids) :]
+        if prompt_length != len(prompt_ids) or sequence_ids[:prompt_length] != prompt_ids:
+            raise ValueError("verl rollout prompt ids do not exactly match the frozen flash prompt pool")
+        response_ids = sequence_ids[prompt_length:]
         with self._stats_lock:
             self.generated_tokens += len(response_ids)
         if not response_ids:
-            return self._empty(len(prompt_ids), 0)
+            return self._empty(prompt_length, 0)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         if not _rollout_terminated(
             response_ids, stop_text, self.eos_token_ids, self.stop_sequences
         ):
             with self._stats_lock:
                 self.truncated_rollouts += 1
-            return self._empty(len(prompt_ids), len(response_ids))
+            return self._empty(prompt_length, len(response_ids))
         kept_ids, completion_text = _trim_trailing_stop(
             self.tokenizer, response_ids, stop_text, self.stop_sequences
         )
         if not completion_text.strip() or "�" in completion_text:
-            return self._empty(len(prompt_ids), len(response_ids))
+            return self._empty(prompt_length, len(response_ids))
         teacher_prompt = _teacher_prompt_text(prompt.messages, self.thinking_prefill)
         teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
         with self._stats_lock:
@@ -233,14 +234,14 @@ class _TeacherAlignmentBridge:
         groups = [(indices, logsum) for indices, logsum in groups if indices]
         coverage = groupwise_coverage(groups, student_tokens)
         with self._stats_lock:
-            self.teacher_input_tokens += len(prompt_ids) + len(student_ids)
+            self.teacher_input_tokens += prompt_length + len(student_ids)
             self.coverage_sum += coverage
             if groups:
                 self.aligned_sequences += 1
             else:
                 self.empty_alignments += 1
         teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
-            len(prompt_ids), len(response_ids), groups
+            prompt_length, len(response_ids), groups
         )
         return {"teacher_ids": teacher_ids, "teacher_logprobs": teacher_logprobs}
 
@@ -273,7 +274,9 @@ class _TeacherAlignmentBridge:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                     if self.path == "/score":
-                        result = bridge.score(payload["index"], payload["sequence_ids"])
+                        result = bridge.score(
+                            payload["index"], payload["prompt_length"], payload["sequence_ids"]
+                        )
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
                         result = {"ok": True}
