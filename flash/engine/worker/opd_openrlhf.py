@@ -37,6 +37,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.adapter import _download_adapter
 from flash.engine.worker.grpo_openrlhf import (
     _OPENRLHF_ENTRYPOINT,
+    _is_sm120,
     _resolve_cached_model_snapshot,
     build_openrlhf_child_env,
 )
@@ -1205,6 +1206,7 @@ def build_openrlhf_opd_child_env(
         plugin_dir=plugin_dir,
         max_response_length=max_response_length,
         language_model_only=language_model_only,
+        sm120_vllm_backend=_is_sm120(),
     )
     child.update(
         {
