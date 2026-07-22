@@ -482,6 +482,7 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
 
     assert 3 in watcher.processed_steps
     assert (checkpoint_dir / ".flash-required-step-3.done").read_text() == "durable\n"
+    assert (checkpoint_dir / ".flash-upload-step-3.done").read_text() == "uploaded\n"
 
 
 def test_checkpoint_watcher_waits_for_authoritative_zero3_export(tmp_path):
@@ -557,15 +558,17 @@ def test_checkpoint_retention_waits_for_upload_before_pruning(monkeypatch, tmp_p
     assert (checkpoint_dir / "global_step2").is_dir()
 
 
-def test_checkpoint_retention_keeps_periodic_save_when_upload_is_deferred(monkeypatch, tmp_path):
+def test_checkpoint_watcher_failed_periodic_upload_does_not_hang(monkeypatch, tmp_path):
     import flash.engine.worker.sft_openrlhf as openrlhf_mod
 
     checkpoint_dir = tmp_path / "checkpoints"
-    checkpoint_dir.mkdir()
-    for step in (1, 2):
-        (checkpoint_dir / f"global_step{step}").mkdir()
-        (checkpoint_dir / f"global_step{step}_hf").mkdir()
-        (checkpoint_dir / f".flash-hf-step-{step}.ready").write_text("ready\n", encoding="utf-8")
+    ds_dir = checkpoint_dir / "global_step2"
+    hf_dir = checkpoint_dir / "global_step2_hf"
+    ds_dir.mkdir(parents=True)
+    hf_dir.mkdir()
+    (hf_dir / "adapter_config.json").write_text('{"peft_type":"LORA"}', encoding="utf-8")
+    (hf_dir / "adapter_model.bin").write_bytes(b"authoritative")
+    (checkpoint_dir / ".flash-hf-step-2.ready").write_text("ready\n", encoding="utf-8")
     monkeypatch.setattr(openrlhf_mod, "_export_checkpoint_adapter", lambda *args, **kwargs: None)
     monkeypatch.setattr(openrlhf_mod._w, "upload_resume_checkpoint", lambda *args, **kwargs: False)
     watcher = _OpenRLHFCheckpointWatcher(
@@ -578,15 +581,15 @@ def test_checkpoint_retention_keeps_periodic_save_when_upload_is_deferred(monkey
         required_steps=(),
         max_num_checkpoints=1,
     )
-    watcher.processed_steps.add(1)
 
-    watcher._publish(
-        2, str(checkpoint_dir / "global_step2"), str(checkpoint_dir / "global_step2_hf")
-    )
+    watcher.start()
+    with pytest.raises(RuntimeError, match="checkpoint watcher failed"):
+        watcher.stop(require_complete=False)
 
-    assert watcher.processed_steps == {1}
-    assert (checkpoint_dir / "global_step1").is_dir()
-    assert (checkpoint_dir / "global_step2").is_dir()
+    assert not watcher._thread.is_alive()
+    assert (checkpoint_dir / ".flash-upload-step-2.failed").is_file()
+    assert ds_dir.is_dir()
+    assert hf_dir.is_dir()
 
 
 def test_checkpoint_retention_prunes_matching_hf_sidecar(tmp_path):
@@ -596,6 +599,9 @@ def test_checkpoint_retention_prunes_matching_hf_sidecar(tmp_path):
         (checkpoint_dir / f"global_step{step}").mkdir()
         (checkpoint_dir / f"global_step{step}_hf").mkdir()
         (checkpoint_dir / f".flash-hf-step-{step}.ready").write_text("ready\n", encoding="utf-8")
+        (checkpoint_dir / f".flash-upload-step-{step}.done").write_text(
+            "uploaded\n", encoding="utf-8"
+        )
     watcher = _OpenRLHFCheckpointWatcher(
         checkpoint_dir=str(checkpoint_dir),
         export_root=str(tmp_path / "exports"),
@@ -612,6 +618,7 @@ def test_checkpoint_retention_prunes_matching_hf_sidecar(tmp_path):
 
     assert not (checkpoint_dir / "global_step1_hf").exists()
     assert not (checkpoint_dir / ".flash-hf-step-1.ready").exists()
+    assert not (checkpoint_dir / ".flash-upload-step-1.done").exists()
     assert (checkpoint_dir / "global_step2_hf").is_dir()
 
 
@@ -682,10 +689,22 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "non_blocking=True" in source
     assert "_install_attention_patch()" in source
     assert "_mark_hf_export_ready(args.ckpt.path, global_step)" in source
-    assert "_wait_for_required_save(args.ckpt.path, global_step)" in source
+    assert "_wait_for_checkpoint_upload(args.ckpt.path, global_step)" in source
     assert "2**31 - 1" in source
     assert 'float("inf")' in source
     assert "falling back" not in source.lower()
+
+
+def test_runtime_backpressures_every_checkpoint_until_upload_and_prune_finish():
+    source = render_openrlhf_sft_runtime()
+    save_block = source.split("if save_due:", 1)[1].split("consumed_in_epoch = 0", 1)[0]
+
+    save_model = save_block.index("self.strategy.save_model(")
+    export_ready = save_block.index("_mark_hf_export_ready(args.ckpt.path, global_step)")
+    upload_wait = save_block.index("_wait_for_checkpoint_upload(args.ckpt.path, global_step)")
+
+    assert save_model < export_ready < upload_wait
+    assert "if global_step in required:" not in save_block
 
 
 def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, tmp_path):

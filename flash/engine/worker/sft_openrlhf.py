@@ -510,6 +510,11 @@ def _hf_export_ready_marker(checkpoint_dir: str, step: int) -> str:
     return os.path.join(checkpoint_dir, f".flash-hf-step-{step}.ready")
 
 
+def _checkpoint_upload_marker(checkpoint_dir: str, step: int, *, failed: bool = False) -> str:
+    suffix = ".failed" if failed else ".done"
+    return os.path.join(checkpoint_dir, f".flash-upload-step-{step}{suffix}")
+
+
 class _OpenRLHFCheckpointWatcher:
     """publish completed DeepSpeed checkpoints and their matching PEFT exports."""
 
@@ -586,13 +591,18 @@ class _OpenRLHFCheckpointWatcher:
         for step in retained[: -self.max_num_checkpoints]:
             ds_dir = os.path.join(self.checkpoint_dir, f"global_step{step}")
             hf_dir = os.path.join(self.checkpoint_dir, f"global_step{step}_hf")
-            ready_marker = _hf_export_ready_marker(self.checkpoint_dir, step)
+            markers = (
+                _hf_export_ready_marker(self.checkpoint_dir, step),
+                _checkpoint_upload_marker(self.checkpoint_dir, step),
+                _checkpoint_upload_marker(self.checkpoint_dir, step, failed=True),
+            )
             if os.path.isdir(ds_dir):
                 shutil.rmtree(ds_dir)
             if os.path.isdir(hf_dir):
                 shutil.rmtree(hf_dir)
-            if os.path.isfile(ready_marker):
-                os.remove(ready_marker)
+            for marker in markers:
+                if os.path.isfile(marker):
+                    os.remove(marker)
 
     def _publish(self, step: int, ds_dir: str, hf_dir: str) -> None:
         required = step in self.required_steps
@@ -621,18 +631,20 @@ class _OpenRLHFCheckpointWatcher:
                 before_upload=publish_adapter,
             )
             if not uploaded:
-                if required:
-                    raise RuntimeError(
-                        f"required save step {step} full-state checkpoint was not published"
-                    )
-                return
+                raise RuntimeError(f"save step {step} full-state checkpoint was not published")
             self.processed_steps.add(step)
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step)
                 with open(marker, "w", encoding="utf-8") as file:
                     file.write("durable\n")
             self._prune_uploaded_checkpoints()
+            marker = _checkpoint_upload_marker(self.checkpoint_dir, step)
+            with open(marker, "w", encoding="utf-8") as file:
+                file.write("uploaded\n")
         except BaseException as error:
+            marker = _checkpoint_upload_marker(self.checkpoint_dir, step, failed=True)
+            with open(marker, "w", encoding="utf-8") as file:
+                file.write(f"{type(error).__name__}: {error}\n")
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step, failed=True)
                 with open(marker, "w", encoding="utf-8") as file:
@@ -1060,16 +1072,16 @@ def _mark_hf_export_ready(checkpoint_dir, step):
     os.replace(temporary, marker)
 
 
-def _wait_for_required_save(checkpoint_dir, step):
+def _wait_for_checkpoint_upload(checkpoint_dir, step):
     import time
 
-    done = os.path.join(checkpoint_dir, f".flash-required-step-{step}.done")
-    failed = os.path.join(checkpoint_dir, f".flash-required-step-{step}.failed")
+    done = os.path.join(checkpoint_dir, f".flash-upload-step-{step}.done")
+    failed = os.path.join(checkpoint_dir, f".flash-upload-step-{step}.failed")
     while not os.path.isfile(done):
         if os.path.isfile(failed):
             with open(failed, encoding="utf-8") as file:
                 detail = file.read().strip()
-            raise RuntimeError(f"required save step {step} failed: {detail}")
+            raise RuntimeError(f"save step {step} upload failed: {detail}")
         time.sleep(0.25)
 
 
@@ -1223,8 +1235,7 @@ def _install_trainer_patch():
                     )
                     if self.strategy.is_rank_0():
                         _mark_hf_export_ready(args.ckpt.path, global_step)
-                    if global_step in required:
-                        _wait_for_required_save(args.ckpt.path, global_step)
+                    _wait_for_checkpoint_upload(args.ckpt.path, global_step)
             consumed_in_epoch = 0
 
         if self._wandb is not None and self.strategy.is_rank_0():
