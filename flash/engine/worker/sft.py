@@ -608,6 +608,18 @@ def _reject_image_completion(completion) -> None:
 
 
 def run_sft():
+    backend = os.environ.get("FLASH_SFT_BACKEND", "trl").strip().lower()
+    if backend == "openrlhf":
+        from flash.engine.worker.sft_openrlhf import run_sft_openrlhf
+
+        run_sft_openrlhf()
+        return
+    if backend != "trl":
+        raise ValueError(
+            f"FLASH_SFT_BACKEND={backend!r} is not a known sft backend "
+            "(expected 'trl' or 'openrlhf')"
+        )
+
     from datasets import Dataset
     from transformers import AutoProcessor
     from trl import SFTConfig as TRLSFTConfig

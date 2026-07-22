@@ -106,6 +106,7 @@ def run_openrlhf_training(
     heartbeat: Callable[[], None] | None = None,
     step_pattern: str = r"(?:global[_ ]step|step)[:=\s]+(\d+)",
     heartbeat_interval_s: float = 20.0,
+    torchrun_args: list[str] | None = None,
 ) -> int:
     """run an OpenRLHF trainer module and stream its merged output.
 
@@ -119,7 +120,19 @@ def run_openrlhf_training(
         raise ValueError("OpenRLHF heartbeat interval must be positive")
 
     step_re = re.compile(step_pattern)
-    cmd = [python_bin, "-u", "-m", entrypoint, *entry_args]
+    if torchrun_args is None:
+        cmd = [python_bin, "-u", "-m", entrypoint, *entry_args]
+    else:
+        cmd = [
+            python_bin,
+            "-u",
+            "-m",
+            "torch.distributed.run",
+            *torchrun_args,
+            "-m",
+            entrypoint,
+            *entry_args,
+        ]
     child_env = dict(env)
     child_env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(

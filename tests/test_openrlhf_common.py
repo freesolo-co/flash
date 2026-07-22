@@ -226,6 +226,42 @@ def test_run_openrlhf_training_defaults_to_ppo_entrypoint(monkeypatch):
     assert commands == [["python", "-u", "-m", "openrlhf.cli.train_ppo_ray"]]
 
 
+def test_run_openrlhf_training_wraps_entrypoint_with_torchrun(monkeypatch):
+    process = _FakeProcess([])
+    commands = []
+
+    def fake_popen(cmd, **_kwargs):
+        commands.append(cmd)
+        return process
+
+    monkeypatch.setattr(openrlhf_common.subprocess, "Popen", fake_popen)
+
+    assert (
+        openrlhf_common.run_openrlhf_training(
+            "python",
+            ["--train.max_epochs", "1"],
+            env={},
+            entrypoint="openrlhf.cli.train_sft",
+            torchrun_args=["--standalone", "--nproc-per-node=2"],
+        )
+        == 0
+    )
+    assert commands == [
+        [
+            "python",
+            "-u",
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            "-m",
+            "openrlhf.cli.train_sft",
+            "--train.max_epochs",
+            "1",
+        ]
+    ]
+
+
 def test_run_openrlhf_training_propagates_real_entrypoint_exit_code(tmp_path):
     tmp_path.joinpath("exit_entry.py").write_text(
         "import sys\nraise SystemExit(int(sys.argv[1]))\n"
