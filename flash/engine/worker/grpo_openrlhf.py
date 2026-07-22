@@ -42,10 +42,11 @@ from flash.engine.worker.openrlhf_common import (
 from flash.engine.worker.perf import (
     gpu_diagnostics,
     grpo_use_reentrant,
+    optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
 )
-from flash.engine.worker.rng import backend_seed
+from flash.engine.worker.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.rollout_samples import select_rollout_samples
 from flash.spec import DEFAULT_CREDIT_ASSIGNMENT
 
@@ -137,6 +138,7 @@ class OpenRLHFGRPOConfig:
     fp8_kv: bool
     warmstart_adapter: str
     resume: bool
+    actor_attn_implementation: str | None
 
 
 def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
@@ -190,7 +192,6 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         str(_OPENRLHF_PPO_EPOCHS),
         "--train.seed",
         str(config.seed),
-        "--train.full_determinism_enable",
         "--algo.advantage.estimator",
         "dr_grpo",
         "--algo.advantage.gamma",
@@ -278,8 +279,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         )
     else:
         args.extend(["--algo.kl.init_coef", "0.0"])
-    if config.qwen35_language_model_only:
-        args.extend(["--ds.attn_implementation", "eager"])
+    if config.actor_attn_implementation:
+        args.extend(["--ds.attn_implementation", config.actor_attn_implementation])
     return args
 
 
@@ -472,9 +473,9 @@ class RewardBridge:
                 self._send(
                     200,
                     {
-                        "rewards": result.reward,
-                        "scores": result.scores,
-                        "extra_logs": result.extra_logs,
+                        "rewards": [result.reward],
+                        "scores": [result.scores],
+                        "extra_logs": {name: [value] for name, value in result.extra_logs.items()},
                     },
                 )
 
@@ -559,6 +560,7 @@ def post_reward_request(url: str, payload: dict[str, Any], *, timeout: float = 5
 def _sitecustomize_source() -> str:
     """Return the self-contained child hook loaded before OpenRLHF imports."""
     return r"""
+import contextlib
 import contextvars
 import functools
 import inspect
@@ -568,6 +570,8 @@ import os
 import time
 
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
+_ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
+_LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 if _MAX_RESPONSE_LENGTH <= 0:
     raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
 _WARMSTART_ADAPTER = os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER", "")
@@ -635,11 +639,32 @@ _ppo_actor_module.aggregate_loss = _flash_aggregate_loss
 _original_training_step = _ActorPPOTrainer.training_step
 
 
+def _flash_attention_context():
+    if _ATTN_IMPLEMENTATION != "sdpa":
+        return contextlib.nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel(
+            [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+            set_priority=True,
+        )
+    except Exception as exc:
+        print(f"[flash-openrlhf] cuDNN SDPA unavailable, using default SDPA: {exc}", flush=True)
+        return contextlib.nullcontext()
+
+
 @functools.wraps(_original_training_step)
 def _flash_training_step(self, *args, **kwargs):
     token = _fixed_dr_grpo_loss.set(True)
     try:
-        return _original_training_step(self, *args, **kwargs)
+        with _flash_attention_context():
+            return _original_training_step(self, *args, **kwargs)
     finally:
         _fixed_dr_grpo_loss.reset(token)
 
@@ -675,6 +700,11 @@ async def _flash_execute(self, *args, **kwargs):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
     for key in ("reward", "scores"):
         value = output.get(key)
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise RuntimeError(f"OpenRLHF reward executor returned invalid {key}")
+            value = value[0]
+            output[key] = value
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise RuntimeError(f"OpenRLHF reward executor returned invalid {key}")
     extra_logs = output.get("extra_logs")
@@ -683,6 +713,11 @@ async def _flash_execute(self, *args, **kwargs):
     for name, value in extra_logs.items():
         if not isinstance(name, str):
             raise RuntimeError("OpenRLHF reward metric names must be strings")
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise RuntimeError(f"OpenRLHF reward metric {name!r} is invalid")
+            value = value[0]
+            extra_logs[name] = value
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise RuntimeError(f"OpenRLHF reward metric {name!r} is invalid")
     return output
@@ -849,6 +884,9 @@ _original_broadcast_to_vllm = _ActorPPOTrainer.broadcast_to_vllm
 _LORA_PARAMETER_SEGMENTS = frozenset(
     {"lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B", "lora_magnitude_vector"}
 )
+_NON_LM_PARAMETER_SEGMENTS = frozenset(
+    {"visual", "vision_tower", "multi_modal_projector", "mtp"}
+)
 
 
 def _flash_vllm_base_name(name):
@@ -879,6 +917,10 @@ def _flash_lora_sync_entries(model):
     for raw_name, parameter in base_model.named_parameters():
         parts = raw_name.split(".")
         if any(part in _LORA_PARAMETER_SEGMENTS for part in parts):
+            continue
+        if _LANGUAGE_MODEL_ONLY and any(
+            part in _NON_LM_PARAMETER_SEGMENTS for part in parts
+        ):
             continue
         name = _flash_vllm_base_name(raw_name)
         if name in seen:
@@ -1021,28 +1063,29 @@ def _flash_broadcast_to_vllm(self):
 
 _ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm
 
-if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1" or _FP8_KV:
+if _LANGUAGE_MODEL_ONLY or _FP8_KV:
     import vllm
 
-    _original_engine_init = vllm.AsyncEngineArgs.__init__
-    _engine_parameters = inspect.signature(_original_engine_init).parameters
-    if (
-        os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
-        and "language_model_only" not in _engine_parameters
-    ):
-        raise RuntimeError("the pinned vLLM lacks AsyncEngineArgs.language_model_only")
-    if _FP8_KV and "kv_cache_dtype" not in _engine_parameters:
-        raise RuntimeError("the pinned vLLM lacks AsyncEngineArgs.kv_cache_dtype")
+    def _flash_patch_engine_args(engine_args_type, type_name):
+        original_init = engine_args_type.__init__
+        parameters = inspect.signature(original_init).parameters
+        if _LANGUAGE_MODEL_ONLY and "language_model_only" not in parameters:
+            raise RuntimeError(f"the pinned vLLM lacks {type_name}.language_model_only")
+        if _FP8_KV and "kv_cache_dtype" not in parameters:
+            raise RuntimeError(f"the pinned vLLM lacks {type_name}.kv_cache_dtype")
 
-    @functools.wraps(_original_engine_init)
-    def _flash_engine_init(self, *args, **kwargs):
-        if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
-            kwargs.setdefault("language_model_only", True)
-        if _FP8_KV:
-            kwargs.setdefault("kv_cache_dtype", "fp8")
-        return _original_engine_init(self, *args, **kwargs)
+        @functools.wraps(original_init)
+        def flash_engine_init(self, *args, **kwargs):
+            if _LANGUAGE_MODEL_ONLY:
+                kwargs.setdefault("language_model_only", True)
+            if _FP8_KV:
+                kwargs.setdefault("kv_cache_dtype", "fp8")
+            return original_init(self, *args, **kwargs)
 
-    vllm.AsyncEngineArgs.__init__ = _flash_engine_init
+        engine_args_type.__init__ = flash_engine_init
+
+    _flash_patch_engine_args(vllm.AsyncEngineArgs, "AsyncEngineArgs")
+    _flash_patch_engine_args(vllm.EngineArgs, "EngineArgs")
 
 print(
     "[flash-openrlhf] flash grpo tis, loss, truncation, reward, warm-start, checkpoint, and lora sync hooks active",
@@ -1066,6 +1109,7 @@ def build_openrlhf_child_env(
     fp8_kv: bool = False,
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
+    actor_attn_implementation: str | None = None,
 ) -> dict[str, str]:
     """Build a minimal child environment without Flash environment or provider secrets."""
     child = {
@@ -1088,6 +1132,8 @@ def build_openrlhf_child_env(
         child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] = warmstart_adapter
     if save_at_steps:
         child["FLASH_OPENRLHF_SAVE_AT_STEPS"] = ",".join(str(step) for step in save_at_steps)
+    if actor_attn_implementation:
+        child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] = actor_attn_implementation
     return child
 
 
@@ -1292,6 +1338,11 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         )
 
     train_spec = spec.train
+    if train_spec.save_every is not None:
+        raise RuntimeError(
+            "OpenRLHF GRPO periodic checkpoints are not uploaded; omit train.save_every or use "
+            "the TRL backend"
+        )
     if train_spec.stop_sequences:
         raise RuntimeError("OpenRLHF GRPO stop sequences are deferred; use the TRL backend")
     if train_spec.structured_outputs:
@@ -1311,30 +1362,43 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
 
     rl = RECIPE.rl
     overrides = _w.grpo_overrides()
-    prompts_per_step = int(train_spec.batch_size or rl.prompts_per_step)
-    group_size = int(overrides.get("group_size") or rl.group_size)
+    prompts_per_step = int(
+        train_spec.batch_size if train_spec.batch_size is not None else rl.prompts_per_step
+    )
+    group_size_value = overrides.get("group_size")
+    group_size = int(group_size_value if group_size_value is not None else rl.group_size)
     if group_size <= 1:
         raise ValueError("OpenRLHF DR-GRPO requires train.group_size greater than 1")
     temperature_value = overrides.get("temperature")
     temperature = float(
         temperature_value if temperature_value is not None else rl.sampling_temperature
     )
-    think_penalty = float(overrides.get("thinking_length_penalty_coef") or 0.0)
-    kl_coef = float(overrides.get("kl_penalty_coef") or 0.0)
-    learning_rate = float(train_spec.learning_rate or rl.learning_rate)
-    lora_rank = int(train_spec.lora_rank or RECIPE.lora.rank)
-    lora_alpha = int(train_spec.lora_alpha or RECIPE.lora.alpha)
+    think_penalty_value = overrides.get("thinking_length_penalty_coef")
+    think_penalty = float(think_penalty_value if think_penalty_value is not None else 0.0)
+    kl_coef_value = overrides.get("kl_penalty_coef")
+    kl_coef = float(kl_coef_value if kl_coef_value is not None else 0.0)
+    learning_rate = float(
+        train_spec.learning_rate if train_spec.learning_rate is not None else rl.learning_rate
+    )
+    lora_rank = int(train_spec.lora_rank if train_spec.lora_rank is not None else RECIPE.lora.rank)
+    lora_alpha = int(
+        train_spec.lora_alpha if train_spec.lora_alpha is not None else RECIPE.lora.alpha
+    )
     warmstart_adapter, lora_rank, lora_alpha = _resolve_openrlhf_warmstart(
         train_spec.init_from_adapter,
         fallback_rank=lora_rank,
         fallback_alpha=lora_alpha,
     )
+    max_completion_value = overrides.get("max_tokens")
     max_completion = int(
-        overrides.get("max_tokens")
-        or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
+        max_completion_value
+        if max_completion_value is not None
+        else (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
     )
     max_length = int(
-        train_spec.max_context_tokens or max(1024, int(rl.max_prompt_len) + max_completion)
+        train_spec.max_context_tokens
+        if train_spec.max_context_tokens is not None
+        else max(1024, int(rl.max_prompt_len) + max_completion)
     )
     prompt_budget = max_length - max_completion
     if prompt_budget <= 0:
@@ -1387,7 +1451,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         prompts_per_step=prompts_per_step,
     )
     steps = resolve_update_horizon(derived_steps, train_spec.max_steps)
-    save_every = int(train_spec.save_every or 20)
+    save_every = -1
     save_at_steps = tuple(int(step) for step in (train_spec.save_at_steps or ()))
     validate_save_steps(save_at_steps, steps)
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
@@ -1426,13 +1490,17 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
 def run_rl_openrlhf() -> None:
     """Run single-turn text GRPO through the isolated OpenRLHF trainer."""
     started_at = time.time()
+    seed_training_rngs(_w.SEED)
     _w.heartbeat("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
         exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
-    inputs = _resolve_single_turn_inputs()
+    # omission selects openrlhf's fa2 default, not transformers' automatic sdpa fallback.
+    actor_attn_implementation = optimal_attn_impl() or "sdpa"
+    with liveness_heartbeat("rl_data_loading"):
+        inputs = _resolve_single_turn_inputs()
 
     if inputs["model_revision"]:
         download_seconds = _w.prefetch_model(inputs["model_id"], revision=inputs["model_revision"])
@@ -1510,6 +1578,7 @@ def run_rl_openrlhf() -> None:
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             resume=bool(resume_checkpoint),
+            actor_attn_implementation=actor_attn_implementation,
         )
         args = build_openrlhf_grpo_args(config)
         child_env = build_openrlhf_child_env(
@@ -1519,6 +1588,7 @@ def run_rl_openrlhf() -> None:
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],
+            actor_attn_implementation=actor_attn_implementation,
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
@@ -1587,7 +1657,6 @@ def run_rl_openrlhf() -> None:
                     step=last_step[0],
                     gpu=gpu_diagnostics(),
                 ),
-                step_pattern=r"(?i)global[_ ]step[:=\s]+(\d+)",
             )
         if returncode != 0:
             raise RuntimeError(
@@ -1595,10 +1664,10 @@ def run_rl_openrlhf() -> None:
             )
         if bridge.call_count == 0 and resumed_step < inputs["steps"]:
             raise RuntimeError("OpenRLHF GRPO completed without scoring any reward")
-        if last_step[0] < inputs["steps"]:
-            raise RuntimeError(
-                f"OpenRLHF GRPO completed {last_step[0]}/{inputs['steps']} requested updates"
-            )
+        # a zero exit is OpenRLHF's completion contract. parsed steps are progress telemetry only:
+        # releases differ between bare/global and zero/one-based counters, while export verifies the
+        # final artifact exists before publication.
+        last_step[0] = max(last_step[0], inputs["steps"])
         missing_required = sorted(set(inputs["save_at_steps"]) - published_steps)
         if missing_required:
             raise RuntimeError(

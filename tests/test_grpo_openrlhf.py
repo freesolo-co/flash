@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import importlib.util
 import json
@@ -56,16 +57,96 @@ def _config(**overrides) -> grpo_openrlhf.OpenRLHFGRPOConfig:
         "lora_rank": 32,
         "lora_alpha": 64,
         "kl_coef": 0.0,
-        "save_every": 20,
+        "save_every": -1,
         "save_at_steps": (),
         "gpu_count": 2,
         "qwen35_language_model_only": True,
         "fp8_kv": False,
         "warmstart_adapter": "",
         "resume": False,
+        "actor_attn_implementation": "flash_attention_3",
     }
     values.update(overrides)
     return grpo_openrlhf.OpenRLHFGRPOConfig(**values)
+
+
+def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None):
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"answer": "ok"}]
+
+        def prompt_messages(self, _example):
+            return [{"role": "user", "content": "prompt"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "</s>"
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return "prompt"
+
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=[1, 2])
+
+    train = SimpleNamespace(
+        init_from_adapter=False,
+        save_at_steps=(),
+        save_every=save_every,
+        stop_sequences=(),
+        structured_outputs="",
+        credit_assignment="per_episode",
+        batch_size=1,
+        learning_rate=0.0,
+        lora_rank=0,
+        lora_alpha=0,
+        max_context_tokens=16,
+        max_examples=0,
+        epochs=1,
+        max_steps=None,
+    )
+    spec = SimpleNamespace(
+        algorithm="grpo",
+        train=train,
+        model="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        seed=7,
+        gpu=SimpleNamespace(count=1),
+    )
+    recipe = SimpleNamespace(
+        rl=SimpleNamespace(
+            prompts_per_step=8,
+            group_size=8,
+            sampling_temperature=0.7,
+            learning_rate=1e-5,
+            max_completion_len_thinking=8,
+            max_completion_len=8,
+            max_prompt_len=8,
+            num_epochs=1,
+            sampling_top_p=0.95,
+        ),
+        lora=SimpleNamespace(dropout=0.0, rank=32, alpha=64),
+    )
+    monkeypatch.setattr(grpo_openrlhf, "RECIPE", recipe)
+    monkeypatch.setattr(grpo_openrlhf._w, "JOB_SPEC", spec)
+    monkeypatch.setattr(grpo_openrlhf._w, "THINKING", False)
+    monkeypatch.setattr(grpo_openrlhf._w, "require_active_env", lambda: _Env())
+    monkeypatch.setattr(
+        grpo_openrlhf._w,
+        "grpo_overrides",
+        lambda: {
+            "group_size": 2,
+            "temperature": 0.0,
+            "thinking_length_penalty_coef": 0.0,
+            "kl_penalty_coef": 0.0,
+            "max_tokens": 4,
+        },
+    )
+    monkeypatch.setattr(grpo_openrlhf._w, "load_tokenizer", lambda *_args, **_kwargs: _Tokenizer())
+    monkeypatch.setattr(grpo_openrlhf._w, "resolve_grpo_prompts_per_step", lambda value, _n: value)
+    return train
 
 
 def _hierarchize(namespace):
@@ -172,7 +253,7 @@ def _package(monkeypatch, name: str):
     return module
 
 
-def _install_pinned_sitecustomize_modules(monkeypatch):
+def _install_pinned_sitecustomize_modules(monkeypatch, *, language_model_only=False):
     torch = pytest.importorskip("torch")
     openrlhf = _package(monkeypatch, "openrlhf")
     models = _package(monkeypatch, "openrlhf.models")
@@ -308,11 +389,17 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
     vllm = types.ModuleType("vllm")
     vllm.SamplingParams = type("SamplingParams", (), {})
 
-    class _AsyncEngineArgs:
-        def __init__(self, kv_cache_dtype=None, language_model_only=False):
+    class _EngineArgs:
+        def __init__(self, *, kv_cache_dtype=None, language_model_only=False):
             self.kv_cache_dtype = kv_cache_dtype
             self.language_model_only = language_model_only
 
+    class _AsyncEngineArgs:
+        def __init__(self, *, kv_cache_dtype=None, language_model_only=False):
+            self.kv_cache_dtype = kv_cache_dtype
+            self.language_model_only = language_model_only
+
+    vllm.EngineArgs = _EngineArgs
     vllm.AsyncEngineArgs = _AsyncEngineArgs
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     vllm_engine = types.ModuleType("openrlhf.trainer.ray.vllm_engine")
@@ -389,13 +476,20 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
 
     class _SingleTurnAgentExecutor:
         async def execute(self, *_args, **_kwargs):
-            return {"reward": 0.0, "scores": 0.0, "extra_logs": {}}
+            return {
+                "reward": [0.0],
+                "scores": [0.0],
+                "extra_logs": {"format": [1.0]},
+            }
 
     agent_module.SingleTurnAgentExecutor = _SingleTurnAgentExecutor
     monkeypatch.setitem(sys.modules, "openrlhf.utils.agent", agent_module)
 
     monkeypatch.setenv("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH", "5")
-    monkeypatch.delenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", raising=False)
+    if language_model_only:
+        monkeypatch.setenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", "1")
+    else:
+        monkeypatch.delenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", raising=False)
     namespace = {"__name__": "sitecustomize", "__file__": "sitecustomize.py"}
     exec(compile(grpo_openrlhf._sitecustomize_source(), "sitecustomize.py", "exec"), namespace)
     return namespace, loss_module, ppo_actor_module, samples_module, experience_module.Experience
@@ -430,7 +524,8 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
     assert _value(args, "--vllm.num_engines") == "2"
     assert "--train.colocate_all" in args
     assert "--vllm.enforce_eager" in args
-    assert "--ds.attn_implementation" in args
+    assert _value(args, "--ds.attn_implementation") == "flash_attention_3"
+    assert "--train.full_determinism_enable" not in args
     assert "--actor.gradient_checkpointing_reentrant" in args
     assert _value(args, "--algo.kl.init_coef") == "0.0"
     assert "--algo.advantage.is_correction_enable" in args
@@ -484,6 +579,27 @@ def test_build_openrlhf_grpo_args_maps_exact_saves_and_resume():
 def test_build_openrlhf_grpo_args_rejects_degenerate_group():
     with pytest.raises(ValueError, match="group_size greater than 1"):
         grpo_openrlhf.build_openrlhf_grpo_args(_config(group_size=1))
+
+
+def test_resolve_single_turn_inputs_preserves_explicit_zero_values(monkeypatch):
+    _install_resolve_inputs_fakes(monkeypatch)
+
+    inputs = grpo_openrlhf._resolve_single_turn_inputs()
+
+    assert inputs["temperature"] == 0.0
+    assert inputs["think_penalty"] == 0.0
+    assert inputs["kl_coef"] == 0.0
+    assert inputs["learning_rate"] == 0.0
+    assert inputs["lora_rank"] == 0
+    assert inputs["lora_alpha"] == 0
+    assert inputs["save_every"] == -1
+
+
+def test_resolve_single_turn_inputs_rejects_unpublished_periodic_saves(monkeypatch):
+    _install_resolve_inputs_fakes(monkeypatch, save_every=5)
+
+    with pytest.raises(RuntimeError, match="periodic checkpoints are not uploaded"):
+        grpo_openrlhf._resolve_single_turn_inputs()
 
 
 def test_dr_grpo_fixed_length_normalization_matches_trl_formula():
@@ -554,7 +670,11 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
             },
         )
 
-    assert response == {"rewards": 1.25, "scores": 1.25, "extra_logs": {"format": 0.5}}
+    assert response == {
+        "rewards": [1.25],
+        "scores": [1.25],
+        "extra_logs": {"format": [0.5]},
+    }
     assert calls == [(7, "completion", "rendered prompt")]
     assert bridge.rewards == [1.25]
     assert bridge.drain_sampled_completions(4) == [
@@ -618,6 +738,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         fp8_kv=True,
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
+        actor_attn_implementation="sdpa",
     )
 
     assert child["PATH"] == "/usr/bin"
@@ -627,6 +748,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["FLASH_OPENRLHF_FP8_KV"] == "1"
     assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/incoming-adapter"
     assert child["FLASH_OPENRLHF_SAVE_AT_STEPS"] == "3,7"
+    assert child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "sdpa"
     assert "USER_ENV_SECRET" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -643,7 +765,10 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "_ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm" in source
     assert 'for key in ("reward", "scores")' in source
     assert "returned invalid {key}" in source
-    assert "language_model_only" in source
+    assert "_flash_patch_engine_args(vllm.AsyncEngineArgs" in source
+    assert "_flash_patch_engine_args(vllm.EngineArgs" in source
+    assert "_NON_LM_PARAMETER_SEGMENTS" in source
+    assert "_flash_attention_context" in source
     assert 'target_modules"] = "all-linear"' in source
     assert 'vllm_is_truncated_threshold"] = [0.0, 2.0]' in source
     assert 'kwargs.setdefault("kv_cache_dtype", "fp8")' in source
@@ -655,6 +780,27 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "_PolicyModelActorImpl.save_checkpoint = _flash_actor_save_checkpoint" in source
     assert "self.broadcast_to_vllm()" in source
     assert "[flash-openrlhf-checkpoint]" in source
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_normalizes_singleton_reward_batches(monkeypatch):
+    _install_pinned_sitecustomize_modules(monkeypatch)
+    executor_type = sys.modules["openrlhf.utils.agent"].SingleTurnAgentExecutor
+
+    output = asyncio.run(executor_type().execute())
+
+    assert output == {"reward": 0.0, "scores": 0.0, "extra_logs": {"format": 1.0}}
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_patches_sync_and_async_language_only_engine_args(monkeypatch):
+    _install_pinned_sitecustomize_modules(monkeypatch, language_model_only=True)
+    vllm = sys.modules["vllm"]
+
+    assert vllm.EngineArgs().language_model_only is True
+    assert vllm.AsyncEngineArgs().language_model_only is True
 
 
 @requires_openrlhf_source
@@ -1049,6 +1195,49 @@ def test_per_step_checkpoint_publishes_deployable_and_complete_resume_sidecars(
     assert grpo_openrlhf._openrlhf_resume_step(str(checkpoint_dir)) == 3
 
 
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_language_only_sync_excludes_vlm_weights(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _, _ = _install_pinned_sitecustomize_modules(
+        monkeypatch, language_model_only=True
+    )
+
+    class _ToyLora(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = torch.nn.Linear(2, 2, bias=False)
+            self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 1, bias=False)})
+            self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 2, bias=False)})
+            self.active_adapters = ["default"]
+            self.lora_variant = {}
+            self.lora_bias = {"default": False}
+
+        def get_delta_weight(self, _adapter):
+            return self.lora_B["default"].weight @ self.lora_A["default"].weight
+
+    class _Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Module()
+            self.language_model.proj = _ToyLora()
+            self.visual = torch.nn.Module()
+            self.visual.proj = torch.nn.Linear(2, 2, bias=False)
+
+    class _PeftModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_model = _Base()
+
+        def get_base_model(self):
+            return self.base_model
+
+    names = {name for name, *_rest in namespace["_flash_lora_sync_entries"](_PeftModel())}
+
+    assert "language_model.proj.weight" in names
+    assert not any(name.startswith("visual.") for name in names)
+
+
 def test_run_rl_dispatches_to_openrlhf(monkeypatch):
     calls = []
     monkeypatch.setenv("FLASH_RL_BACKEND", "openrlhf")
@@ -1097,6 +1286,14 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
     fake_job = SimpleNamespace(
         gpu=SimpleNamespace(type="H100", exact_type="", count=1),
     )
+    events = []
+
+    @contextlib.contextmanager
+    def fake_liveness(name, *_args, **_kwargs):
+        events.append(f"enter:{name}")
+        yield
+        events.append(f"exit:{name}")
+
     monkeypatch.setattr(grpo_openrlhf._w, "JOB_SPEC", fake_job)
     monkeypatch.setattr(grpo_openrlhf._w, "SEED", 42)
     monkeypatch.setattr(grpo_openrlhf._w, "THINKING", False)
@@ -1112,10 +1309,12 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
     monkeypatch.setattr(grpo_openrlhf._w, "graded_text", lambda text, **_kwargs: text)
     monkeypatch.setattr(grpo_openrlhf, "wait_for_gpu", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(grpo_openrlhf, "setup_perf_backends", lambda: None)
-    monkeypatch.setattr(grpo_openrlhf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(grpo_openrlhf, "optimal_attn_impl", lambda: "flash_attention_3")
     monkeypatch.setattr(
-        grpo_openrlhf, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+        grpo_openrlhf, "seed_training_rngs", lambda seed: events.append(f"seed:{seed}")
     )
+    monkeypatch.setattr(grpo_openrlhf, "gpu_diagnostics", lambda: {})
+    monkeypatch.setattr(grpo_openrlhf, "liveness_heartbeat", fake_liveness)
     monkeypatch.setattr(
         grpo_openrlhf, "resolve_openrlhf_python", lambda _workdir: "/openrlhf/python"
     )
@@ -1124,10 +1323,11 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
         "_resolve_cached_model_snapshot",
         lambda *_args: "/cache/snapshots/" + "a" * 40,
     )
-    monkeypatch.setattr(
-        grpo_openrlhf,
-        "_resolve_single_turn_inputs",
-        lambda: {
+
+    def fake_resolve_inputs():
+        assert events[-1] == "enter:rl_data_loading"
+        events.append("resolved-inputs")
+        return {
             "env": _Env(),
             "tokenizer": _Tokenizer(),
             "model_id": "Qwen/Qwen3.5-0.8B",
@@ -1152,14 +1352,15 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
             "max_length": 128,
             "prompt_opened_thinking": False,
             "steps": 2,
-            "save_every": 1,
+            "save_every": -1,
             "save_at_steps": (),
             "gpu_count": 1,
             "seed": 42,
             "fp8_kv": True,
             "warmstart_adapter": "",
-        },
-    )
+        }
+
+    monkeypatch.setattr(grpo_openrlhf, "_resolve_single_turn_inputs", fake_resolve_inputs)
     launched = {}
 
     def fake_training(python_bin, args, **kwargs):
@@ -1171,8 +1372,9 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
             reward_url,
             {"query": ["promptcompletion"], "prompts": ["prompt"], "labels": [0]},
         )
-        assert reward["rewards"] == 2.0
-        kwargs["on_step"](2)
+        assert reward["rewards"] == [2.0]
+        assert "step_pattern" not in kwargs
+        kwargs["on_step"](1)
         return 0
 
     monkeypatch.setattr(grpo_openrlhf, "run_openrlhf_training", fake_training)
@@ -1187,8 +1389,11 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
         grpo_openrlhf._w, "write_base_model_provenance", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(grpo_openrlhf._w, "hf_upload_folder", lambda *_args, **_kwargs: True)
+    published = []
     monkeypatch.setattr(
-        grpo_openrlhf._w, "publish_deployable_checkpoint", lambda *_args, **_kwargs: None
+        grpo_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda *args, **_kwargs: published.append(args),
     )
     metadata = []
     monkeypatch.setattr(
@@ -1200,14 +1405,20 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
 
     assert launched["python"] == "/openrlhf/python"
     assert _value(launched["args"], "--algo.advantage.estimator") == "dr_grpo"
+    assert _value(launched["args"], "--ds.attn_implementation") == "flash_attention_3"
+    assert _value(launched["args"], "--ckpt.save_steps") == "-1"
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
     assert launched["env"]["FLASH_OPENRLHF_FP8_KV"] == "1"
+    assert launched["env"]["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "flash_attention_3"
     assert launched["env"]["HF_HUB_OFFLINE"] == "1"
+    assert events.index("seed:42") < events.index("enter:rl_data_loading")
     assert exports
     assert exports[0][2:4] == ("Qwen/Qwen3.5-0.8B", "a" * 40)
+    assert published[0][1] == 2
     rl_step = next(kwargs for stage, kwargs in heartbeats if stage == "rl_step")
-    assert rl_step["step"] == 2
+    assert rl_step["step"] == 1
     assert rl_step["sampled_completions"][0]["completion"] == "completion"
     assert rl_step["sampled_completions"][0]["reward"] == 2.0
     assert metadata[0]["notes"]["backend"] == "openrlhf"
+    assert metadata[0]["notes"]["steps"] == 2
     assert metadata[0]["notes"]["reward_history"] == [2.0]
