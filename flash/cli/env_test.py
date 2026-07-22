@@ -71,12 +71,12 @@ def _reference_turns(env, example: dict) -> list[str]:
     # envelope like the prompt so a malformed completion (scalar content, missing role)
     # fails the episode instead of silently falling back to echo. text is extracted the
     # same way the real reward path grades a completion, so a gold answer expressed as
-    # openai-style text blocks is replayed instead of echoed; a target with no text (null
-    # content or image-only blocks) yields no replay text and uses echo.
+    # openai-style text blocks is replayed instead of echoed; text-free turns (null content
+    # or image-only blocks) yield an empty replay string that is kept in place.
     messages = _check_messages(env.sft_completion(example), "sft_completion")
     assistant = [m for m in messages if m["role"].strip().lower() == "assistant"]
     selected = assistant or messages
-    return [text for m in selected if (text := _message_text(m["content"]))]
+    return [_message_text(m["content"]) for m in selected]
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
@@ -113,7 +113,11 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
-    response = "\n".join(reference_turns) if policy == "replay" else _ECHO_RESPONSE
+    response = (
+        "\n".join(turn for turn in reference_turns if turn)
+        if policy == "replay"
+        else _ECHO_RESPONSE
+    )
     record["responses"] = [response]
     record["turns"] = 1
     record["reward"] = float(env.reward(response, example))
