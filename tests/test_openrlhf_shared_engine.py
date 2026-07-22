@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
@@ -27,19 +28,31 @@ class _FakeLoRARequest:
 
 
 class _FakeEngine:
-    def __init__(self) -> None:
+    def __init__(self, *, max_loaded: int | None = None) -> None:
         self.added: list[_FakeLoRARequest] = []
         self.pinned: list[int] = []
         self.removed: list[int] = []
+        self.loaded: set[int] = set()
         self.generations: list[dict[str, Any]] = []
         self.started: dict[int, asyncio.Event] = {}
         self.release: dict[int, asyncio.Event] = {}
+        self.add_started: dict[str, asyncio.Event] = {}
+        self.add_release: dict[str, asyncio.Event] = {}
+        self.fail_remove_count: dict[int, int] = {}
         self.fail_add_path: str | None = None
+        self.max_loaded = max_loaded
 
     async def add_lora(self, request: _FakeLoRARequest) -> bool:
         if request.lora_path == self.fail_add_path:
             raise RuntimeError("load failed")
+        if self.max_loaded is not None and len(self.loaded) >= self.max_loaded:
+            raise RuntimeError("hot slots exhausted")
         self.added.append(request)
+        self.loaded.add(request.lora_int_id)
+        self.add_started.setdefault(request.lora_path, asyncio.Event()).set()
+        blocker = self.add_release.get(request.lora_path)
+        if blocker is not None:
+            await blocker.wait()
         return True
 
     async def pin_lora(self, int_id: int) -> bool:
@@ -48,6 +61,11 @@ class _FakeEngine:
 
     async def remove_lora(self, int_id: int) -> bool:
         self.removed.append(int_id)
+        remaining_failures = self.fail_remove_count.get(int_id, 0)
+        if remaining_failures > 0:
+            self.fail_remove_count[int_id] = remaining_failures - 1
+            return False
+        self.loaded.discard(int_id)
         return True
 
     async def generate(
@@ -262,6 +280,134 @@ def test_n_plus_one_slot_blocks_another_publish_until_stale_version_drains(tmp_p
     asyncio.run(scenario())
 
 
+def test_hot_slots_are_reclaimed_across_repeated_transient_eviction_failures(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = _manager(engine, run_capacity=1)
+        current = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+
+        for version in range(1, 11):
+            engine.fail_remove_count[current.lora_int_id] = 1
+            current = await manager.publish_adapter(
+                "run-a",
+                version - 1,
+                version,
+                _adapter_dir(tmp_path, f"a-v{version}"),
+            )
+            assert await manager.current_handle("run-a") == current
+            assert len(engine.loaded) <= manager.hot_slot_capacity
+
+        current = await manager.publish_adapter(
+            "run-a",
+            10,
+            11,
+            _adapter_dir(tmp_path, "a-v11"),
+        )
+        health = await manager.health()
+        assert [item.handle for item in health.adapters] == [current]
+        assert engine.loaded == {current.lora_int_id}
+
+    asyncio.run(scenario())
+
+
+def test_generate_releases_reference_when_request_setup_raises(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = SharedMultiLoRARolloutEngine(
+            engine,
+            run_capacity=1,
+            lora_request_factory=_FakeLoRARequest,
+            request_id_factory=lambda: (_ for _ in ()).throw(RuntimeError("id failed")),
+        )
+        first = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+
+        with pytest.raises(RuntimeError, match="id failed"):
+            await manager.generate(first, {"prompt_token_ids": [1]}, {"temperature": 0})
+
+        first_health = (await manager.health()).adapters[0]
+        assert first_health.in_flight == 0
+        second = await manager.publish_adapter("run-a", 0, 1, _adapter_dir(tmp_path, "a-v1"))
+        assert [item.handle for item in (await manager.health()).adapters] == [second]
+
+    asyncio.run(scenario())
+
+
+def test_remove_run_drain_does_not_block_other_run_publication(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=3)
+        manager = _manager(engine, run_capacity=2)
+        run_a = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        await manager.register_run("run-b", 0, _adapter_dir(tmp_path, "b-v0"))
+        engine.release[run_a.lora_int_id] = asyncio.Event()
+
+        rollout = asyncio.create_task(
+            manager.generate(run_a, {"prompt_token_ids": [1]}, {"temperature": 0})
+        )
+        await engine.started.setdefault(run_a.lora_int_id, asyncio.Event()).wait()
+        removal = asyncio.create_task(manager.remove_run("run-a", 0))
+        while True:
+            with contextlib.suppress(AdapterRegistryError):
+                await manager.current_handle("run-a")
+                await asyncio.sleep(0)
+                continue
+            break
+
+        run_b_v1 = await asyncio.wait_for(
+            manager.publish_adapter("run-b", 0, 1, _adapter_dir(tmp_path, "b-v1")),
+            timeout=1,
+        )
+        assert run_b_v1.version == 1
+        assert removal.done() is False
+
+        engine.release[run_a.lora_int_id].set()
+        await rollout
+        await removal
+
+    asyncio.run(scenario())
+
+
+def test_run_id_normalization_is_consistent_for_every_operation(tmp_path):
+    async def scenario():
+        engine = _FakeEngine()
+        manager = _manager(engine, run_capacity=1)
+        first = await manager.register_run("  run-a  ", 0, _adapter_dir(tmp_path, "a-v0"))
+        assert first.run_id == "run-a"
+        assert await manager.current_handle(" run-a ") == first
+
+        second = await manager.publish_adapter(" run-a ", 0, 1, _adapter_dir(tmp_path, "a-v1"))
+        assert await manager.current_handle("  run-a") == second
+        await manager.remove_run("run-a  ", 1)
+        assert (await manager.health()).adapters == ()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_publication_finishes_load_to_registry_transition(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = _manager(engine, run_capacity=1)
+        first = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        second_dir = _adapter_dir(tmp_path, "a-v1")
+        resolved_second_dir = str(second_dir.resolve())
+        engine.add_started[resolved_second_dir] = asyncio.Event()
+        engine.add_release[resolved_second_dir] = asyncio.Event()
+
+        publication = asyncio.create_task(manager.publish_adapter("run-a", 0, 1, second_dir))
+        await engine.add_started[resolved_second_dir].wait()
+        publication.cancel()
+        engine.add_release[resolved_second_dir].set()
+        with pytest.raises(asyncio.CancelledError):
+            await publication
+
+        current = await manager.current_handle("run-a")
+        assert current.version == 1
+        assert current.lora_int_id in engine.loaded
+        assert first.lora_int_id not in engine.loaded
+        assert [item.handle for item in (await manager.health()).adapters] == [current]
+
+    asyncio.run(scenario())
+
+
 def test_prefix_cache_namespace_isolated_for_every_adapter_version(tmp_path):
     async def scenario():
         engine = _FakeEngine()
@@ -324,6 +470,19 @@ def test_published_old_handle_cannot_admit_a_new_rollout(tmp_path):
 
         with pytest.raises(UnknownAdapterHandle, match="not current"):
             await manager.generate(old, {"prompt_token_ids": [3]}, {"temperature": 0})
+
+    asyncio.run(scenario())
+
+
+def test_adapter_directory_cannot_be_reused_for_another_immutable_version(tmp_path):
+    async def scenario():
+        engine = _FakeEngine()
+        manager = _manager(engine, run_capacity=1)
+        adapter_dir = _adapter_dir(tmp_path, "shared")
+        await manager.register_run("run-a", 0, adapter_dir)
+
+        with pytest.raises(AdapterRegistryError, match="already published"):
+            await manager.publish_adapter("run-a", 0, 1, adapter_dir)
 
     asyncio.run(scenario())
 
