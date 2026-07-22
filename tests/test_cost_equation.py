@@ -39,10 +39,10 @@ def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():
     """Heavy reward latency raises cost but doesn't explode: graders run concurrently (waves of
     16), not serially."""
     light = estimate_cost(
-        RunConfig("openbmb/MiniCPM5-1B", "grpo", 100, reward_seconds_per_completion=0.05)
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 100, reward_seconds_per_completion=0.05)
     )
     heavy = estimate_cost(
-        RunConfig("openbmb/MiniCPM5-1B", "grpo", 100, reward_seconds_per_completion=3.0)
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 100, reward_seconds_per_completion=3.0)
     )
     assert heavy.total_usd > light.total_usd
     assert not heavy.wall_capped  # concurrent grading keeps a small run under the wall cap
