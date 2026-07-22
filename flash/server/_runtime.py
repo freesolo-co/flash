@@ -245,6 +245,15 @@ def _recovery_block_reason(spec) -> str | None:
     return None
 
 
+def _recovery_wall_deadline_is_open(spec) -> bool:
+    from flash.runner import _remaining_run_wall_seconds
+
+    try:
+        return _remaining_run_wall_seconds(spec.run_id) > 0
+    except Exception:
+        return False
+
+
 def _fail_blocked_recovery(
     spec,
     reason: str,
@@ -252,7 +261,7 @@ def _fail_blocked_recovery(
     expected_remote: dict | None = None,
 ) -> bool:
     from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
-    from flash.runner.lifecycle import _adopt_completed_attempt
+    from flash.runner.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
     if status.remote is None:
@@ -260,7 +269,10 @@ def _fail_blocked_recovery(
             deadline_at = _load_run_deadline_at(spec.run_id)
         except RuntimeError:
             deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
-        metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        try:
+            metrics = _handleless_completed_metrics(spec, status, deadline_at)
+        except _CompletedAttemptPending:
+            return False
         if metrics is not None:
             applied = _adopt_completed_attempt(
                 spec.run_id,
@@ -298,6 +310,8 @@ def _start_resubmit(
 
     reason = _recovery_block_reason(spec)
     if reason is not None:
+        if _recovery_wall_deadline_is_open(spec):
+            return False
         _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
         return False
     if spec.algorithm == "opd":
@@ -425,7 +439,9 @@ def _deferred_resubmit_loop(spec) -> None:
                     return
             except Exception:
                 pass
-            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
+            if delay > 0:
+                time.sleep(delay)
             continue
         delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
@@ -619,10 +635,12 @@ def recover_runs() -> None:
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)
         if reason is not None:
-            try:
-                applied = _fail_blocked_recovery(spec, reason)
-            except Exception:
-                applied = False
+            applied = False
+            if not _recovery_wall_deadline_is_open(spec):
+                try:
+                    applied = _fail_blocked_recovery(spec, reason)
+                except Exception:
+                    applied = False
             if not applied:
                 try:
                     current = get_status(spec.run_id)
@@ -650,7 +668,14 @@ def recover_runs() -> None:
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            _start_resubmit(spec, expected_remote=None, expected_state=prior_state)
+            if _start_resubmit(spec, expected_remote=None, expected_state=prior_state):
+                continue
+            try:
+                current = get_status(spec.run_id)
+            except Exception:
+                current = None
+            if current is None or (current.state in _RECOVERABLE and current.remote is None):
+                threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer with
         # observation bounded by the run wall deadline, then durably persist terminal success or failure.
