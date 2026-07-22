@@ -334,6 +334,11 @@ def _install_pinned_sitecustomize_modules(
     class _Actor:
         def __init__(self, *_args, **_kwargs):
             self.model = torch.nn.Linear(2, 2, bias=False)
+            self.packing_samples = False
+            self.temperature = 1.0
+
+        def forward(self, *_args, **_kwargs):
+            raise NotImplementedError
 
     models.Actor = _Actor
     actor_module = types.ModuleType("openrlhf.models.actor")
@@ -561,6 +566,7 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
     assert _value(args, "--ds.lora.alpha") == "64"
     assert _value(args, "--ds.lora.target_modules") == "all-linear"
     assert _value(args, "--ds.zero_stage") == "3"
+    assert _value(args, "--ds.ring_attn_size") == "1"
     assert _value(args, "--actor.num_gpus_per_node") == "2"
     assert _value(args, "--vllm.num_engines") == "2"
     assert "--train.colocate_all" in args
@@ -835,6 +841,9 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
 
     compile(source, "sitecustomize.py", "exec")
     assert "ActorPPOTrainer.training_step = _flash_training_step" in source
+    assert "_Actor.forward = _flash_actor_forward" in source
+    assert "for start in range(0, flat_hidden.shape[0], int(chunk_size))" in source
+    assert "32k gpu validation pending" in source
     assert "loss.shape[0] * _MAX_RESPONSE_LENGTH" in source
     assert "_ppo_actor_module.aggregate_loss = _flash_aggregate_loss" in source
     assert "experience.action_mask.zero_()" in source
@@ -1041,6 +1050,223 @@ def test_sitecustomize_applies_token_tis_inside_fixed_dr_grpo_loss(monkeypatch):
     assert loss_fn.vllm_is_truncated_threshold == [0.0, 2.0]
     assert loss_fn.vllm_is_correction_type == "tis"
     assert actual.item() == pytest.approx(-(1.0 + 2.0 + 1.5) / (2 * 5))
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_chunked_action_logprobs_match_full_policy_loss_and_gradients(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, loss_module, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    torch.manual_seed(17)
+    batch, actions, hidden_size, vocab_size = 3, 5, 7, 13
+    temperature = 0.7
+    action_mask = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    labels = torch.randint(vocab_size, (batch, actions))
+    initial_hidden = torch.randn(batch, actions, hidden_size)
+    initial_weight = torch.randn(vocab_size, hidden_size)
+    initial_bias = torch.randn(vocab_size)
+    old_log_probs = torch.randn(batch, actions)
+    tis_log_ratios = torch.tensor(
+        [
+            [0.0, math.log(4.0), math.log(1.5), -math.log(2.0), 0.0],
+            [math.log(3.0), 0.0, math.log(1.25), 0.0, 0.0],
+            [math.log(1.75), 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    rollout_log_probs = old_log_probs - tis_log_ratios
+    advantages = torch.tensor(
+        [
+            [1.0, -0.5, 0.25, 0.75, -1.0],
+            [0.5, 1.25, -0.75, 0.0, 0.0],
+            [-1.5, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    base_log_probs = torch.randn(batch, actions)
+    kl_coef = 0.03
+    entropy_coef = 0.02
+
+    def combined_loss(action_log_probs, entropy):
+        loss_fn = loss_module.PolicyLoss(
+            enable_vllm_is_correction=False,
+            vllm_is_truncated_threshold=None,
+        )
+        token = namespace["_fixed_dr_grpo_loss"].set(True)
+        try:
+            policy_loss, _, _, _ = loss_fn(
+                action_log_probs,
+                old_log_probs,
+                advantages,
+                action_mask=action_mask,
+                rollout_log_probs=rollout_log_probs,
+            )
+            kl_tokens = (action_log_probs.float() - base_log_probs.float()).square() / 2.0
+            kl_loss = namespace["_flash_aggregate_loss"](kl_tokens, action_mask)
+            entropy_loss = namespace["_flash_aggregate_loss"](entropy, action_mask)
+        finally:
+            namespace["_fixed_dr_grpo_loss"].reset(token)
+        assert loss_fn.enable_vllm_is_correction is True
+        assert loss_fn.vllm_is_truncated_threshold == [0.0, 2.0]
+        assert loss_fn.vllm_is_correction_type == "tis"
+        return policy_loss + kl_coef * kl_loss - entropy_coef * entropy_loss
+
+    def make_projection():
+        projection = torch.nn.Linear(hidden_size, vocab_size)
+        with torch.no_grad():
+            projection.weight.copy_(initial_weight)
+            projection.bias.copy_(initial_bias)
+        return projection
+
+    full_hidden = initial_hidden.clone().requires_grad_(True)
+    full_projection = make_projection()
+    full_raw_logits = full_projection(full_hidden).float()
+    full_logits = full_raw_logits / temperature
+    full_logsumexp = torch.logsumexp(full_logits, dim=-1)
+    full_selected = full_logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    full_action_log_probs = (full_selected - full_logsumexp) * action_mask
+    full_probabilities = torch.softmax(full_raw_logits, dim=-1)
+    full_entropy = torch.logsumexp(full_raw_logits, dim=-1) - (
+        full_probabilities * full_raw_logits
+    ).sum(dim=-1)
+    full_loss = combined_loss(full_action_log_probs, full_entropy)
+    full_loss.backward()
+    expected_gradients = (
+        full_hidden.grad.detach().clone(),
+        full_projection.weight.grad.detach().clone(),
+        full_projection.bias.grad.detach().clone(),
+    )
+
+    for chunk_size in (1, 4, batch * actions):
+        chunked_hidden = initial_hidden.clone().requires_grad_(True)
+        chunked_projection = make_projection()
+        projected_rows = []
+
+        def recording_projection(
+            hidden,
+            projection=chunked_projection,
+            rows=projected_rows,
+        ):
+            rows.append(hidden.shape[0])
+            return projection(hidden)
+
+        saved_shapes = []
+
+        def pack_saved(tensor, shapes=saved_shapes):
+            shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
+            action_log_probs, entropy = namespace["_flash_chunked_action_log_probs"](
+                chunked_hidden,
+                labels,
+                action_mask,
+                recording_projection,
+                temperature,
+                chunk_size=chunk_size,
+                return_entropy=True,
+            )
+            loss = combined_loss(action_log_probs, entropy)
+        loss.backward()
+
+        torch.testing.assert_close(action_log_probs, full_action_log_probs, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(entropy, full_entropy, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(loss, full_loss, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(chunked_hidden.grad, expected_gradients[0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            chunked_projection.weight.grad,
+            expected_gradients[1],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        torch.testing.assert_close(
+            chunked_projection.bias.grad,
+            expected_gradients[2],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert max(projected_rows) <= chunk_size
+        assert sum(projected_rows) == 2 * batch * actions
+        assert not any(len(shape) == 2 and shape[-1] == vocab_size for shape in saved_shapes)
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_actor_projects_only_action_positions(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _install_pinned_sitecustomize_modules(monkeypatch)
+    actor_type = sys.modules["openrlhf.models.actor"].Actor
+    hidden_size, vocab_size = 6, 17
+
+    class _Output(dict):
+        def __getattr__(self, name):
+            return self[name]
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    class _OutputHead(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(hidden_size, vocab_size)
+            self.projected_rows = []
+
+        def forward(self, hidden):
+            self.projected_rows.append(hidden.shape[0])
+            return super().forward(hidden)
+
+    class _ToyCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = _OutputHead()
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, input_ids, attention_mask, position_ids):
+            assert attention_mask.shape == input_ids.shape
+            assert position_ids.shape == input_ids.shape
+            hidden = self.embed(input_ids)
+            return _Output(logits=self.lm_head(hidden), hidden_states=hidden)
+
+    actor = actor_type("base")
+    actor.model = _ToyCausalLM()
+    actor.packing_samples = False
+    actor.temperature = 0.8
+    sequences = torch.randint(vocab_size, (2, 9))
+    attention_mask = torch.ones_like(sequences)
+    action_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0]])
+
+    action_log_probs, output = actor.forward(
+        sequences,
+        action_mask,
+        attention_mask=attention_mask,
+        return_output=True,
+        return_entropy=True,
+    )
+
+    with torch.no_grad():
+        hidden = actor.model.embed(sequences)[:, -action_mask.shape[1] - 1 : -1]
+        logits = actor.model.lm_head(hidden).float() / actor.temperature
+        labels = sequences[:, -action_mask.shape[1] :]
+        expected = (
+            logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+        ) * action_mask
+    torch.testing.assert_close(action_log_probs, expected, atol=1e-5, rtol=1e-5)
+    action_log_probs.sum().backward()
+    assert output.logits is None
+    assert output.entropy.shape == action_mask.shape
+    assert actor.model.embed.weight.grad is not None
+    assert actor.model.lm_head.projected_rows == [
+        action_mask.numel(),
+        sequences.shape[0],
+        action_mask.numel(),
+    ]
+    assert actor.model.lm_head.projected_rows[0] < sequences.numel()
 
 
 @requires_openrlhf_source

@@ -56,6 +56,7 @@ _OPENRLHF_REWARD_MAX_BODY_BYTES = 2 * 1024 * 1024
 _OPENRLHF_TARGET_MODULES = "all-linear"
 _OPENRLHF_PPO_EPOCHS = 1
 _OPENRLHF_REWARD_CLIP_BOUND = "1000000000"
+_OPENRLHF_ACTION_LOGPROB_CHUNK_SIZE = 256
 _SITE_CUSTOMIZE_NAME = "sitecustomize.py"
 _CHILD_ENV_EXACT = frozenset(
     {
@@ -227,6 +228,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         "0.0",
         "--ds.zero_stage",
         "3",
+        "--ds.ring_attn_size",
+        "1",
         "--ds.param_dtype",
         "bf16",
         "--actor.gradient_checkpointing_enable",
@@ -588,7 +591,11 @@ import os
 import threading
 import time
 
+import torch
+from torch.utils.checkpoint import checkpoint
+
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
+_ACTION_LOGPROB_CHUNK_SIZE = 256
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
@@ -784,6 +791,175 @@ _SingleTurnAgentExecutor.execute = _flash_execute
 from openrlhf.models.actor import Actor as _Actor
 
 _original_actor_init = _Actor.__init__
+_original_actor_forward = _Actor.forward
+
+
+def _flash_chunked_action_log_probs(
+    prediction_hidden_states,
+    labels,
+    action_mask,
+    projection,
+    temperature,
+    chunk_size=_ACTION_LOGPROB_CHUNK_SIZE,
+    return_entropy=False,
+):
+    if prediction_hidden_states.ndim != 3:
+        raise RuntimeError("chunked action projection expected rank-3 hidden states")
+    if labels.shape != prediction_hidden_states.shape[:2] or action_mask.shape != labels.shape:
+        raise RuntimeError("chunked action projection received misaligned labels or mask")
+    if int(chunk_size) <= 0:
+        raise RuntimeError("chunked action projection requires a positive chunk size")
+    if float(temperature) <= 0:
+        raise RuntimeError("chunked action projection requires a positive temperature")
+
+    flat_hidden = prediction_hidden_states.reshape(-1, prediction_hidden_states.shape[-1])
+    flat_labels = labels.reshape(-1)
+    def project_chunk(chunk_hidden, chunk_labels):
+        logits = projection(chunk_hidden).to(torch.float32)
+        if logits.ndim != 2 or logits.shape[0] != chunk_hidden.shape[0]:
+            raise RuntimeError("chunked action projection returned invalid logits")
+        entropy = None
+        if return_entropy:
+            entropy_logsumexp = torch.logsumexp(logits, dim=-1)
+            probabilities = torch.softmax(logits, dim=-1)
+            entropy = entropy_logsumexp - (probabilities * logits).sum(dim=-1)
+        if float(temperature) != 1.0:
+            logits = logits / float(temperature)
+        logsumexp = torch.logsumexp(logits, dim=-1)
+        selected = logits.gather(-1, chunk_labels[:, None]).squeeze(-1)
+        log_probs = selected - logsumexp
+        return (log_probs, entropy) if return_entropy else log_probs
+
+    log_prob_chunks = []
+    entropy_chunks = []
+    for start in range(0, flat_hidden.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), flat_hidden.shape[0])
+        chunk_hidden = flat_hidden[start:end]
+        chunk_labels = flat_labels[start:end]
+        if torch.is_grad_enabled() and chunk_hidden.requires_grad:
+            result = checkpoint(
+                project_chunk,
+                chunk_hidden,
+                chunk_labels,
+                use_reentrant=False,
+            )
+        else:
+            result = project_chunk(chunk_hidden, chunk_labels)
+        if return_entropy:
+            log_probs, entropy = result
+            entropy_chunks.append(entropy)
+        else:
+            log_probs = result
+        log_prob_chunks.append(log_probs)
+
+    shape = labels.shape
+    action_log_probs = torch.cat(log_prob_chunks).view(shape) * action_mask.to(torch.float32)
+    entropy = torch.cat(entropy_chunks).view(shape) if return_entropy else None
+    return action_log_probs, entropy
+
+
+def _flash_actor_forward(
+    self,
+    sequences,
+    action_mask=None,
+    attention_mask=None,
+    return_output=False,
+    allgather_logits=False,
+    return_logprobs=False,
+    ring_attn_group=None,
+    packed_seq_lens=None,
+    return_entropy=False,
+    **mm_inputs,
+):
+    if action_mask is None:
+        return _original_actor_forward(
+            self,
+            sequences,
+            action_mask=action_mask,
+            attention_mask=attention_mask,
+            return_output=return_output,
+            allgather_logits=allgather_logits,
+            return_logprobs=return_logprobs,
+            ring_attn_group=ring_attn_group,
+            packed_seq_lens=packed_seq_lens,
+            return_entropy=return_entropy,
+            **mm_inputs,
+        )
+    if self.packing_samples or ring_attn_group is not None:
+        raise RuntimeError("chunked action projection requires ring_attn_size=1 without packing")
+    if allgather_logits or return_logprobs:
+        raise RuntimeError("chunked action projection supports action log probabilities only")
+    if sequences.ndim != 2 or action_mask.ndim != 2:
+        raise RuntimeError("chunked action projection expected batched sequences and action masks")
+    action_width = action_mask.shape[1]
+    if action_width <= 0 or action_width >= sequences.shape[1]:
+        raise RuntimeError("chunked action projection received an invalid action width")
+
+    if getattr(self, "is_vlm", False):
+        position_ids = None
+        if mm_inputs:
+            cfg = self._vlm_config
+            token_type_ids = (sequences == cfg.image_token_id).to(torch.int32)
+            if getattr(cfg, "video_token_id", None) is not None:
+                token_type_ids[sequences == cfg.video_token_id] = 2
+            key = "mm_token_type_ids" if "image_grid_thw" in mm_inputs else "token_type_ids"
+            mm_inputs[key] = token_type_ids
+    else:
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+
+    output_head = self.model.get_output_embeddings()
+    if output_head is None or not callable(getattr(output_head, "forward", None)):
+        raise RuntimeError("chunked action projection requires an accessible output head")
+    original_output_head_forward = output_head.forward
+    captured = {}
+
+    def chunked_output_head(hidden_states, *head_args, **head_kwargs):
+        if head_args or head_kwargs:
+            raise RuntimeError("chunked action projection does not support output-head arguments")
+        if captured:
+            raise RuntimeError("chunked action projection output head was invoked more than once")
+        prediction_hidden = hidden_states[:, -action_width - 1 : -1, :]
+        labels = sequences[:, -action_width:]
+
+        def projection(chunk_hidden):
+            if output_head.forward is chunked_output_head:
+                return original_output_head_forward(chunk_hidden)
+            return output_head(chunk_hidden)
+
+        action_log_probs, entropy = _flash_chunked_action_log_probs(
+            prediction_hidden,
+            labels,
+            action_mask,
+            projection,
+            self.temperature,
+            return_entropy=return_entropy,
+        )
+        captured["action_log_probs"] = action_log_probs
+        captured["entropy"] = entropy
+        return action_log_probs
+
+    output_head.forward = chunked_output_head
+    try:
+        output = self.model(
+            sequences,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **mm_inputs,
+        )
+    finally:
+        output_head.forward = original_output_head_forward
+    if "action_log_probs" not in captured:
+        raise RuntimeError("chunked action projection output head was not invoked")
+    output["logits"] = None
+    if return_entropy:
+        setattr(output, "entropy", captured["entropy"])
+    action_log_probs = captured["action_log_probs"]
+    return (action_log_probs, output) if return_output else action_log_probs
+
+
+_Actor.forward = _flash_actor_forward
+
 _loading_warm_reference = contextvars.ContextVar(
     "flash_openrlhf_loading_warm_reference", default=False
 )
@@ -1175,7 +1351,8 @@ if _LANGUAGE_MODEL_ONLY or _FP8_KV or _SM120_VLLM_BACKEND:
     _flash_patch_engine_args(vllm.EngineArgs, "EngineArgs")
 
 print(
-    "[flash-openrlhf] flash grpo tis, loss, truncation, reward, warm-start, checkpoint, and lora sync hooks active",
+    "[flash-openrlhf] flash grpo chunked action logprobs, tis, loss, truncation, reward, "
+    "warm-start, checkpoint, and lora sync hooks active; 32k gpu validation pending",
     flush=True,
 )
 """.lstrip()
@@ -1847,6 +2024,10 @@ def run_rl_openrlhf() -> None:
             "group_size": inputs["group_size"],
             "prompts_per_step": inputs["prompts_per_step"],
             "max_completion_len": inputs["max_completion"],
+            "chunked_action_logprobs": {
+                "chunk_size": _OPENRLHF_ACTION_LOGPROB_CHUNK_SIZE,
+                "gpu_validation": "pending",
+            },
             "grpo_recipe": {
                 "advantage_estimator": "dr_grpo",
                 "loss_normalization": "fixed_max_response_length",
