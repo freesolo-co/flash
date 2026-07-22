@@ -62,6 +62,9 @@ _OPENRLHF_OPD_MAX_BODY_BYTES = 4 * 1024 * 1024
 _OPENRLHF_TARGET_MODULES = "all-linear"
 _OPENRLHF_PPO_EPOCHS = 1
 _OPENRLHF_NO_SIGNAL_ATTEMPTS = 3
+_OPENRLHF_BRIDGE_TRANSPORT_ATTEMPTS = 3
+_OPENRLHF_PERMANENT_TEACHER_EXIT = 86
+_OPENRLHF_TRANSIENT_TEACHER_EXIT = 87
 _SITE_CUSTOMIZE_NAME = "sitecustomize.py"
 _STEP_RE = re.compile(r"(?i)global[_ ]step[:=\s]+(\d+)")
 _LOSS_RE = re.compile(r"(?:act_loss|policy_loss)['\"\s:=]+(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)", re.I)
@@ -642,6 +645,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -653,6 +657,9 @@ _FLASH_OPD_SEED = int(os.environ["FLASH_OPENRLHF_OPD_SEED"])
 _FLASH_OPD_STOPS = json.loads(os.environ.get("FLASH_OPENRLHF_OPD_STOP_SEQUENCES", "[]"))
 _FLASH_OPD_EOS_IDS = json.loads(os.environ.get("FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS", "[]"))
 _FLASH_OPD_MAX_ATTEMPTS = int(os.environ.get("FLASH_OPENRLHF_OPD_NO_SIGNAL_ATTEMPTS", "3"))
+_FLASH_BRIDGE_TRANSPORT_ATTEMPTS = 3
+_FLASH_PERMANENT_TEACHER_EXIT = 86
+_FLASH_TRANSIENT_TEACHER_EXIT = 87
 
 if _FLASH_OPD_KL_COEF <= 0:
     raise RuntimeError("FLASH_OPENRLHF_OPD_KL_COEF must be positive")
@@ -662,8 +669,13 @@ if _FLASH_OPD_MAX_ATTEMPTS <= 0:
 
 def _flash_identity(label):
     identity = json.loads(label) if isinstance(label, str) else dict(label)
-    required = ("global_step", "example_index", "rollout_ordinal")
-    if any(isinstance(identity.get(name), bool) or not isinstance(identity.get(name), int) for name in required):
+    required = ("global_step", "example_index", "rollout_ordinal", "no_signal_attempt")
+    if set(identity) != set(required) or any(
+        isinstance(identity.get(name), bool)
+        or not isinstance(identity.get(name), int)
+        or identity.get(name) < 0
+        for name in required
+    ):
         raise RuntimeError("flash OPD rollout identity is invalid")
     return identity
 
@@ -680,7 +692,14 @@ def _flash_seed(identity):
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
-def _flash_post_teacher(payload):
+class _FlashTeacherBridgeError(RuntimeError):
+    def __init__(self, message, *, classification, retry_transport=False):
+        super().__init__(message)
+        self.classification = classification
+        self.retry_transport = retry_transport
+
+
+def _flash_post_teacher_once(payload):
     request = urllib.request.Request(
         _FLASH_OPD_BRIDGE_URL,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -696,14 +715,52 @@ def _flash_post_teacher(payload):
             classification = str(detail["classification"])
             message = str(detail["message"])
         except Exception as decode_error:
-            raise RuntimeError(f"flash OPD bridge returned unclassified HTTP {error.code}") from decode_error
-        raise RuntimeError(f"flash OPD teacher {classification} failure: {message}") from error
-    except Exception as error:
-        raise RuntimeError(f"flash OPD teacher transient bridge failure: {type(error).__name__}") from error
-    result = json.loads(body.decode("utf-8"))
+            raise _FlashTeacherBridgeError(
+                f"flash OPD bridge returned unclassified HTTP {error.code}",
+                classification="permanent",
+            ) from decode_error
+        if classification not in {"permanent", "transient"}:
+            raise _FlashTeacherBridgeError(
+                f"flash OPD bridge returned unknown teacher failure classification {classification!r}",
+                classification="permanent",
+            ) from error
+        raise _FlashTeacherBridgeError(message, classification=classification) from error
+    except (OSError, TimeoutError, urllib.error.URLError) as error:
+        raise _FlashTeacherBridgeError(
+            f"flash OPD bridge transport failed: {type(error).__name__}",
+            classification="transient",
+            retry_transport=True,
+        ) from error
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise _FlashTeacherBridgeError(
+            "flash OPD bridge returned malformed success JSON",
+            classification="permanent",
+        ) from error
     if not isinstance(result, dict):
-        raise RuntimeError("flash OPD bridge returned a non-object response")
+        raise _FlashTeacherBridgeError(
+            "flash OPD bridge returned a non-object response",
+            classification="permanent",
+        )
     return result
+
+
+def _flash_post_teacher(payload):
+    for attempt in range(_FLASH_BRIDGE_TRANSPORT_ATTEMPTS):
+        try:
+            return _flash_post_teacher_once(payload)
+        except _FlashTeacherBridgeError as error:
+            if error.retry_transport and attempt + 1 < _FLASH_BRIDGE_TRANSPORT_ATTEMPTS:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            exit_code = (
+                _FLASH_PERMANENT_TEACHER_EXIT
+                if error.classification == "permanent"
+                else _FLASH_TRANSIENT_TEACHER_EXIT
+            )
+            os._exit(exit_code)
+    raise AssertionError("unreachable flash OPD bridge retry state")
 
 
 from openrlhf.utils.agent import SingleTurnAgentExecutor as _FlashSingleTurnExecutor
@@ -800,9 +857,58 @@ def _flash_make_experience_batch(self, rollout_samples):
 
 _FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch
 
-from openrlhf.trainer.ppo_trainer import BasePPOTrainer as _FlashBasePPOTrainer
+from openrlhf.trainer import ppo_trainer as _flash_ppo_trainer_module
 
-_original_save_logs_and_checkpoints = _FlashBasePPOTrainer.save_logs_and_checkpoints
+_FlashPPOTrainer = _flash_ppo_trainer_module.PPOTrainer
+_flash_ray_metadata = getattr(_FlashPPOTrainer, "__ray_metadata__", None)
+_FlashPPOTrainerRuntime = (
+    getattr(_flash_ray_metadata, "modified_class", None) or _FlashPPOTrainer
+)
+
+
+class _FlashOrderedPromptStrategy:
+    def __init__(self, strategy):
+        self._strategy = strategy
+
+    def __getattr__(self, name):
+        return getattr(self._strategy, name)
+
+    def setup_dataloader(
+        self,
+        replay_buffer,
+        batch_size,
+        pin_memory=False,
+        shuffle=True,
+        collate_fn=None,
+        drop_last=True,
+        sampler=None,
+        consumed_samples=0,
+        num_workers=0,
+    ):
+        del shuffle
+        return self._strategy.setup_dataloader(
+            replay_buffer,
+            batch_size,
+            pin_memory=pin_memory,
+            shuffle=False,
+            collate_fn=collate_fn,
+            drop_last=drop_last,
+            sampler=sampler,
+            consumed_samples=consumed_samples,
+            num_workers=num_workers,
+        )
+
+
+_original_prepare_datasets = _flash_ppo_trainer_module.prepare_datasets
+
+
+@functools.wraps(_original_prepare_datasets)
+def _flash_prepare_datasets(strategy, tokenizer):
+    return _original_prepare_datasets(_FlashOrderedPromptStrategy(strategy), tokenizer)
+
+
+_flash_ppo_trainer_module.prepare_datasets = _flash_prepare_datasets
+_original_save_logs_and_checkpoints = _FlashPPOTrainerRuntime.save_logs_and_checkpoints
 
 
 @functools.wraps(_original_save_logs_and_checkpoints)
@@ -819,7 +925,23 @@ def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_s
     return result
 
 
-_FlashBasePPOTrainer.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
+_FlashPPOTrainerRuntime.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
+_original_ppo_fit = _FlashPPOTrainerRuntime.fit
+
+
+@functools.wraps(_original_ppo_fit)
+def _flash_ppo_fit(self, *args, **kwargs):
+    global_step = kwargs.get("global_step", args[0] if args else 0)
+    load_enabled = bool(getattr(getattr(self.args, "ckpt", None), "load_enable", False))
+    warmstart = bool(os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER"))
+    already_synced = bool(getattr(self, "_flash_warmstart_broadcast_done", False))
+    if warmstart and not global_step and not load_enabled and not already_synced:
+        self.broadcast_to_vllm()
+        self._flash_warmstart_broadcast_done = True
+    return _original_ppo_fit(self, *args, **kwargs)
+
+
+_FlashPPOTrainerRuntime.fit = _flash_ppo_fit
 
 
 def _flash_pad_info(value, action_mask, pad_value):
@@ -1164,7 +1286,7 @@ class _OpenRLHFOPDCheckpointPublisher:
         uploaded = _w.upload_resume_checkpoint(
             step,
             stage,
-            before_upload=publish_required,
+            after_upload=publish_required,
         )
         if step in self.required_steps and not uploaded:
             raise RuntimeError(f"required OpenRLHF OPD checkpoint step {step} was not published")
@@ -1370,6 +1492,11 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
 def _raise_training_failure(returncode: int, failure: tuple[str, str] | None) -> None:
     if returncode == 0:
         return
+    message = failure[1] if failure is not None else "the localhost teacher bridge was unavailable"
+    if returncode == _OPENRLHF_TRANSIENT_TEACHER_EXIT:
+        raise _w.RetriableInfraError(f"transient teacher failure after bounded retries: {message}")
+    if returncode == _OPENRLHF_PERMANENT_TEACHER_EXIT:
+        raise RuntimeError(f"permanent teacher failure: {message}")
     if failure is not None:
         classification, message = failure
         if classification == "transient":

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import io
 import json
 import os
 import sys
 import types
+import urllib.error
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +20,11 @@ from flash.engine.worker import opd, opd_openrlhf
 from flash.engine.worker.opd import _gkd_loss_from_logps
 from flash.engine.worker.teacher import TeacherError, TeacherToken
 
+_OPENRLHF_SOURCE = Path(os.environ.get("FLASH_TEST_OPENRLHF_SOURCE", "/mnt/resource/openrlhf-src"))
+requires_openrlhf_source = pytest.mark.skipif(
+    not _OPENRLHF_SOURCE.joinpath("openrlhf/trainer/ppo_trainer.py").is_file(),
+    reason="pinned OpenRLHF source is unavailable",
+)
 requires_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None,
     reason="torch is unavailable in offline CI",
@@ -26,6 +34,86 @@ requires_torch = pytest.mark.skipif(
 def _value(args: list[str], flag: str) -> str:
     index = args.index(flag)
     return args[index + 1]
+
+
+def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
+    class _ActorPPOTrainer:
+        pass
+
+    class _Actor:
+        def __init__(self, *_args, **_kwargs):
+            self.model = SimpleNamespace()
+
+    class _SingleTurnAgentExecutor:
+        def __init__(self, _remote=None):
+            pass
+
+    class _SamplesGenerator:
+        pass
+
+    class _ExperienceMaker:
+        pass
+
+    class _PPOTrainerRuntime:
+        def save_logs_and_checkpoints(self, global_step, logs_dict=None, client_states=None):
+            self.original_saves.append((global_step, logs_dict, client_states))
+
+        def fit(self, *args, **kwargs):
+            self.original_fit_calls.append((args, kwargs))
+            return "fit-result"
+
+    class _PPOTrainer:
+        __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)
+
+    ppo_trainer = types.ModuleType("openrlhf.trainer.ppo_trainer")
+    ppo_trainer.PPOTrainer = _PPOTrainer
+    ppo_trainer.prepare_datasets = lambda strategy, tokenizer: (strategy, tokenizer)
+    modules = {
+        "torch": types.ModuleType("torch"),
+        "openrlhf": types.ModuleType("openrlhf"),
+        "openrlhf.utils": types.ModuleType("openrlhf.utils"),
+        "openrlhf.utils.agent": types.ModuleType("openrlhf.utils.agent"),
+        "openrlhf.trainer": types.ModuleType("openrlhf.trainer"),
+        "openrlhf.trainer.ppo_trainer": ppo_trainer,
+        "openrlhf.trainer.ppo_utils": types.ModuleType("openrlhf.trainer.ppo_utils"),
+        "openrlhf.trainer.ppo_utils.samples_generator": types.ModuleType(
+            "openrlhf.trainer.ppo_utils.samples_generator"
+        ),
+        "openrlhf.trainer.ppo_utils.experience_maker": types.ModuleType(
+            "openrlhf.trainer.ppo_utils.experience_maker"
+        ),
+    }
+    for name in ("openrlhf", "openrlhf.utils", "openrlhf.trainer", "openrlhf.trainer.ppo_utils"):
+        modules[name].__path__ = []
+    modules["openrlhf.utils.agent"].SingleTurnAgentExecutor = _SingleTurnAgentExecutor
+    modules["openrlhf.trainer"].ppo_trainer = ppo_trainer
+    modules["openrlhf.trainer.ppo_utils.samples_generator"].SamplesGenerator = _SamplesGenerator
+    modules["openrlhf.trainer.ppo_utils.experience_maker"].RemoteExperienceMaker = _ExperienceMaker
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_BRIDGE_URL", "http://127.0.0.1:1/teacher")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_KL_COEF", "0.37")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_SEED", "42")
+    if warmstart:
+        monkeypatch.setenv("FLASH_OPENRLHF_WARMSTART_ADAPTER", "/work/warmstart")
+    else:
+        monkeypatch.delenv("FLASH_OPENRLHF_WARMSTART_ADAPTER", raising=False)
+    namespace = {
+        "__name__": "sitecustomize",
+        "__file__": "sitecustomize.py",
+        "os": os,
+        "functools": functools,
+        "_ActorPPOTrainer": _ActorPPOTrainer,
+        "_Actor": _Actor,
+        "_original_execute": lambda *_args, **_kwargs: None,
+        "_original_process_response": lambda *_args, **_kwargs: None,
+    }
+    exec(
+        compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
+        namespace,
+    )
+    return namespace, _ActorPPOTrainer, _PPOTrainer, _PPOTrainerRuntime
 
 
 def _config(**overrides) -> opd_openrlhf.OpenRLHFOPDConfig:
@@ -333,6 +421,183 @@ def test_teacher_bridge_runs_checkpoint_callback_before_reply():
     assert calls == [3]
 
 
+def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
+    events = []
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.required_steps = frozenset({2})
+    monkeypatch.setattr(publisher, "_wait_for_checkpoint", lambda _step: ("actor", "hf"))
+    monkeypatch.setattr(publisher, "_stage", lambda *_args: "/staged/checkpoint-2")
+
+    def upload(step, stage, *, after_upload=None):
+        assert (step, stage) == (2, "/staged/checkpoint-2")
+        events.append("resume")
+        after_upload()
+        return True
+
+    monkeypatch.setattr(opd_openrlhf._w, "upload_resume_checkpoint", upload)
+    monkeypatch.setattr(
+        opd_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda *_args, **_kwargs: events.append("deployable"),
+    )
+
+    publisher._publish(2)
+
+    assert events == ["resume", "deployable"]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (opd_openrlhf._OPENRLHF_TRANSIENT_TEACHER_EXIT, "transient"),
+        (opd_openrlhf._OPENRLHF_PERMANENT_TEACHER_EXIT, "permanent"),
+    ],
+)
+def test_training_failure_maps_child_teacher_exit_codes(returncode, expected):
+    error_type = opd_openrlhf._w.RetriableInfraError if expected == "transient" else RuntimeError
+
+    with pytest.raises(error_type, match=expected):
+        opd_openrlhf._raise_training_failure(returncode, None)
+
+
+def test_ray_modified_class_checkpoint_and_warmstart_fit_hooks_execute(monkeypatch):
+    namespace, actor_trainer, ray_wrapper, runtime = _install_ray_shaped_opd_extension(
+        monkeypatch, warmstart=True
+    )
+    callbacks = []
+    namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
+    trainer = runtime()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=1, load_enable=False))
+    trainer.original_saves = []
+    trainer.original_fit_calls = []
+    trainer.broadcast_to_vllm = lambda: callbacks.append("broadcast")
+
+    trainer.save_logs_and_checkpoints(1, {"loss": 0.2}, {"global_step": 1})
+    result = trainer.fit()
+
+    assert actor_trainer.training_step is namespace["_flash_opd_training_step"]
+    assert ray_wrapper.__ray_metadata__.modified_class is runtime
+    assert runtime.save_logs_and_checkpoints is namespace["_flash_save_logs_and_checkpoints"]
+    assert runtime.fit is namespace["_flash_ppo_fit"]
+    assert trainer.original_saves == [(1, {"loss": 0.2}, {"global_step": 1})]
+    assert callbacks == [{"checkpoint": 1}, "broadcast"]
+    assert trainer.original_fit_calls == [((), {})]
+    assert result == "fit-result"
+
+
+def test_ray_modified_class_fit_does_not_prebroadcast_resumed_warmstart(monkeypatch):
+    _, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch, warmstart=True)
+    trainer = runtime()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=1, load_enable=True))
+    trainer.original_fit_calls = []
+    broadcasts = []
+    trainer.broadcast_to_vllm = lambda: broadcasts.append(True)
+
+    trainer.fit()
+
+    assert broadcasts == []
+    assert trainer.original_fit_calls == [((), {})]
+
+
+def test_opd_prompt_dataloader_forces_authoritative_file_order(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    calls = []
+
+    class _Strategy:
+        def setup_dataloader(self, *_args, **kwargs):
+            calls.append(kwargs["shuffle"])
+            return "loader"
+
+    namespace["_original_prepare_datasets"] = lambda strategy, _tokenizer: (
+        strategy.setup_dataloader(object(), 1, shuffle=True)
+    )
+
+    assert namespace["_flash_prepare_datasets"](_Strategy(), object()) == "loader"
+    assert calls == [False]
+
+
+def test_child_seed_matches_optimizer_example_rollout_retry_identity(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    identity = {
+        "global_step": 3,
+        "example_index": 7,
+        "rollout_ordinal": 2,
+        "no_signal_attempt": 1,
+    }
+
+    actual = namespace["_flash_seed"](namespace["_flash_identity"](identity))
+
+    assert actual == opd_openrlhf.deterministic_rollout_seed(
+        42,
+        3,
+        7,
+        2,
+        no_signal_attempt_ordinal=1,
+    )
+
+
+def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    attempts = []
+    sleeps = []
+
+    class _Exit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(str(code))
+            self.code = code
+
+    def fail_urlopen(*_args, **_kwargs):
+        attempts.append(True)
+        raise urllib.error.URLError("connection refused")
+
+    namespace["urllib"] = SimpleNamespace(
+        error=urllib.error,
+        request=SimpleNamespace(Request=lambda *_args, **_kwargs: object(), urlopen=fail_urlopen),
+    )
+    namespace["time"] = SimpleNamespace(sleep=lambda delay: sleeps.append(delay))
+    namespace["os"] = SimpleNamespace(_exit=lambda code: (_ for _ in ()).throw(_Exit(code)))
+
+    with pytest.raises(_Exit) as error:
+        namespace["_flash_post_teacher"]({"mutation": True})
+
+    assert error.value.code == opd_openrlhf._OPENRLHF_TRANSIENT_TEACHER_EXIT
+    assert len(attempts) == opd_openrlhf._OPENRLHF_BRIDGE_TRANSPORT_ATTEMPTS
+    assert sleeps == [0.25, 0.5]
+
+
+def test_child_bridge_exits_permanent_for_provider_classification(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    class _Exit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(str(code))
+            self.code = code
+
+    body = json.dumps(
+        {"error": {"classification": "permanent", "message": "invalid request"}}
+    ).encode()
+    http_error = urllib.error.HTTPError(
+        namespace["_FLASH_OPD_BRIDGE_URL"],
+        422,
+        "unprocessable",
+        {},
+        io.BytesIO(body),
+    )
+    namespace["urllib"] = SimpleNamespace(
+        error=urllib.error,
+        request=SimpleNamespace(
+            Request=lambda *_args, **_kwargs: object(),
+            urlopen=lambda *_args, **_kwargs: (_ for _ in ()).throw(http_error),
+        ),
+    )
+    namespace["os"] = SimpleNamespace(_exit=lambda code: (_ for _ in ()).throw(_Exit(code)))
+
+    with pytest.raises(_Exit) as error:
+        namespace["_flash_post_teacher"]({"mutation": True})
+
+    assert error.value.code == opd_openrlhf._OPENRLHF_PERMANENT_TEACHER_EXIT
+
+
 def test_warmstart_config_preserves_source_lora_shape(tmp_path):
     tmp_path.joinpath("adapter_config.json").write_text(
         json.dumps(
@@ -442,6 +707,99 @@ def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
     assert "HF_TOKEN" not in child
 
 
+@requires_openrlhf_source
+@requires_torch
+def test_pinned_openrlhf_hooks_target_concrete_ray_runtime(monkeypatch):
+    helper_path = Path(__file__).with_name("test_grpo_openrlhf.py")
+    spec = importlib.util.spec_from_file_location("_flash_grpo_openrlhf_test_helpers", helper_path)
+    assert spec is not None
+    assert spec.loader is not None
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    namespace, _, ppo_actor_module, _, _ = helpers._install_pinned_sitecustomize_modules(
+        monkeypatch
+    )
+
+    ray = sys.modules["ray"]
+
+    def wrap_remote(target):
+        return type(
+            f"RayWrapped{target.__name__}",
+            (),
+            {"__ray_metadata__": SimpleNamespace(modified_class=target)},
+        )
+
+    def remote(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return wrap_remote(args[0])
+        return wrap_remote
+
+    ray.remote = remote
+    datasets = types.ModuleType("openrlhf.datasets")
+    datasets.__path__ = []
+    datasets.PromptDataset = type("PromptDataset", (), {})
+    monkeypatch.setitem(sys.modules, "openrlhf.datasets", datasets)
+    dataset_utils = types.ModuleType("openrlhf.datasets.utils")
+    dataset_utils.blending_datasets = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "openrlhf.datasets.utils", dataset_utils)
+    experience_maker = types.ModuleType("openrlhf.trainer.ppo_utils.experience_maker")
+    experience_maker.RemoteExperienceMaker = type("RemoteExperienceMaker", (), {})
+    monkeypatch.setitem(
+        sys.modules, "openrlhf.trainer.ppo_utils.experience_maker", experience_maker
+    )
+    kl_controller = types.ModuleType("openrlhf.trainer.ppo_utils.kl_controller")
+    kl_controller.AdaptiveKLController = type("AdaptiveKLController", (), {})
+    kl_controller.FixedKLController = type("FixedKLController", (), {})
+    monkeypatch.setitem(sys.modules, "openrlhf.trainer.ppo_utils.kl_controller", kl_controller)
+    launcher = sys.modules["openrlhf.trainer.ray.launcher"]
+    launcher.RayActorGroup = type("RayActorGroup", (), {})
+    logging_utils = sys.modules["openrlhf.utils.logging_utils"]
+    logging_utils.TensorboardLogger = type("TensorboardLogger", (), {})
+    logging_utils.WandbLogger = type("WandbLogger", (), {})
+    sys.modules["openrlhf.utils.utils"].get_tokenizer = lambda *_args, **_kwargs: None
+    ppo_trainer_module = helpers._source_module(
+        monkeypatch,
+        "openrlhf.trainer.ppo_trainer",
+        _OPENRLHF_SOURCE / "openrlhf/trainer/ppo_trainer.py",
+    )
+    sys.modules["openrlhf.trainer"].ppo_trainer = ppo_trainer_module
+
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_BRIDGE_URL", "http://127.0.0.1:1/teacher")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_KL_COEF", "0.37")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_SEED", "42")
+    monkeypatch.setenv("FLASH_OPENRLHF_WARMSTART_ADAPTER", "/work/warmstart")
+    exec(
+        compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
+        namespace,
+    )
+
+    runtime = ppo_trainer_module.PPOTrainer.__ray_metadata__.modified_class
+    callbacks = []
+    namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
+    trainer = object.__new__(runtime)
+    trainer.args = SimpleNamespace(
+        logger=SimpleNamespace(logging_steps=2),
+        ckpt=SimpleNamespace(save_steps=1, load_enable=False),
+    )
+    trainer.wandb_logger = None
+    trainer.tensorboard_logger = None
+    trainer.actor_model_group = SimpleNamespace(async_run_method=lambda **_kwargs: [])
+    trainer.critic_model_group = None
+    trainer._latest_eval_metric_value = None
+    trainer.best_eval_metric_key = "none"
+    trainer.broadcast_to_vllm = lambda: callbacks.append("broadcast")
+    namespace["_original_ppo_fit"] = lambda self, *args, **kwargs: "fit-result"
+
+    trainer.save_logs_and_checkpoints(1, {}, {"global_step": 1})
+    result = trainer.fit()
+
+    assert ppo_actor_module.ActorPPOTrainer.training_step is namespace["_flash_opd_training_step"]
+    assert runtime.save_logs_and_checkpoints is namespace["_flash_save_logs_and_checkpoints"]
+    assert runtime.fit is namespace["_flash_ppo_fit"]
+    assert callbacks == [{"checkpoint": 1}, "broadcast"]
+    assert result == "fit-result"
+
+
 @requires_torch
 def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch):
     torch = pytest.importorskip("torch")
@@ -463,9 +821,15 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     class _ExperienceMaker:
         pass
 
-    class _BasePPOTrainer:
+    class _PPOTrainerRuntime:
         def save_logs_and_checkpoints(self, _global_step, logs_dict=None, client_states=None):
             return None
+
+        def fit(self, *args, **kwargs):
+            return None
+
+    class _PPOTrainer:
+        __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)
 
     modules = {
         "openrlhf": types.ModuleType("openrlhf"),
@@ -486,7 +850,12 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     modules["openrlhf.trainer"].__path__ = []
     modules["openrlhf.trainer.ppo_utils"].__path__ = []
     modules["openrlhf.utils.agent"].SingleTurnAgentExecutor = _SingleTurnAgentExecutor
-    modules["openrlhf.trainer.ppo_trainer"].BasePPOTrainer = _BasePPOTrainer
+    modules["openrlhf.trainer.ppo_trainer"].PPOTrainer = _PPOTrainer
+    modules["openrlhf.trainer.ppo_trainer"].prepare_datasets = lambda strategy, tokenizer: (
+        strategy,
+        tokenizer,
+    )
+    modules["openrlhf.trainer"].ppo_trainer = modules["openrlhf.trainer.ppo_trainer"]
     modules["openrlhf.trainer.ppo_utils.samples_generator"].SamplesGenerator = _SamplesGenerator
     modules["openrlhf.trainer.ppo_utils.experience_maker"].RemoteExperienceMaker = _ExperienceMaker
     for name, module in modules.items():
@@ -587,9 +956,14 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source
     assert "_FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch" in source
     assert (
-        "_FlashBasePPOTrainer.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints"
+        "_FlashPPOTrainerRuntime.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints"
         in source
     )
+    assert "_FlashPPOTrainerRuntime.fit = _flash_ppo_fit" in source
+    assert 'getattr(_flash_ray_metadata, "modified_class", None)' in source
+    assert "_flash_ppo_trainer_module.prepare_datasets = _flash_prepare_datasets" in source
+    assert "shuffle=False" in source
+    assert "_FLASH_BRIDGE_TRANSPORT_ATTEMPTS = 3" in source
     assert "FLASH_OPENRLHF_WARMSTART_ADAPTER" in source
     assert "FIREWORKS_API_KEY" not in source
 
