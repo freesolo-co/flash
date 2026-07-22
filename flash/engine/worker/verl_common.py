@@ -45,6 +45,8 @@ def resolve_verl_python(workdir: str) -> str:
                 "vllm==0.11.0",
                 "xgrammar==0.1.25",
                 "transformers==5.10.2",
+                "tqdm>=4.67",
+                "pyarrow<21",
                 "liger-kernel",
                 "bitsandbytes>=0.49",
                 "qwen-vl-utils",

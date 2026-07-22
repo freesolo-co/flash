@@ -62,6 +62,8 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "vllm==0.11.0" in install
     assert "xgrammar==0.1.25" in install
     assert "transformers==5.10.2" in install
+    assert "tqdm>=4.67" in install
+    assert "pyarrow<21" in install
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install
