@@ -828,6 +828,7 @@ def run_opd():
         seq_cap,
         prompts_per_step=prompts_per_step,
         lora_rank=lora_rank,
+        model_revision=model_revision,
     )
     print(
         f"[opd] rollout backend: colocated vLLM model={rollout_model_source} "

@@ -1039,6 +1039,17 @@ def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
     assert '"use_liger_kernel": True' not in src
 
 
+def test_run_rl_drops_catalog_kv_geometry_for_pinned_revision() -> None:
+    import inspect
+
+    import flash.engine.worker as w
+
+    src = inspect.getsource(w.run_rl)
+    assert "_model_info = None if model_revision else MODELS.get(model_id)" in src
+    assert "active_params_b=_active_b" in src
+    assert "model_info=_model_info" in src
+
+
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:
     """Document the TRL contract the recipe depends on: the field exists and TRL defaults it OFF,
     so the explicit True in run_rl is load-bearing. A TRL rename would silently drop our override,

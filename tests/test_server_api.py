@@ -439,7 +439,7 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 
 @pytest.mark.parametrize(
     ("max_completion_tokens", "status_code"),
-    [(3500, 400), (3000, 200)],
+    [(3500, 400), (2950, 200)],
 )
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     api, monkeypatch, tmp_path, max_completion_tokens, status_code

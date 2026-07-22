@@ -145,6 +145,7 @@ def opd_vllm_kwargs(
     *,
     prompts_per_step: int | None = None,
     lora_rank: int | None = None,
+    model_revision: str = "",
 ) -> dict[str, Any]:
     """Direct vLLM LLM(...) kwargs mirroring the GRPO colocate rollout tuning."""
     kwargs: dict[str, Any] = {
@@ -192,8 +193,12 @@ def opd_vllm_kwargs(
                 resolve_params_b,
             )
 
-            info = MODELS.get(model_id)
-            params_b = resolve_params_b(model_id)
+            info = None if model_revision else MODELS.get(model_id)
+            params_b = (
+                resolve_params_b(model_id, revision=model_revision)
+                if model_revision
+                else resolve_params_b(model_id)
+            )
             sizing_params_b = float(params_b or 1.0)
             resolved_lora_rank = (
                 _sizing_lora_rank(knobs)
@@ -221,6 +226,8 @@ def opd_vllm_kwargs(
                     num_generations=num_generations,
                     active_params_b=active_b,
                     fp8_kv=fp8_kv,
+                    model_info=info,
+                    preserve_legacy_floor=True,
                 )
 
             util = _util_for(rollout_concurrency)
