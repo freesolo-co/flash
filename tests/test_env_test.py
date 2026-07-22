@@ -122,6 +122,12 @@ class _NonTextSftEnv(_SingleTurnEnv):
         return [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]
 
 
+class _ScalarSftEnv(_SingleTurnEnv):
+    def sft_completion(self, example):
+        # scalar content is a malformed message envelope, not a non-text replay target
+        return [{"role": "assistant", "content": 123}]
+
+
 class _EmptyReplyMultiTurnEnv(_MultiTurnEnv):
     def env_reply(self, messages, state):
         # env yields no further messages, which the worker treats as terminal
@@ -192,6 +198,19 @@ def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsy
     out = capsys.readouterr().out
     assert "episode 1: policy=echo turns=1" in out
     assert "overall: PASS" in out
+
+
+def test_env_test_scalar_sft_completion_fails_contract(monkeypatch, tmp_path, capsys):
+    # a malformed gold answer (scalar content) must fail the episode, not echo-pass; the
+    # adapter passes scalars through untouched, so the driver has to reject them itself
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _ScalarSftEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "sft_completion is not well-formed" in captured.err
+    assert "overall: FAIL" in captured.err
 
 
 def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys):

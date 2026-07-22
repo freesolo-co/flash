@@ -15,59 +15,51 @@ _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
 
 
-def _check_prompt(messages: object) -> list[dict]:
-    """Validate that `messages` is a well-formed chat prompt and return it."""
+def _check_messages(messages: object, label: str) -> list[dict]:
+    """Validate that `messages` is a well-formed chat message list and return it."""
     if not isinstance(messages, list) or not messages:
-        raise ValueError("prompt is not well-formed: prompt must be a non-empty list")
+        raise ValueError(f"{label} is not well-formed: {label} must be a non-empty list")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(
-                f"prompt is not well-formed: prompt message {index} must be a dict"
+                f"{label} is not well-formed: {label} message {index} must be a dict"
             )
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(
-                f"prompt is not well-formed: prompt message {index} "
+                f"{label} is not well-formed: {label} message {index} "
                 "must have a non-empty string role"
             )
         if role.strip().lower() not in _ALLOWED_ROLES:
             raise ValueError(
-                f"prompt is not well-formed: prompt message {index} "
+                f"{label} is not well-formed: {label} message {index} "
                 f"has unsupported role {role!r}"
             )
         if "content" not in message:
             raise ValueError(
-                f"prompt is not well-formed: prompt message {index} must have a content key"
+                f"{label} is not well-formed: {label} message {index} must have a content key"
             )
         # content is a string, a multimodal content-block list, or null for a native
-        # assistant tool-call message. reject scalars like ints so a malformed prompt is
+        # assistant tool-call message. reject scalars like ints so a malformed message is
         # not reported as a false pass.
         content = message["content"]
         if content is not None and not isinstance(content, (str, list)):
             raise ValueError(
-                f"prompt is not well-formed: prompt message {index} content "
+                f"{label} is not well-formed: {label} message {index} content "
                 "must be a string, a content-block list, or null"
             )
     return messages
 
 
 def _reference_turns(env, example: dict) -> list[str]:
-    # the adapter's sft_completion is always a list[dict] or raises on a malformed shape
-    # (which surfaces as an episode failure), so only string content is a usable replay
-    # target here; a non-text target contributes nothing and falls back to the echo policy.
-    messages = env.sft_completion(example)
-    assistant = [
-        message
-        for message in messages
-        if isinstance(message, dict)
-        and str(message.get("role") or "").strip().lower() == "assistant"
-    ]
-    selected = assistant or [message for message in messages if isinstance(message, dict)]
-    return [
-        content
-        for message in selected
-        if isinstance(content := message.get("content"), str)
-    ]
+    # the sft_completion gold answer stands in for the missing policy model. validate its
+    # envelope like the prompt so a malformed completion (scalar content, missing role)
+    # fails the episode instead of silently falling back to echo; a well-formed but
+    # non-text target (content-block list or null) yields no replay text and uses echo.
+    messages = _check_messages(env.sft_completion(example), "sft_completion")
+    assistant = [m for m in messages if m["role"].strip().lower() == "assistant"]
+    selected = assistant or messages
+    return [content for m in selected if isinstance(content := m["content"], str)]
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
@@ -99,7 +91,7 @@ def _new_record() -> dict:
 
 
 def _drive_single_turn(env, example: dict, record: dict) -> None:
-    prompt = _check_prompt(env.prompt_messages(example))
+    prompt = _check_messages(env.prompt_messages(example), "prompt")
     record["prompt"] = prompt
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
@@ -112,15 +104,16 @@ def _drive_single_turn(env, example: dict, record: dict) -> None:
 
 def _drive_multi_turn(env, example: dict, record: dict) -> None:
     state = env.new_rollout_state(example)
-    record["prompt"] = _check_prompt(state.get("prompt") or state.get("messages"))
+    record["prompt"] = _check_messages(state.get("prompt") or state.get("messages"), "prompt")
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
     record["policy"] = policy
     # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
     # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
-    # env yields no reply. the hard cap equals what the trainer passes (env.max_turns) and
-    # rises every turn, so a cooperatively-stepping env terminates here exactly as it
-    # would in training; no separate non-termination guard is needed.
+    # env yields no reply. the hard cap is fixed at what the trainer passes (env.max_turns)
+    # and the turn counter rises every turn until it reaches the cap, so a cooperatively-
+    # stepping env terminates here exactly as it would in training; no separate
+    # non-termination guard is needed.
     hard_cap = int(env.max_turns)
     turns = 0
     while True:
