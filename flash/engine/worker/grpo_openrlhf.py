@@ -1,9 +1,9 @@
 """OpenRLHF-backed GRPO foundation for single-turn text environments.
 
 The OpenRLHF runtime stays out of process. The parent worker owns Flash environment state and
-serves rewards over an authenticated localhost bridge. A generated ``sitecustomize`` module makes
-two narrow child-side corrections: reward transport/schema failures abort training, and the policy
-loss uses Flash's fixed configured response-length denominator instead of OpenRLHF's token mean.
+serves rewards over an authenticated localhost bridge. A generated ``sitecustomize`` module keeps
+reward handling fail-closed, applies Flash's combined fixed-length DR-GRPO normalization, masks
+truncated completions, and synchronizes effective merged LoRA weights to the rollout engines.
 
 This foundation intentionally leaves the TRL implementation intact and rejects unsupported modes.
 """
@@ -34,7 +34,12 @@ from flash.engine.worker.openrlhf_common import (
     resolve_openrlhf_python,
     run_openrlhf_training,
 )
-from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
+from flash.engine.worker.perf import (
+    gpu_diagnostics,
+    grpo_use_reentrant,
+    setup_perf_backends,
+    wait_for_gpu,
+)
 from flash.engine.worker.rng import backend_seed
 from flash.spec import DEFAULT_CREDIT_ASSIGNMENT
 
@@ -42,6 +47,7 @@ _OPENRLHF_ENTRYPOINT = "openrlhf.cli.train_ppo_ray"
 _OPENRLHF_REWARD_MAX_BODY_BYTES = 2 * 1024 * 1024
 _OPENRLHF_TARGET_MODULES = "all-linear"
 _OPENRLHF_PPO_EPOCHS = 1
+_OPENRLHF_REWARD_CLIP_BOUND = "1000000000"
 _SITE_CUSTOMIZE_NAME = "sitecustomize.py"
 _CHILD_ENV_EXACT = frozenset(
     {
@@ -182,8 +188,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         "--algo.advantage.gamma",
         "1.0",
         "--reward.clip_range",
-        "-inf",
-        "inf",
+        f"-{_OPENRLHF_REWARD_CLIP_BOUND}",
+        _OPENRLHF_REWARD_CLIP_BOUND,
         "--actor.adam.lr",
         str(config.learning_rate),
         "--actor.lr_scheduler",
@@ -238,6 +244,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         "--ckpt.best_metric_key",
         "none",
     ]
+    if grpo_use_reentrant(config.model_id):
+        args.append("--actor.gradient_checkpointing_reentrant")
     if config.kl_coef > 0:
         args.extend(
             [
@@ -246,6 +254,10 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
                 "--algo.kl.use_loss",
                 "--algo.kl.estimator",
                 "k2",
+                "--ref.num_nodes",
+                "1",
+                "--ref.num_gpus_per_node",
+                str(config.gpu_count),
             ]
         )
     else:
@@ -285,9 +297,9 @@ def completion_from_tokenizer_query(tokenizer, query: str, prompt: str) -> str:
     """Remove the prompt after reproducing OpenRLHF's tokenize-then-decode canonicalization."""
     if not isinstance(query, str) or not isinstance(prompt, str):
         raise TypeError("OpenRLHF reward query and prompt must be strings")
-    prompt_ids = tokenizer(text=prompt, add_special_tokens=False, return_tensors="pt")[
-        "input_ids"
-    ][0]
+    prompt_ids = tokenizer(text=prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][
+        0
+    ]
     if hasattr(prompt_ids, "tolist"):
         prompt_ids = prompt_ids.tolist()
     canonical_prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
@@ -495,7 +507,7 @@ def post_reward_request(url: str, payload: dict[str, Any], *, timeout: float = 5
 
 def _sitecustomize_source() -> str:
     """Return the self-contained child hook loaded before OpenRLHF imports."""
-    return r'''
+    return r"""
 import contextvars
 import functools
 import inspect
@@ -506,10 +518,11 @@ _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
 if _MAX_RESPONSE_LENGTH <= 0:
     raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
 
+from openrlhf import models as _models_module
 from openrlhf.models import loss as _loss_module
 
 _original_aggregate_loss = _loss_module.aggregate_loss
-_fixed_policy_loss = contextvars.ContextVar("flash_openrlhf_fixed_policy_loss", default=False)
+_fixed_dr_grpo_loss = contextvars.ContextVar("flash_openrlhf_fixed_dr_grpo_loss", default=False)
 
 
 @functools.wraps(_original_aggregate_loss)
@@ -521,7 +534,7 @@ def _flash_aggregate_loss(
     batch_num_tokens=None,
     global_batch_size=None,
 ):
-    if _fixed_policy_loss.get() and token_level_loss:
+    if _fixed_dr_grpo_loss.get() and token_level_loss:
         denominator = loss.shape[0] * _MAX_RESPONSE_LENGTH
         if denominator <= 0:
             raise RuntimeError("OpenRLHF DR-GRPO received an empty fixed-length loss batch")
@@ -536,23 +549,46 @@ def _flash_aggregate_loss(
     )
 
 
+# policy loss resolves aggregate_loss through the loss module, while kl and entropy import the
+# package-level symbol into ppo_actor. patch both bindings so every per-token term uses the same
+# local_batch * configured_max_response_length denominator before the scalar terms are summed.
 _loss_module.aggregate_loss = _flash_aggregate_loss
+_models_module.aggregate_loss = _flash_aggregate_loss
 
-from openrlhf.trainer.ray.ppo_actor import ActorPPOTrainer as _ActorPPOTrainer
+from openrlhf.trainer.ray import ppo_actor as _ppo_actor_module
 
+_ActorPPOTrainer = _ppo_actor_module.ActorPPOTrainer
+_ppo_actor_module.aggregate_loss = _flash_aggregate_loss
 _original_training_step = _ActorPPOTrainer.training_step
 
 
 @functools.wraps(_original_training_step)
 def _flash_training_step(self, *args, **kwargs):
-    token = _fixed_policy_loss.set(True)
+    token = _fixed_dr_grpo_loss.set(True)
     try:
         return _original_training_step(self, *args, **kwargs)
     finally:
-        _fixed_policy_loss.reset(token)
+        _fixed_dr_grpo_loss.reset(token)
 
 
 _ActorPPOTrainer.training_step = _flash_training_step
+
+from openrlhf.trainer.ppo_utils.samples_generator import SamplesGenerator as _SamplesGenerator
+
+_original_process_response = _SamplesGenerator._process_response_into_experience
+
+
+@functools.wraps(_original_process_response)
+def _flash_process_response(self, response, **generate_kwargs):
+    experience = _original_process_response(self, response, **generate_kwargs)
+    if bool(response.get("truncated", False)):
+        # retain the sample row but remove every action token from policy and kl numerators. the
+        # fixed dr-grpo denominator still counts the row through loss.shape[0].
+        experience.action_mask.zero_()
+    return experience
+
+
+_SamplesGenerator._process_response_into_experience = _flash_process_response
 
 from openrlhf.utils.agent import SingleTurnAgentExecutor as _SingleTurnAgentExecutor
 
@@ -595,6 +631,182 @@ def _flash_actor_init(self, *args, **kwargs):
 
 _Actor.__init__ = _flash_actor_init
 
+_original_broadcast_to_vllm = _ActorPPOTrainer.broadcast_to_vllm
+_LORA_PARAMETER_SEGMENTS = frozenset(
+    {"lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B", "lora_magnitude_vector"}
+)
+
+
+def _flash_vllm_base_name(name):
+    parts = name.split(".")
+    if any(part in _LORA_PARAMETER_SEGMENTS for part in parts):
+        raise RuntimeError(f"LoRA parameter name leaked into vLLM sync: {name}")
+    return ".".join(part for part in parts if part != "base_layer")
+
+
+def _flash_lora_sync_entries(model):
+    get_base_model = getattr(model, "get_base_model", None)
+    if not callable(get_base_model):
+        return None
+    base_model = get_base_model()
+    lora_modules = {
+        name: module
+        for name, module in base_model.named_modules()
+        if hasattr(module, "base_layer")
+        and hasattr(module, "lora_A")
+        and hasattr(module, "lora_B")
+        and hasattr(module, "get_delta_weight")
+    }
+    if not lora_modules:
+        return None
+
+    entries = []
+    seen = set()
+    for raw_name, parameter in base_model.named_parameters():
+        parts = raw_name.split(".")
+        if any(part in _LORA_PARAMETER_SEGMENTS for part in parts):
+            continue
+        name = _flash_vllm_base_name(raw_name)
+        if name in seen:
+            raise RuntimeError(f"duplicate merged vLLM weight name: {name}")
+        seen.add(name)
+
+        module = None
+        adapters = []
+        marker = ".base_layer.weight"
+        if raw_name == "base_layer.weight":
+            module_name = ""
+        elif raw_name.endswith(marker):
+            module_name = raw_name[: -len(marker)]
+        else:
+            module_name = None
+        if module_name is not None:
+            module = lora_modules.get(module_name)
+            if module is None:
+                raise RuntimeError(f"could not resolve LoRA module for {raw_name}")
+            adapters = [
+                adapter
+                for adapter in module.active_adapters
+                if adapter in module.lora_A and adapter in module.lora_B
+            ]
+            for adapter in adapters:
+                if adapter in getattr(module, "lora_variant", {}):
+                    raise RuntimeError("OpenRLHF vLLM sync supports vanilla LoRA only")
+                if getattr(module, "lora_bias", {}).get(adapter, False):
+                    raise RuntimeError("OpenRLHF vLLM sync does not support LoRA bias")
+
+        sources = [parameter]
+        for adapter in adapters:
+            sources.extend(
+                [
+                    module.lora_A[adapter].weight,
+                    module.lora_B[adapter].weight,
+                ]
+            )
+        entries.append((name, parameter, module, adapters, sources))
+    return entries
+
+
+def _flash_materialize_sync_weight(parameter, module, adapters):
+    if not adapters:
+        return parameter
+    merged = parameter.data
+    for adapter in adapters:
+        delta = module.get_delta_weight(adapter).to(device=parameter.device, dtype=parameter.dtype)
+        merged = merged + delta
+    return merged.contiguous()
+
+
+def _flash_broadcast_to_vllm(self):
+    model = self.actor.model.module
+    entries = _flash_lora_sync_entries(model)
+    if entries is None:
+        return _original_broadcast_to_vllm(self)
+
+    # correctness-first sync: materialize base + scaling * b @ a one layer at a time and send only
+    # standard hf base-model names. this adds one rank-r gemm and one full layer temporary per adapted
+    # weight, but keeps the existing full-weight broadcaster and avoids unsupported peft names in vllm.
+    torch = _ppo_actor_module.torch
+    deepspeed = _ppo_actor_module.deepspeed
+    ray = _ppo_actor_module.ray
+    barrier = _ppo_actor_module.torch_dist_barrier_and_cuda_sync
+    use_prefix_cache = getattr(self.strategy.args.vllm, "enable_prefix_caching", False)
+    cache_reset_refs = []
+    if use_prefix_cache and torch.distributed.get_rank() == 0:
+        cache_reset_refs = [engine.reset_prefix_cache.remote() for engine in self.vllm_engines]
+
+    torch.cuda.empty_cache()
+    use_ray = getattr(self.strategy.args.vllm, "sync_with_ray", False)
+
+    def gather_params_ctx(parameters):
+        if self.strategy.args.ds.tensor_parallel_size > 1:
+            return deepspeed.module_inject.layers.GatherReplacedLayerParams(
+                parameters, model, enabled=True
+            )
+        return deepspeed.zero.GatheredParameters(
+            parameters, enabled=self.strategy.args.ds.zero_stage == 3
+        )
+
+    def broadcast_weight(name, weight, count, num_params):
+        if torch.distributed.get_rank() == 0:
+            refs = [
+                engine.update_weight.remote(
+                    name,
+                    dtype=weight.dtype,
+                    shape=weight.shape,
+                    empty_cache=count == num_params,
+                )
+                for engine in self.vllm_engines
+            ]
+            if use_ray:
+                import ray.util.collective as collective
+
+                collective.broadcast(weight.data, 0, group_name=self._model_update_group)
+            else:
+                self._model_update_group.broadcast(
+                    weight.data, src=0, stream=torch.cuda.current_stream()
+                )
+            ray.get(refs)
+
+    def broadcast_weight_cuda_ipc(name, weight, count, num_params):
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        ipc_weight = weight.data.clone()
+        ipc_handle = {_ppo_actor_module.get_physical_gpu_id(): reduce_tensor(ipc_weight)}
+        ipc_handle_list = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
+        if torch.distributed.get_rank() == 0:
+            ipc_handles = {}
+            for handle in ipc_handle_list:
+                ipc_handles.update(handle)
+            refs = [
+                engine.update_weight_cuda_ipc.remote(
+                    name,
+                    dtype=weight.dtype,
+                    shape=weight.shape,
+                    ipc_handles=ipc_handles,
+                    empty_cache=count == num_params,
+                )
+                for engine in self.vllm_engines
+            ]
+            ray.get(refs)
+        barrier()
+
+    sync = broadcast_weight_cuda_ipc if self.use_cuda_ipc else broadcast_weight
+    num_params = len(entries)
+    for count, (name, parameter, module, adapters, sources) in enumerate(entries, start=1):
+        with gather_params_ctx(sources):
+            weight = _flash_materialize_sync_weight(parameter, module, adapters)
+            sync(name, weight, count, num_params)
+
+    if cache_reset_refs:
+        ray.get(cache_reset_refs)
+    torch.cuda.empty_cache()
+    barrier()
+
+
+_ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm
+
 if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
     import vllm
 
@@ -609,8 +821,8 @@ if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
 
     vllm.AsyncEngineArgs.__init__ = _flash_engine_init
 
-print("[flash-openrlhf] fail-closed rewards and fixed-length dr-grpo loss active", flush=True)
-'''.lstrip()
+print("[flash-openrlhf] flash grpo loss, truncation, reward, and lora sync hooks active", flush=True)
+""".lstrip()
 
 
 def write_openrlhf_sitecustomize(directory: str) -> str:
@@ -670,7 +882,9 @@ def _write_scheduled_dataset(
 
 
 def _resolve_cached_model_snapshot(model_id: str, model_revision: str) -> str:
-    if len(model_revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in model_revision):
+    if len(model_revision) != 40 or any(
+        char not in "0123456789abcdefABCDEF" for char in model_revision
+    ):
         raise ValueError("OpenRLHF GRPO requires a validated immutable 40-character model revision")
     from huggingface_hub import snapshot_download
 
@@ -690,7 +904,9 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         raise RuntimeError("OpenRLHF GRPO requires a GRPO JobSpec")
     env = _w.require_active_env()
     if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
-        raise RuntimeError("OpenRLHF GRPO foundation supports single-turn non-tool environments only")
+        raise RuntimeError(
+            "OpenRLHF GRPO foundation supports single-turn non-tool environments only"
+        )
 
     train_spec = spec.train
     if train_spec.init_from_adapter:
@@ -731,8 +947,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
     )
     max_length = int(
-        train_spec.max_context_tokens
-        or max(1024, int(rl.max_prompt_len) + max_completion)
+        train_spec.max_context_tokens or max(1024, int(rl.max_prompt_len) + max_completion)
     )
     prompt_budget = max_length - max_completion
     if prompt_budget <= 0:
@@ -757,9 +972,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         tokenizer.pad_token = tokenizer.eos_token
 
     prompts: list[dict[str, Any]] = []
-    for example_idx, (example, messages) in enumerate(
-        zip(train, message_prompts, strict=True)
-    ):
+    for example_idx, (example, messages) in enumerate(zip(train, message_prompts, strict=True)):
         rendered = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -788,9 +1001,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     )
     steps = resolve_update_horizon(derived_steps, train_spec.max_steps)
     save_every = int(train_spec.save_every or 20)
-    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(
-        prompts[0]["rendered"]
-    )
+    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
 
     return {
         "env": env,
@@ -829,14 +1040,10 @@ def run_rl_openrlhf() -> None:
     inputs = _resolve_single_turn_inputs()
 
     if inputs["model_revision"]:
-        download_seconds = _w.prefetch_model(
-            inputs["model_id"], revision=inputs["model_revision"]
-        )
+        download_seconds = _w.prefetch_model(inputs["model_id"], revision=inputs["model_revision"])
     else:
         download_seconds = _w.prefetch_model(inputs["model_id"])
-    model_path = _resolve_cached_model_snapshot(
-        inputs["model_id"], inputs["model_revision"]
-    )
+    model_path = _resolve_cached_model_snapshot(inputs["model_id"], inputs["model_revision"])
 
     workdir = f"/tmp/rl_openrlhf_seed{inputs['seed']}"
     shutil.rmtree(workdir, ignore_errors=True)
