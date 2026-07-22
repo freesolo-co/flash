@@ -544,8 +544,11 @@ class RewardBridge:
         if isinstance(labels[0], bool):
             raise TypeError("reward label must be an integer")
         label = int(labels[0])
-        with self._score_lock:
-            result = self._score_by_label(label, completion, prompts[0])
+        if completion:
+            with self._score_lock:
+                result = self._score_by_label(label, completion, prompts[0])
+        else:
+            result = RewardResult(0.0, 0.0, {})
         if not isinstance(result, RewardResult):
             raise TypeError("reward scorer must return RewardResult")
         if not all(math.isfinite(value) for value in (result.reward, result.scores)):
@@ -842,7 +845,7 @@ def _flash_trim_trailing_stop(tokenizer, token_ids, stop_text):
         default="",
     )
     if not stop:
-        return ids, tokenizer.decode(ids, skip_special_tokens=True)
+        return ids, None
     keep_length = len(stop_text) - len(stop)
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
@@ -878,6 +881,7 @@ class _FlashTerminationCapture:
         self.finish_reason = None
         self.stop_reason = None
         self.naturally_terminated = False
+        self.empty_after_stop = False
 
     def __getattr__(self, name):
         return getattr(self._engine, name)
@@ -896,10 +900,12 @@ class _FlashTerminationCapture:
             stop_text,
         )
         kept_ids, kept_text = _flash_trim_trailing_stop(self._tokenizer, token_ids, stop_text)
-        generation_output.token_ids = kept_ids
-        generation_output.text = kept_text
-        if generation_output.logprobs is not None:
-            generation_output.logprobs = generation_output.logprobs[: len(kept_ids)]
+        if kept_text is not None:
+            generation_output.token_ids = kept_ids
+            generation_output.text = kept_text
+            if generation_output.logprobs is not None:
+                generation_output.logprobs = generation_output.logprobs[: len(kept_ids)]
+            self.empty_after_stop = not kept_ids
         return request_output
 
 
@@ -957,7 +963,13 @@ async def _flash_execute(self, *args, **kwargs):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
     output["finish_reason"] = capture.finish_reason
     output["stop_reason"] = capture.stop_reason
-    output["truncated"] = bool(output.get("truncated", False)) and not capture.naturally_terminated
+    output["truncated"] = capture.empty_after_stop or (
+        bool(output.get("truncated", False)) and not capture.naturally_terminated
+    )
+    if capture.empty_after_stop:
+        output["reward"] = 0.0
+        output["scores"] = 0.0
+        output["extra_logs"] = {}
     for key in ("reward", "scores"):
         value = output.get(key)
         if isinstance(value, list):
