@@ -223,14 +223,10 @@ def test_sizing_accuracy_matrix_does_not_accept_known_oom_boundaries():
         )
         > 32
     )
-    assert (
-        model_required_vram_gb(
-            "Qwen/Qwen3.5-4B",
-            "sft",
-            train={"max_context_tokens": 8192, "batch_size": 4},
-        )
-        > 32
-    )
+    # NOTE: 4B SFT @ 8192 is NOT a >32GB OOM boundary anymore -- chunked-NLL (enabled+validated for
+    # Qwen3.5-4B via #582) drops dense logits, so it fits a 32GB card (~27GB). That fits-32GB behavior is
+    # asserted by test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card; keeping a >32 boundary here would
+    # test a boundary chunked-NLL legitimately removed.
     assert model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo") > 48
     assert (
         model_required_vram_gb(
