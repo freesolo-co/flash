@@ -233,15 +233,85 @@ def test_grpo_kv_floor_escalates_large_group_long_context():
     """vLLM KV-cache init preflight: a rollout whose concurrent-group KV cannot fit under the
     colocate utilization cap on a small card must size onto a bigger one — previously such runs
     passed preflight and died at vLLM init with 'No available memory for the cache blocks'."""
+    from flash.catalog import MODELS
     from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
 
-    # 4B, group 16, 4k rollout context: half-group KV (16 GB) + the 8 GB weight copy cannot
-    # live under 0.45 x 32 GB, so the requirement must exceed the RTX 5090 class.
-    assert grpo_kv_floor_gb(4.0, 4096, 16) > 32
-    need = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", train={"group_size": 16, "max_context_tokens": 4096}
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    floor = grpo_kv_floor_gb(
+        info.params_b,
+        4096,
+        16,
+        active_params_b=info.active_params_b,
+        model_info=info,
     )
-    assert need >= grpo_kv_floor_gb(4.0, 4096, 16)
+    # the architecture-aware cache and profiled overhead still exceed the rtx 5090 class.
+    assert floor > 32
+    need = model_required_vram_gb(
+        info.id, "grpo", train={"group_size": 16, "max_context_tokens": 4096}
+    )
+    assert need >= floor
 
     # The validated lean default (group 8, short context) stays on the 32 GB tier.
     assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 36
+
+
+def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
+    from flash.catalog import MODELS
+    from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
+    from flash.providers.base import max_non_fp8_kv_vram_gb
+
+    info = MODELS["Qwen/Qwen3.5-2B"]
+    concurrency = 8 * 16
+    ceiling = max_non_fp8_kv_vram_gb()
+    bf16_floor = grpo_kv_floor_gb(
+        info.params_b,
+        4096,
+        concurrency,
+        active_params_b=info.active_params_b,
+        model_info=info,
+        preserve_legacy_floor=True,
+    )
+    fp8_floor = grpo_kv_floor_gb(
+        info.params_b,
+        4096,
+        concurrency,
+        active_params_b=info.active_params_b,
+        fp8_kv=True,
+        model_info=info,
+        preserve_legacy_floor=True,
+    )
+    need = model_required_vram_gb(
+        info.id,
+        "opd",
+        train={"batch_size": 8, "group_size": 16, "max_context_tokens": 4096},
+    )
+
+    assert bf16_floor > ceiling
+    assert fp8_floor > ceiling
+    assert fp8_floor <= need < bf16_floor
+
+
+def test_pinned_revision_retains_calibrated_vram_floors(monkeypatch):
+    from flash.catalog import MODELS
+    from flash.engine import vram
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    monkeypatch.setattr(
+        vram,
+        "_validated_revision_geometry",
+        lambda model_id, revision, model_info: (model_info.params_b, model_info.vocab_size),
+    )
+
+    grpo_need = vram.model_required_vram_gb(
+        info.id,
+        "grpo",
+        model_revision="a" * 40,
+    )
+    sft_need = vram.model_required_vram_gb(
+        info.id,
+        "sft",
+        model_revision="a" * 40,
+    )
+
+    assert grpo_need >= info.grpo_min_vram_gb
+    assert sft_need >= info.sft_min_vram_gb

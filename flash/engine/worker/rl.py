@@ -490,7 +490,7 @@ def run_rl():
 
     from flash.engine.vram import resolve_params_b
 
-    _params_b = resolve_params_b(model_id)
+    _params_b = resolve_params_b(model_id, revision=model_revision) if model_revision else resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
@@ -615,9 +615,9 @@ def run_rl():
         from flash.catalog import MODELS
         from flash.engine.vram import colocate_kv_util
 
-        # MoE: size the KV pool on the ACTIVE backbone (matches grpo_fits_resident's resident-fit
-        # gate), so the budget and the sleep-mode decision count the SAME KV. Dense -> 0 -> total.
-        _active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0)
+        # pinned revisions use conservative generic kv geometry unless their architecture is validated.
+        _model_info = None if model_revision else MODELS.get(model_id)
+        _active_b = float(getattr(_model_info, "active_params_b", 0.0) or 0.0)
         _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
         _vllm_gpu_mem_util = colocate_kv_util(
             _params_b,
@@ -627,6 +627,7 @@ def run_rl():
             num_generations=group_size,
             active_params_b=_active_b,
             fp8_kv=_fp8_kv,
+            model_info=_model_info,
         )
     except Exception:
         _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10
