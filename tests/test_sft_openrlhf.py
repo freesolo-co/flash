@@ -749,6 +749,48 @@ def test_openrlhf_runtime_reapplies_blackwell_fla_safety(monkeypatch, tmp_path):
     assert tuner.configs == [SimpleNamespace(num_warps=2, num_stages=4)]
 
 
+def test_openrlhf_runtime_disables_unpatchable_blackwell_fla(monkeypatch, tmp_path):
+    import shutil
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    namespace = {"__name__": "flash_openrlhf_sft_blackwell_fallback_test"}
+    exec(compile(render_openrlhf_sft_runtime(), "runtime.py", "exec"), namespace)
+
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda: (10, 0),
+    )
+    fla_dir = tmp_path / "packages" / "fla"
+    fla_dir.mkdir(parents=True)
+    fla = ModuleType("fla")
+    fla.__path__ = [str(fla_dir)]
+    fla.__spec__ = importlib.util.spec_from_loader("fla", loader=None, is_package=True)
+    fla.__spec__.submodule_search_locations = [str(fla_dir)]
+    ops = ModuleType("fla.ops")
+    ops.__path__ = []
+    gated_delta_rule = ModuleType("fla.ops.gated_delta_rule")
+    wy_fast = ModuleType("fla.ops.gated_delta_rule.wy_fast")
+    wy_fast.prepare_wy_repr_bwd_kernel = SimpleNamespace(configs=[])
+    gated_delta_rule.wy_fast = wy_fast
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "fla", fla)
+    monkeypatch.setitem(sys.modules, "fla.ops", ops)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", gated_delta_rule)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule.wy_fast", wy_fast)
+    specs = iter([fla.__spec__, fla.__spec__, None, None])
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: next(specs))
+    removed = []
+    monkeypatch.setattr(shutil, "rmtree", lambda path: removed.append(path))
+
+    namespace["_apply_blackwell_fla_safety"]()
+
+    assert removed == [str(fla_dir)]
+    assert not any(name == "fla" or name.startswith("fla.") for name in sys.modules)
+
+
 def test_runtime_backpressures_every_checkpoint_until_upload_and_prune_finish():
     source = render_openrlhf_sft_runtime()
     save_block = source.split("if save_due:", 1)[1].split("consumed_in_epoch = 0", 1)[0]

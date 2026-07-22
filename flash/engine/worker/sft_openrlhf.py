@@ -749,6 +749,44 @@ with open(_CONFIG_PATH, encoding="utf-8") as _config_file:
     CONFIG = json.load(_config_file)
 
 
+def _remove_fla_from_child():
+    import importlib
+    import importlib.util
+    import shutil
+    import sys
+
+    for name in tuple(sys.modules):
+        if name == "fla" or name.startswith("fla."):
+            sys.modules.pop(name, None)
+    removed = []
+    for _ in range(6):
+        importlib.invalidate_caches()
+        spec = importlib.util.find_spec("fla")
+        if spec is None:
+            break
+        locations = list(getattr(spec, "submodule_search_locations", None) or [])
+        if not locations and spec.origin:
+            locations = [os.path.dirname(spec.origin)]
+        progressed = False
+        for location in locations:
+            if (
+                location
+                and os.path.isdir(location)
+                and os.path.basename(location.rstrip("/")) == "fla"
+            ):
+                try:
+                    shutil.rmtree(location)
+                except OSError as error:
+                    print(f"[blackwell] could not remove unsafe fla at {location}: {error}", flush=True)
+                else:
+                    removed.append(location)
+                    progressed = True
+        if not progressed:
+            break
+    importlib.invalidate_caches()
+    return removed, importlib.util.find_spec("fla") is not None
+
+
 def _apply_blackwell_fla_safety():
     import importlib.util
 
@@ -759,28 +797,40 @@ def _apply_blackwell_fla_safety():
     capability = torch.cuda.get_device_capability()
     if capability == (10, 0):
         os.environ.setdefault("FLA_TILELANG", "0")
-    if capability[0] not in (10, 12) or importlib.util.find_spec("fla") is None:
+    if capability[0] not in (10, 12):
         return
 
-    from fla.ops.gated_delta_rule import wy_fast
+    try:
+        if importlib.util.find_spec("fla") is None:
+            return
+        from fla.ops.gated_delta_rule import wy_fast
 
-    tuner = getattr(wy_fast, "prepare_wy_repr_bwd_kernel", None)
-    for _ in range(8):
-        if tuner is None or hasattr(tuner, "configs"):
-            break
-        tuner = getattr(tuner, "fn", None)
-    configs = getattr(tuner, "configs", None)
-    if not configs:
-        raise RuntimeError("fla GDN backward autotuner is unavailable on Blackwell")
-    validated = [
-        config
-        for config in configs
-        if getattr(config, "num_warps", None) == 2
-        and getattr(config, "num_stages", None) == 4
-    ]
-    if not validated:
-        raise RuntimeError("fla GDN backward has no validated Blackwell autotune config")
-    tuner.configs = validated
+        tuner = getattr(wy_fast, "prepare_wy_repr_bwd_kernel", None)
+        for _ in range(8):
+            if tuner is None or hasattr(tuner, "configs"):
+                break
+            tuner = getattr(tuner, "fn", None)
+        configs = getattr(tuner, "configs", None)
+        if not configs:
+            raise RuntimeError("fla GDN backward autotuner is unavailable on Blackwell")
+        validated = [
+            config
+            for config in configs
+            if getattr(config, "num_warps", None) == 2
+            and getattr(config, "num_stages", None) == 4
+        ]
+        if not validated:
+            raise RuntimeError("fla GDN backward has no validated Blackwell autotune config")
+        tuner.configs = validated
+    except Exception as error:
+        removed, still_importable = _remove_fla_from_child()
+        if still_importable:
+            raise RuntimeError("could not disable unsafe fla on Blackwell") from error
+        print(
+            "[blackwell] disabled unsafe fla in OpenRLHF child "
+            f"({type(error).__name__}: {error}; removed {len(removed)} copy(ies))",
+            flush=True,
+        )
 
 
 class FlashTokenizedSFTDataset:
