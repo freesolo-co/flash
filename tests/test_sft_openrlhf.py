@@ -489,6 +489,25 @@ def test_chunked_selected_token_nll_matches_full_loss_and_gradients(chunk_size):
     assert torch.allclose(output_head.bias.grad, full_bias_grad, atol=1e-5, rtol=1e-5)
 
 
+def test_rendered_runtime_gathers_zero3_head_around_forward_and_backward():
+    source = render_openrlhf_sft_runtime()
+    chunk = source.split("def _selected_token_nll_chunk(", 1)[1].split(
+        "def _chunked_selected_token_nll(", 1
+    )[0]
+    micro_step = source.split("for micro_index, batch in enumerate(window):", 1)[1].split(
+        "global_step += 1", 1
+    )[0]
+
+    assert "_maybe_gather_output_head" not in chunk
+    gather = micro_step.index("with _maybe_gather_output_head(output_head.weight, output_bias):")
+    forward = micro_step.index("output = engine(")
+    backward = micro_step.index("self.strategy.backward(loss, self.model, self.optimizer)")
+    optimizer_step = micro_step.index(
+        "self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)"
+    )
+    assert gather < forward < backward < optimizer_step
+
+
 @requires_torch
 def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
     import torch
@@ -583,6 +602,127 @@ def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
 
 
 @requires_torch
+def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(monkeypatch, tmp_path):
+    import torch
+    import torch.nn.functional as functional
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps({"chunked_loss_size": 2, "force_cudnn_sdpa": False}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    runtime = ModuleType("flash_openrlhf_sft_vlm_runtime_test")
+    exec(compile(render_openrlhf_sft_runtime(), runtime.__name__, "exec"), runtime.__dict__)
+
+    class OutputHead(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(5, 17)
+            self.projection_calls = 0
+
+        def forward(self, hidden_states):
+            self.projection_calls += 1
+            return super().forward(hidden_states)
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.direct_calls = 0
+
+        def forward(self, **_kwargs):
+            self.direct_calls += 1
+            raise AssertionError("VLM training must use the full outer forward")
+
+    class BaseLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_model = Backbone()
+            self.embedding = torch.nn.Embedding(17, 5)
+            self.output_head = OutputHead()
+            self.config = SimpleNamespace(
+                image_token_id=9,
+                video_token_id=10,
+                text_config=SimpleNamespace(logit_scale=1.0),
+            )
+            self.full_forward_calls = 0
+            self.seen_mm_token_type_ids = None
+
+        def get_output_embeddings(self):
+            return self.output_head
+
+        def forward(
+            self,
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            mm_token_type_ids,
+            **_kwargs,
+        ):
+            del image_grid_thw
+            self.full_forward_calls += 1
+            self.seen_mm_token_type_ids = mm_token_type_ids.detach().clone()
+            hidden = self.embedding(input_ids) + pixel_values.sum()
+            return SimpleNamespace(logits=self.output_head(hidden))
+
+    class PeftModel(torch.nn.Module):
+        def __init__(self, base_lm):
+            super().__init__()
+            self.base_lm = base_lm
+
+        def get_base_model(self):
+            return self.base_lm
+
+        def forward(self, **kwargs):
+            return self.base_lm(**kwargs)
+
+    class Engine(torch.nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, **kwargs):
+            return self.module(**kwargs)
+
+    torch.manual_seed(37)
+    base_lm = BaseLM()
+    engine = Engine(PeftModel(base_lm))
+    actor = SimpleNamespace(model=engine, is_vlm=True)
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 9, 6, 7]])
+    loss_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.bool)
+    labels = input_ids.masked_fill(~loss_mask, -100)
+    pixel_values = torch.tensor([[0.25, 0.5]])
+    hidden = base_lm.embedding(input_ids) + pixel_values.sum()
+    shifted_mask = loss_mask[:, 1:]
+    expected = functional.cross_entropy(
+        functional.linear(hidden[:, :-1, :], base_lm.output_head.weight, base_lm.output_head.bias)[
+            shifted_mask
+        ],
+        input_ids[:, 1:][shifted_mask],
+    )
+
+    patched_engine = runtime._install_chunked_loss_forward(actor)
+    output = patched_engine(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        flash_loss_denominator=shifted_mask.sum(),
+        flash_dp_size=1,
+        pixel_values=pixel_values,
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+    )
+
+    assert base_lm.full_forward_calls == 1
+    assert base_lm.base_model.direct_calls == 0
+    assert base_lm.output_head.projection_calls == 0
+    assert base_lm.seen_mm_token_type_ids.dtype == torch.int32
+    assert base_lm.seen_mm_token_type_ids.tolist() == [[0, 0, 0, 0], [0, 1, 0, 0]]
+    assert output.loss.item() == pytest.approx(expected.item(), abs=1e-5)
+    output.loss.backward()
+    assert base_lm.embedding.weight.grad is not None
+    assert base_lm.output_head.weight.grad is not None
+
+
+@requires_torch
 def test_chunked_selected_token_nll_is_chunk_size_invariant():
     import torch
 
@@ -621,6 +761,7 @@ def test_32k_uses_chunked_loss_without_sequence_parallel_rejection():
     assert "if realized_max_length >= 32768:" in worker_source
     assert "per_device_limit = 1" in worker_source
     assert "fused=True" in worker_source
+    assert "fused_ce=True" in worker_source
     assert "_chunked_selected_token_nll(" in runtime_source
     assert "labels.ne(-100)" in runtime_source
     assert "loss_mask[:, 1:].bool()" in runtime_source
@@ -864,7 +1005,7 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "loss_mask[:, :-1]" not in source
     assert 'kwargs["pin_memory"] = True' in source
     assert "non_blocking=True" in source
-    assert "_install_attention_patch()" in source
+    assert "_install_attention_patch" not in source
     assert "_mark_hf_export_ready(args.ckpt.path, global_step)" in source
     assert "_wait_for_checkpoint_upload(args.ckpt.path, global_step)" in source
     assert "2**31 - 1" in source

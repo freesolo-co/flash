@@ -445,10 +445,9 @@ def _selected_token_nll_chunk(
     import torch
     import torch.nn.functional as functional
 
-    with _maybe_gather_output_head(weight, bias):
-        logits = hidden_states.float() @ weight.float().t()
-        if bias is not None:
-            logits = logits + bias.float()
+    logits = hidden_states.float() @ weight.float().t()
+    if bias is not None:
+        logits = logits + bias.float()
     if logit_scale != 1.0:
         logits = logits * logit_scale
     if final_logit_softcapping is not None:
@@ -994,29 +993,6 @@ def _install_warmstart_actor_patch():
     openrlhf.models.Actor = FlashWarmstartActor
 
 
-def _install_attention_patch():
-    if not bool(CONFIG.get("force_cudnn_sdpa")):
-        return
-    import openrlhf.models
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-
-    original_forward = openrlhf.models.Actor.forward
-
-    def forward(self, *args, **kwargs):
-        with sdpa_kernel(
-            [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ],
-            set_priority=True,
-        ):
-            return original_forward(self, *args, **kwargs)
-
-    openrlhf.models.Actor.forward = forward
-
-
 def _install_dataloader_and_scheduler_patches():
     from openrlhf.utils.deepspeed.deepspeed import DeepspeedStrategy
 
@@ -1183,6 +1159,7 @@ def _resume_training_state(consumed_samples):
 def _install_chunked_loss_forward(actor):
     import types
 
+    import torch
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     engine = actor.model
@@ -1204,6 +1181,48 @@ def _install_chunked_loss_forward(actor):
     logit_scale = float(getattr(text_config, "logit_scale", 1.0))
     final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
     original_forward = base_lm.forward
+    is_vlm = bool(getattr(actor, "is_vlm", False))
+
+    def vlm_hidden_states(input_ids, attention_mask, kwargs):
+        config = base_lm.config
+        if "image_grid_thw" in kwargs and "mm_token_type_ids" not in kwargs:
+            token_type_ids = input_ids.new_zeros(input_ids.shape, dtype=input_ids.dtype)
+            image_token_id = getattr(config, "image_token_id", None)
+            if image_token_id is None:
+                raise RuntimeError("OpenRLHF VLM SFT requires an image token id")
+            token_type_ids[input_ids == int(image_token_id)] = 1
+            video_token_id = getattr(config, "video_token_id", None)
+            if video_token_id is not None:
+                token_type_ids[input_ids == int(video_token_id)] = 2
+            kwargs["mm_token_type_ids"] = token_type_ids.to(dtype=torch.int32)
+        elif "pixel_values" in kwargs and "token_type_ids" not in kwargs:
+            image_token_id = getattr(config, "image_token_id", None)
+            if image_token_id is not None:
+                kwargs["token_type_ids"] = (input_ids == int(image_token_id)).to(
+                    dtype=torch.int32
+                )
+
+        original_head_forward = output_head.forward
+        captured_hidden_states = []
+
+        def hidden_passthrough(_self, hidden_states, *args, **head_kwargs):
+            del args, head_kwargs
+            captured_hidden_states.append(hidden_states)
+            return hidden_states
+
+        output_head.forward = types.MethodType(hidden_passthrough, output_head)
+        try:
+            original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                **kwargs,
+            )
+        finally:
+            output_head.forward = original_head_forward
+        if len(captured_hidden_states) != 1:
+            raise RuntimeError("OpenRLHF VLM forward did not reach its output head exactly once")
+        return captured_hidden_states[0]
 
     def chunked_forward(
         self,
@@ -1222,14 +1241,29 @@ def _install_chunked_loss_forward(actor):
             )
         kwargs.pop("use_cache", None)
         kwargs.pop("logits_to_keep", None)
-        outputs = backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            **kwargs,
+        multimodal = is_vlm and any(
+            kwargs.get(key) is not None
+            for key in (
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+                "image_sizes",
+            )
         )
+        if multimodal:
+            hidden_states = vlm_hidden_states(input_ids, attention_mask, kwargs)
+            outputs = None
+        else:
+            outputs = backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                **kwargs,
+            )
+            hidden_states = outputs.last_hidden_state
         loss = _chunked_selected_token_nll(
-            outputs.last_hidden_state,
+            hidden_states,
             output_head,
             input_ids,
             labels.ne(-100),
@@ -1249,6 +1283,7 @@ def _install_chunked_loss_forward(actor):
 
     base_lm.forward = types.MethodType(chunked_forward, base_lm)
     base_lm._flash_chunked_sft_loss = True
+    engine._flash_chunked_output_head = output_head
     return engine
 
 
@@ -1332,18 +1367,21 @@ def _install_trainer_patch():
                     }
                     engine.set_gradient_accumulation_boundary(micro_index + 1 == len(window))
                     labels = inputs.masked_fill(~loss_mask.bool(), -100)
-                    with _attention_context():
-                        output = engine(
-                            input_ids=inputs,
-                            attention_mask=attention_mask,
-                            labels=labels,
-                            flash_loss_denominator=loss_info["batch_num_tokens"],
-                            flash_dp_size=loss_info["dp_size"],
-                            **mm_inputs,
-                        )
-                    gpt_loss = output.loss
-                    loss = gpt_loss * gradient_scale
-                    self.strategy.backward(loss, self.model, self.optimizer)
+                    output_head = engine._flash_chunked_output_head
+                    output_bias = getattr(output_head, "bias", None)
+                    with _maybe_gather_output_head(output_head.weight, output_bias):
+                        with _attention_context():
+                            output = engine(
+                                input_ids=inputs,
+                                attention_mask=attention_mask,
+                                labels=labels,
+                                flash_loss_denominator=loss_info["batch_num_tokens"],
+                                flash_dp_size=loss_info["dp_size"],
+                                **mm_inputs,
+                            )
+                        gpt_loss = output.loss
+                        loss = gpt_loss * gradient_scale
+                        self.strategy.backward(loss, self.model, self.optimizer)
                     self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
                     step_loss += float(gpt_loss.item())
                     step_tokens += int(attention_mask.sum().item())
@@ -1430,7 +1468,6 @@ def _install_trainer_patch():
 def apply_flash_openrlhf_sft_patches():
     _install_dataset_patch()
     _install_warmstart_actor_patch()
-    _install_attention_patch()
     _install_dataloader_and_scheduler_patches()
     _install_loraplus_patch()
     _install_trainer_patch()
@@ -1854,7 +1891,7 @@ def run_sft_openrlhf(spec=None) -> None:
         active_params_b=active_params_b,
         hidden=hidden,
         num_layers=layers,
-        fused_ce=False,
+        fused_ce=True,
         per_device_bs=micro_batch,
         lora_rank=lora_rank,
         revision=model_revision,
