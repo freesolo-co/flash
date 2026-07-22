@@ -840,14 +840,9 @@ def test_child_passes_native_non_length_termination_to_teacher_bridge(monkeypatc
     assert payloads[0]["terminated"] is True
 
 
-def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
+def test_child_drops_no_signal_rollout_after_bounded_resampling(monkeypatch):
     namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
     attempts = []
-
-    class _Exit(RuntimeError):
-        def __init__(self, code):
-            super().__init__(str(code))
-            self.code = code
 
     async def execute(*_args, **_kwargs):
         return {
@@ -858,10 +853,14 @@ def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
 
     namespace["_original_execute"] = execute
     namespace["_flash_post_teacher"] = lambda payload: (
-        attempts.append(payload) or {"signal_count": 0}
-    )
-    namespace["os"] = SimpleNamespace(
-        _exit=lambda code: (_ for _ in ()).throw(_Exit(code)),
+        attempts.append(payload)
+        or {
+            "signal_count": 0,
+            "teacher_group_ids": [-1, -1, -1],
+            "teacher_logsums": [0.0, 0.0, 0.0],
+            "teacher_signal_mask": [False, False, False],
+            "coverage": 0.0,
+        }
     )
     label = json.dumps(
         {
@@ -872,21 +871,55 @@ def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
         }
     )
 
-    with pytest.raises(_Exit) as error:
-        asyncio.run(
-            namespace["_flash_opd_execute"](
-                SimpleNamespace(),
-                "prompt",
-                label,
-                SimpleNamespace(),
-                10,
-                object(),
-                object(),
-            )
+    result = asyncio.run(
+        namespace["_flash_opd_execute"](
+            SimpleNamespace(),
+            "prompt",
+            label,
+            SimpleNamespace(),
+            10,
+            object(),
+            object(),
         )
+    )
 
-    assert error.value.code == opd_openrlhf._OPENRLHF_TRANSIENT_TEACHER_EXIT
+    assert result["teacher_signal_mask"] == [False, False, False]
+    assert result["teacher_coverage"] == 0.0
     assert len(attempts) == opd_openrlhf._OPENRLHF_NO_SIGNAL_ATTEMPTS
+    assert [json.loads(attempt["label"])["no_signal_attempt"] for attempt in attempts] == [0, 1, 2]
+
+
+@requires_torch
+def test_child_process_response_drops_no_signal_action_tokens(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    namespace["torch"] = torch
+    experience = SimpleNamespace(
+        action_mask=torch.ones((1, 3), dtype=torch.bool),
+        info={},
+    )
+    namespace["_original_process_response"] = lambda *_args, **_kwargs: experience
+
+    result = namespace["_flash_opd_process_response"](
+        object(),
+        {
+            "teacher_group_ids": [-1, -1, -1],
+            "teacher_logsums": [0.0, 0.0, 0.0],
+            "teacher_signal_mask": [False, False, False],
+            "teacher_coverage": 0.0,
+        },
+    )
+
+    assert not bool(result.action_mask.any().item())
+
+
+def test_child_mutation_marker_only_precedes_accumulation_boundary(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    assert namespace["_flash_is_optimizer_update"](0, 2) is False
+    assert namespace["_flash_is_optimizer_update"](1, 2) is True
+    with pytest.raises(RuntimeError, match="gradient accumulation must be positive"):
+        namespace["_flash_is_optimizer_update"](0, 0)
 
 
 def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
@@ -1023,6 +1056,23 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert "--actor.gradient_checkpointing_reentrant" in args
     assert "--ds.attn_implementation" in args
     assert "--train.colocate_all" in args
+
+
+@pytest.mark.parametrize(
+    ("prompts_per_step", "group_size", "gpu_count"),
+    [(1, 1, 2), (3, 1, 2)],
+)
+def test_build_openrlhf_opd_args_rejects_invalid_actor_global_batch(
+    prompts_per_step, group_size, gpu_count
+):
+    with pytest.raises(ValueError, match="completion batch must be at least and divisible"):
+        opd_openrlhf.build_openrlhf_opd_args(
+            _config(
+                prompts_per_step=prompts_per_step,
+                group_size=group_size,
+                gpu_count=gpu_count,
+            )
+        )
 
 
 def test_build_openrlhf_opd_args_enables_native_resume():
@@ -1287,6 +1337,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
 
     class _Strategy:
         ring_attn_group = None
+        accumulated_gradient = 1
 
         def backward(self, loss, *_args):
             self.loss = loss
@@ -1360,6 +1411,7 @@ def test_parent_worker_keeps_filtering_liveness_and_exact_final_checkpoint_gate(
     source = Path(opd_openrlhf.__file__).read_text(encoding="utf-8")
 
     assert 'liveness_heartbeat("opd_filtering_prompts", progress=lambda: scanned)' in source
+    assert "heartbeat=lambda:" not in source
     assert 'if final_save_due(last_step[0], inputs["save_at_steps"]):' in source
 
 

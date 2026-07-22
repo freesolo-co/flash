@@ -558,6 +558,10 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         raise ValueError("OpenRLHF OPD requires at least one GPU")
 
     completion_batch = config.prompts_per_step * config.group_size
+    if completion_batch < config.gpu_count or completion_batch % config.gpu_count:
+        raise ValueError(
+            "OpenRLHF OPD completion batch must be at least and divisible by the actor GPU count"
+        )
     target_modules = list(config.lora_target_modules) or [_OPENRLHF_TARGET_MODULES]
     args = [
         "--actor.model_name_or_path",
@@ -852,21 +856,21 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
                 "terminated": not bool(output.get("truncated", False)),
             },
         )
+        output["label"] = attempt_label
+        output["reward"] = 0.0
+        output["scores"] = 0.0
+        output["teacher_group_ids"] = result["teacher_group_ids"]
+        output["teacher_logsums"] = result["teacher_logsums"]
+        output["teacher_signal_mask"] = result["teacher_signal_mask"]
+        output["teacher_coverage"] = float(result.get("coverage", 0.0))
         if int(result.get("signal_count", 0)) > 0:
-            output["label"] = attempt_label
-            output["reward"] = 0.0
-            output["scores"] = 0.0
-            output["teacher_group_ids"] = result["teacher_group_ids"]
-            output["teacher_logsums"] = result["teacher_logsums"]
-            output["teacher_signal_mask"] = result["teacher_signal_mask"]
-            output["teacher_coverage"] = float(result.get("coverage", 0.0))
             return output
     print(
         f"flash OPD produced no aligned teacher signal after {_FLASH_OPD_MAX_ATTEMPTS} rollout attempts; "
-        "requesting a retriable worker replacement",
+        "dropping the rollout from the optimizer update",
         flush=True,
     )
-    os._exit(_FLASH_TRANSIENT_TEACHER_EXIT)
+    return output
 
 
 _FlashSingleTurnExecutor.execute = _flash_opd_execute
@@ -887,8 +891,7 @@ def _flash_opd_process_response(self, response, **generate_kwargs):
             raise RuntimeError(f"OpenRLHF OPD response has invalid {name}")
         experience.info[name] = torch.tensor(value, dtype=dtype).unsqueeze(0)
     signal_mask = experience.info["flash_teacher_signal_mask"]
-    if not bool(signal_mask.any().item()):
-        raise RuntimeError("OpenRLHF OPD accepted a response without aligned teacher signal")
+    experience.action_mask = experience.action_mask.bool() & signal_mask
     experience.info["teacher_coverage"] = torch.tensor([float(response.get("teacher_coverage", 0.0))])
     return experience
 
@@ -1117,6 +1120,13 @@ def _flash_reverse_kl(student_logprobs, teacher_logsums, group_ids, response_mas
     return torch.stack(row_losses).mean(), selected
 
 
+def _flash_is_optimizer_update(step, accumulated_gradient):
+    accumulated_gradient = int(accumulated_gradient)
+    if accumulated_gradient <= 0:
+        raise RuntimeError("OpenRLHF OPD gradient accumulation must be positive")
+    return (int(step) + 1) % accumulated_gradient == 0
+
+
 def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=None):
     del kl_ctl, loss_batch_info
     self.actor.train()
@@ -1138,14 +1148,20 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
     signal_mask = _flash_pad_info(
         experience.info["flash_teacher_signal_mask"], action_log_probs, False
     ).bool()
-    loss, selected = _flash_reverse_kl(
-        action_log_probs,
-        teacher_logsums,
-        group_ids,
-        experience.action_mask.bool() & signal_mask,
-    )
+    response_mask = experience.action_mask.bool() & signal_mask
+    selected = response_mask & group_ids.ge(0)
+    if bool(selected.any().item()):
+        loss, selected = _flash_reverse_kl(
+            action_log_probs,
+            teacher_logsums,
+            group_ids,
+            response_mask,
+        )
+    else:
+        loss = action_log_probs.sum() * 0.0
     self.strategy.backward(loss, self.actor, self.actor_optim)
-    _flash_post_teacher({"mutation": True})
+    if _flash_is_optimizer_update(step, self.strategy.accumulated_gradient):
+        _flash_post_teacher({"mutation": True})
     self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
     grad_norm = self.strategy.get_grad_norm(self.actor)
     coverage = experience.info.get("teacher_coverage", [])
@@ -1170,7 +1186,7 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
             "actor_lr": None,
             "actor_grad_norm": None,
         },
-        "num_samples": float(action_log_probs.shape[0]),
+        "num_samples": float(max(selected.any(dim=-1).sum().item(), 1)),
         "num_action_tokens": float(selected.sum().item()),
     }
 
@@ -1909,11 +1925,6 @@ def run_opd_openrlhf() -> None:
                 env=child_env,
                 entrypoint=_OPENRLHF_ENTRYPOINT,
                 cwd=workdir,
-                heartbeat=lambda: _w.heartbeat(
-                    "opd_openrlhf_training",
-                    step=last_step[0],
-                    gpu=gpu_diagnostics(),
-                ),
             )
         _raise_training_failure(returncode, bridge.teacher_failure)
         if last_step[0] < inputs["steps"]:
