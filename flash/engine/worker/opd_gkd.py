@@ -34,8 +34,8 @@ def _generation_eos_ids(model, tok) -> frozenset:
     ``eos_token_id`` and the model's ``generation_config``/``config`` ``eos_token_id``, each of which
     HF allows to be a single id OR a list.
 
-    A model can stop on a SECONDARY eos: MiniCPM5 halts generation on ``<|im_end|>`` while its primary
-    ``tok.eos_token_id`` is ``</s>``. A completion ending on that secondary id is a NATURAL termination
+    A model can stop on a SECONDARY eos from its generation config while its tokenizer exposes a
+    different primary ``tok.eos_token_id``. A completion ending on that secondary id is a NATURAL termination
     even though it != ``tok.eos_token_id``, so ``_rollout_terminated`` must see the whole set; a
     single-id check misreads the rollout as truncated and skips it, which with no stop_sequences burns
     every sample and fails the run with "no trained step" (codex[bot])."""

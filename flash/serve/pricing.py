@@ -28,12 +28,6 @@ class ServingPrice:
 
 
 SERVING_PRICES: dict[str, ServingPrice] = {
-    "openbmb/MiniCPM5-1B": ServingPrice(
-        model_id="openbmb/MiniCPM5-1B",
-        typical_input_usd_per_mtok=0.01,
-        typical_output_usd_per_mtok=0.05,
-        typical_cached_input_usd_per_mtok=0.002,
-    ),
     "Qwen/Qwen3.5-0.8B": ServingPrice(
         model_id="Qwen/Qwen3.5-0.8B",
         typical_input_usd_per_mtok=0.01,

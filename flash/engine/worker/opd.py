@@ -1,10 +1,10 @@
 """On-policy distillation training path (algorithm="opd") for the fine-tuning worker.
 
-The student (a Qwen3.5 / MiniCPM catalog model) samples completions on-policy; a Fireworks-hosted
-GLM-5.2 teacher scores those completions token-by-token over the API; a groupwise reverse-KL loss is
+The student (a Qwen3.5/3.6 catalog model) samples completions on-policy; a Fireworks-hosted GLM-5.2
+teacher scores those completions token-by-token over the API; a groupwise reverse-KL loss is
 backpropagated through the student LoRA.
 
-Cross-tokenizer bridge (teacher GLM vocab != student Qwen3.5 / MiniCPM vocab): the teacher and student
+Cross-tokenizer bridge (teacher GLM vocab != student Qwen3.5/3.6 vocab): the teacher and student
 tokenize the same completion string differently, so their per-token distributions can't be compared
 directly. We align by SHARED DECODED-TEXT SPANS — the coarsest common refinement of the two
 tokenizations (a group boundary is any character offset that begins a token in BOTH tokenizers) — and
