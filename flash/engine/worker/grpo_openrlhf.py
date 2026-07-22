@@ -624,6 +624,10 @@ _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
 _ACTION_LOGPROB_CHUNK_SIZE = 256
 _FLASH_ROLLOUT_SEED_TEXT = os.environ.get("FLASH_OPENRLHF_ROLLOUT_SEED")
 _FLASH_ROLLOUT_SEED = int(_FLASH_ROLLOUT_SEED_TEXT) if _FLASH_ROLLOUT_SEED_TEXT is not None else None
+_FLASH_STOP_SEQUENCES = tuple(json.loads(os.environ.get("FLASH_OPENRLHF_STOP_SEQUENCES", "[]")))
+_FLASH_EOS_TOKEN_IDS = frozenset(
+    int(token_id) for token_id in json.loads(os.environ.get("FLASH_OPENRLHF_EOS_TOKEN_IDS", "[]"))
+)
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
@@ -808,10 +812,88 @@ def _flash_rollout_seed(identity):
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
+def _flash_trim_trailing_stop(tokenizer, token_ids, stop_text):
+    ids = [int(token_id) for token_id in token_ids]
+    stop = max(
+        (value for value in _FLASH_STOP_SEQUENCES if value and stop_text.endswith(value)),
+        key=len,
+        default="",
+    )
+    if not stop:
+        return ids, tokenizer.decode(ids, skip_special_tokens=True)
+    keep_length = len(stop_text) - len(stop)
+    kept = len(ids)
+    while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
+        kept -= 1
+    return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True)
+
+
+def _flash_naturally_terminated(finish_reason, stop_reason, token_ids, stop_text):
+    if finish_reason == "stop":
+        return True
+    if (
+        isinstance(stop_reason, int)
+        and not isinstance(stop_reason, bool)
+        and stop_reason in _FLASH_EOS_TOKEN_IDS
+    ):
+        return True
+    if _FLASH_EOS_TOKEN_IDS and not _FLASH_EOS_TOKEN_IDS.isdisjoint(token_ids):
+        return True
+    return any(
+        value
+        and (
+            stop_text.endswith(value)
+            or (isinstance(stop_reason, str) and stop_reason == value)
+        )
+        for value in _FLASH_STOP_SEQUENCES
+    )
+
+
+class _FlashTerminationCapture:
+    def __init__(self, engine, tokenizer):
+        self._engine = engine
+        self._tokenizer = tokenizer
+        self.finish_reason = None
+        self.stop_reason = None
+        self.naturally_terminated = False
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+    async def generate(self, *args, **kwargs):
+        request_output = await self._engine.generate(*args, **kwargs)
+        generation_output = request_output.outputs[0]
+        token_ids = [int(token_id) for token_id in generation_output.token_ids]
+        stop_text = self._tokenizer.decode(token_ids, skip_special_tokens=False)
+        self.finish_reason = generation_output.finish_reason
+        self.stop_reason = getattr(generation_output, "stop_reason", None)
+        self.naturally_terminated = _flash_naturally_terminated(
+            self.finish_reason,
+            self.stop_reason,
+            token_ids,
+            stop_text,
+        )
+        kept_ids, kept_text = _flash_trim_trailing_stop(self._tokenizer, token_ids, stop_text)
+        generation_output.token_ids = kept_ids
+        generation_output.text = kept_text
+        if generation_output.logprobs is not None:
+            generation_output.logprobs = generation_output.logprobs[: len(kept_ids)]
+        return request_output
+
+
 @functools.wraps(_original_execute)
 async def _flash_execute(self, *args, **kwargs):
     call_args = list(args)
     call_kwargs = dict(kwargs)
+    sampling_params = call_args[2] if len(call_args) > 2 else call_kwargs.get("sampling_params")
+    if sampling_params is None:
+        raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
+    sampling_params = copy.deepcopy(sampling_params)
+    if _FLASH_STOP_SEQUENCES:
+        sampling_params.stop = list(_FLASH_STOP_SEQUENCES)
+        sampling_params.include_stop_str_in_output = True
+    if _FLASH_EOS_TOKEN_IDS:
+        sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)
     if _FLASH_ROLLOUT_SEED is not None:
         label = call_args[1] if len(call_args) > 1 else call_kwargs.get("label")
         identity = _flash_rollout_identity(label)
@@ -827,22 +909,30 @@ async def _flash_execute(self, *args, **kwargs):
             self._flash_grpo_rollout_ordinals = rollout_ordinals
         identity["rollout_ordinal"] = rollout_ordinals.get(rollout_key, 0)
         rollout_ordinals[rollout_key] = identity["rollout_ordinal"] + 1
-        sampling_params = call_args[2] if len(call_args) > 2 else call_kwargs.get("sampling_params")
-        if sampling_params is None:
-            raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
-        sampling_params = copy.deepcopy(sampling_params)
         sampling_params.seed = _flash_rollout_seed(identity)
         if len(call_args) > 1:
             call_args[1] = identity["example_index"]
         else:
             call_kwargs["label"] = identity["example_index"]
-        if len(call_args) > 2:
-            call_args[2] = sampling_params
-        else:
-            call_kwargs["sampling_params"] = sampling_params
+    if len(call_args) > 2:
+        call_args[2] = sampling_params
+    else:
+        call_kwargs["sampling_params"] = sampling_params
+    tokenizer = call_args[4] if len(call_args) > 4 else call_kwargs.get("hf_tokenizer")
+    llm_engine = call_args[5] if len(call_args) > 5 else call_kwargs.get("llm_engine")
+    if tokenizer is None or llm_engine is None:
+        raise RuntimeError("flash GRPO rollout request is missing tokenizer or engine")
+    capture = _FlashTerminationCapture(llm_engine, tokenizer)
+    if len(call_args) > 5:
+        call_args[5] = capture
+    else:
+        call_kwargs["llm_engine"] = capture
     output = await _original_execute(self, *call_args, **call_kwargs)
     if not isinstance(output, dict):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
+    output["finish_reason"] = capture.finish_reason
+    output["stop_reason"] = capture.stop_reason
+    output["truncated"] = bool(output.get("truncated", False)) and not capture.naturally_terminated
     for key in ("reward", "scores"):
         value = output.get(key)
         if isinstance(value, list):
@@ -1454,6 +1544,8 @@ def build_openrlhf_child_env(
     language_model_only: bool,
     sm120_vllm_backend: bool,
     seed: int | None = None,
+    stop_sequences: tuple[str, ...] = (),
+    eos_token_ids: frozenset[int] = frozenset(),
     fp8_kv: bool = False,
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
@@ -1467,6 +1559,10 @@ def build_openrlhf_child_env(
     }
     child["PYTHONPATH"] = plugin_dir
     child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] = str(int(max_response_length))
+    child["FLASH_OPENRLHF_STOP_SEQUENCES"] = json.dumps(list(stop_sequences))
+    child["FLASH_OPENRLHF_EOS_TOKEN_IDS"] = json.dumps(
+        sorted(int(value) for value in eos_token_ids)
+    )
     if seed is not None:
         child["FLASH_OPENRLHF_ROLLOUT_SEED"] = str(int(seed))
     child["HF_HUB_OFFLINE"] = "1"
@@ -1713,8 +1809,6 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
             "OpenRLHF GRPO periodic checkpoints are not uploaded; omit train.save_every or use "
             "the TRL backend"
         )
-    if train_spec.stop_sequences:
-        raise RuntimeError("OpenRLHF GRPO stop sequences are deferred; use the TRL backend")
     if train_spec.structured_outputs:
         raise RuntimeError("OpenRLHF GRPO structured outputs are deferred; use the TRL backend")
     if train_spec.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
@@ -1852,9 +1946,39 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         "save_at_steps": save_at_steps,
         "gpu_count": int(spec.gpu.count),
         "seed": int(backend_seed(spec.seed)),
+        "stop_sequences": tuple(str(value) for value in train_spec.stop_sequences),
         "fp8_kv": fp8_kv,
         "warmstart_adapter": warmstart_adapter,
     }
+
+
+def _generation_eos_from_cached_config(
+    model_id: str, model_revision: str, tokenizer
+) -> frozenset[int]:
+    from transformers import AutoConfig, GenerationConfig
+
+    from flash.engine.worker.opd_gkd import _generation_eos_ids
+
+    config = AutoConfig.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        revision=model_revision or None,
+        local_files_only=True,
+    )
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            model_id,
+            revision=model_revision or None,
+            local_files_only=True,
+        )
+    except OSError:
+        generation_config = None
+    model_like = type(
+        "ModelGenerationMetadata",
+        (),
+        {"config": config, "generation_config": generation_config},
+    )()
+    return _generation_eos_ids(model_like, tokenizer)
 
 
 def _is_sm120() -> bool:
@@ -1888,6 +2012,11 @@ def run_rl_openrlhf() -> None:
     else:
         download_seconds = _w.prefetch_model(inputs["model_id"])
     model_path = _resolve_cached_model_snapshot(inputs["model_id"], inputs["model_revision"])
+    eos_token_ids = _generation_eos_from_cached_config(
+        inputs["model_id"],
+        inputs["model_revision"],
+        inputs["tokenizer"],
+    )
     resume_checkpoint = _w.hf_resume_checkpoint()
     resumed_step = _openrlhf_resume_step(resume_checkpoint)
 
@@ -1973,6 +2102,8 @@ def run_rl_openrlhf() -> None:
             language_model_only=qwen35_language_model_only,
             sm120_vllm_backend=sm120_vllm_backend,
             seed=inputs["seed"],
+            stop_sequences=inputs["stop_sequences"],
+            eos_token_ids=eos_token_ids,
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],

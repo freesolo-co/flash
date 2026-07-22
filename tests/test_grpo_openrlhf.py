@@ -73,7 +73,7 @@ def _config(**overrides) -> grpo_openrlhf.OpenRLHFGRPOConfig:
     return grpo_openrlhf.OpenRLHFGRPOConfig(**values)
 
 
-def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None):
+def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None, stop_sequences=()):
     class _Env:
         multi_turn = False
         is_tool_env = False
@@ -98,7 +98,7 @@ def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None):
         init_from_adapter=False,
         save_at_steps=(),
         save_every=save_every,
-        stop_sequences=(),
+        stop_sequences=stop_sequences,
         structured_outputs="",
         credit_assignment="per_episode",
         batch_size=1,
@@ -657,6 +657,14 @@ def test_resolve_single_turn_inputs_preserves_explicit_zero_values(monkeypatch):
     assert inputs["save_every"] == -1
 
 
+def test_resolve_single_turn_inputs_accepts_stop_sequences(monkeypatch):
+    _install_resolve_inputs_fakes(monkeypatch, stop_sequences=("</answer>", "\n\n"))
+
+    inputs = grpo_openrlhf._resolve_single_turn_inputs()
+
+    assert inputs["stop_sequences"] == ("</answer>", "\n\n")
+
+
 def test_resolve_single_turn_inputs_rejects_unpublished_periodic_saves(monkeypatch):
     _install_resolve_inputs_fakes(monkeypatch, save_every=5)
 
@@ -856,6 +864,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         language_model_only=True,
         sm120_vllm_backend=True,
         seed=42,
+        stop_sequences=("</answer>", "\n\n"),
+        eos_token_ids=frozenset({2, 73}),
         fp8_kv=True,
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
@@ -866,6 +876,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["NCCL_DEBUG"] == "WARN"
     assert child["PYTHONPATH"] == "/work/plugin"
     assert child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "320"
+    assert json.loads(child["FLASH_OPENRLHF_STOP_SEQUENCES"]) == ["</answer>", "\n\n"]
+    assert json.loads(child["FLASH_OPENRLHF_EOS_TOKEN_IDS"]) == [2, 73]
     assert child["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] == "1"
     assert child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
@@ -878,6 +890,34 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert "HF_TOKEN" not in child
 
 
+def test_generation_eos_union_covers_tokenizer_model_and_generation_config(monkeypatch):
+    transformers = types.ModuleType("transformers")
+
+    class _AutoConfig:
+        @staticmethod
+        def from_pretrained(*_args, **kwargs):
+            assert kwargs["local_files_only"] is True
+            return SimpleNamespace(eos_token_id=[3, 4])
+
+    class _GenerationConfig:
+        @staticmethod
+        def from_pretrained(*_args, **kwargs):
+            assert kwargs["local_files_only"] is True
+            return SimpleNamespace(eos_token_id=5)
+
+    transformers.AutoConfig = _AutoConfig
+    transformers.GenerationConfig = _GenerationConfig
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    eos_ids = grpo_openrlhf._generation_eos_from_cached_config(
+        "owner/model",
+        "a" * 40,
+        SimpleNamespace(eos_token_id=2),
+    )
+
+    assert eos_ids == frozenset({2, 3, 4, 5})
+
+
 def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     source = grpo_openrlhf._sitecustomize_source()
 
@@ -885,6 +925,12 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "ActorPPOTrainer.training_step = _flash_training_step" in source
     assert "self._flash_grpo_rollout_ordinals = rollout_ordinals" in source
     assert "sampling_params.seed = _flash_rollout_seed(identity)" in source
+    assert "sampling_params.stop = list(_FLASH_STOP_SEQUENCES)" in source
+    assert "sampling_params.include_stop_str_in_output = True" in source
+    assert "sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)" in source
+    assert 'output["finish_reason"] = capture.finish_reason' in source
+    assert 'output["stop_reason"] = capture.stop_reason' in source
+    assert "_flash_trim_trailing_stop" in source
     assert "_Actor.forward = _flash_actor_forward" in source
     assert "for start in range(0, flat_hidden.shape[0], int(chunk_size))" in source
     assert "32k gpu validation pending" in source
@@ -920,9 +966,25 @@ def test_sitecustomize_normalizes_singleton_reward_batches(monkeypatch):
     _install_pinned_sitecustomize_modules(monkeypatch)
     executor_type = sys.modules["openrlhf.utils.agent"].SingleTurnAgentExecutor
 
-    output = asyncio.run(executor_type().execute())
+    output = asyncio.run(
+        executor_type().execute(
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=None),
+            32,
+            object(),
+            object(),
+        )
+    )
 
-    assert output == {"reward": 0.0, "scores": 0.0, "extra_logs": {"format": 1.0}}
+    assert output == {
+        "reward": 0.0,
+        "scores": 0.0,
+        "extra_logs": {"format": 1.0},
+        "finish_reason": None,
+        "stop_reason": None,
+        "truncated": False,
+    }
 
 
 def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
@@ -930,8 +992,16 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
     seed_nodes = [
         node
         for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"_flash_rollout_identity", "_flash_rollout_seed", "_flash_execute"}
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.name
+        in {
+            "_flash_rollout_identity",
+            "_flash_rollout_seed",
+            "_flash_trim_trailing_stop",
+            "_flash_naturally_terminated",
+            "_FlashTerminationCapture",
+            "_flash_execute",
+        }
     ]
     calls = []
 
@@ -946,6 +1016,8 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
         "json": json,
         "math": math,
         "_FLASH_ROLLOUT_SEED": 42,
+        "_FLASH_STOP_SEQUENCES": (),
+        "_FLASH_EOS_TOKEN_IDS": frozenset(),
         "_original_execute": execute,
     }
     exec(
@@ -986,6 +1058,187 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
         (7, grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 0)),
     ]
     assert not hasattr(original_params, "seed")
+
+
+def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_token_ids=(99,)):
+    tree = ast.parse(grpo_openrlhf._sitecustomize_source())
+    names = {
+        "_flash_rollout_identity",
+        "_flash_rollout_seed",
+        "_flash_trim_trailing_stop",
+        "_flash_naturally_terminated",
+        "_FlashTerminationCapture",
+        "_flash_execute",
+    }
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.name in names
+    ]
+    namespace = {
+        "copy": copy,
+        "functools": functools,
+        "hashlib": hashlib,
+        "json": json,
+        "math": math,
+        "_FLASH_ROLLOUT_SEED": None,
+        "_FLASH_STOP_SEQUENCES": tuple(stop_sequences),
+        "_FLASH_EOS_TOKEN_IDS": frozenset(eos_token_ids),
+        "_original_execute": execute,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "sitecustomize.py", "exec"), namespace)
+    return namespace
+
+
+def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
+    captured = {}
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            pieces = {
+                1: "ok",
+                2: "B</answer>",
+                10: "prompt",
+                99: "" if skip_special_tokens else "<eos>",
+            }
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, sampling_params):
+            captured["sampling_params"] = sampling_params
+            generation = SimpleNamespace(
+                token_ids=[1, 2],
+                text="okB</answer>",
+                finish_reason="length",
+                stop_reason="</answer>",
+                logprobs=["ok-logprob", "stop-logprob"],
+            )
+            captured["generation"] = generation
+            return SimpleNamespace(outputs=[generation])
+
+    async def execute(
+        _self,
+        prompt,
+        label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        request_output = await llm_engine.generate([10], sampling_params)
+        generation = request_output.outputs[0]
+        return {
+            "prompt": prompt,
+            "label": label,
+            "images": images,
+            "observation_tokens": [10, *generation.token_ids],
+            "action_ranges": [(1, 1 + len(generation.token_ids))],
+            "rollout_log_probs": [0.0, *generation.logprobs],
+            "action_text": generation.text,
+            "truncated": generation.finish_reason == "length",
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    original_params = SimpleNamespace(logprobs=1)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            7,
+            original_params,
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    request_params = captured["sampling_params"]
+    assert request_params.stop == ["</answer>"]
+    assert request_params.include_stop_str_in_output is True
+    assert request_params.stop_token_ids == [99]
+    assert not hasattr(original_params, "stop")
+    assert captured["generation"].token_ids == [1]
+    assert captured["generation"].text == "ok"
+    assert captured["generation"].logprobs == ["ok-logprob"]
+    assert output["observation_tokens"] == [10, 1]
+    assert output["action_ranges"] == [(1, 2)]
+    assert output["rollout_log_probs"] == [0.0, "ok-logprob"]
+    assert output["action_text"] == "ok"
+    assert output["finish_reason"] == "length"
+    assert output["stop_reason"] == "</answer>"
+    assert output["truncated"] is False
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "stop_reason", "token_ids", "expected_truncated"),
+    [
+        ("stop", None, [1], False),
+        ("length", None, [1], True),
+        ("length", 99, [1], False),
+        ("length", None, [1, 99], False),
+    ],
+)
+def test_sitecustomize_preserves_and_maps_native_termination(
+    finish_reason, stop_reason, token_ids, expected_truncated
+):
+    class _Tokenizer:
+        def decode(self, ids, *, skip_special_tokens):
+            pieces = {1: "ok", 99: "" if skip_special_tokens else "<eos>"}
+            return "".join(pieces[int(token_id)] for token_id in ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        token_ids=list(token_ids),
+                        text="ok",
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        logprobs=None,
+                    )
+                ]
+            )
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "reward": [0.0],
+            "scores": [0.0],
+            "extra_logs": {},
+            "truncated": generation.finish_reason == "length",
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=None),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert output["finish_reason"] == finish_reason
+    assert output["stop_reason"] == stop_reason
+    assert output["truncated"] is expected_truncated
 
 
 @requires_openrlhf_source
@@ -1398,6 +1651,31 @@ def test_sitecustomize_masks_truncated_response_but_retains_row(monkeypatch):
     assert experience.action_mask.shape == (1, 2)
     assert torch.count_nonzero(experience.action_mask).item() == 0
     assert experience.truncated.tolist() == [True]
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_keeps_stop_terminated_action_mask(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _, _, _, samples_module, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    generator = object.__new__(samples_module.SamplesGenerator)
+    response = {
+        "observation_tokens": [10, 20, 21],
+        "action_ranges": [(1, 3)],
+        "rollout_log_probs": None,
+        "reward": 1.0,
+        "scores": 1.0,
+        "prompt": "prompt",
+        "label": 0,
+        "truncated": False,
+        "finish_reason": "length",
+        "stop_reason": "</answer>",
+    }
+
+    experience = generator._process_response_into_experience(response, max_len=8)
+
+    assert experience.action_mask.tolist() == [[1, 1]]
+    assert experience.truncated.tolist() == [False]
 
 
 @requires_openrlhf_source
@@ -1957,6 +2235,11 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
         "_resolve_cached_model_snapshot",
         lambda *_args: "/cache/snapshots/" + "a" * 40,
     )
+    monkeypatch.setattr(
+        grpo_openrlhf,
+        "_generation_eos_from_cached_config",
+        lambda *_args: frozenset({2, 73}),
+    )
 
     def fake_resolve_inputs():
         assert events[-1] == "enter:rl_data_loading"
@@ -1990,6 +2273,7 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
             "save_at_steps": (),
             "gpu_count": 1,
             "seed": 42,
+            "stop_sequences": ("</answer>",),
             "fp8_kv": True,
             "warmstart_adapter": "",
         }
@@ -2047,6 +2331,8 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
         assert "FLASH_OPENRLHF_ATTN_IMPLEMENTATION" not in launched["env"]
     assert _value(launched["args"], "--ckpt.save_steps") == "-1"
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
+    assert json.loads(launched["env"]["FLASH_OPENRLHF_STOP_SEQUENCES"]) == ["</answer>"]
+    assert json.loads(launched["env"]["FLASH_OPENRLHF_EOS_TOKEN_IDS"]) == [2, 73]
     assert launched["env"]["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert launched["env"]["FLASH_OPENRLHF_FP8_KV"] == "1"
     assert launched["env"]["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
