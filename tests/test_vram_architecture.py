@@ -181,7 +181,12 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
     for name, (_model_id, _algorithm, _train, old_need) in cases.items():
         assert sized[name] <= old_need
 
-    assert sized["gdn_vl_small_grpo"] <= 24
+    # 0.8B @ 32k ctx is NOT a 24/32 GB run despite the tiny weights: the long-context KV dominates.
+    # The resident peak is ~38.5 GB (grpo_fits_resident rejects 24 and 32, admits 48) and the sleep
+    # pool the worker reserves -- max(_KV_CAP, 1.5 * arch KV) at group 8 -- is likewise > 32 GB. The
+    # old <= 24 bound encoded the sleep-KV under-count this PR removes (preflight would have admitted a
+    # 24 GB card the sleep-mode vLLM executor then OOMs); the run correctly sizes onto the 48 GB tier.
+    assert 32 < sized["gdn_vl_small_grpo"] <= 48
     assert sized["gdn_vl_high_rank_sft"] <= 32
     assert model_required_vram_gb("Qwen/Qwen3.5-2B", "grpo") <= 32
     assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 48
