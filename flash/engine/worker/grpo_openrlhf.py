@@ -10,6 +10,7 @@ This foundation intentionally leaves the TRL implementation intact and rejects u
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -141,6 +142,29 @@ class OpenRLHFGRPOConfig:
     warmstart_adapter: str
     resume: bool
     actor_attn_implementation: str | None
+
+
+def deterministic_rollout_seed(
+    flash_seed: int,
+    global_step: int,
+    example_index: int,
+    rollout_ordinal: int,
+    *,
+    turn_ordinal: int = 0,
+    retry_ordinal: int = 0,
+) -> int:
+    """Derive one stable nonnegative 63-bit seed from the complete rollout identity."""
+    turn = int(turn_ordinal)
+    retry = int(retry_ordinal)
+    if turn < 0 or retry < 0:
+        raise ValueError("flash GRPO turn and retry ordinals must be nonnegative")
+    payload = (
+        f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:{int(rollout_ordinal)}:{turn}"
+    )
+    if retry:
+        payload += f":retry:{retry}"
+    digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
 def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
@@ -583,7 +607,9 @@ def _sitecustomize_source() -> str:
     return r"""
 import contextlib
 import contextvars
+import copy
 import functools
+import hashlib
 import inspect
 import json
 import math
@@ -596,6 +622,8 @@ from torch.utils.checkpoint import checkpoint
 
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
 _ACTION_LOGPROB_CHUNK_SIZE = 256
+_FLASH_ROLLOUT_SEED_TEXT = os.environ.get("FLASH_OPENRLHF_ROLLOUT_SEED")
+_FLASH_ROLLOUT_SEED = int(_FLASH_ROLLOUT_SEED_TEXT) if _FLASH_ROLLOUT_SEED_TEXT is not None else None
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
@@ -756,9 +784,63 @@ from openrlhf.utils.agent import SingleTurnAgentExecutor as _SingleTurnAgentExec
 _original_execute = _SingleTurnAgentExecutor.execute
 
 
+def _flash_rollout_identity(label):
+    identity = json.loads(label) if isinstance(label, str) else dict(label)
+    required = ("global_step", "example_index", "rollout_ordinal", "turn", "retry")
+    if set(identity) != set(required) or any(
+        isinstance(identity.get(name), bool)
+        or not isinstance(identity.get(name), int)
+        or identity.get(name) < 0
+        for name in required
+    ):
+        raise RuntimeError("flash GRPO rollout identity is invalid")
+    return identity
+
+
+def _flash_rollout_seed(identity):
+    payload = (
+        f"{_FLASH_ROLLOUT_SEED}:{identity['global_step']}:{identity['example_index']}:"
+        f"{identity['rollout_ordinal']}:{identity['turn']}"
+    )
+    if identity["retry"]:
+        payload += f":retry:{identity['retry']}"
+    digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
+
+
 @functools.wraps(_original_execute)
 async def _flash_execute(self, *args, **kwargs):
-    output = await _original_execute(self, *args, **kwargs)
+    call_args = list(args)
+    call_kwargs = dict(kwargs)
+    if _FLASH_ROLLOUT_SEED is not None:
+        label = call_args[1] if len(call_args) > 1 else call_kwargs.get("label")
+        identity = _flash_rollout_identity(label)
+        rollout_key = (
+            identity["global_step"],
+            identity["example_index"],
+            identity["turn"],
+            identity["retry"],
+        )
+        rollout_ordinals = getattr(self, "_flash_grpo_rollout_ordinals", None)
+        if rollout_ordinals is None:
+            rollout_ordinals = {}
+            self._flash_grpo_rollout_ordinals = rollout_ordinals
+        identity["rollout_ordinal"] = rollout_ordinals.get(rollout_key, 0)
+        rollout_ordinals[rollout_key] = identity["rollout_ordinal"] + 1
+        sampling_params = call_args[2] if len(call_args) > 2 else call_kwargs.get("sampling_params")
+        if sampling_params is None:
+            raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
+        sampling_params = copy.deepcopy(sampling_params)
+        sampling_params.seed = _flash_rollout_seed(identity)
+        if len(call_args) > 1:
+            call_args[1] = identity["example_index"]
+        else:
+            call_kwargs["label"] = identity["example_index"]
+        if len(call_args) > 2:
+            call_args[2] = sampling_params
+        else:
+            call_kwargs["sampling_params"] = sampling_params
+    output = await _original_execute(self, *call_args, **call_kwargs)
     if not isinstance(output, dict):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
     for key in ("reward", "scores"):
@@ -1371,6 +1453,7 @@ def build_openrlhf_child_env(
     max_response_length: int,
     language_model_only: bool,
     sm120_vllm_backend: bool,
+    seed: int | None = None,
     fp8_kv: bool = False,
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
@@ -1384,6 +1467,8 @@ def build_openrlhf_child_env(
     }
     child["PYTHONPATH"] = plugin_dir
     child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] = str(int(max_response_length))
+    if seed is not None:
+        child["FLASH_OPENRLHF_ROLLOUT_SEED"] = str(int(seed))
     child["HF_HUB_OFFLINE"] = "1"
     child["TRANSFORMERS_OFFLINE"] = "1"
     child["HF_HUB_DISABLE_XET"] = "1"
@@ -1417,9 +1502,19 @@ def _write_scheduled_dataset(
     with open(path, "w", encoding="utf-8") as dataset_file:
         for ordinal in range(scheduled_count):
             prompt = prompts[ordinal % len(prompts)]
+            identity = {
+                "global_step": ordinal // prompts_per_step,
+                "example_index": int(prompt["example_idx"]),
+                "rollout_ordinal": 0,
+                "turn": 0,
+                "retry": 0,
+            }
             dataset_file.write(
                 json.dumps(
-                    {"input": prompt["rendered"], "label": int(prompt["example_idx"])},
+                    {
+                        "input": prompt["rendered"],
+                        "label": json.dumps(identity, sort_keys=True, separators=(",", ":")),
+                    },
                     separators=(",", ":"),
                 )
                 + "\n"
@@ -1877,6 +1972,7 @@ def run_rl_openrlhf() -> None:
             max_response_length=inputs["max_completion"],
             language_model_only=qwen35_language_model_only,
             sm120_vllm_backend=sm120_vllm_backend,
+            seed=inputs["seed"],
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],

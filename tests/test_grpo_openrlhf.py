@@ -5,6 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import copy
+import functools
+import hashlib
 import importlib.util
 import json
 import logging
@@ -537,6 +540,17 @@ def _install_pinned_sitecustomize_modules(
     return namespace, loss_module, ppo_actor_module, samples_module, experience_module.Experience
 
 
+def test_deterministic_rollout_seed_uses_complete_request_identity():
+    base = grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 2)
+
+    assert base == grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 2)
+    assert base != grpo_openrlhf.deterministic_rollout_seed(42, 4, 7, 2)
+    assert base != grpo_openrlhf.deterministic_rollout_seed(42, 3, 8, 2)
+    assert base != grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 3)
+    assert base != grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 2, turn_ordinal=1)
+    assert base != grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 2, retry_ordinal=1)
+
+
 def test_build_openrlhf_grpo_args_maps_flash_recipe():
     args = grpo_openrlhf.build_openrlhf_grpo_args(_config())
 
@@ -802,6 +816,32 @@ def test_score_single_turn_maps_environment_exception_to_zero(monkeypatch):
     assert result == grpo_openrlhf.RewardResult(0.0, 0.0, {})
 
 
+def test_scheduled_dataset_carries_stable_step_and_example_identity(tmp_path):
+    prompts = [
+        {"rendered": "one", "example_idx": 7},
+        {"rendered": "two", "example_idx": 11},
+    ]
+    path = tmp_path / "train.jsonl"
+
+    count = grpo_openrlhf._write_scheduled_dataset(
+        str(path),
+        prompts,
+        steps=2,
+        prompts_per_step=2,
+    )
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    identities = [json.loads(row["label"]) for row in rows]
+
+    assert count == 4
+    assert [row["input"] for row in rows] == ["one", "two", "one", "two"]
+    assert identities == [
+        {"example_index": 7, "global_step": 0, "retry": 0, "rollout_ordinal": 0, "turn": 0},
+        {"example_index": 11, "global_step": 0, "retry": 0, "rollout_ordinal": 0, "turn": 0},
+        {"example_index": 7, "global_step": 1, "retry": 0, "rollout_ordinal": 0, "turn": 0},
+        {"example_index": 11, "global_step": 1, "retry": 0, "rollout_ordinal": 0, "turn": 0},
+    ]
+
+
 def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("NCCL_DEBUG", "WARN")
@@ -815,6 +855,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         max_response_length=320,
         language_model_only=True,
         sm120_vllm_backend=True,
+        seed=42,
         fp8_kv=True,
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
@@ -825,6 +866,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["NCCL_DEBUG"] == "WARN"
     assert child["PYTHONPATH"] == "/work/plugin"
     assert child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "320"
+    assert child["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] == "1"
     assert child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
     assert child["FLASH_OPENRLHF_FP8_KV"] == "1"
@@ -841,6 +883,8 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
 
     compile(source, "sitecustomize.py", "exec")
     assert "ActorPPOTrainer.training_step = _flash_training_step" in source
+    assert "self._flash_grpo_rollout_ordinals = rollout_ordinals" in source
+    assert "sampling_params.seed = _flash_rollout_seed(identity)" in source
     assert "_Actor.forward = _flash_actor_forward" in source
     assert "for start in range(0, flat_hidden.shape[0], int(chunk_size))" in source
     assert "32k gpu validation pending" in source
@@ -879,6 +923,69 @@ def test_sitecustomize_normalizes_singleton_reward_batches(monkeypatch):
     output = asyncio.run(executor_type().execute())
 
     assert output == {"reward": 0.0, "scores": 0.0, "extra_logs": {"format": 1.0}}
+
+
+def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
+    tree = ast.parse(grpo_openrlhf._sitecustomize_source())
+    seed_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"_flash_rollout_identity", "_flash_rollout_seed", "_flash_execute"}
+    ]
+    calls = []
+
+    async def execute(_self, _prompt, label, sampling_params, *_args, **_kwargs):
+        calls.append((label, sampling_params.seed))
+        return {"reward": [0.0], "scores": [0.0], "extra_logs": {}}
+
+    namespace = {
+        "copy": copy,
+        "functools": functools,
+        "hashlib": hashlib,
+        "json": json,
+        "math": math,
+        "_FLASH_ROLLOUT_SEED": 42,
+        "_original_execute": execute,
+    }
+    exec(
+        compile(ast.Module(body=seed_nodes, type_ignores=[]), "sitecustomize.py", "exec"), namespace
+    )
+    identity = json.dumps(
+        {
+            "global_step": 3,
+            "example_index": 7,
+            "rollout_ordinal": 0,
+            "turn": 0,
+            "retry": 0,
+        }
+    )
+    original_params = SimpleNamespace(temperature=0.7)
+
+    executor = SimpleNamespace()
+    asyncio.run(
+        namespace["_flash_execute"](
+            executor, "prompt", identity, original_params, 32, object(), object()
+        )
+    )
+    asyncio.run(
+        namespace["_flash_execute"](
+            executor, "prompt", identity, original_params, 32, object(), object()
+        )
+    )
+    resumed_executor = SimpleNamespace()
+    asyncio.run(
+        namespace["_flash_execute"](
+            resumed_executor, "prompt", identity, original_params, 32, object(), object()
+        )
+    )
+
+    assert calls == [
+        (7, grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 0)),
+        (7, grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 1)),
+        (7, grpo_openrlhf.deterministic_rollout_seed(42, 3, 7, 0)),
+    ]
+    assert not hasattr(original_params, "seed")
 
 
 @requires_openrlhf_source
@@ -1940,6 +2047,7 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
         assert "FLASH_OPENRLHF_ATTN_IMPLEMENTATION" not in launched["env"]
     assert _value(launched["args"], "--ckpt.save_steps") == "-1"
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
+    assert launched["env"]["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert launched["env"]["FLASH_OPENRLHF_FP8_KV"] == "1"
     assert launched["env"]["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
     assert launched["env"]["HF_HUB_OFFLINE"] == "1"
