@@ -946,7 +946,10 @@ def run_rl():
         liveness_heartbeat(
             "rl_step",
             progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
-            fields=hb_cb.latest_fields,
+            fields=lambda: {
+                "metrics_last": list(getattr(hb_cb, "metrics_last", [])),
+                **hb_cb.latest_fields(),
+            },
             progress_step=True,
         ),
         _sdpa_cudnn_ctx(_attn),
@@ -993,7 +996,11 @@ def run_rl():
     # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
     # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
     with liveness_heartbeat(
-        "rl_finalizing", progress=lambda: _steps_run, progress_step=True, keepalive=True
+        "rl_finalizing",
+        progress=lambda: _steps_run,
+        fields=lambda: {"metrics_last": list(getattr(hb_cb, "metrics_last", []))},
+        progress_step=True,
+        keepalive=True,
     ):
         adapter_dir = f"{out_dir}/adapter"
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
@@ -1007,7 +1014,13 @@ def run_rl():
         # preserve the final checkpoint only when exact save steps are not configured.
         if final_save_due(_steps_run, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
-    _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=_steps_run,
+        gpu=gpu_diagnostics(),
+        metrics_last=list(getattr(hb_cb, "metrics_last", [])),
+    )
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).
     gen_tokens = steps * batching["unique_prompts_per_step"] * group_size * _max_completion
@@ -1019,6 +1032,7 @@ def run_rl():
         setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=gen_tokens,
+        heartbeat_fields={"metrics_last": list(getattr(hb_cb, "metrics_last", []))},
         notes={
             "steps": steps,
             "epochs": epochs,
