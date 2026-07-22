@@ -243,6 +243,17 @@ def build_flash_multi_turn_agent_loop(
             rollout_ordinal = int(kwargs.get("session_id", 0))
             max_turns = int(os.environ["FLASH_OPD_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_OPD_MAX_MODEL_LEN"])
+            capabilities = set(
+                json.loads(os.environ.get("FLASH_OPD_ENV_CAPABILITIES", "[]"))
+            )
+            required_capabilities = {
+                "new_rollout_state",
+                "record_model_turn",
+                "env_reply",
+                "rollout_done",
+            }
+            if capabilities != required_capabilities:
+                raise RuntimeError("multi-turn OPD environment capability metadata is invalid")
             stop_sequences = tuple(
                 str(value) for value in json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
             )
@@ -342,7 +353,6 @@ def build_flash_multi_turn_agent_loop(
                             response_ids=list(response_ids),
                             response_mask=[1] * len(response_ids),
                             response_logprobs=response_logprobs,
-                            reward_score=0.0,
                             num_turns=turn_ordinal + 1,
                             metrics={
                                 "generate_sequences": generated_seconds,

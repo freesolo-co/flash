@@ -908,7 +908,7 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
             "opd",
             "Qwen/Qwen3.5-4B",
             {"multi_turn": True},
-            "not yet supported on the verl OPD backend",
+            "only for single-turn environments",
         ),
     ],
 )

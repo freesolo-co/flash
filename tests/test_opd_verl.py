@@ -1152,6 +1152,19 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert "ref_log_prob" not in " ".join(overrides)
     assert not any("structured_outputs_config" in key for key in overrides)
 
+    multi_turn_overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_verl_overrides(
+            _config(multi_turn=True, max_sequence_length=1536, max_model_len=1536)
+        )
+    )
+    assert (
+        multi_turn_overrides["actor_rollout_ref.rollout.agent.default_agent_loop"]
+        == "flash_multi_turn"
+    )
+    assert multi_turn_overrides["actor_rollout_ref.rollout.prompt_length"] == "1536"
+    assert multi_turn_overrides["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"] == "1536"
+
 
 def test_structured_overrides_pin_xgrammar_and_thinking_parser():
     overrides = dict(
@@ -1252,6 +1265,35 @@ def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_p
     assert child["FLASH_OPD_STRUCTURED_OUTPUTS"] == '{"choice":["4"]}'
     assert child["FLASH_OPD_MODEL_VOCAB_SIZE"] == "248320"
     assert child["FLASH_OPD_THINKING"] == "1"
+
+
+def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path):
+    child = _build_opd_child_env(
+        shim_dir=str(tmp_path),
+        wandb_enabled=False,
+        bridge_url="http://127.0.0.1:4444",
+        bridge_token="bridge-token",
+        seed=42,
+        stop_sequences=(),
+        eos_token_ids=frozenset({1}),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        thinking=False,
+        multi_turn=True,
+        max_turns=6,
+        max_model_len=4096,
+    )
+
+    assert child["FLASH_OPD_MULTI_TURN"] == "1"
+    assert child["FLASH_OPD_MAX_TURNS"] == "6"
+    assert child["FLASH_OPD_MAX_MODEL_LEN"] == "4096"
+    assert json.loads(child["FLASH_OPD_ENV_CAPABILITIES"]) == [
+        "new_rollout_state",
+        "record_model_turn",
+        "env_reply",
+        "rollout_done",
+    ]
+    assert "FIREWORKS_API_KEY" not in child
 
 
 def test_runner_accepts_supported_structured_outputs_before_preparation(monkeypatch):
@@ -1426,25 +1468,31 @@ def test_plugin_initialization_checks_structured_versions_before_verl_install(mo
     importlib_module.reload(plugin)
 
 
-def test_runner_rejects_multiturn_tool_flags_before_preparation():
+def test_runner_accepts_multiturn_flag_and_rejects_native_tool_flags():
     from flash import runner
     from flash.spec import EnvironmentSpec, JobSpec
 
-    for flag in ("multi_turn", "is_tool_env", "tool_calling"):
-        spec = JobSpec(
+    multi_turn = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="opd",
+        environment=EnvironmentSpec(id="local", params={"multi_turn": True}),
+    )
+    runner._require_supported_opd_verl_spec(multi_turn)
+
+    for flag in ("is_tool_env", "tool_calling"):
+        native_tool = JobSpec(
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
             environment=EnvironmentSpec(id="local", params={flag: True}),
         )
-        with pytest.raises(ValueError, match="not yet supported on the verl OPD backend"):
-            runner._require_supported_opd_verl_spec(spec)
+        with pytest.raises(ValueError, match="native tool-calling"):
+            runner._require_supported_opd_verl_spec(native_tool)
 
 
 @pytest.mark.parametrize(
     ("multi_turn", "is_tool_env", "records", "message"),
     [
-        (True, False, [], "multi-turn and tool-calling"),
-        (False, True, [], "multi-turn and tool-calling"),
+        (False, True, [], "native tool-calling"),
     ],
 )
 def test_runner_environment_gate_rejects_before_provisioning(
@@ -1598,16 +1646,23 @@ def test_plugin_registers_external_trainer_without_teacher_gpu_pool():
     assert "teacher_pool" not in source
     assert "Role.TeacherModel" not in source
     assert 'params["structured_outputs"]' in source
+    assert "build_flash_multi_turn_agent_loop" in source
+    assert "AgentLoopWorkerTQ._agent_loop_postprocess" in source
     assert 'params["logprobs"]' not in source
 
 
 def test_plugin_identifiers_remain_provider_neutral():
     import inspect
 
+    import flash.engine.worker.opd_verl_multiturn as multiturn
     import flash.engine.worker.opd_verl_plugin as plugin
     import flash.engine.worker.opd_verl_structured as structured
 
-    source = (inspect.getsource(plugin) + inspect.getsource(structured)).lower()
+    source = (
+        inspect.getsource(plugin)
+        + inspect.getsource(structured)
+        + inspect.getsource(multiturn)
+    ).lower()
     forbidden = ("parasail", "fireworks")
     for name in forbidden:
         assert f"class {name}" not in source

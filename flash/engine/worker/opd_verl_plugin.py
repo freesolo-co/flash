@@ -73,24 +73,8 @@ def _full_sequence_signal_sequences(group_ids):
     return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
 
 
-def _flatten_variable_outputs(inputs):
-    counts = [len(item) if isinstance(item, list) else 1 for item in inputs]
-    outputs = [
-        turn
-        for item in inputs
-        for turn in (item if isinstance(item, list) else [item])
-    ]
-    return outputs, counts
-
-
-def _expand_variable_rows(values, counts):
-    if len(values) != len(counts):
-        return list(values)
-    return [
-        values[index]
-        for index, count in enumerate(counts)
-        for _ in range(count)
-    ]
+def _turn_outputs(output):
+    return output if isinstance(output, list) else [output]
 
 
 def _flash_groupwise_reverse_kl_values(
@@ -264,7 +248,6 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
 
 
 def _install_verl_extensions() -> None:
-    import numpy as np
     import ray
     import torch
     from omegaconf import OmegaConf
@@ -287,7 +270,7 @@ def _install_verl_extensions() -> None:
         DistillationLossSettings,
         register_distillation_loss,
     )
-    from verl.trainer.main_ppo_sync import PPOTrainer
+    from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ, PPOTrainer
     from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
     from verl.utils.config import omega_conf_to_dataclass
     from verl.utils.metric import AggregationType, Metric, reduce_metrics
@@ -407,6 +390,12 @@ def _install_verl_extensions() -> None:
         sample_kwargs=None,
     ) -> None:
         if self.distillation_enabled and not validate:
+            existing_ids = output.extra_fields.get("teacher_ids")
+            existing_logprobs = output.extra_fields.get("teacher_logprobs")
+            if existing_ids is not None or existing_logprobs is not None:
+                if existing_ids is None or existing_logprobs is None:
+                    raise RuntimeError("flash OPD teacher metadata is incomplete")
+                return
             precomputed_ids = output.extra_fields.pop("flash_teacher_ids", None)
             precomputed_logprobs = output.extra_fields.pop(
                 "flash_teacher_logprobs", None
@@ -466,44 +455,21 @@ def _install_verl_extensions() -> None:
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
-    original_agent_loop_postprocess = AgentLoopWorker._agent_loop_postprocess
-    original_batch_postprocess = AgentLoopWorker._postprocess
+    original_tq_postprocess = AgentLoopWorkerTQ._agent_loop_postprocess
 
-    async def postprocess_variable_turn_outputs(self, output, validate, **kwargs):
-        if isinstance(output, list):
-            return [
-                await original_agent_loop_postprocess(self, turn, validate, **kwargs)
-                for turn in output
-            ]
-        return await original_agent_loop_postprocess(self, output, validate, **kwargs)
+    async def postprocess_all_turn_outputs(self, output, validate, **kwargs):
+        outputs = _turn_outputs(output)
+        for turn in outputs:
+            await self._compute_teacher_logprobs(
+                turn,
+                prompt_ids=turn.prompt_ids,
+                response_ids=turn.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
+        return await original_tq_postprocess(self, outputs, validate, **kwargs)
 
-    def flatten_variable_turn_batch(
-        self,
-        inputs,
-        input_non_tensor_batch=None,
-        validate=False,
-    ):
-        flat_inputs, counts = _flatten_variable_outputs(inputs)
-        if not flat_inputs:
-            raise RuntimeError("multi-turn OPD batch produced no assistant turns")
-        expanded = input_non_tensor_batch
-        if input_non_tensor_batch is not None and any(count != 1 for count in counts):
-            expanded = {}
-            for key, values in input_non_tensor_batch.items():
-                if len(values) != len(counts):
-                    expanded[key] = values
-                    continue
-                rows = _expand_variable_rows(values, counts)
-                expanded[key] = np.array(rows, dtype=getattr(values, "dtype", object))
-        return original_batch_postprocess(
-            self,
-            flat_inputs,
-            input_non_tensor_batch=expanded,
-            validate=validate,
-        )
-
-    AgentLoopWorker._agent_loop_postprocess = postprocess_variable_turn_outputs
-    AgentLoopWorker._postprocess = flatten_variable_turn_batch
+    AgentLoopWorkerTQ._agent_loop_postprocess = postprocess_all_turn_outputs
 
     @register("flash_single_turn")
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
