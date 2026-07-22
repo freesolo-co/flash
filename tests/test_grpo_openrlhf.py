@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker import grpo_openrlhf, rl
+from flash.engine.worker import grpo_multimodal, grpo_openrlhf, rl
 
 _OPENRLHF_SOURCE = Path(os.environ.get("FLASH_TEST_OPENRLHF_SOURCE", "/mnt/resource/openrlhf-src"))
 requires_openrlhf_source = pytest.mark.skipif(
@@ -64,6 +64,7 @@ def _config(**overrides) -> grpo_openrlhf.OpenRLHFGRPOConfig:
         "save_every": -1,
         "save_at_steps": (),
         "gpu_count": 2,
+        "max_images_per_prompt": 0,
         "qwen35_language_model_only": True,
         "fp8_kv": False,
         "warmstart_adapter": "",
@@ -266,6 +267,8 @@ def _install_pinned_sitecustomize_modules(
     sm120_vllm_backend=False,
     structured_outputs=None,
     reasoning_parser=None,
+    image_pad_token_id=None,
+    image_merge_size=None,
 ):
     torch = pytest.importorskip("torch")
     openrlhf = _package(monkeypatch, "openrlhf")
@@ -343,7 +346,8 @@ def _install_pinned_sitecustomize_modules(
     models.aggregate_loss = loss_module.aggregate_loss
 
     class _Actor:
-        def __init__(self, *_args, **_kwargs):
+        def __init__(self, *_args, **kwargs):
+            self.init_kwargs = dict(kwargs)
             self.model = torch.nn.Linear(2, 2, bias=False)
             self.packing_samples = False
             self.temperature = 1.0
@@ -542,12 +546,29 @@ def _install_pinned_sitecustomize_modules(
     agent_module = types.ModuleType("openrlhf.utils.agent")
 
     class _SingleTurnAgentExecutor:
-        async def execute(self, *_args, **_kwargs):
-            return {
+        async def execute(self, *args, **kwargs):
+            images = args[6] if len(args) > 6 else kwargs.get("images")
+            output = {
                 "reward": [0.0],
                 "scores": [0.0],
                 "extra_logs": {"format": [1.0]},
             }
+            if images:
+                output.update(
+                    prompt=args[0] if args else kwargs["prompt"],
+                    label=args[1] if len(args) > 1 else kwargs["label"],
+                    images=images,
+                    observation_tokens=[1, 99, 2],
+                    action_ranges=[(2, 3)],
+                    rollout_log_probs=None,
+                    truncated=False,
+                    _sampling_logit_bias=dict(getattr(args[2], "logit_bias", {}) or {}),
+                    mm_train_inputs={
+                        "pixel_values": torch.ones((len(images), 3)),
+                        "image_grid_thw": torch.tensor([[1, 2, 2]] * len(images)),
+                    },
+                )
+            return output
 
     agent_module.SingleTurnAgentExecutor = _SingleTurnAgentExecutor
     monkeypatch.setitem(sys.modules, "openrlhf.utils.agent", agent_module)
@@ -567,6 +588,12 @@ def _install_pinned_sitecustomize_modules(
         monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     else:
         monkeypatch.delenv("FLASH_OPENRLHF_SM120_VLLM_BACKEND", raising=False)
+    if image_pad_token_id is not None and image_merge_size is not None:
+        monkeypatch.setenv("FLASH_OPENRLHF_IMAGE_PAD_TOKEN_ID", str(image_pad_token_id))
+        monkeypatch.setenv("FLASH_OPENRLHF_IMAGE_MERGE_SIZE", str(image_merge_size))
+    else:
+        monkeypatch.delenv("FLASH_OPENRLHF_IMAGE_PAD_TOKEN_ID", raising=False)
+        monkeypatch.delenv("FLASH_OPENRLHF_IMAGE_MERGE_SIZE", raising=False)
     namespace = {"__name__": "sitecustomize", "__file__": "sitecustomize.py"}
     exec(compile(grpo_openrlhf._sitecustomize_source(), "sitecustomize.py", "exec"), namespace)
     return namespace, loss_module, ppo_actor_module, samples_module, experience_module.Experience
@@ -591,6 +618,8 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
     assert _value(args, "--data.prompt_dataset") == "/work/train.jsonl"
     assert _value(args, "--data.input_key") == "input"
     assert _value(args, "--data.label_key") == "label"
+    assert _value(args, "--data.image_key") == "images"
+    assert "--data.max_images_per_prompt" not in args
     assert _value(args, "--data.max_len") == "4096"
     assert _value(args, "--rollout.max_new_tokens") == "320"
     assert _value(args, "--rollout.batch_size") == "16"
@@ -629,6 +658,14 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
         + 3
     ] == ["0.0", "2.0"]
     assert _value(args, "--algo.advantage.is_correction_type") == "tis"
+
+
+def test_build_openrlhf_grpo_args_enables_vlm_rollout_without_freezing_full_tree_lora():
+    args = grpo_openrlhf.build_openrlhf_grpo_args(_config(max_images_per_prompt=3))
+
+    assert _value(args, "--data.max_images_per_prompt") == "3"
+    assert _value(args, "--ds.lora.target_modules") == "all-linear"
+    assert "--actor.freeze_visual_encoder" not in args
 
 
 @requires_openrlhf_source
@@ -687,6 +724,159 @@ def test_resolve_single_turn_inputs_preserves_explicit_zero_values(monkeypatch):
     assert inputs["lora_rank"] == 0
     assert inputs["lora_alpha"] == 0
     assert inputs["save_every"] == -1
+
+
+def test_resolve_single_turn_inputs_accepts_image_record_and_carries_rollout_images(monkeypatch):
+    _install_resolve_inputs_fakes(monkeypatch)
+
+    class _ImageEnv:
+        multi_turn = False
+        is_tool_env = False
+        package_root = "/env"
+
+        def dataset(self):
+            return [{"image": b"image", "answer": "ok"}]
+
+        def prompt_messages(self, _example):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "prompt"},
+                    ],
+                }
+            ]
+
+    class _Tokenizer:
+        pad_token = "<pad>"
+        eos_token = "</s>"
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return "unused"
+
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    processor = SimpleNamespace(tokenizer=_Tokenizer())
+    transformers = types.ModuleType("transformers")
+    transformers.AutoProcessor = SimpleNamespace(
+        from_pretrained=lambda *_args, **_kwargs: processor
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(grpo_openrlhf._w, "require_active_env", lambda: _ImageEnv())
+    monkeypatch.setattr(grpo_openrlhf._w, "model_revision_kwargs", lambda _revision: {})
+    monkeypatch.setattr(
+        sys.modules["flash.multimodal"],
+        "validate_multimodal_training",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        grpo_openrlhf,
+        "_prepare_openrlhf_multimodal_prompt",
+        lambda *_args, **_kwargs: {
+            "rendered": "<image>prompt",
+            "images": ["data:image/png;base64,AA=="],
+            "token_count": 2,
+            "image_pad_token_id": 99,
+            "merge_size": 2,
+        },
+    )
+
+    inputs = grpo_openrlhf._resolve_single_turn_inputs()
+
+    assert inputs["multimodal"] is True
+    assert inputs["max_images_per_prompt"] == 1
+    assert inputs["image_pad_token_id"] == 99
+    assert inputs["image_merge_size"] == 2
+    assert inputs["prompts"][0]["images"] == ["data:image/png;base64,AA=="]
+
+
+@requires_torch
+def test_prepare_multimodal_prompt_matches_flash_normalization_and_grid_invariant(monkeypatch):
+    torch = pytest.importorskip("torch")
+    image_module = pytest.importorskip("PIL.Image")
+    from flash.multimodal import image_descriptors_to_data_uris, normalize_prompt_images
+
+    trl = types.ModuleType("trl")
+    trl.__path__ = []
+    data_utils = types.ModuleType("trl.data_utils")
+
+    def prepare_multimodal_messages(messages, *, images):
+        image_iter = iter(images)
+        prepared = copy.deepcopy(messages)
+        for message in prepared:
+            for block in message.get("content", []):
+                if block.get("type") == "image":
+                    block["image"] = next(image_iter)
+        return prepared
+
+    data_utils.prepare_multimodal_messages = prepare_multimodal_messages
+    monkeypatch.setitem(sys.modules, "trl", trl)
+    monkeypatch.setitem(sys.modules, "trl.data_utils", data_utils)
+
+    class _Processor:
+        image_token_id = 99
+        image_processor = SimpleNamespace(merge_size=2)
+        tokenizer = SimpleNamespace()
+
+        def apply_chat_template(self, messages=None, **kwargs):
+            if kwargs.get("tokenize"):
+                conversation = kwargs.pop("conversation")
+                assert kwargs == {
+                    "tokenize": True,
+                    "return_dict": True,
+                    "add_generation_prompt": True,
+                    "enable_thinking": False,
+                }
+                assert conversation[0][0]["content"][0]["image"].size == (2, 2)
+                return {
+                    "input_ids": [[1, 99, 99, 99, 99, 2]],
+                    "image_grid_thw": [[1, 4, 4]],
+                }
+            assert kwargs == {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
+            }
+            assert messages[0]["content"][0]["image"].size == (2, 2)
+            return "<vision>prompt"
+
+        def __call__(self, **kwargs):
+            assert kwargs["text"] == ["<vision>prompt"]
+            assert len(kwargs["images"]) == 1
+            return {
+                "input_ids": torch.tensor([[1, 99, 99, 99, 99, 2]]),
+                "attention_mask": torch.ones((1, 6), dtype=torch.long),
+                "pixel_values": torch.ones((4, 3)),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+
+    image = image_module.new("RGB", (2, 2), color=(12, 34, 56))
+    record = {"image": image}
+    messages = [{"role": "user", "content": "prompt"}]
+    normalized = normalize_prompt_images(record, messages, None)
+
+    prepared = grpo_openrlhf._prepare_openrlhf_multimodal_prompt(
+        record,
+        messages,
+        _Processor(),
+        None,
+        thinking=False,
+    )
+
+    assert prepared["images"] == image_descriptors_to_data_uris(normalized.descriptors, None)
+    assert prepared["token_count"] == 6
+    assert prepared["image_pad_token_id"] == 99
+    assert prepared["merge_size"] == 2
+    grpo_multimodal.validate_image_token_grid_invariant(
+        input_ids=torch.tensor([[1, 99, 99, 99, 99, 2]]),
+        attention_mask=torch.ones((1, 6), dtype=torch.long),
+        image_grid_thw=torch.tensor([[1, 4, 4]]),
+        num_images=[1],
+        image_pad_token_id=99,
+        merge_size=2,
+    )
 
 
 def test_resolve_single_turn_inputs_accepts_stop_sequences(monkeypatch):
@@ -896,6 +1086,22 @@ def test_scheduled_dataset_carries_stable_step_and_example_identity(tmp_path):
     ]
 
 
+def test_scheduled_dataset_preserves_multimodal_images(tmp_path):
+    path = tmp_path / "train.jsonl"
+    image_uri = "data:image/png;base64,AA=="
+
+    grpo_openrlhf._write_scheduled_dataset(
+        str(path),
+        [{"rendered": "<image>prompt", "images": [image_uri], "example_idx": 3}],
+        steps=1,
+        prompts_per_step=1,
+    )
+
+    row = json.loads(path.read_text(encoding="utf-8"))
+    assert row["input"] == "<image>prompt"
+    assert row["images"] == [image_uri]
+
+
 def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("NCCL_DEBUG", "WARN")
@@ -922,6 +1128,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
         actor_attn_implementation="sdpa",
+        image_pad_token_id=99,
+        image_merge_size=2,
     )
 
     assert child["PATH"] == "/usr/bin"
@@ -939,6 +1147,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/incoming-adapter"
     assert child["FLASH_OPENRLHF_SAVE_AT_STEPS"] == "3,7"
     assert child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "sdpa"
+    assert child["FLASH_OPENRLHF_IMAGE_PAD_TOKEN_ID"] == "99"
+    assert child["FLASH_OPENRLHF_IMAGE_MERGE_SIZE"] == "2"
     assert "USER_ENV_SECRET" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -987,6 +1197,10 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert 'output["stop_reason"] = capture.stop_reason' in source
     assert "_flash_trim_trailing_stop" in source
     assert "_Actor.forward = _flash_actor_forward" in source
+    assert "_flash_prepare_vlm_inputs" in source
+    assert "validate_image_token_grid_invariant" in source
+    assert "sampling_params.logit_bias = logit_bias" in source
+    assert 'mm_train_inputs["_flash_num_images"]' in source
     assert "for start in range(0, flat_hidden.shape[0], int(chunk_size))" in source
     assert "32k gpu validation pending" in source
     assert "loss.shape[0] * _MAX_RESPONSE_LENGTH" in source
@@ -1100,6 +1314,43 @@ def test_sitecustomize_normalizes_singleton_reward_batches(monkeypatch):
         "stop_reason": None,
         "truncated": False,
     }
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_multimodal_rollout_carries_processor_tensors_and_suppresses_image_pad(
+    monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    _, _, _, samples_module, _ = _install_pinned_sitecustomize_modules(
+        monkeypatch,
+        image_pad_token_id=99,
+        image_merge_size=2,
+    )
+    executor_type = sys.modules["openrlhf.utils.agent"].SingleTurnAgentExecutor
+    sampling_params = SimpleNamespace(logprobs=None, logit_bias={7: -1.0})
+
+    response = asyncio.run(
+        executor_type().execute(
+            "<image>prompt",
+            4,
+            sampling_params,
+            32,
+            object(),
+            object(),
+            ["data:image/png;base64,AA=="],
+        )
+    )
+    generator = object.__new__(samples_module.SamplesGenerator)
+    experience = generator._process_response_into_experience(response, max_len=8)
+
+    assert response["_sampling_logit_bias"] == {7: -1.0, 99: -100.0}
+    assert response["mm_train_inputs"]["_flash_num_images"].tolist() == [1]
+    assert experience.images == [["data:image/png;base64,AA=="]]
+    assert experience.mm_train_inputs[0]["pixel_values"].shape == (1, 3)
+    assert experience.mm_train_inputs[0]["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert experience.mm_train_inputs[0]["_flash_num_images"].tolist() == [1]
+    assert torch.count_nonzero(experience.action_mask).item() == 1
 
 
 def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
@@ -1804,6 +2055,93 @@ def test_sitecustomize_actor_projects_only_action_positions(monkeypatch):
 
 @requires_openrlhf_source
 @requires_torch
+def test_sitecustomize_vlm_actor_uses_full_forward_with_reconstructed_mm_token_types(
+    monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    _install_pinned_sitecustomize_modules(
+        monkeypatch,
+        image_pad_token_id=99,
+        image_merge_size=2,
+    )
+    actor_type = sys.modules["openrlhf.models.actor"].Actor
+    hidden_size, vocab_size = 5, 128
+
+    class _Output(dict):
+        def __getattr__(self, name):
+            return self[name]
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    class _BareBackbone(torch.nn.Module):
+        def forward(self, *_args, **_kwargs):
+            raise AssertionError("bare VLM backbone must not run")
+
+    class _ToyVLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = torch.nn.Linear(hidden_size, vocab_size)
+            self.base_model = _BareBackbone()
+            self.calls = []
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(
+            self,
+            input_ids,
+            *,
+            attention_mask,
+            position_ids,
+            pixel_values,
+            image_grid_thw,
+            mm_token_type_ids,
+        ):
+            self.calls.append(
+                {
+                    "attention_mask": attention_mask.clone(),
+                    "position_ids": position_ids,
+                    "pixel_values": pixel_values.clone(),
+                    "image_grid_thw": image_grid_thw.clone(),
+                    "mm_token_type_ids": mm_token_type_ids.clone(),
+                }
+            )
+            return _Output(logits=self.lm_head(self.embed(input_ids)))
+
+    actor = actor_type("base")
+    actor.model = _ToyVLM()
+    actor.is_vlm = True
+    actor._vlm_config = SimpleNamespace(image_token_id=99, video_token_id=None)
+    actor.packing_samples = False
+    actor.temperature = 1.0
+    sequences = torch.tensor([[5, 99, 6, 7]])
+    attention_mask = torch.ones_like(sequences)
+    action_mask = torch.ones((1, 1))
+
+    action_log_probs, output = actor.forward(
+        sequences,
+        action_mask,
+        attention_mask=attention_mask,
+        return_output=True,
+        pixel_values=torch.ones((1, 3)),
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        _flash_num_images=torch.tensor([1]),
+    )
+
+    assert action_log_probs.shape == (1, 1)
+    assert output.logits is None
+    assert len(actor.model.calls) == 1
+    call = actor.model.calls[0]
+    assert call["position_ids"] is None
+    assert call["mm_token_type_ids"].dtype == torch.int32
+    assert call["mm_token_type_ids"].tolist() == [[0, 1, 0, 0]]
+    assert call["image_grid_thw"].tolist() == [[1, 2, 2]]
+
+
+@requires_openrlhf_source
+@requires_torch
 def test_sitecustomize_masks_truncated_response_but_retains_row(monkeypatch):
     torch = pytest.importorskip("torch")
     _, _, _, samples_module, _ = _install_pinned_sitecustomize_modules(monkeypatch)
@@ -2319,6 +2657,50 @@ def test_sitecustomize_language_only_sync_excludes_vlm_weights(monkeypatch):
     assert not any(name.startswith("visual.") for name in names)
 
 
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_vlm_lora_targets_and_syncs_the_full_model_tree(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    actor_type = sys.modules["openrlhf.models.actor"].Actor
+    actor = actor_type("base", lora_rank=8, target_modules=["all-linear"])
+
+    class _ToyLora(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = torch.nn.Linear(2, 2, bias=False)
+            self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 1, bias=False)})
+            self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 2, bias=False)})
+            self.active_adapters = ["default"]
+            self.lora_variant = {}
+            self.lora_bias = {"default": False}
+
+        def get_delta_weight(self, _adapter):
+            return self.lora_B["default"].weight @ self.lora_A["default"].weight
+
+    class _Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Module()
+            self.language_model.proj = _ToyLora()
+            self.visual = torch.nn.Module()
+            self.visual.proj = _ToyLora()
+
+    class _PeftModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_model = _Base()
+
+        def get_base_model(self):
+            return self.base_model
+
+    names = {name for name, *_rest in namespace["_flash_lora_sync_entries"](_PeftModel())}
+
+    assert actor.init_kwargs["target_modules"] == "all-linear"
+    assert "language_model.proj.weight" in names
+    assert "visual.proj.weight" in names
+
+
 def test_run_rl_dispatches_to_openrlhf(monkeypatch):
     calls = []
     monkeypatch.setenv("FLASH_RL_BACKEND", "openrlhf")
@@ -2420,6 +2802,11 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
         return {
             "env": _Env(),
             "tokenizer": _Tokenizer(),
+            "processing_class": _Tokenizer(),
+            "multimodal": False,
+            "image_pad_token_id": None,
+            "image_merge_size": None,
+            "max_images_per_prompt": 0,
             "model_id": "Qwen/Qwen3.5-0.8B",
             "model_revision": "a" * 40,
             "prompts": [

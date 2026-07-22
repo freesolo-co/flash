@@ -1,11 +1,9 @@
-"""OpenRLHF-backed GRPO foundation for single-turn text environments.
+"""OpenRLHF-backed GRPO for single-turn text and multimodal environments.
 
 The OpenRLHF runtime stays out of process. The parent worker owns Flash environment state and
 serves rewards over an authenticated localhost bridge. A generated ``sitecustomize`` module keeps
 reward handling fail-closed, applies Flash's combined fixed-length DR-GRPO normalization, masks
 truncated completions, and synchronizes effective merged LoRA weights to the rollout engines.
-
-This foundation intentionally leaves the TRL implementation intact and rejects unsupported modes.
 """
 
 from __future__ import annotations
@@ -138,6 +136,7 @@ class OpenRLHFGRPOConfig:
     save_every: int
     save_at_steps: tuple[int, ...]
     gpu_count: int
+    max_images_per_prompt: int
     qwen35_language_model_only: bool
     fp8_kv: bool
     warmstart_adapter: str
@@ -193,6 +192,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         "input",
         "--data.label_key",
         "label",
+        "--data.image_key",
+        "images",
         "--data.max_len",
         str(config.max_length),
         "--data.max_samples",
@@ -311,6 +312,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         )
     else:
         args.extend(["--algo.kl.init_coef", "0.0"])
+    if config.max_images_per_prompt > 0:
+        args.extend(["--data.max_images_per_prompt", str(config.max_images_per_prompt)])
     if config.actor_attn_implementation:
         args.extend(["--ds.attn_implementation", config.actor_attn_implementation])
     return args
@@ -603,6 +606,92 @@ def post_reward_request(url: str, payload: dict[str, Any], *, timeout: float = 5
         return json.loads(response.read().decode("utf-8"))
 
 
+def _prepare_openrlhf_multimodal_prompt(
+    record: dict,
+    messages: list[dict],
+    processor,
+    package_root: str | Path | None,
+    *,
+    thinking: bool,
+) -> dict[str, Any]:
+    """normalize and validate one prompt exactly as the OpenRLHF VLM rollout will."""
+    from trl.data_utils import prepare_multimodal_messages
+
+    from flash.engine.worker.grpo_multimodal import (
+        _processor_merge_size,
+        validate_image_token_grid_invariant,
+    )
+    from flash.multimodal import (
+        decode_image_descriptors,
+        image_descriptors_to_data_uris,
+        normalize_prompt_images,
+        resolve_image_pad_token_id,
+    )
+
+    normalized = normalize_prompt_images(record, messages, package_root)
+    decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
+    prepared_messages = prepare_multimodal_messages(normalized.messages, images=decoded_images)
+    rendered = processor.apply_chat_template(
+        prepared_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=thinking,
+    )
+    trl_tokenized = processor.apply_chat_template(
+        conversation=[prepared_messages],
+        tokenize=True,
+        return_dict=True,
+        add_generation_prompt=True,
+        enable_thinking=thinking,
+    )
+    tokenized = processor(
+        text=[rendered],
+        images=decoded_images,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+    input_ids = tokenized["input_ids"]
+
+    def nested_list(value):
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        return value
+
+    if nested_list(trl_tokenized["input_ids"]) != nested_list(input_ids):
+        raise ValueError("OpenRLHF multimodal prompt ids differ from the TRL processor path")
+    trl_grid = trl_tokenized.get("image_grid_thw")
+    openrlhf_grid = tokenized.get("image_grid_thw")
+    if (trl_grid is None) != (openrlhf_grid is None) or (
+        trl_grid is not None and nested_list(trl_grid) != nested_list(openrlhf_grid)
+    ):
+        raise ValueError("OpenRLHF multimodal image grids differ from the TRL processor path")
+
+    attention_mask = tokenized.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = input_ids.new_ones(input_ids.shape)
+    image_pad_token_id = resolve_image_pad_token_id(processor, processor.tokenizer)
+    merge_size = _processor_merge_size(processor)
+    image_grid_thw = tokenized.get("image_grid_thw")
+    if image_grid_thw is not None:
+        validate_image_token_grid_invariant(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            image_grid_thw=image_grid_thw,
+            num_images=[len(decoded_images)],
+            image_pad_token_id=image_pad_token_id,
+            merge_size=merge_size,
+        )
+    return {
+        "rendered": rendered,
+        "images": image_descriptors_to_data_uris(normalized.descriptors, package_root),
+        "token_count": int(input_ids.shape[-1]),
+        "image_pad_token_id": image_pad_token_id,
+        "merge_size": merge_size,
+    }
+
+
 def _sitecustomize_source() -> str:
     """Return the self-contained child hook loaded before OpenRLHF imports."""
     return r"""
@@ -633,9 +722,17 @@ _FLASH_STRUCTURED_OUTPUTS = json.loads(os.environ.get("FLASH_OPENRLHF_STRUCTURED
 _FLASH_REASONING_PARSER = os.environ.get("FLASH_OPENRLHF_REASONING_PARSER")
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
+_IMAGE_PAD_TOKEN_ID_TEXT = os.environ.get("FLASH_OPENRLHF_IMAGE_PAD_TOKEN_ID")
+_IMAGE_PAD_TOKEN_ID = int(_IMAGE_PAD_TOKEN_ID_TEXT) if _IMAGE_PAD_TOKEN_ID_TEXT is not None else None
+_IMAGE_MERGE_SIZE_TEXT = os.environ.get("FLASH_OPENRLHF_IMAGE_MERGE_SIZE")
+_IMAGE_MERGE_SIZE = int(_IMAGE_MERGE_SIZE_TEXT) if _IMAGE_MERGE_SIZE_TEXT is not None else None
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
 if _MAX_RESPONSE_LENGTH <= 0:
     raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
+if (_IMAGE_PAD_TOKEN_ID is None) != (_IMAGE_MERGE_SIZE is None):
+    raise RuntimeError("OpenRLHF multimodal token and merge metadata must be configured together")
+if _IMAGE_MERGE_SIZE is not None and _IMAGE_MERGE_SIZE <= 0:
+    raise RuntimeError("OpenRLHF multimodal image merge size must be positive")
 _WARMSTART_ADAPTER = os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER", "")
 _FP8_KV = os.environ.get("FLASH_OPENRLHF_FP8_KV") == "1"
 _EXACT_SAVE_STEPS = frozenset(
@@ -911,6 +1008,11 @@ async def _flash_execute(self, *args, **kwargs):
     if sampling_params is None:
         raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
     sampling_params = copy.deepcopy(sampling_params)
+    image_pad_token_id = globals().get("_IMAGE_PAD_TOKEN_ID")
+    if image_pad_token_id is not None:
+        logit_bias = dict(getattr(sampling_params, "logit_bias", None) or {})
+        logit_bias[image_pad_token_id] = -100.0
+        sampling_params.logit_bias = logit_bias
     if _FLASH_STRUCTURED_OUTPUTS:
         sampling_params.structured_outputs = _StructuredOutputsParams(**_FLASH_STRUCTURED_OUTPUTS)
     if _FLASH_STOP_SEQUENCES:
@@ -944,6 +1046,7 @@ async def _flash_execute(self, *args, **kwargs):
         call_kwargs["sampling_params"] = sampling_params
     tokenizer = call_args[4] if len(call_args) > 4 else call_kwargs.get("hf_tokenizer")
     llm_engine = call_args[5] if len(call_args) > 5 else call_kwargs.get("llm_engine")
+    images = call_args[6] if len(call_args) > 6 else call_kwargs.get("images")
     if tokenizer is None or llm_engine is None:
         raise RuntimeError("flash GRPO rollout request is missing tokenizer or engine")
     capture = _FlashTerminationCapture(llm_engine, tokenizer)
@@ -954,6 +1057,14 @@ async def _flash_execute(self, *args, **kwargs):
     output = await _original_execute(self, *call_args, **call_kwargs)
     if not isinstance(output, dict):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
+    if images:
+        mm_train_inputs = output.get("mm_train_inputs")
+        if not isinstance(mm_train_inputs, dict):
+            raise RuntimeError("OpenRLHF multimodal rollout returned no processor tensors")
+        mm_train_inputs = dict(mm_train_inputs)
+        image_count = len(images) if isinstance(images, (list, tuple)) else 1
+        mm_train_inputs["_flash_num_images"] = torch.tensor([image_count], dtype=torch.long)
+        output["mm_train_inputs"] = mm_train_inputs
     output["finish_reason"] = capture.finish_reason
     output["stop_reason"] = capture.stop_reason
     output["truncated"] = bool(output.get("truncated", False)) and not capture.naturally_terminated
@@ -1054,6 +1165,39 @@ def _flash_chunked_action_log_probs(
     return action_log_probs, entropy
 
 
+def _flash_prepare_vlm_inputs(self, sequences, attention_mask, mm_inputs):
+    mm_inputs = dict(mm_inputs)
+    num_images = mm_inputs.pop("_flash_num_images", None)
+    image_grid_thw = mm_inputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        if _IMAGE_PAD_TOKEN_ID is None or _IMAGE_MERGE_SIZE is None:
+            raise RuntimeError("OpenRLHF VLM actor is missing Flash image-grid metadata")
+        if attention_mask is None:
+            raise RuntimeError("OpenRLHF VLM actor requires an attention mask")
+        from flash.engine.worker.grpo_multimodal import validate_image_token_grid_invariant
+
+        validate_image_token_grid_invariant(
+            input_ids=sequences,
+            attention_mask=attention_mask,
+            image_grid_thw=image_grid_thw,
+            num_images=num_images,
+            image_pad_token_id=_IMAGE_PAD_TOKEN_ID,
+            merge_size=_IMAGE_MERGE_SIZE,
+        )
+
+    cfg = self._vlm_config
+    image_token_id = getattr(cfg, "image_token_id", _IMAGE_PAD_TOKEN_ID)
+    if image_token_id is None:
+        raise RuntimeError("OpenRLHF VLM actor requires an image token id")
+    token_type_ids = (sequences == int(image_token_id)).to(torch.int32)
+    video_token_id = getattr(cfg, "video_token_id", None)
+    if video_token_id is not None:
+        token_type_ids[sequences == int(video_token_id)] = 2
+    key = "mm_token_type_ids" if image_grid_thw is not None else "token_type_ids"
+    mm_inputs[key] = token_type_ids
+    return mm_inputs
+
+
 def _flash_actor_forward(
     self,
     sequences,
@@ -1094,12 +1238,7 @@ def _flash_actor_forward(
     if getattr(self, "is_vlm", False):
         position_ids = None
         if mm_inputs:
-            cfg = self._vlm_config
-            token_type_ids = (sequences == cfg.image_token_id).to(torch.int32)
-            if getattr(cfg, "video_token_id", None) is not None:
-                token_type_ids[sequences == cfg.video_token_id] = 2
-            key = "mm_token_type_ids" if "image_grid_thw" in mm_inputs else "token_type_ids"
-            mm_inputs[key] = token_type_ids
+            mm_inputs = _flash_prepare_vlm_inputs(self, sequences, attention_mask, mm_inputs)
     else:
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
@@ -1578,6 +1717,8 @@ def build_openrlhf_child_env(
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
     actor_attn_implementation: str | None = None,
+    image_pad_token_id: int | None = None,
+    image_merge_size: int | None = None,
 ) -> dict[str, str]:
     """Build a minimal child environment without Flash environment or provider secrets."""
     child = {
@@ -1613,6 +1754,11 @@ def build_openrlhf_child_env(
         child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] = "1"
     if actor_attn_implementation:
         child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] = actor_attn_implementation
+    if (image_pad_token_id is None) != (image_merge_size is None):
+        raise ValueError("OpenRLHF multimodal token and merge metadata must be configured together")
+    if image_pad_token_id is not None:
+        child["FLASH_OPENRLHF_IMAGE_PAD_TOKEN_ID"] = str(int(image_pad_token_id))
+        child["FLASH_OPENRLHF_IMAGE_MERGE_SIZE"] = str(int(image_merge_size))
     return child
 
 
@@ -1638,16 +1784,13 @@ def _write_scheduled_dataset(
                 "turn": 0,
                 "retry": 0,
             }
-            dataset_file.write(
-                json.dumps(
-                    {
-                        "input": prompt["rendered"],
-                        "label": json.dumps(identity, sort_keys=True, separators=(",", ":")),
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+            row = {
+                "input": prompt["rendered"],
+                "label": json.dumps(identity, sort_keys=True, separators=(",", ":")),
+            }
+            if prompt.get("images"):
+                row["images"] = list(prompt["images"])
+            dataset_file.write(json.dumps(row, separators=(",", ":")) + "\n")
     return scheduled_count
 
 
@@ -1909,31 +2052,72 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     random.Random(spec.seed).shuffle(train)
     message_prompts = [env.prompt_messages(example) for example in train]
 
-    from flash.multimodal import record_has_images
+    from flash.multimodal import record_has_images, validate_multimodal_training
 
-    if any(
+    multimodal = any(
         record_has_images(example, messages)
         for example, messages in zip(train, message_prompts, strict=True)
-    ):
-        raise RuntimeError("OpenRLHF GRPO multimodal support is deferred; use the TRL backend")
+    )
+    processor = None
+    if multimodal:
+        from transformers import AutoProcessor
 
-    tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
+        validate_multimodal_training(model_id, "grpo")
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            **_w.model_revision_kwargs(model_revision),
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    package_root = getattr(env, "package_root", None)
+    image_pad_token_id = None
+    image_merge_size = None
+    max_images_per_prompt = 0
     prompts: list[dict[str, Any]] = []
     for example_idx, (example, messages) in enumerate(zip(train, message_prompts, strict=True)):
-        rendered = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=_w.THINKING,
-        )
-        token_count = len(tokenizer(rendered, add_special_tokens=False).input_ids)
+        images: list[str] = []
+        if multimodal and record_has_images(example, messages):
+            prepared = _prepare_openrlhf_multimodal_prompt(
+                example,
+                messages,
+                processor,
+                package_root,
+                thinking=bool(_w.THINKING),
+            )
+            rendered = prepared["rendered"]
+            images = prepared["images"]
+            token_count = prepared["token_count"]
+            current_pad_token_id = int(prepared["image_pad_token_id"])
+            current_merge_size = int(prepared["merge_size"])
+            if image_pad_token_id not in (None, current_pad_token_id):
+                raise RuntimeError(
+                    "OpenRLHF multimodal prompts resolved inconsistent image token ids"
+                )
+            if image_merge_size not in (None, current_merge_size):
+                raise RuntimeError(
+                    "OpenRLHF multimodal prompts resolved inconsistent image merge sizes"
+                )
+            image_pad_token_id = current_pad_token_id
+            image_merge_size = current_merge_size
+            max_images_per_prompt = max(max_images_per_prompt, len(images))
+        else:
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=_w.THINKING,
+            )
+            token_count = len(tokenizer(rendered, add_special_tokens=False).input_ids)
         if 0 < token_count <= prompt_budget:
             prompts.append(
                 {
                     "rendered": rendered,
+                    "images": images,
                     "example": example,
                     "example_idx": example_idx,
                 }
@@ -1961,6 +2145,11 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     return {
         "env": env,
         "tokenizer": tokenizer,
+        "processing_class": processor or tokenizer,
+        "multimodal": multimodal,
+        "image_pad_token_id": image_pad_token_id,
+        "image_merge_size": image_merge_size,
+        "max_images_per_prompt": max_images_per_prompt,
         "model_id": model_id,
         "model_revision": model_revision,
         "prompts": prompts,
@@ -2091,6 +2280,7 @@ def run_rl_openrlhf() -> None:
 
     qwen35_language_model_only = bool(
         _w.is_vl_checkpoint(inputs["model_id"], inputs["model_revision"])
+        and not inputs["multimodal"]
     )
     last_step = [resumed_step]
 
@@ -2126,6 +2316,7 @@ def run_rl_openrlhf() -> None:
             save_every=inputs["save_every"],
             save_at_steps=inputs["save_at_steps"],
             gpu_count=inputs["gpu_count"],
+            max_images_per_prompt=inputs["max_images_per_prompt"],
             qwen35_language_model_only=qwen35_language_model_only,
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
@@ -2147,6 +2338,8 @@ def run_rl_openrlhf() -> None:
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],
             actor_attn_implementation=actor_attn_implementation,
+            image_pad_token_id=inputs["image_pad_token_id"],
+            image_merge_size=inputs["image_merge_size"],
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
@@ -2188,7 +2381,7 @@ def run_rl_openrlhf() -> None:
                 adapter_workdir=checkpoint_adapter_workdir,
                 model_id=inputs["model_id"],
                 model_revision=inputs["model_revision"],
-                tokenizer=inputs["tokenizer"],
+                tokenizer=inputs["processing_class"],
                 python_bin=python_bin,
                 required_steps=inputs["save_at_steps"],
             )
@@ -2244,7 +2437,7 @@ def run_rl_openrlhf() -> None:
             inputs["model_revision"],
             python_bin,
         )
-        inputs["tokenizer"].save_pretrained(adapter_dir)
+        inputs["processing_class"].save_pretrained(adapter_dir)
         _w.write_base_model_provenance(
             adapter_dir,
             inputs["model_id"],
@@ -2276,6 +2469,7 @@ def run_rl_openrlhf() -> None:
         generated_tokens=generated_tokens,
         notes={
             "backend": "openrlhf",
+            "multimodal": inputs["multimodal"],
             "steps": last_step[0],
             "retained_prompts": len(inputs["prompts"]),
             "scheduled_prompts": scheduled_prompt_count,
