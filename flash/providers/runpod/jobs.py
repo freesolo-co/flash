@@ -650,6 +650,14 @@ def poll_job(
             last_status = status
             last_progress = time.time()
         if status in TERMINAL_OK:
+            # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
+            # completes right at the boundary still surfaces its final per-step metrics for `flash log -f`
+            forced_reader = (
+                (lambda: heartbeat_reader(force=True, deadline_at=None))
+                if heartbeat_reader is not None
+                else None
+            )
+            last_hb_key, _ = surface_heartbeat(forced_reader, last_hb_key, say)
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:

@@ -75,5 +75,7 @@ def test_reward_fn_accumulates_breakdowns_across_microbatches() -> None:
 
     assert "pending_named_breakdowns.extend(breakdowns)" in source
     assert "_latest_named_reward_metrics(" in source
-    assert "fields=hb_cb.latest_fields" in source
+    # reconciled with #591 log-follow: the rl_step heartbeat merges reward metrics
+    # (**hb_cb.latest_fields()) alongside metrics_last; verify latest_fields is still emitted
+    assert "hb_cb.latest_fields()" in source
     assert "breakdowns.append(None)" in source
