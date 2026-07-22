@@ -2060,7 +2060,12 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
 
     runtime.recover_runs()
 
-    assert started == [(runtime._deferred_resubmit_loop, (spec,), True)]
+    # recover_runs also backgrounds a _drain_cleanup_remotes_bg thread per known run (see
+    # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
+    # for the resubmit-loop thread specifically rather than asserting the full thread list.
+    assert (runtime._deferred_resubmit_loop, (spec,), True) in started
+    drain_calls = [args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"]
+    assert drain_calls == [(spec.run_id,)]
 
 
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
