@@ -777,6 +777,12 @@ def _reconcile_attached_remote(
                         return
                 except Exception:
                     pass
+                # past the grace window the terminal CAS is the only exit; if it raised or
+                # lost the compare-and-swap, rate-limit the retry at the full reconcile
+                # interval. remaining grace is <= 0 here, so falling through to the shared
+                # sleep below would sleep 0 and busy-spin the reconciler.
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
             remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
             time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
             continue

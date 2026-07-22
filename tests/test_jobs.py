@@ -4534,6 +4534,81 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
         assert probes == [deadline - 1.0, deadline]
 
 
+def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatch):
+    # past the recovery grace window the terminal compare-and-fail CAS is the only exit
+    # from the completed-but-unadoptable branch. if that CAS transiently raises, the
+    # reconciler must rate-limit each retry at the full reconcile interval instead of
+    # sleeping 0 (remaining grace is <= 0 past the window) and busy-spinning the loop.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-cas-ratelimit")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        # start already past the recovery grace window so remaining grace is <= 0.
+        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S}
+        sleeps = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+
+        def advance(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        monkeypatch.setattr(deploy_mod.time, "sleep", advance)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_runpod_completed_metrics",
+            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+        )
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+        # the reconciler imports _compare_and_fail_remote / _record_cleanup_remote from
+        # flash.runner (== orch), so patch them there rather than on lifecycle.
+        monkeypatch.setattr(orch, "_record_cleanup_remote", lambda *_a, **_k: True)
+
+        real_fail = orch._compare_and_fail_remote
+        cas_calls = {"n": 0}
+
+        def flaky_fail(run_id, expected_remote, reason):
+            cas_calls["n"] += 1
+            if cas_calls["n"] <= 2:
+                raise RuntimeError("transient status store failure")
+            return real_fail(run_id, expected_remote, reason)
+
+        monkeypatch.setattr(orch, "_compare_and_fail_remote", flaky_fail)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        # two transient CAS failures -> two full-interval rate-limited retries (never sleep 0),
+        # then the third CAS sticks and fails the run.
+        assert sleeps == [
+            deploy_mod._ATTACH_RECONCILE_INTERVAL_S,
+            deploy_mod._ATTACH_RECONCILE_INTERVAL_S,
+        ]
+        assert cas_calls["n"] == 3
+        assert orch.get_status(spec.run_id).state == "failed"
+        assert "could not be adopted" in orch.get_status(spec.run_id).error
+
+
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
