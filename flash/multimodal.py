@@ -902,6 +902,32 @@ def validate_image_opd_teacher(teacher_model: str | None) -> None:
         )
 
 
+def validate_image_opd_user_text(record: dict, messages: list[dict]) -> None:
+    """reject user text that collides with verl's managed image placeholder protocol."""
+    user_text: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or str(message.get("role") or "").lower() != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            user_text.append(content)
+        elif isinstance(content, list):
+            user_text.extend(
+                block["text"]
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+    if not messages and isinstance(record.get("input"), str):
+        user_text.append(record["input"])
+    if any("<image>" in text for text in user_text):
+        raise ValueError(
+            "image-bearing opd user text must not contain the literal '<image>' marker; "
+            "image placeholders are managed automatically"
+        )
+
+
 def assistant_completion_text(completion: object) -> str:
     if not isinstance(completion, list):
         return str(completion or "")
@@ -992,8 +1018,13 @@ def preflight_validate_image_opd(spec) -> None:
     max_examples = int(getattr(train, "max_examples", 0) or 0)
     if max_examples > 0:
         records = records[:max_examples]
+    validated_image_support = False
     for record in records:
-        if record_has_images(record, _record_messages(record)):
+        messages = _record_messages(record)
+        if not record_has_images(record, messages):
+            continue
+        validate_image_opd_user_text(record, messages)
+        if not validated_image_support:
             multi_turn = bool(
                 getattr(environment, "multi_turn", False) or params.get("multi_turn", False)
             )
@@ -1001,4 +1032,4 @@ def preflight_validate_image_opd(spec) -> None:
                 str(getattr(spec, "model", "")), "opd", multi_turn=multi_turn
             )
             validate_image_opd_teacher(getattr(train, "teacher_model", "") if train else "")
-            return
+            validated_image_support = True

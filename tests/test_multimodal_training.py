@@ -948,6 +948,47 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
         runner.get_status(spec.run_id)
 
 
+def test_image_opd_submit_rejects_literal_image_marker_before_provision(monkeypatch, tmp_path):
+    from flash import runner
+    from flash.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("literal image marker rejection must happen before provisioning")
+
+    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner, "_run_job", fail)
+    monkeypatch.setattr(runner, "_run_job_background", fail)
+    monkeypatch.setattr(runner.threading, "Thread", fail)
+    spec = JobSpec.from_dict(
+        {
+            "run_id": "image-opd-literal-placeholder",
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "opd",
+            "environment": {
+                "id": "local",
+                "params": {
+                    "records": [
+                        {
+                            "input": "compare this image to <image>",
+                            "output": "red",
+                            "image": "dataset/red.png",
+                        }
+                    ]
+                },
+            },
+            "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"literal '<image>' marker"):
+        runner.submit_job(spec)
+    with pytest.raises(FileNotFoundError):
+        runner.get_status(spec.run_id)
+
+
 def test_cost_specs_price_the_full_context_budget_for_image_and_mixed_rows():
     from flash.cost.spec import runconfig_from_spec
     from flash.spec import JobSpec

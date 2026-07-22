@@ -31,6 +31,7 @@ from flash.engine.worker.opd_verl import (
 )
 from flash.engine.worker.opd_verl_plugin import (
     FlashTeacherBridgeError,
+    _bridge_score_payload,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
     _multi_modal_image_count,
@@ -39,7 +40,6 @@ from flash.engine.worker.opd_verl_plugin import (
     _resolve_image_token_id,
     _set_current_global_batch_info,
     _signal_sequences,
-    _teacher_bridge_payload,
     deterministic_rollout_seed,
 )
 from flash.engine.worker.tokenizer_align import TeacherToken
@@ -464,13 +464,59 @@ def test_bridge_verifies_prompt_and_serializes_aligned_native_fields():
         stop_sequences=(),
         mutation_callback=lambda: None,
     )
-    encoded = bridge.score(0, [10, 11, 65, 66, 99])
+    encoded = bridge.score(0, 2, [10, 11, 65, 66, 99])
     assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
     assert encoded["teacher_logprobs"] == [0.0, -0.4, -0.7, 0.0, 0.0]
     assert bridge.aligned_sequences == 1
     assert bridge.generated_tokens == 3
     with pytest.raises(ValueError, match="prompt ids"):
-        bridge.score(0, [10, 12, 65, 99])
+        bridge.score(0, 2, [10, 12, 65, 99])
+
+
+def test_bridge_rejects_child_prompt_with_extra_token_as_permanent_error():
+    bridge = _TeacherAlignmentBridge(
+        prompts=[
+            _BridgePrompt(
+                student_messages=[{"role": "user", "content": "question"}],
+                teacher_messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                image_descriptors=(),
+                package_root=None,
+            )
+        ],
+        tokenizer=_BridgeTokenizer(),
+        teacher=_BridgeTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({99}),
+        stop_sequences=(),
+        mutation_callback=lambda: None,
+    )
+    bridge.start()
+    try:
+        with pytest.raises(FlashTeacherBridgeError, match="exactly match") as error:
+            _post_json(
+                bridge.url,
+                bridge.token,
+                "/score",
+                _bridge_score_payload(0, [10, 11, 77], [65, 99]),
+            )
+    finally:
+        bridge.close()
+
+    assert error.value.classification == "permanent"
+    assert bridge.teacher_failure is not None
+    assert bridge.teacher_failure[0] == "permanent"
+
+
+def test_child_bridge_payload_carries_actual_prompt_boundary():
+    payload = _bridge_score_payload(4, [10, 11, 77], [65, 99])
+
+    assert payload == {
+        "index": 4,
+        "prompt_length": 3,
+        "sequence_ids": [10, 11, 77, 65, 99],
+        "image_count": 0,
+    }
 
 
 class _ScoredImageTokens(list):
@@ -537,7 +583,7 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
         mutation_callback=lambda: None,
     )
 
-    encoded = bridge.score(0, [10, 11, 65, 66, 99], image_count=2)
+    encoded = bridge.score(0, 2, [10, 11, 65, 66, 99], image_count=2)
 
     expected_uris = image_descriptors_to_data_uris(descriptors, tmp_path)
     assert teacher.items == [
@@ -545,6 +591,8 @@ def test_multimodal_bridge_rebuilds_teacher_images_in_frozen_order_and_accounts_
     ]
     assert encoded["teacher_ids"] == [-1, 0, 1, -1, -1]
     assert bridge.teacher_input_tokens == 17
+    with pytest.raises(ValueError, match="exactly match"):
+        bridge.score(0, 3, [10, 11, 77, 65, 99], image_count=2)
 
 
 def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
@@ -567,7 +615,7 @@ def test_bridge_rejects_parent_child_image_count_mismatch_before_scoring():
     )
 
     with pytest.raises(ValueError, match=r"reported 0 image.*frozen prompt has 1"):
-        bridge.score(0, [10, 11, 65, 99], image_count=0)
+        bridge.score(0, 2, [10, 11, 65, 99], image_count=0)
 
 
 def test_prompt_pool_fingerprint_freezes_image_descriptor_order_and_preserves_text():
@@ -662,7 +710,7 @@ def test_resume_restores_bridge_counters_and_extends_full_curves():
     )
     progress = _OpdProgressState(state)
     progress.start_training()
-    bridge.score(0, [10, 11, 65, 66, 99])
+    bridge.score(0, 2, [10, 11, 65, 66, 99])
     progress.record_step(3, 0.5, bridge)
     restored = progress.checkpoint_state(3, timeout_s=0.1)
 
@@ -741,7 +789,7 @@ def test_bridge_returns_typed_teacher_failures_and_records_classification(
                 bridge.url,
                 bridge.token,
                 "/score",
-                {"index": 0, "sequence_ids": [10, 11, 65, 66, 99]},
+                {"index": 0, "prompt_length": 2, "sequence_ids": [10, 11, 65, 66, 99]},
             )
     finally:
         bridge.close()
@@ -835,15 +883,21 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert "ref_log_prob" not in " ".join(overrides)
 
 
-def test_child_teacher_bridge_payload_sends_image_count_without_pixels():
+def test_child_teacher_bridge_payload_sends_boundary_and_image_count_without_pixels():
     pixel_marker = "raw-image-pixels-must-not-cross-localhost"
-    payload = _teacher_bridge_payload(
+    payload = _bridge_score_payload(
         7,
-        [10, 11, 12],
+        [10, 11],
+        [12],
         {"images": [pixel_marker, pixel_marker], "videos": [pixel_marker]},
     )
 
-    assert payload == {"index": 7, "sequence_ids": [10, 11, 12], "image_count": 2}
+    assert payload == {
+        "index": 7,
+        "prompt_length": 2,
+        "sequence_ids": [10, 11, 12],
+        "image_count": 2,
+    }
     assert pixel_marker not in json.dumps(payload)
     assert _multi_modal_image_count(None) == 0
 

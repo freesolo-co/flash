@@ -66,6 +66,7 @@ def _preflight_opd_verl_environment(spec: JobSpec) -> None:
     from flash.multimodal import (
         record_has_images,
         validate_image_opd_teacher,
+        validate_image_opd_user_text,
         validate_multimodal_training,
     )
     from flash.runner import _require_supported_opd_verl_spec
@@ -83,12 +84,16 @@ def _preflight_opd_verl_environment(spec: JobSpec) -> None:
     max_examples = int(spec.train.max_examples or 0)
     if max_examples > 0:
         records = records[:max_examples]
+    validated_image_support = False
     for record in records:
         messages = environment.prompt_messages(record)
-        if record_has_images(record, messages):
+        if not record_has_images(record, messages):
+            continue
+        validate_image_opd_user_text(record, messages)
+        if not validated_image_support:
             validate_multimodal_training(spec.model, "opd", multi_turn=False)
             validate_image_opd_teacher(spec.train.teacher_model)
-            break
+            validated_image_support = True
 
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:

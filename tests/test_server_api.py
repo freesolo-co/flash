@@ -437,38 +437,19 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
     assert response.json()["state"] == "dry_run"
 
 
-@pytest.mark.parametrize(
-    ("max_completion_tokens", "status_code"),
-    [(3500, 400), (3000, 200)],
-)
-def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
-    api, monkeypatch, tmp_path, max_completion_tokens, status_code
+@pytest.mark.parametrize("max_completion_tokens", [3500, 3000])
+def test_opd_structured_dry_run_rejects_before_allocation(
+    api, monkeypatch, max_completion_tokens
 ) -> None:
-    import flash.envs.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
-    # offline: the valid-context path pins the github env ref to a sha; stub it so the
-    # test never makes a real github request (the api fixture only sets a fake token)
-    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
-    # the valid-context path also runs the image-opd preflight, which resolves the env
-    # reference to inspect its dataset for images. point it at an empty local dir so the
-    # preflight finds no packaged dataset and returns without a real github request.
-    _offline_env_dir = tmp_path / "env"
-    _offline_env_dir.mkdir()
-    (_offline_env_dir / "environment.py").write_text("")
     monkeypatch.setattr(
-        envs_loader,
-        "_resolve_environment_reference",
-        lambda *_a, **_k: str(_offline_env_dir / "environment.py"),
+        runs_route._app,
+        "submit_job",
+        lambda *_a, **_k: pytest.fail("structured opd must fail before allocation"),
     )
-    if status_code == 400:
-        monkeypatch.setattr(
-            runs_route._app,
-            "submit_job",
-            lambda *_a, **_k: pytest.fail("invalid context must fail before allocation"),
-        )
     spec = {
         **SPEC,
         "model": "Qwen/Qwen3.6-35B-A3B",
@@ -488,13 +469,11 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         json={"spec": spec, "dry_run": True},
     )
 
-    assert response.status_code == status_code, response.text
-    if status_code == 400:
-        detail = response.json()["detail"]
-        assert "OPD rollout prompt+completion)=4524" in detail
-        assert "serving max_model_len=4096" in detail
-    else:
-        assert response.json()["state"] == "dry_run"
+    # the structured-output verl extension will restore support at this preflight boundary.
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "structured_outputs is not yet supported on the verl OPD backend" in detail
+    assert "forced-position metadata is not yet threaded" in detail
 
 
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:

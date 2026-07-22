@@ -58,7 +58,9 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert python_bin.endswith("/verl-venv/bin/python")
     assert calls[0][:2] == ["uv", "venv"]
     install = calls[1]
-    assert "verl==0.8.0" in install
+    assert "verl[vllm]==0.8.0" in install
+    assert "vllm==0.11.0" in install
+    assert "transformers==5.10.2" in install
     assert "liger-kernel" in install
     assert "bitsandbytes>=0.49" in install
     assert "qwen-vl-utils" in install

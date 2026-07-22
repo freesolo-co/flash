@@ -107,10 +107,18 @@ def _multi_modal_image_count(multi_modal_data) -> int:
         raise TypeError("verl multimodal images must be a sized collection") from error
 
 
-def _teacher_bridge_payload(routing_key, sequence_ids, multi_modal_data) -> dict:
+def _bridge_score_payload(
+    index: int,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    multi_modal_data=None,
+) -> dict[str, Any]:
+    prompt_ids = [int(token_id) for token_id in prompt_ids]
+    response_ids = [int(token_id) for token_id in response_ids]
     return {
-        "index": int(routing_key),
-        "sequence_ids": [int(token_id) for token_id in sequence_ids],
+        "index": int(index),
+        "prompt_length": len(prompt_ids),
+        "sequence_ids": prompt_ids + response_ids,
         "image_count": _multi_modal_image_count(multi_modal_data),
     }
 
@@ -210,7 +218,7 @@ def _install_verl_extensions() -> None:
     except ImportError:
         from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
-    from verl.experimental.agent_loop.agent_loop import register
+    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker, register
     from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
     from verl.single_controller.ray import ResourcePoolManager
     from verl.trainer.distillation.losses import (
@@ -285,20 +293,24 @@ def _install_verl_extensions() -> None:
 
         async def compute_teacher_logprobs_single(
             self,
-            sequence_ids: list[int],
+            prompt_ids: list[int],
+            response_ids: list[int],
             multi_modal_data=None,
             mm_processor_kwargs=None,
             routing_key=None,
         ):
             if routing_key is None:
                 raise RuntimeError("flash OPD bridge requires the indexed dataset row")
+            request_payload = _bridge_score_payload(
+                routing_key, prompt_ids, response_ids, multi_modal_data
+            )
             try:
                 payload = await asyncio.to_thread(
                     _post_json,
                     self.bridge_url,
                     self.bridge_token,
                     "/score",
-                    _teacher_bridge_payload(routing_key, sequence_ids, multi_modal_data),
+                    request_payload,
                 )
             except FlashTeacherBridgeError as error:
                 exit_code = (
@@ -315,12 +327,41 @@ def _install_verl_extensions() -> None:
             ).unsqueeze(-1)
             if teacher_ids.shape != teacher_logprobs.shape:
                 raise RuntimeError("flash OPD bridge returned inconsistent teacher tensors")
-            if teacher_ids.shape[0] != len(sequence_ids):
+            if teacher_ids.shape[0] != len(request_payload["sequence_ids"]):
                 raise RuntimeError("flash OPD bridge returned the wrong sequence length")
             return teacher_ids, teacher_logprobs
 
+    async def compute_flash_teacher_logprobs(
+        self,
+        output,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        validate: bool,
+        sample_kwargs=None,
+    ) -> None:
+        if self.distillation_enabled and not validate:
+            routing_key = None
+            if sample_kwargs is not None:
+                routing_value = sample_kwargs.get(self.teacher_key)
+                if routing_value is not None:
+                    routing_key = (
+                        routing_value.item() if hasattr(routing_value, "item") else routing_value
+                    )
+            teacher_ids, teacher_logprobs = (
+                await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    prompt_ids=prompt_ids,
+                    response_ids=response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
+            )
+            output.extra_fields["teacher_ids"] = teacher_ids
+            output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
     import verl.experimental.teacher_loop.teacher_manager as teacher_manager_module
 
+    AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
     @register("flash_single_turn")
