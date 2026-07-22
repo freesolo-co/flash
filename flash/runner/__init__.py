@@ -128,18 +128,86 @@ def _require_priced_sft_examples(spec: JobSpec) -> None:
         )
 
 
+def _xgrammar_unsupported_json_feature(schema: dict) -> bool:
+    """mirror vLLM 0.11.0's xgrammar-to-guidance fallback predicate."""
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    if schema_type in {"integer", "number"} and "multipleOf" in schema:
+        return True
+    if schema_type == "array" and any(
+        key in schema for key in ("uniqueItems", "contains", "minContains", "maxContains")
+    ):
+        return True
+    if schema_type == "string" and "format" in schema:
+        return True
+    if schema_type == "object" and any(
+        key in schema
+        for key in ("minProperties", "maxProperties", "propertyNames", "patternProperties")
+    ):
+        return True
+    for value in schema.values():
+        if isinstance(value, dict) and _xgrammar_unsupported_json_feature(value):
+            return True
+        if isinstance(value, list) and any(
+            isinstance(item, dict) and _xgrammar_unsupported_json_feature(item)
+            for item in value
+        ):
+            return True
+    return False
+
+
+def _require_opd_structured_exactness(spec: JobSpec) -> None:
+    if not spec.train.structured_outputs:
+        return
+    from flash.engine.structured_outputs import parse_structured_outputs
+
+    constraint = parse_structured_outputs(spec.train.structured_outputs)
+    if constraint is None:
+        return
+    if "whitespace_pattern" in constraint:
+        raise ValueError(
+            "train.structured_outputs whitespace_pattern is unsupported by vLLM 0.11.0 V1"
+        )
+    if "disable_additional_properties" in constraint:
+        raise ValueError(
+            "train.structured_outputs disable_additional_properties is guidance-backend only; "
+            "verl OPD pins xgrammar"
+        )
+    schema = constraint.get("json")
+    if isinstance(schema, dict) and _xgrammar_unsupported_json_feature(schema):
+        raise ValueError(
+            "train.structured_outputs JSON schema requires vLLM's guidance fallback, but verl OPD "
+            "pins xgrammar for exact forced-token replay"
+        )
+
+
 def _require_supported_opd_verl_spec(spec: JobSpec) -> None:
     if spec.algorithm != "opd":
         return
     unsupported_backend = "not yet supported on the verl OPD backend"
-    if spec.train.structured_outputs:
-        raise ValueError(
-            f"structured_outputs is {unsupported_backend} because forced-position metadata "
-            "is not yet threaded"
-        )
+    _require_opd_structured_exactness(spec)
     params = dict(spec.environment.params or {})
     if params.get("multi_turn") or params.get("is_tool_env") or params.get("tool_calling"):
         raise ValueError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+
+
+def _require_opd_structured_vocab_match(spec: JobSpec, info: ModelInfo) -> None:
+    if spec.algorithm != "opd" or not spec.train.structured_outputs:
+        return
+    if spec.model_revision:
+        actual_vocab_size = int(info.vocab_size)
+    else:
+        from flash.engine.vram import fetch_hf_model_geometry
+
+        _params_b, actual_vocab_size, _hidden, _layers = fetch_hf_model_geometry(
+            spec.model,
+            strict=True,
+        )
+    if actual_vocab_size <= 0 or int(info.vocab_size) != actual_vocab_size:
+        raise ValueError(
+            "structured OPD model vocabulary size does not match the xgrammar compiler vocabulary"
+        )
 
 
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
@@ -1000,6 +1068,7 @@ def prepare_job(
         gpu=spec.gpu.exact_type or spec.gpu.type,
         model_revision=spec.model_revision,
     )
+    _require_opd_structured_vocab_match(spec, info)
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = _assign_managed_hf_repo(spec)

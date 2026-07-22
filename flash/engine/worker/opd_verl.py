@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from flash.catalog import resolve_vocab_size
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
     final_save_due,
@@ -23,9 +24,14 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
+from flash.engine.structured_outputs import parse_structured_outputs, reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.opd import _resolve_opd_knobs, _thinking_prefill_text
+from flash.engine.worker.opd import (
+    _drop_fully_forced_groups,
+    _resolve_opd_knobs,
+    _thinking_prefill_text,
+)
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
     _rollout_terminated,
@@ -158,6 +164,38 @@ def encode_shifted_group_metadata(
     return teacher_ids, teacher_logprobs
 
 
+def _validate_forced_mask(
+    forced,
+    response_length: int,
+    *,
+    required: bool,
+) -> list[bool]:
+    if not required:
+        return []
+    if forced is None:
+        raise ValueError("structured OPD bridge payload is missing the forced mask")
+    if not isinstance(forced, list) or any(type(value) is not bool for value in forced):
+        raise ValueError("structured OPD bridge forced mask must contain only booleans")
+    if len(forced) != response_length:
+        raise ValueError(
+            "structured OPD bridge forced mask length does not match the untrimmed response"
+        )
+    return forced
+
+
+def _trim_response_and_forced(
+    tokenizer,
+    response_ids: list[int],
+    stop_text: str,
+    stop_sequences: tuple[str, ...],
+    forced: list[bool],
+) -> tuple[list[int], str, list[bool]]:
+    kept_ids, completion_text = _trim_trailing_stop(
+        tokenizer, response_ids, stop_text, stop_sequences
+    )
+    return kept_ids, completion_text, forced[: len(kept_ids)]
+
+
 class _TeacherAlignmentBridge:
     def __init__(
         self,
@@ -169,6 +207,7 @@ class _TeacherAlignmentBridge:
         eos_token_ids: frozenset[int],
         stop_sequences: tuple[str, ...],
         mutation_callback,
+        structured: bool = False,
         initial_state: dict | None = None,
     ) -> None:
         state = initial_state or {}
@@ -178,6 +217,7 @@ class _TeacherAlignmentBridge:
         self.thinking_prefill = thinking_prefill
         self.eos_token_ids = eos_token_ids
         self.stop_sequences = stop_sequences
+        self.structured = bool(structured)
         self.mutation_callback = mutation_callback
         self.token = hashlib.sha256(os.urandom(32)).hexdigest()
         self._server = None
@@ -192,6 +232,8 @@ class _TeacherAlignmentBridge:
             state.get("empty_alignments", dict(state.get("skip_counts", {})).get("empty_alignment", 0))
         )
         self.truncated_rollouts = int(state.get("truncated_rollouts", 0))
+        self.forced_tokens = int(state.get("forced_tokens", 0))
+        self.dropped_forced_groups = int(state.get("dropped_forced_groups", 0))
         self.coverage_sum = float(state.get("coverage_sum", state.get("granularity_sum", 0.0)))
         self.teacher_ok = int(state.get("teacher_ok", 0))
         self.teacher_transient = int(state.get("teacher_transient", 0))
@@ -226,6 +268,8 @@ class _TeacherAlignmentBridge:
                 "generated_tokens": self.generated_tokens,
                 "teacher_input_tokens": self.teacher_input_tokens,
                 "truncated_rollouts": self.truncated_rollouts,
+                "forced_tokens": self.forced_tokens,
+                "dropped_forced_groups": self.dropped_forced_groups,
                 "granularity_n": self.aligned_sequences,
                 "samples_seen": self.score_requests,
                 "teacher_ok": self.teacher_ok,
@@ -256,6 +300,7 @@ class _TeacherAlignmentBridge:
         prompt_length: int,
         sequence_ids: list[int],
         image_count: int = 0,
+        forced=None,
     ) -> dict:
         with self._stats_lock:
             self.score_requests += 1
@@ -274,8 +319,14 @@ class _TeacherAlignmentBridge:
         if prompt_length != len(prompt_ids) or sequence_ids[:prompt_length] != prompt_ids:
             raise ValueError("verl rollout prompt ids do not exactly match the frozen flash prompt pool")
         response_ids = sequence_ids[prompt_length:]
+        forced = _validate_forced_mask(
+            forced,
+            len(response_ids),
+            required=self.structured,
+        )
         with self._stats_lock:
             self.generated_tokens += len(response_ids)
+            self.forced_tokens += sum(forced)
         if not response_ids:
             return self._empty(prompt_length, 0)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
@@ -285,8 +336,12 @@ class _TeacherAlignmentBridge:
             with self._stats_lock:
                 self.truncated_rollouts += 1
             return self._empty(prompt_length, len(response_ids))
-        kept_ids, completion_text = _trim_trailing_stop(
-            self.tokenizer, response_ids, stop_text, self.stop_sequences
+        kept_ids, completion_text, kept_forced = _trim_response_and_forced(
+            self.tokenizer,
+            response_ids,
+            stop_text,
+            self.stop_sequences,
+            forced,
         )
         if not completion_text.strip() or "�" in completion_text:
             return self._empty(prompt_length, len(response_ids))
@@ -313,9 +368,12 @@ class _TeacherAlignmentBridge:
             teacher_input_tokens = prompt_length + len(student_ids)
         groups = groupwise_alignment(student_tokens, teacher_tokens)
         groups = [(indices, logsum) for indices, logsum in groups if indices]
+        aligned_group_count = len(groups)
+        groups = _drop_fully_forced_groups(groups, kept_forced)
         coverage = groupwise_coverage(groups, student_tokens)
         with self._stats_lock:
             self.teacher_input_tokens += teacher_input_tokens
+            self.dropped_forced_groups += aligned_group_count - len(groups)
             self.coverage_sum += coverage
             if groups:
                 self.aligned_sequences += 1
@@ -360,6 +418,7 @@ class _TeacherAlignmentBridge:
                             payload["prompt_length"],
                             payload["sequence_ids"],
                             payload.get("image_count", 0),
+                            payload.get("forced"),
                         )
                     elif self.path == "/mutation":
                         bridge.notify_mutation()
@@ -501,7 +560,7 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
     if missing:
         raise KeyError(f"build_opd_verl_overrides missing required config keys: {missing}")
     max_tokens = int(config["max_prompt_length"]) + int(config["max_response_length"])
-    return [
+    overrides = [
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
         "algorithm.norm_adv_by_std_in_grpo=false",
@@ -581,6 +640,25 @@ def build_opd_verl_overrides(config: dict) -> list[str]:
         "trainer.resume_mode=auto",
         "trainer.max_actor_ckpt_to_keep=null",
     ]
+    structured_outputs = config.get("structured_outputs")
+    if structured_outputs:
+        structured_outputs_config = {
+            "backend": "xgrammar",
+            "disable_any_whitespace": bool(
+                structured_outputs.get("disable_any_whitespace", False)
+            ),
+        }
+        reasoning_parser = reasoning_parser_for(
+            thinking=bool(config.get("thinking", False)),
+            structured_outputs=structured_outputs,
+        )
+        if reasoning_parser is not None:
+            structured_outputs_config["reasoning_parser"] = reasoning_parser
+        overrides.append(
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.structured_outputs_config="
+            + _hydra_val(structured_outputs_config)
+        )
+    return overrides
 
 
 def _build_opd_child_env(
@@ -592,6 +670,9 @@ def _build_opd_child_env(
     seed: int,
     stop_sequences: tuple,
     eos_token_ids: frozenset[int],
+    structured_outputs: dict | None,
+    model_vocab_size: int,
+    thinking: bool,
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -604,6 +685,16 @@ def _build_opd_child_env(
             "FLASH_OPD_EOS_TOKEN_IDS": json.dumps(sorted(eos_token_ids)),
         }
     )
+    if structured_outputs:
+        child.update(
+            {
+                "FLASH_OPD_STRUCTURED_OUTPUTS": json.dumps(
+                    structured_outputs, sort_keys=True, separators=(",", ":")
+                ),
+                "FLASH_OPD_MODEL_VOCAB_SIZE": str(int(model_vocab_size)),
+                "FLASH_OPD_THINKING": "1" if thinking else "0",
+            }
+        )
     return child
 
 
@@ -833,11 +924,7 @@ def run_opd_verl(spec=None) -> None:
     if getattr(env, "is_tool_env", False) or getattr(env, "multi_turn", False):
         raise RuntimeError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
     knobs = _resolve_opd_knobs()
-    if knobs.structured_outputs:
-        raise RuntimeError(
-            f"structured_outputs is {unsupported_backend} because forced-position metadata "
-            "is not yet threaded"
-        )
+    structured_outputs = parse_structured_outputs(knobs.structured_outputs)
     train = list(env.dataset())
     if not train:
         raise RuntimeError("opd environment dataset is empty")
@@ -859,6 +946,7 @@ def run_opd_verl(spec=None) -> None:
         exact_type=spec.gpu.exact_type if spec else "",
     )
     model_revision = getattr(spec, "model_revision", "") if spec else ""
+    model_vocab_size = resolve_vocab_size(model_id, model_revision)
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
 
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()
@@ -1012,6 +1100,11 @@ def run_opd_verl(spec=None) -> None:
 
     plugin_path = os.path.join(shim_dir, "flash_opd_verl_plugin.py")
     shutil.copy2(os.path.join(os.path.dirname(__file__), "opd_verl_plugin.py"), plugin_path)
+    structured_helper_path = os.path.join(shim_dir, "flash_opd_verl_structured.py")
+    shutil.copy2(
+        os.path.join(os.path.dirname(__file__), "opd_verl_structured.py"),
+        structured_helper_path,
+    )
     entry_path = os.path.join(shim_dir, "flash_opd_verl_entry.py")
     with open(entry_path, "w", encoding="utf-8") as file:
         file.write("import verl\nfrom flash_opd_verl_plugin import main\nmain()\n")
@@ -1028,6 +1121,7 @@ def run_opd_verl(spec=None) -> None:
         thinking_prefill=thinking_prefill,
         eos_token_ids=eos_token_ids,
         stop_sequences=tuple(str(value) for value in knobs.stop_sequences),
+        structured=structured_outputs is not None,
         mutation_callback=_w.publish_opd_optimizer_start_marker,
         initial_state=resume_state,
     )
@@ -1061,6 +1155,7 @@ def run_opd_verl(spec=None) -> None:
             "top_p": knobs.top_p,
             "max_model_len": 32768,
             "thinking": bool(_w.THINKING),
+            "structured_outputs": structured_outputs,
             "loggers": loggers,
         }
         overrides = build_opd_verl_overrides(config)
@@ -1091,6 +1186,9 @@ def run_opd_verl(spec=None) -> None:
             seed=int(_w.SEED),
             stop_sequences=knobs.stop_sequences,
             eos_token_ids=eos_token_ids,
+            structured_outputs=structured_outputs,
+            model_vocab_size=model_vocab_size,
+            thinking=bool(_w.THINKING),
         )
         command = [python_bin, entry_path, *overrides]
         progress = {"step": resume_step, "loss": None}
@@ -1198,6 +1296,10 @@ def run_opd_verl(spec=None) -> None:
                     else 0.0
                 ),
                 "truncated_rollouts": int(final_accounting["truncated_rollouts"]),
+                "forced_tokens": int(final_accounting["forced_tokens"]),
+                "dropped_forced_groups": int(
+                    final_accounting["dropped_forced_groups"]
+                ),
                 "teacher_input_tokens": int(final_accounting["teacher_input_tokens"]),
                 "aligned_sequences": int(final_accounting["aligned_sequences"]),
                 "empty_alignments": int(final_accounting["empty_alignments"]),
