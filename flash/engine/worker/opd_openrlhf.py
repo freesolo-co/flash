@@ -27,7 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from flash.engine.recipe import RECIPE
-from flash.engine.steps import on_policy_steps, resolve_update_horizon, validate_save_steps
+from flash.engine.steps import (
+    final_save_due,
+    on_policy_steps,
+    resolve_update_horizon,
+    validate_save_steps,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.adapter import _download_adapter
 from flash.engine.worker.grpo_openrlhf import (
@@ -39,6 +44,7 @@ from flash.engine.worker.grpo_openrlhf import (
     _sitecustomize_source as _grpo_sitecustomize_source,
 )
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.opd import _resolve_opd_knobs, _thinking_prefill_text
 from flash.engine.worker.opd_gkd import (
     _generation_eos_ids,
@@ -66,8 +72,6 @@ _OPENRLHF_BRIDGE_TRANSPORT_ATTEMPTS = 3
 _OPENRLHF_PERMANENT_TEACHER_EXIT = 86
 _OPENRLHF_TRANSIENT_TEACHER_EXIT = 87
 _SITE_CUSTOMIZE_NAME = "sitecustomize.py"
-_STEP_RE = re.compile(r"(?i)global[_ ]step[:=\s]+(\d+)")
-_LOSS_RE = re.compile(r"(?:act_loss|policy_loss)['\"\s:=]+(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)", re.I)
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,8 @@ class OpenRLHFOPDConfig:
     lora_target_modules: tuple[str, ...]
     kl_penalty_coef: float
     save_every: int
+    save_at_steps: tuple[int, ...]
+    final_step: int
     gpu_count: int
     qwen35_language_model_only: bool
     resume: bool = False
@@ -228,6 +234,7 @@ class TeacherAlignmentBridge:
         eos_token_ids: frozenset[int],
         stop_sequences: tuple[str, ...],
         mutation_callback=None,
+        metrics_callback=None,
         checkpoint_callback=None,
         initial_state: dict[str, Any] | None = None,
         token: str | None = None,
@@ -239,6 +246,7 @@ class TeacherAlignmentBridge:
         self.eos_token_ids = eos_token_ids
         self.stop_sequences = stop_sequences
         self.mutation_callback = mutation_callback or (lambda: None)
+        self.metrics_callback = metrics_callback or (lambda _step, _loss, _coverage: None)
         self.checkpoint_callback = checkpoint_callback or (lambda _step: None)
         self.token = token or secrets.token_urlsafe(32)
         self._path = f"/teacher/{self.token}"
@@ -292,11 +300,12 @@ class TeacherAlignmentBridge:
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
                     result = bridge.score_payload(payload)
                 except Exception as exc:
-                    classification = (
-                        "transient"
-                        if isinstance(exc, TeacherError) and not exc.permanent
-                        else "permanent"
-                    )
+                    if isinstance(exc, _w.RetriableInfraError) or (
+                        isinstance(exc, TeacherError) and not exc.permanent
+                    ):
+                        classification = "transient"
+                    else:
+                        classification = "permanent"
                     bridge._record_failure(classification, str(exc))
                     self._send(
                         503 if classification == "transient" else 422,
@@ -339,6 +348,24 @@ class TeacherAlignmentBridge:
                     self.mutation_callback()
                     self._mutation_notified = True
             return {"ok": True}
+        if set(payload) == {"metrics"}:
+            metrics = payload["metrics"]
+            if not isinstance(metrics, dict) or set(metrics) != {"step", "loss", "coverage"}:
+                raise ValueError("OpenRLHF OPD step metrics are invalid")
+            step = metrics["step"]
+            loss = metrics["loss"]
+            coverage = metrics["coverage"]
+            if isinstance(step, bool) or not isinstance(step, int) or step <= 0:
+                raise ValueError("OpenRLHF OPD metrics step is invalid")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in (loss, coverage)
+            ):
+                raise ValueError("OpenRLHF OPD metric values are invalid")
+            self.metrics_callback(step, float(loss), float(coverage))
+            return {"ok": True}
         if set(payload) == {"checkpoint"}:
             step = payload["checkpoint"]
             if isinstance(step, bool) or not isinstance(step, int) or step <= 0:
@@ -371,6 +398,9 @@ class TeacherAlignmentBridge:
 
         sequence_ids = payload["sequence_ids"]
         prompt_length = payload["prompt_length"]
+        terminated = payload["terminated"]
+        if not isinstance(terminated, bool):
+            raise TypeError("flash OPD rollout termination state must be a boolean")
         if not isinstance(sequence_ids, list) or any(
             isinstance(token, bool) or not isinstance(token, int) for token in sequence_ids
         ):
@@ -393,7 +423,7 @@ class TeacherAlignmentBridge:
         if not response_ids:
             return self._response(*empty)
         stop_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
-        if not _rollout_terminated(
+        if not terminated and not _rollout_terminated(
             response_ids,
             stop_text,
             self.eos_token_ids,
@@ -565,7 +595,6 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         str(_OPENRLHF_PPO_EPOCHS),
         "--train.seed",
         str(config.seed),
-        "--train.full_determinism_enable",
         "--algo.advantage.estimator",
         "reinforce",
         "--algo.advantage.gamma",
@@ -574,6 +603,13 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         "0.0",
         "--actor.adam.lr",
         str(config.learning_rate),
+        "--actor.adam.betas",
+        "0.9",
+        "0.999",
+        "--actor.adam.eps",
+        "1e-8",
+        "--actor.adam.weight_decay",
+        "0.01",
         "--actor.lr_scheduler",
         "constant",
         "--actor.lr_warmup_ratio",
@@ -618,7 +654,7 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         config.checkpoint_dir,
         "--ckpt.save_hf",
         "--ckpt.save_steps",
-        str(config.save_every),
+        str(-1 if config.save_at_steps else config.save_every),
         "--ckpt.max_num",
         "1",
         "--logger.logging_steps",
@@ -645,6 +681,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -657,6 +694,10 @@ _FLASH_OPD_SEED = int(os.environ["FLASH_OPENRLHF_OPD_SEED"])
 _FLASH_OPD_STOPS = json.loads(os.environ.get("FLASH_OPENRLHF_OPD_STOP_SEQUENCES", "[]"))
 _FLASH_OPD_EOS_IDS = json.loads(os.environ.get("FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS", "[]"))
 _FLASH_OPD_MAX_ATTEMPTS = int(os.environ.get("FLASH_OPENRLHF_OPD_NO_SIGNAL_ATTEMPTS", "3"))
+_FLASH_OPD_EXACT_SAVE_STEPS = frozenset(
+    int(step) for step in json.loads(os.environ.get("FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS", "[]"))
+)
+_FLASH_OPD_FINAL_STEP = int(os.environ.get("FLASH_OPENRLHF_OPD_FINAL_STEP", "0"))
 _FLASH_BRIDGE_TRANSPORT_ATTEMPTS = 3
 _FLASH_PERMANENT_TEACHER_EXIT = 86
 _FLASH_TRANSIENT_TEACHER_EXIT = 87
@@ -806,6 +847,7 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
                 "label": attempt_label,
                 "prompt_length": start,
                 "sequence_ids": output["observation_tokens"][:end],
+                "terminated": not bool(output.get("truncated", False)),
             },
         )
         if int(result.get("signal_count", 0)) > 0:
@@ -817,9 +859,12 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
             output["teacher_signal_mask"] = result["teacher_signal_mask"]
             output["teacher_coverage"] = float(result.get("coverage", 0.0))
             return output
-    raise RuntimeError(
-        f"flash OPD produced no aligned teacher signal after {_FLASH_OPD_MAX_ATTEMPTS} rollout attempts"
+    print(
+        f"flash OPD produced no aligned teacher signal after {_FLASH_OPD_MAX_ATTEMPTS} rollout attempts; "
+        "requesting a retriable worker replacement",
+        flush=True,
     )
+    os._exit(_FLASH_TRANSIENT_TEACHER_EXIT)
 
 
 _FlashSingleTurnExecutor.execute = _flash_opd_execute
@@ -911,17 +956,57 @@ _flash_ppo_trainer_module.prepare_datasets = _flash_prepare_datasets
 _original_save_logs_and_checkpoints = _FlashPPOTrainerRuntime.save_logs_and_checkpoints
 
 
+def _flash_metric_scalar(logs, *names):
+    for name in names:
+        if name not in logs:
+            continue
+        value = logs[name]
+        tensor_type = getattr(torch, "Tensor", ())
+        if tensor_type and isinstance(value, tensor_type):
+            value = value.detach().float().mean().item()
+        value = float(value)
+        if not math.isfinite(value):
+            raise RuntimeError(f"OpenRLHF OPD metric {name} is not finite")
+        return value
+    raise RuntimeError(f"OpenRLHF OPD metrics are missing {names[0]}")
+
+
 @functools.wraps(_original_save_logs_and_checkpoints)
 def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_states=None):
-    result = _original_save_logs_and_checkpoints(
-        self,
-        global_step,
-        logs_dict=logs_dict,
-        client_states=client_states,
+    global_step = int(global_step)
+    logs = logs_dict or {}
+    _flash_post_teacher(
+        {
+            "metrics": {
+                "step": global_step,
+                "loss": _flash_metric_scalar(logs, "distillation_loss", "policy_loss"),
+                "coverage": _flash_metric_scalar(logs, "teacher_coverage"),
+            }
+        }
     )
-    save_steps = self.args.ckpt.save_steps
-    if save_steps != float("inf") and global_step % save_steps == 0:
-        _flash_post_teacher({"checkpoint": int(global_step)})
+    original_save_steps = self.args.ckpt.save_steps
+    periodic_due = (
+        not _FLASH_OPD_EXACT_SAVE_STEPS
+        and original_save_steps != float("inf")
+        and global_step % int(original_save_steps) == 0
+    )
+    save_due = (
+        global_step in _FLASH_OPD_EXACT_SAVE_STEPS
+        or global_step == _FLASH_OPD_FINAL_STEP
+        or periodic_due
+    )
+    self.args.ckpt.save_steps = global_step if save_due else float("inf")
+    try:
+        result = _original_save_logs_and_checkpoints(
+            self,
+            global_step,
+            logs_dict=logs_dict,
+            client_states=client_states,
+        )
+    finally:
+        self.args.ckpt.save_steps = original_save_steps
+    if save_due:
+        _flash_post_teacher({"checkpoint": global_step})
     return result
 
 
@@ -1063,14 +1148,21 @@ if os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER"):
         from peft.utils.save_and_load import set_peft_model_state_dict
 
         result = set_peft_model_state_dict(self.model, state, adapter_name="default")
-        if getattr(result, "unexpected_keys", None):
+        missing = [
+            key for key in (getattr(result, "missing_keys", []) or []) if "lora_" in key
+        ]
+        unexpected = [
+            key for key in (getattr(result, "unexpected_keys", []) or []) if "lora_" in key
+        ]
+        if missing or unexpected:
             raise RuntimeError(
-                f"OpenRLHF OPD warm-start adapter has unexpected keys: {result.unexpected_keys}"
+                "OpenRLHF OPD warm-start adapter load was incomplete: "
+                f"missing={missing}, unexpected={unexpected}"
             )
         loaded_b = [
             parameter
             for name, parameter in self.model.named_parameters()
-            if "lora_B" in name and parameter.requires_grad
+            if name.endswith("lora_B.default.weight") and parameter.requires_grad
         ]
         if not loaded_b or not any(bool(torch.count_nonzero(parameter).item()) for parameter in loaded_b):
             raise RuntimeError("OpenRLHF OPD warm-start adapter did not load a nonzero LoRA B delta")
@@ -1102,6 +1194,8 @@ def build_openrlhf_opd_child_env(
     seed: int,
     stop_sequences: tuple[str, ...],
     eos_token_ids: frozenset[int],
+    save_at_steps: tuple[int, ...] = (),
+    final_step: int = 0,
     warmstart_adapter: str | None = None,
 ) -> dict[str, str]:
     """Build the isolated child env with bridge capability but no provider credential."""
@@ -1118,6 +1212,8 @@ def build_openrlhf_opd_child_env(
             "FLASH_OPENRLHF_OPD_STOP_SEQUENCES": json.dumps(list(stop_sequences)),
             "FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS": json.dumps(sorted(eos_token_ids)),
             "FLASH_OPENRLHF_OPD_NO_SIGNAL_ATTEMPTS": str(_OPENRLHF_NO_SIGNAL_ATTEMPTS),
+            "FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS": json.dumps(list(save_at_steps)),
+            "FLASH_OPENRLHF_OPD_FINAL_STEP": str(int(final_step)),
         }
     )
     if warmstart_adapter:
@@ -1179,6 +1275,14 @@ def _find_checkpoint_state_file(root: str, marker: str) -> str:
     raise RuntimeError(f"OpenRLHF OPD checkpoint has no {marker} state file")
 
 
+def _save_training_rng_state(path: str) -> None:
+    import torch
+
+    from flash.engine.worker.rng import capture_training_rng_state
+
+    torch.save(capture_training_rng_state(torch), path)
+
+
 class _OpenRLHFOPDCheckpointPublisher:
     """Stage and publish a complete native DeepSpeed checkpoint before training continues."""
 
@@ -1194,6 +1298,8 @@ class _OpenRLHFOPDCheckpointPublisher:
         prompt_pool_fingerprint: str,
         prompts_per_step: int,
         group_size: int,
+        save_every: int,
+        final_step: int,
         required_steps: tuple[int, ...],
         state_for_step,
     ) -> None:
@@ -1206,6 +1312,8 @@ class _OpenRLHFOPDCheckpointPublisher:
         self.prompt_pool_fingerprint = prompt_pool_fingerprint
         self.prompts_per_step = prompts_per_step
         self.group_size = group_size
+        self.save_every = int(save_every)
+        self.final_step = int(final_step)
         self.required_steps = frozenset(int(step) for step in required_steps)
         self.state_for_step = state_for_step
         self._lock = threading.Lock()
@@ -1262,9 +1370,8 @@ class _OpenRLHFOPDCheckpointPublisher:
             shutil.copy2(os.path.join(adapter_export, name), os.path.join(stage, name))
         shutil.rmtree(adapter_export)
         optimizer = _find_checkpoint_state_file(actor_tag, "optim")
-        rng_state = _find_checkpoint_state_file(actor_tag, "model_states")
         shutil.copy2(optimizer, os.path.join(stage, "optimizer.pt"))
-        shutil.copy2(rng_state, os.path.join(stage, "rng_state.pth"))
+        _save_training_rng_state(os.path.join(stage, "rng_state.pth"))
         state = self.state_for_step(step)
         with open(os.path.join(stage, "opd_state.json"), "w", encoding="utf-8") as state_file:
             json.dump(state, state_file, sort_keys=True)
@@ -1274,22 +1381,33 @@ class _OpenRLHFOPDCheckpointPublisher:
         actor_tag, hf_export = self._wait_for_checkpoint(step)
         stage = self._stage(step, actor_tag, hf_export)
 
-        def publish_required() -> None:
-            if step in self.required_steps:
+        required_deployable = step in self.required_steps
+        periodic_deployable = (
+            not self.required_steps
+            and step != self.final_step
+            and self.save_every > 0
+            and step % self.save_every == 0
+        )
+
+        def publish_deployable() -> None:
+            if required_deployable or periodic_deployable:
                 _w.publish_deployable_checkpoint(
                     stage,
                     step,
-                    required=True,
+                    required=required_deployable,
                     _provenance_ready=True,
                 )
 
         uploaded = _w.upload_resume_checkpoint(
             step,
             stage,
-            after_upload=publish_required,
+            after_upload=publish_deployable,
         )
-        if step in self.required_steps and not uploaded:
-            raise RuntimeError(f"required OpenRLHF OPD checkpoint step {step} was not published")
+        resume_required = required_deployable or step == self.final_step
+        if resume_required and not uploaded:
+            raise _w.RetriableInfraError(
+                f"required OpenRLHF OPD checkpoint step {step} was not published"
+            )
 
 
 def _restore_openrlhf_resume(
@@ -1319,6 +1437,24 @@ def _restore_openrlhf_resume(
     if not os.path.isdir(os.path.join(resume, "_actor")):
         raise RuntimeError("OpenRLHF OPD resume checkpoint has no native DeepSpeed actor state")
     return resume, state
+
+
+def _reconcile_required_deployable(
+    resume_dir: str | None,
+    resume_state: dict[str, Any] | None,
+    save_at_steps: tuple[int, ...],
+) -> None:
+    if not resume_dir or resume_state is None:
+        return
+    step = int(resume_state["opt_steps"])
+    if step not in save_at_steps or _deployable_adapter_on_hf(step):
+        return
+    _w.publish_deployable_checkpoint(
+        resume_dir,
+        step,
+        required=True,
+        _provenance_ready=True,
+    )
 
 
 def _write_scheduled_dataset(
@@ -1438,21 +1574,26 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         raise RuntimeError("OpenRLHF OPD max_context_tokens leaves no room for a prompt")
 
     prompts: list[_PromptRecord] = []
-    for example in train:
-        messages = env.prompt_messages(example)
-        if record_has_images(example, messages):
-            raise RuntimeError("OpenRLHF OPD multimodal support is deferred; use the TRL backend")
-        rendered = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=_w.THINKING,
-        )
-        prompt_ids = tuple(tokenizer(rendered, add_special_tokens=False).input_ids)
-        if 0 < len(prompt_ids) <= prompt_budget:
-            prompts.append(
-                _PromptRecord(messages=messages, prompt_ids=prompt_ids, rendered=rendered)
+    scanned = 0
+    with liveness_heartbeat("opd_filtering_prompts", progress=lambda: scanned):
+        for example in train:
+            messages = env.prompt_messages(example)
+            if record_has_images(example, messages):
+                raise RuntimeError(
+                    "OpenRLHF OPD multimodal support is deferred; use the TRL backend"
+                )
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=_w.THINKING,
             )
+            prompt_ids = tuple(tokenizer(rendered, add_special_tokens=False).input_ids)
+            if 0 < len(prompt_ids) <= prompt_budget:
+                prompts.append(
+                    _PromptRecord(messages=messages, prompt_ids=prompt_ids, rendered=rendered)
+                )
+            scanned += 1
     if not prompts:
         raise RuntimeError("every OpenRLHF OPD prompt exceeds the configured prompt budget")
 
@@ -1480,7 +1621,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         "max_completion": knobs.max_completion,
         "max_length": knobs.max_length or (prompt_budget + knobs.max_completion),
         "steps": int(steps),
-        "save_every": math.gcd(knobs.save_every, steps, *knobs.save_at_steps),
+        "save_every": int(knobs.save_every),
         "save_at_steps": knobs.save_at_steps,
         "gpu_count": int(spec.gpu.count),
         "seed": int(backend_seed(spec.seed)),
@@ -1558,6 +1699,11 @@ def run_opd_openrlhf() -> None:
     )
     if resume_dir:
         checkpoint_dir = resume_dir
+    _reconcile_required_deployable(
+        resume_dir,
+        resume_state,
+        inputs["save_at_steps"],
+    )
     dataset_path = os.path.join(workdir, "train.jsonl")
     adapter_dir = f"/tmp/opd_seed{_w.SEED}/adapter"
     plugin_dir = write_openrlhf_opd_sitecustomize(workdir)
@@ -1613,6 +1759,8 @@ def run_opd_openrlhf() -> None:
             lora_target_modules=target_modules,
             kl_penalty_coef=inputs["kl_penalty_coef"],
             save_every=inputs["save_every"],
+            save_at_steps=inputs["save_at_steps"],
+            final_step=inputs["steps"],
             gpu_count=inputs["gpu_count"],
             qwen35_language_model_only=qwen35_language_model_only,
             resume=bool(resume_dir),
@@ -1627,6 +1775,8 @@ def run_opd_openrlhf() -> None:
             seed=int(_w.SEED),
             stop_sequences=inputs["stop_sequences"],
             eos_token_ids=eos_token_ids,
+            save_at_steps=inputs["save_at_steps"],
+            final_step=inputs["steps"],
             warmstart_adapter=warmstart_adapter,
         )
         python_bin = resolve_openrlhf_python(workdir)
@@ -1657,23 +1807,23 @@ def run_opd_openrlhf() -> None:
             prompt_pool_fingerprint=inputs["prompt_pool_fingerprint"],
             prompts_per_step=inputs["prompts_per_step"],
             group_size=inputs["group_size"],
+            save_every=inputs["save_every"],
+            final_step=inputs["steps"],
             required_steps=inputs["save_at_steps"],
             state_for_step=state_for_step,
         )
         bridge.checkpoint_callback = publisher.publish
 
-        def on_step(step: int) -> None:
+        def on_step(step: int, loss: float, coverage: float) -> None:
             step = int(step)
             if step <= last_step[0]:
                 return
+            if len(loss_curve) != step - 1 or len(coverage_curve) != step - 1:
+                raise RuntimeError(f"OpenRLHF OPD step {step} metrics are out of order")
+            loss_curve.append(float(loss))
+            coverage_curve.append(float(coverage))
             last_step[0] = step
             snapshot = bridge.snapshot()
-            aligned = int(snapshot["aligned_sequences"])
-            coverage = float(snapshot["coverage_sum"]) / aligned if aligned else 0.0
-            if len(coverage_curve) == step - 1:
-                coverage_curve.append(coverage)
-            if len(loss_curve) < step or len(coverage_curve) < step:
-                raise RuntimeError(f"OpenRLHF OPD step {step} log is missing loss or coverage")
             state = _checkpoint_state(
                 step=step,
                 seed=int(_w.SEED),
@@ -1690,14 +1840,7 @@ def run_opd_openrlhf() -> None:
                 step_states_condition.notify_all()
             _w.heartbeat("opd_step", step=last_step[0])
 
-        def on_line(line: str) -> None:
-            step_match = _STEP_RE.search(line)
-            loss_match = _LOSS_RE.search(line)
-            if step_match and loss_match:
-                step = int(step_match.group(1))
-                value = float(loss_match.group(1))
-                if step == len(loss_curve) + 1:
-                    loss_curve.append(value)
+        bridge.metrics_callback = on_step
 
         with liveness_heartbeat(
             "opd_openrlhf_training",
@@ -1710,14 +1853,11 @@ def run_opd_openrlhf() -> None:
                 env=child_env,
                 entrypoint=_OPENRLHF_ENTRYPOINT,
                 cwd=workdir,
-                on_step=on_step,
-                on_line=on_line,
                 heartbeat=lambda: _w.heartbeat(
                     "opd_openrlhf_training",
                     step=last_step[0],
                     gpu=gpu_diagnostics(),
                 ),
-                step_pattern=r"(?i)global[_ ]step[:=\s]+(\d+)",
             )
         _raise_training_failure(returncode, bridge.teacher_failure)
         if last_step[0] < inputs["steps"]:
@@ -1746,7 +1886,8 @@ def run_opd_openrlhf() -> None:
             inputs["model_revision"],
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(adapter_dir, last_step[0])
+        if final_save_due(last_step[0], inputs["save_at_steps"]):
+            _w.publish_deployable_checkpoint(adapter_dir, last_step[0])
 
     train_wall = time.time() - started_at
     aligned = int(accounting["aligned_sequences"])

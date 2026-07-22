@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib.util
 import io
@@ -139,6 +140,8 @@ def _config(**overrides) -> opd_openrlhf.OpenRLHFOPDConfig:
         "lora_target_modules": ("all-linear",),
         "kl_penalty_coef": 0.3,
         "save_every": 20,
+        "save_at_steps": (),
+        "final_step": 3,
         "gpu_count": 2,
         "qwen35_language_model_only": True,
     }
@@ -259,6 +262,7 @@ def test_teacher_bridge_round_trip_returns_aligned_action_tensors():
                 "label": identity,
                 "prompt_length": 2,
                 "sequence_ids": [10, 11, 20, 21, 2],
+                "terminated": True,
             },
         )
 
@@ -310,6 +314,7 @@ def test_teacher_bridge_preserves_typed_teacher_error_classification(permanent, 
                 "label": identity,
                 "prompt_length": 2,
                 "sequence_ids": [10, 11, 20, 21, 2],
+                "terminated": True,
             },
         )
 
@@ -348,6 +353,7 @@ def test_teacher_bridge_fails_closed_on_prompt_identity_mismatch():
                 "label": identity,
                 "prompt_length": 2,
                 "sequence_ids": [10, 99, 20, 21, 2],
+                "terminated": True,
             },
         )
 
@@ -421,10 +427,59 @@ def test_teacher_bridge_runs_checkpoint_callback_before_reply():
     assert calls == [3]
 
 
+def test_teacher_bridge_delivers_metrics_before_checkpoint():
+    calls = []
+    prompt = opd_openrlhf._PromptRecord(messages=[], prompt_ids=(10,), rendered="P")
+    with opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_Tokenizer(),
+        teacher=_Teacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        metrics_callback=lambda step, loss, coverage: calls.append(
+            ("metrics", step, loss, coverage)
+        ),
+        checkpoint_callback=lambda step: calls.append(("checkpoint", step)),
+    ) as bridge:
+        assert opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {"metrics": {"step": 3, "loss": 0.2, "coverage": 0.75}},
+        ) == {"ok": True}
+        assert opd_openrlhf.post_teacher_request(bridge.url, {"checkpoint": 3}) == {"ok": True}
+
+    assert calls == [("metrics", 3, 0.2, 0.75), ("checkpoint", 3)]
+
+
+def test_teacher_bridge_classifies_retriable_callback_failure_as_transient():
+    prompt = opd_openrlhf._PromptRecord(messages=[], prompt_ids=(10,), rendered="P")
+
+    def fail(_step):
+        raise opd_openrlhf._w.RetriableInfraError("temporary upload failure")
+
+    with (
+        opd_openrlhf.TeacherAlignmentBridge(
+            prompts=[prompt],
+            tokenizer=_Tokenizer(),
+            teacher=_Teacher(),
+            thinking_prefill="",
+            eos_token_ids=frozenset({2}),
+            stop_sequences=(),
+            checkpoint_callback=fail,
+        ) as bridge,
+        pytest.raises(opd_openrlhf.OpenRLHFTeacherBridgeError) as error,
+    ):
+        opd_openrlhf.post_teacher_request(bridge.url, {"checkpoint": 3})
+
+    assert error.value.classification == "transient"
+
+
 def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     events = []
     publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
     publisher.required_steps = frozenset({2})
+    publisher.save_every = 20
+    publisher.final_step = 3
     monkeypatch.setattr(publisher, "_wait_for_checkpoint", lambda _step: ("actor", "hf"))
     monkeypatch.setattr(publisher, "_stage", lambda *_args: "/staged/checkpoint-2")
 
@@ -444,6 +499,111 @@ def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     publisher._publish(2)
 
     assert events == ["resume", "deployable"]
+
+
+def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
+    events = []
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.required_steps = frozenset()
+    publisher.save_every = 2
+    publisher.final_step = 5
+    monkeypatch.setattr(publisher, "_wait_for_checkpoint", lambda _step: ("actor", "hf"))
+    monkeypatch.setattr(publisher, "_stage", lambda *_args: "/staged/checkpoint-2")
+
+    def upload(_step, _stage, *, after_upload=None):
+        events.append("resume")
+        after_upload()
+        return True
+
+    monkeypatch.setattr(opd_openrlhf._w, "upload_resume_checkpoint", upload)
+    monkeypatch.setattr(
+        opd_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda *_args, **kwargs: events.append(("deployable", kwargs["required"])),
+    )
+
+    publisher._publish(2)
+
+    assert events == ["resume", ("deployable", False)]
+
+
+def test_checkpoint_stage_writes_flash_rng_blob_instead_of_model_state_shard(monkeypatch, tmp_path):
+    actor_tag = tmp_path / "actor"
+    hf_export = tmp_path / "hf"
+    actor_tag.mkdir()
+    hf_export.mkdir()
+    actor_tag.joinpath("zero_optim_states.pt").write_bytes(b"optimizer")
+    hf_export.joinpath("adapter_config.json").write_text("{}", encoding="utf-8")
+    hf_export.joinpath("adapter_model.bin").write_bytes(b"adapter")
+
+    def export(_source, destination, *_args):
+        os.makedirs(destination)
+        Path(destination, "adapter_config.json").write_text("{}", encoding="utf-8")
+        Path(destination, "adapter_model.bin").write_bytes(b"adapter")
+
+    monkeypatch.setattr(opd_openrlhf, "export_openrlhf_adapter", export)
+    monkeypatch.setattr(
+        opd_openrlhf,
+        "_save_training_rng_state",
+        lambda path: Path(path).write_bytes(b"flash-rng-state"),
+    )
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.staging_root = str(tmp_path / "staging")
+    publisher.model_id = "Qwen/Qwen3.5-0.8B"
+    publisher.model_revision = "a" * 40
+    publisher.python_bin = "/usr/bin/python"
+    publisher.state_for_step = lambda step: {"step": step}
+
+    stage = Path(publisher._stage(2, str(actor_tag), str(hf_export)))
+
+    assert stage.joinpath("optimizer.pt").read_bytes() == b"optimizer"
+    assert stage.joinpath("rng_state.pth").read_bytes() == b"flash-rng-state"
+
+
+def test_final_resume_checkpoint_is_required_without_extra_deployable(monkeypatch):
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.required_steps = frozenset()
+    publisher.save_every = 20
+    publisher.final_step = 3
+    monkeypatch.setattr(publisher, "_wait_for_checkpoint", lambda _step: ("actor", "hf"))
+    monkeypatch.setattr(publisher, "_stage", lambda *_args: "/staged/checkpoint-3")
+    monkeypatch.setattr(
+        opd_openrlhf._w, "upload_resume_checkpoint", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(
+        opd_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("final deployable is published during finalization"),
+    )
+
+    with pytest.raises(
+        opd_openrlhf._w.RetriableInfraError,
+        match="required OpenRLHF OPD checkpoint step 3",
+    ):
+        publisher._publish(3)
+
+
+def test_resume_reconciles_missing_required_deployable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(opd_openrlhf, "_deployable_adapter_on_hf", lambda _step: False)
+    monkeypatch.setattr(
+        opd_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    opd_openrlhf._reconcile_required_deployable(
+        "/resume/checkpoint-2",
+        {"opt_steps": 2},
+        (2,),
+    )
+
+    assert calls == [
+        (
+            ("/resume/checkpoint-2", 2),
+            {"required": True, "_provenance_ready": True},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -472,17 +632,48 @@ def test_ray_modified_class_checkpoint_and_warmstart_fit_hooks_execute(monkeypat
     trainer.original_fit_calls = []
     trainer.broadcast_to_vllm = lambda: callbacks.append("broadcast")
 
-    trainer.save_logs_and_checkpoints(1, {"loss": 0.2}, {"global_step": 1})
+    logs = {"policy_loss": 0.2, "teacher_coverage": 0.75}
+    trainer.save_logs_and_checkpoints(1, logs, {"global_step": 1})
     result = trainer.fit()
 
     assert actor_trainer.training_step is namespace["_flash_opd_training_step"]
     assert ray_wrapper.__ray_metadata__.modified_class is runtime
     assert runtime.save_logs_and_checkpoints is namespace["_flash_save_logs_and_checkpoints"]
     assert runtime.fit is namespace["_flash_ppo_fit"]
-    assert trainer.original_saves == [(1, {"loss": 0.2}, {"global_step": 1})]
-    assert callbacks == [{"checkpoint": 1}, "broadcast"]
+    assert trainer.original_saves == [(1, logs, {"global_step": 1})]
+    assert callbacks == [
+        {"metrics": {"step": 1, "loss": 0.2, "coverage": 0.75}},
+        {"checkpoint": 1},
+        "broadcast",
+    ]
     assert trainer.original_fit_calls == [((), {})]
     assert result == "fit-result"
+
+
+def test_checkpoint_hook_uses_exact_steps_plus_final_boundary(monkeypatch):
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS", "[2]")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_FINAL_STEP", "3")
+    namespace, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch)
+    callbacks = []
+    namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
+    trainer = runtime()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=float("inf"), load_enable=False))
+    trainer.original_saves = []
+    trainer.original_fit_calls = []
+    logs = {"policy_loss": 0.2, "teacher_coverage": 0.75}
+
+    trainer.save_logs_and_checkpoints(1, logs, {"global_step": 1})
+    trainer.save_logs_and_checkpoints(2, logs, {"global_step": 2})
+    trainer.save_logs_and_checkpoints(3, logs, {"global_step": 3})
+
+    assert callbacks == [
+        {"metrics": {"step": 1, "loss": 0.2, "coverage": 0.75}},
+        {"metrics": {"step": 2, "loss": 0.2, "coverage": 0.75}},
+        {"checkpoint": 2},
+        {"metrics": {"step": 3, "loss": 0.2, "coverage": 0.75}},
+        {"checkpoint": 3},
+    ]
+    assert trainer.args.ckpt.save_steps == float("inf")
 
 
 def test_ray_modified_class_fit_does_not_prebroadcast_resumed_warmstart(monkeypatch):
@@ -534,6 +725,102 @@ def test_child_seed_matches_optimizer_example_rollout_retry_identity(monkeypatch
         2,
         no_signal_attempt_ordinal=1,
     )
+
+
+def test_child_passes_native_non_length_termination_to_teacher_bridge(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    payloads = []
+
+    async def execute(*_args, **_kwargs):
+        return {
+            "action_ranges": [(2, 4)],
+            "observation_tokens": [10, 11, 20, 21],
+            "truncated": False,
+        }
+
+    namespace["_original_execute"] = execute
+    namespace["_flash_post_teacher"] = lambda payload: (
+        payloads.append(payload)
+        or {
+            "signal_count": 1,
+            "teacher_group_ids": [-1, 0, 1],
+            "teacher_logsums": [0.0, -0.2, -0.4],
+            "teacher_signal_mask": [False, True, True],
+            "coverage": 1.0,
+        }
+    )
+    label = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 0,
+            "no_signal_attempt": 0,
+        }
+    )
+
+    result = asyncio.run(
+        namespace["_flash_opd_execute"](
+            SimpleNamespace(),
+            "prompt",
+            label,
+            SimpleNamespace(),
+            10,
+            object(),
+            object(),
+        )
+    )
+
+    assert result["teacher_coverage"] == 1.0
+    assert payloads[0]["terminated"] is True
+
+
+def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    attempts = []
+
+    class _Exit(RuntimeError):
+        def __init__(self, code):
+            super().__init__(str(code))
+            self.code = code
+
+    async def execute(*_args, **_kwargs):
+        return {
+            "action_ranges": [(2, 4)],
+            "observation_tokens": [10, 11, 20, 21],
+            "truncated": False,
+        }
+
+    namespace["_original_execute"] = execute
+    namespace["_flash_post_teacher"] = lambda payload: (
+        attempts.append(payload) or {"signal_count": 0}
+    )
+    namespace["os"] = SimpleNamespace(
+        _exit=lambda code: (_ for _ in ()).throw(_Exit(code)),
+    )
+    label = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 0,
+            "no_signal_attempt": 0,
+        }
+    )
+
+    with pytest.raises(_Exit) as error:
+        asyncio.run(
+            namespace["_flash_opd_execute"](
+                SimpleNamespace(),
+                "prompt",
+                label,
+                SimpleNamespace(),
+                10,
+                object(),
+                object(),
+            )
+        )
+
+    assert error.value.code == opd_openrlhf._OPENRLHF_TRANSIENT_TEACHER_EXIT
+    assert len(attempts) == opd_openrlhf._OPENRLHF_NO_SIGNAL_ATTEMPTS
 
 
 def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
@@ -657,6 +944,13 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert _value(args, "--algo.advantage.estimator") == "reinforce"
     assert _value(args, "--algo.kl.init_coef") == "0.0"
     assert _value(args, "--actor.adam.lr") == "1e-05"
+    assert args[args.index("--actor.adam.betas") + 1 : args.index("--actor.adam.betas") + 3] == [
+        "0.9",
+        "0.999",
+    ]
+    assert _value(args, "--actor.adam.eps") == "1e-8"
+    assert _value(args, "--actor.adam.weight_decay") == "0.01"
+    assert "--train.full_determinism_enable" not in args
     assert _value(args, "--ds.lora.rank") == "32"
     assert _value(args, "--ds.lora.alpha") == "64"
     assert _value(args, "--ds.lora.target_modules") == "all-linear"
@@ -669,6 +963,12 @@ def test_build_openrlhf_opd_args_enables_native_resume():
     args = opd_openrlhf.build_openrlhf_opd_args(replace(_config(), resume=True))
 
     assert "--ckpt.load_enable" in args
+
+
+def test_build_openrlhf_opd_args_disables_periodic_saves_for_exact_schedule():
+    args = opd_openrlhf.build_openrlhf_opd_args(_config(save_at_steps=(2,)))
+
+    assert _value(args, "--ckpt.save_steps") == "-1"
 
 
 def test_build_openrlhf_opd_args_rejects_nonpositive_objective_scale():
@@ -692,6 +992,8 @@ def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
         seed=42,
         stop_sequences=("</answer>",),
         eos_token_ids=frozenset({2, 3}),
+        save_at_steps=(2,),
+        final_step=3,
         warmstart_adapter="/work/warmstart",
     )
 
@@ -702,6 +1004,8 @@ def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
     assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/warmstart"
     assert json.loads(child["FLASH_OPENRLHF_OPD_STOP_SEQUENCES"]) == ["</answer>"]
     assert json.loads(child["FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS"]) == [2, 3]
+    assert json.loads(child["FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS"]) == [2]
+    assert child["FLASH_OPENRLHF_OPD_FINAL_STEP"] == "3"
     assert "FIREWORKS_API_KEY" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -790,13 +1094,21 @@ def test_pinned_openrlhf_hooks_target_concrete_ray_runtime(monkeypatch):
     trainer.broadcast_to_vllm = lambda: callbacks.append("broadcast")
     namespace["_original_ppo_fit"] = lambda self, *args, **kwargs: "fit-result"
 
-    trainer.save_logs_and_checkpoints(1, {}, {"global_step": 1})
+    trainer.save_logs_and_checkpoints(
+        1,
+        {"distillation_loss": 0.2, "teacher_coverage": 0.75},
+        {"global_step": 1},
+    )
     result = trainer.fit()
 
     assert ppo_actor_module.ActorPPOTrainer.training_step is namespace["_flash_opd_training_step"]
     assert runtime.save_logs_and_checkpoints is namespace["_flash_save_logs_and_checkpoints"]
     assert runtime.fit is namespace["_flash_ppo_fit"]
-    assert callbacks == [{"checkpoint": 1}, "broadcast"]
+    assert callbacks == [
+        {"metrics": {"step": 1, "loss": 0.2, "coverage": 0.75}},
+        {"checkpoint": 1},
+        "broadcast",
+    ]
     assert result == "fit-result"
 
 
@@ -965,7 +1277,16 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
     assert "shuffle=False" in source
     assert "_FLASH_BRIDGE_TRANSPORT_ATTEMPTS = 3" in source
     assert "FLASH_OPENRLHF_WARMSTART_ADAPTER" in source
+    assert 'getattr(result, "missing_keys", [])' in source
+    assert 'name.endswith("lora_B.default.weight")' in source
     assert "FIREWORKS_API_KEY" not in source
+
+
+def test_parent_worker_keeps_filtering_liveness_and_exact_final_checkpoint_gate():
+    source = Path(opd_openrlhf.__file__).read_text(encoding="utf-8")
+
+    assert 'liveness_heartbeat("opd_filtering_prompts", progress=lambda: scanned)' in source
+    assert 'if final_save_due(last_step[0], inputs["save_at_steps"]):' in source
 
 
 def test_run_opd_dispatches_to_openrlhf(monkeypatch):
