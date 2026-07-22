@@ -426,6 +426,57 @@ def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
     assert out["gpu_memory_utilization"] == 0.37
 
 
+def test_opd_vllm_kwargs_drops_catalog_geometry_for_pinned_revision(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker import gpu_setup
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    class _Cuda:
+        @staticmethod
+        def get_device_capability():
+            return (8, 9)
+
+        @staticmethod
+        def get_device_properties(_idx):
+            return SimpleNamespace(total_memory=80e9)
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = _Cuda
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
+    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
+    captured = {}
+
+    def _resolve_params(_model_id, revision=""):
+        captured["revision"] = revision
+        return 35.0
+
+    def _capture_util(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0.37
+
+    monkeypatch.setattr(vram, "resolve_params_b", _resolve_params)
+    monkeypatch.setattr(vram, "colocate_kv_util", _capture_util)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.6-35B-A3B",
+        SimpleNamespace(prompts_per_step=1, group_size=1),
+        4096,
+        model_revision="a" * 40,
+    )
+
+    assert captured["revision"] == "a" * 40
+    assert captured["active_params_b"] == 0.0
+    assert captured["model_info"] is None
+    assert out["gpu_memory_utilization"] == 0.37
+
+    import inspect
+
+    from flash.engine.worker import opd as opd_mod
+
+    assert "model_revision=model_revision" in inspect.getsource(opd_mod.run_opd)
+
+
 @pytest.mark.parametrize(("card_gb", "free_gb"), [(80.0, 68.0), (141.0, 125.0)])
 def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
     monkeypatch, card_gb, free_gb
