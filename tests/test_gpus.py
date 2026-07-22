@@ -260,7 +260,7 @@ def test_opd_kv_floor_uses_fp8_above_non_fp8_ceiling():
     from flash.engine.vram import grpo_kv_floor_gb, model_required_vram_gb
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
-    info = MODELS["Qwen/Qwen3.5-0.8B"]
+    info = MODELS["Qwen/Qwen3.5-2B"]
     concurrency = 8 * 16
     ceiling = max_non_fp8_kv_vram_gb()
     bf16_floor = grpo_kv_floor_gb(
