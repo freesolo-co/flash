@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from flash.catalog import resolve_vocab_size
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
     final_save_due,
@@ -24,7 +23,7 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
-from flash.engine.structured_outputs import parse_structured_outputs, reasoning_parser_for
+from flash.engine.structured_outputs import reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.opd import (
@@ -924,7 +923,19 @@ def run_opd_verl(spec=None) -> None:
     if getattr(env, "is_tool_env", False) or getattr(env, "multi_turn", False):
         raise RuntimeError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
     knobs = _resolve_opd_knobs()
-    structured_outputs = parse_structured_outputs(knobs.structured_outputs)
+    model_id = spec.model if spec else RECIPE.hf_model_id
+    model_revision = getattr(spec, "model_revision", "") if spec else ""
+    from flash.opd_verl_validation import validate_opd_verl_structured_outputs
+
+    structured_validation = validate_opd_verl_structured_outputs(
+        knobs.structured_outputs,
+        model_id=model_id,
+        model_revision=model_revision,
+        model_policy=getattr(spec, "model_policy", "catalog") if spec else "catalog",
+        gpu=(spec.gpu.exact_type or spec.gpu.type) if spec else None,
+    )
+    structured_outputs = structured_validation.constraint
+    model_vocab_size = structured_validation.model_vocab_size
     train = list(env.dataset())
     if not train:
         raise RuntimeError("opd environment dataset is empty")
@@ -933,7 +944,6 @@ def run_opd_verl(spec=None) -> None:
         train = train[:max_examples]
     prompt_rows = [(example, env.prompt_messages(example)) for example in train]
     multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
-    model_id = spec.model if spec else RECIPE.hf_model_id
     if multimodal:
         validate_multimodal_training(model_id, "opd", multi_turn=False)
         validate_image_opd_teacher(knobs.teacher_model)
@@ -945,8 +955,6 @@ def run_opd_verl(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.exact_type if spec else "",
     )
-    model_revision = getattr(spec, "model_revision", "") if spec else ""
-    model_vocab_size = resolve_vocab_size(model_id, model_revision)
     download_seconds = _w.prefetch_model(model_id, revision=model_revision)
 
     api_key = os.environ.get("FIREWORKS_API_KEY", "").strip()

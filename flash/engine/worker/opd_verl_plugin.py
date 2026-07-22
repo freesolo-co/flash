@@ -29,7 +29,11 @@ except ImportError:
 
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
-_STRUCTURED_RUNTIME_VERSIONS = {"verl": "0.8.0", "vllm": "0.11.0"}
+_STRUCTURED_RUNTIME_VERSIONS = {
+    "verl": "0.8.0",
+    "vllm": "0.11.0",
+    "xgrammar": "0.1.25",
+}
 
 
 def _require_structured_runtime_versions() -> None:
@@ -618,6 +622,9 @@ def main() -> None:
 
     verl_main()
 
+
+if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
+    _require_structured_runtime_versions()
 
 if importlib.util.find_spec("verl") is not None:
     _install_verl_extensions()
