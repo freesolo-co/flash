@@ -80,6 +80,38 @@ class _MultiTurnEnv:
         return 0.5
 
 
+class _TextFreeMultiTurnEnv(_MultiTurnEnv):
+    # a native tool-call assistant turn (content=null) sits between two text turns; the
+    # offline driver must replay the gold turns positionally so the null turn maps to model
+    # turn 2 instead of collapsing the sequence and shifting "third" up a slot.
+    def __init__(self):
+        super().__init__()
+        self.recorded = []
+
+    def dataset(self):
+        return [
+            {
+                "input": "finish the exchange",
+                "output": [
+                    {"role": "assistant", "content": "first"},
+                    {"role": "assistant", "content": None},
+                    {"role": "assistant", "content": "third"},
+                ],
+            }
+        ]
+
+    def record_model_turn(self, state, content):
+        self.recorded.append(content)
+        return super().record_model_turn(state, content)
+
+    def env_reply(self, messages, state):
+        state["turn"] += 1
+        state["done"] = state["turn"] >= 3
+        reply = {"role": "user", "content": "continue"}
+        messages.append(reply)
+        return [reply]
+
+
 class _PerExampleCapMultiTurnEnv(_MultiTurnEnv):
     max_turns = 8
 
@@ -286,6 +318,21 @@ def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys
     out = capsys.readouterr().out
     assert "episode 1: policy=replay turns=2 reward=0.500000" in out
     assert "1/1 episodes passed contract checks" in out
+
+
+def test_env_test_multi_turn_replays_text_free_turn_positionally(
+    monkeypatch, tmp_path, capsys
+):
+    # dropping the null tool-call turn would shift "third" into its slot and misgrade; the
+    # driver must replay ["first", "", "third"] positionally.
+    env_dir = _environment_dir(tmp_path)
+    env = _TextFreeMultiTurnEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert env.recorded == ["first", "", "third"]
+    out = capsys.readouterr().out
+    assert "overall: PASS" in out
 
 
 def test_env_test_multi_turn_bounds_turns_to_hard_cap(monkeypatch, tmp_path, capsys):
