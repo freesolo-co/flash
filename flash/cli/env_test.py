@@ -12,26 +12,48 @@ from .envpush import _err, _resolve_local_env_entrypoint
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
 _PREVIEW_CHARS = 200
-_TURN_SAFETY_BUFFER = 2
 
 
-def _prompt_error(messages: object) -> str | None:
+def _check_prompt(messages: object) -> list[dict]:
+    """Validate that `messages` is a well-formed chat prompt and return it."""
     if not isinstance(messages, list) or not messages:
-        return "prompt must be a non-empty list"
+        raise ValueError("prompt is not well-formed: prompt must be a non-empty list")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
-            return f"prompt message {index} must be a dict"
+            raise ValueError(
+                f"prompt is not well-formed: prompt message {index} must be a dict"
+            )
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
-            return f"prompt message {index} must have a non-empty string role"
+            raise ValueError(
+                f"prompt is not well-formed: prompt message {index} "
+                "must have a non-empty string role"
+            )
         if role.strip().lower() not in _ALLOWED_ROLES:
-            return f"prompt message {index} has unsupported role {role!r}"
+            raise ValueError(
+                f"prompt is not well-formed: prompt message {index} "
+                f"has unsupported role {role!r}"
+            )
         if "content" not in message:
-            return f"prompt message {index} must have a content key"
-    return None
+            raise ValueError(
+                f"prompt is not well-formed: prompt message {index} must have a content key"
+            )
+        # content is a string, a multimodal content-block list, or null for a native
+        # assistant tool-call message. reject scalars like ints so a malformed prompt is
+        # not reported as a false pass.
+        content = message["content"]
+        if content is not None and not isinstance(content, (str, list)):
+            raise ValueError(
+                f"prompt is not well-formed: prompt message {index} content "
+                "must be a string, a content-block list, or null"
+            )
+    return messages
 
 
 def _reference_turns(env, example: dict) -> list[str]:
+    # the adapter's sft_completion is always a list[dict] or raises on a malformed shape
+    # (which surfaces as an episode failure), so only string content is a usable replay
+    # target here; a non-text target contributes nothing and falls back to the echo policy.
     messages = env.sft_completion(example)
     assistant = [
         message
@@ -41,8 +63,9 @@ def _reference_turns(env, example: dict) -> list[str]:
     ]
     selected = assistant or [message for message in messages if isinstance(message, dict)]
     return [
-        content if isinstance(content := message.get("content"), str) else str(content or "")
+        content
         for message in selected
+        if isinstance(content := message.get("content"), str)
     ]
 
 
@@ -69,55 +92,53 @@ def _preview(value: object) -> str:
     return f"{text[: _PREVIEW_CHARS - 3]}..."
 
 
-def _check_prompt(messages: object) -> list[dict]:
-    error = _prompt_error(messages)
-    if error:
-        raise ValueError(f"prompt is not well-formed: {error}")
-    return messages
+def _new_record() -> dict:
+    """Mutable per-episode record so a failing episode still reports real progress."""
+    return {"policy": "n/a", "turns": 0, "reward": None, "prompt": [], "responses": []}
 
 
-def _drive_single_turn(env, example: dict):
+def _drive_single_turn(env, example: dict, record: dict) -> None:
     prompt = _check_prompt(env.prompt_messages(example))
+    record["prompt"] = prompt
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
+    record["policy"] = policy
     response = "\n".join(reference_turns) if policy == "replay" else _ECHO_RESPONSE
-    reward = float(env.reward(response, example))
-    return policy, 1, reward, prompt, [response]
+    record["responses"] = [response]
+    record["turns"] = 1
+    record["reward"] = float(env.reward(response, example))
 
 
-def _drive_multi_turn(env, example: dict):
+def _drive_multi_turn(env, example: dict, record: dict) -> None:
     state = env.new_rollout_state(example)
-    prompt = _check_prompt(state.get("prompt") or state.get("messages"))
+    record["prompt"] = _check_prompt(state.get("prompt") or state.get("messages"))
     reference_turns = _reference_turns(env, example)
     policy = _resolve_policy(reference_turns)
+    record["policy"] = policy
+    # mirror the worker turn loop (flash/engine/multiturn_rollout.py): drive one model
+    # turn, then stop at the hard turn ceiling, on the env's own done signal, or when the
+    # env yields no reply. the hard cap equals what the trainer passes (env.max_turns) and
+    # rises every turn, so a cooperatively-stepping env terminates here exactly as it
+    # would in training; no separate non-termination guard is needed.
     hard_cap = int(env.max_turns)
-    per_example_cap = state.get("max_episode_turns")
-    effective_cap = int(per_example_cap) if per_example_cap is not None else hard_cap
-    safety_limit = effective_cap + _TURN_SAFETY_BUFFER
-    turn_index = 0
-    responses: list[str] = []
-    safety_tripped = False
-
-    while not env.rollout_done(state, max_turns=hard_cap):
-        if policy == "replay" and turn_index < len(reference_turns):
-            content = reference_turns[turn_index]
+    turns = 0
+    while True:
+        if policy == "replay" and turns < len(reference_turns):
+            content = reference_turns[turns]
         else:
             content = _ECHO_RESPONSE
-        responses.append(content)
+        record["responses"].append(content)
         env.record_model_turn(state, content)
-        env.env_reply(state["messages"], state)
-        turn_index += 1
-        if turn_index > safety_limit:
-            safety_tripped = True
+        turns += 1
+        record["turns"] = turns
+        if turns >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
+            break
+        if not env.env_reply(state["messages"], state):
+            break
+        if env.rollout_done(state, max_turns=hard_cap):
             break
 
-    if safety_tripped:
-        raise RuntimeError(f"episode exceeded the turn safety limit ({safety_limit})")
-    if not env.rollout_done(state, max_turns=hard_cap):
-        raise RuntimeError(f"episode did not terminate within the turn cap ({effective_cap})")
-
-    reward = float(env.reward("", example, state))
-    return policy, turn_index, reward, prompt, responses
+    record["reward"] = float(env.reward("", example, state))
 
 
 def _load_failure(reason: str) -> int:
@@ -127,16 +148,30 @@ def _load_failure(reason: str) -> int:
 
 
 def cmd_env_test(args) -> int:
-    """Load a local environment and drive deterministic offline contract checks."""
+    """Load a local environment and drive deterministic offline contract checks.
+
+    a fully non-returning environment hook (one that never yields control back) cannot be
+    interrupted in-process, so run this under a ci job timeout to bound that class of
+    defect; the per-episode turn cap (env.max_turns) bounds any cooperatively-stepping
+    multi-turn loop exactly as the trainer does.
+    """
     try:
         _, _, entrypoint, _ = _resolve_local_env_entrypoint(Path(args.path))
-        from flash.envs.loader import load_freesolo_environment
-
-        env = load_freesolo_environment(str(entrypoint))
-        dataset = env.dataset()
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         reason = str(exc) or exc.__class__.__name__
         return _load_failure(reason.replace("cannot publish", "cannot test"))
+
+    try:
+        from flash.envs.loader import load_freesolo_environment
+
+        # resolve to an absolute path so the loader takes its local-file branch; a bare
+        # relative dir like `my-env` matches the managed-slug pattern and would otherwise
+        # resolve remotely, breaking the offline contract.
+        env = load_freesolo_environment(str(entrypoint.resolve()))
+        dataset = env.dataset()
+    except (Exception, SystemExit) as exc:
+        reason = str(exc) or exc.__class__.__name__
+        return _load_failure(reason)
 
     if not dataset:
         return _load_failure("dataset is empty")
@@ -144,35 +179,39 @@ def cmd_env_test(args) -> int:
     episode_count = min(max(1, int(args.episodes)), len(dataset))
     passed = 0
     for index, example in enumerate(dataset[:episode_count], start=1):
-        policy = "replay"
-        turns = 0
-        reward: float | None = None
-        prompt: object = []
-        responses: list[str] = []
+        record = _new_record()
         failure: str | None = None
         try:
             if env.multi_turn:
-                policy, turns, reward, prompt, responses = _drive_multi_turn(env, example)
+                _drive_multi_turn(env, example, record)
             else:
-                policy, turns, reward, prompt, responses = _drive_single_turn(env, example)
-            if not math.isfinite(reward):
+                _drive_single_turn(env, example, record)
+            reward = record["reward"]
+            if reward is None or not math.isfinite(reward):
                 raise ValueError(f"reward is not finite: {reward}")
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             failure = str(exc) or exc.__class__.__name__
 
+        reward = record["reward"]
         reward_text = "n/a" if reward is None else f"{reward:.6f}"
-        print(f"episode {index}: policy={policy} turns={turns} reward={reward_text}")
-        print(f"  prompt: {_preview(prompt)}")
-        print(f"  response: {_preview(responses)}")
+        print(
+            f"episode {index}: policy={record['policy']} "
+            f"turns={record['turns']} reward={reward_text}"
+        )
+        print(f"  prompt: {_preview(record['prompt'])}")
+        print(f"  response: {_preview(record['responses'])}")
         if failure:
             _err(f"episode {index} failed contract checks: {failure}")
             continue
 
         passed += 1
-        if policy == "replay" and reward is not None and reward <= 0.0:
+        if record["policy"] == "replay" and reward is not None and reward <= 0.0:
+            message = (
+                f"replay gold answer scored low (reward={reward:.6f}); "
+                "check the reward function"
+            )
             print(
-                f"WARNING: replay gold answer scored low (reward={reward:.6f}); "
-                "check the reward function",
+                render.warn(message) if render.styled() else f"warning: {message}",
                 file=sys.stderr,
             )
 
