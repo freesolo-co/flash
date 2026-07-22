@@ -366,6 +366,88 @@ def test_remove_run_drain_does_not_block_other_run_publication(tmp_path):
     asyncio.run(scenario())
 
 
+def test_replacement_run_can_register_while_removed_run_drains(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = _manager(engine, run_capacity=1)
+        run_a = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        engine.release[run_a.lora_int_id] = asyncio.Event()
+
+        rollout = asyncio.create_task(
+            manager.generate(run_a, {"prompt_token_ids": [1]}, {"temperature": 0})
+        )
+        await engine.started.setdefault(run_a.lora_int_id, asyncio.Event()).wait()
+        removal = asyncio.create_task(manager.remove_run("run-a", 0))
+        while True:
+            with contextlib.suppress(AdapterRegistryError):
+                await manager.current_handle("run-a")
+                await asyncio.sleep(0)
+                continue
+            break
+
+        run_b = await manager.register_run("run-b", 0, _adapter_dir(tmp_path, "b-v0"))
+        assert run_b.run_slot == run_a.run_slot
+        assert removal.done() is False
+
+        engine.release[run_a.lora_int_id].set()
+        await rollout
+        await removal
+        assert await manager.current_handle("run-b") == run_b
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_remove_finishes_drain_and_cleanup(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = _manager(engine, run_capacity=1)
+        run_a = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        engine.release[run_a.lora_int_id] = asyncio.Event()
+
+        rollout = asyncio.create_task(
+            manager.generate(run_a, {"prompt_token_ids": [1]}, {"temperature": 0})
+        )
+        await engine.started.setdefault(run_a.lora_int_id, asyncio.Event()).wait()
+        removal = asyncio.create_task(manager.remove_run("run-a", 0))
+        while True:
+            with contextlib.suppress(AdapterRegistryError):
+                await manager.current_handle("run-a")
+                await asyncio.sleep(0)
+                continue
+            break
+
+        removal.cancel()
+        engine.release[run_a.lora_int_id].set()
+        await rollout
+        with pytest.raises(asyncio.CancelledError):
+            await removal
+
+        assert (await manager.health()).adapters == ()
+        assert run_a.lora_int_id not in engine.loaded
+
+    asyncio.run(scenario())
+
+
+def test_remove_eviction_failure_is_deferred_without_blocking_free_capacity(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=3)
+        manager = _manager(engine, run_capacity=2)
+        run_a = await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        await manager.register_run("run-b", 0, _adapter_dir(tmp_path, "b-v0"))
+        engine.fail_remove_count[run_a.lora_int_id] = 2
+
+        await manager.remove_run("run-a", 0)
+        assert engine.fail_remove_count[run_a.lora_int_id] == 1
+        with pytest.raises(AdapterRegistryError, match="unknown run"):
+            await manager.current_handle("run-a")
+
+        run_b_v1 = await manager.publish_adapter("run-b", 0, 1, _adapter_dir(tmp_path, "b-v1"))
+        assert run_b_v1.version == 1
+        assert engine.fail_remove_count[run_a.lora_int_id] == 1
+
+    asyncio.run(scenario())
+
+
 def test_run_id_normalization_is_consistent_for_every_operation(tmp_path):
     async def scenario():
         engine = _FakeEngine()
@@ -483,6 +565,12 @@ def test_adapter_directory_cannot_be_reused_for_another_immutable_version(tmp_pa
 
         with pytest.raises(AdapterRegistryError, match="already published"):
             await manager.publish_adapter("run-a", 0, 1, adapter_dir)
+
+        first = await manager.current_handle("run-a")
+        await manager.remove_run("run-a", 0)
+        second = await manager.register_run("run-b", 0, adapter_dir)
+        assert second.adapter_dir == first.adapter_dir
+        assert second.lora_int_id != first.lora_int_id
 
     asyncio.run(scenario())
 
