@@ -790,6 +790,8 @@ def render_openrlhf_sft_runtime() -> str:
     """return the standalone child patch module loaded through sitecustomize."""
     import inspect
 
+    from flash.engine.worker.perf.memory import enable_multimodal_input_require_grads
+
     runtime = r"""from __future__ import annotations
 
 import io
@@ -1134,28 +1136,6 @@ def _resume_training_state(consumed_samples):
     return global_step, restored_samples, loss_curve, token_count
 
 
-def _enable_vlm_input_require_grads(model):
-    existing_handle = getattr(model, "_flash_vision_require_grads_hook", None)
-    if existing_handle is not None:
-        existing_handle.remove()
-
-    for module_path, module in model.named_modules():
-        if not module_path.endswith("visual.patch_embed"):
-            continue
-
-        def require_output_grad(_module, _inputs, output):
-            import torch
-
-            tensor = output[0] if isinstance(output, tuple) and output else output
-            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
-                tensor.requires_grad_(True)
-
-        handle = module.register_forward_hook(require_output_grad)
-        model._flash_vision_require_grads_hook = handle
-        return handle
-    return None
-
-
 def _install_chunked_loss_forward(actor):
     import types
 
@@ -1183,7 +1163,7 @@ def _install_chunked_loss_forward(actor):
     original_forward = base_lm.forward
     is_vlm = bool(getattr(actor, "is_vlm", False))
     if is_vlm:
-        _enable_vlm_input_require_grads(base_lm)
+        enable_multimodal_input_require_grads(base_lm)
 
     def vlm_hidden_states(input_ids, attention_mask, kwargs):
         config = base_lm.config
@@ -1473,6 +1453,7 @@ def apply_flash_openrlhf_sft_patches():
     helper_source = "\n\n".join(
         inspect.getsource(function)
         for function in (
+            enable_multimodal_input_require_grads,
             _selected_token_nll_chunk,
             _chunked_selected_token_nll,
         )

@@ -523,6 +523,17 @@ def test_chunked_nll_uses_output_head_hooks_during_backward_recompute():
     assert output_head.weight.grad is not None
 
 
+def test_rendered_runtime_embeds_canonical_vlm_gradient_hook():
+    import inspect
+
+    from flash.engine.worker.perf.memory import enable_multimodal_input_require_grads
+
+    source = render_openrlhf_sft_runtime()
+
+    assert inspect.getsource(enable_multimodal_input_require_grads) in source
+    assert "def _enable_vlm_input_require_grads" not in source
+
+
 def test_rendered_runtime_keeps_sdpa_context_through_backward():
     source = render_openrlhf_sft_runtime()
     micro_step = source.split("for micro_index, batch in enumerate(window):", 1)[1].split(
