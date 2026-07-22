@@ -63,9 +63,12 @@ def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
             self.original_fit_calls.append((args, kwargs))
             return "fit-result"
 
-    class _PolicyModelActor:
+    class _PolicyModelActorRuntime:
         def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
             return (tag, client_states, metric_value, metric_key)
+
+    class _PolicyModelActor:
+        __ray_metadata__ = SimpleNamespace(modified_class=_PolicyModelActorRuntime)
 
     class _PPOTrainer:
         __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)
@@ -479,11 +482,14 @@ def test_teacher_bridge_classifies_retriable_callback_failure_as_transient():
     assert error.value.classification == "transient"
 
 
-def test_child_actor_writes_flash_rng_after_native_checkpoint(monkeypatch, tmp_path):
+def test_child_ray_actor_runtime_writes_flash_rng_after_native_checkpoint(monkeypatch, tmp_path):
     namespace, *_ = _install_ray_shaped_opd_extension(monkeypatch)
     events = []
     checkpoint_root = tmp_path / "checkpoints"
-    actor = namespace["_FlashPolicyModelActor"]()
+    runtime = namespace["_FlashPolicyModelActorRuntime"]
+    assert namespace["_FlashPolicyModelActor"].__ray_metadata__.modified_class is runtime
+    assert runtime.save_checkpoint is namespace["_flash_policy_save_checkpoint"]
+    actor = runtime()
     actor.strategy = SimpleNamespace(
         args=SimpleNamespace(ckpt=SimpleNamespace(path=str(checkpoint_root))),
         is_rank_0=lambda: True,
@@ -1200,9 +1206,12 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         def fit(self, *args, **kwargs):
             return None
 
-    class _PolicyModelActor:
+    class _PolicyModelActorRuntime:
         def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
             return (tag, client_states, metric_value, metric_key)
+
+    class _PolicyModelActor:
+        __ray_metadata__ = SimpleNamespace(modified_class=_PolicyModelActorRuntime)
 
     class _PPOTrainer:
         __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)

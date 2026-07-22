@@ -907,7 +907,11 @@ _FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch
 from openrlhf.trainer import ppo_trainer as _flash_ppo_trainer_module
 
 _FlashPolicyModelActor = _ppo_actor_module.PolicyModelActor
-_original_policy_save_checkpoint = _FlashPolicyModelActor.save_checkpoint
+_flash_policy_ray_metadata = getattr(_FlashPolicyModelActor, "__ray_metadata__", None)
+_FlashPolicyModelActorRuntime = (
+    getattr(_flash_policy_ray_metadata, "modified_class", None) or _FlashPolicyModelActor
+)
+_original_policy_save_checkpoint = _FlashPolicyModelActorRuntime.save_checkpoint
 
 
 def _flash_capture_training_rng_state():
@@ -949,7 +953,7 @@ def _flash_policy_save_checkpoint(
     return result
 
 
-_FlashPolicyModelActor.save_checkpoint = _flash_policy_save_checkpoint
+_FlashPolicyModelActorRuntime.save_checkpoint = _flash_policy_save_checkpoint
 _FlashPPOTrainer = _flash_ppo_trainer_module.PPOTrainer
 _flash_ray_metadata = getattr(_FlashPPOTrainer, "__ray_metadata__", None)
 _FlashPPOTrainerRuntime = (
