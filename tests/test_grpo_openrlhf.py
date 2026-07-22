@@ -246,7 +246,9 @@ def _package(monkeypatch, name: str):
     return module
 
 
-def _install_pinned_sitecustomize_modules(monkeypatch, *, language_model_only=False):
+def _install_pinned_sitecustomize_modules(
+    monkeypatch, *, language_model_only=False, sm120_vllm_backend=False
+):
     torch = pytest.importorskip("torch")
     openrlhf = _package(monkeypatch, "openrlhf")
     models = _package(monkeypatch, "openrlhf.models")
@@ -347,12 +349,14 @@ def _install_pinned_sitecustomize_modules(monkeypatch, *, language_model_only=Fa
     vllm.SamplingParams = type("SamplingParams", (), {})
 
     class _EngineArgs:
-        def __init__(self, *, language_model_only=False):
+        def __init__(self, *, language_model_only=False, attention_backend=None):
             self.language_model_only = language_model_only
+            self.attention_backend = attention_backend
 
     class _AsyncEngineArgs:
-        def __init__(self, *, language_model_only=False):
+        def __init__(self, *, language_model_only=False, attention_backend=None):
             self.language_model_only = language_model_only
+            self.attention_backend = attention_backend
 
     vllm.EngineArgs = _EngineArgs
     vllm.AsyncEngineArgs = _AsyncEngineArgs
@@ -423,6 +427,11 @@ def _install_pinned_sitecustomize_modules(monkeypatch, *, language_model_only=Fa
         monkeypatch.setenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", "1")
     else:
         monkeypatch.delenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", raising=False)
+    if sm120_vllm_backend:
+        monkeypatch.setenv("FLASH_OPENRLHF_SM120_VLLM_BACKEND", "1")
+        monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    else:
+        monkeypatch.delenv("FLASH_OPENRLHF_SM120_VLLM_BACKEND", raising=False)
     namespace = {"__name__": "sitecustomize", "__file__": "sitecustomize.py"}
     exec(compile(grpo_openrlhf._sitecustomize_source(), "sitecustomize.py", "exec"), namespace)
     return namespace, loss_module, ppo_actor_module, samples_module, experience_module.Experience
@@ -621,6 +630,7 @@ def test_score_single_turn_maps_environment_exception_to_zero(monkeypatch):
 def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("NCCL_DEBUG", "WARN")
+    monkeypatch.setenv("PYTHONPATH", "/parent/flash-code")
     monkeypatch.setenv("USER_ENV_SECRET", "do-not-forward")
     monkeypatch.setenv("RUNPOD_API_KEY", "do-not-forward")
     monkeypatch.setenv("HF_TOKEN", "do-not-forward")
@@ -629,13 +639,16 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         plugin_dir="/work/plugin",
         max_response_length=320,
         language_model_only=True,
+        sm120_vllm_backend=True,
         actor_attn_implementation="sdpa",
     )
 
     assert child["PATH"] == "/usr/bin"
     assert child["NCCL_DEBUG"] == "WARN"
+    assert child["PYTHONPATH"] == "/work/plugin"
     assert child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "320"
     assert child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] == "1"
+    assert child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
     assert child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "sdpa"
     assert "USER_ENV_SECRET" not in child
     assert "RUNPOD_API_KEY" not in child
@@ -679,6 +692,16 @@ def test_sitecustomize_patches_sync_and_async_language_only_engine_args(monkeypa
 
     assert vllm.EngineArgs().language_model_only is True
     assert vllm.AsyncEngineArgs().language_model_only is True
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_pins_sm120_vllm_attention_backend(monkeypatch):
+    _install_pinned_sitecustomize_modules(monkeypatch, sm120_vllm_backend=True)
+    vllm = sys.modules["vllm"]
+
+    assert vllm.EngineArgs().attention_backend == "FLASHINFER"
+    assert vllm.AsyncEngineArgs().attention_backend == "FLASHINFER"
 
 
 @requires_openrlhf_source
@@ -891,7 +914,10 @@ def test_run_rl_rejects_unknown_backend(monkeypatch):
         rl.run_rl()
 
 
-def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_path):
+@pytest.mark.parametrize("actor_attn_implementation", ["flash_attention_3", None])
+def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
+    monkeypatch, tmp_path, actor_attn_implementation
+):
     class _Tokenizer:
         pad_token = "<pad>"
         eos_token = "</s>"
@@ -939,7 +965,8 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
     monkeypatch.setattr(grpo_openrlhf._w, "graded_text", lambda text, **_kwargs: text)
     monkeypatch.setattr(grpo_openrlhf, "wait_for_gpu", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(grpo_openrlhf, "setup_perf_backends", lambda: None)
-    monkeypatch.setattr(grpo_openrlhf, "optimal_attn_impl", lambda: "flash_attention_3")
+    monkeypatch.setattr(grpo_openrlhf, "_is_sm120", lambda: True)
+    monkeypatch.setattr(grpo_openrlhf, "optimal_attn_impl", lambda: actor_attn_implementation)
     monkeypatch.setattr(
         grpo_openrlhf, "seed_training_rngs", lambda seed: events.append(f"seed:{seed}")
     )
@@ -1032,10 +1059,15 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
 
     assert launched["python"] == "/openrlhf/python"
     assert _value(launched["args"], "--algo.advantage.estimator") == "dr_grpo"
-    assert _value(launched["args"], "--ds.attn_implementation") == "flash_attention_3"
+    if actor_attn_implementation:
+        assert _value(launched["args"], "--ds.attn_implementation") == actor_attn_implementation
+        assert launched["env"]["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == actor_attn_implementation
+    else:
+        assert "--ds.attn_implementation" not in launched["args"]
+        assert "FLASH_OPENRLHF_ATTN_IMPLEMENTATION" not in launched["env"]
     assert _value(launched["args"], "--ckpt.save_steps") == "-1"
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
-    assert launched["env"]["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "flash_attention_3"
+    assert launched["env"]["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
     assert launched["env"]["HF_HUB_OFFLINE"] == "1"
     assert events.index("seed:42") < events.index("enter:rl_data_loading")
     assert exports
