@@ -576,6 +576,7 @@ import time
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
+_SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
 if _MAX_RESPONSE_LENGTH <= 0:
     raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
 _WARMSTART_ADAPTER = os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER", "")
@@ -1106,23 +1107,38 @@ def _flash_broadcast_to_vllm(self):
 
 _ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm
 
-if _LANGUAGE_MODEL_ONLY or _FP8_KV:
+if _LANGUAGE_MODEL_ONLY or _FP8_KV or _SM120_VLLM_BACKEND:
     import vllm
+
+    _engine_arg_defaults = {}
+    if _LANGUAGE_MODEL_ONLY:
+        _engine_arg_defaults["language_model_only"] = True
+    if _FP8_KV:
+        _engine_arg_defaults["kv_cache_dtype"] = "fp8"
+    if _SM120_VLLM_BACKEND:
+        try:
+            import flashinfer  # noqa: F401
+
+            _engine_arg_defaults["attention_backend"] = "FLASHINFER"
+        except Exception as exc:
+            _engine_arg_defaults["attention_backend"] = "TRITON_ATTN"
+            print(
+                f"[flash-openrlhf] sm120 flashinfer import failed ({exc}); "
+                "using attention_backend=TRITON_ATTN",
+                flush=True,
+            )
 
     def _flash_patch_engine_args(engine_args_type, type_name):
         original_init = engine_args_type.__init__
         parameters = inspect.signature(original_init).parameters
-        if _LANGUAGE_MODEL_ONLY and "language_model_only" not in parameters:
-            raise RuntimeError(f"the pinned vLLM lacks {type_name}.language_model_only")
-        if _FP8_KV and "kv_cache_dtype" not in parameters:
-            raise RuntimeError(f"the pinned vLLM lacks {type_name}.kv_cache_dtype")
+        missing = [name for name in _engine_arg_defaults if name not in parameters]
+        if missing:
+            raise RuntimeError(f"the pinned vLLM lacks {type_name}.{missing[0]}")
 
         @functools.wraps(original_init)
         def flash_engine_init(self, *args, **kwargs):
-            if _LANGUAGE_MODEL_ONLY:
-                kwargs.setdefault("language_model_only", True)
-            if _FP8_KV:
-                kwargs.setdefault("kv_cache_dtype", "fp8")
+            for name, value in _engine_arg_defaults.items():
+                kwargs.setdefault(name, value)
             return original_init(self, *args, **kwargs)
 
         engine_args_type.__init__ = flash_engine_init
@@ -1149,6 +1165,7 @@ def build_openrlhf_child_env(
     plugin_dir: str,
     max_response_length: int,
     language_model_only: bool,
+    sm120_vllm_backend: bool,
     fp8_kv: bool = False,
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
@@ -1160,9 +1177,7 @@ def build_openrlhf_child_env(
         for key, value in os.environ.items()
         if key in _CHILD_ENV_EXACT or key.startswith(_CHILD_ENV_PREFIXES)
     }
-    child["PYTHONPATH"] = os.pathsep.join(
-        item for item in (plugin_dir, os.environ.get("PYTHONPATH", "")) if item
-    )
+    child["PYTHONPATH"] = plugin_dir
     child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] = str(int(max_response_length))
     child["HF_HUB_OFFLINE"] = "1"
     child["TRANSFORMERS_OFFLINE"] = "1"
@@ -1175,6 +1190,8 @@ def build_openrlhf_child_env(
         child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] = warmstart_adapter
     if save_at_steps:
         child["FLASH_OPENRLHF_SAVE_AT_STEPS"] = ",".join(str(step) for step in save_at_steps)
+    if sm120_vllm_backend:
+        child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] = "1"
     if actor_attn_implementation:
         child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] = actor_attn_implementation
     return child
@@ -1540,6 +1557,16 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     }
 
 
+def _is_sm120() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] == 12)
+    except Exception as exc:
+        print(f"[flash-openrlhf] sm120 vLLM backend probe skipped: {exc}", flush=True)
+        return False
+
+
 def run_rl_openrlhf() -> None:
     """Run single-turn text GRPO through the isolated OpenRLHF trainer."""
     started_at = time.time()
@@ -1550,8 +1577,9 @@ def run_rl_openrlhf() -> None:
         exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
-    # omission selects openrlhf's fa2 default, not transformers' automatic sdpa fallback.
-    actor_attn_implementation = optimal_attn_impl() or "sdpa"
+    sm120_vllm_backend = _is_sm120()
+    # none leaves openrlhf's actor attention default unchanged.
+    actor_attn_implementation = optimal_attn_impl()
     with liveness_heartbeat("rl_data_loading"):
         inputs = _resolve_single_turn_inputs()
 
@@ -1638,6 +1666,7 @@ def run_rl_openrlhf() -> None:
             plugin_dir=plugin_dir,
             max_response_length=inputs["max_completion"],
             language_model_only=qwen35_language_model_only,
+            sm120_vllm_backend=sm120_vllm_backend,
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],
