@@ -437,23 +437,34 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
     assert response.json()["state"] == "dry_run"
 
 
-@pytest.mark.parametrize("max_completion_tokens", [3500, 3000])
-def test_opd_structured_dry_run_rejects_before_allocation(
+@pytest.mark.parametrize("max_completion_tokens", [3000, 2500])
+def test_opd_structured_dry_run_passes_preprovision_gate(
     api, monkeypatch, max_completion_tokens
 ) -> None:
+    import flash.multimodal as multimodal
+    import flash.runner as runner
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
 
+    def prepare(spec, **_kwargs):
+        runner._require_supported_opd_verl_spec(spec)
+        return runner.PreparedJob(
+            public_spec=spec,
+            worker_spec=spec,
+            estimated_cost_usd=1.25,
+        )
+
     monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
-    monkeypatch.setattr(
-        runs_route._app,
-        "submit_job",
-        lambda *_a, **_k: pytest.fail("structured opd must fail before allocation"),
-    )
+    monkeypatch.setattr(multimodal, "preflight_validate_image_opd", lambda *_a: None)
+    monkeypatch.setattr(runs_route._app, "prepare_job", prepare)
     spec = {
         **SPEC,
         "model": "Qwen/Qwen3.6-35B-A3B",
         "algorithm": "opd",
+        "environment": {
+            **SPEC["environment"],
+            "params": {"records": [{"input": [{"role": "user", "content": "question"}]}]},
+        },
         "thinking": False,
         "train": {
             **SPEC["train"],
@@ -469,11 +480,8 @@ def test_opd_structured_dry_run_rejects_before_allocation(
         json={"spec": spec, "dry_run": True},
     )
 
-    # the structured-output verl extension will restore support at this preflight boundary.
-    assert response.status_code == 400, response.text
-    detail = response.json()["detail"]
-    assert "structured_outputs is not yet supported on the verl OPD backend" in detail
-    assert "forced-position metadata is not yet threaded" in detail
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "dry_run"
 
 
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
