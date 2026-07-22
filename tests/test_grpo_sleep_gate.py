@@ -140,6 +140,30 @@ def test_resident_kv_uncapped_for_long_context():
     )
 
 
+def test_pinned_sleep_gate_forwards_revision_to_resident_check(monkeypatch):
+    import flash.engine.vram as vram_mod
+    import flash.engine.worker.perf.memory as memory_mod
+
+    captured = {}
+
+    def _capture_fit(_model_id, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(memory_mod, "_memory_mode", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(vram_mod, "grpo_fits_resident", _capture_fit)
+
+    assert (
+        memory_mod.grpo_sleep_mode(
+            "Qwen/Qwen3.5-4B",
+            card_vram_gb=80,
+            revision="a" * 40,
+        )
+        is False
+    )
+    assert captured["revision"] == "a" * 40
+
+
 def test_fits_resident_is_conservative_when_unknown():
     # Unknown card VRAM (0) or an unlisted/open model (no catalog params) -> keep the safe
     # sleep default (return False), never disable sleep on a guess.
