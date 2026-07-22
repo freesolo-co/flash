@@ -118,8 +118,19 @@ class _SystemExitRewardEnv(_SingleTurnEnv):
 
 class _NonTextSftEnv(_SingleTurnEnv):
     def sft_completion(self, example):
-        # a non-text (content-block list) target is not a usable replay string
-        return [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]
+        # an image-only content block carries no replay text, so the driver falls to echo
+        return [{"role": "assistant", "content": [{"type": "image", "image": "x.png"}]}]
+
+
+class _TextBlockSftEnv(_SingleTurnEnv):
+    def sft_completion(self, example):
+        # a valid gold answer in openai text-block form, the same shape the real reward
+        # path flattens before grading; it must be replayed, not echoed
+        return [{"role": "assistant", "content": [{"type": "text", "text": "4"}]}]
+
+    def reward(self, completion, example, state=None):
+        self.completions.append(completion)
+        return 1.0 if completion == "4" else 0.0
 
 
 class _ScalarSftEnv(_SingleTurnEnv):
@@ -207,6 +218,20 @@ def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsy
     assert env.completions == ["test"]
     out = capsys.readouterr().out
     assert "episode 1: policy=echo turns=1" in out
+    assert "overall: PASS" in out
+
+
+def test_env_test_text_block_sft_completion_replays(monkeypatch, tmp_path, capsys):
+    # a gold answer in openai text-block form must be replayed and graded as that text,
+    # matching the real reward path, instead of falling back to the canned echo
+    env_dir = _environment_dir(tmp_path)
+    env = _TextBlockSftEnv()
+    _patch_loader(monkeypatch, env)
+
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert env.completions == ["4"]
+    out = capsys.readouterr().out
+    assert "episode 1: policy=replay turns=1 reward=1.000000" in out
     assert "overall: PASS" in out
 
 

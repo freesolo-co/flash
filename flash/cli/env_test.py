@@ -51,15 +51,32 @@ def _check_messages(messages: object, label: str) -> list[dict]:
     return messages
 
 
+def _message_text(content: object) -> str:
+    # mirror flash.multimodal.assistant_completion_text block handling: a message's replay
+    # text is its string content, or the concatenation of its openai-style text blocks; any
+    # other shape (null tool-call content, image-only blocks) yields no replay text.
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
 def _reference_turns(env, example: dict) -> list[str]:
     # the sft_completion gold answer stands in for the missing policy model. validate its
     # envelope like the prompt so a malformed completion (scalar content, missing role)
-    # fails the episode instead of silently falling back to echo; a well-formed but
-    # non-text target (content-block list or null) yields no replay text and uses echo.
+    # fails the episode instead of silently falling back to echo. text is extracted the
+    # same way the real reward path grades a completion, so a gold answer expressed as
+    # openai-style text blocks is replayed instead of echoed; a target with no text (null
+    # content or image-only blocks) yields no replay text and uses echo.
     messages = _check_messages(env.sft_completion(example), "sft_completion")
     assistant = [m for m in messages if m["role"].strip().lower() == "assistant"]
     selected = assistant or messages
-    return [content for m in selected if isinstance(content := m["content"], str)]
+    return [text for m in selected if (text := _message_text(m["content"]))]
 
 
 def _resolve_policy(reference_turns: list[str]) -> str:
