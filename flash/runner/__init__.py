@@ -135,10 +135,13 @@ def _require_supported_opd_verl_spec(
 ) -> None:
     if spec.algorithm != "opd":
         return
-    unsupported_backend = "not yet supported on the verl OPD backend"
     params = dict(spec.environment.params or {})
-    if params.get("multi_turn") or params.get("is_tool_env") or params.get("tool_calling"):
-        raise ValueError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+    if params.get("is_tool_env") or params.get("tool_calling"):
+        raise ValueError("native tool-calling OPD environments are not supported")
+    if params.get("multi_turn") and spec.train.structured_outputs:
+        raise ValueError(
+            "multi-turn structured-output OPD is not supported until a per-turn constraint contract exists"
+        )
     from flash.opd_verl_validation import validate_opd_verl_structured_outputs
 
     validate_opd_verl_structured_outputs(

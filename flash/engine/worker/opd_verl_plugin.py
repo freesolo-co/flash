@@ -20,8 +20,10 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
+    from flash_opd_verl_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_verl_structured import StructuredOutputReplay, canonical_structured_spec
 except ImportError:
+    from flash.engine.worker.opd_verl_multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.opd_verl_structured import (
         StructuredOutputReplay,
         canonical_structured_spec,
@@ -46,10 +48,17 @@ def _require_structured_runtime_versions() -> None:
 
 
 def deterministic_rollout_seed(
-    flash_seed: int, global_step: int, example_index: int, rollout_ordinal: int
+    flash_seed: int,
+    global_step: int,
+    example_index: int,
+    rollout_ordinal: int,
+    assistant_turn_ordinal: int = 0,
 ) -> int:
     """Derive one stable vLLM request seed from the complete rollout identity."""
-    payload = f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:{int(rollout_ordinal)}"
+    payload = (
+        f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:"
+        f"{int(rollout_ordinal)}:{int(assistant_turn_ordinal)}"
+    )
     digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
@@ -62,6 +71,26 @@ def _signal_sequences(group_ids, response_mask):
 def _full_sequence_signal_sequences(group_ids):
     """Detect aligned metadata in native full-sequence teacher tensors."""
     return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
+
+
+def _flatten_variable_outputs(inputs):
+    counts = [len(item) if isinstance(item, list) else 1 for item in inputs]
+    outputs = [
+        turn
+        for item in inputs
+        for turn in (item if isinstance(item, list) else [item])
+    ]
+    return outputs, counts
+
+
+def _expand_variable_rows(values, counts):
+    if len(values) != len(counts):
+        return list(values)
+    return [
+        values[index]
+        for index, count in enumerate(counts)
+        for _ in range(count)
+    ]
 
 
 def _flash_groupwise_reverse_kl_values(
@@ -235,6 +264,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
 
 
 def _install_verl_extensions() -> None:
+    import numpy as np
     import ray
     import torch
     from omegaconf import OmegaConf
@@ -245,7 +275,12 @@ def _install_verl_extensions() -> None:
     except ImportError:
         from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
-    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker, register
+    from verl.experimental.agent_loop.agent_loop import (
+        AgentLoopBase,
+        AgentLoopOutput,
+        AgentLoopWorker,
+        register,
+    )
     from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
     from verl.single_controller.ray import ResourcePoolManager
     from verl.trainer.distillation.losses import (
@@ -372,6 +407,24 @@ def _install_verl_extensions() -> None:
         sample_kwargs=None,
     ) -> None:
         if self.distillation_enabled and not validate:
+            precomputed_ids = output.extra_fields.pop("flash_teacher_ids", None)
+            precomputed_logprobs = output.extra_fields.pop(
+                "flash_teacher_logprobs", None
+            )
+            if precomputed_ids is not None or precomputed_logprobs is not None:
+                if precomputed_ids is None or precomputed_logprobs is None:
+                    raise RuntimeError("multi-turn OPD teacher metadata is incomplete")
+                teacher_ids = torch.tensor(precomputed_ids, dtype=torch.int32).unsqueeze(-1)
+                teacher_logprobs = torch.tensor(
+                    precomputed_logprobs, dtype=torch.float32
+                ).unsqueeze(-1)
+                if teacher_ids.shape != teacher_logprobs.shape:
+                    raise RuntimeError("multi-turn OPD teacher tensors are inconsistent")
+                if teacher_ids.shape[0] != len(prompt_ids) + len(response_ids):
+                    raise RuntimeError("multi-turn OPD teacher tensors have the wrong sequence length")
+                output.extra_fields["teacher_ids"] = teacher_ids
+                output.extra_fields["teacher_logprobs"] = teacher_logprobs
+                return
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -413,6 +466,45 @@ def _install_verl_extensions() -> None:
     AgentLoopWorker._compute_teacher_logprobs = compute_flash_teacher_logprobs
     teacher_manager_module.AsyncTeacherLLMServerManager = FlashBridgeTeacherManager
 
+    original_agent_loop_postprocess = AgentLoopWorker._agent_loop_postprocess
+    original_batch_postprocess = AgentLoopWorker._postprocess
+
+    async def postprocess_variable_turn_outputs(self, output, validate, **kwargs):
+        if isinstance(output, list):
+            return [
+                await original_agent_loop_postprocess(self, turn, validate, **kwargs)
+                for turn in output
+            ]
+        return await original_agent_loop_postprocess(self, output, validate, **kwargs)
+
+    def flatten_variable_turn_batch(
+        self,
+        inputs,
+        input_non_tensor_batch=None,
+        validate=False,
+    ):
+        flat_inputs, counts = _flatten_variable_outputs(inputs)
+        if not flat_inputs:
+            raise RuntimeError("multi-turn OPD batch produced no assistant turns")
+        expanded = input_non_tensor_batch
+        if input_non_tensor_batch is not None and any(count != 1 for count in counts):
+            expanded = {}
+            for key, values in input_non_tensor_batch.items():
+                if len(values) != len(counts):
+                    expanded[key] = values
+                    continue
+                rows = _expand_variable_rows(values, counts)
+                expanded[key] = np.array(rows, dtype=getattr(values, "dtype", object))
+        return original_batch_postprocess(
+            self,
+            flat_inputs,
+            input_non_tensor_batch=expanded,
+            validate=validate,
+        )
+
+    AgentLoopWorker._agent_loop_postprocess = postprocess_variable_turn_outputs
+    AgentLoopWorker._postprocess = flatten_variable_turn_batch
+
     @register("flash_single_turn")
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
@@ -450,6 +542,16 @@ def _install_verl_extensions() -> None:
 
     FlashSingleTurnAgentLoop.__module__ = __name__
     globals()["FlashSingleTurnAgentLoop"] = FlashSingleTurnAgentLoop
+
+    FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
+        register=register,
+        agent_loop_base=AgentLoopBase,
+        agent_loop_output=AgentLoopOutput,
+        post_json=_post_json,
+        deterministic_seed=deterministic_rollout_seed,
+    )
+    FlashMultiTurnAgentLoop.__module__ = __name__
+    globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
     def filter_signal_batch(batch):
         fields = tq.kv_batch_get(

@@ -77,9 +77,30 @@ def _preflight_opd_verl_environment(spec: JobSpec) -> None:
         dict(spec.environment.params or {}),
         spec.environment.resolved_sha or None,
     )
-    unsupported_backend = "not yet supported on the verl OPD backend"
-    if getattr(environment, "is_tool_env", False) or getattr(environment, "multi_turn", False):
-        raise ValueError(f"multi-turn and tool-calling OPD environments are {unsupported_backend}")
+    if getattr(environment, "is_tool_env", False):
+        raise ValueError("native tool-calling OPD environments are not supported")
+    multi_turn = bool(getattr(environment, "multi_turn", False))
+    if multi_turn:
+        if spec.train.structured_outputs:
+            raise ValueError(
+                "multi-turn structured-output OPD is not supported until a per-turn constraint contract exists"
+            )
+        required_methods = (
+            "new_rollout_state",
+            "record_model_turn",
+            "env_reply",
+            "rollout_done",
+        )
+        missing = [
+            name for name in required_methods if not callable(getattr(environment, name, None))
+        ]
+        if missing:
+            raise ValueError(
+                f"multi-turn OPD environment is missing required rollout methods: {missing}"
+            )
+        max_turns = int(getattr(environment, "max_turns", 0) or 0)
+        if max_turns <= 0:
+            raise ValueError("multi-turn OPD environment requires a positive bounded turn limit")
     records = list(environment.dataset())
     max_examples = int(spec.train.max_examples or 0)
     if max_examples > 0:
@@ -87,11 +108,15 @@ def _preflight_opd_verl_environment(spec: JobSpec) -> None:
     validated_image_support = False
     for record in records:
         messages = environment.prompt_messages(record)
+        if multi_turn:
+            from flash.engine.worker.opd_verl_multiturn import validate_teacher_messages
+
+            validate_teacher_messages(messages, source="environment initial prompt")
         if not record_has_images(record, messages):
             continue
         validate_image_opd_user_text(record, messages)
         if not validated_image_support:
-            validate_multimodal_training(spec.model, "opd", multi_turn=False)
+            validate_multimodal_training(spec.model, "opd", multi_turn=multi_turn)
             validate_image_opd_teacher(spec.train.teacher_model)
             validated_image_support = True
 
