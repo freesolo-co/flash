@@ -1275,7 +1275,11 @@ def get_logs(run_id: str) -> str:
         return f.read()
 
 
-def _sanitize_status_value(value, *, depth: int = 0):
+_STATUS_LIST_LIMIT = 16
+_STATUS_METRICS_HISTORY_LIMIT = 1024
+
+
+def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
     """Bound a heartbeat payload before persisting it in run status JSON."""
     if depth > 5:
         return str(value)[:200]
@@ -1284,14 +1288,21 @@ def _sanitize_status_value(value, *, depth: int = 0):
     if isinstance(value, str):
         return value[:1000]
     if isinstance(value, list):
-        return [_sanitize_status_value(v, depth=depth + 1) for v in value[:16]]
+        if field == "metrics_last":
+            values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
+        else:
+            values = value[:_STATUS_LIST_LIMIT]
+        return [_sanitize_status_value(v, depth=depth + 1) for v in values]
     if isinstance(value, dict):
         out = {}
         for i, (k, v) in enumerate(value.items()):
             if i >= 64:
                 out["truncated"] = True
                 break
-            out[str(k)[:120]] = _sanitize_status_value(v, depth=depth + 1)
+            sanitized_key = str(k)[:120]
+            out[sanitized_key] = _sanitize_status_value(
+                v, depth=depth + 1, field=sanitized_key
+            )
         return out
     return str(value)[:500]
 
@@ -1309,6 +1320,17 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
+        # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
+        # the existing per-step backlog forward so `flash log -f` doesn't drop it mid-save until the next
+        # metrics-bearing heartbeat lands.
+        if isinstance(hb, dict) and not hb.get("metrics_last"):
+            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+            prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
+            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
+            # new attempt must not inherit the prior attempt's stale per-step metrics.
+            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
+            if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
+                hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()

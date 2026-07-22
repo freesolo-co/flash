@@ -186,6 +186,42 @@ def test_poll_job_completes(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    recorded = []
+    heartbeat = {
+        "run_id": "terminal-heartbeat",
+        "stage": "done",
+        "ts": 123.0,
+        "attempt": 0,
+        "metrics_last": [{"step": 4, "reward": 0.75}],
+    }
+    forces = []
+    monkeypatch.setattr("flash.providers._poll._record_heartbeat", recorded.append)
+    monkeypatch.setattr(jobs, "decode_output", lambda _output: {"acc": 1.0})
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda _endpoint_id, _job_id, **_kwargs: {"status": "COMPLETED", "output": {}},
+    )
+    def read_heartbeat(force=False, **_kwargs):
+        forces.append(force)
+        return heartbeat
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=read_heartbeat,
+    )
+
+    assert res.ok
+    assert forces == [True]
+    assert recorded == [heartbeat]
+
+
 def test_surface_heartbeat_logs_gpu_status(monkeypatch):
     from flash.providers._poll import surface_heartbeat
 

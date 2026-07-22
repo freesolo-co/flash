@@ -414,6 +414,59 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     return state, " ".join(parts)
 
 
+_FOLLOW_METRIC_FIELDS = (
+    ("reward", "reward"),
+    ("reward_std", "reward_std"),
+    ("grad_norm", "grad_norm"),
+    ("kl", "kl"),
+    ("entropy", "entropy"),
+    ("frac_reward_zero_std", "frac_zero_std"),
+    ("mean_completion_tokens", "comp_len"),
+    ("truncation_rate", "trunc"),
+    ("max_completion_tokens", "max_comp_tokens"),
+)
+
+
+def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
+    """Return unseen heartbeat-backed RL metric rows, deduplicated by attempt and optimizer step."""
+    heartbeat = (status or {}).get("last_heartbeat")
+    if not isinstance(heartbeat, dict):
+        return []
+    # during a retry, status.remote.attempt can already point at the replacement worker while
+    # last_heartbeat still belongs to the prior attempt; don't render that stale attempt's rows
+    if not render.heartbeat_is_current_attempt(status, heartbeat):
+        return []
+    metrics_last = heartbeat.get("metrics_last")
+    if not isinstance(metrics_last, list):
+        return []
+    rows = []
+    attempt = heartbeat.get("attempt")
+    for metrics in metrics_last:
+        if not isinstance(metrics, dict):
+            continue
+        step = metrics.get("step")
+        if step is None:
+            continue
+        try:
+            step_key = int(step)
+        except (TypeError, ValueError):
+            step_key = str(step)
+        metric_key = (attempt, step_key)
+        if metric_key in seen_steps:
+            continue
+        seen_steps.add(metric_key)
+        parts = [f"step={step_key}"]
+        for key, label in _FOLLOW_METRIC_FIELDS:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            if isinstance(value, float):
+                value = f"{value:.6g}"
+            parts.append(f"{label}={value}")
+        rows.append(" ".join(parts))
+    return rows
+
+
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
     """Stream offset-paged logs until the run reaches a terminal state.
 
@@ -421,6 +474,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
     offset = 0
     printed_any = False
     last_progress: str | None = None
+    seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)
     try:
         while True:
@@ -435,6 +489,11 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
             # older servers or test doubles.
             status = client.get_run(run_id)
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
+            metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
+            if metric_rows:
+                spinner.clear()
+                for row in metric_rows:
+                    print(row, file=sys.stderr, flush=True)
             if state in _CLI_DONE_STATES:
                 spinner.clear()
                 return state, printed_any

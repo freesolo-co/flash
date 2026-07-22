@@ -364,6 +364,20 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
+def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
+    import flash.runner as runner
+
+    metrics = [{"step": step, "reward": step / 1025} for step in range(1025)]
+    sanitized = runner._sanitize_status_value(
+        {"metrics_last": metrics, "other": list(range(32))}
+    )
+
+    assert len(sanitized["metrics_last"]) == 1024
+    assert sanitized["metrics_last"][0]["step"] == 1
+    assert sanitized["metrics_last"][-1]["step"] == 1024
+    assert sanitized["other"] == list(range(16))
+
+
 def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch):
     """The finalize-phase daemon pings (liveness=True, stage sft_finalizing, step stamped) must
     land in status.last_heartbeat intact: cancel billing reads .step from the freshest persisted

@@ -490,7 +490,7 @@ def run_rl():
 
     from flash.engine.vram import resolve_params_b
 
-    _params_b = resolve_params_b(model_id)
+    _params_b = resolve_params_b(model_id, revision=model_revision) if model_revision else resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     # Multi-turn accumulates a full transcript up to the engine context, so size the fp32 logits
@@ -615,9 +615,9 @@ def run_rl():
         from flash.catalog import MODELS
         from flash.engine.vram import colocate_kv_util
 
-        # MoE: size the KV pool on the ACTIVE backbone (matches grpo_fits_resident's resident-fit
-        # gate), so the budget and the sleep-mode decision count the SAME KV. Dense -> 0 -> total.
-        _active_b = float(getattr(MODELS.get(model_id), "active_params_b", 0.0) or 0.0)
+        # pinned revisions use conservative generic kv geometry unless their architecture is validated.
+        _model_info = None if model_revision else MODELS.get(model_id)
+        _active_b = float(getattr(_model_info, "active_params_b", 0.0) or 0.0)
         _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
         _vllm_gpu_mem_util = colocate_kv_util(
             _params_b,
@@ -627,6 +627,7 @@ def run_rl():
             num_generations=group_size,
             active_params_b=_active_b,
             fp8_kv=_fp8_kv,
+            model_info=_model_info,
         )
     except Exception:
         _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10
@@ -945,7 +946,10 @@ def run_rl():
         liveness_heartbeat(
             "rl_step",
             progress=lambda: int(getattr(trainer.state, "global_step", 0) or 0),
-            fields=hb_cb.latest_fields,
+            fields=lambda: {
+                "metrics_last": list(getattr(hb_cb, "metrics_last", [])),
+                **hb_cb.latest_fields(),
+            },
             progress_step=True,
         ),
         _sdpa_cudnn_ctx(_attn),
@@ -992,7 +996,11 @@ def run_rl():
     # progress_step stamps the final step on every finalize heartbeat so a cancel landing in this
     # window still bills the actual steps trained (actual_steps_run reads last_heartbeat.step).
     with liveness_heartbeat(
-        "rl_finalizing", progress=lambda: _steps_run, progress_step=True, keepalive=True
+        "rl_finalizing",
+        progress=lambda: _steps_run,
+        fields=lambda: {"metrics_last": list(getattr(hb_cb, "metrics_last", []))},
+        progress_step=True,
+        keepalive=True,
     ):
         adapter_dir = f"{out_dir}/adapter"
         _w.stamp_adapter_provenance(trainer.model, model_id, model_revision)
@@ -1006,7 +1014,13 @@ def run_rl():
         # preserve the final checkpoint only when exact save steps are not configured.
         if final_save_due(_steps_run, save_at_steps):
             _w.publish_deployable_checkpoint(adapter_dir, _steps_run)
-    _w.heartbeat("rl_trained", train_wall=train_wall, step=_steps_run, gpu=gpu_diagnostics())
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=_steps_run,
+        gpu=gpu_diagnostics(),
+        metrics_last=list(getattr(hb_cb, "metrics_last", [])),
+    )
 
     # Upper bound on generated tokens (over-counts; used only for a rough throughput).
     gen_tokens = steps * batching["unique_prompts_per_step"] * group_size * _max_completion
@@ -1018,6 +1032,7 @@ def run_rl():
         setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=gen_tokens,
+        heartbeat_fields={"metrics_last": list(getattr(hb_cb, "metrics_last", []))},
         notes={
             "steps": steps,
             "epochs": epochs,
