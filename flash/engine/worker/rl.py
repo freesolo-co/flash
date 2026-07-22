@@ -149,6 +149,19 @@ def select_grpo_trainer_class(
 
 
 def run_rl():
+    # private backend selector; the default trl body below remains unchanged.
+    backend = os.environ.get("FLASH_RL_BACKEND", "trl").strip().lower()
+    if backend == "openrlhf":
+        from flash.engine.worker.grpo_openrlhf import run_rl_openrlhf
+
+        run_rl_openrlhf()
+        return
+    if backend != "trl":
+        raise RuntimeError(
+            f"FLASH_RL_BACKEND={backend!r} is not a known grpo backend "
+            "(expected 'trl' or 'openrlhf')"
+        )
+
     from datasets import Dataset
     from transformers import AutoProcessor
     from trl import GRPOConfig, GRPOTrainer

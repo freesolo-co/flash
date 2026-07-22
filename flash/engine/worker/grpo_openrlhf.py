@@ -1,0 +1,1011 @@
+"""OpenRLHF-backed GRPO foundation for single-turn text environments.
+
+The OpenRLHF runtime stays out of process. The parent worker owns Flash environment state and
+serves rewards over an authenticated localhost bridge. A generated ``sitecustomize`` module makes
+two narrow child-side corrections: reward transport/schema failures abort training, and the policy
+loss uses Flash's fixed configured response-length denominator instead of OpenRLHF's token mean.
+
+This foundation intentionally leaves the TRL implementation intact and rejects unsupported modes.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import secrets
+import shutil
+import threading
+import time
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+from flash.engine.recipe import RECIPE
+from flash.engine.steps import on_policy_steps, resolve_update_horizon
+from flash.engine.worker._pkg import W as _w
+from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.openrlhf_common import (
+    export_openrlhf_adapter,
+    resolve_openrlhf_python,
+    run_openrlhf_training,
+)
+from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
+from flash.engine.worker.rng import backend_seed
+from flash.spec import DEFAULT_CREDIT_ASSIGNMENT
+
+_OPENRLHF_ENTRYPOINT = "openrlhf.cli.train_ppo_ray"
+_OPENRLHF_REWARD_MAX_BODY_BYTES = 2 * 1024 * 1024
+_OPENRLHF_TARGET_MODULES = "all-linear"
+_OPENRLHF_PPO_EPOCHS = 1
+_SITE_CUSTOMIZE_NAME = "sitecustomize.py"
+_CHILD_ENV_EXACT = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LD_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "XDG_CACHE_HOME",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_DATASETS_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+        "TOKENIZERS_PARALLELISM",
+    }
+)
+_CHILD_ENV_PREFIXES = (
+    "CUDA_",
+    "NCCL_",
+    "TORCH_",
+    "PYTORCH_",
+    "RAY_",
+    "VLLM_",
+    "OMP_",
+    "MKL_",
+    "OPENBLAS_",
+    "LC_",
+)
+
+# todo(openrlhf-grpo-parity): add token-level tis with c_max=2.0 in its own follow-up.
+# todo(openrlhf-grpo-parity): add fp8 kv-cache selection after a matched gpu validation.
+# todo(openrlhf-grpo-parity): add warm-start with the incoming adapter as the frozen kl anchor.
+# todo(openrlhf-grpo-parity): add exact per-step deployable dumps and full resume sidecars.
+# todo(openrlhf-grpo-parity): add per-turn credit only with explicit action-span rewards.
+
+
+class _RewardHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+@dataclass(frozen=True)
+class RewardResult:
+    reward: float
+    scores: float
+    extra_logs: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OpenRLHFGRPOConfig:
+    model_path: str
+    dataset_path: str
+    reward_url: str
+    output_dir: str
+    checkpoint_dir: str
+    model_id: str
+    model_revision: str
+    max_length: int
+    max_completion: int
+    prompts_per_step: int
+    group_size: int
+    scheduled_prompt_count: int
+    learning_rate: float
+    temperature: float
+    top_p: float
+    seed: int
+    lora_rank: int
+    lora_alpha: int
+    kl_coef: float
+    save_every: int
+    gpu_count: int
+    qwen35_language_model_only: bool
+
+
+def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
+    """Map the resolved Flash GRPO job to ``openrlhf.cli.train_ppo_ray`` arguments."""
+    if config.group_size <= 1:
+        raise ValueError("OpenRLHF DR-GRPO requires group_size greater than 1")
+    if config.prompts_per_step <= 0 or config.scheduled_prompt_count <= 0:
+        raise ValueError("OpenRLHF GRPO requires a nonempty scheduled prompt dataset")
+    if config.max_completion <= 0 or config.max_length <= config.max_completion:
+        raise ValueError("OpenRLHF max length must leave room for a prompt")
+    if config.lora_rank <= 0 or config.lora_alpha <= 0:
+        raise ValueError("OpenRLHF GRPO requires positive LoRA rank and alpha")
+    if config.gpu_count <= 0:
+        raise ValueError("OpenRLHF GRPO requires at least one GPU")
+
+    completion_batch = config.prompts_per_step * config.group_size
+    args = [
+        "--actor.model_name_or_path",
+        config.model_path,
+        "--reward.remote_url",
+        config.reward_url,
+        "--data.prompt_dataset",
+        config.dataset_path,
+        "--data.input_key",
+        "input",
+        "--data.label_key",
+        "label",
+        "--data.max_len",
+        str(config.max_length),
+        "--data.max_samples",
+        str(config.scheduled_prompt_count),
+        "--rollout.max_new_tokens",
+        str(config.max_completion),
+        "--rollout.batch_size",
+        str(config.prompts_per_step),
+        "--rollout.micro_batch_size",
+        "1",
+        "--rollout.n_samples_per_prompt",
+        str(config.group_size),
+        "--rollout.temperature",
+        str(config.temperature),
+        "--rollout.top_p",
+        str(config.top_p),
+        "--train.batch_size",
+        str(completion_batch),
+        "--train.micro_batch_size",
+        "1",
+        "--train.num_episodes",
+        "1",
+        "--train.max_epochs",
+        str(_OPENRLHF_PPO_EPOCHS),
+        "--train.seed",
+        str(config.seed),
+        "--train.full_determinism_enable",
+        "--algo.advantage.estimator",
+        "dr_grpo",
+        "--algo.advantage.gamma",
+        "1.0",
+        "--reward.clip_range",
+        "-inf",
+        "inf",
+        "--actor.adam.lr",
+        str(config.learning_rate),
+        "--actor.lr_scheduler",
+        "constant",
+        "--actor.lr_warmup_ratio",
+        "0.0",
+        "--actor.min_lr_ratio",
+        "1.0",
+        "--ds.lora.rank",
+        str(config.lora_rank),
+        "--ds.lora.alpha",
+        str(config.lora_alpha),
+        "--ds.lora.target_modules",
+        _OPENRLHF_TARGET_MODULES,
+        "--ds.lora.dropout",
+        "0.0",
+        "--ds.zero_stage",
+        "3",
+        "--ds.param_dtype",
+        "bf16",
+        "--actor.gradient_checkpointing_enable",
+        "--actor.num_nodes",
+        "1",
+        "--actor.num_gpus_per_node",
+        str(config.gpu_count),
+        "--vllm.num_engines",
+        str(config.gpu_count),
+        "--vllm.tensor_parallel_size",
+        "1",
+        "--vllm.gpu_memory_utilization",
+        "0.5",
+        "--vllm.sync_backend",
+        "nccl",
+        "--vllm.enable_prefix_caching",
+        "--vllm.enforce_eager",
+        "--vllm.enable_sleep",
+        "--ds.enable_sleep",
+        "--train.colocate_all",
+        "--ckpt.output_dir",
+        config.output_dir,
+        "--ckpt.path",
+        config.checkpoint_dir,
+        "--ckpt.save_hf",
+        "--ckpt.save_steps",
+        str(config.save_every),
+        "--ckpt.max_num",
+        "1",
+        "--logger.logging_steps",
+        "1",
+        "--eval.steps",
+        "-1",
+        "--ckpt.best_metric_key",
+        "none",
+    ]
+    if config.kl_coef > 0:
+        args.extend(
+            [
+                "--algo.kl.init_coef",
+                str(config.kl_coef),
+                "--algo.kl.use_loss",
+                "--algo.kl.estimator",
+                "k2",
+            ]
+        )
+    else:
+        args.extend(["--algo.kl.init_coef", "0.0"])
+    if config.qwen35_language_model_only:
+        args.extend(["--ds.attn_implementation", "eager"])
+    return args
+
+
+def dr_grpo_fixed_length_normalize(
+    per_token_losses: list[list[float]],
+    action_masks: list[list[float]],
+    max_response_length: int,
+) -> float:
+    """Pure numeric reference for TRL's DR-GRPO fixed-length reduction."""
+    if max_response_length <= 0:
+        raise ValueError("max_response_length must be positive")
+    if not per_token_losses or len(per_token_losses) != len(action_masks):
+        raise ValueError("loss and mask batches must be nonempty and aligned")
+    numerator = 0.0
+    for losses, mask in zip(per_token_losses, action_masks, strict=True):
+        if len(losses) != len(mask):
+            raise ValueError("loss and mask rows must be aligned")
+        numerator += sum(float(loss) * float(keep) for loss, keep in zip(losses, mask, strict=True))
+    return numerator / (len(per_token_losses) * int(max_response_length))
+
+
+def _completion_from_openrlhf_query(query: str, prompt: str) -> str:
+    if not isinstance(query, str) or not isinstance(prompt, str):
+        raise TypeError("OpenRLHF reward query and prompt must be strings")
+    if not query.startswith(prompt):
+        raise ValueError("OpenRLHF reward query does not start with its rendered prompt")
+    return query[len(prompt) :]
+
+
+def completion_from_tokenizer_query(tokenizer, query: str, prompt: str) -> str:
+    """Remove the prompt after reproducing OpenRLHF's tokenize-then-decode canonicalization."""
+    if not isinstance(query, str) or not isinstance(prompt, str):
+        raise TypeError("OpenRLHF reward query and prompt must be strings")
+    prompt_ids = tokenizer(text=prompt, add_special_tokens=False, return_tensors="pt")[
+        "input_ids"
+    ][0]
+    if hasattr(prompt_ids, "tolist"):
+        prompt_ids = prompt_ids.tolist()
+    canonical_prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+    return _completion_from_openrlhf_query(query, canonical_prompt)
+
+
+def _named_metrics(breakdown: Any) -> dict[str, float]:
+    if not isinstance(breakdown, dict):
+        return {}
+    metrics: dict[str, float] = {}
+    for name, value in breakdown.items():
+        if name == "total":
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            metrics[str(name)] = number
+    return metrics
+
+
+def score_single_turn(
+    env,
+    completion: str,
+    example,
+    *,
+    tokenizer,
+    thinking: bool,
+    prompt_opened_thinking: bool,
+    think_penalty: float,
+) -> RewardResult:
+    """Score one text completion with the same environment semantics as the TRL path."""
+    try:
+        graded = _w.graded_text(completion, prompt_opened_thinking=prompt_opened_thinking)
+        state = (
+            {
+                "raw": completion,
+                "completion": graded,
+                "thinking": _w.thinking_text(
+                    completion, prompt_opened_thinking=prompt_opened_thinking
+                ),
+            }
+            if thinking
+            else None
+        )
+        breakdown = None
+        if hasattr(env, "scores_breakdown"):
+            breakdown = env.scores_breakdown(graded, example, state)
+            if not isinstance(breakdown, dict):
+                raise TypeError("environment scores_breakdown must return a mapping")
+            reward = float(breakdown.get("total", 0.0))
+        else:
+            reward = float(env.reward(graded, example, state))
+    except Exception as exc:
+        print(
+            f"[rl-openrlhf] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0",
+            flush=True,
+        )
+        return RewardResult(0.0, 0.0, {})
+
+    if think_penalty > 0 and thinking:
+        reward -= think_penalty * _w.think_token_count(
+            completion,
+            tokenizer,
+            prompt_opened_thinking=prompt_opened_thinking,
+        )
+    if not math.isfinite(reward):
+        raise ValueError("environment reward must be finite")
+    return RewardResult(reward, reward, _named_metrics(breakdown))
+
+
+class RewardBridge:
+    """Authenticated localhost bridge from OpenRLHF rollout actors to the live Flash env."""
+
+    def __init__(
+        self,
+        score_by_label: Callable[[int, str, str], RewardResult],
+        *,
+        completion_from_query: Callable[[str, str], str] = _completion_from_openrlhf_query,
+        token: str | None = None,
+    ) -> None:
+        self._score_by_label = score_by_label
+        self._completion_from_query = completion_from_query
+        self._token = token or secrets.token_urlsafe(32)
+        self._path = f"/reward/{self._token}"
+        self._score_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._rewards: list[float] = []
+        bridge = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                return
+
+            def _send(self, status: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                if not secrets.compare_digest(self.path, bridge._path):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    raw_length = self.headers.get("Content-Length")
+                    if raw_length is None:
+                        raise ValueError("missing content length")
+                    length = int(raw_length)
+                    if length <= 0 or length > _OPENRLHF_REWARD_MAX_BODY_BYTES:
+                        raise ValueError("invalid reward request size")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    result = bridge._score_payload(payload)
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    self._send(400, {"error": "invalid reward request"})
+                    return
+                except Exception as exc:
+                    print(
+                        f"[rl-openrlhf] reward bridge failed ({type(exc).__name__}: {exc})",
+                        flush=True,
+                    )
+                    self._send(500, {"error": "reward scoring failed"})
+                    return
+                self._send(
+                    200,
+                    {
+                        "rewards": result.reward,
+                        "scores": result.scores,
+                        "extra_logs": result.extra_logs,
+                    },
+                )
+
+        self._server = _RewardHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="openrlhf-reward-bridge",
+            daemon=True,
+        )
+        self._thread.start()
+        port = int(self._server.server_address[1])
+        self.url = f"http://127.0.0.1:{port}{self._path}"
+
+    def _score_payload(self, payload: Any) -> RewardResult:
+        if not isinstance(payload, dict):
+            raise TypeError("reward request must be an object")
+        queries = payload["query"]
+        prompts = payload["prompts"]
+        labels = payload["labels"]
+        if not all(isinstance(items, list) for items in (queries, prompts, labels)):
+            raise TypeError("reward request fields must be lists")
+        if not (len(queries) == len(prompts) == len(labels) == 1):
+            raise ValueError("OpenRLHF reward bridge accepts exactly one completion per request")
+        completion = self._completion_from_query(queries[0], prompts[0])
+        if isinstance(labels[0], bool):
+            raise TypeError("reward label must be an integer")
+        label = int(labels[0])
+        with self._score_lock:
+            result = self._score_by_label(label, completion, prompts[0])
+        if not isinstance(result, RewardResult):
+            raise TypeError("reward scorer must return RewardResult")
+        if not all(math.isfinite(value) for value in (result.reward, result.scores)):
+            raise ValueError("reward response must be finite")
+        if not all(math.isfinite(float(value)) for value in result.extra_logs.values()):
+            raise ValueError("reward metrics must be finite")
+        with self._stats_lock:
+            self._rewards.append(float(result.reward))
+        return result
+
+    @property
+    def rewards(self) -> list[float]:
+        with self._stats_lock:
+            return list(self._rewards)
+
+    @property
+    def call_count(self) -> int:
+        with self._stats_lock:
+            return len(self._rewards)
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+    def __enter__(self) -> RewardBridge:
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.shutdown()
+
+
+def post_reward_request(url: str, payload: dict[str, Any], *, timeout: float = 5.0) -> dict:
+    """Small stdlib client used by CPU bridge tests."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _sitecustomize_source() -> str:
+    """Return the self-contained child hook loaded before OpenRLHF imports."""
+    return r'''
+import contextvars
+import functools
+import inspect
+import math
+import os
+
+_MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
+if _MAX_RESPONSE_LENGTH <= 0:
+    raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
+
+from openrlhf.models import loss as _loss_module
+
+_original_aggregate_loss = _loss_module.aggregate_loss
+_fixed_policy_loss = contextvars.ContextVar("flash_openrlhf_fixed_policy_loss", default=False)
+
+
+@functools.wraps(_original_aggregate_loss)
+def _flash_aggregate_loss(
+    loss,
+    loss_mask,
+    token_level_loss=True,
+    dp_size=1,
+    batch_num_tokens=None,
+    global_batch_size=None,
+):
+    if _fixed_policy_loss.get() and token_level_loss:
+        denominator = loss.shape[0] * _MAX_RESPONSE_LENGTH
+        if denominator <= 0:
+            raise RuntimeError("OpenRLHF DR-GRPO received an empty fixed-length loss batch")
+        return (loss * loss_mask).sum() / denominator
+    return _original_aggregate_loss(
+        loss,
+        loss_mask,
+        token_level_loss=token_level_loss,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
+
+
+_loss_module.aggregate_loss = _flash_aggregate_loss
+
+from openrlhf.trainer.ray.ppo_actor import ActorPPOTrainer as _ActorPPOTrainer
+
+_original_training_step = _ActorPPOTrainer.training_step
+
+
+@functools.wraps(_original_training_step)
+def _flash_training_step(self, *args, **kwargs):
+    token = _fixed_policy_loss.set(True)
+    try:
+        return _original_training_step(self, *args, **kwargs)
+    finally:
+        _fixed_policy_loss.reset(token)
+
+
+_ActorPPOTrainer.training_step = _flash_training_step
+
+from openrlhf.utils.agent import SingleTurnAgentExecutor as _SingleTurnAgentExecutor
+
+_original_execute = _SingleTurnAgentExecutor.execute
+
+
+@functools.wraps(_original_execute)
+async def _flash_execute(self, *args, **kwargs):
+    output = await _original_execute(self, *args, **kwargs)
+    if not isinstance(output, dict):
+        raise RuntimeError("OpenRLHF reward executor returned a non-object output")
+    for key in ("reward", "scores"):
+        value = output.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise RuntimeError(f"OpenRLHF reward executor returned invalid {key}")
+    extra_logs = output.get("extra_logs")
+    if not isinstance(extra_logs, dict):
+        raise RuntimeError("OpenRLHF reward executor returned invalid extra_logs")
+    for name, value in extra_logs.items():
+        if not isinstance(name, str):
+            raise RuntimeError("OpenRLHF reward metric names must be strings")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise RuntimeError(f"OpenRLHF reward metric {name!r} is invalid")
+    return output
+
+
+_SingleTurnAgentExecutor.execute = _flash_execute
+
+from openrlhf.models.actor import Actor as _Actor
+
+_original_actor_init = _Actor.__init__
+
+
+@functools.wraps(_original_actor_init)
+def _flash_actor_init(self, *args, **kwargs):
+    if kwargs.get("target_modules") == ["all-linear"]:
+        kwargs["target_modules"] = "all-linear"
+    return _original_actor_init(self, *args, **kwargs)
+
+
+_Actor.__init__ = _flash_actor_init
+
+if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
+    import vllm
+
+    _original_engine_init = vllm.AsyncEngineArgs.__init__
+    if "language_model_only" not in inspect.signature(_original_engine_init).parameters:
+        raise RuntimeError("the pinned vLLM lacks AsyncEngineArgs.language_model_only")
+
+    @functools.wraps(_original_engine_init)
+    def _flash_engine_init(self, *args, **kwargs):
+        kwargs.setdefault("language_model_only", True)
+        return _original_engine_init(self, *args, **kwargs)
+
+    vllm.AsyncEngineArgs.__init__ = _flash_engine_init
+
+print("[flash-openrlhf] fail-closed rewards and fixed-length dr-grpo loss active", flush=True)
+'''.lstrip()
+
+
+def write_openrlhf_sitecustomize(directory: str) -> str:
+    plugin_dir = os.path.join(directory, "flash_openrlhf_plugin")
+    os.makedirs(plugin_dir, exist_ok=True)
+    Path(plugin_dir, _SITE_CUSTOMIZE_NAME).write_text(_sitecustomize_source(), encoding="utf-8")
+    return plugin_dir
+
+
+def build_openrlhf_child_env(
+    *,
+    plugin_dir: str,
+    max_response_length: int,
+    language_model_only: bool,
+) -> dict[str, str]:
+    """Build a minimal child environment without Flash environment or provider secrets."""
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CHILD_ENV_EXACT or key.startswith(_CHILD_ENV_PREFIXES)
+    }
+    child["PYTHONPATH"] = os.pathsep.join(
+        item for item in (plugin_dir, os.environ.get("PYTHONPATH", "")) if item
+    )
+    child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] = str(int(max_response_length))
+    child["HF_HUB_OFFLINE"] = "1"
+    child["TRANSFORMERS_OFFLINE"] = "1"
+    child["HF_HUB_DISABLE_XET"] = "1"
+    if language_model_only:
+        child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] = "1"
+    return child
+
+
+def _write_scheduled_dataset(
+    path: str,
+    prompts: list[dict[str, Any]],
+    *,
+    steps: int,
+    prompts_per_step: int,
+) -> int:
+    if not prompts:
+        raise ValueError("cannot schedule an empty OpenRLHF prompt dataset")
+    scheduled_count = int(steps) * int(prompts_per_step)
+    if scheduled_count <= 0:
+        raise ValueError("OpenRLHF prompt schedule must contain at least one row")
+    with open(path, "w", encoding="utf-8") as dataset_file:
+        for ordinal in range(scheduled_count):
+            prompt = prompts[ordinal % len(prompts)]
+            dataset_file.write(
+                json.dumps(
+                    {"input": prompt["rendered"], "label": int(prompt["example_idx"])},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    return scheduled_count
+
+
+def _resolve_cached_model_snapshot(model_id: str, model_revision: str) -> str:
+    if len(model_revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in model_revision):
+        raise ValueError("OpenRLHF GRPO requires a validated immutable 40-character model revision")
+    from huggingface_hub import snapshot_download
+
+    snapshot = snapshot_download(
+        repo_id=model_id,
+        revision=model_revision,
+        local_files_only=True,
+    )
+    if os.path.basename(os.path.normpath(snapshot)).lower() != model_revision.lower():
+        raise RuntimeError("cached OpenRLHF model snapshot does not match the validated revision")
+    return snapshot
+
+
+def _resolve_single_turn_inputs() -> dict[str, Any]:
+    spec = _w.JOB_SPEC
+    if spec is None or spec.algorithm != "grpo":
+        raise RuntimeError("OpenRLHF GRPO requires a GRPO JobSpec")
+    env = _w.require_active_env()
+    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
+        raise RuntimeError("OpenRLHF GRPO foundation supports single-turn non-tool environments only")
+
+    train_spec = spec.train
+    if train_spec.init_from_adapter:
+        raise RuntimeError("OpenRLHF GRPO warm-start is deferred; use the TRL backend")
+    if train_spec.save_at_steps:
+        raise RuntimeError("OpenRLHF GRPO exact per-step dumps are deferred; use the TRL backend")
+    if train_spec.stop_sequences:
+        raise RuntimeError("OpenRLHF GRPO stop sequences are deferred; use the TRL backend")
+    if train_spec.structured_outputs:
+        raise RuntimeError("OpenRLHF GRPO structured outputs are deferred; use the TRL backend")
+    if train_spec.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
+        raise RuntimeError("OpenRLHF GRPO per-turn credit is deferred; use the TRL backend")
+    if float(RECIPE.lora.dropout) != 0.0:
+        raise RuntimeError("OpenRLHF GRPO requires the managed zero LoRA dropout")
+
+    model_id = spec.model
+    model_revision = spec.model_revision
+    if not model_revision:
+        raise ValueError("OpenRLHF GRPO requires model_revision for immutable adapter provenance")
+
+    rl = RECIPE.rl
+    overrides = _w.grpo_overrides()
+    prompts_per_step = int(train_spec.batch_size or rl.prompts_per_step)
+    group_size = int(overrides.get("group_size") or rl.group_size)
+    if group_size <= 1:
+        raise ValueError("OpenRLHF DR-GRPO requires train.group_size greater than 1")
+    temperature_value = overrides.get("temperature")
+    temperature = float(
+        temperature_value if temperature_value is not None else rl.sampling_temperature
+    )
+    think_penalty = float(overrides.get("thinking_length_penalty_coef") or 0.0)
+    kl_coef = float(overrides.get("kl_penalty_coef") or 0.0)
+    learning_rate = float(train_spec.learning_rate or rl.learning_rate)
+    lora_rank = int(train_spec.lora_rank or RECIPE.lora.rank)
+    lora_alpha = int(train_spec.lora_alpha or RECIPE.lora.alpha)
+    max_completion = int(
+        overrides.get("max_tokens")
+        or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
+    )
+    max_length = int(
+        train_spec.max_context_tokens
+        or max(1024, int(rl.max_prompt_len) + max_completion)
+    )
+    prompt_budget = max_length - max_completion
+    if prompt_budget <= 0:
+        raise ValueError("OpenRLHF max_context_tokens leaves no room for a prompt")
+
+    train = list(env.dataset())
+    if train_spec.max_examples:
+        train = train[: int(train_spec.max_examples)]
+    random.Random(spec.seed).shuffle(train)
+    message_prompts = [env.prompt_messages(example) for example in train]
+
+    from flash.multimodal import record_has_images
+
+    if any(
+        record_has_images(example, messages)
+        for example, messages in zip(train, message_prompts, strict=True)
+    ):
+        raise RuntimeError("OpenRLHF GRPO multimodal support is deferred; use the TRL backend")
+
+    tokenizer = _w.load_tokenizer(model_id, revision=model_revision)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompts: list[dict[str, Any]] = []
+    for example_idx, (example, messages) in enumerate(
+        zip(train, message_prompts, strict=True)
+    ):
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=_w.THINKING,
+        )
+        token_count = len(tokenizer(rendered, add_special_tokens=False).input_ids)
+        if 0 < token_count <= prompt_budget:
+            prompts.append(
+                {
+                    "rendered": rendered,
+                    "example": example,
+                    "example_idx": example_idx,
+                }
+            )
+    if not prompts:
+        raise ValueError(
+            f"every OpenRLHF training prompt exceeds the {prompt_budget}-token prompt budget"
+        )
+    prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
+    epochs = int(train_spec.epochs if train_spec.epochs is not None else rl.num_epochs)
+    derived_steps = on_policy_steps(
+        epochs=epochs,
+        prompt_count=len(prompts),
+        prompts_per_step=prompts_per_step,
+    )
+    steps = resolve_update_horizon(derived_steps, train_spec.max_steps)
+    save_every = int(train_spec.save_every or 20)
+    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(
+        prompts[0]["rendered"]
+    )
+
+    return {
+        "env": env,
+        "tokenizer": tokenizer,
+        "model_id": model_id,
+        "model_revision": model_revision,
+        "prompts": prompts,
+        "prompts_per_step": prompts_per_step,
+        "group_size": group_size,
+        "temperature": temperature,
+        "top_p": float(rl.sampling_top_p),
+        "think_penalty": think_penalty,
+        "kl_coef": kl_coef,
+        "learning_rate": learning_rate,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "max_completion": max_completion,
+        "max_length": max_length,
+        "prompt_opened_thinking": prompt_opened_thinking,
+        "steps": int(steps),
+        "save_every": save_every,
+        "gpu_count": int(spec.gpu.count),
+        "seed": int(backend_seed(spec.seed)),
+    }
+
+
+def run_rl_openrlhf() -> None:
+    """Run single-turn text GRPO through the isolated OpenRLHF trainer."""
+    started_at = time.time()
+    _w.heartbeat("rl_start", gpu=gpu_diagnostics())
+    wait_for_gpu(
+        _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
+        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+    )
+    setup_perf_backends()
+    inputs = _resolve_single_turn_inputs()
+
+    if inputs["model_revision"]:
+        download_seconds = _w.prefetch_model(
+            inputs["model_id"], revision=inputs["model_revision"]
+        )
+    else:
+        download_seconds = _w.prefetch_model(inputs["model_id"])
+    model_path = _resolve_cached_model_snapshot(
+        inputs["model_id"], inputs["model_revision"]
+    )
+
+    workdir = f"/tmp/rl_openrlhf_seed{inputs['seed']}"
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir, exist_ok=True)
+    output_dir = os.path.join(workdir, "final")
+    checkpoint_dir = os.path.join(workdir, "checkpoints")
+    dataset_path = os.path.join(workdir, "train.jsonl")
+    adapter_dir = f"/tmp/rl_seed{_w.SEED}/adapter"
+    plugin_dir = write_openrlhf_sitecustomize(workdir)
+    scheduled_prompt_count = _write_scheduled_dataset(
+        dataset_path,
+        inputs["prompts"],
+        steps=inputs["steps"],
+        prompts_per_step=inputs["prompts_per_step"],
+    )
+    examples = {int(prompt["example_idx"]): prompt["example"] for prompt in inputs["prompts"]}
+
+    def score_by_label(label: int, completion: str, _prompt: str) -> RewardResult:
+        try:
+            example = examples[label]
+        except KeyError as exc:
+            raise ValueError(f"unknown OpenRLHF reward label {label}") from exc
+        return score_single_turn(
+            inputs["env"],
+            completion,
+            example,
+            tokenizer=inputs["tokenizer"],
+            thinking=bool(_w.THINKING),
+            prompt_opened_thinking=inputs["prompt_opened_thinking"],
+            think_penalty=inputs["think_penalty"],
+        )
+
+    qwen35_language_model_only = bool(
+        _w.is_vl_checkpoint(inputs["model_id"], inputs["model_revision"])
+    )
+    last_step = [0]
+
+    def split_query(query: str, prompt: str) -> str:
+        return completion_from_tokenizer_query(inputs["tokenizer"], query, prompt)
+
+    with RewardBridge(score_by_label, completion_from_query=split_query) as bridge:
+        config = OpenRLHFGRPOConfig(
+            model_path=model_path,
+            dataset_path=dataset_path,
+            reward_url=bridge.url,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            model_id=inputs["model_id"],
+            model_revision=inputs["model_revision"],
+            max_length=inputs["max_length"],
+            max_completion=inputs["max_completion"],
+            prompts_per_step=inputs["prompts_per_step"],
+            group_size=inputs["group_size"],
+            scheduled_prompt_count=scheduled_prompt_count,
+            learning_rate=inputs["learning_rate"],
+            temperature=inputs["temperature"],
+            top_p=inputs["top_p"],
+            seed=inputs["seed"],
+            lora_rank=inputs["lora_rank"],
+            lora_alpha=inputs["lora_alpha"],
+            kl_coef=inputs["kl_coef"],
+            save_every=inputs["save_every"],
+            gpu_count=inputs["gpu_count"],
+            qwen35_language_model_only=qwen35_language_model_only,
+        )
+        args = build_openrlhf_grpo_args(config)
+        child_env = build_openrlhf_child_env(
+            plugin_dir=plugin_dir,
+            max_response_length=inputs["max_completion"],
+            language_model_only=qwen35_language_model_only,
+        )
+        python_bin = resolve_openrlhf_python(workdir)
+        _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
+
+        def on_step(step: int) -> None:
+            last_step[0] = max(last_step[0], int(step))
+
+        with liveness_heartbeat(
+            "rl_openrlhf_training",
+            progress=lambda: last_step[0],
+            progress_step=True,
+        ):
+            returncode = run_openrlhf_training(
+                python_bin,
+                args,
+                env=child_env,
+                entrypoint=_OPENRLHF_ENTRYPOINT,
+                cwd=workdir,
+                on_step=on_step,
+                heartbeat=lambda: _w.heartbeat(
+                    "rl_openrlhf_training",
+                    step=last_step[0],
+                    gpu=gpu_diagnostics(),
+                ),
+                step_pattern=r"(?i)global[_ ]step[:=\s]+(\d+)",
+            )
+        if returncode != 0:
+            raise RuntimeError(
+                f"openrlhf.cli.train_ppo_ray exited {returncode}; see the worker log"
+            )
+        if bridge.call_count == 0:
+            raise RuntimeError("OpenRLHF GRPO completed without scoring any reward")
+        if last_step[0] < inputs["steps"]:
+            raise RuntimeError(
+                f"OpenRLHF GRPO completed {last_step[0]}/{inputs['steps']} requested updates"
+            )
+        reward_history = bridge.rewards
+
+    with liveness_heartbeat(
+        "rl_openrlhf_finalizing",
+        progress=lambda: last_step[0],
+        progress_step=True,
+        keepalive=True,
+    ):
+        export_openrlhf_adapter(
+            output_dir,
+            adapter_dir,
+            inputs["model_id"],
+            inputs["model_revision"],
+            python_bin,
+        )
+        inputs["tokenizer"].save_pretrained(adapter_dir)
+        _w.write_base_model_provenance(
+            adapter_dir,
+            inputs["model_id"],
+            inputs["model_revision"],
+        )
+        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        _w.publish_deployable_checkpoint(adapter_dir, last_step[0])
+
+    train_wall = time.time() - started_at
+    _w.heartbeat(
+        "rl_trained",
+        train_wall=train_wall,
+        step=last_step[0],
+        gpu=gpu_diagnostics(),
+    )
+    generated_tokens = (
+        inputs["steps"]
+        * inputs["prompts_per_step"]
+        * inputs["group_size"]
+        * inputs["max_completion"]
+    )
+    _w.write_train_meta(
+        phase="rl",
+        adapter_dir=adapter_dir,
+        model_id=inputs["model_id"],
+        train_wall=train_wall,
+        train_tokens=0,
+        generated_tokens=generated_tokens,
+        notes={
+            "backend": "openrlhf",
+            "steps": last_step[0],
+            "retained_prompts": len(inputs["prompts"]),
+            "scheduled_prompts": scheduled_prompt_count,
+            "download_seconds": download_seconds,
+            "reward_history": reward_history,
+            "group_size": inputs["group_size"],
+            "prompts_per_step": inputs["prompts_per_step"],
+            "max_completion_len": inputs["max_completion"],
+            "grpo_recipe": {
+                "advantage_estimator": "dr_grpo",
+                "loss_normalization": "fixed_max_response_length",
+                "max_response_length": inputs["max_completion"],
+                "kl_coef": inputs["kl_coef"],
+                "temperature": inputs["temperature"],
+                "top_p": inputs["top_p"],
+                "seed": inputs["seed"],
+                "tis": False,
+            },
+        },
+    )
