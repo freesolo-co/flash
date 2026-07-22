@@ -242,8 +242,8 @@ def make_hf_heartbeat_reader(
         **deadline_kwargs(make_hf_text_reader, deadline_at),
     )
 
-    def read(force: bool = False) -> dict | None:
-        raw = text_reader(force=force)
+    def read(force: bool = False, *, deadline_at: float | None = deadline_at) -> dict | None:
+        raw = text_reader(force=force, deadline_at=deadline_at)
         if raw is None:
             return None
         try:
