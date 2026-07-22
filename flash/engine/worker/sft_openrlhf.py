@@ -28,6 +28,7 @@ from flash.engine.steps import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.hf import resolve_cached_model_commit
 from flash.engine.worker.openrlhf_common import (
     export_openrlhf_adapter,
     resolve_openrlhf_python,
@@ -63,6 +64,7 @@ _REQUIRED_ARG_KEYS = (
     "micro_batch_size",
     "model_path",
     "output_dir",
+    "resume_enabled",
     "seed",
     "train_batch_size",
 )
@@ -139,6 +141,8 @@ def build_sft_openrlhf_args(cfg: dict) -> list[str]:
         "--max_norm",
         str(cfg.get("max_norm", 1.0)),
     ]
+    if cfg["resume_enabled"]:
+        args.append("--ckpt.load_enable")
     if cfg["gradient_checkpointing"]:
         args.append("--model.gradient_checkpointing_enable")
     if cfg["gradient_checkpointing_reentrant"]:
@@ -338,6 +342,8 @@ def validate_openrlhf_warmstart_adapter(
             config = json.load(file)
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError("the prepared SFT warm-start adapter has no valid config") from error
+    if not model_revision:
+        raise ValueError("SFT warm-start validation requires an immutable target model revision")
     if str(config.get("peft_type") or "").upper() != "LORA":
         raise ValueError("SFT warm-start source must be a LoRA adapter")
     rank = int(config.get("r") or 0)
@@ -387,14 +393,38 @@ def _warmstart_adapter_path(model_id: str, model_revision: str, expected_rank: i
     return adapter_dir
 
 
+def _resolve_immutable_model_revision(model_id: str, requested_revision: str) -> str:
+    """bind the prefetched model snapshot to the immutable commit used for all paid work."""
+    resolved = resolve_cached_model_commit(model_id, requested_revision)
+    if not resolved:
+        raise RuntimeError(
+            f"could not resolve the cached model snapshot for {model_id!r} to an immutable commit"
+        )
+    return resolved
+
+
 def _cached_model_path(model_id: str, model_revision: str) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
         repo_id=model_id,
-        revision=model_revision or None,
+        revision=model_revision,
         local_files_only=True,
     )
+
+
+def _validate_gdn_realized_length(
+    model_id: str,
+    model_revision: str,
+    realized_max_length: int,
+) -> None:
+    """fail loudly only when tokenized GDN rows actually reach the unvalidated 32k path."""
+    if model_is_gdn_hybrid(model_id, revision=model_revision) and realized_max_length >= 32768:
+        raise ValueError(
+            "OpenRLHF 32k GDN SFT is not validated: the hybrid full-attention layers remain "
+            "memory-intensive, and 32k execution needs matched real-GPU validation of eager "
+            "attention plus ZeRO-3 fit before use; no validated sequence-parallel path exists"
+        )
 
 
 def _copy_processing_sidecars(source_dir: str, adapter_dir: str) -> None:
@@ -900,6 +930,17 @@ def _iter_windows(iterable, size):
         yield window
 
 
+def _resume_training_state(consumed_samples):
+    resume_states = dict(CONFIG.get("_resume_states") or {})
+    global_step = int(CONFIG.get("resume_step", 0))
+    state_step = int(resume_states.get("global_step", global_step) or 0)
+    if state_step != global_step:
+        raise RuntimeError("OpenRLHF resume checkpoint step does not match its directory tag")
+    loss_curve = [float(value) for value in resume_states.get("loss_curve", [])]
+    token_count = int(resume_states.get("token_count", 0) or 0)
+    return global_step, int(consumed_samples), loss_curve, token_count
+
+
 def _install_trainer_patch():
     import torch
     import torch.distributed as dist
@@ -911,11 +952,9 @@ def _install_trainer_patch():
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         del num_update_steps_per_epoch
         total_steps = int(CONFIG["total_steps"])
-        resume_states = dict(CONFIG.get("_resume_states") or {})
-        global_step = int(CONFIG.get("resume_step", 0))
-        state_step = int(resume_states.get("global_step", global_step) or 0)
-        if state_step != global_step:
-            raise RuntimeError("OpenRLHF resume checkpoint step does not match its directory tag")
+        global_step, consumed_total, loss_curve, token_count = _resume_training_state(
+            consumed_samples
+        )
         gas = max(1, int(self.strategy.accumulated_gradient))
         sampler = getattr(self.train_dataloader, "sampler", None)
         if isinstance(sampler, DistributedSampler):
@@ -923,14 +962,11 @@ def _install_trainer_patch():
         else:
             epoch_samples = len(self.train_dataloader.dataset)
         epoch_samples = max(1, epoch_samples)
-        consumed_total = int(consumed_samples)
         start_epoch = consumed_total // epoch_samples
         consumed_in_epoch = consumed_total % epoch_samples
         loss_fn = SFTLoss()
         self.model.train()
         device = next(self.model.parameters()).device
-        loss_curve = [float(value) for value in resume_states.get("loss_curve", [])]
-        token_count = int(resume_states.get("token_count", 0) or 0)
 
         for epoch in range(start_epoch, self.epochs):
             if global_step >= total_steps:
@@ -1182,8 +1218,9 @@ def run_sft_openrlhf(spec=None) -> None:
     )
 
     model_id = spec.model if spec else RECIPE.hf_model_id
-    model_revision = getattr(spec, "model_revision", "") if spec else ""
-    download_seconds = _w.prefetch_model(model_id, revision=model_revision)
+    requested_model_revision = getattr(spec, "model_revision", "") if spec else ""
+    download_seconds = _w.prefetch_model(model_id, revision=requested_model_revision)
+    model_revision = _resolve_immutable_model_revision(model_id, requested_model_revision)
     train_spec = spec.train if spec else None
 
     def train_opt(name, default):
@@ -1196,11 +1233,6 @@ def run_sft_openrlhf(spec=None) -> None:
             RECIPE.sft.max_seq_len_thinking if _w.THINKING else RECIPE.sft.max_seq_len,
         )
     )
-    if model_is_gdn_hybrid(model_id, revision=model_revision) and max_length >= 32768:
-        raise ValueError(
-            "OpenRLHF RingAttention does not preserve Qwen3.5/3.6 GatedDeltaNet recurrent state; "
-            "32k GDN SFT must remain on the existing backend until sequence-parallel parity is proven"
-        )
     epochs = int(train_opt("epochs", RECIPE.sft.num_epochs))
     learning_rate = float(train_opt("learning_rate", RECIPE.sft.learning_rate))
     effective_batch = int(train_opt("batch_size", RECIPE.sft.effective_batch))
@@ -1383,6 +1415,7 @@ def run_sft_openrlhf(spec=None) -> None:
         masked_tokens = sum(row["loss_mask"].count(0) for row in rows)
         total_tokens_per_epoch = sum(len(row["input_ids"]) for row in rows)
         realized_max_length = max(len(row["input_ids"]) for row in rows)
+        _validate_gdn_realized_length(model_id, model_revision, realized_max_length)
         print(
             f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
             f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
@@ -1505,6 +1538,7 @@ def run_sft_openrlhf(spec=None) -> None:
         "model_path": model_path,
         "num_workers": 4,
         "output_dir": output_dir,
+        "resume_enabled": resume_step > 0,
         "row_count": len(rows),
         "seed": _w.backend_seed(_w.SEED),
         "train_batch_size": train_batch_size,
