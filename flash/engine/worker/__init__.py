@@ -403,16 +403,21 @@ def main():
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
+        detail = sanitize_diagnostic(e, limit=500)
+        # preserve the bounded metric backlog on BOTH the primary and the fallback error
+        # heartbeat. compute it (and detail) before the guarded call -- both are cheap and
+        # cannot raise -- so that if the primary heartbeat fails (most likely gpu_diagnostics()
+        # or the upload itself), the fallback still carries metrics_last, which is the backlog
+        # this path exists to surface for short failing RL runs.
+        _err_metrics = (
+            {"metrics_last": list(LATEST_GRPO_METRICS_LAST)} if LATEST_GRPO_METRICS_LAST else {}
+        )
         try:
-            detail = sanitize_diagnostic(e, limit=500)
-            _err_metrics = (
-                {"metrics_last": list(LATEST_GRPO_METRICS_LAST)} if LATEST_GRPO_METRICS_LAST else {}
-            )
             heartbeat(
                 f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics, diag=gpu_diagnostics()
             )
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=sanitize_diagnostic(e, limit=500), **hb_flags)
+            heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
         wandb_finish(exit_code=1)
         remaining = _remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)

@@ -463,6 +463,37 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     assert "hb_cb" in ast.unparse(write_keywords["heartbeat_fields"])
 
 
+def test_error_heartbeat_fallback_preserves_metric_backlog():
+    # regression (#591): the error_{RUN_MODE} heartbeat exists to surface the bounded metric
+    # backlog (metrics_last) for short failing RL runs. main() emits it twice -- a primary call
+    # (with gpu diagnostics) and an except-fallback used if that primary call raises. BOTH must
+    # splat **_err_metrics, or a failure inside the primary call (e.g. gpu_diagnostics() or the
+    # heartbeat upload itself) re-emits an error snapshot that drops the very backlog this path
+    # was added to preserve.
+    import ast
+    import textwrap
+
+    import flash.engine.worker as ne
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ne.main)))
+    error_hb_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.JoinedStr)
+        and ast.unparse(node.args[0]).startswith(("f'error_", 'f"error_'))
+    ]
+    assert len(error_hb_calls) == 2, "expected a primary and a fallback error heartbeat in main()"
+    for call in error_hb_calls:
+        assert any(
+            keyword.arg is None and ast.unparse(keyword.value) == "_err_metrics"
+            for keyword in call.keywords
+        ), "both the primary and fallback error heartbeats must splat **_err_metrics (metrics_last)"
+
+
 def test_per_step_training_stages_are_throttled():
     """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
     _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
