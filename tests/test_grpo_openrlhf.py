@@ -760,6 +760,26 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
     assert bridge.drain_sampled_completions(5) == []
 
 
+def test_reward_bridge_neutralizes_empty_completion_without_environment_scoring():
+    calls = []
+
+    def score(label, completion, prompt):
+        calls.append((label, completion, prompt))
+        return grpo_openrlhf.RewardResult(1.0, 1.0, {"unexpected": 1.0})
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=1, first_step=1, token="empty-token"
+    ) as bridge:
+        response = grpo_openrlhf.post_reward_request(
+            bridge.url,
+            {"query": ["prompt"], "prompts": ["prompt"], "labels": [3]},
+        )
+
+    assert response == {"rewards": [0.0], "scores": [0.0], "extra_logs": {}}
+    assert calls == []
+    assert bridge.rewards == [0.0]
+
+
 def test_reward_bridge_keeps_samples_with_their_generation_step():
     def score(label, _completion, _prompt):
         return grpo_openrlhf.RewardResult(float(label), float(label), {})
@@ -1172,6 +1192,138 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     assert output["finish_reason"] == "length"
     assert output["stop_reason"] == "</answer>"
     assert output["truncated"] is False
+
+
+def test_sitecustomize_preserves_native_output_when_no_stop_is_trimmed():
+    captured = {}
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            assert token_ids == [7]
+            return "rewritten"
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            generation = SimpleNamespace(
+                token_ids=[7],
+                text="native text",
+                finish_reason="stop",
+                stop_reason=None,
+                logprobs=["native-logprob"],
+            )
+            captured["generation"] = generation
+            return SimpleNamespace(outputs=[generation])
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "action_text": generation.text,
+            "token_ids": generation.token_ids,
+            "logprobs": generation.logprobs,
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    generation = captured["generation"]
+    assert generation.token_ids == [7]
+    assert generation.text == "native text"
+    assert generation.logprobs == ["native-logprob"]
+    assert output["action_text"] == "native text"
+    assert output["token_ids"] == [7]
+    assert output["logprobs"] == ["native-logprob"]
+
+
+def test_sitecustomize_masks_and_neutralizes_stop_only_completion():
+    captured = {}
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            if not token_ids:
+                return ""
+            assert token_ids == [2]
+            return "</answer>"
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            generation = SimpleNamespace(
+                token_ids=[2],
+                text="</answer>",
+                finish_reason="stop",
+                stop_reason="</answer>",
+                logprobs=["stop-logprob"],
+            )
+            captured["generation"] = generation
+            return SimpleNamespace(outputs=[generation])
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "observation_tokens": [10, *generation.token_ids],
+            "action_ranges": [(1, 1 + len(generation.token_ids))],
+            "rollout_log_probs": [0.0, *generation.logprobs],
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {"unexpected": [1.0]},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    generation = captured["generation"]
+    assert generation.token_ids == []
+    assert generation.text == ""
+    assert generation.logprobs == []
+    assert output["observation_tokens"] == [10]
+    assert output["action_ranges"] == [(1, 1)]
+    assert output["rollout_log_probs"] == [0.0]
+    assert output["truncated"] is True
+    assert output["reward"] == 0.0
+    assert output["scores"] == 0.0
+    assert output["extra_logs"] == {}
 
 
 @pytest.mark.parametrize(
