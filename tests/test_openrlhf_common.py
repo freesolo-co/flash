@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -11,7 +12,33 @@ import pytest
 
 from flash.engine.worker import openrlhf_common
 
-_TENSOR_PYTHON = "/usr/bin/python3"
+
+def _resolve_tensor_python() -> str | None:
+    candidates = (sys.executable, "/usr/bin/python3", shutil.which("python3"))
+    seen = set()
+    for candidate in candidates:
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            result = subprocess.run(
+                [candidate, "-c", "import torch, safetensors"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            continue
+        if result.returncode == 0:
+            return candidate
+    return None
+
+
+_TENSOR_PYTHON = _resolve_tensor_python()
+requires_torch = pytest.mark.skipif(
+    _TENSOR_PYTHON is None,
+    reason="no interpreter with torch+safetensors (offline CI)",
+)
 
 
 class _FakeProcess:
@@ -391,6 +418,7 @@ def test_export_openrlhf_adapter_accepts_matching_immutable_snapshot_path(tmp_pa
     assert config["revision"] == revision
 
 
+@requires_torch
 def test_export_openrlhf_adapter_converts_real_zero3_peft_bin(tmp_path):
     checkpoint = tmp_path / "checkpoint"
     output = tmp_path / "adapter"
@@ -412,6 +440,7 @@ def test_export_openrlhf_adapter_converts_real_zero3_peft_bin(tmp_path):
     assert not output.joinpath("adapter_model.bin").exists()
 
 
+@requires_torch
 def test_export_openrlhf_adapter_prefers_authoritative_bin_when_both_weights_exist(tmp_path):
     checkpoint = tmp_path / "checkpoint"
     output = tmp_path / "adapter"
