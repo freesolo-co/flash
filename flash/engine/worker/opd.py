@@ -1098,6 +1098,54 @@ def run_opd():
     def _samples_progress():
         return samples_seen
 
+    # generate-ahead (cross-step rollout prefetch), single-turn text only. While this step's completions
+    # echo-score over the network the GPU would otherwise sit idle; instead we generate the NEXT step's
+    # rollouts from the current (pre-update) student so that window does real work. Those rollouts are
+    # then exactly one optimizer update stale (mildly off-policy). A real-GPU paired A/B (arith env,
+    # Qwen3.5-0.8B, GLM-5.2 teacher) found identical held-out accuracy vs strict on-policy while cutting
+    # the exposed teacher-scoring idle ~80%, so it is unconditional here. Multi-turn and multimodal keep
+    # the strict on-policy loop below. Because rollouts are generated in strict `step` order and each step
+    # prefetches exactly it+1, the buffered slice always matches the next consumed step (including across
+    # no-signal retries and skipped steps), so no seed rollback is ever required.
+    generate_ahead_active = not multi_turn and not multimodal
+    # (slice_index, contexts, gens) generated from pre-update weights, or None.
+    prefetched_rollouts: tuple[int, list, list] | None = None
+
+    def _generate_slice_rollouts(it_index: int, *, secs_key: str, count_key: str):
+        """[single-turn text] Generate every rollout for data slice ``it_index`` in the same chunks as
+        the strict loop, returning (contexts, gens) WITHOUT teacher-queueing or accounting (the per-step
+        closures own those). Shared by the generate-ahead prefetch and its reuse path; the strict
+        on-policy branch is left untouched."""
+        slice_batch = [
+            examples[(it_index * prompts_per_step + i) % len(examples)]
+            for i in range(prompts_per_step)
+        ]
+        slice_contexts: list[_PromptRecord] = []
+        slice_prompts: list[list[int]] = []
+        for prompt_record in slice_batch:
+            for _g in range(group):
+                slice_contexts.append(prompt_record)
+                slice_prompts.append(prompt_record.rollout_prompt_ids)
+        chunk = _opd_rollout_chunk_size(len(slice_prompts))
+        slice_gens: list = []
+        for start in range(0, len(slice_prompts), chunk):
+            with liveness_heartbeat(
+                "opd_step",
+                progress=_samples_progress,
+                fields=lambda _step=opt_steps: {"step": _step},
+                keepalive=True,
+            ):
+                gen_started = time.perf_counter()
+                slice_gens.extend(
+                    _generate_with_rollout_seeds(
+                        slice_prompts[start : start + chunk],
+                        max_tokens=knobs.max_completion,
+                    )
+                )
+                opd_phase_seconds[secs_key] += time.perf_counter() - gen_started
+                opd_phase_counts[count_key] += 1
+        return slice_contexts, slice_gens
+
     with (
         liveness_heartbeat(
             "opd_step", progress=_samples_progress, fields=lambda: {"step": opt_steps}
@@ -1274,6 +1322,49 @@ def run_opd():
                                 )
                             _flush_pending_teacher_batch()
                             _drain_ready_teacher_futures()
+                elif generate_ahead_active:
+                    # Reuse the rollouts prefetched during the previous step (generated from the
+                    # then-current student, now one optimizer update stale), or generate this slice
+                    # fresh on a miss (first step, or after a prefetch-skipped checkpoint/final boundary).
+                    if prefetched_rollouts is not None and prefetched_rollouts[0] == it:
+                        ga_contexts, ga_gens = prefetched_rollouts[1], prefetched_rollouts[2]
+                    else:
+                        ga_contexts, ga_gens = _generate_slice_rollouts(
+                            it, secs_key="rollout_generate", count_key="rollout_generate_calls"
+                        )
+                    prefetched_rollouts = None
+                    scorable: list[_Pending] = []
+                    for gen, prompt_record in zip(ga_gens, ga_contexts, strict=True):
+                        p = _Pending(
+                            gen=gen,
+                            prompt_ids=prompt_record.prompt_ids,
+                            prompt_messages=prompt_record.teacher_messages,
+                        )
+                        if gen.skip or gen.truncated:
+                            _account(_resolve_no_loss_sample(gen, None))
+                        else:
+                            scorable.append(p)
+                        samples_seen += 1  # advances the liveness-thread progress signal
+                        _opd_progress(opt_steps, nseq)
+                    _queue_teacher_batch(scorable)
+                    _drain_ready_teacher_futures()
+                    # fill this step's echo-scoring idle: generate the next step's rollouts (gpu) while
+                    # the current teacher batch scores over the network. skip when this step is the final
+                    # update or a checkpoint boundary, so no unconsumed prefetched slice is ever persisted
+                    # in a resume checkpoint (rollout_seed_ordinal then only reflects consumed-and-trained
+                    # slices).
+                    next_update = opt_steps + 1
+                    if (
+                        step < max_iters
+                        and next_update < steps
+                        and not save_step_due(next_update, knobs.save_at_steps, knobs.save_every)
+                    ):
+                        prefetched_rollouts = (
+                            step,
+                            *_generate_slice_rollouts(
+                                step, secs_key="prefetch_generate", count_key="prefetch_generates"
+                            ),
+                        )
                 else:
                     contexts: list[_PromptRecord] = []
                     prompts: list[list[int]] = []
@@ -1525,10 +1616,14 @@ def run_opd():
                         prompt_pool_fingerprint=prompt_pool_fingerprint,
                         required=False,
                     )
-            # on-policy means the next rollout must sample from the just-updated student lora. a due
-            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip the
-            # final sync because no rollout remains and the final adapter is saved from the hf model.
-            if opt_steps < steps:
+            # on-policy means future generation must sample from the just-updated student lora. a due
+            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip when
+            # no rollout remains or the final rollout is already buffered and requires no more generation.
+            if opt_steps < steps and not (
+                generate_ahead_active
+                and prefetched_rollouts is not None
+                and opt_steps == steps - 1
+            ):
                 with liveness_heartbeat(
                     "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
                 ):
@@ -1663,6 +1758,9 @@ def run_opd():
             "opd_phase_teacher_batches": int(opd_phase_counts["teacher_batches"]),
             "opd_phase_optimizer_steps": int(opd_phase_counts["optimizer_steps"]),
             "opd_phase_vllm_syncs": int(opd_phase_counts["vllm_syncs"]),
+            "opd_phase_prefetch_generate_seconds": float(opd_phase_seconds["prefetch_generate"]),
+            "opd_phase_prefetch_generates": int(opd_phase_counts["prefetch_generates"]),
+            "opd_generate_ahead": bool(generate_ahead_active),
             "opd_rollout_pipeline_chunks": (
                 _opd_rollout_pipeline_chunks(prompts_per_step * group) if not multi_turn else None
             ),
