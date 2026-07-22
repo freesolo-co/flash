@@ -71,9 +71,9 @@ def _patch_cfg(monkeypatch, cfg):
 
 
 def test_pure_attention_plain_decoder(monkeypatch):
-    # Llama/Qwen3/MiniCPM: no per-layer types, no linear-attn dims -> every layer reads the mask.
+    # a plain-attention llama config has no per-layer types or linear-attention dimensions.
     _patch_cfg(monkeypatch, types.SimpleNamespace())
-    assert model_is_pure_attention("any/dense") is True
+    assert model_is_pure_attention("meta-llama/Llama-3.2-1B") is True
 
 
 def test_pure_attention_all_full_layer_types(monkeypatch):
@@ -383,7 +383,7 @@ def test_packed_forward_matches_separate(arch):
             attn_implementation="sdpa",
         )
         model = transformers.Qwen3ForCausalLM(cfg).eval()
-    else:  # MiniCPM5 is the Llama arch
+    else:  # uncataloged plain-attention llama architecture
         cfg = transformers.LlamaConfig(
             vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
             num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
@@ -716,10 +716,9 @@ def test_packed_completion_loss_matches_unpacked():
     )
 
 
-# ------------------------------------------------ end-to-end across arches (Qwen3 + MiniCPM/Llama)
+# ------------------------------------------------ end-to-end across qwen3 and llama architectures
 def _tiny(arch, transformers):
-    """Tiny model per arch — qwen3 (pure-attn flagship tier) and llama (the MiniCPM5-1B tier, which
-    really is LlamaForCausalLM: verified model_is_pure_attention(openbmb/MiniCPM5-1B) is True)."""
+    """Tiny qwen3 and uncataloged plain-attention llama models for packing parity coverage."""
     common = {
         "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
         "num_attention_heads": 4, "num_key_value_heads": 2, "max_position_embeddings": 64,
