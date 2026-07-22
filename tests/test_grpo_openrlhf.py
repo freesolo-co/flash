@@ -1218,7 +1218,9 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "_flash_trim_trailing_stop" in source
     assert "_Actor.forward = _flash_actor_forward" in source
     assert "_flash_prepare_vlm_inputs" in source
-    assert "validate_image_token_grid_invariant" in source
+    assert "_flash_validate_image_token_grid" in source
+    assert "from flash.engine.worker.grpo_multimodal" not in source
+    assert "_flash_apply_multimodal_reward" in source
     assert "sampling_params.logit_bias = logit_bias" in source
     assert 'mm_train_inputs["_flash_num_images"]' in source
     assert "for start in range(0, flat_hidden.shape[0], int(chunk_size))" in source
@@ -1371,6 +1373,51 @@ def test_sitecustomize_multimodal_rollout_carries_processor_tensors_and_suppress
     assert experience.mm_train_inputs[0]["image_grid_thw"].tolist() == [[1, 2, 2]]
     assert experience.mm_train_inputs[0]["_flash_num_images"].tolist() == [1]
     assert torch.count_nonzero(experience.action_mask).item() == 1
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_multimodal_reward_uses_expanded_prompt_prefix(monkeypatch):
+    pytest.importorskip("torch")
+    _install_pinned_sitecustomize_modules(
+        monkeypatch,
+        image_pad_token_id=99,
+        image_merge_size=2,
+    )
+    executor_type = sys.modules["openrlhf.utils.agent"].SingleTurnAgentExecutor
+    executor = executor_type()
+    executor.reward_endpoints = ["http://127.0.0.1/reward"]
+    executor.reward_func = None
+    calls = []
+
+    async def fetch_rewards(_self, queries, prompts, labels):
+        calls.append((queries, prompts, labels))
+        return [{"rewards": 2.0, "scores": 1.0, "extra_logs": {"format": 1.0}}]
+
+    executor._fetch_rewards_via_http = types.MethodType(fetch_rewards, executor)
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            assert skip_special_tokens is False
+            pieces = {1: "expanded ", 99: "prompt", 2: "completion"}
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    response = asyncio.run(
+        executor.execute(
+            "<image>prompt",
+            4,
+            SimpleNamespace(logprobs=None),
+            32,
+            _Tokenizer(),
+            object(),
+            ["data:image/png;base64,AA=="],
+        )
+    )
+
+    assert calls == [(["expanded promptcompletion"], ["expanded prompt"], [4])]
+    assert response["reward"] == 2.0
+    assert response["scores"] == 1.0
+    assert response["extra_logs"] == {"format": 1.0}
 
 
 def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
@@ -2269,31 +2316,31 @@ def test_sitecustomize_vlm_actor_uses_full_forward_with_reconstructed_mm_token_t
     actor = actor_type("base")
     actor.model = _ToyVLM()
     actor.is_vlm = True
-    actor._vlm_config = SimpleNamespace(image_token_id=99, video_token_id=None)
+    actor._vlm_config = SimpleNamespace(image_token_id=77, video_token_id=None)
     actor.packing_samples = False
     actor.temperature = 1.0
-    sequences = torch.tensor([[5, 99, 6, 7]])
+    sequences = torch.tensor([[5, 99, 6, 7], [8, 99, 9, 10]])
     attention_mask = torch.ones_like(sequences)
-    action_mask = torch.ones((1, 1))
+    action_mask = torch.ones((2, 1))
 
     action_log_probs, output = actor.forward(
         sequences,
         action_mask,
         attention_mask=attention_mask,
         return_output=True,
-        pixel_values=torch.ones((1, 3)),
-        image_grid_thw=torch.tensor([[1, 2, 2]]),
-        _flash_num_images=torch.tensor([1]),
+        pixel_values=torch.ones((2, 3)),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        _flash_num_images=torch.tensor([[1], [1]]),
     )
 
-    assert action_log_probs.shape == (1, 1)
+    assert action_log_probs.shape == (2, 1)
     assert output.logits is None
     assert len(actor.model.calls) == 1
     call = actor.model.calls[0]
     assert call["position_ids"] is None
     assert call["mm_token_type_ids"].dtype == torch.int32
-    assert call["mm_token_type_ids"].tolist() == [[0, 1, 0, 0]]
-    assert call["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert call["mm_token_type_ids"].tolist() == [[0, 1, 0, 0], [0, 1, 0, 0]]
+    assert call["image_grid_thw"].tolist() == [[1, 2, 2], [1, 2, 2]]
 
 
 @requires_openrlhf_source

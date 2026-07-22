@@ -1006,6 +1006,42 @@ class _FlashTerminationCapture:
         return request_output
 
 
+async def _flash_apply_multimodal_reward(executor, output, tokenizer):
+    reward_endpoints = getattr(executor, "reward_endpoints", None)
+    if not reward_endpoints:
+        return
+    observation_tokens = output.get("observation_tokens")
+    action_ranges = output.get("action_ranges")
+    if not isinstance(observation_tokens, list) or not action_ranges:
+        raise RuntimeError("OpenRLHF multimodal rollout returned no reward split boundary")
+    prompt_end = int(action_ranges[0][0])
+    if prompt_end <= 0 or prompt_end > len(observation_tokens):
+        raise RuntimeError("OpenRLHF multimodal rollout returned an invalid reward split boundary")
+    expanded_prompt = tokenizer.decode(
+        observation_tokens[:prompt_end], skip_special_tokens=False
+    )
+    query = tokenizer.decode(observation_tokens, skip_special_tokens=False)
+    labels = [output.get("label")]
+    if getattr(executor, "reward_func", None):
+        rewards_info_list = await executor._fetch_rewards_via_func(
+            [query], [expanded_prompt], labels
+        )
+    else:
+        rewards_info_list = await executor._fetch_rewards_via_http(
+            [query], [expanded_prompt], labels
+        )
+    rewards_info = rewards_info_list[0] if rewards_info_list else None
+    if rewards_info:
+        score_value = rewards_info.get("scores")
+        if score_value is None:
+            score_value = rewards_info.get("rewards")
+        output.update(
+            reward=rewards_info.get("rewards"),
+            scores=score_value,
+            extra_logs=rewards_info.get("extra_logs") or {},
+        )
+
+
 @functools.wraps(_original_execute)
 async def _flash_execute(self, *args, **kwargs):
     call_args = list(args)
@@ -1061,10 +1097,16 @@ async def _flash_execute(self, *args, **kwargs):
         call_args[5] = capture
     else:
         call_kwargs["llm_engine"] = capture
-    output = await _original_execute(self, *call_args, **call_kwargs)
+    reward_executor = self
+    rollout_executor = self
+    if images and getattr(self, "reward_endpoints", None):
+        rollout_executor = copy.copy(self)
+        rollout_executor.reward_endpoints = []
+    output = await _original_execute(rollout_executor, *call_args, **call_kwargs)
     if not isinstance(output, dict):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
     if images:
+        await _flash_apply_multimodal_reward(reward_executor, output, tokenizer)
         mm_train_inputs = output.get("mm_train_inputs")
         if not isinstance(mm_train_inputs, dict):
             raise RuntimeError("OpenRLHF multimodal rollout returned no processor tensors")
@@ -1178,18 +1220,107 @@ def _flash_chunked_action_log_probs(
     return action_log_probs, entropy
 
 
+def _flash_int_list(values):
+    if hasattr(values, "reshape"):
+        values = values.reshape(-1)
+    if hasattr(values, "detach"):
+        values = values.detach().cpu()
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    flattened = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            flattened.extend(int(item) for item in value)
+        else:
+            flattened.append(int(value))
+    return flattened
+
+
+def _flash_image_token_runs(input_ids, attention_mask, image_pad_token_id):
+    active = (input_ids == image_pad_token_id) & attention_mask.bool()
+    batch_runs = []
+    for row in active:
+        if row.numel() == 0:
+            batch_runs.append([])
+            continue
+        previous = row.roll(1)
+        previous[0] = False
+        following = row.roll(-1)
+        following[-1] = False
+        starts = (row & ~previous).nonzero(as_tuple=False).flatten()
+        ends = (row & ~following).nonzero(as_tuple=False).flatten()
+        batch_runs.append(_flash_int_list(ends - starts + 1))
+    return batch_runs
+
+
+def _flash_grid_feature_counts(image_grid_thw, merge_size):
+    merge_length = int(merge_size) ** 2
+    products = image_grid_thw.prod(dim=-1)
+    remainders = products.remainder(merge_length)
+    if bool(remainders.ne(0).any().item()):
+        raise ValueError("image_grid_thw contains a grid not divisible by merge_size squared")
+    return _flash_int_list(products // merge_length)
+
+
+def _flash_validate_image_token_grid(
+    input_ids,
+    attention_mask,
+    image_grid_thw,
+    num_images,
+    image_pad_token_id,
+    merge_size,
+):
+    if num_images is None:
+        raise ValueError(
+            "single-turn multimodal grpo requires num_images for image-grid validation"
+        )
+    images_per_sample = _flash_int_list(num_images)
+    active_runs = _flash_image_token_runs(input_ids, attention_mask, image_pad_token_id)
+    if len(images_per_sample) != len(active_runs):
+        raise ValueError(
+            "single-turn multimodal grpo image counts do not match the forward batch: "
+            f"images={len(images_per_sample)}, samples={len(active_runs)}"
+        )
+    feature_counts = _flash_grid_feature_counts(image_grid_thw, merge_size)
+    if sum(images_per_sample) != len(feature_counts):
+        raise ValueError(
+            "single-turn multimodal grpo image_grid_thw rows do not match num_images: "
+            f"grids={len(feature_counts)}, images={sum(images_per_sample)}"
+        )
+    grid_offset = 0
+    for sample_index, (sample_runs, image_count) in enumerate(
+        zip(active_runs, images_per_sample, strict=True)
+    ):
+        if len(sample_runs) != image_count:
+            raise ValueError(
+                "single-turn multimodal grpo image-token/grid invariant failed before forward for "
+                f"sample {sample_index}: image_token_runs={len(sample_runs)}, images={image_count}"
+            )
+        sample_features = feature_counts[grid_offset : grid_offset + image_count]
+        for image_index, (run_length, feature_count) in enumerate(
+            zip(sample_runs, sample_features, strict=True)
+        ):
+            if run_length != feature_count:
+                raise ValueError(
+                    "single-turn multimodal grpo image-token/grid invariant failed before forward for "
+                    f"sample {sample_index}, image {image_index}: "
+                    f"active_image_tokens={run_length}, grid_features={feature_count}"
+                )
+        grid_offset += image_count
+
+
 def _flash_prepare_vlm_inputs(self, sequences, attention_mask, mm_inputs):
     mm_inputs = dict(mm_inputs)
     num_images = mm_inputs.pop("_flash_num_images", None)
+    if hasattr(num_images, "reshape"):
+        num_images = num_images.reshape(-1)
     image_grid_thw = mm_inputs.get("image_grid_thw")
     if image_grid_thw is not None:
         if _IMAGE_PAD_TOKEN_ID is None or _IMAGE_MERGE_SIZE is None:
             raise RuntimeError("OpenRLHF VLM actor is missing Flash image-grid metadata")
         if attention_mask is None:
             raise RuntimeError("OpenRLHF VLM actor requires an attention mask")
-        from flash.engine.worker.grpo_multimodal import validate_image_token_grid_invariant
-
-        validate_image_token_grid_invariant(
+        _flash_validate_image_token_grid(
             input_ids=sequences,
             attention_mask=attention_mask,
             image_grid_thw=image_grid_thw,
@@ -1198,12 +1329,10 @@ def _flash_prepare_vlm_inputs(self, sequences, attention_mask, mm_inputs):
             merge_size=_IMAGE_MERGE_SIZE,
         )
 
-    cfg = self._vlm_config
-    image_token_id = getattr(cfg, "image_token_id", _IMAGE_PAD_TOKEN_ID)
-    if image_token_id is None:
+    if _IMAGE_PAD_TOKEN_ID is None:
         raise RuntimeError("OpenRLHF VLM actor requires an image token id")
-    token_type_ids = (sequences == int(image_token_id)).to(torch.int32)
-    video_token_id = getattr(cfg, "video_token_id", None)
+    token_type_ids = (sequences == _IMAGE_PAD_TOKEN_ID).to(torch.int32)
+    video_token_id = getattr(self._vlm_config, "video_token_id", None)
     if video_token_id is not None:
         token_type_ids[sequences == int(video_token_id)] = 2
     key = "mm_token_type_ids" if image_grid_thw is not None else "token_type_ids"
