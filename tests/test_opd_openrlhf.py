@@ -9,8 +9,10 @@ import io
 import json
 import os
 import sys
+import threading
 import types
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +41,8 @@ def _value(args: list[str], flag: str) -> str:
 
 def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
     class _ActorPPOTrainer:
-        pass
+        def ppo_train(self, *_args, **_kwargs):
+            return dict(self.original_actor_status)
 
     class _Actor:
         def __init__(self, *_args, **_kwargs):
@@ -281,6 +284,71 @@ def test_teacher_bridge_round_trip_returns_aligned_action_tensors():
     assert result["teacher_signal_mask"] == [False, True, True, False]
     assert result["signal_count"] == 2
     assert bridge.snapshot()["teacher_ok"] == 1
+
+
+def test_teacher_bridge_scores_requests_concurrently():
+    class _ConcurrentTeacher:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def score(self, _prompt, _completion):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=2)
+                return [
+                    TeacherToken(text="a", logprob=-0.2, start=0, end=1),
+                    TeacherToken(text="b", logprob=-0.4, start=1, end=2),
+                ]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    teacher = _ConcurrentTeacher()
+    prompt = opd_openrlhf._PromptRecord(
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=(10, 11),
+        rendered="P:",
+    )
+
+    def score(rollout_ordinal):
+        return opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {
+                "label": json.dumps(
+                    {
+                        "global_step": 0,
+                        "example_index": 0,
+                        "rollout_ordinal": rollout_ordinal,
+                        "no_signal_attempt": 0,
+                    }
+                ),
+                "prompt_length": 2,
+                "sequence_ids": [10, 11, 20, 21, 2],
+                "terminated": True,
+            },
+            timeout=5,
+        )
+
+    with (
+        opd_openrlhf.TeacherAlignmentBridge(
+            prompts=[prompt],
+            tokenizer=_Tokenizer(),
+            teacher=teacher,
+            thinking_prefill="",
+            eos_token_ids=frozenset({2}),
+            stop_sequences=(),
+        ) as bridge,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        results = list(pool.map(score, (0, 1)))
+
+    assert [result["signal_count"] for result in results] == [2, 2]
+    assert teacher.max_active == 2
 
 
 @pytest.mark.parametrize(
@@ -530,12 +598,15 @@ def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     monkeypatch.setattr(
         opd_openrlhf._w,
         "publish_deployable_checkpoint",
-        lambda *_args, **_kwargs: events.append("deployable"),
+        lambda path, step, **_kwargs: events.append(("deployable", path, step)),
     )
 
     publisher._publish(2)
 
-    assert events == ["resume", "deployable"]
+    assert events == [
+        "resume",
+        ("deployable", "/staged/checkpoint-2/_adapter_export", 2),
+    ]
 
 
 def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
@@ -556,12 +627,15 @@ def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
     monkeypatch.setattr(
         opd_openrlhf._w,
         "publish_deployable_checkpoint",
-        lambda *_args, **kwargs: events.append(("deployable", kwargs["required"])),
+        lambda path, _step, **kwargs: events.append(("deployable", path, kwargs["required"])),
     )
 
     publisher._publish(2)
 
-    assert events == ["resume", ("deployable", False)]
+    assert events == [
+        "resume",
+        ("deployable", "/staged/checkpoint-2/_adapter_export", False),
+    ]
 
 
 def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
@@ -591,6 +665,10 @@ def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
 
     assert stage.joinpath("optimizer.pt").read_bytes() == b"optimizer"
     assert stage.joinpath("rng_state.pth").read_bytes() == b"child-trainer-rng"
+    deployable = stage / "_adapter_export"
+    assert deployable.joinpath("adapter_config.json").is_file()
+    assert deployable.joinpath("adapter_model.bin").is_file()
+    assert not deployable.joinpath("_actor").exists()
 
 
 def test_final_resume_checkpoint_is_required_without_extra_deployable(monkeypatch):
@@ -633,7 +711,7 @@ def test_resume_reconciles_missing_required_deployable(monkeypatch):
 
     assert calls == [
         (
-            ("/resume/checkpoint-2", 2),
+            ("/resume/checkpoint-2/_adapter_export", 2),
             {"required": True, "_provenance_ready": True},
         )
     ]
@@ -840,14 +918,9 @@ def test_child_passes_native_non_length_termination_to_teacher_bridge(monkeypatc
     assert payloads[0]["terminated"] is True
 
 
-def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
+def test_child_drops_no_signal_rollout_after_bounded_resampling(monkeypatch):
     namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
     attempts = []
-
-    class _Exit(RuntimeError):
-        def __init__(self, code):
-            super().__init__(str(code))
-            self.code = code
 
     async def execute(*_args, **_kwargs):
         return {
@@ -858,10 +931,14 @@ def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
 
     namespace["_original_execute"] = execute
     namespace["_flash_post_teacher"] = lambda payload: (
-        attempts.append(payload) or {"signal_count": 0}
-    )
-    namespace["os"] = SimpleNamespace(
-        _exit=lambda code: (_ for _ in ()).throw(_Exit(code)),
+        attempts.append(payload)
+        or {
+            "signal_count": 0,
+            "teacher_group_ids": [-1, -1, -1],
+            "teacher_logsums": [0.0, 0.0, 0.0],
+            "teacher_signal_mask": [False, False, False],
+            "coverage": 0.0,
+        }
     )
     label = json.dumps(
         {
@@ -872,21 +949,152 @@ def test_child_no_signal_requests_retriable_worker_replacement(monkeypatch):
         }
     )
 
-    with pytest.raises(_Exit) as error:
-        asyncio.run(
-            namespace["_flash_opd_execute"](
-                SimpleNamespace(),
-                "prompt",
-                label,
-                SimpleNamespace(),
-                10,
-                object(),
-                object(),
-            )
+    result = asyncio.run(
+        namespace["_flash_opd_execute"](
+            SimpleNamespace(),
+            "prompt",
+            label,
+            SimpleNamespace(),
+            10,
+            object(),
+            object(),
         )
+    )
 
-    assert error.value.code == opd_openrlhf._OPENRLHF_TRANSIENT_TEACHER_EXIT
+    assert result["teacher_signal_mask"] == [False, False, False]
+    assert result["teacher_coverage"] == 0.0
     assert len(attempts) == opd_openrlhf._OPENRLHF_NO_SIGNAL_ATTEMPTS
+    assert [json.loads(attempt["label"])["no_signal_attempt"] for attempt in attempts] == [0, 1, 2]
+
+
+@requires_torch
+def test_child_process_response_drops_no_signal_action_tokens(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    namespace["torch"] = torch
+    experience = SimpleNamespace(
+        action_mask=torch.ones((1, 3), dtype=torch.bool),
+        info={},
+    )
+    namespace["_original_process_response"] = lambda *_args, **_kwargs: experience
+
+    result = namespace["_flash_opd_process_response"](
+        object(),
+        {
+            "teacher_group_ids": [-1, -1, -1],
+            "teacher_logsums": [0.0, 0.0, 0.0],
+            "teacher_signal_mask": [False, False, False],
+            "teacher_coverage": 0.0,
+        },
+    )
+
+    assert not bool(result.action_mask.any().item())
+
+
+def test_child_mutation_marker_requires_signal_in_accumulation_window(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    trainer = SimpleNamespace()
+    should_mark = namespace["_flash_should_mark_mutation"]
+
+    assert should_mark(trainer, 0, 2, True) is False
+    assert should_mark(trainer, 1, 2, False) is True
+    assert should_mark(trainer, 0, 2, False) is False
+    assert should_mark(trainer, 1, 2, False) is False
+    with pytest.raises(RuntimeError, match="gradient accumulation must be positive"):
+        should_mark(trainer, 0, 0, True)
+
+
+def test_child_counts_only_samples_with_aligned_tokens(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    selected = SimpleNamespace(
+        any=lambda dim: SimpleNamespace(
+            sum=lambda: SimpleNamespace(item=lambda: 0 if dim == -1 else 99)
+        )
+    )
+
+    assert namespace["_flash_aligned_sample_count"](selected) == 0.0
+
+
+def test_child_gates_sample_metrics_on_current_global_microbatch(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    class _Strategy:
+        def __init__(self, count):
+            self.count = count
+
+        def all_reduce(self, values, *, op):
+            assert values == {"flash_aligned_samples": 0.0}
+            assert op == "sum"
+            return {"flash_aligned_samples": self.count}
+
+    has_signal = namespace["_flash_current_batch_has_signal"]
+
+    assert has_signal(_Strategy(0), 0.0) is False
+    assert has_signal(_Strategy(2), 0.0) is True
+
+
+def test_child_scales_local_loss_to_global_sequence_mean(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    scale = namespace["_flash_global_sequence_mean_loss"]
+
+    assert scale(2.0, 2.0, 2.0, 1) == 2.0
+    assert scale(2.0, 1.0, 1.5, 3) == 4.0
+    assert scale(2.0, 0.0, 1.5, 3) == 0.0
+
+
+def test_child_empty_window_advances_without_optimizer_update(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    events = []
+
+    class _Optimizer:
+        def zero_grad(self):
+            events.append("zero_grad")
+
+    class _Engine:
+        def __init__(self):
+            self._is_gradient_accumulation_boundary = None
+            self.optimizer = _Optimizer()
+
+        def set_gradient_accumulation_boundary(self, value):
+            self._is_gradient_accumulation_boundary = value
+            events.append(("boundary", value))
+
+    engine = _Engine()
+
+    class _Strategy:
+        def optimizer_step(self, *_args, **_kwargs):
+            events.append(("step", engine._is_gradient_accumulation_boundary))
+
+    trainer = SimpleNamespace(
+        actor=SimpleNamespace(model=engine),
+        actor_optim=object(),
+        actor_scheduler=object(),
+        strategy=_Strategy(),
+    )
+
+    namespace["_flash_advance_empty_accumulation"](trainer)
+
+    assert events == [
+        ("boundary", False),
+        ("step", False),
+        ("boundary", None),
+        "zero_grad",
+    ]
+
+
+def test_child_actor_status_defaults_empty_signal_metrics(monkeypatch):
+    _, actor_trainer, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    trainer = actor_trainer()
+    trainer.original_actor_status = {"actor_lr": 1e-5}
+
+    status = trainer.ppo_train(0.0)
+
+    assert status == {
+        "actor_lr": 1e-5,
+        "policy_loss": 0.0,
+        "distillation_loss": 0.0,
+        "teacher_coverage": 0.0,
+    }
 
 
 def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
@@ -1025,6 +1233,23 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert "--ds.attn_implementation" not in args
     assert "--vllm.enforce_eager" in args
     assert "--train.colocate_all" in args
+
+
+@pytest.mark.parametrize(
+    ("prompts_per_step", "group_size", "gpu_count"),
+    [(1, 1, 2), (3, 1, 2)],
+)
+def test_build_openrlhf_opd_args_rejects_invalid_actor_global_batch(
+    prompts_per_step, group_size, gpu_count
+):
+    with pytest.raises(ValueError, match="completion batch must be at least and divisible"):
+        opd_openrlhf.build_openrlhf_opd_args(
+            _config(
+                prompts_per_step=prompts_per_step,
+                group_size=group_size,
+                gpu_count=gpu_count,
+            )
+        )
 
 
 def test_build_openrlhf_opd_args_enables_native_resume():
@@ -1185,7 +1410,8 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     torch = pytest.importorskip("torch")
 
     class _ActorPPOTrainer:
-        pass
+        def ppo_train(self, *_args, **_kwargs):
+            return dict(self.original_actor_status)
 
     class _Actor:
         def __init__(self, *_args, **_kwargs):
@@ -1298,6 +1524,11 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
 
     class _Strategy:
         ring_attn_group = None
+        accumulated_gradient = 1
+        world_size = 1
+
+        def all_reduce(self, values, **_kwargs):
+            return values
 
         def backward(self, loss, *_args):
             self.loss = loss
@@ -1342,7 +1573,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         reduction="none",
     ).view_as(action_mask)
     reference_logps = full_logps * action_mask.float()
-    expected = opd_openrlhf.flash_groupwise_reverse_kl(
+    expected_chunked = opd_openrlhf.flash_groupwise_reverse_kl(
         reference_logps,
         teacher_logsums,
         group_ids,
@@ -1350,7 +1581,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         0.37,
     )
     expected_grads = torch.autograd.grad(
-        expected,
+        expected_chunked,
         tuple(reference_model.parameters()),
         retain_graph=True,
     )
@@ -1375,7 +1606,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         chunked_grads = torch.autograd.grad(chunked_loss, tuple(chunked_model.parameters()))
 
         assert torch.allclose(chunked_logps, reference_logps, atol=1e-6, rtol=0)
-        assert chunked_loss.item() == pytest.approx(expected.item(), abs=1e-6)
+        assert chunked_loss.item() == pytest.approx(expected_chunked.item(), abs=1e-6)
         for actual_grad, expected_grad in zip(chunked_grads, expected_grads, strict=True):
             assert torch.allclose(actual_grad, expected_grad, atol=1e-6, rtol=0)
 
@@ -1398,10 +1629,22 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         },
     )
 
-    status = trainer.training_step(experience, 0.0, 0)
+    status = trainer.training_step(
+        experience,
+        0.0,
+        0,
+        {"global_batch_size": torch.tensor(2.0)},
+    )
     training_grads = torch.autograd.grad(
         trainer.strategy.loss,
         tuple(training_model.parameters()),
+    )
+    expected = opd_openrlhf.flash_groupwise_reverse_kl(
+        reference_logps,
+        teacher_logsums,
+        group_ids,
+        signal_mask,
+        0.37,
     )
 
     assert trainer.strategy.loss.item() == pytest.approx(expected.item(), abs=1e-6)
@@ -1442,6 +1685,7 @@ def test_parent_worker_keeps_filtering_liveness_and_exact_final_checkpoint_gate(
     source = Path(opd_openrlhf.__file__).read_text(encoding="utf-8")
 
     assert 'liveness_heartbeat("opd_filtering_prompts", progress=lambda: scanned)' in source
+    assert "heartbeat=lambda:" not in source
     assert 'if final_save_due(last_step[0], inputs["save_at_steps"]):' in source
 
 
