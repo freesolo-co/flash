@@ -39,7 +39,8 @@ def _value(args: list[str], flag: str) -> str:
 
 def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
     class _ActorPPOTrainer:
-        pass
+        def ppo_train(self, *_args, **_kwargs):
+            return dict(self.original_actor_status)
 
     class _Actor:
         def __init__(self, *_args, **_kwargs):
@@ -913,13 +914,43 @@ def test_child_process_response_drops_no_signal_action_tokens(monkeypatch):
     assert not bool(result.action_mask.any().item())
 
 
-def test_child_mutation_marker_only_precedes_accumulation_boundary(monkeypatch):
+def test_child_mutation_marker_requires_signal_in_accumulation_window(monkeypatch):
     namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    trainer = SimpleNamespace()
+    should_mark = namespace["_flash_should_mark_mutation"]
 
-    assert namespace["_flash_is_optimizer_update"](0, 2) is False
-    assert namespace["_flash_is_optimizer_update"](1, 2) is True
+    assert should_mark(trainer, 0, 2, True) is False
+    assert should_mark(trainer, 1, 2, False) is True
+    assert should_mark(trainer, 0, 2, False) is False
+    assert should_mark(trainer, 1, 2, False) is False
     with pytest.raises(RuntimeError, match="gradient accumulation must be positive"):
-        namespace["_flash_is_optimizer_update"](0, 0)
+        should_mark(trainer, 0, 0, True)
+
+
+def test_child_counts_only_samples_with_aligned_tokens(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    selected = SimpleNamespace(
+        any=lambda dim: SimpleNamespace(
+            sum=lambda: SimpleNamespace(item=lambda: 0 if dim == -1 else 99)
+        )
+    )
+
+    assert namespace["_flash_aligned_sample_count"](selected) == 0.0
+
+
+def test_child_actor_status_defaults_empty_signal_metrics(monkeypatch):
+    _, actor_trainer, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    trainer = actor_trainer()
+    trainer.original_actor_status = {"actor_lr": 1e-5}
+
+    status = trainer.ppo_train(0.0)
+
+    assert status == {
+        "actor_lr": 1e-5,
+        "policy_loss": 0.0,
+        "distillation_loss": 0.0,
+        "teacher_coverage": 0.0,
+    }
 
 
 def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
@@ -1233,7 +1264,8 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     torch = pytest.importorskip("torch")
 
     class _ActorPPOTrainer:
-        pass
+        def ppo_train(self, *_args, **_kwargs):
+            return dict(self.original_actor_status)
 
     class _Actor:
         def __init__(self, *_args, **_kwargs):
@@ -1338,6 +1370,9 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     class _Strategy:
         ring_attn_group = None
         accumulated_gradient = 1
+
+        def all_reduce(self, values, **_kwargs):
+            return values
 
         def backward(self, loss, *_args):
             self.loss = loss

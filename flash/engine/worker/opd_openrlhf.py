@@ -1127,6 +1127,21 @@ def _flash_is_optimizer_update(step, accumulated_gradient):
     return (int(step) + 1) % accumulated_gradient == 0
 
 
+def _flash_should_mark_mutation(trainer, step, accumulated_gradient, has_signal):
+    window_has_signal = bool(
+        getattr(trainer, "_flash_opd_accumulation_has_signal", False) or has_signal
+    )
+    trainer._flash_opd_accumulation_has_signal = window_has_signal
+    if not _flash_is_optimizer_update(step, accumulated_gradient):
+        return False
+    trainer._flash_opd_accumulation_has_signal = False
+    return window_has_signal
+
+
+def _flash_aligned_sample_count(selected):
+    return float(selected.any(dim=-1).sum().item())
+
+
 def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=None):
     del kl_ctl, loss_batch_info
     self.actor.train()
@@ -1150,6 +1165,14 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
     ).bool()
     response_mask = experience.action_mask.bool() & signal_mask
     selected = response_mask & group_ids.ge(0)
+    aligned_samples = _flash_aligned_sample_count(selected)
+    global_aligned_samples = float(
+        self.strategy.all_reduce(
+            {"flash_aligned_samples": aligned_samples},
+            op="sum",
+        )["flash_aligned_samples"]
+    )
+    has_signal = global_aligned_samples > 0
     if bool(selected.any().item()):
         loss, selected = _flash_reverse_kl(
             action_log_probs,
@@ -1160,7 +1183,12 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
     else:
         loss = action_log_probs.sum() * 0.0
     self.strategy.backward(loss, self.actor, self.actor_optim)
-    if _flash_is_optimizer_update(step, self.strategy.accumulated_gradient):
+    if _flash_should_mark_mutation(
+        self,
+        step,
+        self.strategy.accumulated_gradient,
+        has_signal,
+    ):
         _flash_post_teacher({"mutation": True})
     self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
     grad_norm = self.strategy.get_grad_norm(self.actor)
@@ -1171,27 +1199,51 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         coverage = coverage.float().mean()
     else:
         coverage = loss.detach().new_zeros(())
+    metrics = {
+        "actor_lr": self.actor_scheduler.get_last_lr()[0],
+        "actor_grad_norm": grad_norm,
+    }
+    weights = {
+        "actor_lr": None,
+        "actor_grad_norm": None,
+    }
+    if has_signal:
+        metrics.update(
+            {
+                "policy_loss": loss.detach(),
+                "distillation_loss": loss.detach(),
+                "teacher_coverage": coverage.detach(),
+            }
+        )
+        weights.update(
+            {
+                "policy_loss": "sample",
+                "distillation_loss": "sample",
+                "teacher_coverage": "sample",
+            }
+        )
     return {
-        "metrics": {
-            "policy_loss": loss.detach(),
-            "distillation_loss": loss.detach(),
-            "teacher_coverage": coverage.detach(),
-            "actor_lr": self.actor_scheduler.get_last_lr()[0],
-            "actor_grad_norm": grad_norm,
-        },
-        "weights": {
-            "policy_loss": "sample",
-            "distillation_loss": "sample",
-            "teacher_coverage": "sample",
-            "actor_lr": None,
-            "actor_grad_norm": None,
-        },
-        "num_samples": float(max(selected.any(dim=-1).sum().item(), 1)),
+        "metrics": metrics,
+        "weights": weights,
+        "num_samples": aligned_samples,
         "num_action_tokens": float(selected.sum().item()),
     }
 
 
 _ActorPPOTrainer.training_step = _flash_opd_training_step
+_original_actor_ppo_train = _ActorPPOTrainer.ppo_train
+
+
+@functools.wraps(_original_actor_ppo_train)
+def _flash_actor_ppo_train(self, *args, **kwargs):
+    status = _original_actor_ppo_train(self, *args, **kwargs)
+    status.setdefault("policy_loss", 0.0)
+    status.setdefault("distillation_loss", 0.0)
+    status.setdefault("teacher_coverage", 0.0)
+    return status
+
+
+_ActorPPOTrainer.ppo_train = _flash_actor_ppo_train
 
 if os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER"):
     _flash_actor_init_before_warmstart = _Actor.__init__
