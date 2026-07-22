@@ -366,7 +366,8 @@ def test_validate_openrlhf_warmstart_adapter_accepts_matching_snapshot_path(tmp_
     )
 
 
-def test_validate_openrlhf_warmstart_adapter_accepts_matching_provenance(tmp_path):
+@pytest.mark.parametrize("peft_revision", [None, "main"])
+def test_validate_openrlhf_warmstart_adapter_accepts_matching_provenance(tmp_path, peft_revision):
     revision = "f" * 40
     adapter = tmp_path / "adapter"
     adapter.mkdir()
@@ -377,7 +378,7 @@ def test_validate_openrlhf_warmstart_adapter_accepts_matching_provenance(tmp_pat
                 "peft_type": "LORA",
                 "r": 16,
                 "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
-                "revision": None,
+                "revision": peft_revision,
             }
         ),
         encoding="utf-8",
@@ -425,9 +426,20 @@ def test_resolve_immutable_model_revision_uses_prefetched_snapshot(monkeypatch):
     assert _resolve_immutable_model_revision("org/model", "") == commit
 
 
-def test_resolve_immutable_model_revision_fails_before_training_when_cache_is_unresolved(
-    monkeypatch,
-):
+def test_resolve_immutable_model_revision_retries_unpinned_cache_miss(monkeypatch):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    monkeypatch.setattr(
+        openrlhf_mod,
+        "resolve_cached_model_commit",
+        lambda model_id, revision: "",
+    )
+
+    with pytest.raises(openrlhf_mod._w.RetriableInfraError, match="immutable commit"):
+        _resolve_immutable_model_revision("org/model", "")
+
+
+def test_resolve_immutable_model_revision_rejects_unresolved_pinned_revision(monkeypatch):
     import flash.engine.worker.sft_openrlhf as openrlhf_mod
 
     monkeypatch.setattr(
@@ -437,7 +449,7 @@ def test_resolve_immutable_model_revision_fails_before_training_when_cache_is_un
     )
 
     with pytest.raises(RuntimeError, match="immutable commit"):
-        _resolve_immutable_model_revision("org/model", "")
+        _resolve_immutable_model_revision("org/model", "main")
 
 
 def test_gdn_32k_gate_uses_realized_rows_and_allows_short_rows(monkeypatch):
@@ -649,10 +661,12 @@ def test_openrlhf_child_env_excludes_training_and_provider_secrets(monkeypatch, 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("FLA_TILELANG", "0")
 
     child = build_openrlhf_sft_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
 
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert child["FLA_TILELANG"] == "0"
     assert "HF_TOKEN" not in child
     assert "FIREWORKS_API_KEY" not in child
     assert "RUNPOD_API_KEY" not in child
@@ -693,6 +707,46 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "2**31 - 1" in source
     assert 'float("inf")' in source
     assert "falling back" not in source.lower()
+
+
+def test_openrlhf_runtime_reapplies_blackwell_fla_safety(monkeypatch, tmp_path):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    monkeypatch.delenv("FLA_TILELANG", raising=False)
+    namespace = {"__name__": "flash_openrlhf_sft_blackwell_test"}
+    exec(compile(render_openrlhf_sft_runtime(), "runtime.py", "exec"), namespace)
+
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda: (10, 0),
+    )
+    fla = ModuleType("fla")
+    fla.__path__ = []
+    fla.__spec__ = importlib.util.spec_from_loader("fla", loader=None, is_package=True)
+    ops = ModuleType("fla.ops")
+    ops.__path__ = []
+    gated_delta_rule = ModuleType("fla.ops.gated_delta_rule")
+    tuner = SimpleNamespace(
+        configs=[
+            SimpleNamespace(num_warps=4, num_stages=3),
+            SimpleNamespace(num_warps=2, num_stages=4),
+        ]
+    )
+    wy_fast = ModuleType("fla.ops.gated_delta_rule.wy_fast")
+    wy_fast.prepare_wy_repr_bwd_kernel = tuner
+    gated_delta_rule.wy_fast = wy_fast
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "fla", fla)
+    monkeypatch.setitem(sys.modules, "fla.ops", ops)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", gated_delta_rule)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule.wy_fast", wy_fast)
+
+    namespace["_apply_blackwell_fla_safety"]()
+
+    assert os.environ["FLA_TILELANG"] == "0"
+    assert tuner.configs == [SimpleNamespace(num_warps=2, num_stages=4)]
 
 
 def test_runtime_backpressures_every_checkpoint_until_upload_and_prune_finish():

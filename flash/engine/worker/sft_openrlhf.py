@@ -27,7 +27,7 @@ from flash.engine.steps import (
 )
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
-from flash.engine.worker.hf import resolve_cached_model_commit
+from flash.engine.worker.hf import _is_commit_sha, resolve_cached_model_commit
 from flash.engine.worker.openrlhf_common import (
     _hf_snapshot_identity,
     export_openrlhf_adapter,
@@ -364,12 +364,12 @@ def validate_openrlhf_warmstart_adapter(
     elif base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
     revision = str(config.get("revision") or "").strip()
-    declared_revision = (
-        revision or snapshot_revision or _warmstart_provenance_revision(adapter_dir, model_id)
-    )
+    declared_revision = revision if _is_commit_sha(revision) else snapshot_revision
+    if not declared_revision:
+        declared_revision = _warmstart_provenance_revision(adapter_dir, model_id)
     if declared_revision != model_revision:
         raise ValueError("SFT warm-start adapter revision does not match the target model revision")
-    if revision and snapshot_revision and revision != snapshot_revision:
+    if _is_commit_sha(revision) and snapshot_revision and revision != snapshot_revision:
         raise ValueError("SFT warm-start adapter carries conflicting base revisions")
     if not any(
         os.path.isfile(os.path.join(adapter_dir, name))
@@ -399,9 +399,12 @@ def _resolve_immutable_model_revision(model_id: str, requested_revision: str) ->
     """bind the prefetched model snapshot to the immutable commit used for all paid work."""
     resolved = resolve_cached_model_commit(model_id, requested_revision)
     if not resolved:
-        raise RuntimeError(
+        message = (
             f"could not resolve the cached model snapshot for {model_id!r} to an immutable commit"
         )
+        if not requested_revision:
+            raise _w.RetriableInfraError(message)
+        raise RuntimeError(message)
     return resolved
 
 
@@ -703,6 +706,7 @@ _CHILD_ENV_PREFIXES = (
     "OMP_",
     "MKL_",
     "OPENBLAS_",
+    "FLA_",
     "LC_",
 )
 
@@ -743,6 +747,40 @@ import os
 _CONFIG_PATH = os.environ["FLASH_OPENRLHF_SFT_CONFIG"]
 with open(_CONFIG_PATH, encoding="utf-8") as _config_file:
     CONFIG = json.load(_config_file)
+
+
+def _apply_blackwell_fla_safety():
+    import importlib.util
+
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    capability = torch.cuda.get_device_capability()
+    if capability == (10, 0):
+        os.environ.setdefault("FLA_TILELANG", "0")
+    if capability[0] not in (10, 12) or importlib.util.find_spec("fla") is None:
+        return
+
+    from fla.ops.gated_delta_rule import wy_fast
+
+    tuner = getattr(wy_fast, "prepare_wy_repr_bwd_kernel", None)
+    for _ in range(8):
+        if tuner is None or hasattr(tuner, "configs"):
+            break
+        tuner = getattr(tuner, "fn", None)
+    configs = getattr(tuner, "configs", None)
+    if not configs:
+        raise RuntimeError("fla GDN backward autotuner is unavailable on Blackwell")
+    validated = [
+        config
+        for config in configs
+        if getattr(config, "num_warps", None) == 2
+        and getattr(config, "num_stages", None) == 4
+    ]
+    if not validated:
+        raise RuntimeError("fla GDN backward has no validated Blackwell autotune config")
+    tuner.configs = validated
 
 
 class FlashTokenizedSFTDataset:
@@ -1262,6 +1300,7 @@ def _install_trainer_patch():
 
 
 def apply_flash_openrlhf_sft_patches():
+    _apply_blackwell_fla_safety()
     _install_dataset_patch()
     _install_warmstart_actor_patch()
     _install_attention_patch()
