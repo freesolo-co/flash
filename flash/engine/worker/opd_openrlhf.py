@@ -683,6 +683,7 @@ import copy
 import hashlib
 import json
 import math
+import random
 import time
 import urllib.error
 import urllib.request
@@ -905,6 +906,50 @@ _FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch
 
 from openrlhf.trainer import ppo_trainer as _flash_ppo_trainer_module
 
+_FlashPolicyModelActor = _ppo_actor_module.PolicyModelActor
+_original_policy_save_checkpoint = _FlashPolicyModelActor.save_checkpoint
+
+
+def _flash_capture_training_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": None,
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    with contextlib.suppress(ImportError):
+        import numpy as np
+
+        state["numpy"] = np.random.get_state()
+    return state
+
+
+@functools.wraps(_original_policy_save_checkpoint)
+def _flash_policy_save_checkpoint(
+    self,
+    tag,
+    client_states=None,
+    metric_value=None,
+    metric_key=None,
+):
+    result = _original_policy_save_checkpoint(
+        self,
+        tag,
+        client_states=client_states,
+        metric_value=metric_value,
+        metric_key=metric_key,
+    )
+    if self.strategy.is_rank_0() and str(tag).startswith("global_step"):
+        # deepspeed restores authoritative per-rank rng from its native actor checkpoint; this
+        # child rank-zero sidecar satisfies flash's shared resume-bundle contract.
+        torch.save(
+            _flash_capture_training_rng_state(),
+            os.path.join(self.strategy.args.ckpt.path, "_actor", str(tag), "rng_state.pth"),
+        )
+    return result
+
+
+_FlashPolicyModelActor.save_checkpoint = _flash_policy_save_checkpoint
 _FlashPPOTrainer = _flash_ppo_trainer_module.PPOTrainer
 _flash_ray_metadata = getattr(_FlashPPOTrainer, "__ray_metadata__", None)
 _FlashPPOTrainerRuntime = (
@@ -1287,14 +1332,6 @@ def _find_checkpoint_state_file(root: str, marker: str) -> str:
     raise RuntimeError(f"OpenRLHF OPD checkpoint has no {marker} state file")
 
 
-def _save_training_rng_state(path: str) -> None:
-    import torch
-
-    from flash.engine.worker.rng import capture_training_rng_state
-
-    torch.save(capture_training_rng_state(torch), path)
-
-
 class _OpenRLHFOPDCheckpointPublisher:
     """Stage and publish a complete native DeepSpeed checkpoint before training continues."""
 
@@ -1383,7 +1420,10 @@ class _OpenRLHFOPDCheckpointPublisher:
         shutil.rmtree(adapter_export)
         optimizer = _find_checkpoint_state_file(actor_tag, "optim")
         shutil.copy2(optimizer, os.path.join(stage, "optimizer.pt"))
-        _save_training_rng_state(os.path.join(stage, "rng_state.pth"))
+        trainer_rng = os.path.join(actor_tag, "rng_state.pth")
+        if not os.path.isfile(trainer_rng):
+            raise RuntimeError("OpenRLHF OPD checkpoint has no child trainer RNG state")
+        shutil.copy2(trainer_rng, os.path.join(stage, "rng_state.pth"))
         state = self.state_for_step(step)
         with open(os.path.join(stage, "opd_state.json"), "w", encoding="utf-8") as state_file:
             json.dump(state, state_file, sort_keys=True)

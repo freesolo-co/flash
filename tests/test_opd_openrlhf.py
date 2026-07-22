@@ -63,6 +63,10 @@ def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
             self.original_fit_calls.append((args, kwargs))
             return "fit-result"
 
+    class _PolicyModelActor:
+        def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
+            return (tag, client_states, metric_value, metric_key)
+
     class _PPOTrainer:
         __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)
 
@@ -105,6 +109,7 @@ def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
         "__file__": "sitecustomize.py",
         "os": os,
         "functools": functools,
+        "_ppo_actor_module": SimpleNamespace(PolicyModelActor=_PolicyModelActor),
         "_ActorPPOTrainer": _ActorPPOTrainer,
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
@@ -474,6 +479,32 @@ def test_teacher_bridge_classifies_retriable_callback_failure_as_transient():
     assert error.value.classification == "transient"
 
 
+def test_child_actor_writes_flash_rng_after_native_checkpoint(monkeypatch, tmp_path):
+    namespace, *_ = _install_ray_shaped_opd_extension(monkeypatch)
+    events = []
+    checkpoint_root = tmp_path / "checkpoints"
+    actor = namespace["_FlashPolicyModelActor"]()
+    actor.strategy = SimpleNamespace(
+        args=SimpleNamespace(ckpt=SimpleNamespace(path=str(checkpoint_root))),
+        is_rank_0=lambda: True,
+    )
+    namespace["_original_policy_save_checkpoint"] = lambda *_args, **_kwargs: events.append(
+        "native"
+    )
+    namespace["_flash_capture_training_rng_state"] = lambda: {"source": "child-trainer"}
+    namespace["torch"].save = lambda state, path: events.append((state, path))
+
+    actor.save_checkpoint("global_step2", client_states={"global_step": 2})
+
+    assert events == [
+        "native",
+        (
+            {"source": "child-trainer"},
+            str(checkpoint_root / "_actor" / "global_step2" / "rng_state.pth"),
+        ),
+    ]
+
+
 def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     events = []
     publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
@@ -527,12 +558,13 @@ def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
     assert events == ["resume", ("deployable", False)]
 
 
-def test_checkpoint_stage_writes_flash_rng_blob_instead_of_model_state_shard(monkeypatch, tmp_path):
+def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
     actor_tag = tmp_path / "actor"
     hf_export = tmp_path / "hf"
     actor_tag.mkdir()
     hf_export.mkdir()
     actor_tag.joinpath("zero_optim_states.pt").write_bytes(b"optimizer")
+    actor_tag.joinpath("rng_state.pth").write_bytes(b"child-trainer-rng")
     hf_export.joinpath("adapter_config.json").write_text("{}", encoding="utf-8")
     hf_export.joinpath("adapter_model.bin").write_bytes(b"adapter")
 
@@ -542,11 +574,6 @@ def test_checkpoint_stage_writes_flash_rng_blob_instead_of_model_state_shard(mon
         Path(destination, "adapter_model.bin").write_bytes(b"adapter")
 
     monkeypatch.setattr(opd_openrlhf, "export_openrlhf_adapter", export)
-    monkeypatch.setattr(
-        opd_openrlhf,
-        "_save_training_rng_state",
-        lambda path: Path(path).write_bytes(b"flash-rng-state"),
-    )
     publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
     publisher.staging_root = str(tmp_path / "staging")
     publisher.model_id = "Qwen/Qwen3.5-0.8B"
@@ -557,7 +584,7 @@ def test_checkpoint_stage_writes_flash_rng_blob_instead_of_model_state_shard(mon
     stage = Path(publisher._stage(2, str(actor_tag), str(hf_export)))
 
     assert stage.joinpath("optimizer.pt").read_bytes() == b"optimizer"
-    assert stage.joinpath("rng_state.pth").read_bytes() == b"flash-rng-state"
+    assert stage.joinpath("rng_state.pth").read_bytes() == b"child-trainer-rng"
 
 
 def test_final_resume_checkpoint_is_required_without_extra_deployable(monkeypatch):
@@ -1173,6 +1200,10 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         def fit(self, *args, **kwargs):
             return None
 
+    class _PolicyModelActor:
+        def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
+            return (tag, client_states, metric_value, metric_key)
+
     class _PPOTrainer:
         __ray_metadata__ = SimpleNamespace(modified_class=_PPOTrainerRuntime)
 
@@ -1214,6 +1245,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         "__file__": "sitecustomize.py",
         "os": os,
         "functools": functools,
+        "_ppo_actor_module": SimpleNamespace(PolicyModelActor=_PolicyModelActor),
         "_ActorPPOTrainer": _ActorPPOTrainer,
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
