@@ -34,7 +34,7 @@ from flash.engine.worker.openrlhf_common import (
     resolve_openrlhf_python,
     run_openrlhf_training,
 )
-from flash.engine.worker.packing import completion_mask_from_ids, model_is_gdn_hybrid
+from flash.engine.worker.packing import completion_mask_from_ids
 from flash.engine.worker.perf.attn import _attn_impl_for_capability
 from flash.engine.worker.sft import (
     _model_arch_dims,
@@ -47,6 +47,7 @@ from flash.engine.worker.sft import (
 )
 
 _SFT_LORAPLUS_RATIO = 16.0
+_SFT_CHUNKED_LOSS_SIZE = 256
 _LORAPLUS_READY_MARKER = "FLASH_OPENRLHF_LORAPLUS_READY"
 _STEP_PREFIX = "FLASH_OPENRLHF_SFT_STEP="
 _FINAL_STATE_FILE = "flash_sft_final_state.json"
@@ -105,6 +106,8 @@ def build_sft_openrlhf_args(cfg: dict) -> list[str]:
         str(cfg["seed"]),
         "--ds.zero_stage",
         "3",
+        "--ds.ring_attn_size",
+        "1",
         "--ds.param_dtype",
         "bf16",
         "--ds.attn_implementation",
@@ -415,18 +418,93 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
     )
 
 
-def _validate_gdn_realized_length(
-    model_id: str,
-    model_revision: str,
-    realized_max_length: int,
-) -> None:
-    """fail loudly only when tokenized GDN rows actually reach the unvalidated 32k path."""
-    if model_is_gdn_hybrid(model_id, revision=model_revision) and realized_max_length >= 32768:
-        raise ValueError(
-            "OpenRLHF 32k GDN SFT is not validated: the hybrid full-attention layers remain "
-            "memory-intensive, and 32k execution needs matched real-GPU validation of eager "
-            "attention plus ZeRO-3 fit before use; no validated sequence-parallel path exists"
+def _maybe_gather_output_head(weight, bias):
+    """gather a zero-3 output head only when its parameters are partitioned."""
+    import contextlib
+
+    if not hasattr(weight, "ds_status"):
+        return contextlib.nullcontext()
+
+    import deepspeed
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+    parameters = [weight] if bias is None else [weight, bias]
+    if all(parameter.ds_status == ZeroParamStatus.AVAILABLE for parameter in parameters):
+        return contextlib.nullcontext()
+    return deepspeed.zero.GatheredParameters(parameters)
+
+
+def _selected_token_nll_chunk(
+    hidden_states,
+    weight,
+    bias,
+    labels,
+    logit_scale: float,
+    final_logit_softcapping: float | None,
+):
+    import torch
+    import torch.nn.functional as functional
+
+    with _maybe_gather_output_head(weight, bias):
+        logits = hidden_states.float() @ weight.float().t()
+        if bias is not None:
+            logits = logits + bias.float()
+    if logit_scale != 1.0:
+        logits = logits * logit_scale
+    if final_logit_softcapping is not None:
+        logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+    return functional.cross_entropy(logits, labels, reduction="sum")
+
+
+def _chunked_selected_token_nll(
+    hidden_states,
+    output_head,
+    input_ids,
+    loss_mask,
+    *,
+    chunk_size: int,
+    denominator=None,
+    dp_size: int = 1,
+    logit_scale: float = 1.0,
+    final_logit_softcapping: float | None = None,
+):
+    """compute exact completion-only next-token nll without full-sequence logits."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    if int(chunk_size) <= 0:
+        raise ValueError("chunk_size must be positive")
+    if hidden_states.shape[:-1] != input_ids.shape or input_ids.shape != loss_mask.shape:
+        raise ValueError("hidden states, input ids, and loss mask must share batch and sequence")
+
+    shifted_mask = loss_mask[:, 1:].bool()
+    selected_hidden = hidden_states[:, :-1, :][shifted_mask]
+    selected_labels = input_ids[:, 1:][shifted_mask]
+    selected_count = int(selected_labels.numel())
+    if selected_count == 0:
+        raise ValueError("chunked SFT loss received no completion target")
+
+    loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
+    weight = output_head.weight
+    bias = getattr(output_head, "bias", None)
+    for start in range(0, selected_count, int(chunk_size)):
+        end = min(start + int(chunk_size), selected_count)
+        chunk_loss = checkpoint(
+            _selected_token_nll_chunk,
+            selected_hidden[start:end],
+            weight,
+            bias,
+            selected_labels[start:end],
+            float(logit_scale),
+            final_logit_softcapping,
+            use_reentrant=False,
         )
+        loss_sum = loss_sum + chunk_loss
+
+    normalizer = selected_count if denominator is None else denominator
+    if isinstance(normalizer, torch.Tensor):
+        normalizer = normalizer.to(device=loss_sum.device, dtype=loss_sum.dtype)
+    return loss_sum / normalizer * int(dp_size)
 
 
 def _copy_processing_sidecars(source_dir: str, adapter_dir: str) -> None:
@@ -733,7 +811,9 @@ def _render_sitecustomize() -> str:
 
 def render_openrlhf_sft_runtime() -> str:
     """return the standalone child patch module loaded through sitecustomize."""
-    return r"""from __future__ import annotations
+    import inspect
+
+    runtime = r"""from __future__ import annotations
 
 import io
 import json
@@ -1035,6 +1115,9 @@ def _install_loraplus_patch():
     deepspeed.initialize = initialize
 
 
+__FLASH_CHUNKED_SELECTED_TOKEN_NLL__
+
+
 def _global_count(local_count, device):
     import torch
     import torch.distributed as dist
@@ -1097,10 +1180,99 @@ def _resume_training_state(consumed_samples):
     return global_step, restored_samples, loss_curve, token_count
 
 
+def _install_chunked_loss_forward(actor):
+    import types
+
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    engine = actor.model
+    peft_model = getattr(engine, "module", None)
+    if peft_model is None:
+        raise RuntimeError("OpenRLHF chunked SFT loss requires a DeepSpeed-wrapped model")
+    base_lm = peft_model.get_base_model() if hasattr(peft_model, "get_base_model") else peft_model
+    if getattr(base_lm, "_flash_chunked_sft_loss", False):
+        return engine
+
+    output_head = base_lm.get_output_embeddings()
+    if output_head is None or not hasattr(output_head, "weight"):
+        raise RuntimeError("OpenRLHF chunked SFT loss requires an accessible output head")
+    backbone = base_lm.base_model
+    if backbone is base_lm:
+        raise RuntimeError("OpenRLHF chunked SFT loss requires a backbone that bypasses the output head")
+
+    text_config = getattr(base_lm.config, "text_config", None) or base_lm.config
+    logit_scale = float(getattr(text_config, "logit_scale", 1.0))
+    final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
+    original_forward = base_lm.forward
+
+    def chunked_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        flash_loss_denominator=None,
+        flash_dp_size=1,
+        **kwargs,
+    ):
+        if labels is None:
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        kwargs.pop("use_cache", None)
+        kwargs.pop("logits_to_keep", None)
+        outputs = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            **kwargs,
+        )
+        loss = _chunked_selected_token_nll(
+            outputs.last_hidden_state,
+            output_head,
+            input_ids,
+            labels.ne(-100),
+            chunk_size=int(CONFIG["chunked_loss_size"]),
+            denominator=flash_loss_denominator,
+            dp_size=int(flash_dp_size),
+            logit_scale=logit_scale,
+            final_logit_softcapping=final_logit_softcapping,
+        )
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=None,
+            past_key_values=getattr(outputs, "past_key_values", None),
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
+    base_lm.forward = types.MethodType(chunked_forward, base_lm)
+    base_lm._flash_chunked_sft_loss = True
+    return engine
+
+
+def _attention_context():
+    import contextlib
+
+    if not bool(CONFIG.get("force_cudnn_sdpa")):
+        return contextlib.nullcontext()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    return sdpa_kernel(
+        [
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ],
+        set_priority=True,
+    )
+
+
 def _install_trainer_patch():
     import torch
     import torch.distributed as dist
-    from openrlhf.models import SFTLoss
     from openrlhf.trainer.sft_trainer import SFTTrainer
     from openrlhf.utils.distributed_sampler import DistributedSampler
     from openrlhf.utils.loss_utils import _optimizer_step_loss_norm
@@ -1120,9 +1292,11 @@ def _install_trainer_patch():
         epoch_samples = max(1, epoch_samples)
         start_epoch = consumed_total // epoch_samples
         consumed_in_epoch = consumed_total % epoch_samples
-        loss_fn = SFTLoss()
         self.model.train()
         device = next(self.model.parameters()).device
+        if self.aux_loss:
+            raise RuntimeError("OpenRLHF chunked SFT loss does not support a router auxiliary objective")
+        engine = _install_chunked_loss_forward(self.model)
 
         for epoch in range(start_epoch, self.epochs):
             if global_step >= total_steps:
@@ -1143,7 +1317,6 @@ def _install_trainer_patch():
                 step_loss = 0.0
                 step_tokens = 0
                 step_examples = 0
-                engine = self.model.model
                 if not hasattr(engine, "set_gradient_accumulation_boundary"):
                     raise RuntimeError(
                         "OpenRLHF DeepSpeed cannot preserve exact SFT update boundaries"
@@ -1158,19 +1331,18 @@ def _install_trainer_patch():
                         for key, value in mm_inputs.items()
                     }
                     engine.set_gradient_accumulation_boundary(micro_index + 1 == len(window))
-                    per_token_log_probs, output = self.model(
-                        inputs,
-                        attention_mask=attention_mask,
-                        return_output=True,
-                        return_logprobs=True,
-                        ring_attn_group=self.strategy.ring_attn_group,
-                        **mm_inputs,
-                    )
-                    aux_loss = output.aux_loss if self.aux_loss else 0
-                    gpt_loss = loss_fn(per_token_log_probs, loss_mask[:, 1:], **loss_info)
-                    loss = (
-                        gpt_loss + aux_loss * self.args.model.aux_loss_coef
-                    ) * gradient_scale
+                    labels = inputs.masked_fill(~loss_mask.bool(), -100)
+                    with _attention_context():
+                        output = engine(
+                            input_ids=inputs,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            flash_loss_denominator=loss_info["batch_num_tokens"],
+                            flash_dp_size=loss_info["dp_size"],
+                            **mm_inputs,
+                        )
+                    gpt_loss = output.loss
+                    loss = gpt_loss * gradient_scale
                     self.strategy.backward(loss, self.model, self.optimizer)
                     self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
                     step_loss += float(gpt_loss.item())
@@ -1263,6 +1435,15 @@ def apply_flash_openrlhf_sft_patches():
     _install_loraplus_patch()
     _install_trainer_patch()
 """
+    helper_source = "\n\n".join(
+        inspect.getsource(function)
+        for function in (
+            _maybe_gather_output_head,
+            _selected_token_nll_chunk,
+            _chunked_selected_token_nll,
+        )
+    )
+    return runtime.replace("__FLASH_CHUNKED_SELECTED_TOKEN_NLL__", helper_source)
 
 
 def _probe_gpu_in_subprocess(
@@ -1614,7 +1795,6 @@ def run_sft_openrlhf(spec=None) -> None:
         total_tokens_per_epoch = sum(len(row["input_ids"]) for row in rows)
         realized_max_length = max(len(row["input_ids"]) for row in rows)
         runtime_max_length = realized_max_length
-        _validate_gdn_realized_length(model_id, model_revision, realized_max_length)
         print(
             f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
             f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
@@ -1638,8 +1818,11 @@ def run_sft_openrlhf(spec=None) -> None:
         effective_batch,
         seq_len=runtime_max_length,
         vocab=vocab_size,
-        fused=False,
+        fused=True,
     )
+    if realized_max_length >= 32768:
+        # gpu-validation-pending: keep the first qwen3.5 gdn 32k proof at microbatch one.
+        per_device_limit = 1
     micro_batch, gradient_accumulation, train_batch_size = _training_batch_shape(
         row_count=len(rows),
         effective_batch=effective_batch,
@@ -1698,6 +1881,7 @@ def run_sft_openrlhf(spec=None) -> None:
         "adam_betas": [0.9, 0.999],
         "adam_epsilon": 1e-8,
         "attn_implementation": attn_implementation,
+        "chunked_loss_size": _SFT_CHUNKED_LOSS_SIZE,
         "force_cudnn_sdpa": bool(capability and int(capability[0]) in (10, 12)),
         "final_state_path": final_state_path,
         "learning_rate": learning_rate,

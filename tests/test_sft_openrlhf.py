@@ -13,13 +13,13 @@ import pytest
 from flash.engine.worker import sft as sft_mod
 from flash.engine.worker.sft_openrlhf import (
     _attention_implementation,
+    _chunked_selected_token_nll,
     _OpenRLHFCheckpointWatcher,
     _probe_gpu_in_subprocess,
     _processor_tokenized_row,
     _resolve_immutable_model_revision,
     _serialize_multimodal_inputs,
     _training_batch_shape,
-    _validate_gdn_realized_length,
     build_openrlhf_sft_child_env,
     build_sft_openrlhf_args,
     build_text_openrlhf_rows,
@@ -160,6 +160,7 @@ def test_build_sft_openrlhf_args_maps_zero3_lora_gc_and_dataset(tmp_path):
     assert args[args.index("--model.model_name_or_path") + 1] == str(tmp_path / "model")
     assert args[args.index("--data.dataset") + 1] == str(tmp_path / "dataset")
     assert args[args.index("--ds.zero_stage") + 1] == "3"
+    assert args[args.index("--ds.ring_attn_size") + 1] == "1"
     assert args[args.index("--ds.param_dtype") + 1] == "bf16"
     assert args[args.index("--ds.lora.rank") + 1] == "32"
     assert args[args.index("--ds.lora.alpha") + 1] == "64"
@@ -440,14 +441,190 @@ def test_resolve_immutable_model_revision_fails_before_training_when_cache_is_un
         _resolve_immutable_model_revision("org/model", "")
 
 
-def test_gdn_32k_gate_uses_realized_rows_and_allows_short_rows(monkeypatch):
+@requires_torch
+@pytest.mark.parametrize("chunk_size", [1, 3, 8])
+def test_chunked_selected_token_nll_matches_full_loss_and_gradients(chunk_size):
+    import torch
+    import torch.nn.functional as functional
+
+    torch.manual_seed(17)
+    hidden = torch.randn(2, 6, 5, dtype=torch.float32, requires_grad=True)
+    output_head = torch.nn.Linear(5, 11, bias=True, dtype=torch.float32)
+    input_ids = torch.randint(0, 11, (2, 6))
+    loss_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 1], [0, 1, 0, 1, 1, 0]],
+        dtype=torch.bool,
+    )
+
+    shifted_mask = loss_mask[:, 1:]
+    full_logits = functional.linear(
+        hidden[:, :-1, :].float(),
+        output_head.weight.float(),
+        output_head.bias.float(),
+    )
+    full_loss = functional.cross_entropy(
+        full_logits[shifted_mask],
+        input_ids[:, 1:][shifted_mask],
+    )
+    full_loss.backward()
+    full_hidden_grad = hidden.grad.detach().clone()
+    full_weight_grad = output_head.weight.grad.detach().clone()
+    full_bias_grad = output_head.bias.grad.detach().clone()
+
+    hidden.grad = None
+    output_head.weight.grad = None
+    output_head.bias.grad = None
+    chunked_loss = _chunked_selected_token_nll(
+        hidden,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=chunk_size,
+    )
+    chunked_loss.backward()
+
+    assert chunked_loss.item() == pytest.approx(full_loss.item(), abs=1e-5)
+    assert torch.allclose(hidden.grad, full_hidden_grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(output_head.weight.grad, full_weight_grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(output_head.bias.grad, full_bias_grad, atol=1e-5, rtol=1e-5)
+
+
+@requires_torch
+def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
+    import torch
+    import torch.nn.functional as functional
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps({"chunked_loss_size": 2, "force_cudnn_sdpa": False}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    runtime = ModuleType("flash_openrlhf_sft_runtime_test")
+    exec(compile(render_openrlhf_sft_runtime(), runtime.__name__, "exec"), runtime.__dict__)
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(17, 5)
+
+        def forward(self, input_ids, **_kwargs):
+            return SimpleNamespace(
+                last_hidden_state=self.embedding(input_ids),
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            )
+
+    class BaseLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_model = Backbone()
+            self.output_head = torch.nn.Linear(5, 17)
+            self.config = SimpleNamespace(logit_scale=1.0)
+            self.full_forward_calls = 0
+
+        def get_output_embeddings(self):
+            return self.output_head
+
+        def forward(self, input_ids, **_kwargs):
+            self.full_forward_calls += 1
+            hidden = self.base_model(input_ids=input_ids).last_hidden_state
+            return SimpleNamespace(logits=self.output_head(hidden))
+
+    class PeftModel(torch.nn.Module):
+        def __init__(self, base_lm):
+            super().__init__()
+            self.base_lm = base_lm
+
+        def get_base_model(self):
+            return self.base_lm
+
+        def forward(self, **kwargs):
+            return self.base_lm(**kwargs)
+
+    class Engine(torch.nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, **kwargs):
+            return self.module(**kwargs)
+
+    torch.manual_seed(31)
+    base_lm = BaseLM()
+    engine = Engine(PeftModel(base_lm))
+    actor = SimpleNamespace(model=engine)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    loss_mask = torch.tensor([[0, 0, 1, 1, 1]], dtype=torch.bool)
+    labels = input_ids.masked_fill(~loss_mask, -100)
+    hidden = base_lm.base_model(input_ids=input_ids).last_hidden_state
+    shifted_mask = loss_mask[:, 1:]
+    expected = functional.cross_entropy(
+        base_lm.output_head(hidden[:, :-1, :])[shifted_mask],
+        input_ids[:, 1:][shifted_mask],
+    )
+
+    patched_engine = runtime._install_chunked_loss_forward(actor)
+    output = patched_engine(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        flash_loss_denominator=shifted_mask.sum(),
+        flash_dp_size=1,
+    )
+
+    assert base_lm.full_forward_calls == 0
+    assert output.logits is None
+    assert output.loss.item() == pytest.approx(expected.item(), abs=1e-5)
+    output.loss.backward()
+    assert base_lm.base_model.embedding.weight.grad is not None
+    assert base_lm.output_head.weight.grad is not None
+
+
+@requires_torch
+def test_chunked_selected_token_nll_is_chunk_size_invariant():
+    import torch
+
+    torch.manual_seed(23)
+    hidden = torch.randn(2, 7, 4, dtype=torch.float32, requires_grad=True)
+    output_head = torch.nn.Linear(4, 13, bias=False, dtype=torch.float32)
+    input_ids = torch.randint(0, 13, (2, 7))
+    loss_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 1, 1], [0, 1, 1, 0, 1, 1, 0]],
+        dtype=torch.bool,
+    )
+
+    losses = [
+        _chunked_selected_token_nll(
+            hidden,
+            output_head,
+            input_ids,
+            loss_mask,
+            chunk_size=chunk_size,
+        ).detach()
+        for chunk_size in (1, 4, 7)
+    ]
+
+    assert torch.allclose(torch.stack(losses), losses[0].expand(3), atol=1e-5, rtol=1e-5)
+
+
+def test_32k_uses_chunked_loss_without_sequence_parallel_rejection():
+    import inspect
+
     import flash.engine.worker.sft_openrlhf as openrlhf_mod
 
-    monkeypatch.setattr(openrlhf_mod, "model_is_gdn_hybrid", lambda *args, **kwargs: True)
+    worker_source = inspect.getsource(openrlhf_mod.run_sft_openrlhf)
+    runtime_source = render_openrlhf_sft_runtime()
 
-    _validate_gdn_realized_length("org/gdn", "e" * 40, 2048)
-    with pytest.raises(ValueError, match="matched real-GPU validation"):
-        _validate_gdn_realized_length("org/gdn", "e" * 40, 32768)
+    assert "_validate_gdn_realized_length" not in worker_source
+    assert "if realized_max_length >= 32768:" in worker_source
+    assert "per_device_limit = 1" in worker_source
+    assert "fused=True" in worker_source
+    assert "_chunked_selected_token_nll(" in runtime_source
+    assert "labels.ne(-100)" in runtime_source
+    assert "loss_mask[:, 1:].bool()" in runtime_source
+    assert "return_logprobs=True" not in runtime_source
 
 
 def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_path):
