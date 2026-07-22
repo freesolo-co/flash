@@ -147,17 +147,15 @@ def _patch_loader(monkeypatch, env, seen=None):
     return seen
 
 
-def _args(path, *, episodes=3):
-    return argparse.Namespace(path=str(path), episodes=episodes)
+def _args(path):
+    return argparse.Namespace(path=str(path))
 
 
 def test_env_test_single_turn_replays_reference_and_passes(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv()
     seen = _patch_loader(monkeypatch, env)
-    args = cli._build_parser().parse_args(
-        ["env", "test", str(env_dir), "--episodes", "1"]
-    )
+    args = cli._build_parser().parse_args(["env", "test", str(env_dir)])
 
     assert args.func is cmd_env_test
     assert args.func(args) == 0
@@ -176,7 +174,7 @@ def test_env_test_auto_falls_back_to_echo_for_empty_reference(
     env = _SingleTurnEnv(rows=[{"input": "say anything", "output": ""}], reward=0.0)
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     assert env.completions == ["test"]
     captured = capsys.readouterr()
     assert "episode 1: policy=echo turns=1 reward=0.000000" in captured.out
@@ -189,7 +187,7 @@ def test_env_test_non_text_sft_completion_uses_echo(monkeypatch, tmp_path, capsy
     env = _NonTextSftEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     assert env.completions == ["test"]
     out = capsys.readouterr().out
     assert "episode 1: policy=echo turns=1" in out
@@ -201,7 +199,7 @@ def test_env_test_multi_turn_terminates_and_scores(monkeypatch, tmp_path, capsys
     env = _MultiTurnEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     assert env.scored_state is not None
     assert env.scored_state["turn"] == 2
     out = capsys.readouterr().out
@@ -216,21 +214,24 @@ def test_env_test_multi_turn_bounds_turns_to_hard_cap(monkeypatch, tmp_path, cap
     env = _PerExampleCapMultiTurnEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     out = capsys.readouterr().out
     assert "episode 1: policy=replay turns=8 reward=0.500000" in out
     assert "overall: PASS" in out
 
 
-def test_env_test_zero_episodes_runs_one(monkeypatch, tmp_path, capsys):
+def test_env_test_drives_three_episodes_by_default(monkeypatch, tmp_path, capsys):
+    # the command always drives a fixed number of episodes (no --episodes flag); a larger
+    # dataset is capped at that default, a smaller one runs every available record
     env_dir = _environment_dir(tmp_path)
-    env = _SingleTurnEnv()
+    rows = [{"input": f"q{i}", "output": str(i)} for i in range(5)]
+    env = _SingleTurnEnv(rows=rows)
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=0)) == 0
-    assert env.completions == ["4"]
+    assert cmd_env_test(_args(env_dir)) == 0
+    assert len(env.completions) == 3
     out = capsys.readouterr().out
-    assert "1/1 episodes passed contract checks" in out
+    assert "3/3 episodes passed contract checks" in out
     assert "overall: PASS" in out
 
 
@@ -238,7 +239,7 @@ def test_env_test_nan_reward_fails_contract(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SingleTurnEnv(reward=float("nan")))
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 1
+    assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "0/1 episodes passed contract checks" in captured.out
     assert "reward is not finite: nan" in captured.err
@@ -264,7 +265,7 @@ def test_env_test_passes_absolute_path_to_loader(monkeypatch, tmp_path, capsys):
     seen = _patch_loader(monkeypatch, env)
     monkeypatch.chdir(tmp_path)
 
-    assert cmd_env_test(_args("local-env", episodes=1)) == 0
+    assert cmd_env_test(_args("local-env")) == 0
     reference = seen["reference"]
     assert Path(reference).is_absolute()
     assert reference == str((tmp_path / "local-env" / "environment.py").resolve())
@@ -274,7 +275,7 @@ def test_env_test_malformed_prompt_fails_contract(monkeypatch, tmp_path, capsys)
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _BadPromptEnv())
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 1
+    assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "policy=n/a" in captured.out
     assert "0/1 episodes passed contract checks" in captured.out
@@ -289,7 +290,7 @@ def test_env_test_multi_turn_stops_on_empty_env_reply(monkeypatch, tmp_path, cap
     env = _EmptyReplyMultiTurnEnv()
     _patch_loader(monkeypatch, env)
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     assert env.scored_state is not None
     assert env.scored_state["turn"] == 1
     out = capsys.readouterr().out
@@ -301,7 +302,7 @@ def test_env_test_replay_low_reward_warns_but_passes(monkeypatch, tmp_path, caps
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SingleTurnEnv(reward=0.0))
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 0
+    assert cmd_env_test(_args(env_dir)) == 0
     captured = capsys.readouterr()
     assert "episode 1: policy=replay turns=1 reward=0.000000" in captured.out
     assert "1/1 episodes passed contract checks" in captured.out
@@ -314,7 +315,7 @@ def test_env_test_systemexit_from_reward_fails_contract(monkeypatch, tmp_path, c
     env_dir = _environment_dir(tmp_path)
     _patch_loader(monkeypatch, _SystemExitRewardEnv())
 
-    assert cmd_env_test(_args(env_dir, episodes=1)) == 1
+    assert cmd_env_test(_args(env_dir)) == 1
     captured = capsys.readouterr()
     assert "0/1 episodes passed contract checks" in captured.out
     assert "failed contract checks" in captured.err

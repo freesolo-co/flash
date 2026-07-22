@@ -285,13 +285,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=".",
         help="local environment directory or environment.py path",
     )
-    env_test.add_argument(
-        "-n",
-        "--episodes",
-        type=int,
-        default=3,
-        help="number of deterministic dataset episodes to drive (default: 3)",
-    )
     env_test.set_defaults(func=cmd_env_test)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")

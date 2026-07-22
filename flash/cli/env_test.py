@@ -12,6 +12,7 @@ from .envpush import _err, _resolve_local_env_entrypoint
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
 _PREVIEW_CHARS = 200
+_DEFAULT_EPISODES = 3
 
 
 def _check_prompt(messages: object) -> list[dict]:
@@ -176,7 +177,7 @@ def cmd_env_test(args) -> int:
     if not dataset:
         return _load_failure("dataset is empty")
 
-    episode_count = min(max(1, int(args.episodes)), len(dataset))
+    episode_count = min(_DEFAULT_EPISODES, len(dataset))
     passed = 0
     for index, example in enumerate(dataset[:episode_count], start=1):
         record = _new_record()
