@@ -251,7 +251,6 @@ class TeacherAlignmentBridge:
         self.checkpoint_callback = checkpoint_callback or (lambda _step: None)
         self.token = token or secrets.token_urlsafe(32)
         self._path = f"/teacher/{self.token}"
-        self._score_lock = threading.Lock()
         self._mutation_lock = threading.Lock()
         self._mutation_notified = False
         self._stats_lock = threading.Lock()
@@ -443,8 +442,7 @@ class TeacherAlignmentBridge:
             return self._response(*empty)
 
         teacher_prompt = _teacher_prompt_text(prompt.messages, self.thinking_prefill)
-        with self._score_lock:
-            teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+        teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer,
             kept_ids,
@@ -1142,8 +1140,53 @@ def _flash_aligned_sample_count(selected):
     return float(selected.any(dim=-1).sum().item())
 
 
+def _flash_current_batch_has_signal(strategy, aligned_samples):
+    global_aligned_samples = strategy.all_reduce(
+        {"flash_aligned_samples": aligned_samples},
+        op="sum",
+    )["flash_aligned_samples"]
+    return float(global_aligned_samples) > 0
+
+
+def _flash_global_sequence_mean_loss(
+    local_loss,
+    aligned_samples,
+    global_batch_size,
+    world_size,
+):
+    if global_batch_size <= 0:
+        return local_loss * 0.0
+    return local_loss * (aligned_samples * int(world_size) / global_batch_size)
+
+
+def _flash_advance_empty_accumulation(trainer):
+    engine = trainer.actor.model
+    previous_boundary = getattr(engine, "_is_gradient_accumulation_boundary", None)
+    engine.set_gradient_accumulation_boundary(False)
+    try:
+        trainer.strategy.optimizer_step(
+            trainer.actor_optim,
+            trainer.actor,
+            trainer.actor_scheduler,
+            name="actor",
+        )
+    finally:
+        engine.set_gradient_accumulation_boundary(previous_boundary)
+    optimizer = getattr(engine, "optimizer", None)
+    if optimizer is not None and hasattr(optimizer, "zero_grad"):
+        optimizer.zero_grad()
+    else:
+        engine.zero_grad()
+
+
 def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=None):
-    del kl_ctl, loss_batch_info
+    del kl_ctl
+    if not isinstance(loss_batch_info, dict) or "global_batch_size" not in loss_batch_info:
+        raise RuntimeError("OpenRLHF OPD requires global accumulation loss normalization")
+    global_batch_size = loss_batch_info["global_batch_size"]
+    if isinstance(global_batch_size, torch.Tensor):
+        global_batch_size = global_batch_size.item()
+    global_batch_size = float(global_batch_size)
     self.actor.train()
     action_log_probs, _output = self.actor(
         experience.sequences,
@@ -1166,31 +1209,48 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
     response_mask = experience.action_mask.bool() & signal_mask
     selected = response_mask & group_ids.ge(0)
     aligned_samples = _flash_aligned_sample_count(selected)
-    global_aligned_samples = float(
-        self.strategy.all_reduce(
-            {"flash_aligned_samples": aligned_samples},
-            op="sum",
-        )["flash_aligned_samples"]
-    )
-    has_signal = global_aligned_samples > 0
+    has_current_signal = _flash_current_batch_has_signal(self.strategy, aligned_samples)
+    has_window_signal = global_batch_size > 0
     if bool(selected.any().item()):
-        loss, selected = _flash_reverse_kl(
+        local_loss, selected = _flash_reverse_kl(
             action_log_probs,
             teacher_logsums,
             group_ids,
             response_mask,
         )
     else:
-        loss = action_log_probs.sum() * 0.0
+        local_loss = action_log_probs.sum() * 0.0
+    loss = _flash_global_sequence_mean_loss(
+        local_loss,
+        aligned_samples,
+        global_batch_size,
+        self.strategy.world_size,
+    )
     self.strategy.backward(loss, self.actor, self.actor_optim)
-    if _flash_should_mark_mutation(
+    is_optimizer_update = _flash_is_optimizer_update(step, self.strategy.accumulated_gradient)
+    should_mutate = _flash_should_mark_mutation(
         self,
         step,
         self.strategy.accumulated_gradient,
-        has_signal,
-    ):
+        has_window_signal,
+    )
+    if should_mutate:
         _flash_post_teacher({"mutation": True})
-    self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+        self.strategy.optimizer_step(
+            self.actor_optim,
+            self.actor,
+            self.actor_scheduler,
+            name="actor",
+        )
+    elif is_optimizer_update:
+        _flash_advance_empty_accumulation(self)
+    else:
+        self.strategy.optimizer_step(
+            self.actor_optim,
+            self.actor,
+            self.actor_scheduler,
+            name="actor",
+        )
     grad_norm = self.strategy.get_grad_norm(self.actor)
     coverage = experience.info.get("teacher_coverage", [])
     if isinstance(coverage, list):
@@ -1207,11 +1267,11 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         "actor_lr": None,
         "actor_grad_norm": None,
     }
-    if has_signal:
+    if has_current_signal:
         metrics.update(
             {
-                "policy_loss": loss.detach(),
-                "distillation_loss": loss.detach(),
+                "policy_loss": local_loss.detach(),
+                "distillation_loss": local_loss.detach(),
                 "teacher_coverage": coverage.detach(),
             }
         )
@@ -1489,7 +1549,6 @@ class _OpenRLHFOPDCheckpointPublisher:
         )
         for name in os.listdir(adapter_export):
             shutil.copy2(os.path.join(adapter_export, name), os.path.join(stage, name))
-        shutil.rmtree(adapter_export)
         optimizer = _find_checkpoint_state_file(actor_tag, "optim")
         shutil.copy2(optimizer, os.path.join(stage, "optimizer.pt"))
         trainer_rng = os.path.join(actor_tag, "rng_state.pth")
@@ -1516,7 +1575,7 @@ class _OpenRLHFOPDCheckpointPublisher:
         def publish_deployable() -> None:
             if required_deployable or periodic_deployable:
                 _w.publish_deployable_checkpoint(
-                    stage,
+                    os.path.join(stage, "_adapter_export"),
                     step,
                     required=required_deployable,
                     _provenance_ready=True,
@@ -1574,7 +1633,7 @@ def _reconcile_required_deployable(
     if step not in save_at_steps or _deployable_adapter_on_hf(step):
         return
     _w.publish_deployable_checkpoint(
-        resume_dir,
+        os.path.join(resume_dir, "_adapter_export"),
         step,
         required=True,
         _provenance_ready=True,

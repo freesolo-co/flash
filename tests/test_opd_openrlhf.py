@@ -9,8 +9,10 @@ import io
 import json
 import os
 import sys
+import threading
 import types
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -284,6 +286,71 @@ def test_teacher_bridge_round_trip_returns_aligned_action_tensors():
     assert bridge.snapshot()["teacher_ok"] == 1
 
 
+def test_teacher_bridge_scores_requests_concurrently():
+    class _ConcurrentTeacher:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def score(self, _prompt, _completion):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=2)
+                return [
+                    TeacherToken(text="a", logprob=-0.2, start=0, end=1),
+                    TeacherToken(text="b", logprob=-0.4, start=1, end=2),
+                ]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    teacher = _ConcurrentTeacher()
+    prompt = opd_openrlhf._PromptRecord(
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=(10, 11),
+        rendered="P:",
+    )
+
+    def score(rollout_ordinal):
+        return opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {
+                "label": json.dumps(
+                    {
+                        "global_step": 0,
+                        "example_index": 0,
+                        "rollout_ordinal": rollout_ordinal,
+                        "no_signal_attempt": 0,
+                    }
+                ),
+                "prompt_length": 2,
+                "sequence_ids": [10, 11, 20, 21, 2],
+                "terminated": True,
+            },
+            timeout=5,
+        )
+
+    with (
+        opd_openrlhf.TeacherAlignmentBridge(
+            prompts=[prompt],
+            tokenizer=_Tokenizer(),
+            teacher=teacher,
+            thinking_prefill="",
+            eos_token_ids=frozenset({2}),
+            stop_sequences=(),
+        ) as bridge,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        results = list(pool.map(score, (0, 1)))
+
+    assert [result["signal_count"] for result in results] == [2, 2]
+    assert teacher.max_active == 2
+
+
 @pytest.mark.parametrize(
     ("permanent", "classification"),
     [(True, "permanent"), (False, "transient")],
@@ -531,12 +598,15 @@ def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     monkeypatch.setattr(
         opd_openrlhf._w,
         "publish_deployable_checkpoint",
-        lambda *_args, **_kwargs: events.append("deployable"),
+        lambda path, step, **_kwargs: events.append(("deployable", path, step)),
     )
 
     publisher._publish(2)
 
-    assert events == ["resume", "deployable"]
+    assert events == [
+        "resume",
+        ("deployable", "/staged/checkpoint-2/_adapter_export", 2),
+    ]
 
 
 def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
@@ -557,12 +627,15 @@ def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
     monkeypatch.setattr(
         opd_openrlhf._w,
         "publish_deployable_checkpoint",
-        lambda *_args, **kwargs: events.append(("deployable", kwargs["required"])),
+        lambda path, _step, **kwargs: events.append(("deployable", path, kwargs["required"])),
     )
 
     publisher._publish(2)
 
-    assert events == ["resume", ("deployable", False)]
+    assert events == [
+        "resume",
+        ("deployable", "/staged/checkpoint-2/_adapter_export", False),
+    ]
 
 
 def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
@@ -592,6 +665,10 @@ def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
 
     assert stage.joinpath("optimizer.pt").read_bytes() == b"optimizer"
     assert stage.joinpath("rng_state.pth").read_bytes() == b"child-trainer-rng"
+    deployable = stage / "_adapter_export"
+    assert deployable.joinpath("adapter_config.json").is_file()
+    assert deployable.joinpath("adapter_model.bin").is_file()
+    assert not deployable.joinpath("_actor").exists()
 
 
 def test_final_resume_checkpoint_is_required_without_extra_deployable(monkeypatch):
@@ -634,7 +711,7 @@ def test_resume_reconciles_missing_required_deployable(monkeypatch):
 
     assert calls == [
         (
-            ("/resume/checkpoint-2", 2),
+            ("/resume/checkpoint-2/_adapter_export", 2),
             {"required": True, "_provenance_ready": True},
         )
     ]
@@ -936,6 +1013,73 @@ def test_child_counts_only_samples_with_aligned_tokens(monkeypatch):
     )
 
     assert namespace["_flash_aligned_sample_count"](selected) == 0.0
+
+
+def test_child_gates_sample_metrics_on_current_global_microbatch(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    class _Strategy:
+        def __init__(self, count):
+            self.count = count
+
+        def all_reduce(self, values, *, op):
+            assert values == {"flash_aligned_samples": 0.0}
+            assert op == "sum"
+            return {"flash_aligned_samples": self.count}
+
+    has_signal = namespace["_flash_current_batch_has_signal"]
+
+    assert has_signal(_Strategy(0), 0.0) is False
+    assert has_signal(_Strategy(2), 0.0) is True
+
+
+def test_child_scales_local_loss_to_global_sequence_mean(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    scale = namespace["_flash_global_sequence_mean_loss"]
+
+    assert scale(2.0, 2.0, 2.0, 1) == 2.0
+    assert scale(2.0, 1.0, 1.5, 3) == 4.0
+    assert scale(2.0, 0.0, 1.5, 3) == 0.0
+
+
+def test_child_empty_window_advances_without_optimizer_update(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    events = []
+
+    class _Optimizer:
+        def zero_grad(self):
+            events.append("zero_grad")
+
+    class _Engine:
+        def __init__(self):
+            self._is_gradient_accumulation_boundary = None
+            self.optimizer = _Optimizer()
+
+        def set_gradient_accumulation_boundary(self, value):
+            self._is_gradient_accumulation_boundary = value
+            events.append(("boundary", value))
+
+    engine = _Engine()
+
+    class _Strategy:
+        def optimizer_step(self, *_args, **_kwargs):
+            events.append(("step", engine._is_gradient_accumulation_boundary))
+
+    trainer = SimpleNamespace(
+        actor=SimpleNamespace(model=engine),
+        actor_optim=object(),
+        actor_scheduler=object(),
+        strategy=_Strategy(),
+    )
+
+    namespace["_flash_advance_empty_accumulation"](trainer)
+
+    assert events == [
+        ("boundary", False),
+        ("step", False),
+        ("boundary", None),
+        "zero_grad",
+    ]
 
 
 def test_child_actor_status_defaults_empty_signal_metrics(monkeypatch):
@@ -1370,6 +1514,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     class _Strategy:
         ring_attn_group = None
         accumulated_gradient = 1
+        world_size = 1
 
         def all_reduce(self, values, **_kwargs):
             return values
@@ -1400,7 +1545,12 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         },
     )
 
-    status = trainer.training_step(experience, 0.0, 0)
+    status = trainer.training_step(
+        experience,
+        0.0,
+        0,
+        {"global_batch_size": torch.tensor(2.0)},
+    )
     expected = opd_openrlhf.flash_groupwise_reverse_kl(
         student,
         teacher_logsums,
