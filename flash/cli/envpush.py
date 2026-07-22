@@ -494,16 +494,13 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress) -> 
     return 0
 
 
-def cmd_env_push(args) -> int:
-    env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
-    if not env_name:
-        return _err("env name required: pass `--name <name>`")
-
-    src = Path(args.path)
+def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, bool]:
+    """Resolve a local environment path to its Python entrypoint and package root."""
+    src = Path(path)
     if not src.exists():
-        return _err(f"no such path: {src}")
+        raise ValueError(f"no such path: {src}")
     if src.is_symlink():
-        return _err(f"cannot publish {src}: symlinks are not allowed")
+        raise ValueError(f"cannot publish {src}: symlinks are not allowed")
 
     include_full_tree = src.is_dir()
     if include_full_tree:
@@ -512,11 +509,11 @@ def cmd_env_push(args) -> int:
             entrypoint = canonical_entrypoint
             env_root = src
         elif (src / "pyproject.toml").is_file():
-            return _err(f"{src} has a pyproject.toml but no environment.py entrypoint")
+            raise ValueError(f"{src} has a pyproject.toml but no environment.py entrypoint")
         else:
             modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
             if len(modules) != 1:
-                return _err(
+                raise ValueError(
                     f"{src} has no environment.py and "
                     f"{'no' if not modules else 'multiple'} top-level .py module(s); "
                     "add an environment.py entrypoint or pass the exact .py file "
@@ -528,10 +525,24 @@ def cmd_env_push(args) -> int:
         env_root = src.parent
         entrypoint = src
     else:
-        return _err(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
+        raise ValueError(
+            f"cannot publish {src}: expected a Freesolo .py module or an env directory."
+        )
 
     if entrypoint.is_symlink():
-        return _err(f"cannot publish {entrypoint}: symlinks are not allowed")
+        raise ValueError(f"cannot publish {entrypoint}: symlinks are not allowed")
+    return src, env_root, entrypoint, include_full_tree
+
+
+def cmd_env_push(args) -> int:
+    env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
+    if not env_name:
+        return _err("env name required: pass `--name <name>`")
+
+    try:
+        src, env_root, entrypoint, include_full_tree = _resolve_local_env_entrypoint(args.path)
+    except ValueError as exc:
+        return _err(str(exc))
 
     try:
         _check_env_push_limits(

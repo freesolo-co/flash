@@ -40,6 +40,7 @@ from flash.cli.commands import (  # noqa: F401
     verify_freesolo_key,
 )
 from flash.cli.env_setup import cmd_env_setup
+from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
@@ -67,6 +68,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("env setup", "scaffold a starter Freesolo environment"),
             ("env list", "list local environment sources"),
+            ("env test", "validate a local environment offline"),
             ("env push", "upload a local environment"),
             ("env pull", "download a published environment or file"),
             ("env delete", "delete a published environment"),
@@ -269,6 +271,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
     env_list = env_sub.add_parser("list", help="list local environment sources")
     env_list.set_defaults(func=cmd_env_list)
+
+    env_test = env_sub.add_parser(
+        "test",
+        help="locally validate an environment by driving a few offline episodes before pushing",
+        description=(
+            "locally validate an environment by driving a few offline episodes before pushing"
+        ),
+    )
+    env_test.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="local environment directory or environment.py path",
+    )
+    env_test.add_argument(
+        "-n",
+        "--episodes",
+        type=int,
+        default=3,
+        help="number of deterministic dataset episodes to drive (default: 3)",
+    )
+    env_test.set_defaults(func=cmd_env_test)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument(
