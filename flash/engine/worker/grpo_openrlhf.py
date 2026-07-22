@@ -426,9 +426,15 @@ class RewardBridge:
         self,
         score_by_label: Callable[[int, str, str], RewardResult],
         *,
+        samples_per_step: int,
+        first_step: int,
         completion_from_query: Callable[[str, str], str] = _completion_from_openrlhf_query,
         token: str | None = None,
     ) -> None:
+        if int(samples_per_step) <= 0:
+            raise ValueError("OpenRLHF reward samples per step must be positive")
+        if int(first_step) <= 0:
+            raise ValueError("OpenRLHF first reward step must be positive")
         self._score_by_label = score_by_label
         self._completion_from_query = completion_from_query
         self._token = token or secrets.token_urlsafe(32)
@@ -436,7 +442,10 @@ class RewardBridge:
         self._score_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._rewards: list[float] = []
-        self._samples: list[tuple[str, str, float]] = []
+        self._samples: dict[int, list[tuple[str, str, float]]] = {}
+        self._samples_per_step = int(samples_per_step)
+        self._sample_step = int(first_step)
+        self._samples_in_step = 0
         bridge = self
 
         class _Handler(BaseHTTPRequestHandler):
@@ -517,8 +526,13 @@ class RewardBridge:
             raise ValueError("reward metrics must be finite")
         with self._stats_lock:
             self._rewards.append(float(result.reward))
-            self._samples.append((prompts[0], completion, float(result.reward)))
-            del self._samples[:-64]
+            samples = self._samples.setdefault(self._sample_step, [])
+            samples.append((prompts[0], completion, float(result.reward)))
+            del samples[:-64]
+            self._samples_in_step += 1
+            if self._samples_in_step == self._samples_per_step:
+                self._sample_step += 1
+                self._samples_in_step = 0
         return result
 
     @property
@@ -527,10 +541,10 @@ class RewardBridge:
             return list(self._rewards)
 
     def drain_sampled_completions(self, generated_at_step: int) -> list[dict]:
+        generated_at_step = int(generated_at_step)
         with self._stats_lock:
-            samples = list(self._samples)
-            self._samples.clear()
-        return select_rollout_samples(samples, generated_at_step=int(generated_at_step))
+            samples = self._samples.pop(generated_at_step, [])
+        return select_rollout_samples(samples, generated_at_step=generated_at_step)
 
     @property
     def call_count(self) -> int:
@@ -774,17 +788,7 @@ _loading_warm_reference = contextvars.ContextVar(
 )
 
 
-def _flash_assert_adapter_loaded(model, load_result):
-    missing = [
-        key for key in (getattr(load_result, "missing_keys", []) or []) if "lora_" in key
-    ]
-    unexpected = [
-        key for key in (getattr(load_result, "unexpected_keys", []) or []) if "lora_" in key
-    ]
-    if missing or unexpected:
-        raise RuntimeError(
-            f"OpenRLHF warm-start adapter load was incomplete: missing={missing}, unexpected={unexpected}"
-        )
+def _flash_assert_adapter_loaded(model):
     lora_b_parameters = [
         parameter
         for name, parameter in model.named_parameters()
@@ -820,15 +824,9 @@ def _flash_actor_init(self, *args, **kwargs):
         _WARMSTART_ADAPTER,
         adapter_name="default",
         is_trainable=not is_reference,
+        key_mapping=getattr(base_model, "_checkpoint_conversion_mapping", None),
     )
-    key_mapping = getattr(base_model, "_checkpoint_conversion_mapping", None)
-    load_result = self.model.load_adapter(
-        _WARMSTART_ADAPTER,
-        adapter_name="default",
-        is_trainable=not is_reference,
-        key_mapping=key_mapping,
-    )
-    _flash_assert_adapter_loaded(self.model, load_result)
+    _flash_assert_adapter_loaded(self.model)
     if is_reference:
         self.model.requires_grad_(False)
         self.model.eval()
@@ -1388,7 +1386,7 @@ def _publish_openrlhf_checkpoint(
             before_upload=publish_deployable,
         )
         if required and not uploaded:
-            raise RuntimeError(
+            raise _w.RetriableInfraError(
                 f"required OpenRLHF save step {step} full-state checkpoint was not durable"
             )
         Path(ack_path).touch()
@@ -1631,7 +1629,12 @@ def run_rl_openrlhf() -> None:
     def split_query(query: str, prompt: str) -> str:
         return completion_from_tokenizer_query(inputs["tokenizer"], query, prompt)
 
-    with RewardBridge(score_by_label, completion_from_query=split_query) as bridge:
+    with RewardBridge(
+        score_by_label,
+        samples_per_step=inputs["prompts_per_step"] * inputs["group_size"],
+        first_step=resumed_step + 1,
+        completion_from_query=split_query,
+    ) as bridge:
         config = OpenRLHFGRPOConfig(
             model_path=model_path,
             dataset_path=dataset_path,

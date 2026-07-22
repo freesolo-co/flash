@@ -342,6 +342,7 @@ def _install_pinned_sitecustomize_modules(
 
     peft = types.ModuleType("peft")
     peft.loads = []
+    peft.adapter_loads = []
 
     class _FakePeftModel(torch.nn.Module):
         def __init__(self, base, *, is_trainable):
@@ -355,16 +356,16 @@ def _install_pinned_sitecustomize_modules(
             self.is_trainable = is_trainable
 
         @classmethod
-        def from_pretrained(cls, base, path, *, adapter_name, is_trainable):
+        def from_pretrained(cls, base, path, *, adapter_name, is_trainable, key_mapping):
             assert adapter_name == "default"
+            assert key_mapping is None
             model = cls(base, is_trainable=is_trainable)
             peft.loads.append((path, is_trainable, model))
             return model
 
         def load_adapter(self, path, *, adapter_name, is_trainable, key_mapping):
-            assert adapter_name == "default"
-            assert is_trainable == self.is_trainable
-            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+            peft.adapter_loads.append((path, adapter_name, is_trainable, key_mapping))
+            raise AssertionError("warm-start adapter was loaded twice")
 
     peft.PeftModel = _FakePeftModel
     monkeypatch.setitem(sys.modules, "peft", peft)
@@ -693,7 +694,9 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
         calls.append((label, completion, prompt))
         return grpo_openrlhf.RewardResult(1.25, 1.25, {"format": 0.5})
 
-    with grpo_openrlhf.RewardBridge(score, token="test-token") as bridge:
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=1, first_step=4, token="test-token"
+    ) as bridge:
         response = grpo_openrlhf.post_reward_request(
             bridge.url,
             {
@@ -721,11 +724,39 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
     assert bridge.drain_sampled_completions(5) == []
 
 
+def test_reward_bridge_keeps_samples_with_their_generation_step():
+    def score(label, _completion, _prompt):
+        return grpo_openrlhf.RewardResult(float(label), float(label), {})
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=2, first_step=7, token="step-token"
+    ) as bridge:
+        for label in range(4):
+            grpo_openrlhf.post_reward_request(
+                bridge.url,
+                {
+                    "query": [f"promptcompletion-{label}"],
+                    "prompts": ["prompt"],
+                    "labels": [label],
+                },
+            )
+
+        step_7 = bridge.drain_sampled_completions(7)
+        step_8 = bridge.drain_sampled_completions(8)
+
+    assert [sample["completion"] for sample in step_7] == ["completion-0", "completion-1"]
+    assert [sample["generated_at_step"] for sample in step_7] == [7, 7]
+    assert [sample["completion"] for sample in step_8] == ["completion-2", "completion-3"]
+    assert [sample["generated_at_step"] for sample in step_8] == [8, 8]
+
+
 def test_reward_bridge_rejects_bad_auth_and_scoring_failures():
     def fail(_label, _completion, _prompt):
         raise RuntimeError("environment unavailable")
 
-    with grpo_openrlhf.RewardBridge(fail, token="right-token") as bridge:
+    with grpo_openrlhf.RewardBridge(
+        fail, samples_per_step=1, first_step=1, token="right-token"
+    ) as bridge:
         payload = {"query": ["pc"], "prompts": ["p"], "labels": [0]}
         wrong_url = bridge.url.replace("right-token", "wrong-token")
         with pytest.raises(urllib.error.HTTPError) as auth_error:
@@ -1059,6 +1090,7 @@ def test_sitecustomize_loads_warm_policy_and_incoming_kl_reference(monkeypatch):
     assert reference_wrapper.init_model_from_pretrained is not namespace["_flash_reference_init"]
     assert loads[0][0:2] == ("/work/incoming-adapter", True)
     assert loads[1][0:2] == ("/work/incoming-adapter", False)
+    assert sys.modules["peft"].adapter_loads == []
     assert policy.model.is_trainable is True
     assert reference.actor.model.is_trainable is False
     assert all(not parameter.requires_grad for parameter in reference.actor.model.parameters())
@@ -1343,6 +1375,57 @@ def test_per_step_checkpoint_publishes_deployable_and_complete_resume_sidecars(
     assert published[0][1:] == (3, {"required": True})
     assert uploaded[0][0] == 3
     assert grpo_openrlhf._openrlhf_resume_step(str(checkpoint_dir)) == 3
+
+
+def test_required_checkpoint_failed_resume_upload_is_retriable(monkeypatch, tmp_path):
+    monkeypatch.setattr(grpo_openrlhf._w, "HF_REPO", "owner/artifacts")
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    tag = "global_step3"
+    ack_path = checkpoint_dir / f".flash-uploaded-{tag}"
+    marker = {
+        "step": 3,
+        "tag": tag,
+        "checkpoint_dir": str(checkpoint_dir),
+        "adapter_dir": str(checkpoint_dir / f"{tag}_hf"),
+        "ack_path": str(ack_path),
+    }
+    staged_resume = tmp_path / "staged-resume"
+
+    def stage_resume(*_args):
+        staged_resume.mkdir()
+        return str(staged_resume)
+
+    def fail_upload(_step, _staged_resume, *, before_upload):
+        before_upload()
+        return False
+
+    monkeypatch.setattr(grpo_openrlhf, "export_openrlhf_adapter", lambda *_args: None)
+    monkeypatch.setattr(grpo_openrlhf, "_stage_openrlhf_resume_checkpoint", stage_resume)
+    monkeypatch.setattr(
+        grpo_openrlhf._w, "write_base_model_provenance", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_openrlhf._w, "publish_deployable_checkpoint", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(grpo_openrlhf._w, "upload_resume_checkpoint", fail_upload)
+
+    with pytest.raises(
+        grpo_openrlhf._w.RetriableInfraError,
+        match="required OpenRLHF save step 3 full-state checkpoint was not durable",
+    ):
+        grpo_openrlhf._publish_openrlhf_checkpoint(
+            marker,
+            checkpoint_dir=str(checkpoint_dir),
+            adapter_workdir=str(tmp_path / "deployables"),
+            model_id="Qwen/Qwen3.5-0.8B",
+            model_revision="a" * 40,
+            tokenizer=SimpleNamespace(save_pretrained=lambda _path: None),
+            python_bin="/openrlhf/python",
+            required_steps=(3,),
+        )
+
+    assert not ack_path.exists()
 
 
 def test_openrlhf_resume_step_rejects_incomplete_download(tmp_path):
