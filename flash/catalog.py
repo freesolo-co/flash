@@ -167,7 +167,6 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 # 35b-a3b moe serves the official qwen fp8 variant. informational for the catalog mirror; deploy
 # gating reads only max_lora_rank.
 SERVING_FP8_MODEL_REPOS: dict[str, str] = {
-    "openbmb/MiniCPM5-1B": "Freesolo-Co/MiniCPM5-1B-FP8",
     "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
     "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
     "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
@@ -177,25 +176,6 @@ SERVING_FP8_MODEL_REPOS: dict[str, str] = {
 }
 
 MODELS: dict[str, ModelInfo] = {
-    "openbmb/MiniCPM5-1B": ModelInfo(
-        id="openbmb/MiniCPM5-1B",
-        display_name="MiniCPM5 1B",
-        params="1.2B dense (Llama arch)",
-        params_b=1.2,
-        vocab_size=130_560,
-        algos=ALGORITHMS,
-        min_vram_gb=12,
-        recommended_gpu="RTX 4090",
-        serving=ServingCapacity(
-            gpu="L4",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"],
-            max_loras=16,
-            max_lora_rank=128,
-            max_model_len=32768,
-        ),
-        thinking="hybrid",
-        notes="On-device class SLM (131k ctx); standard Llama architecture.",
-    ),
     "Qwen/Qwen3.5-0.8B": ModelInfo(
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",

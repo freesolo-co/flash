@@ -197,6 +197,7 @@ class _OptionalUpload:
     label: str
     staged_dir: str
     run: Callable[[], None]
+    on_coalesce: Callable[[_OptionalUpload], None] | None = None
 
 
 class _SingleSlotUploader:
@@ -209,12 +210,18 @@ class _SingleSlotUploader:
         self._next_sequence = 0
         self._thread: threading.Thread | None = None
 
-    def enqueue(self, label: str, staged_dir: str, run: Callable[[], None]) -> None:
+    def enqueue(
+        self,
+        label: str,
+        staged_dir: str,
+        run: Callable[[], None],
+        on_coalesce: Callable[[_OptionalUpload], None] | None = None,
+    ) -> None:
         replaced: _OptionalUpload | None = None
         thread: threading.Thread | None = None
         with self._condition:
             self._next_sequence += 1
-            task = _OptionalUpload(self._next_sequence, label, staged_dir, run)
+            task = _OptionalUpload(self._next_sequence, label, staged_dir, run, on_coalesce)
             replaced, self._pending = self._pending, task
             if self._thread is None:
                 thread = threading.Thread(
@@ -229,7 +236,11 @@ class _SingleSlotUploader:
                 f"[upload] coalesced optional {replaced.label} into newer {label} "
                 f"(sequence {task.sequence})"
             )
-            shutil.rmtree(replaced.staged_dir, ignore_errors=True)
+            if replaced.on_coalesce is not None:
+                # the coalesce hook takes over cleanup of the replaced staged tree.
+                replaced.on_coalesce(replaced)
+            else:
+                shutil.rmtree(replaced.staged_dir, ignore_errors=True)
         if thread is not None:
             thread.start()
 
@@ -264,8 +275,68 @@ class _SingleSlotUploader:
             return True
 
 
+class _FifoUploader:
+    """run uploads one at a time in FIFO order, never dropping a pending task.
+
+    unlike _SingleSlotUploader this keeps every enqueued upload, so per-step artifacts that must
+    each land (deployable adapters) are not coalesced away by a newer save.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._in_flight: _OptionalUpload | None = None
+        self._pending: list[_OptionalUpload] = []
+        self._next_sequence = 0
+        self._thread: threading.Thread | None = None
+
+    def enqueue(self, label: str, staged_dir: str, run: Callable[[], None]) -> None:
+        thread: threading.Thread | None = None
+        with self._condition:
+            self._next_sequence += 1
+            self._pending.append(_OptionalUpload(self._next_sequence, label, staged_dir, run))
+            if self._thread is None:
+                thread = threading.Thread(
+                    target=self._drain, name="flash-deployable-uploader", daemon=True
+                )
+                self._thread = thread
+            self._condition.notify_all()
+        if thread is not None:
+            thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            with self._condition:
+                if not self._pending:
+                    self._thread = None
+                    self._condition.notify_all()
+                    return
+                task = self._pending.pop(0)
+                self._in_flight = task
+            try:
+                task.run()
+            except Exception as e:
+                print(f"deployable upload warn ({task.label}): {sanitize_diagnostic(e, limit=500)}")
+            finally:
+                shutil.rmtree(task.staged_dir, ignore_errors=True)
+                with self._condition:
+                    self._in_flight = None
+                    self._condition.notify_all()
+
+    def flush(self, timeout_s: float) -> bool:
+        """wait for the in-flight and all pending FIFO uploads to finish."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._condition:
+            while self._in_flight is not None or self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
 _OPTIONAL_CHECKPOINT_UPLOADER = _SingleSlotUploader()
 _OPTIONAL_AUX_UPLOADER = _SingleSlotUploader()
+_OPTIONAL_DEPLOYABLE_UPLOADER = _FifoUploader()
 _DEBUG_UPLOAD_LOCK = threading.Lock()
 
 
@@ -331,8 +402,10 @@ def flush_optional_uploads(timeout_s: float = _OPTIONAL_UPLOAD_FLUSH_TIMEOUT_S) 
     started = time.monotonic()
     checkpoints_flushed = _OPTIONAL_CHECKPOINT_UPLOADER.flush(timeout_s)
     remaining = max(0.0, timeout_s - (time.monotonic() - started))
+    deployables_flushed = _OPTIONAL_DEPLOYABLE_UPLOADER.flush(remaining)
+    remaining = max(0.0, timeout_s - (time.monotonic() - started))
     aux_flushed = _OPTIONAL_AUX_UPLOADER.flush(remaining)
-    return checkpoints_flushed and aux_flushed
+    return checkpoints_flushed and deployables_flushed and aux_flushed
 
 
 def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
@@ -985,14 +1058,37 @@ def make_checkpoint_upload_callback(save_at_steps=()):
                 ckpt_dir, f"checkpoint-{step}"
             )
         except Exception as e:
-            print(f"[ckpt] step {step} snapshot warn: {sanitize_diagnostic(e, limit=500)}")
+            # surface the miss explicitly rather than logging a soft warning and continuing as if
+            # the periodic save reached hf.
+            print(
+                f"[ckpt] step {step} snapshot failed; step not published: "
+                f"{sanitize_diagnostic(e, limit=500)}"
+            )
             return
+
+        def _publish_coalesced_deployable(
+            replaced: _OptionalUpload,
+            step: int = step,
+            staged_checkpoint: str = staged_checkpoint,
+        ) -> None:
+            # a newer optional save coalesced this resume checkpoint away; still publish this step's
+            # small durable deployable through the non-coalescing fifo path (which owns the staged
+            # tree cleanup) so per-step deployables are never dropped.
+            _OPTIONAL_DEPLOYABLE_UPLOADER.enqueue(
+                f"coalesced deployable step {step}",
+                replaced.staged_dir,
+                lambda: publish_deployable_checkpoint(
+                    staged_checkpoint, step, _provenance_ready=True, _emit_heartbeat=False
+                ),
+            )
+
         _OPTIONAL_CHECKPOINT_UPLOADER.enqueue(
             f"checkpoint step {step}",
             staged_dir,
             lambda: _upload(
                 step, staged_checkpoint, provenance_ready=True, emit_heartbeat=False
             ),
+            on_coalesce=_publish_coalesced_deployable,
         )
 
     class _CheckpointUpload(TrainerCallback):

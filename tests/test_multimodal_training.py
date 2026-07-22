@@ -742,7 +742,7 @@ def test_multimodal_algorithm_validation_rejects_unsupported_modes():
     with pytest.raises(ValueError, match="single-turn"):
         mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", multi_turn=True)
     with pytest.raises(ValueError, match="does not support"):
-        mm.validate_multimodal_training("openbmb/MiniCPM5-1B", "opd")
+        mm.validate_multimodal_training("meta-llama/Llama-3.2-1B", "opd")
 
 
 def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
@@ -779,7 +779,7 @@ def test_image_opd_preflight_validates_packaged_dataset_before_allocation(tmp_pa
     mm.preflight_validate_image_opd(supported)
 
     unsupported = SimpleNamespace(
-        model="openbmb/MiniCPM5-1B",
+        model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
         train=SimpleNamespace(teacher_model="kimi-k2.6"),
@@ -849,7 +849,7 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
         )
         environment = SimpleNamespace(id=str(env_file), resolved_sha="", params={})
     spec = SimpleNamespace(
-        model="openbmb/MiniCPM5-1B",
+        model="meta-llama/Llama-3.2-1B",
         algorithm="opd",
         environment=environment,
         train=SimpleNamespace(max_examples=1),
@@ -902,7 +902,7 @@ def test_image_opd_submit_preflight_accepts_supported_single_turn_records(
 @pytest.mark.parametrize(
     ("algorithm", "model", "extra_params", "message"),
     [
-        ("opd", "openbmb/MiniCPM5-1B", {}, "does not support image-bearing"),
+        ("opd", "meta-llama/Llama-3.2-1B", {}, "does not support image-bearing"),
         ("opd", "Qwen/Qwen3.5-4B", {"multi_turn": True}, "single-turn"),
     ],
 )
@@ -935,9 +935,10 @@ def test_image_opd_submit_preflight_rejects_unsupported_or_multi_turn_records(
             "train": {"epochs": 1, "max_examples": 1, "teacher_model": "kimi-k2.6"},
         }
     )
+    prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=0.0)
 
     with pytest.raises(ValueError, match=message):
-        runner.submit_job(spec)
+        runner.submit_job(spec, prepared_job=prepared)
     with pytest.raises(FileNotFoundError):
         runner.get_status(spec.run_id)
 
@@ -981,6 +982,6 @@ def test_catalog_image_capability_does_not_change_public_rows():
 
     assert supports_image_training("Qwen/Qwen3.5-4B")
     assert supports_image_training("Qwen/Qwen3.6-27B")
-    assert not supports_image_training("openbmb/MiniCPM5-1B")
+    assert not supports_image_training("meta-llama/Llama-3.2-1B")
     forbidden = {"modalities", "multimodal", "supports_images", "image_training"}
     assert all(not (forbidden & set(row)) for row in public_model_rows())

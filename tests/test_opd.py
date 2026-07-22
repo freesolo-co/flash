@@ -604,8 +604,8 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
 def test_generation_eos_ids_unions_tokenizer_and_generation_config_lists():
     """_rollout_terminated must see EVERY halting id. _generation_eos_ids unions the tokenizer's
     eos_token_id with the model's generation_config/config eos_token_id, each of which HF allows to be
-    a scalar OR a list — so a model like MiniCPM5 that halts on a secondary <|im_end|> (a list member)
-    while its primary eos is </s> gets both ids, and a secondary-eos rollout is not misread as truncated
+    a scalar OR a list — so a model that halts on a secondary eos id from a list while its tokenizer
+    exposes a different primary eos gets both ids, and the rollout is not misread as truncated
     (codex[bot]). bool is an int subclass but never a token id, so it's excluded."""
     from flash.engine.worker.opd import _generation_eos_ids
 
