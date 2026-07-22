@@ -3247,9 +3247,12 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
-        assert status_deadlines == [
-            orch._load_run_deadline_at("walked") + lifecycle._RECOVERY_MARKER_GRACE_S
-        ]
+        # the completion probe uses a short fresh timeout cap, never the far-future run wall
+        # deadline (which would let a status-api outage burn the full retry budget and stall
+        # recovery). the exact cap is pinned by
+        # test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_future.
+        assert len(status_deadlines) == 1
+        assert status_deadlines[0] < orch._load_run_deadline_at("walked")
         import json
         import os
 
@@ -5300,6 +5303,35 @@ def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatc
     )
 
     assert metrics == {"wall_seconds": 60.0}
+    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
+
+
+def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_future(monkeypatch):
+    # regression (#613): the status probe timeout must stay a short fresh cap even when the run's
+    # wall deadline is hours away. otherwise job_status is handed a multi-hour deadline and, during
+    # a runpod api outage, burns its full per-request retry budget (~minutes) before returning,
+    # stalling the attach/recovery reconciler each pass. the wall+grace value governs only the
+    # pending-output decision, never the per-probe timeout.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    now = 1_000.0
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
+    probe_deadlines = []
+
+    def completed_status(_endpoint_id, _job_id, **kwargs):
+        probe_deadlines.append(kwargs["deadline_at"])
+        return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
+
+    monkeypatch.setattr(runpod_api, "job_status", completed_status)
+    metrics = lifecycle._runpod_completed_metrics(
+        _runpod_handle(jobs),
+        deadline_at=now + 7_200.0,  # wall deadline hours in the future
+    )
+
+    assert metrics == {"wall_seconds": 60.0}
+    # short fresh cap, NOT now + 7200 + grace (which would let an outage stall the reconciler)
     assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
 
 

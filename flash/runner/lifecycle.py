@@ -154,11 +154,13 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         from flash.providers.runpod import api as runpod_api
         from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
 
+        # a status probe must fail fast: cap it at a short fresh timeout regardless of how far
+        # the run wall deadline is. handing job_status the wall+grace deadline (which can be
+        # hours out for a run that just started) lets a runpod api outage burn the full
+        # per-request retry budget before returning None, stalling the reconciler each pass.
+        # the wall+grace value governs only the pending-output decision below, never the probe.
         probe_deadline_at = (
-            max(
-                deadline_at + _RECOVERY_MARKER_GRACE_S,
-                time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S,
-            )
+            time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
             if deadline_at is not None
             else None
         )
