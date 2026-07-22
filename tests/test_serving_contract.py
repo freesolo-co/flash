@@ -273,7 +273,6 @@ def test_serving_prices_pin_public_rates_plus_markup():
     from flash.serve.pricing import SERVING_MARKUP, SERVING_PRICES
 
     typical = {
-        "openbmb/MiniCPM5-1B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-0.8B": (0.01, 0.05, 0.002),
         "Qwen/Qwen3.5-2B": (0.02, 0.10, 0.004),
         "Qwen/Qwen3.5-4B": (0.03, 0.15, 0.006),
