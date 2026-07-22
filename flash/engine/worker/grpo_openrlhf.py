@@ -33,6 +33,7 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
+from flash.engine.structured_outputs import parse_structured_outputs, reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.hf import _deployable_adapter_on_hf
@@ -628,6 +629,8 @@ _FLASH_STOP_SEQUENCES = tuple(json.loads(os.environ.get("FLASH_OPENRLHF_STOP_SEQ
 _FLASH_EOS_TOKEN_IDS = frozenset(
     int(token_id) for token_id in json.loads(os.environ.get("FLASH_OPENRLHF_EOS_TOKEN_IDS", "[]"))
 )
+_FLASH_STRUCTURED_OUTPUTS = json.loads(os.environ.get("FLASH_OPENRLHF_STRUCTURED_OUTPUTS", "null"))
+_FLASH_REASONING_PARSER = os.environ.get("FLASH_OPENRLHF_REASONING_PARSER")
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
@@ -640,6 +643,25 @@ _EXACT_SAVE_STEPS = frozenset(
     for value in os.environ.get("FLASH_OPENRLHF_SAVE_AT_STEPS", "").split(",")
     if value
 )
+
+def _flash_structured_outputs_type():
+    if not _FLASH_STRUCTURED_OUTPUTS:
+        return None
+    try:
+        import vllm
+        from vllm.sampling_params import StructuredOutputsParams
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("the pinned vLLM lacks StructuredOutputsParams") from exc
+    try:
+        sampling_parameters = inspect.signature(vllm.SamplingParams).parameters
+    except (TypeError, ValueError):
+        sampling_parameters = {}
+    if "structured_outputs" not in sampling_parameters:
+        raise RuntimeError("the pinned vLLM lacks SamplingParams.structured_outputs")
+    return StructuredOutputsParams
+
+
+_StructuredOutputsParams = _flash_structured_outputs_type()
 
 from openrlhf import models as _models_module
 from openrlhf.models import loss as _loss_module
@@ -889,6 +911,8 @@ async def _flash_execute(self, *args, **kwargs):
     if sampling_params is None:
         raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
     sampling_params = copy.deepcopy(sampling_params)
+    if _FLASH_STRUCTURED_OUTPUTS:
+        sampling_params.structured_outputs = _StructuredOutputsParams(**_FLASH_STRUCTURED_OUTPUTS)
     if _FLASH_STOP_SEQUENCES:
         sampling_params.stop = list(_FLASH_STOP_SEQUENCES)
         sampling_params.include_stop_str_in_output = True
@@ -1483,10 +1507,12 @@ def _flash_broadcast_to_vllm(self):
 
 _ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm
 
-if _LANGUAGE_MODEL_ONLY or _FP8_KV or _SM120_VLLM_BACKEND:
+if _LANGUAGE_MODEL_ONLY or _FP8_KV or _SM120_VLLM_BACKEND or _FLASH_REASONING_PARSER:
     import vllm
 
     _engine_arg_defaults = {}
+    if _FLASH_REASONING_PARSER:
+        _engine_arg_defaults["reasoning_parser"] = _FLASH_REASONING_PARSER
     if _LANGUAGE_MODEL_ONLY:
         _engine_arg_defaults["language_model_only"] = True
     if _FP8_KV:
@@ -1546,6 +1572,8 @@ def build_openrlhf_child_env(
     seed: int | None = None,
     stop_sequences: tuple[str, ...] = (),
     eos_token_ids: frozenset[int] = frozenset(),
+    structured_outputs: dict[str, Any] | None = None,
+    reasoning_parser: str | None = None,
     fp8_kv: bool = False,
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
@@ -1563,6 +1591,11 @@ def build_openrlhf_child_env(
     child["FLASH_OPENRLHF_EOS_TOKEN_IDS"] = json.dumps(
         sorted(int(value) for value in eos_token_ids)
     )
+    child["FLASH_OPENRLHF_STRUCTURED_OUTPUTS"] = json.dumps(
+        structured_outputs, sort_keys=True, separators=(",", ":")
+    )
+    if reasoning_parser:
+        child["FLASH_OPENRLHF_REASONING_PARSER"] = reasoning_parser
     if seed is not None:
         child["FLASH_OPENRLHF_ROLLOUT_SEED"] = str(int(seed))
     child["HF_HUB_OFFLINE"] = "1"
@@ -1804,13 +1837,15 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         )
 
     train_spec = spec.train
+    structured_outputs = parse_structured_outputs(train_spec.structured_outputs)
+    reasoning_parser = reasoning_parser_for(
+        thinking=bool(_w.THINKING), structured_outputs=structured_outputs
+    )
     if train_spec.save_every is not None:
         raise RuntimeError(
             "OpenRLHF GRPO periodic checkpoints are not uploaded; omit train.save_every or use "
             "the TRL backend"
         )
-    if train_spec.structured_outputs:
-        raise RuntimeError("OpenRLHF GRPO structured outputs are deferred; use the TRL backend")
     if train_spec.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
         raise RuntimeError(
             "OpenRLHF GRPO per-turn credit requires action-span reward advantages that the pinned "
@@ -1947,6 +1982,8 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         "gpu_count": int(spec.gpu.count),
         "seed": int(backend_seed(spec.seed)),
         "stop_sequences": tuple(str(value) for value in train_spec.stop_sequences),
+        "structured_outputs": structured_outputs,
+        "reasoning_parser": reasoning_parser,
         "fp8_kv": fp8_kv,
         "warmstart_adapter": warmstart_adapter,
     }
@@ -2104,6 +2141,8 @@ def run_rl_openrlhf() -> None:
             seed=inputs["seed"],
             stop_sequences=inputs["stop_sequences"],
             eos_token_ids=eos_token_ids,
+            structured_outputs=inputs["structured_outputs"],
+            reasoning_parser=inputs["reasoning_parser"],
             fp8_kv=inputs["fp8_kv"],
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],

@@ -9,6 +9,7 @@ import copy
 import functools
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -73,7 +74,9 @@ def _config(**overrides) -> grpo_openrlhf.OpenRLHFGRPOConfig:
     return grpo_openrlhf.OpenRLHFGRPOConfig(**values)
 
 
-def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None, stop_sequences=()):
+def _install_resolve_inputs_fakes(
+    monkeypatch, *, save_every=None, stop_sequences=(), structured_outputs="", thinking=False
+):
     class _Env:
         multi_turn = False
         is_tool_env = False
@@ -99,7 +102,7 @@ def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None, stop_sequence
         save_at_steps=(),
         save_every=save_every,
         stop_sequences=stop_sequences,
-        structured_outputs="",
+        structured_outputs=structured_outputs,
         credit_assignment="per_episode",
         batch_size=1,
         learning_rate=0.0,
@@ -134,7 +137,7 @@ def _install_resolve_inputs_fakes(monkeypatch, *, save_every=None, stop_sequence
     )
     monkeypatch.setattr(grpo_openrlhf, "RECIPE", recipe)
     monkeypatch.setattr(grpo_openrlhf._w, "JOB_SPEC", spec)
-    monkeypatch.setattr(grpo_openrlhf._w, "THINKING", False)
+    monkeypatch.setattr(grpo_openrlhf._w, "THINKING", thinking)
     monkeypatch.setattr(grpo_openrlhf._w, "require_active_env", lambda: _Env())
     monkeypatch.setattr(
         grpo_openrlhf._w,
@@ -257,7 +260,12 @@ def _package(monkeypatch, name: str):
 
 
 def _install_pinned_sitecustomize_modules(
-    monkeypatch, *, language_model_only=False, sm120_vllm_backend=False
+    monkeypatch,
+    *,
+    language_model_only=False,
+    sm120_vllm_backend=False,
+    structured_outputs=None,
+    reasoning_parser=None,
 ):
     torch = pytest.importorskip("torch")
     openrlhf = _package(monkeypatch, "openrlhf")
@@ -413,7 +421,14 @@ def _install_pinned_sitecustomize_modules(
     monkeypatch.setitem(sys.modules, "openrlhf.utils.logging_utils", logging_utils)
 
     vllm = types.ModuleType("vllm")
-    vllm.SamplingParams = type("SamplingParams", (), {})
+
+    class _SamplingParams:
+        def __init__(self, *, structured_outputs=None, **kwargs):
+            self.structured_outputs = structured_outputs
+            for name, value in kwargs.items():
+                setattr(self, name, value)
+
+    vllm.SamplingParams = _SamplingParams
 
     class _EngineArgs:
         def __init__(
@@ -422,10 +437,12 @@ def _install_pinned_sitecustomize_modules(
             kv_cache_dtype=None,
             language_model_only=False,
             attention_backend=None,
+            reasoning_parser=None,
         ):
             self.kv_cache_dtype = kv_cache_dtype
             self.language_model_only = language_model_only
             self.attention_backend = attention_backend
+            self.reasoning_parser = reasoning_parser
 
     class _AsyncEngineArgs:
         def __init__(
@@ -434,14 +451,24 @@ def _install_pinned_sitecustomize_modules(
             kv_cache_dtype=None,
             language_model_only=False,
             attention_backend=None,
+            reasoning_parser=None,
         ):
             self.kv_cache_dtype = kv_cache_dtype
             self.language_model_only = language_model_only
             self.attention_backend = attention_backend
+            self.reasoning_parser = reasoning_parser
 
     vllm.EngineArgs = _EngineArgs
     vllm.AsyncEngineArgs = _AsyncEngineArgs
     monkeypatch.setitem(sys.modules, "vllm", vllm)
+    sampling_params_module = types.ModuleType("vllm.sampling_params")
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    sampling_params_module.StructuredOutputsParams = _StructuredOutputsParams
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params_module)
     vllm_engine = types.ModuleType("openrlhf.trainer.ray.vllm_engine")
     vllm_engine.batch_vllm_engine_call = lambda *_args, **_kwargs: None
     monkeypatch.setitem(sys.modules, "openrlhf.trainer.ray.vllm_engine", vllm_engine)
@@ -526,6 +553,11 @@ def _install_pinned_sitecustomize_modules(
     monkeypatch.setitem(sys.modules, "openrlhf.utils.agent", agent_module)
 
     monkeypatch.setenv("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH", "5")
+    monkeypatch.setenv("FLASH_OPENRLHF_STRUCTURED_OUTPUTS", json.dumps(structured_outputs))
+    if reasoning_parser:
+        monkeypatch.setenv("FLASH_OPENRLHF_REASONING_PARSER", reasoning_parser)
+    else:
+        monkeypatch.delenv("FLASH_OPENRLHF_REASONING_PARSER", raising=False)
     if language_model_only:
         monkeypatch.setenv("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY", "1")
     else:
@@ -663,6 +695,20 @@ def test_resolve_single_turn_inputs_accepts_stop_sequences(monkeypatch):
     inputs = grpo_openrlhf._resolve_single_turn_inputs()
 
     assert inputs["stop_sequences"] == ("</answer>", "\n\n")
+
+
+def test_resolve_single_turn_inputs_accepts_structured_outputs(monkeypatch):
+    spec = {"json": {"type": "object", "properties": {"answer": {"type": "string"}}}}
+    _install_resolve_inputs_fakes(
+        monkeypatch,
+        structured_outputs=json.dumps(spec, sort_keys=True, separators=(",", ":")),
+        thinking=True,
+    )
+
+    inputs = grpo_openrlhf._resolve_single_turn_inputs()
+
+    assert inputs["structured_outputs"] == spec
+    assert inputs["reasoning_parser"] == "deepseek_r1"
 
 
 def test_resolve_single_turn_inputs_rejects_unpublished_periodic_saves(monkeypatch):
@@ -858,6 +904,10 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "do-not-forward")
     monkeypatch.setenv("HF_TOKEN", "do-not-forward")
 
+    structured_outputs = {
+        "json": {"type": "object"},
+        "disable_additional_properties": True,
+    }
     child = grpo_openrlhf.build_openrlhf_child_env(
         plugin_dir="/work/plugin",
         max_response_length=320,
@@ -866,6 +916,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         seed=42,
         stop_sequences=("</answer>", "\n\n"),
         eos_token_ids=frozenset({2, 73}),
+        structured_outputs=structured_outputs,
+        reasoning_parser="deepseek_r1",
         fp8_kv=True,
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
@@ -878,6 +930,8 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "320"
     assert json.loads(child["FLASH_OPENRLHF_STOP_SEQUENCES"]) == ["</answer>", "\n\n"]
     assert json.loads(child["FLASH_OPENRLHF_EOS_TOKEN_IDS"]) == [2, 73]
+    assert json.loads(child["FLASH_OPENRLHF_STRUCTURED_OUTPUTS"]) == structured_outputs
+    assert child["FLASH_OPENRLHF_REASONING_PARSER"] == "deepseek_r1"
     assert child["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] == "1"
     assert child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
@@ -925,6 +979,7 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "ActorPPOTrainer.training_step = _flash_training_step" in source
     assert "self._flash_grpo_rollout_ordinals = rollout_ordinals" in source
     assert "sampling_params.seed = _flash_rollout_seed(identity)" in source
+    assert "sampling_params.structured_outputs = _StructuredOutputsParams" in source
     assert "sampling_params.stop = list(_FLASH_STOP_SEQUENCES)" in source
     assert "sampling_params.include_stop_str_in_output = True" in source
     assert "sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)" in source
@@ -942,6 +997,7 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "returned invalid {key}" in source
     assert "_flash_patch_engine_args(vllm.AsyncEngineArgs" in source
     assert "_flash_patch_engine_args(vllm.EngineArgs" in source
+    assert '_engine_arg_defaults["reasoning_parser"] = _FLASH_REASONING_PARSER' in source
     assert "_NON_LM_PARAMETER_SEGMENTS" in source
     assert "_flash_attention_context" in source
     assert 'target_modules"] = "all-linear"' in source
@@ -958,6 +1014,65 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert 'config["zero_allow_untested_optimizer"] = True' in source
     assert "self.broadcast_to_vllm()" in source
     assert "[flash-openrlhf-checkpoint]" in source
+
+
+@pytest.mark.parametrize(
+    ("supports_type", "supports_field", "message"),
+    [
+        (False, True, "pinned vLLM lacks StructuredOutputsParams"),
+        (True, False, "pinned vLLM lacks SamplingParams.structured_outputs"),
+    ],
+)
+def test_sitecustomize_structured_outputs_capability_fails_loud(
+    monkeypatch, supports_type, supports_field, message
+):
+    tree = ast.parse(grpo_openrlhf._sitecustomize_source())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_flash_structured_outputs_type"
+    )
+    vllm = types.ModuleType("vllm")
+    if supports_field:
+
+        class _SamplingParams:
+            def __init__(self, *, structured_outputs=None):
+                self.structured_outputs = structured_outputs
+
+    else:
+
+        class _SamplingParams:
+            def __init__(self):
+                pass
+
+    vllm.SamplingParams = _SamplingParams
+    sampling_params_module = types.ModuleType("vllm.sampling_params")
+    if supports_type:
+        sampling_params_module.StructuredOutputsParams = type("StructuredOutputsParams", (), {})
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params_module)
+    namespace = {"_FLASH_STRUCTURED_OUTPUTS": {"json_object": True}, "inspect": inspect}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "sitecustomize.py", "exec"), namespace
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        namespace["_flash_structured_outputs_type"]()
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_applies_structured_grammar_only_after_thinking(monkeypatch):
+    spec = {"json_object": True}
+    _install_pinned_sitecustomize_modules(
+        monkeypatch,
+        structured_outputs=spec,
+        reasoning_parser="deepseek_r1",
+    )
+
+    vllm = sys.modules["vllm"]
+    assert vllm.AsyncEngineArgs().reasoning_parser == "deepseek_r1"
+    assert vllm.EngineArgs().reasoning_parser == "deepseek_r1"
 
 
 @requires_openrlhf_source
@@ -1018,6 +1133,8 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
         "_FLASH_ROLLOUT_SEED": 42,
         "_FLASH_STOP_SEQUENCES": (),
         "_FLASH_EOS_TOKEN_IDS": frozenset(),
+        "_FLASH_STRUCTURED_OUTPUTS": None,
+        "_StructuredOutputsParams": None,
         "_original_execute": execute,
     }
     exec(
@@ -1060,7 +1177,9 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
     assert not hasattr(original_params, "seed")
 
 
-def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_token_ids=(99,)):
+def _termination_hook_namespace(
+    *, execute, stop_sequences=("</answer>",), eos_token_ids=(99,), structured_outputs=None
+):
     tree = ast.parse(grpo_openrlhf._sitecustomize_source())
     names = {
         "_flash_rollout_identity",
@@ -1076,6 +1195,11 @@ def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_t
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         and node.name in names
     ]
+
+    class _StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     namespace = {
         "copy": copy,
         "functools": functools,
@@ -1085,6 +1209,8 @@ def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_t
         "_FLASH_ROLLOUT_SEED": None,
         "_FLASH_STOP_SEQUENCES": tuple(stop_sequences),
         "_FLASH_EOS_TOKEN_IDS": frozenset(eos_token_ids),
+        "_FLASH_STRUCTURED_OUTPUTS": structured_outputs,
+        "_StructuredOutputsParams": _StructuredOutputsParams,
         "_original_execute": execute,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "sitecustomize.py", "exec"), namespace)
@@ -1143,7 +1269,11 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
             "extra_logs": {},
         }
 
-    namespace = _termination_hook_namespace(execute=execute)
+    structured_outputs = {
+        "regex": r"[A-Z]+",
+        "disable_any_whitespace": True,
+    }
+    namespace = _termination_hook_namespace(execute=execute, structured_outputs=structured_outputs)
     original_params = SimpleNamespace(logprobs=1)
     output = asyncio.run(
         namespace["_flash_execute"](
@@ -1158,9 +1288,11 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     )
 
     request_params = captured["sampling_params"]
+    assert request_params.structured_outputs.kwargs == structured_outputs
     assert request_params.stop == ["</answer>"]
     assert request_params.include_stop_str_in_output is True
     assert request_params.stop_token_ids == [99]
+    assert not hasattr(original_params, "structured_outputs")
     assert not hasattr(original_params, "stop")
     assert captured["generation"].token_ids == [1]
     assert captured["generation"].text == "ok"
@@ -1172,6 +1304,47 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     assert output["finish_reason"] == "length"
     assert output["stop_reason"] == "</answer>"
     assert output["truncated"] is False
+
+
+def test_sitecustomize_constructs_structured_outputs_params_per_request():
+    captured = []
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        _llm_engine,
+        images=None,
+    ):
+        captured.append((sampling_params.structured_outputs, images))
+        return {"reward": [0.0], "scores": [0.0], "extra_logs": {}}
+
+    spec = {
+        "json": {"type": "object", "required": ["answer"]},
+        "disable_additional_properties": True,
+    }
+    namespace = _termination_hook_namespace(
+        execute=execute,
+        stop_sequences=(),
+        eos_token_ids=(),
+        structured_outputs=spec,
+    )
+    original_params = SimpleNamespace(temperature=0.7)
+    for _ in range(2):
+        asyncio.run(
+            namespace["_flash_execute"](
+                SimpleNamespace(), "prompt", 0, original_params, 32, object(), object()
+            )
+        )
+
+    first, second = (item[0] for item in captured)
+    assert first.kwargs == spec
+    assert second.kwargs == spec
+    assert first is not second
+    assert not hasattr(original_params, "structured_outputs")
 
 
 @pytest.mark.parametrize(
@@ -2274,6 +2447,8 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
             "gpu_count": 1,
             "seed": 42,
             "stop_sequences": ("</answer>",),
+            "structured_outputs": {"json_object": True},
+            "reasoning_parser": "deepseek_r1",
             "fp8_kv": True,
             "warmstart_adapter": "",
         }
@@ -2333,6 +2508,8 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
     assert json.loads(launched["env"]["FLASH_OPENRLHF_STOP_SEQUENCES"]) == ["</answer>"]
     assert json.loads(launched["env"]["FLASH_OPENRLHF_EOS_TOKEN_IDS"]) == [2, 73]
+    assert json.loads(launched["env"]["FLASH_OPENRLHF_STRUCTURED_OUTPUTS"]) == {"json_object": True}
+    assert launched["env"]["FLASH_OPENRLHF_REASONING_PARSER"] == "deepseek_r1"
     assert launched["env"]["FLASH_OPENRLHF_ROLLOUT_SEED"] == "42"
     assert launched["env"]["FLASH_OPENRLHF_FP8_KV"] == "1"
     assert launched["env"]["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] == "1"
