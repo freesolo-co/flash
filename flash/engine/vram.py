@@ -621,16 +621,28 @@ def estimate_vram_gb(
         rollout = 0.0
         if use_vllm:
             if sleep_offload:
-                rollout = weights + min(
-                    _resident_kv_gb(
-                        eff_b,
-                        seq_len,
-                        8,
-                        fp8_kv=fp8_kv,
-                        model_info=model_info,
-                    ),
-                    _KV_CAP,
+                kv = _resident_kv_gb(
+                    eff_b,
+                    seq_len,
+                    group_size,
+                    fp8_kv=fp8_kv,
+                    model_info=model_info,
                 )
+                # the sleep-mode worker (colocate_kv_util) budgets max(_KV_CAP, 1.5 * kv) at the real
+                # group_size. only mirror that lift when kv is backed by real catalog geometry AND
+                # exceeds _KV_CAP -- that is the finding's case (architecture-aware KV above the cap),
+                # where the old min(kv, _KV_CAP) under-counted the pool by 4-11 gb and preflight
+                # admitted a gpu the sleep executor then overran. the generic legacy KV formula
+                # OVER-estimates long context, and its _KV_CAP clamp is what keeps the uncataloged
+                # estimate on its measured train/OOM boundary, so keep min(kv, _KV_CAP) whenever the
+                # geometry is absent (generic) or the arch-aware kv still fits the cap (short context).
+                arch_kv_known = (
+                    _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
+                )
+                if arch_kv_known and kv > _KV_CAP:
+                    rollout = weights + max(_KV_CAP, 1.5 * kv)
+                else:
+                    rollout = weights + min(kv, _KV_CAP)
             else:
                 rollout = weights + _resident_kv_gb(
                     eff_b,
@@ -1089,6 +1101,12 @@ def model_required_vram_gb(
                     * 1.15
                 )
                 floor = max(floor, resident_need)
+                # ``need`` above was sized with the default sleep estimate. Now that the sleep rollout
+                # honestly reserves the worker's colocate KV pool (max(_KV_CAP, 1.5 * arch KV)), that
+                # estimate can exceed this resident wall and FALSELY reject a config that fits resident
+                # on the big floor card. Sleep never runs for this model (it HANGS), so discard the
+                # sleep sizing and size purely on the resident peak.
+                need = floor
             else:
                 floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
