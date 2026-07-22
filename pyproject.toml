@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.0.15"
+version = "1.0.16"
 description = "Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -84,7 +84,8 @@ dev = [
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
     "freesolo>=0.2.54",
-    "transformers>=5.6,<5.11",
+    "transformers==5.10.2",
+    "xgrammar==0.1.25",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -116,7 +117,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.0.15"
+version = "1.0.16"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -124,11 +125,16 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
   "live: hits real provider APIs; opt in with FLASH_LIVE=1 (plus provider creds)",
+  "opd_verl_backend: requires the pinned verl 0.8.0 and vllm 0.11.0 runtime",
 ]
 
 [tool.uv]
 # Heavy GPU extras are worker-side; keep the default sync light.
 package = true
+conflicts = [
+    [{ extra = "gpu" }, { extra = "dev" }],
+    [{ extra = "gpu" }, { group = "dev" }],
+]
 
 [dependency-groups]
 dev = [
@@ -139,6 +145,8 @@ dev = [
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
     "freesolo>=0.2.54",
+    "transformers==5.10.2",
+    "xgrammar==0.1.25",
 ]
 
 [tool.mypy]
