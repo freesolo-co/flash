@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 
@@ -30,11 +29,13 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.hf import resolve_cached_model_commit
 from flash.engine.worker.openrlhf_common import (
+    _hf_snapshot_identity,
     export_openrlhf_adapter,
     resolve_openrlhf_python,
     run_openrlhf_training,
 )
 from flash.engine.worker.packing import completion_mask_from_ids, model_is_gdn_hybrid
+from flash.engine.worker.perf.attn import _attn_impl_for_capability
 from flash.engine.worker.sft import (
     _model_arch_dims,
     _prepare_sft_examples,
@@ -102,7 +103,6 @@ def build_sft_openrlhf_args(cfg: dict) -> list[str]:
         str(cfg["epochs"]),
         "--train.seed",
         str(cfg["seed"]),
-        "--train.full_determinism_enable",
         "--ds.zero_stage",
         "3",
         "--ds.param_dtype",
@@ -279,9 +279,7 @@ def _has_real_target(row: dict, special_ids: set[int]) -> bool:
     )
 
 
-def filter_openrlhf_sft_rows(
-    rows: list[dict], special_ids: set[int]
-) -> tuple[list[dict], int]:
+def filter_openrlhf_sft_rows(rows: list[dict], special_ids: set[int]) -> tuple[list[dict], int]:
     """drop rows without a trainable completion token and fail if no signal remains."""
     kept = [row for row in rows if _has_real_target(row, special_ids)]
     dropped = len(rows) - len(kept)
@@ -297,9 +295,7 @@ def build_text_openrlhf_rows(
     text_specs: list[dict], tokenizer, max_length: int
 ) -> tuple[list[dict], int]:
     """turn flash-rendered text rows into the exact tensors consumed by OpenRLHF."""
-    kept_specs, tokenized, dropped = _pretokenize_completion_only(
-        text_specs, tokenizer, max_length
-    )
+    kept_specs, tokenized, dropped = _pretokenize_completion_only(text_specs, tokenizer, max_length)
     del kept_specs
     rows = [
         {
@@ -312,20 +308,18 @@ def build_text_openrlhf_rows(
     return rows, dropped
 
 
-def _hf_snapshot_identity(path: str) -> tuple[str, str] | None:
-    parts = os.path.normpath(path).split(os.sep)
+def _warmstart_provenance_revision(adapter_dir: str, model_id: str) -> str:
+    path = os.path.join(adapter_dir, "base_model_provenance.json")
+    if not os.path.isfile(path):
+        return ""
     try:
-        snapshots_index = len(parts) - 1 - parts[::-1].index("snapshots")
-    except ValueError:
-        return None
-    if snapshots_index == 0 or snapshots_index + 1 >= len(parts):
-        return None
-    repo_folder = parts[snapshots_index - 1]
-    if not repo_folder.startswith("models--"):
-        return None
-    model_id = repo_folder.removeprefix("models--").replace("--", "/")
-    revision = parts[snapshots_index + 1]
-    return (model_id, revision) if model_id and revision else None
+        with open(path, encoding="utf-8") as file:
+            provenance = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("the prepared SFT warm-start adapter has invalid provenance") from error
+    if str(provenance.get("model_id") or "").strip() != model_id:
+        raise ValueError("SFT warm-start adapter provenance model does not match the target model")
+    return str(provenance.get("resolved_commit") or "").strip()
 
 
 def validate_openrlhf_warmstart_adapter(
@@ -364,8 +358,10 @@ def validate_openrlhf_warmstart_adapter(
     elif base != model_id:
         raise ValueError("SFT warm-start adapter base model does not match the target model")
     revision = str(config.get("revision") or "").strip()
-    declared_revision = revision or snapshot_revision
-    if model_revision and declared_revision != model_revision:
+    declared_revision = (
+        revision or snapshot_revision or _warmstart_provenance_revision(adapter_dir, model_id)
+    )
+    if declared_revision != model_revision:
         raise ValueError("SFT warm-start adapter revision does not match the target model revision")
     if revision and snapshot_revision and revision != snapshot_revision:
         raise ValueError("SFT warm-start adapter carries conflicting base revisions")
@@ -499,6 +495,11 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     return durable
 
 
+def _required_save_marker(checkpoint_dir: str, step: int, *, failed: bool = False) -> str:
+    suffix = ".failed" if failed else ".done"
+    return os.path.join(checkpoint_dir, f".flash-required-step-{step}{suffix}")
+
+
 class _OpenRLHFCheckpointWatcher:
     """publish completed DeepSpeed checkpoints and their matching PEFT exports."""
 
@@ -534,9 +535,7 @@ class _OpenRLHFCheckpointWatcher:
 
     def stop(self, *, require_complete: bool) -> None:
         self._stop.set()
-        self._thread.join(timeout=600)
-        if self._thread.is_alive():
-            raise RuntimeError("OpenRLHF checkpoint watcher did not stop")
+        self._thread.join()
         self.raise_if_failed()
         if require_complete:
             missing = sorted(self.required_steps - self.processed_steps)
@@ -568,32 +567,46 @@ class _OpenRLHFCheckpointWatcher:
         return sorted(found)
 
     def _publish(self, step: int, ds_dir: str, hf_dir: str) -> None:
-        adapter_dir = os.path.join(self.export_root, f"step-{step}")
-        _export_checkpoint_adapter(
-            hf_dir,
-            adapter_dir,
-            processing_dir=self.processing_dir,
-            model_id=self.model_id,
-            model_revision=self.model_revision,
-            python_bin=self.python_bin,
-        )
-
-        def publish_adapter() -> None:
-            _w.publish_deployable_checkpoint(
+        required = step in self.required_steps
+        try:
+            adapter_dir = os.path.join(self.export_root, f"step-{step}")
+            _export_checkpoint_adapter(
+                hf_dir,
                 adapter_dir,
-                step,
-                required=step in self.required_steps,
-                _provenance_ready=True,
+                processing_dir=self.processing_dir,
+                model_id=self.model_id,
+                model_revision=self.model_revision,
+                python_bin=self.python_bin,
             )
 
-        uploaded = _w.upload_resume_checkpoint(
-            step,
-            ds_dir,
-            before_upload=publish_adapter,
-        )
-        if step in self.required_steps and not uploaded:
-            raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
-        self.processed_steps.add(step)
+            def publish_adapter() -> None:
+                _w.publish_deployable_checkpoint(
+                    adapter_dir,
+                    step,
+                    required=required,
+                    _provenance_ready=True,
+                )
+
+            uploaded = _w.upload_resume_checkpoint(
+                step,
+                ds_dir,
+                before_upload=publish_adapter,
+            )
+            if required and not uploaded:
+                raise RuntimeError(
+                    f"required save step {step} full-state checkpoint was not published"
+                )
+            self.processed_steps.add(step)
+            if required:
+                marker = _required_save_marker(self.checkpoint_dir, step)
+                with open(marker, "w", encoding="utf-8") as file:
+                    file.write("durable\n")
+        except BaseException as error:
+            if required:
+                marker = _required_save_marker(self.checkpoint_dir, step, failed=True)
+                with open(marker, "w", encoding="utf-8") as file:
+                    file.write(f"{type(error).__name__}: {error}\n")
+            raise
 
     def _run(self) -> None:
         try:
@@ -677,7 +690,7 @@ def _render_sitecustomize() -> str:
 
 def render_openrlhf_sft_runtime() -> str:
     """return the standalone child patch module loaded through sitecustomize."""
-    return r'''from __future__ import annotations
+    return r"""from __future__ import annotations
 
 import io
 import json
@@ -762,11 +775,16 @@ class FlashTokenizedSFTDataset:
         inputs = zero_pad_sequences([item[0] for item in item_list], "right", self.tokenizer.pad_token_id)
         attention = zero_pad_sequences([item[1] for item in item_list], "right")
         masks = zero_pad_sequences([item[2] for item in item_list], "right")
-        merged = {}
-        for _inputs, _attention, _mask, mm_inputs in item_list:
-            for key, value in mm_inputs.items():
-                merged.setdefault(key, []).append(value)
-        mm_batch = {key: torch.cat(values, dim=0) for key, values in merged.items()}
+        multimodal_rows = [item[3] for item in item_list]
+        multimodal_keys = {key for row in multimodal_rows for key in row}
+        mm_batch = {}
+        for key in multimodal_keys:
+            template = next(row[key] for row in multimodal_rows if key in row)
+            values = [
+                row[key] if key in row else template.narrow(0, 0, 0)
+                for row in multimodal_rows
+            ]
+            mm_batch[key] = torch.cat(values, dim=0)
         return inputs, attention, masks, mm_batch
 
 
@@ -812,6 +830,29 @@ def _install_warmstart_actor_patch():
     openrlhf.models.Actor = FlashWarmstartActor
 
 
+def _install_attention_patch():
+    if not bool(CONFIG.get("force_cudnn_sdpa")):
+        return
+    import openrlhf.models
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    original_forward = openrlhf.models.Actor.forward
+
+    def forward(self, *args, **kwargs):
+        with sdpa_kernel(
+            [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+            set_priority=True,
+        ):
+            return original_forward(self, *args, **kwargs)
+
+    openrlhf.models.Actor.forward = forward
+
+
 def _install_dataloader_and_scheduler_patches():
     from openrlhf.utils.deepspeed.deepspeed import DeepspeedStrategy
 
@@ -821,6 +862,7 @@ def _install_dataloader_and_scheduler_patches():
 
     def setup_dataloader(self, *args, **kwargs):
         kwargs["drop_last"] = False
+        kwargs["pin_memory"] = True
         return original_setup(self, *args, **kwargs)
 
     def prepare(self, *args):
@@ -919,6 +961,14 @@ def _global_count(local_count, device):
     return int(value.item())
 
 
+def _accumulation_window_scale(configured_size, realized_size):
+    configured_size = max(1, int(configured_size))
+    realized_size = int(realized_size)
+    if realized_size <= 0 or realized_size > configured_size:
+        raise ValueError("invalid gradient accumulation window size")
+    return configured_size / realized_size
+
+
 def _iter_windows(iterable, size):
     window = []
     for item in iterable:
@@ -930,6 +980,19 @@ def _iter_windows(iterable, size):
         yield window
 
 
+def _wait_for_required_save(checkpoint_dir, step):
+    import time
+
+    done = os.path.join(checkpoint_dir, f".flash-required-step-{step}.done")
+    failed = os.path.join(checkpoint_dir, f".flash-required-step-{step}.failed")
+    while not os.path.isfile(done):
+        if os.path.isfile(failed):
+            with open(failed, encoding="utf-8") as file:
+                detail = file.read().strip()
+            raise RuntimeError(f"required save step {step} failed: {detail}")
+        time.sleep(0.25)
+
+
 def _resume_training_state(consumed_samples):
     resume_states = dict(CONFIG.get("_resume_states") or {})
     global_step = int(CONFIG.get("resume_step", 0))
@@ -938,7 +1001,8 @@ def _resume_training_state(consumed_samples):
         raise RuntimeError("OpenRLHF resume checkpoint step does not match its directory tag")
     loss_curve = [float(value) for value in resume_states.get("loss_curve", [])]
     token_count = int(resume_states.get("token_count", 0) or 0)
-    return global_step, int(consumed_samples), loss_curve, token_count
+    restored_samples = int(resume_states.get("consumed_samples", consumed_samples) or 0)
+    return global_step, restored_samples, loss_curve, token_count
 
 
 def _install_trainer_patch():
@@ -976,10 +1040,14 @@ def _install_trainer_patch():
             for window in _iter_windows(self.train_dataloader, gas):
                 if global_step >= total_steps:
                     break
+                window_size = len(window)
                 masks = [batch[2].squeeze(1)[:, 1:] for batch in window]
                 dp_group = self.strategy.ds_device_mesh["dp"].get_group()
                 dp_size = dist.get_world_size(group=dp_group)
-                loss_info = _optimizer_step_loss_norm(masks, dp_group, dp_size, gas)
+                loss_info = _optimizer_step_loss_norm(
+                    masks, dp_group, dp_size, window_size
+                )
+                gradient_scale = _accumulation_window_scale(gas, window_size)
                 step_loss = 0.0
                 step_tokens = 0
                 step_examples = 0
@@ -990,10 +1058,13 @@ def _install_trainer_patch():
                     )
                 for micro_index, batch in enumerate(window):
                     inputs, attention_masks, loss_masks, mm_inputs = batch
-                    inputs = inputs.to(device).squeeze(1)
-                    attention_mask = attention_masks.to(device).squeeze(1)
-                    loss_mask = loss_masks.to(device).squeeze(1)
-                    mm_inputs = {key: value.to(device) for key, value in mm_inputs.items()}
+                    inputs = inputs.to(device, non_blocking=True).squeeze(1)
+                    attention_mask = attention_masks.to(device, non_blocking=True).squeeze(1)
+                    loss_mask = loss_masks.to(device, non_blocking=True).squeeze(1)
+                    mm_inputs = {
+                        key: value.to(device, non_blocking=True)
+                        for key, value in mm_inputs.items()
+                    }
                     engine.set_gradient_accumulation_boundary(micro_index + 1 == len(window))
                     per_token_log_probs, output = self.model(
                         inputs,
@@ -1005,8 +1076,9 @@ def _install_trainer_patch():
                     )
                     aux_loss = output.aux_loss if self.aux_loss else 0
                     gpt_loss = loss_fn(per_token_log_probs, loss_mask[:, 1:], **loss_info)
-                    aux_scale = gas / len(window)
-                    loss = gpt_loss + aux_loss * self.args.model.aux_loss_coef * aux_scale
+                    loss = (
+                        gpt_loss + aux_loss * self.args.model.aux_loss_coef
+                    ) * gradient_scale
                     self.strategy.backward(loss, self.model, self.optimizer)
                     self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
                     step_loss += float(gpt_loss.item())
@@ -1020,7 +1092,7 @@ def _install_trainer_patch():
                 token_count += global_tokens
                 logs = self.strategy.all_reduce(
                     {
-                        "gpt_loss": step_loss / gas,
+                        "gpt_loss": step_loss / window_size,
                         "lr": self.scheduler.get_last_lr()[0],
                         "grad_norm": self.strategy.get_grad_norm(self.model),
                     }
@@ -1069,6 +1141,8 @@ def _install_trainer_patch():
                         self.tokenizer,
                         os.path.join(args.ckpt.path, f"{tag}_hf"),
                     )
+                    if global_step in required:
+                        _wait_for_required_save(args.ckpt.path, global_step)
             consumed_in_epoch = 0
 
         if self._wandb is not None and self.strategy.is_rank_0():
@@ -1091,14 +1165,17 @@ def _install_trainer_patch():
 def apply_flash_openrlhf_sft_patches():
     _install_dataset_patch()
     _install_warmstart_actor_patch()
+    _install_attention_patch()
     _install_dataloader_and_scheduler_patches()
     _install_loraplus_patch()
     _install_trainer_patch()
-'''
+"""
 
 
-def _probe_gpu_in_subprocess(requested_gpu: str | None, exact_type: str = "") -> dict:
-    script = r'''
+def _probe_gpu_in_subprocess(
+    python_bin: str, requested_gpu: str | None, exact_type: str = ""
+) -> dict:
+    script = r"""
 import json
 import sys
 
@@ -1107,15 +1184,24 @@ from flash.engine.worker.perf.lifecycle import wait_for_gpu
 requested, exact = json.loads(sys.argv[1])
 wait_for_gpu(requested, exact_type=exact)
 import torch
+try:
+    from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
+    fa2_available = bool(is_flash_attn_2_available())
+    fa3_available = bool(is_flash_attn_3_available())
+except Exception:
+    fa2_available = False
+    fa3_available = False
 print("FLASH_GPU_PROBE=" + json.dumps({
     "name": torch.cuda.get_device_name(0),
     "memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
     "capability": list(torch.cuda.get_device_capability(0)),
+    "fa2_available": fa2_available,
+    "fa3_available": fa3_available,
 }), flush=True)
-'''
+"""
     try:
         result = subprocess.run(
-            [sys.executable, "-c", script, json.dumps([requested_gpu, exact_type])],
+            [python_bin, "-c", script, json.dumps([requested_gpu, exact_type])],
             capture_output=True,
             text=True,
             timeout=150,
@@ -1126,9 +1212,7 @@ print("FLASH_GPU_PROBE=" + json.dumps({
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if result.returncode != 0:
-        raise _w.RetriableInfraError(
-            f"gpu readiness probe exited with status {result.returncode}"
-        )
+        raise _w.RetriableInfraError(f"gpu readiness probe exited with status {result.returncode}")
     for line in result.stdout.splitlines():
         if line.startswith("FLASH_GPU_PROBE="):
             return json.loads(line.split("=", 1)[1])
@@ -1156,7 +1240,11 @@ class _NvidiaSmiPeakSampler:
                     timeout=8,
                 )
                 if result.returncode == 0:
-                    values = [float(value.strip()) for value in result.stdout.splitlines() if value.strip()]
+                    values = [
+                        float(value.strip())
+                        for value in result.stdout.splitlines()
+                        if value.strip()
+                    ]
                     if values:
                         self.peak_mib = max(self.peak_mib, max(values))
             except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -1182,6 +1270,19 @@ def _parse_step_line(line: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _attention_implementation(gpu_probe: dict) -> str:
+    capability = tuple(gpu_probe.get("capability") or ())
+    if len(capability) != 2:
+        return "sdpa"
+    implementation = _attn_impl_for_capability(
+        int(capability[0]),
+        int(capability[1]),
+        fa2_available=bool(gpu_probe.get("fa2_available")),
+        fa3_available=bool(gpu_probe.get("fa3_available")),
+    )
+    return implementation or "sdpa"
 
 
 def _training_batch_shape(
@@ -1212,7 +1313,9 @@ def run_sft_openrlhf(spec=None) -> None:
     env = _w.require_active_env()
     started_at = time.time()
     _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
+    python_bin = resolve_openrlhf_python("")
     gpu_probe = _probe_gpu_in_subprocess(
+        python_bin,
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.exact_type if spec else "",
     )
@@ -1300,7 +1403,9 @@ def run_sft_openrlhf(spec=None) -> None:
         rows: list[dict] = []
         dropped = 0
         sampled_texts: list[str] = []
-        multiturn_targets = sum(1 for _example, _prompt, completion in prompt_rows if len(completion) > 1)
+        multiturn_targets = sum(
+            1 for _example, _prompt, completion in prompt_rows if len(completion) > 1
+        )
         if not multimodal:
             texts, tokenized, dropped, _multiturn, cache_hit = _prepare_sft_examples(
                 env,
@@ -1415,6 +1520,7 @@ def run_sft_openrlhf(spec=None) -> None:
         masked_tokens = sum(row["loss_mask"].count(0) for row in rows)
         total_tokens_per_epoch = sum(len(row["input_ids"]) for row in rows)
         realized_max_length = max(len(row["input_ids"]) for row in rows)
+        runtime_max_length = realized_max_length
         _validate_gdn_realized_length(model_id, model_revision, realized_max_length)
         print(
             f"[sft] completion-only loss: masking {masked_tokens}/{total_tokens_per_epoch} "
@@ -1437,7 +1543,7 @@ def run_sft_openrlhf(spec=None) -> None:
     vocab_size = resolve_vocab_size(model_id, model_revision)
     per_device_limit, _unused_grad_accum = sft_grad_accum(
         effective_batch,
-        seq_len=max_length,
+        seq_len=runtime_max_length,
         vocab=vocab_size,
         fused=False,
     )
@@ -1465,7 +1571,7 @@ def run_sft_openrlhf(spec=None) -> None:
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _w.grad_checkpointing_on(
         model_id,
-        max_length,
+        runtime_max_length,
         allow_disable=True,
         card_vram_gb=card_vram_gb,
         capability=capability,
@@ -1482,7 +1588,6 @@ def run_sft_openrlhf(spec=None) -> None:
     )
 
     model_path = _cached_model_path(model_id, model_revision)
-    python_bin = resolve_openrlhf_python(workdir)
     resume_step = _restore_openrlhf_resume(checkpoint_dir)
     if resume_step > update_horizon:
         print(
@@ -1494,9 +1599,13 @@ def run_sft_openrlhf(spec=None) -> None:
     wandb_project = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     wandb_run_name = _w.wandb_run_name()
     final_state_path = os.path.join(workdir, _FINAL_STATE_FILE)
+    attn_implementation = _attention_implementation(gpu_probe)
+    capability = tuple(gpu_probe.get("capability") or ())
     runtime_config = {
         "adam_betas": [0.9, 0.999],
         "adam_epsilon": 1e-8,
+        "attn_implementation": attn_implementation,
+        "force_cudnn_sdpa": bool(capability and int(capability[0]) in (10, 12)),
         "final_state_path": final_state_path,
         "learning_rate": learning_rate,
         "lora_rank": lora_rank,
@@ -1512,12 +1621,13 @@ def run_sft_openrlhf(spec=None) -> None:
     }
     with open(os.path.join(shim_dir, _RUNTIME_CONFIG_FILE), "w", encoding="utf-8") as file:
         json.dump(runtime_config, file, sort_keys=True)
-    with open(os.path.join(shim_dir, "flash_openrlhf_sft_runtime.py"), "w", encoding="utf-8") as file:
+    with open(
+        os.path.join(shim_dir, "flash_openrlhf_sft_runtime.py"), "w", encoding="utf-8"
+    ) as file:
         file.write(render_openrlhf_sft_runtime())
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
         file.write(_render_sitecustomize())
 
-    attn_implementation = "eager" if model_is_gdn_hybrid(model_id, revision=model_revision) else "flash_attention_2"
     arg_config = {
         "adam_beta1": 0.9,
         "adam_beta2": 0.999,
@@ -1596,9 +1706,12 @@ def run_sft_openrlhf(spec=None) -> None:
             "grad_norm": progress["grad_norm"],
             "learning_rate": progress["lr"],
         }
-        _w.heartbeat("sft_step", **{key: value for key, value in payload.items() if value is not None})
+        _w.heartbeat(
+            "sft_step", **{key: value for key, value in payload.items() if value is not None}
+        )
 
     def child_heartbeat() -> None:
+        watcher.raise_if_failed()
         _w.heartbeat("sft_step", liveness=True, step=int(progress["step"] or 0))
 
     gpu_sampler = _NvidiaSmiPeakSampler().start()
@@ -1643,7 +1756,9 @@ def run_sft_openrlhf(spec=None) -> None:
         raise RuntimeError("OpenRLHF SFT did not write its final training state") from error
     final_step = int(final_state.get("step") or 0)
     if sft_under_ran(final_step, update_horizon, max_steps):
-        raise RuntimeError(f"sft completed {final_step}/{update_horizon} requested optimizer updates")
+        raise RuntimeError(
+            f"sft completed {final_step}/{update_horizon} requested optimizer updates"
+        )
     if final_step < update_horizon:
         raise RuntimeError(f"sft completed {final_step}/{update_horizon} optimizer updates")
     state_loss_curve = [round(float(value), 4) for value in final_state.get("loss_curve", [])]
@@ -1702,7 +1817,7 @@ def run_sft_openrlhf(spec=None) -> None:
             "gradient_checkpointing_reentrant": reentrant_gradient_checkpointing,
             "configured_max_length": max_length,
             "realized_max_length": realized_max_length,
-            "runtime_max_length": max_length,
+            "runtime_max_length": runtime_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": gradient_accumulation,
             "packing": "unpacked_openrlhf",

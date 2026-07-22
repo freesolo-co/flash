@@ -12,6 +12,9 @@ import pytest
 
 from flash.engine.worker import sft as sft_mod
 from flash.engine.worker.sft_openrlhf import (
+    _attention_implementation,
+    _OpenRLHFCheckpointWatcher,
+    _probe_gpu_in_subprocess,
     _resolve_immutable_model_revision,
     _serialize_multimodal_inputs,
     _training_batch_shape,
@@ -115,6 +118,41 @@ def test_run_sft_rejects_unknown_backend(monkeypatch):
         sft_mod.run_sft()
 
 
+def test_worker_gate_allows_only_openrlhf_sft_adapter_continuation(monkeypatch):
+    import flash.engine.worker as worker
+
+    class ReachedOpenRLHF(BaseException):
+        pass
+
+    monkeypatch.setattr(worker, "RUN_MODE", "sft")
+    monkeypatch.setattr(
+        worker,
+        "JOB_SPEC",
+        SimpleNamespace(train=SimpleNamespace(init_from_adapter="owner/repo:sft/source")),
+    )
+    monkeypatch.setattr(worker, "HF_REPO", "")
+    monkeypatch.setattr(worker, "flush_optional_uploads", lambda: True)
+    monkeypatch.setattr(worker, "error_artifact_name", lambda *args: "error.txt")
+    monkeypatch.setattr(worker, "hf_upload_file", lambda *args: None)
+    monkeypatch.setattr(worker, "_force_fla_triton_gdn_on_sm100", lambda: None)
+    monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
+    monkeypatch.setattr(worker, "_neutralize_tilelang_cudart_stub", lambda: None)
+    monkeypatch.setattr(worker, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
+    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **kwargs: {})
+    monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
+    monkeypatch.setattr(worker, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker, "run_sft", lambda: (_ for _ in ()).throw(ReachedOpenRLHF()))
+
+    monkeypatch.delenv("FLASH_SFT_BACKEND", raising=False)
+    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
+        worker.main()
+
+    monkeypatch.setenv("FLASH_SFT_BACKEND", "openrlhf")
+    with pytest.raises(ReachedOpenRLHF):
+        worker.main()
+
+
 def test_build_sft_openrlhf_args_maps_zero3_lora_gc_and_dataset(tmp_path):
     args = build_sft_openrlhf_args(_arg_config(tmp_path))
 
@@ -128,6 +166,12 @@ def test_build_sft_openrlhf_args_maps_zero3_lora_gc_and_dataset(tmp_path):
     assert "--model.gradient_checkpointing_reentrant" in args
     assert "--ds.lora.target_modules" not in args
     assert args[args.index("--lr_scheduler") + 1] == "linear"
+    assert args[args.index("--adam.betas") + 1 : args.index("--adam.betas") + 3] == [
+        "0.9",
+        "0.999",
+    ]
+    assert args[args.index("--adam.weight_decay") + 1] == "0.0"
+    assert "--train.full_determinism_enable" not in args
     assert "--ckpt.save_hf" in args
     assert "--ckpt.load_enable" not in args
 
@@ -294,6 +338,52 @@ def test_validate_openrlhf_warmstart_adapter_accepts_matching_snapshot_path(tmp_
     )
 
 
+def test_validate_openrlhf_warmstart_adapter_accepts_matching_provenance(tmp_path):
+    revision = "f" * 40
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    (adapter / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": 16,
+                "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
+                "revision": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (adapter / "base_model_provenance.json").write_text(
+        json.dumps(
+            {
+                "model_id": "Qwen/Qwen3.5-0.8B",
+                "requested_revision": None,
+                "resolved_commit": revision,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    validate_openrlhf_warmstart_adapter(
+        str(adapter),
+        model_id="Qwen/Qwen3.5-0.8B",
+        model_revision=revision,
+        expected_rank=16,
+    )
+
+    provenance = json.loads((adapter / "base_model_provenance.json").read_text(encoding="utf-8"))
+    provenance["resolved_commit"] = "0" * 40
+    (adapter / "base_model_provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="revision"):
+        validate_openrlhf_warmstart_adapter(
+            str(adapter),
+            model_id="Qwen/Qwen3.5-0.8B",
+            model_revision=revision,
+            expected_rank=16,
+        )
+
+
 def test_resolve_immutable_model_revision_uses_prefetched_snapshot(monkeypatch):
     import flash.engine.worker.sft_openrlhf as openrlhf_mod
 
@@ -330,6 +420,60 @@ def test_gdn_32k_gate_uses_realized_rows_and_allows_short_rows(monkeypatch):
     _validate_gdn_realized_length("org/gdn", "e" * 40, 2048)
     with pytest.raises(ValueError, match="matched real-GPU validation"):
         _validate_gdn_realized_length("org/gdn", "e" * 40, 32768)
+
+
+def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_path):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    ds_dir = checkpoint_dir / "global_step3"
+    hf_dir = checkpoint_dir / "global_step3_hf"
+    ds_dir.mkdir()
+    hf_dir.mkdir()
+    monkeypatch.setattr(openrlhf_mod, "_export_checkpoint_adapter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        openrlhf_mod._w, "publish_deployable_checkpoint", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        openrlhf_mod._w,
+        "upload_resume_checkpoint",
+        lambda *args, **kwargs: True,
+    )
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(3,),
+    )
+
+    watcher._publish(3, str(ds_dir), str(hf_dir))
+
+    assert 3 in watcher.processed_steps
+    assert (checkpoint_dir / ".flash-required-step-3.done").read_text() == "durable\n"
+
+
+def test_checkpoint_watcher_stop_does_not_impose_upload_timeout(tmp_path):
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(tmp_path),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(),
+    )
+    join_calls = []
+    watcher._thread = SimpleNamespace(
+        join=lambda *args, **kwargs: join_calls.append((args, kwargs))
+    )
+
+    watcher.stop(require_complete=False)
+
+    assert join_calls == [((), {})]
 
 
 def test_openrlhf_child_env_excludes_training_and_provider_secrets(monkeypatch, tmp_path):
@@ -375,7 +519,26 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "FLASH_OPENRLHF_LORAPLUS_READY" in source
     assert "loss_mask[:, 1:]" in source
     assert "loss_mask[:, :-1]" not in source
+    assert 'kwargs["pin_memory"] = True' in source
+    assert "non_blocking=True" in source
+    assert "_install_attention_patch()" in source
+    assert "_wait_for_required_save(args.ckpt.path, global_step)" in source
     assert "falling back" not in source.lower()
+
+
+def test_short_accumulation_window_uses_realized_loss_norm_and_deepspeed_scale(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    namespace = {"__name__": "flash_openrlhf_sft_accumulation_test"}
+    source = render_openrlhf_sft_runtime()
+    exec(compile(source, "runtime.py", "exec"), namespace)
+
+    assert namespace["_accumulation_window_scale"](4, 2) == 2.0
+    assert "masks, dp_group, dp_size, window_size" in source
+    assert '"gpt_loss": step_loss / window_size' in source
 
 
 def test_restored_client_state_reaches_runtime_trainer_state(monkeypatch, tmp_path):
@@ -420,8 +583,8 @@ def test_restored_client_state_reaches_runtime_trainer_state(monkeypatch, tmp_pa
     )
 
     namespace["_install_dataloader_and_scheduler_patches"]()
-    load_path, loaded_states = FakeDeepspeedStrategy().load_ckpt(object(), "/checkpoints")
-    trainer_state = namespace["_resume_training_state"](loaded_states["consumed_samples"])
+    load_path, _loaded_states = FakeDeepspeedStrategy().load_ckpt(object(), "/checkpoints")
+    trainer_state = namespace["_resume_training_state"](0)
 
     assert load_path == "/checkpoints/global_step7"
     assert namespace["CONFIG"]["_resume_states"] == states
@@ -527,6 +690,44 @@ def test_torchrun_sitecustomize_patches_dataset_before_train_sft_import(tmp_path
     assert "FLASH_DATASET_PATCHED_BEFORE_TRAIN_SFT" in result.stdout
 
 
+def test_gpu_probe_uses_configured_openrlhf_interpreter(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                'FLASH_GPU_PROBE={"name":"gpu","memory_gb":80.0,'
+                '"capability":[9,0],"fa2_available":true,"fa3_available":true}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = _probe_gpu_in_subprocess("/opt/openrlhf/bin/python", "H100")
+
+    assert calls[0][0][0] == "/opt/openrlhf/bin/python"
+    assert result["capability"] == [9, 0]
+
+
+def test_attention_implementation_matches_gpu_capability():
+    assert (
+        _attention_implementation(
+            {"capability": [9, 0], "fa2_available": True, "fa3_available": True}
+        )
+        == "flash_attention_3"
+    )
+    assert (
+        _attention_implementation(
+            {"capability": [8, 9], "fa2_available": True, "fa3_available": False}
+        )
+        == "flash_attention_2"
+    )
+    assert _attention_implementation({"capability": [12, 0]}) == "sdpa"
+
+
 def test_training_batch_shape_respects_gpu_and_device_limits():
     micro, accumulation, global_batch = _training_batch_shape(
         row_count=100,
@@ -600,3 +801,40 @@ def test_rendered_dataset_collates_multimodal_tensors(tmp_path, monkeypatch):
     assert loss_mask.tolist() == [[0.0, 1.0, 1.0], [0.0, 1.0, 0.0]]
     assert mm_inputs["pixel_values"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
     assert mm_inputs["image_grid_thw"].tolist() == [[1, 2, 3], [4, 5, 6]]
+
+
+@requires_torch
+def test_rendered_dataset_collates_mixed_text_and_image_rows(tmp_path, monkeypatch):
+    import numpy as np
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    namespace = {"__name__": "flash_openrlhf_sft_mixed_multimodal_test"}
+    exec(compile(render_openrlhf_sft_runtime(), "runtime.py", "exec"), namespace)
+    dataset_class = namespace["FlashTokenizedSFTDataset"]
+    rows = [
+        {"input_ids": [1, 2], "loss_mask": [0, 1], "multimodal_inputs": b""},
+        {
+            "input_ids": [3, 4, 5],
+            "loss_mask": [0, 1, 1],
+            "multimodal_inputs": _serialize_multimodal_inputs(
+                {
+                    "pixel_values": np.array([[1.0, 2.0]], dtype=np.float32),
+                    "image_grid_thw": np.array([[1, 2, 3]], dtype=np.int64),
+                }
+            ),
+        },
+        {"input_ids": [6], "loss_mask": [1], "multimodal_inputs": b""},
+    ]
+    dataset = dataset_class(rows, SimpleNamespace(pad_token_id=0), 8, strategy=object())
+
+    inputs, attention, loss_mask, mm_inputs = dataset.collate_fn(
+        [dataset[0], dataset[1], dataset[2]]
+    )
+
+    assert inputs.tolist() == [[1, 2, 0], [3, 4, 5], [6, 0, 0]]
+    assert attention.tolist() == [[1, 1, 0], [1, 1, 1], [1, 0, 0]]
+    assert loss_mask.tolist() == [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
+    assert mm_inputs["pixel_values"].tolist() == [[1.0, 2.0]]
+    assert mm_inputs["image_grid_thw"].tolist() == [[1, 2, 3]]
