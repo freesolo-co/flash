@@ -241,7 +241,6 @@ def test_models_table(fake_client, capsys) -> None:
     assert "Qwen/Qwen3.5-9B" in out
     assert "Qwen/Qwen3.6-27B" in out
     assert "Qwen/Qwen3.5-2B" in out
-    assert "openbmb/MiniCPM5-1B" in out
     # only bare model ids, none of the extra per-model detail columns
     assert "2.3B" not in out
     assert "dense" not in out

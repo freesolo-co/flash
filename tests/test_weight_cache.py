@@ -691,7 +691,6 @@ def test_fits_weight_cache_is_size_based():
     assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-27B"])
     assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])
     for mid in (
-        "openbmb/MiniCPM5-1B",
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",

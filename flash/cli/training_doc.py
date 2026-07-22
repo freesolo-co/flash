@@ -472,7 +472,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
   Arbitrary bring-your-own teacher models or keys are not supported (the allow-list is curated to
   teachers verified to echo-score the student's tokens). The key is never stored in the spec or needed
   at serving time; teacher token cost varies by model and is shown in the pre-flight estimate.
-- **The student (Qwen / MiniCPM) and the teacher have different tokenizers.** Flash
+- **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai *spider* / Tinker
   method): it aligns the two tokenizations by shared decoded-text spans and applies per-span reverse
   KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly

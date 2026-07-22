@@ -185,12 +185,12 @@ def test_grpo_use_reentrant_true_for_gdn_hybrid():
 
 
 def test_grpo_use_reentrant_false_for_non_gdn_dense():
-    # Non-GDN dense models (MiniCPM = plain Llama attention) keep the faster non-reentrant path:
-    # standard transformer layers recompute deterministically, no metadata divergence.
+    # uncataloged non-gdn dense models keep the faster non-reentrant path because standard
+    # transformer layers recompute deterministically without metadata divergence.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    assert grpo_use_reentrant("openbmb/MiniCPM5-1B") is False
-    # An uncataloged / open non-Qwen model is treated as non-GDN dense (null-safe, no crash).
+    assert grpo_use_reentrant("meta-llama/Llama-3.2-1B") is False
+    # an uncataloged open non-qwen model is treated as non-gdn dense (null-safe, no crash).
     assert grpo_use_reentrant("some/uncataloged-open-model") is False
 
 

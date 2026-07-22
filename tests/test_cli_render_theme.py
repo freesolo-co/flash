@@ -49,7 +49,7 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
     # plain output is bare model ids, one per line, with no themed header or detail columns
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "supported base models" not in out
-    assert all(line in out for line in ("Qwen/Qwen3.5-9B", "openbmb/MiniCPM5-1B"))
+    assert "Qwen/Qwen3.5-9B" in out
     assert "\t" not in out
 
     assert cli.main(["status", "flash-1"]) == 0

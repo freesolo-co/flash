@@ -82,7 +82,7 @@ def test_is_vl_checkpoint_qwen35(monkeypatch):
 def test_is_vl_checkpoint_text_model(monkeypatch):
     worker = _import_worker(monkeypatch)
     _fake_transformers(monkeypatch, "llama")
-    assert worker.is_vl_checkpoint("openbmb/MiniCPM5-1B") is False
+    assert worker.is_vl_checkpoint("meta-llama/Llama-3.2-1B") is False
 
 
 @pytest.mark.parametrize(
@@ -710,18 +710,18 @@ def test_liger_default_model_size_gate(monkeypatch):
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
-    assert w._liger_default_for_model("openbmb/MiniCPM5-1B") is False
+    assert w._liger_default_for_model("meta-llama/Llama-3.2-1B") is False
     # grad checkpointing follows the same small=speed(off) / large=memory(on) principle
-    assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B") is False
+    assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B") is False
     fake_cfg(big)
     assert w._liger_default_for_model("Qwen/Qwen3-4B") is True
     assert w.grad_checkpointing_on("Qwen/Qwen3-4B") is True
     # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
     # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).
     fake_cfg(small)
-    assert w._memory_mode("openbmb/MiniCPM5-1B", 512) is False
-    assert w._memory_mode("openbmb/MiniCPM5-1B", 4096) is True
-    assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
+    assert w._memory_mode("meta-llama/Llama-3.2-1B", 512) is False
+    assert w._memory_mode("meta-llama/Llama-3.2-1B", 4096) is True
+    assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B", 4096) is True
 
 
 def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
@@ -789,9 +789,9 @@ def test_prepare_fresh_lora_base_keeps_non_vl_path(monkeypatch):
 
     assert (
         adapter_mod.prepare_fresh_lora_base(
-            "openbmb/MiniCPM5-1B", "openbmb/MiniCPM5-1B", {}, phase="sft"
+            "meta-llama/Llama-3.2-1B", "meta-llama/Llama-3.2-1B", {}, phase="sft"
         )
-        == "openbmb/MiniCPM5-1B"
+        == "meta-llama/Llama-3.2-1B"
     )
 
 

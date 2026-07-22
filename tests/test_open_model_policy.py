@@ -20,13 +20,6 @@ def test_catalog_model_resolves_normally():
     assert info.id == "Qwen/Qwen3.5-4B"
 
 
-def test_minicpm5_in_catalog():
-    info = resolve_model("openbmb/MiniCPM5-1B", "grpo", policy="catalog")
-    assert info.recommended_gpu == "RTX 4090"
-    assert "grpo" in info.algos
-    assert "sft" in info.algos
-
-
 def test_allow_policy_accepts_fitting_model(monkeypatch):
     monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.2, raising=True)
     info = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
