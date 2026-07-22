@@ -1,0 +1,611 @@
+"""cpu coverage for the OpenRLHF OPD core."""
+
+from __future__ import annotations
+
+import functools
+import importlib.util
+import json
+import os
+import sys
+import types
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from flash.engine.worker import opd, opd_openrlhf
+from flash.engine.worker.opd import _gkd_loss_from_logps
+from flash.engine.worker.teacher import TeacherError, TeacherToken
+
+requires_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None,
+    reason="torch is unavailable in offline CI",
+)
+
+
+def _value(args: list[str], flag: str) -> str:
+    index = args.index(flag)
+    return args[index + 1]
+
+
+def _config(**overrides) -> opd_openrlhf.OpenRLHFOPDConfig:
+    values = {
+        "model_path": "/cache/models--Qwen--Qwen3.5-0.8B/snapshots/" + "a" * 40,
+        "dataset_path": "/work/train.jsonl",
+        "teacher_url": "http://127.0.0.1:1234/teacher/token",
+        "output_dir": "/work/final",
+        "checkpoint_dir": "/work/checkpoints",
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_revision": "a" * 40,
+        "max_length": 4096,
+        "max_completion": 320,
+        "prompts_per_step": 16,
+        "group_size": 8,
+        "scheduled_prompt_count": 48,
+        "learning_rate": 1e-5,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "seed": 42,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "lora_target_modules": ("all-linear",),
+        "kl_penalty_coef": 0.3,
+        "save_every": 20,
+        "gpu_count": 2,
+        "qwen35_language_model_only": True,
+    }
+    values.update(overrides)
+    return opd_openrlhf.OpenRLHFOPDConfig(**values)
+
+
+class _Tokenizer:
+    eos_token_id = 2
+
+    def decode(self, token_ids, *, skip_special_tokens):
+        pieces = {10: "P", 11: ":", 20: "a", 21: "b", 2: "" if skip_special_tokens else "</s>"}
+        return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+
+class _Teacher:
+    def score(self, prompt, completion):
+        assert prompt == "User: question\nAssistant: "
+        assert completion == "ab"
+        return [
+            TeacherToken(text="a", logprob=-0.2, start=0, end=1),
+            TeacherToken(text="b", logprob=-0.4, start=1, end=2),
+        ]
+
+
+@requires_torch
+def test_reverse_kl_value_and_gradients_match_trl_reference():
+    torch = pytest.importorskip("torch")
+    student = torch.tensor(
+        [[-0.2, -0.7, -1.1, -0.3], [-0.4, -0.8, -0.2, -0.9]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    group_ids = torch.tensor([[0, 0, 1, -1], [0, 1, 1, 1]], dtype=torch.long)
+    teacher_logsums = torch.tensor(
+        [[-1.4, -1.4, -0.6, 0.0], [-0.7, -2.1, -2.1, -2.1]],
+        dtype=torch.float64,
+    )
+    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1]], dtype=torch.bool)
+    coefficient = 0.37
+
+    actual = opd_openrlhf.flash_groupwise_reverse_kl(
+        student,
+        teacher_logsums,
+        group_ids,
+        mask,
+        coefficient,
+    )
+    actual_grad = torch.autograd.grad(actual, student, retain_graph=True)[0]
+
+    row0 = _gkd_loss_from_logps(
+        student[0],
+        [([0, 1], -1.4), ([2], -0.6)],
+        kl_coef=coefficient,
+    )
+    row1 = _gkd_loss_from_logps(
+        student[1],
+        [([0], -0.7), ([1, 2, 3], -2.1)],
+        kl_coef=coefficient,
+    )
+    expected = (row0 + row1) / 2
+    expected_grad = torch.autograd.grad(expected, student)[0]
+
+    assert actual.item() == pytest.approx(expected.item(), abs=1e-12)
+    assert torch.allclose(actual_grad, expected_grad, atol=1e-12, rtol=0)
+
+
+@requires_torch
+def test_reverse_kl_excludes_empty_signal_rows_from_sequence_mean():
+    torch = pytest.importorskip("torch")
+    student = torch.tensor([[-0.2, -0.7], [-0.3, -0.4]], dtype=torch.float64, requires_grad=True)
+    group_ids = torch.tensor([[0, 0], [-1, -1]])
+    teacher = torch.tensor([[-1.5, -1.5], [0.0, 0.0]], dtype=torch.float64)
+    mask = torch.ones_like(group_ids, dtype=torch.bool)
+
+    actual = opd_openrlhf.flash_groupwise_reverse_kl(student, teacher, group_ids, mask, 1.0)
+    expected = _gkd_loss_from_logps(student[0], [([0, 1], -1.5)], kl_coef=1.0)
+
+    assert actual.item() == pytest.approx(expected.item(), abs=1e-12)
+
+
+def test_deterministic_rollout_seed_uses_full_identity_and_retry():
+    base = opd_openrlhf.deterministic_rollout_seed(42, 3, 7, 2)
+
+    assert base == opd_openrlhf.deterministic_rollout_seed(42, 3, 7, 2)
+    assert base != opd_openrlhf.deterministic_rollout_seed(42, 4, 7, 2)
+    assert base != opd_openrlhf.deterministic_rollout_seed(42, 3, 8, 2)
+    assert base != opd_openrlhf.deterministic_rollout_seed(42, 3, 7, 3)
+    assert base != opd_openrlhf.deterministic_rollout_seed(42, 3, 7, 2, no_signal_attempt_ordinal=1)
+
+
+def test_teacher_bridge_round_trip_returns_aligned_action_tensors():
+    prompt = opd_openrlhf._PromptRecord(
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=(10, 11),
+        rendered="P:",
+    )
+    identity = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 1,
+            "no_signal_attempt": 0,
+        }
+    )
+    with opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_Tokenizer(),
+        teacher=_Teacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        token="test-token",
+    ) as bridge:
+        result = opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {
+                "label": identity,
+                "prompt_length": 2,
+                "sequence_ids": [10, 11, 20, 21, 2],
+            },
+        )
+
+    assert result["rewards"] == 0.0
+    assert result["scores"] == 0.0
+    assert result["teacher_group_ids"] == [-1, 0, 1, -1]
+    assert result["teacher_logsums"] == [0.0, -0.2, -0.4, 0.0]
+    assert result["teacher_signal_mask"] == [False, True, True, False]
+    assert result["signal_count"] == 2
+    assert bridge.snapshot()["teacher_ok"] == 1
+
+
+@pytest.mark.parametrize(
+    ("permanent", "classification"),
+    [(True, "permanent"), (False, "transient")],
+)
+def test_teacher_bridge_preserves_typed_teacher_error_classification(permanent, classification):
+    class _FailingTeacher:
+        def score(self, _prompt, _completion):
+            raise TeacherError("teacher unavailable", permanent=permanent)
+
+    prompt = opd_openrlhf._PromptRecord(
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=(10, 11),
+        rendered="P:",
+    )
+    identity = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 0,
+            "no_signal_attempt": 0,
+        }
+    )
+    with (
+        opd_openrlhf.TeacherAlignmentBridge(
+            prompts=[prompt],
+            tokenizer=_Tokenizer(),
+            teacher=_FailingTeacher(),
+            thinking_prefill="",
+            eos_token_ids=frozenset({2}),
+            stop_sequences=(),
+        ) as bridge,
+        pytest.raises(opd_openrlhf.OpenRLHFTeacherBridgeError) as error,
+    ):
+        opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {
+                "label": identity,
+                "prompt_length": 2,
+                "sequence_ids": [10, 11, 20, 21, 2],
+            },
+        )
+
+    assert error.value.classification == classification
+    assert bridge.teacher_failure == (classification, "teacher unavailable")
+
+
+def test_teacher_bridge_fails_closed_on_prompt_identity_mismatch():
+    prompt = opd_openrlhf._PromptRecord(
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=(10, 11),
+        rendered="P:",
+    )
+    identity = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 0,
+            "no_signal_attempt": 0,
+        }
+    )
+    with (
+        opd_openrlhf.TeacherAlignmentBridge(
+            prompts=[prompt],
+            tokenizer=_Tokenizer(),
+            teacher=_Teacher(),
+            thinking_prefill="",
+            eos_token_ids=frozenset({2}),
+            stop_sequences=(),
+        ) as bridge,
+        pytest.raises(opd_openrlhf.OpenRLHFTeacherBridgeError) as error,
+    ):
+        opd_openrlhf.post_teacher_request(
+            bridge.url,
+            {
+                "label": identity,
+                "prompt_length": 2,
+                "sequence_ids": [10, 99, 20, 21, 2],
+            },
+        )
+
+    assert error.value.classification == "permanent"
+
+
+def test_teacher_bridge_mutation_callback_is_idempotent():
+    calls = []
+    prompt = opd_openrlhf._PromptRecord(messages=[], prompt_ids=(10,), rendered="P")
+    with opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_Tokenizer(),
+        teacher=_Teacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        mutation_callback=lambda: calls.append(True),
+    ) as bridge:
+        assert opd_openrlhf.post_teacher_request(bridge.url, {"mutation": True}) == {"ok": True}
+        assert opd_openrlhf.post_teacher_request(bridge.url, {"mutation": True}) == {"ok": True}
+
+    assert calls == [True]
+
+
+def test_checkpoint_state_is_valid_full_resume_sidecar():
+    state = opd_openrlhf._checkpoint_state(
+        step=2,
+        seed=42,
+        prompt_pool_fingerprint="a" * 64,
+        prompts_per_step=3,
+        group_size=4,
+        accounting={
+            "generated_tokens": 20,
+            "teacher_input_tokens": 40,
+            "truncated_rollouts": 1,
+            "aligned_sequences": 18,
+            "empty_alignments": 2,
+            "coverage_sum": 15.0,
+            "teacher_ok": 18,
+            "teacher_transient": 1,
+            "teacher_error": 0,
+            "samples_seen": 20,
+            "no_signal_resamples": 2,
+        },
+        loss_curve=[0.4, 0.3],
+        coverage_curve=[0.7, 0.8],
+        train_wall_seconds=12.5,
+    )
+
+    assert state["opt_steps"] == 2
+    assert state["rollout_seed_ordinal"] == 24
+    assert state["loss_curve"] == [0.4, 0.3]
+    assert state["coverage_curve"] == [0.7, 0.8]
+    assert state["skip_counts"] == {"empty_alignment": 2}
+
+
+def test_teacher_bridge_runs_checkpoint_callback_before_reply():
+    calls = []
+    prompt = opd_openrlhf._PromptRecord(messages=[], prompt_ids=(10,), rendered="P")
+    with opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[prompt],
+        tokenizer=_Tokenizer(),
+        teacher=_Teacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        checkpoint_callback=lambda step: calls.append(step),
+    ) as bridge:
+        assert opd_openrlhf.post_teacher_request(bridge.url, {"checkpoint": 3}) == {"ok": True}
+
+    assert calls == [3]
+
+
+def test_warmstart_config_preserves_source_lora_shape(tmp_path):
+    tmp_path.joinpath("adapter_config.json").write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 32,
+                "target_modules": ["q_proj", "v_proj"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert opd_openrlhf._warmstart_config(str(tmp_path), "Qwen/Qwen3.5-0.8B") == (
+        16,
+        32,
+        ("q_proj", "v_proj"),
+    )
+
+
+def test_scheduled_dataset_carries_stable_step_and_example_identity(tmp_path):
+    prompts = [
+        opd_openrlhf._PromptRecord(messages=[], prompt_ids=(1,), rendered="one"),
+        opd_openrlhf._PromptRecord(messages=[], prompt_ids=(2,), rendered="two"),
+    ]
+    path = tmp_path / "train.jsonl"
+
+    count = opd_openrlhf._write_scheduled_dataset(
+        str(path),
+        prompts,
+        steps=2,
+        prompts_per_step=2,
+    )
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    identities = [json.loads(row["label"]) for row in rows]
+
+    assert count == 4
+    assert [row["input"] for row in rows] == ["one", "two", "one", "two"]
+    assert identities == [
+        {"example_index": 0, "global_step": 0, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 1, "global_step": 0, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 0, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 1, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 0},
+    ]
+
+
+def test_build_openrlhf_opd_args_maps_distillation_job():
+    args = opd_openrlhf.build_openrlhf_opd_args(_config())
+
+    assert _value(args, "--actor.model_name_or_path").endswith("/" + "a" * 40)
+    assert _value(args, "--reward.remote_url").startswith("http://127.0.0.1:")
+    assert _value(args, "--data.input_key") == "input"
+    assert _value(args, "--data.label_key") == "label"
+    assert _value(args, "--rollout.max_new_tokens") == "320"
+    assert _value(args, "--rollout.batch_size") == "16"
+    assert _value(args, "--rollout.n_samples_per_prompt") == "8"
+    assert _value(args, "--train.batch_size") == "128"
+    assert _value(args, "--algo.advantage.estimator") == "reinforce"
+    assert _value(args, "--algo.kl.init_coef") == "0.0"
+    assert _value(args, "--actor.adam.lr") == "1e-05"
+    assert _value(args, "--ds.lora.rank") == "32"
+    assert _value(args, "--ds.lora.alpha") == "64"
+    assert _value(args, "--ds.lora.target_modules") == "all-linear"
+    assert "--actor.gradient_checkpointing_reentrant" in args
+    assert "--ds.attn_implementation" in args
+    assert "--train.colocate_all" in args
+
+
+def test_build_openrlhf_opd_args_enables_native_resume():
+    args = opd_openrlhf.build_openrlhf_opd_args(replace(_config(), resume=True))
+
+    assert "--ckpt.load_enable" in args
+
+
+def test_build_openrlhf_opd_args_rejects_nonpositive_objective_scale():
+    with pytest.raises(ValueError, match="kl_penalty_coef must be positive"):
+        opd_openrlhf.build_openrlhf_opd_args(_config(kl_penalty_coef=0.0))
+
+
+def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("NCCL_DEBUG", "WARN")
+    monkeypatch.setenv("FIREWORKS_API_KEY", "do-not-forward")
+    monkeypatch.setenv("RUNPOD_API_KEY", "do-not-forward")
+    monkeypatch.setenv("HF_TOKEN", "do-not-forward")
+
+    child = opd_openrlhf.build_openrlhf_opd_child_env(
+        plugin_dir="/work/plugin",
+        max_response_length=320,
+        language_model_only=True,
+        bridge_url="http://127.0.0.1:1234/teacher/token",
+        kl_penalty_coef=0.3,
+        seed=42,
+        stop_sequences=("</answer>",),
+        eos_token_ids=frozenset({2, 3}),
+        warmstart_adapter="/work/warmstart",
+    )
+
+    assert child["PATH"] == "/usr/bin"
+    assert child["NCCL_DEBUG"] == "WARN"
+    assert child["FLASH_OPENRLHF_OPD_KL_COEF"] == "0.3"
+    assert child["FLASH_OPENRLHF_OPD_SEED"] == "42"
+    assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/warmstart"
+    assert json.loads(child["FLASH_OPENRLHF_OPD_STOP_SEQUENCES"]) == ["</answer>"]
+    assert json.loads(child["FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS"]) == [2, 3]
+    assert "FIREWORKS_API_KEY" not in child
+    assert "RUNPOD_API_KEY" not in child
+    assert "HF_TOKEN" not in child
+
+
+@requires_torch
+def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    class _ActorPPOTrainer:
+        pass
+
+    class _Actor:
+        def __init__(self, *_args, **_kwargs):
+            self.model = SimpleNamespace()
+
+    class _SingleTurnAgentExecutor:
+        def __init__(self, _remote=None):
+            pass
+
+    class _SamplesGenerator:
+        pass
+
+    class _ExperienceMaker:
+        pass
+
+    class _BasePPOTrainer:
+        def save_logs_and_checkpoints(self, _global_step, logs_dict=None, client_states=None):
+            return None
+
+    modules = {
+        "openrlhf": types.ModuleType("openrlhf"),
+        "openrlhf.utils": types.ModuleType("openrlhf.utils"),
+        "openrlhf.utils.agent": types.ModuleType("openrlhf.utils.agent"),
+        "openrlhf.trainer": types.ModuleType("openrlhf.trainer"),
+        "openrlhf.trainer.ppo_trainer": types.ModuleType("openrlhf.trainer.ppo_trainer"),
+        "openrlhf.trainer.ppo_utils": types.ModuleType("openrlhf.trainer.ppo_utils"),
+        "openrlhf.trainer.ppo_utils.samples_generator": types.ModuleType(
+            "openrlhf.trainer.ppo_utils.samples_generator"
+        ),
+        "openrlhf.trainer.ppo_utils.experience_maker": types.ModuleType(
+            "openrlhf.trainer.ppo_utils.experience_maker"
+        ),
+    }
+    modules["openrlhf"].__path__ = []
+    modules["openrlhf.utils"].__path__ = []
+    modules["openrlhf.trainer"].__path__ = []
+    modules["openrlhf.trainer.ppo_utils"].__path__ = []
+    modules["openrlhf.utils.agent"].SingleTurnAgentExecutor = _SingleTurnAgentExecutor
+    modules["openrlhf.trainer.ppo_trainer"].BasePPOTrainer = _BasePPOTrainer
+    modules["openrlhf.trainer.ppo_utils.samples_generator"].SamplesGenerator = _SamplesGenerator
+    modules["openrlhf.trainer.ppo_utils.experience_maker"].RemoteExperienceMaker = _ExperienceMaker
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_BRIDGE_URL", "http://127.0.0.1:1/teacher")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_KL_COEF", "0.37")
+    monkeypatch.setenv("FLASH_OPENRLHF_OPD_SEED", "42")
+    namespace = {
+        "__name__": "sitecustomize",
+        "__file__": "sitecustomize.py",
+        "os": os,
+        "functools": functools,
+        "_ActorPPOTrainer": _ActorPPOTrainer,
+        "_Actor": _Actor,
+        "_original_execute": lambda *_args, **_kwargs: None,
+        "_original_process_response": lambda *_args, **_kwargs: None,
+    }
+    exec(
+        compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
+        namespace,
+    )
+    namespace["_flash_post_teacher"] = lambda _payload: {"ok": True}
+
+    student = torch.tensor(
+        [[-0.2, -0.7, -1.1], [-0.4, -0.8, -0.2]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    group_ids = torch.tensor([[0, 0, 1], [0, 1, 1]], dtype=torch.long)
+    teacher_logsums = torch.tensor(
+        [[-1.4, -1.4, -0.6], [-0.7, -1.8, -1.8]],
+        dtype=torch.float64,
+    )
+    signal_mask = torch.ones_like(group_ids, dtype=torch.bool)
+
+    class _ActorModel:
+        def train(self):
+            return None
+
+        def __call__(self, *_args, **_kwargs):
+            return student, SimpleNamespace()
+
+    class _Strategy:
+        ring_attn_group = None
+
+        def backward(self, loss, *_args):
+            self.loss = loss
+
+        def optimizer_step(self, *_args, **_kwargs):
+            return None
+
+        def get_grad_norm(self, _actor):
+            return torch.tensor(0.0)
+
+    trainer = _ActorPPOTrainer()
+    trainer.actor = _ActorModel()
+    trainer.actor_optim = object()
+    trainer.actor_scheduler = SimpleNamespace(get_last_lr=lambda: [1e-5])
+    trainer.strategy = _Strategy()
+    experience = SimpleNamespace(
+        sequences=torch.ones((2, 4), dtype=torch.long),
+        attention_mask=torch.ones((2, 4), dtype=torch.long),
+        action_mask=torch.ones((2, 3), dtype=torch.bool),
+        info={
+            "flash_teacher_group_ids": group_ids,
+            "flash_teacher_logsums": teacher_logsums,
+            "flash_teacher_signal_mask": signal_mask,
+            "teacher_coverage": torch.tensor([1.0, 1.0]),
+        },
+    )
+
+    status = trainer.training_step(experience, 0.0, 0)
+    expected = opd_openrlhf.flash_groupwise_reverse_kl(
+        student,
+        teacher_logsums,
+        group_ids,
+        signal_mask,
+        0.37,
+    )
+
+    assert trainer.strategy.loss.item() == pytest.approx(expected.item(), abs=1e-12)
+    assert status["metrics"]["distillation_loss"].item() == pytest.approx(
+        expected.item(), abs=1e-12
+    )
+    expected_grad = torch.autograd.grad(expected, student, retain_graph=True)[0]
+    actual_grad = torch.autograd.grad(trainer.strategy.loss, student)[0]
+    assert torch.allclose(actual_grad, expected_grad, atol=1e-12, rtol=0)
+
+
+def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
+    source = opd_openrlhf._sitecustomize_source()
+
+    compile(source, "sitecustomize.py", "exec")
+    assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
+    assert "student_logprobs[row][group_mask].detach().sum()" in source
+    assert "torch.stack(row_losses).mean()" in source
+    assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source
+    assert "_FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch" in source
+    assert (
+        "_FlashBasePPOTrainer.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints"
+        in source
+    )
+    assert "FLASH_OPENRLHF_WARMSTART_ADAPTER" in source
+    assert "FIREWORKS_API_KEY" not in source
+
+
+def test_run_opd_dispatches_to_openrlhf(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FLASH_RL_BACKEND", "openrlhf")
+    monkeypatch.setattr(opd_openrlhf, "run_opd_openrlhf", lambda: calls.append(True))
+
+    opd.run_opd()
+
+    assert calls == [True]
+
+
+def test_run_opd_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setenv("FLASH_RL_BACKEND", "unknown")
+
+    with pytest.raises(RuntimeError, match="not a known opd backend"):
+        opd.run_opd()

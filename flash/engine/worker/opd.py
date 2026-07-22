@@ -530,6 +530,19 @@ def _format_skip_counts(counts: Counter[str]) -> str:
 
 
 def run_opd():
+    # private backend selector; the default trl body below remains unchanged.
+    backend = os.environ.get("FLASH_RL_BACKEND", "trl").strip().lower()
+    if backend == "openrlhf":
+        from flash.engine.worker.opd_openrlhf import run_opd_openrlhf
+
+        run_opd_openrlhf()
+        return
+    if backend != "trl":
+        raise RuntimeError(
+            f"FLASH_RL_BACKEND={backend!r} is not a known opd backend "
+            "(expected 'trl' or 'openrlhf')"
+        )
+
     import torch
 
     from flash.engine.worker.hf import load_tokenizer, model_revision_kwargs
