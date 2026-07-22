@@ -63,6 +63,7 @@ def grad_checkpointing_on(
         batch=per_device_bs or 4,
         lora_rank=lora_rank,
         quant=(getattr(info, "quant", "bf16") or "bf16") if info else "bf16",
+        model_info=info,
     ):
         print(
             f"[sft] gradient checkpointing OFF: GC-off peak fits {card_vram_gb:.0f} GB "
@@ -197,6 +198,7 @@ def grpo_sleep_mode(
                 thinking=thinking,
                 card_vram_gb=card_vram_gb,
                 fp8_kv=fp8_kv,
+                revision=revision,
             )
         except Exception as e:
             print("[rl] grpo sleep-mode resident check skipped:", e)
