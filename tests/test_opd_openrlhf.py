@@ -1020,8 +1020,10 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert _value(args, "--ds.lora.rank") == "32"
     assert _value(args, "--ds.lora.alpha") == "64"
     assert _value(args, "--ds.lora.target_modules") == "all-linear"
+    assert _value(args, "--ds.ring_attn_size") == "1"
     assert "--actor.gradient_checkpointing_reentrant" in args
-    assert "--ds.attn_implementation" in args
+    assert "--ds.attn_implementation" not in args
+    assert "--vllm.enforce_eager" in args
     assert "--train.colocate_all" in args
 
 
@@ -1266,24 +1268,33 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     )
     namespace["_flash_post_teacher"] = lambda _payload: {"ok": True}
 
-    student = torch.tensor(
-        [[-0.2, -0.7, -1.1], [-0.4, -0.8, -0.2]],
-        dtype=torch.float64,
-        requires_grad=True,
-    )
-    group_ids = torch.tensor([[0, 0, 1], [0, 1, 1]], dtype=torch.long)
-    teacher_logsums = torch.tensor(
-        [[-1.4, -1.4, -0.6], [-0.7, -1.8, -1.8]],
-        dtype=torch.float64,
-    )
-    signal_mask = torch.ones_like(group_ids, dtype=torch.bool)
+    class _TinyCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(13, 5)
+            self.body = torch.nn.Linear(5, 5)
+            self.lm_head = torch.nn.Linear(5, 13, bias=False)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, input_ids, attention_mask=None, position_ids=None):
+            del attention_mask, position_ids
+            hidden_states = torch.tanh(self.body(self.embed(input_ids)))
+            return {"logits": self.lm_head(hidden_states)}
 
     class _ActorModel:
-        def train(self):
-            return None
+        is_vlm = False
+        temperature = 0.7
 
-        def __call__(self, *_args, **_kwargs):
-            return student, SimpleNamespace()
+        def __init__(self, model):
+            self.model = model
+
+        def train(self):
+            self.model.train()
 
     class _Strategy:
         ring_attn_group = None
@@ -1297,15 +1308,88 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         def get_grad_norm(self, _actor):
             return torch.tensor(0.0)
 
+    torch.manual_seed(7)
+    reference_model = _TinyCausalLM()
+    initial_state = reference_model.state_dict()
+    sequences = torch.tensor(
+        [[1, 2, 3, 4, 5, 6], [1, 7, 8, 9, 0, 0]],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]],
+        dtype=torch.long,
+    )
+    action_mask = torch.tensor(
+        [[0, 0, 1, 1, 1], [0, 1, 1, 0, 0]],
+        dtype=torch.bool,
+    )
+    group_ids = torch.tensor(
+        [[-1, -1, 0, 0, 1], [-1, 0, 1, -1, -1]],
+        dtype=torch.long,
+    )
+    teacher_logsums = torch.tensor(
+        [[0.0, 0.0, -1.4, -1.4, -0.6], [0.0, -0.7, -1.8, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    signal_mask = group_ids.ge(0)
+
+    hidden_states = torch.tanh(reference_model.body(reference_model.embed(sequences)))
+    full_logits = reference_model.lm_head(hidden_states[:, :-1]).float()
+    full_logits.div_(0.7)
+    full_logps = -torch.nn.functional.cross_entropy(
+        full_logits.flatten(0, 1),
+        sequences[:, 1:].flatten(),
+        reduction="none",
+    ).view_as(action_mask)
+    reference_logps = full_logps * action_mask.float()
+    expected = opd_openrlhf.flash_groupwise_reverse_kl(
+        reference_logps,
+        teacher_logsums,
+        group_ids,
+        action_mask & signal_mask,
+        0.37,
+    )
+    expected_grads = torch.autograd.grad(
+        expected,
+        tuple(reference_model.parameters()),
+        retain_graph=True,
+    )
+
+    for chunk_size in (1, 2, 256):
+        chunked_model = _TinyCausalLM()
+        chunked_model.load_state_dict(initial_state)
+        chunked_actor = _ActorModel(chunked_model)
+        chunked_logps = namespace["_flash_chunked_action_log_probs"](
+            chunked_actor,
+            sequences,
+            action_mask,
+            attention_mask,
+            chunk_size=chunk_size,
+        )
+        chunked_loss = namespace["_flash_reverse_kl"](
+            chunked_logps,
+            teacher_logsums,
+            group_ids,
+            action_mask & signal_mask,
+        )[0]
+        chunked_grads = torch.autograd.grad(chunked_loss, tuple(chunked_model.parameters()))
+
+        assert torch.allclose(chunked_logps, reference_logps, atol=1e-6, rtol=0)
+        assert chunked_loss.item() == pytest.approx(expected.item(), abs=1e-6)
+        for actual_grad, expected_grad in zip(chunked_grads, expected_grads, strict=True):
+            assert torch.allclose(actual_grad, expected_grad, atol=1e-6, rtol=0)
+
+    training_model = _TinyCausalLM()
+    training_model.load_state_dict(initial_state)
     trainer = _ActorPPOTrainer()
-    trainer.actor = _ActorModel()
+    trainer.actor = _ActorModel(training_model)
     trainer.actor_optim = object()
     trainer.actor_scheduler = SimpleNamespace(get_last_lr=lambda: [1e-5])
     trainer.strategy = _Strategy()
     experience = SimpleNamespace(
-        sequences=torch.ones((2, 4), dtype=torch.long),
-        attention_mask=torch.ones((2, 4), dtype=torch.long),
-        action_mask=torch.ones((2, 3), dtype=torch.bool),
+        sequences=sequences,
+        attention_mask=attention_mask,
+        action_mask=action_mask,
         info={
             "flash_teacher_group_ids": group_ids,
             "flash_teacher_logsums": teacher_logsums,
@@ -1315,21 +1399,16 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     )
 
     status = trainer.training_step(experience, 0.0, 0)
-    expected = opd_openrlhf.flash_groupwise_reverse_kl(
-        student,
-        teacher_logsums,
-        group_ids,
-        signal_mask,
-        0.37,
+    training_grads = torch.autograd.grad(
+        trainer.strategy.loss,
+        tuple(training_model.parameters()),
     )
 
-    assert trainer.strategy.loss.item() == pytest.approx(expected.item(), abs=1e-12)
-    assert status["metrics"]["distillation_loss"].item() == pytest.approx(
-        expected.item(), abs=1e-12
-    )
-    expected_grad = torch.autograd.grad(expected, student, retain_graph=True)[0]
-    actual_grad = torch.autograd.grad(trainer.strategy.loss, student)[0]
-    assert torch.allclose(actual_grad, expected_grad, atol=1e-12, rtol=0)
+    assert trainer.strategy.loss.item() == pytest.approx(expected.item(), abs=1e-6)
+    assert status["metrics"]["distillation_loss"].item() == pytest.approx(expected.item(), abs=1e-6)
+    assert status["num_action_tokens"] == 5.0
+    for actual_grad, expected_grad in zip(training_grads, expected_grads, strict=True):
+        assert torch.allclose(actual_grad, expected_grad, atol=1e-6, rtol=0)
 
 
 def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
@@ -1337,6 +1416,9 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
 
     compile(source, "sitecustomize.py", "exec")
     assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
+    assert "action_log_probs = _flash_chunked_action_log_probs(" in source
+    assert "checkpoint(" in source
+    assert "hidden_states[response_mask]" in source
     assert "student_logprobs[row][group_mask].detach().sum()" in source
     assert "torch.stack(row_losses).mean()" in source
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source

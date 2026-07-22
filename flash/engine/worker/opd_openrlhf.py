@@ -629,6 +629,8 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         "0.0",
         "--ds.zero_stage",
         "3",
+        "--ds.ring_attn_size",
+        "1",
         "--ds.param_dtype",
         "bf16",
         "--actor.gradient_checkpointing_enable",
@@ -671,8 +673,6 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
 
     if grpo_use_reentrant(config.model_id):
         args.append("--actor.gradient_checkpointing_reentrant")
-    if config.qwen35_language_model_only:
-        args.extend(["--ds.attn_implementation", "eager"])
     return args
 
 
@@ -1096,6 +1096,116 @@ def _flash_pad_info(value, action_mask, pad_value):
     return tensor
 
 
+_FLASH_OPD_LOGIT_CHUNK_SIZE = 256
+
+
+def _flash_output_embeddings(actor):
+    model = getattr(actor.model, "module", actor.model)
+    output_embeddings = model.get_output_embeddings()
+    input_embeddings = model.get_input_embeddings()
+    if output_embeddings is None or output_embeddings is input_embeddings:
+        raise RuntimeError("OpenRLHF OPD chunked projection requires a distinct output embedding module")
+    return output_embeddings
+
+
+def _flash_action_hidden_states(actor, sequences, attention_mask):
+    if sequences.ndim != 2 or attention_mask.shape != sequences.shape:
+        raise ValueError("OpenRLHF OPD chunked projection expects matching sequence and attention tensors")
+    output_embeddings = _flash_output_embeddings(actor)
+    captured = {}
+    had_instance_forward = "forward" in output_embeddings.__dict__
+    original_instance_forward = output_embeddings.__dict__.get("forward")
+
+    def _capture_hidden(hidden_states, *_args, **_kwargs):
+        if "hidden_states" in captured:
+            raise RuntimeError("OpenRLHF OPD output embedding was invoked more than once")
+        captured["hidden_states"] = hidden_states
+        return hidden_states[..., :1] * 0
+
+    output_embeddings.forward = _capture_hidden
+    try:
+        if getattr(actor, "is_vlm", False):
+            position_ids = None
+        else:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+        actor.model(
+            sequences,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+    finally:
+        if had_instance_forward:
+            output_embeddings.forward = original_instance_forward
+        else:
+            del output_embeddings.forward
+
+    hidden_states = captured.get("hidden_states")
+    if hidden_states is None or hidden_states.shape[:2] != sequences.shape:
+        raise RuntimeError("OpenRLHF OPD could not capture full-sequence hidden states")
+    return hidden_states
+
+
+def _flash_chunked_token_logps(
+    lm_head,
+    hidden_states,
+    token_ids,
+    *,
+    temperature,
+    chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE,
+):
+    from torch.utils.checkpoint import checkpoint
+
+    if hidden_states.ndim != 2 or token_ids.ndim != 1:
+        raise ValueError("OpenRLHF OPD chunked projection expects [tokens, hidden] states and [tokens] ids")
+    if hidden_states.shape[0] != token_ids.shape[0]:
+        raise ValueError("OpenRLHF OPD chunked projection token counts differ")
+    if float(temperature) <= 0:
+        raise ValueError("OpenRLHF OPD rollout temperature must be positive")
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty((0,), dtype=torch.float32)
+
+    def _logps(hidden_chunk, ids_chunk):
+        logits = lm_head(hidden_chunk).float()
+        if float(temperature) != 1.0:
+            logits.div_(float(temperature))
+        return -torch.nn.functional.cross_entropy(logits, ids_chunk, reduction="none")
+
+    size = max(1, int(chunk_size))
+    chunks = []
+    for start in range(0, hidden_states.shape[0], size):
+        hidden_chunk = hidden_states[start : start + size]
+        ids_chunk = token_ids[start : start + size]
+        if torch.is_grad_enabled():
+            chunks.append(
+                checkpoint(
+                    _logps,
+                    hidden_chunk,
+                    ids_chunk,
+                    use_reentrant=False,
+                )
+            )
+        else:
+            chunks.append(_logps(hidden_chunk, ids_chunk))
+    return torch.cat(chunks)
+
+
+def _flash_chunked_action_log_probs(actor, sequences, action_mask, attention_mask, *, chunk_size=None):
+    if action_mask.shape != (sequences.shape[0], sequences.shape[1] - 1):
+        raise ValueError("OpenRLHF OPD action mask must align with next-token predictions")
+    response_mask = action_mask.bool()
+    hidden_states = _flash_action_hidden_states(actor, sequences, attention_mask)[:, :-1]
+    target_ids = sequences[:, 1:]
+    flat_logps = _flash_chunked_token_logps(
+        _flash_output_embeddings(actor),
+        hidden_states[response_mask],
+        target_ids[response_mask],
+        temperature=actor.temperature,
+        chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE if chunk_size is None else chunk_size,
+    )
+    return flat_logps.new_zeros(action_mask.shape).masked_scatter(response_mask, flat_logps)
+
+
 def _flash_reverse_kl(student_logprobs, teacher_logsums, group_ids, response_mask):
     selected = response_mask.bool() & group_ids.ge(0)
     if not bool(selected.any().item()):
@@ -1120,14 +1230,11 @@ def _flash_reverse_kl(student_logprobs, teacher_logsums, group_ids, response_mas
 def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=None):
     del kl_ctl, loss_batch_info
     self.actor.train()
-    action_log_probs, _output = self.actor(
+    action_log_probs = _flash_chunked_action_log_probs(
+        self.actor,
         experience.sequences,
         experience.action_mask,
-        attention_mask=experience.attention_mask,
-        return_output=True,
-        ring_attn_group=self.strategy.ring_attn_group,
-        packed_seq_lens=None,
-        return_entropy=False,
+        experience.attention_mask,
     )
     group_ids = _flash_pad_info(
         experience.info["flash_teacher_group_ids"], action_log_probs, -1
@@ -1221,7 +1328,11 @@ if os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER"):
 
     _Actor.__init__ = _flash_actor_init_with_warmstart
 
-print("[flash-openrlhf] flash opd reverse-kl, teacher, deterministic rollout, and lora hooks active", flush=True)
+print(
+    "[flash-openrlhf] flash opd chunked reverse-kl hooks active; "
+    "32k gpu-validation-pending on h100 qwen3.5-0.8b for two steps with teacher alignment and post-sync rollout",
+    flush=True,
+)
 """.lstrip()
 
 
