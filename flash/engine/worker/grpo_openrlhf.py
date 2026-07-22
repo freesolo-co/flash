@@ -761,9 +761,15 @@ def _flash_actor_init(self, *args, **kwargs):
 
 _Actor.__init__ = _flash_actor_init
 
+def _flash_ray_modified_class(actor_class):
+    metadata = getattr(actor_class, "__ray_metadata__", None)
+    return getattr(metadata, "modified_class", actor_class)
+
+
 from openrlhf.trainer.ray.launcher import ReferenceModelActor as _ReferenceModelActor
 
-_original_reference_init = _ReferenceModelActor.init_model_from_pretrained
+_ReferenceModelActorImpl = _flash_ray_modified_class(_ReferenceModelActor)
+_original_reference_init = _ReferenceModelActorImpl.init_model_from_pretrained
 
 
 @functools.wraps(_original_reference_init)
@@ -775,12 +781,13 @@ def _flash_reference_init(self, *args, **kwargs):
         _loading_warm_reference.reset(token)
 
 
-_ReferenceModelActor.init_model_from_pretrained = _flash_reference_init
+_ReferenceModelActorImpl.init_model_from_pretrained = _flash_reference_init
 
 from openrlhf.trainer.ppo_trainer import PPOTrainer as _PPOTrainer
 
-_original_ppo_fit = _PPOTrainer.fit
-_original_save_logs_and_checkpoints = _PPOTrainer.save_logs_and_checkpoints
+_PPOTrainerImpl = _flash_ray_modified_class(_PPOTrainer)
+_original_ppo_fit = _PPOTrainerImpl.fit
+_original_save_logs_and_checkpoints = _PPOTrainerImpl.save_logs_and_checkpoints
 
 
 @functools.wraps(_original_ppo_fit)
@@ -803,10 +810,12 @@ def _flash_save_logs_and_checkpoints(self, global_step, *args, **kwargs):
         self.args.ckpt.save_steps = original_save_steps
 
 
-_PPOTrainer.fit = _flash_ppo_fit
-_PPOTrainer.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
+_PPOTrainerImpl.fit = _flash_ppo_fit
+_PPOTrainerImpl.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
 
-_original_actor_save_checkpoint = _ppo_actor_module.PolicyModelActor.save_checkpoint
+_PolicyModelActor = _ppo_actor_module.PolicyModelActor
+_PolicyModelActorImpl = _flash_ray_modified_class(_PolicyModelActor)
+_original_actor_save_checkpoint = _PolicyModelActorImpl.save_checkpoint
 
 
 @functools.wraps(_original_actor_save_checkpoint)
@@ -834,7 +843,7 @@ def _flash_actor_save_checkpoint(self, tag, *args, **kwargs):
     return result
 
 
-_ppo_actor_module.PolicyModelActor.save_checkpoint = _flash_actor_save_checkpoint
+_PolicyModelActorImpl.save_checkpoint = _flash_actor_save_checkpoint
 
 _original_broadcast_to_vllm = _ActorPPOTrainer.broadcast_to_vllm
 _LORA_PARAMETER_SEGMENTS = frozenset(

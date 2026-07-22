@@ -184,10 +184,17 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
 
     ray = types.ModuleType("ray")
 
+    class _RayActorClass:
+        def __init__(self, modified_class):
+            self.__ray_metadata__ = SimpleNamespace(modified_class=modified_class)
+            for name, value in vars(modified_class).items():
+                if callable(value):
+                    setattr(self, name, value)
+
     def remote(*args, **kwargs):
         if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-        return lambda target: target
+            return _RayActorClass(args[0])
+        return lambda target: _RayActorClass(target)
 
     ray.remote = remote
     ray.get = lambda value: value
@@ -351,7 +358,7 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
             self.actor = models.Actor("base", lora_rank=0)
             return self.actor
 
-    launcher.ReferenceModelActor = _ReferenceModelActor
+    launcher.ReferenceModelActor = ray.remote(_ReferenceModelActor)
     monkeypatch.setitem(sys.modules, "openrlhf.trainer.ray.launcher", launcher)
     ray_utils = types.ModuleType("openrlhf.trainer.ray.utils")
     ray_utils.get_physical_gpu_id = lambda: 0
@@ -369,10 +376,13 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
         def fit(self, *_args, **_kwargs):
             return None
 
-        def save_logs_and_checkpoints(self, *_args, **_kwargs):
+        def save_logs_and_checkpoints(self, global_step, *_args, **_kwargs):
+            self.observed_save_steps.append(self.args.ckpt.save_steps)
+            if global_step % self.args.ckpt.save_steps == 0:
+                return self.policy.save_checkpoint(f"global_step{global_step}")
             return None
 
-    ppo_trainer_module.PPOTrainer = _PPOTrainer
+    ppo_trainer_module.PPOTrainer = ray.remote(_PPOTrainer)
     monkeypatch.setitem(sys.modules, "openrlhf.trainer.ppo_trainer", ppo_trainer_module)
 
     agent_module = types.ModuleType("openrlhf.utils.agent")
@@ -638,6 +648,11 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert 'vllm_is_truncated_threshold"] = [0.0, 2.0]' in source
     assert 'kwargs.setdefault("kv_cache_dtype", "fp8")' in source
     assert "PeftModel.from_pretrained" in source
+    assert 'getattr(metadata, "modified_class", actor_class)' in source
+    assert "_ReferenceModelActorImpl.init_model_from_pretrained = _flash_reference_init" in source
+    assert "_PPOTrainerImpl.fit = _flash_ppo_fit" in source
+    assert "_PPOTrainerImpl.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints" in source
+    assert "_PolicyModelActorImpl.save_checkpoint = _flash_actor_save_checkpoint" in source
     assert "self.broadcast_to_vllm()" in source
     assert "[flash-openrlhf-checkpoint]" in source
 
@@ -789,21 +804,102 @@ def test_sitecustomize_loads_warm_policy_and_incoming_kl_reference(monkeypatch):
     actor_class = sys.modules["openrlhf.models"].Actor
 
     policy = actor_class("base", lora_rank=8, target_modules=["all-linear"])
-    reference = namespace["_ReferenceModelActor"]()
+    reference_wrapper = namespace["_ReferenceModelActor"]
+    reference_class = reference_wrapper.__ray_metadata__.modified_class
+    reference = reference_class()
     reference.init_model_from_pretrained(None, "base")
     loads = sys.modules["peft"].loads
 
+    assert reference_class.init_model_from_pretrained is namespace["_flash_reference_init"]
+    assert reference_wrapper.init_model_from_pretrained is not namespace["_flash_reference_init"]
     assert loads[0][0:2] == ("/work/incoming-adapter", True)
     assert loads[1][0:2] == ("/work/incoming-adapter", False)
     assert policy.model.is_trainable is True
     assert reference.actor.model.is_trainable is False
     assert all(not parameter.requires_grad for parameter in reference.actor.model.parameters())
 
-    trainer = namespace["_PPOTrainer"]()
+    trainer_wrapper = namespace["_PPOTrainer"]
+    trainer_class = trainer_wrapper.__ray_metadata__.modified_class
+    trainer = trainer_class()
     broadcasts = []
     trainer.broadcast_to_vllm = lambda: broadcasts.append(True)
-    trainer.fit()
+    trainer.fit(global_step=0)
+
+    assert trainer_class.fit is namespace["_flash_ppo_fit"]
+    assert trainer_wrapper.fit is not namespace["_flash_ppo_fit"]
     assert broadcasts == [True]
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_exact_save_reaches_exported_policy_actor_and_acknowledges(
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("torch")
+    monkeypatch.setenv("FLASH_OPENRLHF_SAVE_AT_STEPS", "3")
+    namespace, _, ppo_actor_module, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    saved = []
+
+    class _Strategy:
+        def __init__(self):
+            self.args = SimpleNamespace(
+                ckpt=SimpleNamespace(path=str(checkpoint_dir), max_num=2, max_mem=0)
+            )
+
+        def save_ckpt(self, model, path, tag, max_num, max_mem, client_states, **kwargs):
+            saved.append((model, path, tag, max_num, max_mem, client_states, kwargs))
+
+        def is_rank_0(self):
+            return True
+
+    policy_wrapper = ppo_actor_module.PolicyModelActor
+    policy_class = policy_wrapper.__ray_metadata__.modified_class
+    policy = object.__new__(policy_class)
+    policy.strategy = _Strategy()
+    policy.actor = SimpleNamespace(model=object())
+    policy.disable_ds_ckpt = False
+    policy.save_hf_ckpt = False
+    markers = []
+
+    def acknowledge_marker(message, *_args, **kwargs):
+        if message.startswith("[flash-openrlhf-checkpoint] "):
+            assert kwargs == {"flush": True}
+            marker = json.loads(message.removeprefix("[flash-openrlhf-checkpoint] "))
+            markers.append(marker)
+            Path(marker["ack_path"]).touch()
+
+    namespace["print"] = acknowledge_marker
+    trainer_wrapper = namespace["_PPOTrainer"]
+    trainer_class = trainer_wrapper.__ray_metadata__.modified_class
+    trainer = trainer_class()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=float("inf")))
+    trainer.observed_save_steps = []
+    trainer.policy = policy
+
+    trainer.save_logs_and_checkpoints(3, {}, {})
+
+    assert trainer_class.save_logs_and_checkpoints is namespace["_flash_save_logs_and_checkpoints"]
+    assert (
+        trainer_wrapper.save_logs_and_checkpoints
+        is not namespace["_flash_save_logs_and_checkpoints"]
+    )
+    assert policy_class.save_checkpoint is namespace["_flash_actor_save_checkpoint"]
+    assert policy_wrapper.save_checkpoint is not namespace["_flash_actor_save_checkpoint"]
+    assert trainer.observed_save_steps == [3]
+    assert trainer.args.ckpt.save_steps == float("inf")
+    assert saved[0][1:3] == (str(checkpoint_dir / "_actor"), "global_step3")
+    assert markers == [
+        {
+            "step": 3,
+            "tag": "global_step3",
+            "checkpoint_dir": str(checkpoint_dir),
+            "adapter_dir": str(checkpoint_dir / "global_step3_hf"),
+            "ack_path": str(checkpoint_dir / ".flash-uploaded-global_step3"),
+        }
+    ]
+    assert Path(markers[0]["ack_path"]).is_file()
 
 
 @requires_openrlhf_source
