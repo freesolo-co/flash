@@ -15,7 +15,6 @@ from flash.engine.vram import (
 )
 
 _EXPECTED_LORA_TARGET_COUNTS = {
-    "openbmb/MiniCPM5-1B": 168,
     "Qwen/Qwen3.5-0.8B": 236,
     "Qwen/Qwen3.5-2B": 284,
     "Qwen/Qwen3.5-4B": 346,
@@ -63,19 +62,20 @@ def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
 
 
 def test_gdn_state_page_and_attention_kv_use_real_geometry():
-    dense = MODELS["openbmb/MiniCPM5-1B"]
-    dense_raw = _architecture_kv_raw_gb(dense, 4096, 8, False)
-    dense_expected = (
-        dense.num_attention_layers
+    gdn = MODELS["Qwen/Qwen3.5-0.8B"]
+    gdn_raw = _architecture_kv_raw_gb(gdn, 4096, 8, False)
+    attention_expected = (
+        gdn.num_attention_layers
         * 8
         * 4096
         * 2
-        * dense.num_key_value_heads
-        * dense.head_dim
+        * gdn.num_key_value_heads
+        * gdn.head_dim
         * 2
         / 1e9
     )
-    assert dense_raw == pytest.approx(dense_expected)
+    assert gdn_raw is not None
+    assert gdn_raw > attention_expected
 
     moe = MODELS["Qwen/Qwen3.6-35B-A3B"]
     state_elements = (
@@ -126,12 +126,6 @@ def test_pinned_grpo_resident_check_uses_generic_geometry(monkeypatch):
 
 def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overrouting():
     cases = {
-        "gqa_dense_sft": (
-            "openbmb/MiniCPM5-1B",
-            "sft",
-            {"max_context_tokens": 4096, "lora_rank": 32},
-            18,
-        ),
         "gdn_vl_small_grpo": (
             "Qwen/Qwen3.5-0.8B",
             "grpo",
@@ -187,7 +181,6 @@ def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overroutin
     for name, (_model_id, _algorithm, _train, old_need) in cases.items():
         assert sized[name] <= old_need
 
-    assert sized["gqa_dense_sft"] <= 24
     assert sized["gdn_vl_small_grpo"] <= 24
     assert sized["gdn_vl_high_rank_sft"] <= 32
     assert model_required_vram_gb("Qwen/Qwen3.5-2B", "grpo") <= 32

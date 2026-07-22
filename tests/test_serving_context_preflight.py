@@ -8,7 +8,6 @@ from flash.spec import JobSpec
 @pytest.mark.parametrize(
     ("model", "expected_cap"),
     [
-        ("openbmb/MiniCPM5-1B", 32768),
         ("Qwen/Qwen3.5-0.8B", 32768),
         ("Qwen/Qwen3.5-2B", 32768),
         ("Qwen/Qwen3.5-4B", 32768),
