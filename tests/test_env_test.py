@@ -135,6 +135,16 @@ class _EmptyReplyMultiTurnEnv(_MultiTurnEnv):
         return []
 
 
+class _MalformedReplyMultiTurnEnv(_MultiTurnEnv):
+    def env_reply(self, messages, state):
+        # a non-empty but malformed reply (scalar content) would break the real chat
+        # template on the next turn, so the driver must fail the episode, not pass on it
+        state["turn"] += 1
+        reply = {"role": "user", "content": 123}
+        messages.append(reply)
+        return [reply]
+
+
 def _environment_dir(tmp_path):
     env_dir = tmp_path / "local-env"
     env_dir.mkdir()
@@ -299,6 +309,21 @@ def test_env_test_malformed_prompt_fails_contract(monkeypatch, tmp_path, capsys)
     assert "policy=n/a" in captured.out
     assert "0/1 episodes passed contract checks" in captured.out
     assert "prompt is not well-formed" in captured.err
+    assert "overall: FAIL" in captured.err
+
+
+def test_env_test_multi_turn_malformed_env_reply_fails_contract(
+    monkeypatch, tmp_path, capsys
+):
+    # a non-empty but malformed env reply must fail the episode: those messages become
+    # chat-template input for the next turn in the real rollout and would break remotely
+    env_dir = _environment_dir(tmp_path)
+    _patch_loader(monkeypatch, _MalformedReplyMultiTurnEnv())
+
+    assert cmd_env_test(_args(env_dir)) == 1
+    captured = capsys.readouterr()
+    assert "0/1 episodes passed contract checks" in captured.out
+    assert "env_reply is not well-formed" in captured.err
     assert "overall: FAIL" in captured.err
 
 

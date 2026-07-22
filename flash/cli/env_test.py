@@ -127,8 +127,13 @@ def _drive_multi_turn(env, example: dict, record: dict) -> None:
         record["turns"] = turns
         if turns >= hard_cap or env.rollout_done(state, max_turns=hard_cap):
             break
-        if not env.env_reply(state["messages"], state):
+        env_msgs = env.env_reply(state["messages"], state)
+        if not env_msgs:
             break
+        # the env's own reply messages feed the chat template for the next turn in the real
+        # rollout, so validate their envelope here too: a malformed reply that would break
+        # remotely must fail the episode instead of slipping through on a finite reward.
+        _check_messages(env_msgs, "env_reply")
         if env.rollout_done(state, max_turns=hard_cap):
             break
 
