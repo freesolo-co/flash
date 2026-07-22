@@ -553,14 +553,28 @@ def recover_runs() -> None:
     # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
     # attempt is reaped without racing the resubmit's fresh allocation.
     resubmit: list[tuple[JobSpec, str]] = []
+
+    def _drain_cleanup_remotes_bg(run_id: str) -> None:
+        with contextlib.suppress(Exception):
+            _drain_cleanup_remotes(run_id)
+
     for row in db.all_runs():
         known.add(row["run_id"])
         try:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        with contextlib.suppress(Exception):
-            _drain_cleanup_remotes(status.run_id)
+        # Best-effort provider teardown for any remote resources a prior crash left dangling.
+        # Backgrounded (not awaited here, like the attach_run dispatch below): under a provider API
+        # outage, the underlying cancel/destroy calls can each block for their full retry/backoff
+        # window, and this loop runs unconditionally over every known run (not just recoverable
+        # ones). Serialized inline, a handful of stuck cleanup remotes during an outage is enough to
+        # blow past the container's HEALTHCHECK grace period, so the still-starting process gets
+        # killed before it ever accepts a request -- a self-sustaining restart loop. Nothing below
+        # depends on this having finished.
+        threading.Thread(
+            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
+        ).start()
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
