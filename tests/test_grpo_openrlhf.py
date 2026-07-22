@@ -1344,6 +1344,10 @@ def test_sitecustomize_constructs_structured_outputs_params_per_request():
     assert first.kwargs == spec
     assert second.kwargs == spec
     assert first is not second
+    assert first.kwargs["json"] is not second.kwargs["json"]
+    first.kwargs["json"]["required"].append("explanation")
+    assert second.kwargs == spec
+    assert spec["json"]["required"] == ["answer"]
     assert not hasattr(original_params, "structured_outputs")
 
 

@@ -912,7 +912,8 @@ async def _flash_execute(self, *args, **kwargs):
         raise RuntimeError("flash GRPO rollout request is missing sampling parameters")
     sampling_params = copy.deepcopy(sampling_params)
     if _FLASH_STRUCTURED_OUTPUTS:
-        sampling_params.structured_outputs = _StructuredOutputsParams(**_FLASH_STRUCTURED_OUTPUTS)
+        structured_outputs = copy.deepcopy(_FLASH_STRUCTURED_OUTPUTS)
+        sampling_params.structured_outputs = _StructuredOutputsParams(**structured_outputs)
     if _FLASH_STOP_SEQUENCES:
         sampling_params.stop = list(_FLASH_STOP_SEQUENCES)
         sampling_params.include_stop_str_in_output = True
