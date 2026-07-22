@@ -50,6 +50,10 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
 _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
+
+# latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
+# for `flash log -f` when a short run raises before the throttled rl_step ping committed
+LATEST_GRPO_METRICS_LAST: list = []
 # Throttled to avoid blowing the 128/hr HF commit cap; terminal transitions are never throttled. Every
 # tight-liveness stage is throttled (⊂) PLUS the per-step training stages: opd_filtering_prompts alone
 # emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
@@ -79,6 +83,8 @@ _HB_CLAIM_SEQ = 0
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
+# retain at least one metric row per second across the 900s training heartbeat throttle window.
+_GRPO_METRIC_HISTORY_LIMIT = 1024
 
 
 def _dump_thread_stacks(reason: str) -> None:
@@ -104,6 +110,16 @@ def _rollback_throttle_slot(
             _w._HB_LAST_UPLOAD = prev_last_upload
             _w._HB_LAST_COMMITTED_STEP = prev_last_step
             _w._HB_LAST_FORCED_UPLOAD = prev_last_forced
+
+
+def _console_heartbeat_snapshot(payload: dict, payload_committed: bool = True) -> str:
+    console_payload = dict(payload)
+    metrics_last = console_payload.pop("metrics_last", None)
+    if isinstance(metrics_last, list):
+        console_payload["metrics_last_count"] = len(metrics_last)
+    if not payload_committed and console_payload.get("sampled_completions"):
+        console_payload.pop("sampled_completions", None)
+    return json.dumps(console_payload)
 
 
 def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
@@ -220,12 +236,7 @@ def heartbeat(stage: str, *, liveness: bool = False, force: bool = False, **kw):
         else:
             _rollback_throttle_slot(my_claim, prev_last_upload, prev_last_step, prev_last_forced)
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
-    console_payload = payload
-    if not payload_committed and payload.get("sampled_completions"):
-        console_payload = {
-            key: value for key, value in payload.items() if key != "sampled_completions"
-        }
-    print("HEARTBEAT", json.dumps(console_payload))
+    print("HEARTBEAT", _console_heartbeat_snapshot(payload, payload_committed))
     return payload_committed
 
 
@@ -352,6 +363,7 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
     class _RewardHeartbeat(TrainerCallback):
         def __init__(self):
             self.reward_history = []
+            self.metrics_last = []
             self.last_gpu_diag_at = 0.0
             self.sent_first_sample_heartbeat = False
             self.latest_reward_metrics: dict[str, float] = {}
@@ -371,12 +383,42 @@ def make_reward_heartbeat_callback(reward_metrics=None, samples=None):
                 r = float(r)
             except (TypeError, ValueError):
                 return
+            if not math.isfinite(r):
+                return
             self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
+            metrics = {"step": step, "reward": r}
+            for payload_key, log_key in (
+                ("reward_std", "reward_std"),
+                ("grad_norm", "grad_norm"),
+                ("kl", "kl"),
+                ("entropy", "entropy"),
+                ("frac_reward_zero_std", "frac_reward_zero_std"),
+                ("mean_completion_tokens", "completions/mean_length"),
+                ("truncation_rate", "completions/clipped_ratio"),
+            ):
+                value = logs.get(log_key)
+                if value is None:
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(value):
+                    continue
+                metrics[payload_key] = value
+            max_completion_tokens = getattr(args, "max_completion_length", None)
+            if max_completion_tokens is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    metrics["max_completion_tokens"] = int(max_completion_tokens)
+            self.metrics_last = [item for item in self.metrics_last if item["step"] != step]
+            self.metrics_last.append(metrics)
+            self.metrics_last = self.metrics_last[-_GRPO_METRIC_HISTORY_LIMIT:]
+            LATEST_GRPO_METRICS_LAST[:] = self.metrics_last
             payload = {
-                "step": step,
-                "reward": r,
+                **metrics,
                 "reward_last": self.reward_history[-8:],
+                "metrics_last": self.metrics_last,
             }
             latest_metrics = reward_metrics() if callable(reward_metrics) else reward_metrics
             self.latest_reward_metrics = _bounded_reward_metrics(latest_metrics)
