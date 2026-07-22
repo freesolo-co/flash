@@ -418,26 +418,9 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
     )
 
 
-def _maybe_gather_output_head(weight, bias):
-    """gather a zero-3 output head only when its parameters are partitioned."""
-    import contextlib
-
-    if not hasattr(weight, "ds_status"):
-        return contextlib.nullcontext()
-
-    import deepspeed
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-
-    parameters = [weight] if bias is None else [weight, bias]
-    if all(parameter.ds_status == ZeroParamStatus.AVAILABLE for parameter in parameters):
-        return contextlib.nullcontext()
-    return deepspeed.zero.GatheredParameters(parameters)
-
-
 def _selected_token_nll_chunk(
     hidden_states,
-    weight,
-    bias,
+    output_head,
     labels,
     logit_scale: float,
     final_logit_softcapping: float | None,
@@ -445,9 +428,7 @@ def _selected_token_nll_chunk(
     import torch
     import torch.nn.functional as functional
 
-    logits = hidden_states.float() @ weight.float().t()
-    if bias is not None:
-        logits = logits + bias.float()
+    logits = output_head(hidden_states).float()
     if logit_scale != 1.0:
         logits = logits * logit_scale
     if final_logit_softcapping is not None:
@@ -484,15 +465,12 @@ def _chunked_selected_token_nll(
         raise ValueError("chunked SFT loss received no completion target")
 
     loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
-    weight = output_head.weight
-    bias = getattr(output_head, "bias", None)
     for start in range(0, selected_count, int(chunk_size)):
         end = min(start + int(chunk_size), selected_count)
         chunk_loss = checkpoint(
             _selected_token_nll_chunk,
             selected_hidden[start:end],
-            weight,
-            bias,
+            output_head,
             selected_labels[start:end],
             float(logit_scale),
             final_logit_softcapping,
@@ -1156,6 +1134,28 @@ def _resume_training_state(consumed_samples):
     return global_step, restored_samples, loss_curve, token_count
 
 
+def _enable_vlm_input_require_grads(model):
+    existing_handle = getattr(model, "_flash_vision_require_grads_hook", None)
+    if existing_handle is not None:
+        existing_handle.remove()
+
+    for module_path, module in model.named_modules():
+        if not module_path.endswith("visual.patch_embed"):
+            continue
+
+        def require_output_grad(_module, _inputs, output):
+            import torch
+
+            tensor = output[0] if isinstance(output, tuple) and output else output
+            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                tensor.requires_grad_(True)
+
+        handle = module.register_forward_hook(require_output_grad)
+        model._flash_vision_require_grads_hook = handle
+        return handle
+    return None
+
+
 def _install_chunked_loss_forward(actor):
     import types
 
@@ -1182,6 +1182,8 @@ def _install_chunked_loss_forward(actor):
     final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
     original_forward = base_lm.forward
     is_vlm = bool(getattr(actor, "is_vlm", False))
+    if is_vlm:
+        _enable_vlm_input_require_grads(base_lm)
 
     def vlm_hidden_states(input_ids, attention_mask, kwargs):
         config = base_lm.config
@@ -1283,7 +1285,6 @@ def _install_chunked_loss_forward(actor):
 
     base_lm.forward = types.MethodType(chunked_forward, base_lm)
     base_lm._flash_chunked_sft_loss = True
-    engine._flash_chunked_output_head = output_head
     return engine
 
 
@@ -1367,18 +1368,15 @@ def _install_trainer_patch():
                     }
                     engine.set_gradient_accumulation_boundary(micro_index + 1 == len(window))
                     labels = inputs.masked_fill(~loss_mask.bool(), -100)
-                    output_head = engine._flash_chunked_output_head
-                    output_bias = getattr(output_head, "bias", None)
-                    with _maybe_gather_output_head(output_head.weight, output_bias):
-                        with _attention_context():
-                            output = engine(
-                                input_ids=inputs,
-                                attention_mask=attention_mask,
-                                labels=labels,
-                                flash_loss_denominator=loss_info["batch_num_tokens"],
-                                flash_dp_size=loss_info["dp_size"],
-                                **mm_inputs,
-                            )
+                    with _attention_context():
+                        output = engine(
+                            input_ids=inputs,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                            flash_loss_denominator=loss_info["batch_num_tokens"],
+                            flash_dp_size=loss_info["dp_size"],
+                            **mm_inputs,
+                        )
                         gpt_loss = output.loss
                         loss = gpt_loss * gradient_scale
                         self.strategy.backward(loss, self.model, self.optimizer)
@@ -1475,7 +1473,6 @@ def apply_flash_openrlhf_sft_patches():
     helper_source = "\n\n".join(
         inspect.getsource(function)
         for function in (
-            _maybe_gather_output_head,
             _selected_token_nll_chunk,
             _chunked_selected_token_nll,
         )

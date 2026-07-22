@@ -489,23 +489,63 @@ def test_chunked_selected_token_nll_matches_full_loss_and_gradients(chunk_size):
     assert torch.allclose(output_head.bias.grad, full_bias_grad, atol=1e-5, rtol=1e-5)
 
 
-def test_rendered_runtime_gathers_zero3_head_around_forward_and_backward():
+@requires_torch
+def test_chunked_nll_uses_output_head_hooks_during_backward_recompute():
+    import torch
+
+    torch.manual_seed(29)
+    hidden = torch.randn(1, 7, 4, requires_grad=True)
+    output_head = torch.nn.Linear(4, 13)
+    input_ids = torch.randint(0, 13, (1, 7))
+    loss_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1]], dtype=torch.bool)
+    hook_calls = {"pre": 0, "post": 0}
+
+    def pre_hook(_module, _inputs):
+        hook_calls["pre"] += 1
+
+    def post_hook(_module, _inputs, _output):
+        hook_calls["post"] += 1
+
+    output_head.register_forward_pre_hook(pre_hook)
+    output_head.register_forward_hook(post_hook)
+
+    loss = _chunked_selected_token_nll(
+        hidden,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=2,
+    )
+    loss.backward()
+
+    assert hook_calls == {"pre": 6, "post": 6}
+    assert hidden.grad is not None
+    assert output_head.weight.grad is not None
+
+
+def test_rendered_runtime_keeps_sdpa_context_through_backward():
     source = render_openrlhf_sft_runtime()
-    chunk = source.split("def _selected_token_nll_chunk(", 1)[1].split(
-        "def _chunked_selected_token_nll(", 1
-    )[0]
     micro_step = source.split("for micro_index, batch in enumerate(window):", 1)[1].split(
         "global_step += 1", 1
     )[0]
 
-    assert "_maybe_gather_output_head" not in chunk
-    gather = micro_step.index("with _maybe_gather_output_head(output_head.weight, output_bias):")
+    assert "_maybe_gather_output_head" not in source
+    attention = micro_step.index("with _attention_context():")
     forward = micro_step.index("output = engine(")
     backward = micro_step.index("self.strategy.backward(loss, self.model, self.optimizer)")
     optimizer_step = micro_step.index(
         "self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)"
     )
-    assert gather < forward < backward < optimizer_step
+    assert attention < forward < backward < optimizer_step
+    backward_line = next(
+        line for line in micro_step.splitlines() if "self.strategy.backward" in line
+    )
+    optimizer_line = next(
+        line for line in micro_step.splitlines() if "self.strategy.optimizer_step" in line
+    )
+    assert len(backward_line) - len(backward_line.lstrip()) > len(optimizer_line) - len(
+        optimizer_line.lstrip()
+    )
 
 
 @requires_torch
@@ -605,6 +645,7 @@ def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
 def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(monkeypatch, tmp_path):
     import torch
     import torch.nn.functional as functional
+    from torch.utils.checkpoint import checkpoint
 
     config_path = tmp_path / "runtime.json"
     config_path.write_text(
@@ -618,10 +659,10 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
     class OutputHead(torch.nn.Linear):
         def __init__(self):
             super().__init__(5, 17)
-            self.projection_calls = 0
+            self.projection_shapes = []
 
         def forward(self, hidden_states):
-            self.projection_calls += 1
+            self.projection_shapes.append(tuple(hidden_states.shape))
             return super().forward(hidden_states)
 
     class Backbone(torch.nn.Module):
@@ -638,6 +679,10 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
             super().__init__()
             self.base_model = Backbone()
             self.embedding = torch.nn.Embedding(17, 5)
+            self.visual = torch.nn.Module()
+            self.visual.patch_embed = torch.nn.Linear(4, 5)
+            self.visual.patch_embed.requires_grad_(False)
+            self.vision_block = torch.nn.Linear(5, 5)
             self.output_head = OutputHead()
             self.config = SimpleNamespace(
                 image_token_id=9,
@@ -661,7 +706,9 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
             del image_grid_thw
             self.full_forward_calls += 1
             self.seen_mm_token_type_ids = mm_token_type_ids.detach().clone()
-            hidden = self.embedding(input_ids) + pixel_values.sum()
+            vision_hidden = self.visual.patch_embed(pixel_values)
+            vision_hidden = checkpoint(self.vision_block, vision_hidden, use_reentrant=True)
+            hidden = self.embedding(input_ids) + vision_hidden.sum()
             return SimpleNamespace(logits=self.output_head(hidden))
 
     class PeftModel(torch.nn.Module):
@@ -690,8 +737,18 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 9, 6, 7]])
     loss_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.bool)
     labels = input_ids.masked_fill(~loss_mask, -100)
-    pixel_values = torch.tensor([[0.25, 0.5]])
-    hidden = base_lm.embedding(input_ids) + pixel_values.sum()
+    pixel_values = torch.tensor([[0.25, 0.5, 0.75, 1.0]])
+    vision_hidden = functional.linear(
+        pixel_values,
+        base_lm.visual.patch_embed.weight,
+        base_lm.visual.patch_embed.bias,
+    )
+    vision_hidden = functional.linear(
+        vision_hidden,
+        base_lm.vision_block.weight,
+        base_lm.vision_block.bias,
+    )
+    hidden = base_lm.embedding(input_ids) + vision_hidden.sum()
     shifted_mask = loss_mask[:, 1:]
     expected = functional.cross_entropy(
         functional.linear(hidden[:, :-1, :], base_lm.output_head.weight, base_lm.output_head.bias)[
@@ -713,13 +770,16 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
 
     assert base_lm.full_forward_calls == 1
     assert base_lm.base_model.direct_calls == 0
-    assert base_lm.output_head.projection_calls == 0
+    assert base_lm.output_head.projection_shapes == [(2, 5), (2, 5)]
     assert base_lm.seen_mm_token_type_ids.dtype == torch.int32
     assert base_lm.seen_mm_token_type_ids.tolist() == [[0, 0, 0, 0], [0, 1, 0, 0]]
     assert output.loss.item() == pytest.approx(expected.item(), abs=1e-5)
     output.loss.backward()
     assert base_lm.embedding.weight.grad is not None
+    assert base_lm.vision_block.weight.grad is not None
     assert base_lm.output_head.weight.grad is not None
+    assert base_lm.output_head.projection_shapes == [(2, 5)] * 4
+    assert len(base_lm.visual.patch_embed._forward_hooks) == 1
 
 
 @requires_torch
