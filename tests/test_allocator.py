@@ -1143,19 +1143,21 @@ def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
     assert get_gpu_info(preview_gpu).vram_gb >= need
 
 
-def test_required_vram_sft_plain_nll_fallback_keeps_logits_term():
+def test_required_vram_sft_plain_nll_fallback_keeps_logits_term(monkeypatch):
     import math
 
-    from flash.catalog import MODELS, vocab_size_for
+    from flash.catalog import vocab_size_for
+    from flash.engine import vram
     from flash.engine.vram import estimate_vram_gb, model_required_vram_gb
 
-    mid = "openbmb/MiniCPM5-1B"
-    info = MODELS[mid]
+    mid = "meta-llama/Llama-3.2-1B"
+    params_b = 1.2
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: params_b)
     train = {"max_context_tokens": 4096, "batch_size": 4}
     need = model_required_vram_gb(mid, "sft", train=train, headroom=1.0)
     unfused = math.ceil(
         estimate_vram_gb(
-            info.params_b,
+            params_b,
             "sft",
             seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
@@ -1165,7 +1167,7 @@ def test_required_vram_sft_plain_nll_fallback_keeps_logits_term():
     )
     fused = math.ceil(
         estimate_vram_gb(
-            info.params_b,
+            params_b,
             "sft",
             seq_len=train["max_context_tokens"],
             batch_size=train["batch_size"],
@@ -1301,7 +1303,7 @@ def test_sft_chunked_nll_model_gate_mirrors_worker():
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-0.8B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.6-35B-A3B") is True
-    assert sft_chunked_nll_enabled("openbmb/MiniCPM5-1B") is False
+    assert sft_chunked_nll_enabled("meta-llama/Llama-3.2-1B") is False
     assert sft_chunked_nll_enabled("org/unknown") is False
 
 
