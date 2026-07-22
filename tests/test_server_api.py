@@ -4278,6 +4278,11 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
 
     app_mod.recover_runs()
 
+    # Drained in a background thread (see recover_runs) so an outage-slow teardown can't block
+    # the startup path; poll instead of asserting immediately after recover_runs() returns.
+    deadline = time.time() + 5
+    while not drained and time.time() < deadline:
+        time.sleep(0.01)
     assert drained == [run_id]
 
 
