@@ -777,7 +777,8 @@ def _reconcile_attached_remote(
                         return
                 except Exception:
                     pass
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
+            time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
             continue
         if time.time() >= deadline_at:
             try:
@@ -826,6 +827,8 @@ def _reconcile_attached_remote(
         delay = min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
             time.sleep(delay)
+            if time.time() >= deadline_at:
+                continue
         if time.time() < deadline_at:
             # if a replacement cannot meet the 60-second provider minimum yet the run
             # wall deadline is still open, keep reconciling (probe for completion) rather

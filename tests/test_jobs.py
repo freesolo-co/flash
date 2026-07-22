@@ -4429,6 +4429,111 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         ]
 
 
+def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-adoption-grace")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S - 1.0}
+        sleeps = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+
+        def advance(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        monkeypatch.setattr(deploy_mod.time, "sleep", advance)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_runpod_completed_metrics",
+            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+        )
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert sleeps == [1.0]
+        assert orch.get_status(spec.run_id).state == "failed"
+        assert "could not be adopted" in orch.get_status(spec.run_id).error
+
+
+def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-deadline-reprobe")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        clock = {"now": deadline - 1.0}
+        probes = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(
+            deploy_mod.time,
+            "sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        def completed_metrics(*_args, **_kwargs):
+            probes.append(clock["now"])
+            if clock["now"] >= deadline:
+                return {"wall_seconds": 60.0}
+            return None
+
+        monkeypatch.setattr(lifecycle_mod, "_runpod_completed_metrics", completed_metrics)
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_strict_teardown_handle",
+            lambda *_args, **_kwargs: pytest.fail("completed attempt must not be torn down"),
+        )
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert probes == [deadline - 1.0, deadline]
+
+
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -5098,6 +5203,29 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
         lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0)
     # once the grace has expired -> give up (return None)
     assert lifecycle._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
+
+
+def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    now = 1_000.0
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
+    probe_deadlines = []
+
+    def completed_status(_endpoint_id, _job_id, **kwargs):
+        probe_deadlines.append(kwargs["deadline_at"])
+        return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
+
+    monkeypatch.setattr(runpod_api, "job_status", completed_status)
+    metrics = lifecycle._runpod_completed_metrics(
+        _runpod_handle(jobs),
+        deadline_at=now - lifecycle._RECOVERY_MARKER_GRACE_S - 1.0,
+    )
+
+    assert metrics == {"wall_seconds": 60.0}
+    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
 
 
 def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):

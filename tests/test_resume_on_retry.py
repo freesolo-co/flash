@@ -797,6 +797,38 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
     )
 
 
+def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeypatch):
+    import flash.runner.lifecycle as lifecycle
+    from flash.runner import _RunCancelled
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_runpod_completed_metrics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            lifecycle._CompletedAttemptPending("output metrics not readable yet")
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle.time,
+        "sleep",
+        lambda _seconds: pytest.fail("cancelled pending wait must not sleep"),
+    )
+    checks = []
+
+    def check_cancelled():
+        checks.append(True)
+        raise _RunCancelled("run was cancelled")
+
+    with pytest.raises(_RunCancelled, match="was cancelled"):
+        lifecycle._await_runpod_completed_metrics(
+            object(),
+            lifecycle.time.time() + 1_000.0,
+            check_cancelled=check_cancelled,
+        )
+
+    assert checks == [True]
+
+
 @pytest.mark.parametrize(
     ("teardown_failure", "status_mode"),
     [

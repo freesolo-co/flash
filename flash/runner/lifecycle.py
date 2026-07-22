@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from flash.opd_retry_contract import OPD_RESUME_REVISION_ENV
@@ -23,6 +24,7 @@ INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_p
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _RECOVERY_MARKER_GRACE_S = 120.0
 _RECOVERY_METRICS_POLL_S = 5.0
+_RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
 
 
 class _CompletedAttemptPending(RuntimeError):
@@ -153,7 +155,12 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
 
         probe_deadline_at = (
-            deadline_at + _RECOVERY_MARKER_GRACE_S if deadline_at is not None else None
+            max(
+                deadline_at + _RECOVERY_MARKER_GRACE_S,
+                time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S,
+            )
+            if deadline_at is not None
+            else None
         )
         job = runpod_api.job_status(
             data["endpoint_id"],
@@ -424,7 +431,12 @@ def _oom_escalated(candidates, oom_vram_floor: int):
     return [c for c in candidates if c.vram_gb > oom_vram_floor]
 
 
-def _await_runpod_completed_metrics(last_handle, deadline_at) -> dict | None:
+def _await_runpod_completed_metrics(
+    last_handle,
+    deadline_at,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> dict | None:
     # a terminal-ok runpod job whose output metrics are not decodable yet raises
     # _CompletedAttemptPending within the grace window; keep reconciling (like attach_run
     # and background reconciliation) instead of letting it escape the supervisor and fail
@@ -443,6 +455,8 @@ def _await_runpod_completed_metrics(last_handle, deadline_at) -> dict | None:
         try:
             return _runpod_completed_metrics(last_handle, deadline_at=observation_floor)
         except _CompletedAttemptPending:
+            if check_cancelled is not None:
+                check_cancelled()
             time.sleep(_RECOVERY_METRICS_POLL_S)
 
 
@@ -554,6 +568,13 @@ def _submit_seed_supervised(
         _gc_seen_endpoints()
         return _RunCancelled(f"run {spec.run_id} was cancelled")
 
+    def _raise_if_cancelled() -> None:
+        try:
+            if get_status(spec.run_id).state == "cancelled":
+                raise _cancel()
+        except FileNotFoundError:
+            pass
+
     def _return_completed_runpod_metrics(metrics: dict) -> dict:
         try:
             if get_status(spec.run_id).state == "cancelled":
@@ -594,7 +615,11 @@ def _submit_seed_supervised(
             from flash.providers import get_provider
             from flash.providers.base import JobHandle
 
-            completed_metrics = _await_runpod_completed_metrics(last_handle, _load_run_deadline_at(spec.run_id))
+            completed_metrics = _await_runpod_completed_metrics(
+                last_handle,
+                _load_run_deadline_at(spec.run_id),
+                check_cancelled=_raise_if_cancelled,
+            )
             if completed_metrics is not None:
                 return _return_completed_runpod_metrics(completed_metrics)
             resource_deleted = False
@@ -834,7 +859,11 @@ def _submit_seed_supervised(
                 raise _cancel()
         except FileNotFoundError:
             pass
-        completed_metrics = _await_runpod_completed_metrics(last_handle, _load_run_deadline_at(spec.run_id))
+        completed_metrics = _await_runpod_completed_metrics(
+            last_handle,
+            _load_run_deadline_at(spec.run_id),
+            check_cancelled=_raise_if_cancelled,
+        )
         if completed_metrics is not None:
             return _return_completed_runpod_metrics(completed_metrics)
         last_detail = f"{res.failure}: {res.detail}"
