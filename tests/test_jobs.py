@@ -3209,7 +3209,6 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
-        import flash.runner.lifecycle as lifecycle
         from flash.providers.runpod import api as runpod_api
 
         status = orch.RunStatus(
