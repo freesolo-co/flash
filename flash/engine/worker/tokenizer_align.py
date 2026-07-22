@@ -1,4 +1,4 @@
-"""Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.2 -> student Qwen3.5 / MiniCPM).
+"""Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.2 -> student Qwen3.5/3.6).
 
 The teacher and student have different tokenizers and vocabularies, so they segment the SAME
 completion string at different byte boundaries and their per-token distributions can't be compared
