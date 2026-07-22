@@ -258,15 +258,25 @@ def test_no_signal_sequence_is_excluded_before_actor_training():
 
 def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     attempts = []
+    seeds = []
     cleaned = []
     prepared = []
     resamples = []
     abandoned = []
 
-    def run_attempt():
-        attempts.append(len(attempts) + 1)
-        if len(attempts) == 1:
-            raise _AllNoSignalBatch("empty-batch")
+    def run_attempt(attempt_ordinal):
+        attempts.append(attempt_ordinal)
+        seeds.append(
+            deterministic_rollout_seed(
+                42,
+                3,
+                7,
+                1,
+                no_signal_attempt_ordinal=attempt_ordinal,
+            )
+        )
+        if attempt_ordinal < 2:
+            raise _AllNoSignalBatch(f"empty-batch-{attempt_ordinal}")
         return "usable-batch"
 
     result = _run_with_no_signal_replacements(
@@ -278,10 +288,15 @@ def test_all_no_signal_rollout_dispatches_bounded_usable_replacement():
     )
 
     assert result == "usable-batch"
-    assert attempts == [1, 2]
-    assert cleaned == ["empty-batch"]
-    assert prepared == [True]
-    assert resamples == [True]
+    assert attempts == [0, 1, 2]
+    assert seeds[0] == deterministic_rollout_seed(42, 3, 7, 1)
+    assert len(set(seeds)) == 3
+    assert seeds[1] == deterministic_rollout_seed(
+        42, 3, 7, 1, no_signal_attempt_ordinal=1
+    )
+    assert cleaned == ["empty-batch-0", "empty-batch-1"]
+    assert prepared == [True, True]
+    assert resamples == [True, True]
     assert abandoned == []
 
 
@@ -1315,7 +1330,6 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
         max_model_len=4096,
     )
 
-    assert child["FLASH_OPD_MULTI_TURN"] == "1"
     assert child["FLASH_OPD_MAX_TURNS"] == "6"
     assert child["FLASH_OPD_MAX_MODEL_LEN"] == "4096"
     assert json.loads(child["FLASH_OPD_ENV_CAPABILITIES"]) == [
@@ -1634,8 +1648,9 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
             deterministic_rollout_seed(42, 4, 7, 1),
             deterministic_rollout_seed(42, 3, 8, 1),
             deterministic_rollout_seed(42, 3, 7, 2),
+            deterministic_rollout_seed(42, 3, 7, 1, no_signal_attempt_ordinal=1),
         }
-    ) == 5
+    ) == 6
     assert 0 <= baseline < 2**63
 
 

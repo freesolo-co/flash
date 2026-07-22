@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -539,6 +540,8 @@ class _TeacherAlignmentBridge:
                 "terminal": False,
                 "turn_limit": turn_limit,
                 "start_identity": start_identity,
+                "score_cache": None,
+                "score_lock": threading.Lock(),
                 "lease_deadline": now + self.session_lease_s,
             }
         with self._stats_lock:
@@ -602,7 +605,24 @@ class _TeacherAlignmentBridge:
         raw_response_ids, response_ids, completion_text, skip_reason = (
             self._validated_multiturn_response(payload)
         )
+        request_identity = (
+            turn_ordinal,
+            tuple(accepted_prefix),
+            tuple(raw_response_ids),
+            tuple(response_ids),
+            completion_text,
+            str(payload.get("termination") or ""),
+            str(payload.get("stop_reason") or ""),
+            int(payload.get("max_tokens", 0)),
+            bool(payload.get("truncated")),
+            skip_reason,
+        )
         with self._env_lock:
+            if turn_ordinal < len(session["turns"]):
+                prior = session["turns"][turn_ordinal]
+                if prior["request_identity"] != request_identity:
+                    raise ValueError("multi-turn rollout assistant turn ordinal was reused")
+                return copy.deepcopy(prior["step_response"])
             if session["terminal"]:
                 raise ValueError("multi-turn rollout attempted to step a terminal session")
             if turn_ordinal != len(session["turns"]):
@@ -637,8 +657,10 @@ class _TeacherAlignmentBridge:
                     next_prefix.extend(
                         _dedup_seam_terminator(response_ids, self._env_glue(messages))
                     )
+            step_response = {"messages": messages, "terminal": bool(terminal)}
             session["terminal"] = bool(terminal)
             session["required_prefix"] = next_prefix
+            session["score_cache"] = None
             session["turns"].append(
                 {
                     "prompt_ids": accepted_prefix,
@@ -648,6 +670,8 @@ class _TeacherAlignmentBridge:
                     "context_messages": context_messages,
                     "truncated": bool(payload.get("truncated")),
                     "skip_reason": skip_reason,
+                    "request_identity": request_identity,
+                    "step_response": copy.deepcopy(step_response),
                 }
             )
         with self._stats_lock:
@@ -658,61 +682,72 @@ class _TeacherAlignmentBridge:
                 self.truncated_rollouts += 1
             if skip_reason:
                 self.skip_counts[skip_reason] = self.skip_counts.get(skip_reason, 0) + 1
-        return {"messages": messages, "terminal": bool(terminal)}
+        return step_response
 
     def score_multiturn(self, session_id: str) -> dict:
         self._require_multiturn()
         session = self._session(session_id)
-        turns = list(session["turns"])
-        results = [
-            self._empty(len(turn["prompt_ids"]), len(turn["response_ids"]))
-            for turn in turns
-        ]
-        scorable = [
-            position
-            for position, turn in enumerate(turns)
-            if not turn["truncated"]
-            and not turn["skip_reason"]
-            and turn["response_ids"]
-        ]
-        if not scorable:
-            return {"turns": results}
-        items = [
-            (
-                _teacher_prompt_text(turns[position]["context_messages"], self.thinking_prefill),
-                turns[position]["completion_text"],
-            )
-            for position in scorable
-        ]
-        teacher_batches = self.teacher.score_many(items)
-        if len(teacher_batches) != len(scorable):
-            raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
-        with self._stats_lock:
-            self.teacher_ok += len(teacher_batches)
-        for position, teacher_tokens in zip(scorable, teacher_batches, strict=True):
-            turn = turns[position]
-            response_ids = turn["response_ids"]
-            student_ids, student_tokens = student_tokens_with_offsets(
-                self.tokenizer, response_ids, turn["completion_text"]
-            )
-            groups = groupwise_alignment(student_tokens, teacher_tokens)
-            groups = [(indices, logsum) for indices, logsum in groups if indices]
-            coverage = groupwise_coverage(groups, student_tokens)
-            with self._stats_lock:
-                self.teacher_input_tokens += len(turn["prompt_ids"]) + len(student_ids)
-                self.coverage_sum += coverage
-                if groups:
-                    self.aligned_sequences += 1
-                else:
-                    self.empty_alignments += 1
-            teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
-                len(turn["prompt_ids"]), len(response_ids), groups
-            )
-            results[position] = {
-                "teacher_ids": teacher_ids,
-                "teacher_logprobs": teacher_logprobs,
+        with session["score_lock"]:
+            turn_count = len(session["turns"])
+            cached = session["score_cache"]
+            if cached is not None and cached["turn_count"] == turn_count:
+                return copy.deepcopy(cached["result"])
+            turns = list(session["turns"])
+            results = [
+                self._empty(len(turn["prompt_ids"]), len(turn["response_ids"]))
+                for turn in turns
+            ]
+            scorable = [
+                position
+                for position, turn in enumerate(turns)
+                if not turn["truncated"]
+                and not turn["skip_reason"]
+                and turn["response_ids"]
+            ]
+            if scorable:
+                items = [
+                    (
+                        _teacher_prompt_text(
+                            turns[position]["context_messages"], self.thinking_prefill
+                        ),
+                        turns[position]["completion_text"],
+                    )
+                    for position in scorable
+                ]
+                teacher_batches = self.teacher.score_many(items)
+                if len(teacher_batches) != len(scorable):
+                    raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
+                with self._stats_lock:
+                    self.teacher_ok += len(teacher_batches)
+                for position, teacher_tokens in zip(scorable, teacher_batches, strict=True):
+                    turn = turns[position]
+                    response_ids = turn["response_ids"]
+                    student_ids, student_tokens = student_tokens_with_offsets(
+                        self.tokenizer, response_ids, turn["completion_text"]
+                    )
+                    groups = groupwise_alignment(student_tokens, teacher_tokens)
+                    groups = [(indices, logsum) for indices, logsum in groups if indices]
+                    coverage = groupwise_coverage(groups, student_tokens)
+                    with self._stats_lock:
+                        self.teacher_input_tokens += len(turn["prompt_ids"]) + len(student_ids)
+                        self.coverage_sum += coverage
+                        if groups:
+                            self.aligned_sequences += 1
+                        else:
+                            self.empty_alignments += 1
+                    teacher_ids, teacher_logprobs = encode_shifted_group_metadata(
+                        len(turn["prompt_ids"]), len(response_ids), groups
+                    )
+                    results[position] = {
+                        "teacher_ids": teacher_ids,
+                        "teacher_logprobs": teacher_logprobs,
+                    }
+            result = {"turns": results}
+            session["score_cache"] = {
+                "turn_count": turn_count,
+                "result": copy.deepcopy(result),
             }
-        return {"turns": results}
+            return result
 
     def close_multiturn(self, session_id: str) -> dict:
         session_id = self._validate_session_id(session_id)
@@ -1081,7 +1116,6 @@ def _build_opd_child_env(
     if multi_turn:
         child.update(
             {
-                "FLASH_OPD_MULTI_TURN": "1",
                 "FLASH_OPD_THINKING": "1" if thinking else "0",
                 "FLASH_OPD_MAX_TURNS": str(int(max_turns)),
                 "FLASH_OPD_MAX_MODEL_LEN": str(int(max_model_len)),

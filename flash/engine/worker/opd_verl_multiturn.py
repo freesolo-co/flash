@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
-_PROBE = "flash-env-glue-probe"
+_PROBE_PREFIX = "flash-env-glue-probe"
 
 
 def normalize_token_ids(value) -> list[int]:
@@ -64,6 +64,14 @@ def _tokenize_text(tokenizer, text: str) -> list[int]:
     return normalize_token_ids(tokenizer(text, add_special_tokens=False))
 
 
+def _unique_glue_probe(messages: list[dict]) -> str:
+    contents = [message["content"] for message in messages]
+    while True:
+        probe = f"{_PROBE_PREFIX}-{uuid4().hex}"
+        if all(probe not in content for content in contents):
+            return probe
+
+
 def _dedup_seam_terminator(response_ids: list[int], glue_ids: list[int]) -> list[int]:
     """keep the sampled terminator and drop the duplicate leading glue copy."""
     if response_ids and glue_ids and response_ids[-1] == glue_ids[0]:
@@ -86,19 +94,20 @@ class EnvGlueTokenizer:
         cached = self.cache.get(key)
         if cached is not None:
             return list(cached)
+        probe = _unique_glue_probe(messages)
         text = self.tokenizer.apply_chat_template(
-            [{"role": "assistant", "content": _PROBE}, *messages],
+            [{"role": "assistant", "content": probe}, *messages],
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=self.thinking,
         )
-        first = text.find(_PROBE)
-        if first == -1 or text.find(_PROBE, first + len(_PROBE)) != -1:
+        first = text.find(probe)
+        if first == -1 or text.find(probe, first + len(probe)) != -1:
             raise ValueError(
                 "multi-turn OPD could not uniquely locate the assistant-content probe in the chat "
                 "template; exact inter-turn glue cannot be recovered"
             )
-        glue_ids = _tokenize_text(self.tokenizer, text[first + len(_PROBE) :])
+        glue_ids = _tokenize_text(self.tokenizer, text[first + len(probe) :])
         if len(self.cache) >= self.cache_size:
             self.cache.pop(next(iter(self.cache)))
         self.cache[key] = list(glue_ids)
@@ -237,11 +246,29 @@ def build_flash_multi_turn_agent_loop(
     agent_loop_output,
     post_json,
     deterministic_seed,
+    permanent_teacher_exit: int = 86,
+    transient_teacher_exit: int = 87,
+    process_exit=None,
 ):
     """build and register the child loop without importing verl in the parent interpreter."""
+    exit_process = process_exit or os._exit
 
     class FlashMultiTurnAgentLoop(agent_loop_base):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
+            try:
+                return await self._run(sampling_params, **kwargs)
+            except Exception as error:
+                exit_code = (
+                    transient_teacher_exit
+                    if getattr(error, "classification", None) == "transient"
+                    else permanent_teacher_exit
+                )
+                exit_process(exit_code)
+                raise AssertionError(
+                    "multi-turn OPD process exit returned unexpectedly"
+                ) from error
+
+        async def _run(self, sampling_params: dict[str, Any], **kwargs):
             raw_prompt = validate_teacher_messages(
                 [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
             )
@@ -252,6 +279,7 @@ def build_flash_multi_turn_agent_loop(
             global_step = int(kwargs["global_steps"])
             example_index = int(kwargs["index"])
             rollout_ordinal = int(kwargs.get("session_id", 0))
+            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
             max_turns = int(os.environ["FLASH_OPD_MAX_TURNS"])
             max_model_len = int(os.environ["FLASH_OPD_MAX_MODEL_LEN"])
             capabilities = set(
@@ -278,6 +306,7 @@ def build_flash_multi_turn_agent_loop(
             generated_seconds = 0.0
             num_preempted = -1
             start_attempted = False
+            failure_exit_code = None
             try:
                 start_attempted = True
                 start = await _run_executor_call(
@@ -299,9 +328,11 @@ def build_flash_multi_turn_agent_loop(
                     raise RuntimeError("multi-turn bridge returned an invalid per-example turn limit")
                 prefix_ids = list(prompt_ids)
                 for turn_ordinal in range(turn_limit):
-                    remaining = max_model_len - len(prefix_ids) - 8
+                    remaining = max_model_len - len(prefix_ids)
                     if remaining <= 0:
-                        break
+                        raise RuntimeError(
+                            "multi-turn OPD dispatched a prompt without completion capacity"
+                        )
                     max_tokens = min(int(self.rollout_config.response_length), remaining)
                     params = dict(sampling_params)
                     params["max_tokens"] = max_tokens
@@ -311,6 +342,7 @@ def build_flash_multi_turn_agent_loop(
                         example_index,
                         rollout_ordinal,
                         turn_ordinal,
+                        no_signal_attempt_ordinal,
                     )
                     if stop_sequences:
                         params["stop"] = list(stop_sequences)
@@ -385,7 +417,7 @@ def build_flash_multi_turn_agent_loop(
                     glue_ids = _dedup_seam_terminator(
                         response_ids, glue_tokenizer(env_messages)
                     )
-                    if len(prefix_ids) + len(glue_ids) > max_model_len - 8:
+                    if len(prefix_ids) + len(glue_ids) > max_model_len:
                         break
                     prefix_ids.extend(glue_ids)
                 score_payload = await _run_executor_call(
@@ -416,7 +448,12 @@ def build_flash_multi_turn_agent_loop(
                         )
                     output.extra_fields["teacher_ids"] = teacher_ids
                     output.extra_fields["teacher_logprobs"] = teacher_logprobs
-                return outputs
+            except Exception as error:
+                failure_exit_code = (
+                    transient_teacher_exit
+                    if getattr(error, "classification", None) == "transient"
+                    else permanent_teacher_exit
+                )
             finally:
                 if start_attempted:
                     with contextlib.suppress(Exception):
@@ -429,6 +466,10 @@ def build_flash_multi_turn_agent_loop(
                                 {"session_id": session_id},
                             ),
                         )
+            if failure_exit_code is not None:
+                exit_process(failure_exit_code)
+                raise AssertionError("multi-turn OPD process exit returned unexpectedly")
+            return outputs
 
     FlashMultiTurnAgentLoop.__module__ = __name__
     FlashMultiTurnAgentLoop.__qualname__ = "FlashMultiTurnAgentLoop"

@@ -53,12 +53,18 @@ def deterministic_rollout_seed(
     example_index: int,
     rollout_ordinal: int,
     assistant_turn_ordinal: int = 0,
+    no_signal_attempt_ordinal: int = 0,
 ) -> int:
     """Derive one stable vLLM request seed from the complete rollout identity."""
     payload = (
         f"{int(flash_seed)}:{int(global_step)}:{int(example_index)}:"
         f"{int(rollout_ordinal)}:{int(assistant_turn_ordinal)}"
     )
+    attempt_ordinal = int(no_signal_attempt_ordinal)
+    if attempt_ordinal < 0:
+        raise ValueError("flash OPD no-signal attempt ordinal must be nonnegative")
+    if attempt_ordinal:
+        payload += f":retry:{attempt_ordinal}"
     digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
@@ -143,12 +149,12 @@ def _run_with_no_signal_replacements(
     """retry an all-no-signal rollout with a fresh bounded dispatch."""
     if max_attempts <= 0:
         raise ValueError("flash OPD no-signal attempt limit must be positive")
-    for attempt in range(1, max_attempts + 1):
+    for attempt_ordinal in range(max_attempts):
         try:
-            return run_attempt()
+            return run_attempt(attempt_ordinal)
         except _AllNoSignalBatch as error:
             cleanup_attempt(error.batch)
-            if attempt == max_attempts:
+            if attempt_ordinal == max_attempts - 1:
                 record_abandoned()
                 raise RuntimeError(
                     f"flash OPD produced no aligned teacher signal after {max_attempts} rollout attempts"
@@ -277,6 +283,7 @@ def _post_json(url: str, token: str, path: str, payload: dict) -> dict:
 
 
 def _install_verl_extensions() -> None:
+    import numpy as np
     import ray
     import torch
     from omegaconf import OmegaConf
@@ -479,8 +486,13 @@ def _install_verl_extensions() -> None:
             global_step = int(kwargs["global_steps"])
             example_index = int(kwargs["index"])
             rollout_ordinal = int(kwargs.get("session_id", 0))
+            no_signal_attempt_ordinal = int(kwargs.get("flash_no_signal_attempt", 0))
             params["seed"] = deterministic_rollout_seed(
-                flash_seed, global_step, example_index, rollout_ordinal
+                flash_seed,
+                global_step,
+                example_index,
+                rollout_ordinal,
+                no_signal_attempt_ordinal=no_signal_attempt_ordinal,
             )
             stops = json.loads(os.environ.get("FLASH_OPD_STOP_SEQUENCES", "[]"))
             if stops:
@@ -510,6 +522,8 @@ def _install_verl_extensions() -> None:
         agent_loop_output=AgentLoopOutput,
         post_json=_post_json,
         deterministic_seed=deterministic_rollout_seed,
+        permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
+        transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
     )
     globals()["FlashMultiTurnAgentLoop"] = FlashMultiTurnAgentLoop
 
@@ -546,7 +560,10 @@ def _install_verl_extensions() -> None:
             self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
 
         def step(self, batch_dict, metrics, timing_raw):
-            def run_attempt():
+            def run_attempt(attempt_ordinal: int):
+                batch_dict["flash_no_signal_attempt"] = np.full(
+                    len(batch_dict["raw_prompt"]), attempt_ordinal, dtype=np.int64
+                )
                 return super(FlashPPOTrainer, self).step(batch_dict, metrics, timing_raw)
 
             def cleanup_attempt(batch) -> None:

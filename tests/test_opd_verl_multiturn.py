@@ -19,6 +19,9 @@ from flash.engine.worker.opd_verl_multiturn import (
     validate_teacher_messages,
 )
 from flash.engine.worker.opd_verl_plugin import (
+    _PERMANENT_TEACHER_EXIT,
+    _TRANSIENT_TEACHER_EXIT,
+    FlashTeacherBridgeError,
     _flash_groupwise_reverse_kl_values,
     _full_sequence_signal_sequences,
     deterministic_rollout_seed,
@@ -54,6 +57,12 @@ class _ChatTokenizer:
     def decode(self, token_ids, *, skip_special_tokens):
         text = "".join(chr(int(token_id)) for token_id in token_ids)
         return text.replace("|", "") if skip_special_tokens else text
+
+
+class _ProcessExit(BaseException):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
 
 
 class _Teacher:
@@ -329,8 +338,8 @@ def test_per_example_turn_limit_executes_cap_turn_environment_transition_once():
     assert env.states[0]["assistant"] == ["A"]
 
 
-def test_bridge_start_close_are_idempotent_and_closed_sessions_cannot_resurrect():
-    bridge, env, _teacher = _bridge()
+def test_bridge_lifecycle_requests_are_idempotent_and_closed_sessions_cannot_resurrect():
+    bridge, env, teacher = _bridge()
     kwargs = {
         "index": 0,
         "session_id": "idempotent",
@@ -342,6 +351,22 @@ def test_bridge_start_close_are_idempotent_and_closed_sessions_cannot_resurrect(
     assert bridge.start_multiturn(**kwargs) == {"max_turns": 2}
     assert len(env.states) == 1
     assert bridge.active_session_count == 1
+
+    step = _step_payload("idempotent", 0, [1, 2], "A")
+    first_step = bridge.step_multiturn(step)
+    assert bridge.step_multiturn(step) == first_step
+    assert env.step_calls == [(id(env.states[0]), ("A",))]
+    assert env.states[0]["assistant"] == ["A"]
+
+    first_score = bridge.score_multiturn("idempotent")
+    assert bridge.score_multiturn("idempotent") == first_score
+    assert len(teacher.batches) == 1
+    assert len(teacher.batches[0]) == 1
+
+    divergent = _step_payload("idempotent", 0, [1, 2], "B")
+    with pytest.raises(ValueError, match="ordinal was reused"):
+        bridge.step_multiturn(divergent)
+
     assert bridge.close_multiturn("idempotent") == {"ok": True}
     assert bridge.close_multiturn("idempotent") == {"ok": True}
     assert bridge.active_session_count == 0
@@ -398,6 +423,8 @@ def _make_loop(
     max_model_len=128,
     max_turns=4,
     phase_control=None,
+    score_failure_index=None,
+    process_exit=None,
 ):
     tokenizer = _ChatTokenizer()
     active_sessions = set()
@@ -408,7 +435,8 @@ def _make_loop(
         "registry": {},
         "active_sessions": active_sessions,
     }
-    sessions = {"turns": []}
+    session_indexes = {}
+    session_turns = {}
 
     def block_phase(phase):
         if phase_control is None or phase_control["phase"] != phase:
@@ -459,18 +487,26 @@ def _make_loop(
     def post_json(_url, _token, path, payload):
         if path == "/multiturn/start":
             active_sessions.add(payload["session_id"])
+            session_indexes[payload["session_id"]] = payload["index"]
+            session_turns[payload["session_id"]] = []
             block_phase("start")
             if phase_control is not None and phase_control["phase"] == "start_error":
                 phase_control["entered"].set()
-                raise OSError("lost start response")
+                raise FlashTeacherBridgeError(
+                    "lost start response", classification="transient"
+                )
             return {"max_turns": max_turns}
         if path == "/multiturn/step":
             block_phase("step")
             calls["steps"].append(payload)
-            sessions["turns"].append(payload)
+            session_turns[payload["session_id"]].append(payload)
             return step_replies[len(calls["steps"]) - 1]
         if path == "/multiturn/score":
             block_phase("score")
+            if session_indexes[payload["session_id"]] == score_failure_index:
+                raise FlashTeacherBridgeError(
+                    "teacher rejected one prompt", classification="permanent"
+                )
             return {
                 "turns": [
                     {
@@ -479,7 +515,7 @@ def _make_loop(
                         "teacher_logprobs": [0.0]
                         * (len(turn["accepted_prefix"]) + len(turn["response_ids"])),
                     }
-                    for turn in sessions["turns"]
+                    for turn in session_turns[payload["session_id"]]
                 ]
             }
         if path == "/multiturn/close":
@@ -506,6 +542,9 @@ def _make_loop(
         agent_loop_output=Output,
         post_json=post_json,
         deterministic_seed=deterministic_rollout_seed,
+        permanent_teacher_exit=_PERMANENT_TEACHER_EXIT,
+        transient_teacher_exit=_TRANSIENT_TEACHER_EXIT,
+        process_exit=process_exit,
     )
     return loop_class, calls, tokenizer
 
@@ -591,21 +630,26 @@ def test_child_cancellation_closes_active_session_after_inflight_work(monkeypatc
     assert calls["closed"] == 1
 
 
-def test_child_lost_start_response_still_closes_session(monkeypatch):
+def test_child_lost_start_response_still_closes_session_before_transient_exit(monkeypatch):
     control = {
         "phase": "start_error",
         "entered": threading.Event(),
         "release": threading.Event(),
     }
+
+    def process_exit(code):
+        raise _ProcessExit(code)
+
     loop_class, calls, _tokenizer = _make_loop(
         monkeypatch,
         [],
         [],
         phase_control=control,
+        process_exit=process_exit,
     )
 
     async def run():
-        with pytest.raises(OSError, match="lost start response"):
+        with pytest.raises(_ProcessExit) as error:
             await loop_class().run(
                 {},
                 raw_prompt=[{"role": "user", "content": "q"}],
@@ -613,10 +657,58 @@ def test_child_lost_start_response_still_closes_session(monkeypatch):
                 index=0,
                 session_id=0,
             )
+        assert error.value.code == _TRANSIENT_TEACHER_EXIT
 
     asyncio.run(run())
     assert calls["active_sessions"] == set()
     assert calls["closed"] == 1
+
+
+def test_one_multiturn_teacher_failure_exits_before_partial_batch_actor_update(monkeypatch):
+    actor_updates = []
+
+    def process_exit(code):
+        raise _ProcessExit(code)
+
+    loop_class, calls, _tokenizer = _make_loop(
+        monkeypatch,
+        [([ord("A"), ord("|")], "completed")],
+        [
+            {"messages": [], "terminal": True},
+            {"messages": [], "terminal": True},
+        ],
+        max_turns=1,
+        score_failure_index=1,
+        process_exit=process_exit,
+    )
+
+    async def run_prompt(index):
+        return await loop_class().run(
+            {},
+            raw_prompt=[{"role": "user", "content": "q"}],
+            global_steps=0,
+            index=index,
+            session_id=0,
+        )
+
+    async def run_batch():
+        results = await asyncio.gather(
+            run_prompt(0),
+            run_prompt(1),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, _ProcessExit):
+                raise result
+        actor_updates.append(True)
+
+    with pytest.raises(_ProcessExit) as error:
+        asyncio.run(run_batch())
+
+    assert error.value.code == _PERMANENT_TEACHER_EXIT
+    assert actor_updates == []
+    assert calls["active_sessions"] == set()
+    assert calls["closed"] == 2
 
 
 @pytest.mark.parametrize(
@@ -636,10 +728,16 @@ def test_child_lost_start_response_still_closes_session(monkeypatch):
             1,
             "",
         ),
-        ([], [], len("u:q|a:") + 8, 0, None),
+        (
+            [([ord("A"), ord("|")], "completed")],
+            [{"messages": [], "terminal": True}],
+            len("u:q|a:") + 4,
+            1,
+            "",
+        ),
     ],
 )
-def test_child_rollout_handles_truncation_no_reply_and_context_exhaustion(
+def test_child_rollout_handles_truncation_no_reply_and_exact_context_boundary(
     monkeypatch,
     generated,
     reply,
@@ -824,6 +922,22 @@ def test_env_glue_keeps_one_assistant_terminator_at_the_seam():
     )
     assert glue[0] == ord("|")
     assert tokenizer.decode(glue, skip_special_tokens=False) == "|t:obs|a:"
+
+
+def test_env_glue_probe_cannot_collide_with_environment_content():
+    bridge, _env, _teacher = _bridge()
+    messages = [
+        {"role": "tool", "content": "result contains flash-env-glue-probe exactly once"}
+    ]
+    child_glue = EnvGlueTokenizer(bridge.tokenizer, thinking=False)(messages)
+    assert bridge._env_glue is not None
+    parent_glue = bridge._env_glue(messages)
+    expected = bridge.tokenizer(
+        "|t:result contains flash-env-glue-probe exactly once|a:",
+        add_special_tokens=False,
+    ).input_ids
+
+    assert child_glue == parent_glue == expected
 
 
 def test_lifecycle_accepts_bounded_multiturn_and_rejects_missing_contract(monkeypatch):
