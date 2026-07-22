@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import contextlib
 import importlib.util
+import json
 import logging
+import math
 import os
 import sys
 import types
@@ -55,8 +57,12 @@ def _config(**overrides) -> grpo_openrlhf.OpenRLHFGRPOConfig:
         "lora_alpha": 64,
         "kl_coef": 0.0,
         "save_every": 20,
+        "save_at_steps": (),
         "gpu_count": 2,
         "qwen35_language_model_only": True,
+        "fp8_kv": False,
+        "warmstart_adapter": "",
+        "resume": False,
     }
     values.update(overrides)
     return grpo_openrlhf.OpenRLHFGRPOConfig(**values)
@@ -230,12 +236,41 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
 
     class _Actor:
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.model = torch.nn.Linear(2, 2, bias=False)
 
     models.Actor = _Actor
     actor_module = types.ModuleType("openrlhf.models.actor")
     actor_module.Actor = _Actor
     monkeypatch.setitem(sys.modules, "openrlhf.models.actor", actor_module)
+
+    peft = types.ModuleType("peft")
+    peft.loads = []
+
+    class _FakePeftModel(torch.nn.Module):
+        def __init__(self, base, *, is_trainable):
+            super().__init__()
+            self.base = base
+            self.proj = torch.nn.Module()
+            self.proj.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 1, bias=False)})
+            self.proj.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(1, 1, bias=False)})
+            with torch.no_grad():
+                self.proj.lora_B["default"].weight.fill_(1.0)
+            self.is_trainable = is_trainable
+
+        @classmethod
+        def from_pretrained(cls, base, path, *, adapter_name, is_trainable):
+            assert adapter_name == "default"
+            model = cls(base, is_trainable=is_trainable)
+            peft.loads.append((path, is_trainable, model))
+            return model
+
+        def load_adapter(self, path, *, adapter_name, is_trainable, key_mapping):
+            assert adapter_name == "default"
+            assert is_trainable == self.is_trainable
+            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+    peft.PeftModel = _FakePeftModel
+    monkeypatch.setitem(sys.modules, "peft", peft)
 
     utils.get_tokenizer = lambda *_args, **_kwargs: None
     utils_utils = types.ModuleType("openrlhf.utils.utils")
@@ -265,6 +300,13 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
 
     vllm = types.ModuleType("vllm")
     vllm.SamplingParams = type("SamplingParams", (), {})
+
+    class _AsyncEngineArgs:
+        def __init__(self, kv_cache_dtype=None, language_model_only=False):
+            self.kv_cache_dtype = kv_cache_dtype
+            self.language_model_only = language_model_only
+
+    vllm.AsyncEngineArgs = _AsyncEngineArgs
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     vllm_engine = types.ModuleType("openrlhf.trainer.ray.vllm_engine")
     vllm_engine.batch_vllm_engine_call = lambda *_args, **_kwargs: None
@@ -303,6 +345,13 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
     ppo_utils.NaiveReplayBuffer = type("NaiveReplayBuffer", (), {})
     launcher = types.ModuleType("openrlhf.trainer.ray.launcher")
     launcher.BaseModelActor = type("BaseModelActor", (), {})
+
+    class _ReferenceModelActor:
+        def init_model_from_pretrained(self, *_args, **_kwargs):
+            self.actor = models.Actor("base", lora_rank=0)
+            return self.actor
+
+    launcher.ReferenceModelActor = _ReferenceModelActor
     monkeypatch.setitem(sys.modules, "openrlhf.trainer.ray.launcher", launcher)
     ray_utils = types.ModuleType("openrlhf.trainer.ray.utils")
     ray_utils.get_physical_gpu_id = lambda: 0
@@ -313,6 +362,18 @@ def _install_pinned_sitecustomize_modules(monkeypatch):
         _OPENRLHF_SOURCE / "openrlhf/trainer/ray/ppo_actor.py",
     )
     trainer_ray.ppo_actor = ppo_actor_module
+
+    ppo_trainer_module = types.ModuleType("openrlhf.trainer.ppo_trainer")
+
+    class _PPOTrainer:
+        def fit(self, *_args, **_kwargs):
+            return None
+
+        def save_logs_and_checkpoints(self, *_args, **_kwargs):
+            return None
+
+    ppo_trainer_module.PPOTrainer = _PPOTrainer
+    monkeypatch.setitem(sys.modules, "openrlhf.trainer.ppo_trainer", ppo_trainer_module)
 
     agent_module = types.ModuleType("openrlhf.utils.agent")
 
@@ -362,7 +423,14 @@ def test_build_openrlhf_grpo_args_maps_flash_recipe():
     assert "--ds.attn_implementation" in args
     assert "--actor.gradient_checkpointing_reentrant" in args
     assert _value(args, "--algo.kl.init_coef") == "0.0"
-    assert "--algo.advantage.is_correction_enable" not in args
+    assert "--algo.advantage.is_correction_enable" in args
+    assert args[
+        args.index("--algo.advantage.is_correction_threshold") + 1 : args.index(
+            "--algo.advantage.is_correction_threshold"
+        )
+        + 3
+    ] == ["0.0", "2.0"]
+    assert _value(args, "--algo.advantage.is_correction_type") == "tis"
 
 
 @requires_openrlhf_source
@@ -396,6 +464,13 @@ def test_build_openrlhf_grpo_args_enables_fresh_policy_kl():
     assert _value(args, "--ref.num_gpus_per_node") == "2"
 
 
+def test_build_openrlhf_grpo_args_maps_exact_saves_and_resume():
+    args = grpo_openrlhf.build_openrlhf_grpo_args(_config(save_at_steps=(3, 7), resume=True))
+
+    assert _value(args, "--ckpt.save_steps") == "-1"
+    assert "--ckpt.load_enable" in args
+
+
 def test_build_openrlhf_grpo_args_rejects_degenerate_group():
     with pytest.raises(ValueError, match="group_size greater than 1"):
         grpo_openrlhf.build_openrlhf_grpo_args(_config(group_size=1))
@@ -410,6 +485,22 @@ def test_dr_grpo_fixed_length_normalization_matches_trl_formula():
     assert actual == pytest.approx((1.0 + 2.0) / (2 * 5))
     token_mean = (1.0 + 2.0) / 2
     assert actual != pytest.approx(token_mean)
+
+
+def test_token_level_tis_math_matches_trl_token_truncate_formula():
+    losses = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    masks = [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+    log_ratios = [[0.0, math.log(4.0), -math.log(2.0)], [math.log(1.5), 0.0, 0.0]]
+
+    actual = grpo_openrlhf.tis_weighted_dr_grpo_normalize(
+        losses,
+        masks,
+        log_ratios,
+        5,
+    )
+
+    expected = (1.0 * 1.0 + 2.0 * 2.0 + 4.0 * 1.5) / (2 * 5)
+    assert actual == pytest.approx(expected)
 
 
 def test_completion_split_matches_openrlhf_tokenizer_canonicalization():
@@ -456,6 +547,15 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
     assert response == {"rewards": 1.25, "scores": 1.25, "extra_logs": {"format": 0.5}}
     assert calls == [(7, "completion", "rendered prompt")]
     assert bridge.rewards == [1.25]
+    assert bridge.drain_sampled_completions(4) == [
+        {
+            "prompt_tail": "rendered prompt",
+            "completion": "completion",
+            "reward": 1.25,
+            "generated_at_step": 4,
+        }
+    ]
+    assert bridge.drain_sampled_completions(5) == []
 
 
 def test_reward_bridge_rejects_bad_auth_and_scoring_failures():
@@ -505,12 +605,18 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         plugin_dir="/work/plugin",
         max_response_length=320,
         language_model_only=True,
+        fp8_kv=True,
+        warmstart_adapter="/work/incoming-adapter",
+        save_at_steps=(3, 7),
     )
 
     assert child["PATH"] == "/usr/bin"
     assert child["NCCL_DEBUG"] == "WARN"
     assert child["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "320"
     assert child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] == "1"
+    assert child["FLASH_OPENRLHF_FP8_KV"] == "1"
+    assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/incoming-adapter"
+    assert child["FLASH_OPENRLHF_SAVE_AT_STEPS"] == "3,7"
     assert "USER_ENV_SECRET" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -529,6 +635,11 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "returned invalid {key}" in source
     assert "language_model_only" in source
     assert 'target_modules"] = "all-linear"' in source
+    assert 'vllm_is_truncated_threshold"] = [0.0, 2.0]' in source
+    assert 'kwargs.setdefault("kv_cache_dtype", "fp8")' in source
+    assert "PeftModel.from_pretrained" in source
+    assert "self.broadcast_to_vllm()" in source
+    assert "[flash-openrlhf-checkpoint]" in source
 
 
 @requires_openrlhf_source
@@ -604,6 +715,37 @@ def test_sitecustomize_combines_policy_and_kl_with_one_dr_grpo_denominator(monke
 
 @requires_openrlhf_source
 @requires_torch
+def test_sitecustomize_applies_token_tis_inside_fixed_dr_grpo_loss(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, loss_module, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    loss_fn = loss_module.PolicyLoss(
+        enable_vllm_is_correction=False,
+        vllm_is_truncated_threshold=None,
+    )
+    action_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+    zeros = torch.zeros_like(action_mask)
+    rollout_log_probs = -torch.tensor([[0.0, math.log(4.0)], [math.log(1.5), 0.0]])
+    advantages = torch.ones_like(action_mask)
+    token = namespace["_fixed_dr_grpo_loss"].set(True)
+    try:
+        actual, _, _, _ = loss_fn(
+            zeros,
+            zeros,
+            advantages,
+            action_mask=action_mask,
+            rollout_log_probs=rollout_log_probs,
+        )
+    finally:
+        namespace["_fixed_dr_grpo_loss"].reset(token)
+
+    assert loss_fn.enable_vllm_is_correction is True
+    assert loss_fn.vllm_is_truncated_threshold == [0.0, 2.0]
+    assert loss_fn.vllm_is_correction_type == "tis"
+    assert actual.item() == pytest.approx(-(1.0 + 2.0 + 1.5) / (2 * 5))
+
+
+@requires_openrlhf_source
+@requires_torch
 def test_sitecustomize_masks_truncated_response_but_retains_row(monkeypatch):
     torch = pytest.importorskip("torch")
     _, _, _, samples_module, _ = _install_pinned_sitecustomize_modules(monkeypatch)
@@ -624,6 +766,44 @@ def test_sitecustomize_masks_truncated_response_but_retains_row(monkeypatch):
     assert experience.action_mask.shape == (1, 2)
     assert torch.count_nonzero(experience.action_mask).item() == 0
     assert experience.truncated.tolist() == [True]
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_maps_fp8_kv_to_vllm_engine_args(monkeypatch):
+    pytest.importorskip("torch")
+    monkeypatch.setenv("FLASH_OPENRLHF_FP8_KV", "1")
+    _install_pinned_sitecustomize_modules(monkeypatch)
+
+    engine_args = sys.modules["vllm"].AsyncEngineArgs()
+
+    assert engine_args.kv_cache_dtype == "fp8"
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_loads_warm_policy_and_incoming_kl_reference(monkeypatch):
+    pytest.importorskip("torch")
+    monkeypatch.setenv("FLASH_OPENRLHF_WARMSTART_ADAPTER", "/work/incoming-adapter")
+    namespace, _, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    actor_class = sys.modules["openrlhf.models"].Actor
+
+    policy = actor_class("base", lora_rank=8, target_modules=["all-linear"])
+    reference = namespace["_ReferenceModelActor"]()
+    reference.init_model_from_pretrained(None, "base")
+    loads = sys.modules["peft"].loads
+
+    assert loads[0][0:2] == ("/work/incoming-adapter", True)
+    assert loads[1][0:2] == ("/work/incoming-adapter", False)
+    assert policy.model.is_trainable is True
+    assert reference.actor.model.is_trainable is False
+    assert all(not parameter.requires_grad for parameter in reference.actor.model.parameters())
+
+    trainer = namespace["_PPOTrainer"]()
+    broadcasts = []
+    trainer.broadcast_to_vllm = lambda: broadcasts.append(True)
+    trainer.fit()
+    assert broadcasts == [True]
 
 
 @requires_openrlhf_source
@@ -681,6 +861,98 @@ def test_sitecustomize_lora_sync_emits_only_merged_base_model_keys(monkeypatch):
     assert torch.allclose(merged, expected)
 
 
+def test_per_step_checkpoint_publishes_deployable_and_complete_resume_sidecars(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(grpo_openrlhf._w, "HF_REPO", "owner/artifacts")
+    checkpoint_dir = tmp_path / "checkpoints"
+    tag = "global_step3"
+    actor_state = checkpoint_dir / "_actor" / tag
+    adapter_source = checkpoint_dir / f"{tag}_hf"
+    actor_state.mkdir(parents=True)
+    adapter_source.mkdir(parents=True)
+    (actor_state / "model_states.pt").write_bytes(b"model")
+    (actor_state / "optim_states.pt").write_bytes(b"optimizer")
+    (actor_state / "scheduler_states.pt").write_bytes(b"scheduler")
+    (actor_state / "client_state.json").write_text(
+        json.dumps(
+            {
+                "episode": 0,
+                "global_step": 3,
+                "total_consumed_prompts": 12,
+                "data_loader_state_dict": {"cursor": 12},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "_actor" / "latest").write_text(tag, encoding="utf-8")
+    ack_path = checkpoint_dir / f".flash-uploaded-{tag}"
+    marker = {
+        "step": 3,
+        "tag": tag,
+        "checkpoint_dir": str(checkpoint_dir),
+        "adapter_dir": str(adapter_source),
+        "ack_path": str(ack_path),
+    }
+
+    def fake_export(_source, destination, *_args):
+        os.makedirs(destination, exist_ok=True)
+        Path(destination, "adapter_config.json").write_text("{}", encoding="utf-8")
+        Path(destination, "adapter_model.safetensors").write_bytes(b"adapter")
+
+    class _Tokenizer:
+        def save_pretrained(self, destination):
+            Path(destination, "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    published = []
+    uploaded = []
+    monkeypatch.setattr(grpo_openrlhf, "export_openrlhf_adapter", fake_export)
+    monkeypatch.setattr(
+        grpo_openrlhf._w, "write_base_model_provenance", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_openrlhf._w,
+        "publish_deployable_checkpoint",
+        lambda path, step, **kwargs: published.append((path, step, kwargs)),
+    )
+
+    def fake_upload(step, staged_resume, *, before_upload):
+        before_upload()
+        staged = Path(staged_resume)
+        metadata = json.loads((staged / "resume_metadata.json").read_text(encoding="utf-8"))
+        assert metadata == {
+            "backend": "openrlhf",
+            "checkpoint_tag": tag,
+            "global_step": 3,
+            "schema_version": 1,
+        }
+        assert (staged / "_actor" / "latest").read_text(encoding="utf-8") == tag
+        assert (staged / "_actor" / tag / "model_states.pt").read_bytes() == b"model"
+        assert (staged / "_actor" / tag / "optim_states.pt").read_bytes() == b"optimizer"
+        assert (staged / "_actor" / tag / "scheduler_states.pt").read_bytes() == b"scheduler"
+        uploaded.append((step, staged_resume))
+        return True
+
+    monkeypatch.setattr(grpo_openrlhf._w, "upload_resume_checkpoint", fake_upload)
+
+    step = grpo_openrlhf._publish_openrlhf_checkpoint(
+        marker,
+        checkpoint_dir=str(checkpoint_dir),
+        adapter_workdir=str(tmp_path / "deployables"),
+        model_id="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        tokenizer=_Tokenizer(),
+        python_bin="/openrlhf/python",
+        required_steps=(3,),
+    )
+
+    assert step == 3
+    assert ack_path.is_file()
+    assert published[0][1:] == (3, {"required": True})
+    assert uploaded[0][0] == 3
+    assert grpo_openrlhf._openrlhf_resume_step(str(checkpoint_dir)) == 3
+
+
 def test_run_rl_dispatches_to_openrlhf(monkeypatch):
     calls = []
     monkeypatch.setenv("FLASH_RL_BACKEND", "openrlhf")
@@ -732,8 +1004,14 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
     monkeypatch.setattr(grpo_openrlhf._w, "JOB_SPEC", fake_job)
     monkeypatch.setattr(grpo_openrlhf._w, "SEED", 42)
     monkeypatch.setattr(grpo_openrlhf._w, "THINKING", False)
-    monkeypatch.setattr(grpo_openrlhf._w, "heartbeat", lambda *_args, **_kwargs: None)
+    heartbeats = []
+    monkeypatch.setattr(
+        grpo_openrlhf._w,
+        "heartbeat",
+        lambda stage, **kwargs: heartbeats.append((stage, kwargs)),
+    )
     monkeypatch.setattr(grpo_openrlhf._w, "prefetch_model", lambda *_args, **_kwargs: 1.5)
+    monkeypatch.setattr(grpo_openrlhf._w, "hf_resume_checkpoint", lambda: None)
     monkeypatch.setattr(grpo_openrlhf._w, "is_vl_checkpoint", lambda *_args: False)
     monkeypatch.setattr(grpo_openrlhf._w, "graded_text", lambda text, **_kwargs: text)
     monkeypatch.setattr(grpo_openrlhf, "wait_for_gpu", lambda *_args, **_kwargs: None)
@@ -779,8 +1057,11 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
             "prompt_opened_thinking": False,
             "steps": 2,
             "save_every": 1,
+            "save_at_steps": (),
             "gpu_count": 1,
             "seed": 42,
+            "fp8_kv": True,
+            "warmstart_adapter": "",
         },
     )
     launched = {}
@@ -824,8 +1105,13 @@ def test_run_rl_openrlhf_launches_mock_subprocess_and_exports(monkeypatch, tmp_p
     assert launched["python"] == "/openrlhf/python"
     assert _value(launched["args"], "--algo.advantage.estimator") == "dr_grpo"
     assert launched["env"]["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"] == "32"
+    assert launched["env"]["FLASH_OPENRLHF_FP8_KV"] == "1"
     assert launched["env"]["HF_HUB_OFFLINE"] == "1"
     assert exports
     assert exports[0][2:4] == ("Qwen/Qwen3.5-0.8B", "a" * 40)
+    rl_step = next(kwargs for stage, kwargs in heartbeats if stage == "rl_step")
+    assert rl_step["step"] == 2
+    assert rl_step["sampled_completions"][0]["completion"] == "completion"
+    assert rl_step["sampled_completions"][0]["reward"] == 2.0
     assert metadata[0]["notes"]["backend"] == "openrlhf"
     assert metadata[0]["notes"]["reward_history"] == [2.0]

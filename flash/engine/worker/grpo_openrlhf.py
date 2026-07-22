@@ -26,7 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from flash.engine.recipe import RECIPE
-from flash.engine.steps import on_policy_steps, resolve_update_horizon
+from flash.engine.steps import (
+    final_save_due,
+    on_policy_steps,
+    resolve_update_horizon,
+    validate_save_steps,
+)
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.openrlhf_common import (
@@ -41,6 +46,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed
+from flash.engine.worker.rollout_samples import select_rollout_samples
 from flash.spec import DEFAULT_CREDIT_ASSIGNMENT
 
 _OPENRLHF_ENTRYPOINT = "openrlhf.cli.train_ppo_ray"
@@ -87,11 +93,9 @@ _CHILD_ENV_PREFIXES = (
     "LC_",
 )
 
-# todo(openrlhf-grpo-parity): add token-level tis with c_max=2.0 in its own follow-up.
-# todo(openrlhf-grpo-parity): add fp8 kv-cache selection after a matched gpu validation.
-# todo(openrlhf-grpo-parity): add warm-start with the incoming adapter as the frozen kl anchor.
-# todo(openrlhf-grpo-parity): add exact per-step deployable dumps and full resume sidecars.
-# todo(openrlhf-grpo-parity): add per-turn credit only with explicit action-span rewards.
+# openrlhf's multi-turn executor exposes action spans but collapses all turn rewards into one episode
+# scalar before advantage estimation. exact per-turn credit therefore needs an upstream experience and
+# advantage-data-model extension; keep that mode fail-closed until the backend can carry turn rewards.
 
 
 class _RewardHTTPServer(ThreadingHTTPServer):
@@ -127,8 +131,12 @@ class OpenRLHFGRPOConfig:
     lora_alpha: int
     kl_coef: float
     save_every: int
+    save_at_steps: tuple[int, ...]
     gpu_count: int
     qwen35_language_model_only: bool
+    fp8_kv: bool
+    warmstart_adapter: str
+    resume: bool
 
 
 def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
@@ -187,6 +195,12 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         "dr_grpo",
         "--algo.advantage.gamma",
         "1.0",
+        "--algo.advantage.is_correction_enable",
+        "--algo.advantage.is_correction_threshold",
+        "0.0",
+        "2.0",
+        "--algo.advantage.is_correction_type",
+        "tis",
         "--reward.clip_range",
         f"-{_OPENRLHF_REWARD_CLIP_BOUND}",
         _OPENRLHF_REWARD_CLIP_BOUND,
@@ -234,7 +248,7 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
         config.checkpoint_dir,
         "--ckpt.save_hf",
         "--ckpt.save_steps",
-        str(config.save_every),
+        str(-1 if config.save_at_steps else config.save_every),
         "--ckpt.max_num",
         "1",
         "--logger.logging_steps",
@@ -246,6 +260,8 @@ def build_openrlhf_grpo_args(config: OpenRLHFGRPOConfig) -> list[str]:
     ]
     if grpo_use_reentrant(config.model_id):
         args.append("--actor.gradient_checkpointing_reentrant")
+    if config.resume:
+        args.append("--ckpt.load_enable")
     if config.kl_coef > 0:
         args.extend(
             [
@@ -283,6 +299,32 @@ def dr_grpo_fixed_length_normalize(
             raise ValueError("loss and mask rows must be aligned")
         numerator += sum(float(loss) * float(keep) for loss, keep in zip(losses, mask, strict=True))
     return numerator / (len(per_token_losses) * int(max_response_length))
+
+
+def tis_weighted_dr_grpo_normalize(
+    per_token_losses: list[list[float]],
+    action_masks: list[list[float]],
+    old_minus_rollout_log_probs: list[list[float]],
+    max_response_length: int,
+    *,
+    c_max: float = 2.0,
+) -> float:
+    """Pure numeric reference for TRL token-truncate TIS plus DR-GRPO reduction."""
+    if c_max <= 0:
+        raise ValueError("c_max must be positive")
+    if len(per_token_losses) != len(old_minus_rollout_log_probs):
+        raise ValueError("loss and importance-ratio batches must be aligned")
+    weighted: list[list[float]] = []
+    for losses, log_ratios in zip(per_token_losses, old_minus_rollout_log_probs, strict=True):
+        if len(losses) != len(log_ratios):
+            raise ValueError("loss and importance-ratio rows must be aligned")
+        weighted.append(
+            [
+                float(loss) * min(math.exp(float(log_ratio)), float(c_max))
+                for loss, log_ratio in zip(losses, log_ratios, strict=True)
+            ]
+        )
+    return dr_grpo_fixed_length_normalize(weighted, action_masks, max_response_length)
 
 
 def _completion_from_openrlhf_query(query: str, prompt: str) -> str:
@@ -389,6 +431,7 @@ class RewardBridge:
         self._score_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._rewards: list[float] = []
+        self._samples: list[tuple[str, str, float]] = []
         bridge = self
 
         class _Handler(BaseHTTPRequestHandler):
@@ -469,12 +512,20 @@ class RewardBridge:
             raise ValueError("reward metrics must be finite")
         with self._stats_lock:
             self._rewards.append(float(result.reward))
+            self._samples.append((prompts[0], completion, float(result.reward)))
+            del self._samples[:-64]
         return result
 
     @property
     def rewards(self) -> list[float]:
         with self._stats_lock:
             return list(self._rewards)
+
+    def drain_sampled_completions(self, generated_at_step: int) -> list[dict]:
+        with self._stats_lock:
+            samples = list(self._samples)
+            self._samples.clear()
+        return select_rollout_samples(samples, generated_at_step=int(generated_at_step))
 
     @property
     def call_count(self) -> int:
@@ -511,12 +562,21 @@ def _sitecustomize_source() -> str:
 import contextvars
 import functools
 import inspect
+import json
 import math
 import os
+import time
 
 _MAX_RESPONSE_LENGTH = int(os.environ["FLASH_OPENRLHF_MAX_RESPONSE_LENGTH"])
 if _MAX_RESPONSE_LENGTH <= 0:
     raise RuntimeError("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH must be positive")
+_WARMSTART_ADAPTER = os.environ.get("FLASH_OPENRLHF_WARMSTART_ADAPTER", "")
+_FP8_KV = os.environ.get("FLASH_OPENRLHF_FP8_KV") == "1"
+_EXACT_SAVE_STEPS = frozenset(
+    int(value)
+    for value in os.environ.get("FLASH_OPENRLHF_SAVE_AT_STEPS", "").split(",")
+    if value
+)
 
 from openrlhf import models as _models_module
 from openrlhf.models import loss as _loss_module
@@ -554,6 +614,19 @@ def _flash_aggregate_loss(
 # local_batch * configured_max_response_length denominator before the scalar terms are summed.
 _loss_module.aggregate_loss = _flash_aggregate_loss
 _models_module.aggregate_loss = _flash_aggregate_loss
+
+_original_policy_loss_init = _loss_module.PolicyLoss.__init__
+
+
+@functools.wraps(_original_policy_loss_init)
+def _flash_policy_loss_init(self, *args, **kwargs):
+    kwargs["enable_vllm_is_correction"] = True
+    kwargs["vllm_is_truncated_threshold"] = [0.0, 2.0]
+    kwargs["vllm_is_correction_type"] = "tis"
+    return _original_policy_loss_init(self, *args, **kwargs)
+
+
+_loss_module.PolicyLoss.__init__ = _flash_policy_loss_init
 
 from openrlhf.trainer.ray import ppo_actor as _ppo_actor_module
 
@@ -620,16 +693,148 @@ _SingleTurnAgentExecutor.execute = _flash_execute
 from openrlhf.models.actor import Actor as _Actor
 
 _original_actor_init = _Actor.__init__
+_loading_warm_reference = contextvars.ContextVar(
+    "flash_openrlhf_loading_warm_reference", default=False
+)
+
+
+def _flash_assert_adapter_loaded(model, load_result):
+    missing = [
+        key for key in (getattr(load_result, "missing_keys", []) or []) if "lora_" in key
+    ]
+    unexpected = [
+        key for key in (getattr(load_result, "unexpected_keys", []) or []) if "lora_" in key
+    ]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"OpenRLHF warm-start adapter load was incomplete: missing={missing}, unexpected={unexpected}"
+        )
+    lora_b_parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.endswith("lora_B.default.weight")
+    ]
+    if not lora_b_parameters:
+        raise RuntimeError("OpenRLHF warm-start adapter contains no default LoRA parameters")
+    if not any(parameter.detach().count_nonzero().item() for parameter in lora_b_parameters):
+        raise RuntimeError("OpenRLHF warm-start adapter has an all-zero LoRA delta")
 
 
 @functools.wraps(_original_actor_init)
 def _flash_actor_init(self, *args, **kwargs):
     if kwargs.get("target_modules") == ["all-linear"]:
         kwargs["target_modules"] = "all-linear"
-    return _original_actor_init(self, *args, **kwargs)
+    load_warm = bool(_WARMSTART_ADAPTER) and (
+        int(kwargs.get("lora_rank", 0) or 0) > 0 or _loading_warm_reference.get()
+    )
+    if not load_warm:
+        return _original_actor_init(self, *args, **kwargs)
+
+    kwargs["lora_rank"] = 0
+    result = _original_actor_init(self, *args, **kwargs)
+    from peft import PeftModel
+
+    is_reference = _loading_warm_reference.get()
+    base_model = self.model
+    enable_input_require_grads = getattr(base_model, "enable_input_require_grads", None)
+    if callable(enable_input_require_grads):
+        enable_input_require_grads()
+    self.model = PeftModel.from_pretrained(
+        base_model,
+        _WARMSTART_ADAPTER,
+        adapter_name="default",
+        is_trainable=not is_reference,
+    )
+    key_mapping = getattr(base_model, "_checkpoint_conversion_mapping", None)
+    load_result = self.model.load_adapter(
+        _WARMSTART_ADAPTER,
+        adapter_name="default",
+        is_trainable=not is_reference,
+        key_mapping=key_mapping,
+    )
+    _flash_assert_adapter_loaded(self.model, load_result)
+    if is_reference:
+        self.model.requires_grad_(False)
+        self.model.eval()
+    return result
 
 
 _Actor.__init__ = _flash_actor_init
+
+from openrlhf.trainer.ray.launcher import ReferenceModelActor as _ReferenceModelActor
+
+_original_reference_init = _ReferenceModelActor.init_model_from_pretrained
+
+
+@functools.wraps(_original_reference_init)
+def _flash_reference_init(self, *args, **kwargs):
+    token = _loading_warm_reference.set(bool(_WARMSTART_ADAPTER))
+    try:
+        return _original_reference_init(self, *args, **kwargs)
+    finally:
+        _loading_warm_reference.reset(token)
+
+
+_ReferenceModelActor.init_model_from_pretrained = _flash_reference_init
+
+from openrlhf.trainer.ppo_trainer import PPOTrainer as _PPOTrainer
+
+_original_ppo_fit = _PPOTrainer.fit
+_original_save_logs_and_checkpoints = _PPOTrainer.save_logs_and_checkpoints
+
+
+@functools.wraps(_original_ppo_fit)
+def _flash_ppo_fit(self, *args, **kwargs):
+    if _WARMSTART_ADAPTER:
+        # vllm starts from the catalog base; synchronize the incoming adapter before rollout one.
+        self.broadcast_to_vllm()
+    return _original_ppo_fit(self, *args, **kwargs)
+
+
+@functools.wraps(_original_save_logs_and_checkpoints)
+def _flash_save_logs_and_checkpoints(self, global_step, *args, **kwargs):
+    if not _EXACT_SAVE_STEPS:
+        return _original_save_logs_and_checkpoints(self, global_step, *args, **kwargs)
+    original_save_steps = self.args.ckpt.save_steps
+    self.args.ckpt.save_steps = int(global_step) if int(global_step) in _EXACT_SAVE_STEPS else float("inf")
+    try:
+        return _original_save_logs_and_checkpoints(self, global_step, *args, **kwargs)
+    finally:
+        self.args.ckpt.save_steps = original_save_steps
+
+
+_PPOTrainer.fit = _flash_ppo_fit
+_PPOTrainer.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
+
+_original_actor_save_checkpoint = _ppo_actor_module.PolicyModelActor.save_checkpoint
+
+
+@functools.wraps(_original_actor_save_checkpoint)
+def _flash_actor_save_checkpoint(self, tag, *args, **kwargs):
+    result = _original_actor_save_checkpoint(self, tag, *args, **kwargs)
+    if self.strategy.is_rank_0() and str(tag).startswith("global_step"):
+        step_text = str(tag).removeprefix("global_step")
+        if not step_text.isdigit():
+            raise RuntimeError(f"OpenRLHF emitted an invalid checkpoint tag: {tag}")
+        checkpoint_dir = os.path.abspath(self.strategy.args.ckpt.path)
+        ack_path = os.path.join(checkpoint_dir, f".flash-uploaded-{tag}")
+        marker = {
+            "step": int(step_text),
+            "tag": str(tag),
+            "checkpoint_dir": checkpoint_dir,
+            "adapter_dir": os.path.join(checkpoint_dir, f"{tag}_hf"),
+            "ack_path": ack_path,
+        }
+        print("[flash-openrlhf-checkpoint] " + json.dumps(marker, sort_keys=True), flush=True)
+        deadline = time.monotonic() + 1800.0
+        while not os.path.isfile(ack_path):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"timed out publishing OpenRLHF checkpoint {tag}")
+            time.sleep(0.1)
+    return result
+
+
+_ppo_actor_module.PolicyModelActor.save_checkpoint = _flash_actor_save_checkpoint
 
 _original_broadcast_to_vllm = _ActorPPOTrainer.broadcast_to_vllm
 _LORA_PARAMETER_SEGMENTS = frozenset(
@@ -807,21 +1012,33 @@ def _flash_broadcast_to_vllm(self):
 
 _ActorPPOTrainer.broadcast_to_vllm = _flash_broadcast_to_vllm
 
-if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
+if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1" or _FP8_KV:
     import vllm
 
     _original_engine_init = vllm.AsyncEngineArgs.__init__
-    if "language_model_only" not in inspect.signature(_original_engine_init).parameters:
+    _engine_parameters = inspect.signature(_original_engine_init).parameters
+    if (
+        os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
+        and "language_model_only" not in _engine_parameters
+    ):
         raise RuntimeError("the pinned vLLM lacks AsyncEngineArgs.language_model_only")
+    if _FP8_KV and "kv_cache_dtype" not in _engine_parameters:
+        raise RuntimeError("the pinned vLLM lacks AsyncEngineArgs.kv_cache_dtype")
 
     @functools.wraps(_original_engine_init)
     def _flash_engine_init(self, *args, **kwargs):
-        kwargs.setdefault("language_model_only", True)
+        if os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1":
+            kwargs.setdefault("language_model_only", True)
+        if _FP8_KV:
+            kwargs.setdefault("kv_cache_dtype", "fp8")
         return _original_engine_init(self, *args, **kwargs)
 
     vllm.AsyncEngineArgs.__init__ = _flash_engine_init
 
-print("[flash-openrlhf] flash grpo loss, truncation, reward, and lora sync hooks active", flush=True)
+print(
+    "[flash-openrlhf] flash grpo tis, loss, truncation, reward, warm-start, checkpoint, and lora sync hooks active",
+    flush=True,
+)
 """.lstrip()
 
 
@@ -837,6 +1054,9 @@ def build_openrlhf_child_env(
     plugin_dir: str,
     max_response_length: int,
     language_model_only: bool,
+    fp8_kv: bool = False,
+    warmstart_adapter: str = "",
+    save_at_steps: tuple[int, ...] = (),
 ) -> dict[str, str]:
     """Build a minimal child environment without Flash environment or provider secrets."""
     child = {
@@ -853,6 +1073,12 @@ def build_openrlhf_child_env(
     child["HF_HUB_DISABLE_XET"] = "1"
     if language_model_only:
         child["FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY"] = "1"
+    if fp8_kv:
+        child["FLASH_OPENRLHF_FP8_KV"] = "1"
+    if warmstart_adapter:
+        child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] = warmstart_adapter
+    if save_at_steps:
+        child["FLASH_OPENRLHF_SAVE_AT_STEPS"] = ",".join(str(step) for step in save_at_steps)
     return child
 
 
@@ -898,6 +1124,154 @@ def _resolve_cached_model_snapshot(model_id: str, model_revision: str) -> str:
     return snapshot
 
 
+def _resolve_openrlhf_warmstart(
+    adapter_ref: str,
+    *,
+    fallback_rank: int,
+    fallback_alpha: int,
+) -> tuple[str, int, int]:
+    if not adapter_ref:
+        return "", int(fallback_rank), int(fallback_alpha)
+    from flash.engine.worker.adapter import _download_adapter
+
+    adapter_dir = _download_adapter(adapter_ref)
+    if not adapter_dir:
+        raise RuntimeError(
+            "OpenRLHF warm-start source adapter could not be downloaded; refusing to start from base"
+        )
+    with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as config_file:
+        adapter_config = json.load(config_file)
+    if str(adapter_config.get("peft_type", "")).upper() != "LORA":
+        raise RuntimeError("OpenRLHF warm-start requires a LoRA adapter")
+    rank = int(adapter_config.get("r") or 0)
+    alpha = int(adapter_config.get("lora_alpha") or 0)
+    if rank <= 0 or alpha <= 0:
+        raise RuntimeError("OpenRLHF warm-start adapter has invalid rank or alpha")
+    return adapter_dir, rank, alpha
+
+
+def _openrlhf_resume_step(checkpoint_dir: str | None) -> int:
+    if not checkpoint_dir:
+        return 0
+    latest_path = os.path.join(checkpoint_dir, "_actor", "latest")
+    try:
+        with open(latest_path, encoding="utf-8") as latest_file:
+            tag = latest_file.read().strip()
+    except OSError:
+        return 0
+    if not tag.startswith("global_step") or not tag.removeprefix("global_step").isdigit():
+        raise RuntimeError("OpenRLHF resume checkpoint has an invalid latest tag")
+    step = int(tag.removeprefix("global_step"))
+    if step <= 0 or not os.path.isdir(os.path.join(checkpoint_dir, "_actor", tag)):
+        raise RuntimeError("OpenRLHF resume checkpoint is missing its DeepSpeed state")
+    return step
+
+
+def _stage_openrlhf_resume_checkpoint(checkpoint_dir: str, tag: str, step: int) -> str:
+    source = os.path.join(checkpoint_dir, "_actor", tag)
+    if not os.path.isdir(source):
+        raise RuntimeError(f"OpenRLHF checkpoint {tag} has no DeepSpeed actor state")
+    stage = os.path.join(checkpoint_dir, ".flash-resume-upload", f"checkpoint-{step}")
+    shutil.rmtree(stage, ignore_errors=True)
+    actor_stage = os.path.join(stage, "_actor")
+    os.makedirs(actor_stage, exist_ok=True)
+    try:
+        shutil.copytree(source, os.path.join(actor_stage, tag), copy_function=os.link)
+    except OSError:
+        shutil.rmtree(os.path.join(actor_stage, tag), ignore_errors=True)
+        shutil.copytree(source, os.path.join(actor_stage, tag))
+    Path(actor_stage, "latest").write_text(tag, encoding="utf-8")
+    Path(stage, "resume_metadata.json").write_text(
+        json.dumps(
+            {
+                "backend": "openrlhf",
+                "checkpoint_tag": tag,
+                "global_step": int(step),
+                "schema_version": 1,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return stage
+
+
+def _checkpoint_marker(line: str) -> dict[str, Any] | None:
+    prefix = "[flash-openrlhf-checkpoint] "
+    marker_start = line.find(prefix)
+    if marker_start < 0:
+        return None
+    payload = json.loads(line[marker_start + len(prefix) :])
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenRLHF checkpoint marker must be an object")
+    return payload
+
+
+def _publish_openrlhf_checkpoint(
+    marker: dict[str, Any],
+    *,
+    checkpoint_dir: str,
+    adapter_workdir: str,
+    model_id: str,
+    model_revision: str,
+    tokenizer,
+    python_bin: str,
+    required_steps: tuple[int, ...],
+) -> int:
+    step = int(marker.get("step", 0))
+    tag = str(marker.get("tag", ""))
+    if step <= 0 or tag != f"global_step{step}":
+        raise RuntimeError("OpenRLHF checkpoint marker has an invalid step or tag")
+    expected_root = os.path.realpath(checkpoint_dir)
+    if os.path.realpath(str(marker.get("checkpoint_dir", ""))) != expected_root:
+        raise RuntimeError("OpenRLHF checkpoint marker escaped its checkpoint directory")
+    source_adapter = os.path.join(checkpoint_dir, f"{tag}_hf")
+    if os.path.realpath(str(marker.get("adapter_dir", ""))) != os.path.realpath(source_adapter):
+        raise RuntimeError("OpenRLHF checkpoint marker has an invalid adapter directory")
+    ack_path = str(marker.get("ack_path", ""))
+    expected_ack = os.path.join(checkpoint_dir, f".flash-uploaded-{tag}")
+    if os.path.realpath(ack_path) != os.path.realpath(expected_ack):
+        raise RuntimeError("OpenRLHF checkpoint marker has an invalid acknowledgement path")
+
+    deployable_dir = os.path.join(adapter_workdir, f"step-{step}")
+    export_openrlhf_adapter(
+        source_adapter,
+        deployable_dir,
+        model_id,
+        model_revision,
+        python_bin,
+    )
+    tokenizer.save_pretrained(deployable_dir)
+    _w.write_base_model_provenance(deployable_dir, model_id, model_revision)
+    required = step in frozenset(int(value) for value in required_steps)
+    if required and not getattr(_w, "HF_REPO", ""):
+        raise RuntimeError(f"required OpenRLHF save step {step} has no artifact repository")
+    staged_resume = _stage_openrlhf_resume_checkpoint(checkpoint_dir, tag, step)
+    try:
+
+        def publish_deployable() -> None:
+            _w.publish_deployable_checkpoint(
+                deployable_dir,
+                step,
+                required=required,
+            )
+
+        uploaded = _w.upload_resume_checkpoint(
+            step,
+            staged_resume,
+            before_upload=publish_deployable,
+        )
+        if required and not uploaded:
+            raise RuntimeError(
+                f"required OpenRLHF save step {step} full-state checkpoint was not durable"
+            )
+        Path(ack_path).touch()
+    finally:
+        shutil.rmtree(staged_resume, ignore_errors=True)
+    return step
+
+
 def _resolve_single_turn_inputs() -> dict[str, Any]:
     spec = _w.JOB_SPEC
     if spec is None or spec.algorithm != "grpo":
@@ -909,16 +1283,15 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         )
 
     train_spec = spec.train
-    if train_spec.init_from_adapter:
-        raise RuntimeError("OpenRLHF GRPO warm-start is deferred; use the TRL backend")
-    if train_spec.save_at_steps:
-        raise RuntimeError("OpenRLHF GRPO exact per-step dumps are deferred; use the TRL backend")
     if train_spec.stop_sequences:
         raise RuntimeError("OpenRLHF GRPO stop sequences are deferred; use the TRL backend")
     if train_spec.structured_outputs:
         raise RuntimeError("OpenRLHF GRPO structured outputs are deferred; use the TRL backend")
     if train_spec.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
-        raise RuntimeError("OpenRLHF GRPO per-turn credit is deferred; use the TRL backend")
+        raise RuntimeError(
+            "OpenRLHF GRPO per-turn credit requires action-span reward advantages that the pinned "
+            "OpenRLHF experience schema cannot express; use the TRL backend"
+        )
     if float(RECIPE.lora.dropout) != 0.0:
         raise RuntimeError("OpenRLHF GRPO requires the managed zero LoRA dropout")
 
@@ -942,6 +1315,11 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     learning_rate = float(train_spec.learning_rate or rl.learning_rate)
     lora_rank = int(train_spec.lora_rank or RECIPE.lora.rank)
     lora_alpha = int(train_spec.lora_alpha or RECIPE.lora.alpha)
+    warmstart_adapter, lora_rank, lora_alpha = _resolve_openrlhf_warmstart(
+        train_spec.init_from_adapter,
+        fallback_rank=lora_rank,
+        fallback_alpha=lora_alpha,
+    )
     max_completion = int(
         overrides.get("max_tokens")
         or (rl.max_completion_len_thinking if _w.THINKING else rl.max_completion_len)
@@ -1001,7 +1379,12 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     )
     steps = resolve_update_horizon(derived_steps, train_spec.max_steps)
     save_every = int(train_spec.save_every or 20)
+    save_at_steps = tuple(int(step) for step in (train_spec.save_at_steps or ()))
+    validate_save_steps(save_at_steps, steps)
     prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
+    from flash.engine.worker.grpo import resolve_grpo_sleep_mode
+
+    _, _, _, fp8_kv = resolve_grpo_sleep_mode()
 
     return {
         "env": env,
@@ -1023,8 +1406,11 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         "prompt_opened_thinking": prompt_opened_thinking,
         "steps": int(steps),
         "save_every": save_every,
+        "save_at_steps": save_at_steps,
         "gpu_count": int(spec.gpu.count),
         "seed": int(backend_seed(spec.seed)),
+        "fp8_kv": fp8_kv,
+        "warmstart_adapter": warmstart_adapter,
     }
 
 
@@ -1044,14 +1430,17 @@ def run_rl_openrlhf() -> None:
     else:
         download_seconds = _w.prefetch_model(inputs["model_id"])
     model_path = _resolve_cached_model_snapshot(inputs["model_id"], inputs["model_revision"])
+    resume_checkpoint = _w.hf_resume_checkpoint()
+    resumed_step = _openrlhf_resume_step(resume_checkpoint)
 
     workdir = f"/tmp/rl_openrlhf_seed{inputs['seed']}"
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir, exist_ok=True)
     output_dir = os.path.join(workdir, "final")
-    checkpoint_dir = os.path.join(workdir, "checkpoints")
+    checkpoint_dir = resume_checkpoint or os.path.join(workdir, "checkpoints")
     dataset_path = os.path.join(workdir, "train.jsonl")
     adapter_dir = f"/tmp/rl_seed{_w.SEED}/adapter"
+    checkpoint_adapter_workdir = os.path.join(workdir, "checkpoint-adapters")
     plugin_dir = write_openrlhf_sitecustomize(workdir)
     scheduled_prompt_count = _write_scheduled_dataset(
         dataset_path,
@@ -1079,7 +1468,7 @@ def run_rl_openrlhf() -> None:
     qwen35_language_model_only = bool(
         _w.is_vl_checkpoint(inputs["model_id"], inputs["model_revision"])
     )
-    last_step = [0]
+    last_step = [resumed_step]
 
     def split_query(query: str, prompt: str) -> str:
         return completion_from_tokenizer_query(inputs["tokenizer"], query, prompt)
@@ -1106,20 +1495,70 @@ def run_rl_openrlhf() -> None:
             lora_alpha=inputs["lora_alpha"],
             kl_coef=inputs["kl_coef"],
             save_every=inputs["save_every"],
+            save_at_steps=inputs["save_at_steps"],
             gpu_count=inputs["gpu_count"],
             qwen35_language_model_only=qwen35_language_model_only,
+            fp8_kv=inputs["fp8_kv"],
+            warmstart_adapter=inputs["warmstart_adapter"],
+            resume=bool(resume_checkpoint),
         )
         args = build_openrlhf_grpo_args(config)
         child_env = build_openrlhf_child_env(
             plugin_dir=plugin_dir,
             max_response_length=inputs["max_completion"],
             language_model_only=qwen35_language_model_only,
+            fp8_kv=inputs["fp8_kv"],
+            warmstart_adapter=inputs["warmstart_adapter"],
+            save_at_steps=inputs["save_at_steps"],
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
 
+        published_steps: set[int] = {
+            int(step) for step in inputs["save_at_steps"] if int(step) <= resumed_step
+        }
+        dumped_sample_steps: set[int] = set()
+        sent_first_sample_heartbeat = [False]
+
         def on_step(step: int) -> None:
-            last_step[0] = max(last_step[0], int(step))
+            step = int(step)
+            last_step[0] = max(last_step[0], step)
+            if step in dumped_sample_steps:
+                return
+            sampled_completions = bridge.drain_sampled_completions(step)
+            if not sampled_completions:
+                return
+            dumped_sample_steps.add(step)
+            print(
+                f"[rl-openrlhf] step {step} sampled_completions="
+                + json.dumps(sampled_completions, separators=(",", ":")),
+                flush=True,
+            )
+            committed = _w.heartbeat(
+                "rl_step",
+                step=step,
+                sampled_completions=sampled_completions,
+                force=not sent_first_sample_heartbeat[0],
+            )
+            if committed:
+                sent_first_sample_heartbeat[0] = True
+
+        def on_line(line: str) -> None:
+            marker = _checkpoint_marker(line)
+            if marker is None:
+                return
+            step = _publish_openrlhf_checkpoint(
+                marker,
+                checkpoint_dir=checkpoint_dir,
+                adapter_workdir=checkpoint_adapter_workdir,
+                model_id=inputs["model_id"],
+                model_revision=inputs["model_revision"],
+                tokenizer=inputs["tokenizer"],
+                python_bin=python_bin,
+                required_steps=inputs["save_at_steps"],
+            )
+            published_steps.add(step)
+            last_step[0] = max(last_step[0], step)
 
         with liveness_heartbeat(
             "rl_openrlhf_training",
@@ -1133,6 +1572,7 @@ def run_rl_openrlhf() -> None:
                 entrypoint=_OPENRLHF_ENTRYPOINT,
                 cwd=workdir,
                 on_step=on_step,
+                on_line=on_line,
                 heartbeat=lambda: _w.heartbeat(
                     "rl_openrlhf_training",
                     step=last_step[0],
@@ -1144,11 +1584,16 @@ def run_rl_openrlhf() -> None:
             raise RuntimeError(
                 f"openrlhf.cli.train_ppo_ray exited {returncode}; see the worker log"
             )
-        if bridge.call_count == 0:
+        if bridge.call_count == 0 and resumed_step < inputs["steps"]:
             raise RuntimeError("OpenRLHF GRPO completed without scoring any reward")
         if last_step[0] < inputs["steps"]:
             raise RuntimeError(
                 f"OpenRLHF GRPO completed {last_step[0]}/{inputs['steps']} requested updates"
+            )
+        missing_required = sorted(set(inputs["save_at_steps"]) - published_steps)
+        if missing_required:
+            raise RuntimeError(
+                f"required OpenRLHF save steps were not durably published: {missing_required}"
             )
         reward_history = bridge.rewards
 
@@ -1172,7 +1617,8 @@ def run_rl_openrlhf() -> None:
             inputs["model_revision"],
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        _w.publish_deployable_checkpoint(adapter_dir, last_step[0])
+        if final_save_due(last_step[0], inputs["save_at_steps"]):
+            _w.publish_deployable_checkpoint(adapter_dir, last_step[0])
 
     train_wall = time.time() - started_at
     _w.heartbeat(
@@ -1201,6 +1647,12 @@ def run_rl_openrlhf() -> None:
             "scheduled_prompts": scheduled_prompt_count,
             "download_seconds": download_seconds,
             "reward_history": reward_history,
+            "resumed": bool(resume_checkpoint),
+            "init_from_adapter": getattr(
+                getattr(_w.JOB_SPEC, "train", None), "init_from_adapter", ""
+            ),
+            "vllm_kv_cache_dtype": "fp8" if inputs["fp8_kv"] else None,
+            "save_at_steps": list(inputs["save_at_steps"]),
             "group_size": inputs["group_size"],
             "prompts_per_step": inputs["prompts_per_step"],
             "max_completion_len": inputs["max_completion"],
@@ -1212,7 +1664,7 @@ def run_rl_openrlhf() -> None:
                 "temperature": inputs["temperature"],
                 "top_p": inputs["top_p"],
                 "seed": inputs["seed"],
-                "tis": False,
+                "tis": {"mode": "token_truncate", "c_max": 2.0},
             },
         },
     )
