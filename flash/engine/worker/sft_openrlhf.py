@@ -898,6 +898,7 @@ def _install_warmstart_actor_patch():
             super().__init__(pretrain_or_model, *args, lora_rank=0, **kwargs)
             base = self.model
             model = PeftModel.from_pretrained(base, warmstart, is_trainable=True)
+            model.enable_input_require_grads()
             key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
             load_result = model.load_adapter(
                 warmstart,
@@ -945,8 +946,13 @@ def _install_dataloader_and_scheduler_patches():
     original_load_ckpt = DeepspeedStrategy.load_ckpt
 
     def setup_dataloader(self, *args, **kwargs):
+        args = list(args)
         kwargs["drop_last"] = False
-        kwargs["pin_memory"] = True
+        if len(args) >= 3:
+            args[2] = True
+            kwargs.pop("pin_memory", None)
+        else:
+            kwargs["pin_memory"] = True
         return original_setup(self, *args, **kwargs)
 
     def prepare(self, *args):

@@ -685,7 +685,7 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "FLASH_OPENRLHF_LORAPLUS_READY" in source
     assert "loss_mask[:, 1:]" in source
     assert "loss_mask[:, :-1]" not in source
-    assert 'kwargs["pin_memory"] = True' in source
+    assert 'kwargs.pop("pin_memory", None)' in source
     assert "non_blocking=True" in source
     assert "_install_attention_patch()" in source
     assert "_mark_hf_export_ready(args.ckpt.path, global_step)" in source
@@ -736,6 +736,12 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
             return True
 
     class AdapterModel:
+        def __init__(self):
+            self.input_grads_enabled = False
+
+        def enable_input_require_grads(self):
+            self.input_grads_enabled = True
+
         def named_modules(self):
             return [
                 ("layer.lora_A.default", object()),
@@ -777,6 +783,7 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
     patched = models.Actor("base", lora_rank=16)
 
     assert isinstance(patched.model, AdapterModel)
+    assert patched.model.input_grads_enabled is True
     assert "from flash.engine.worker.lora import" not in source
 
 
@@ -793,6 +800,56 @@ def test_short_accumulation_window_uses_realized_loss_norm_and_deepspeed_scale(
     assert namespace["_accumulation_window_scale"](4, 2) == 2.0
     assert "masks, dp_group, dp_size, window_size" in source
     assert '"gpt_loss": step_loss / window_size' in source
+
+
+def test_dataloader_patch_overrides_positional_pin_memory_without_duplication(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    namespace = {"__name__": "flash_openrlhf_sft_dataloader_test"}
+    exec(compile(render_openrlhf_sft_runtime(), "runtime.py", "exec"), namespace)
+
+    class FakeDeepspeedStrategy:
+        def setup_dataloader(self, *args, **kwargs):
+            return args, kwargs
+
+        def prepare(self, *args):
+            return args
+
+        def load_ckpt(self, *args, **kwargs):
+            return None, {}
+
+    openrlhf = ModuleType("openrlhf")
+    openrlhf.__path__ = []
+    utils = ModuleType("openrlhf.utils")
+    utils.__path__ = []
+    deepspeed_package = ModuleType("openrlhf.utils.deepspeed")
+    deepspeed_package.__path__ = []
+    deepspeed_module = ModuleType("openrlhf.utils.deepspeed.deepspeed")
+    deepspeed_module.DeepspeedStrategy = FakeDeepspeedStrategy
+    monkeypatch.setitem(sys.modules, "openrlhf", openrlhf)
+    monkeypatch.setitem(sys.modules, "openrlhf.utils", utils)
+    monkeypatch.setitem(sys.modules, "openrlhf.utils.deepspeed", deepspeed_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "openrlhf.utils.deepspeed.deepspeed",
+        deepspeed_module,
+    )
+
+    namespace["_install_dataloader_and_scheduler_patches"]()
+    positional_args, positional_kwargs = FakeDeepspeedStrategy().setup_dataloader(
+        "dataset", 2, False, True
+    )
+    keyword_args, keyword_kwargs = FakeDeepspeedStrategy().setup_dataloader(
+        "dataset", 2, pin_memory=False
+    )
+
+    assert positional_args == ("dataset", 2, True, True)
+    assert positional_kwargs == {"drop_last": False}
+    assert keyword_args == ("dataset", 2)
+    assert keyword_kwargs == {"drop_last": False, "pin_memory": True}
 
 
 def test_restored_client_state_reaches_runtime_trainer_state(monkeypatch, tmp_path):
