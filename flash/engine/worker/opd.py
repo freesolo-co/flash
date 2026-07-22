@@ -1348,11 +1348,11 @@ def run_opd():
                         _opd_progress(opt_steps, nseq)
                     _queue_teacher_batch(scorable)
                     _drain_ready_teacher_futures()
-                    # Fill this step's echo-scoring idle: generate the NEXT step's rollouts (GPU) while
-                    # the current teacher batch scores over the network. Skip when the next step is the
-                    # final update or a checkpoint boundary, so no un-consumed prefetched slice is ever
-                    # persisted in a resume checkpoint (rollout_seed_ordinal then only reflects
-                    # consumed-and-trained slices).
+                    # fill this step's echo-scoring idle: generate the next step's rollouts (gpu) while
+                    # the current teacher batch scores over the network. skip when this step is the final
+                    # update or a checkpoint boundary, so no unconsumed prefetched slice is ever persisted
+                    # in a resume checkpoint (rollout_seed_ordinal then only reflects consumed-and-trained
+                    # slices).
                     next_update = opt_steps + 1
                     if (
                         step < max_iters
@@ -1616,10 +1616,14 @@ def run_opd():
                         prompt_pool_fingerprint=prompt_pool_fingerprint,
                         required=False,
                     )
-            # on-policy means the next rollout must sample from the just-updated student lora. a due
-            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip the
-            # final sync because no rollout remains and the final adapter is saved from the hf model.
-            if opt_steps < steps:
+            # on-policy means future generation must sample from the just-updated student lora. a due
+            # optimizer-boundary checkpoint must already be durable before this fallible sync. skip when
+            # no rollout remains or the final rollout is already buffered and requires no more generation.
+            if opt_steps < steps and not (
+                generate_ahead_active
+                and prefetched_rollouts is not None
+                and opt_steps == steps - 1
+            ):
                 with liveness_heartbeat(
                     "opd_vllm_sync", progress=lambda s=opt_steps: s, progress_step=True
                 ):

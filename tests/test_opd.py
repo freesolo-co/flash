@@ -2358,7 +2358,41 @@ def test_opd_resumed_at_final_step_does_not_repeat_full_state(monkeypatch):
     ]
 
 
-def test_opd_nondue_step_syncs_before_next_rollout(monkeypatch):
+def test_opd_generate_ahead_skips_sync_when_final_rollout_is_prefetched(monkeypatch):
+    pytest.importorskip("torch")
+
+    def _one_update(*, model, **_kwargs):
+        from flash.engine.worker.opd import SampleResult
+
+        return SampleResult(
+            loss=model.w.float().sum() * 1e-6,
+            teacher_status="ok",
+            coverage=1.0,
+            gen_tokens=1,
+            teacher_tokens=1,
+        )
+
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=2, group=1)
+    engine_type = opd_mod.OpdVllmRolloutEngine
+    original_sync = engine_type.sync_from_model
+    sync_calls = 0
+
+    def _sync(self, model):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 2:
+            raise RuntimeError("unnecessary final-boundary sync")
+        return original_sync(self, model)
+
+    monkeypatch.setattr(engine_type, "sync_from_model", _sync)
+    monkeypatch.setattr(opd_mod, "_publish_opd_deployable", lambda *args, **kwargs: None)
+
+    opd_mod.run_opd()
+
+    assert sync_calls == 1
+
+
+def test_opd_generate_ahead_syncs_before_nonfinal_prefetch(monkeypatch):
     pytest.importorskip("torch")
     events = []
 
@@ -2373,7 +2407,7 @@ def test_opd_nondue_step_syncs_before_next_rollout(monkeypatch):
             teacher_tokens=1,
         )
 
-    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=2, group=1)
+    opd_mod = _opd_harness(monkeypatch, sample_result=_one_update, epochs=3, group=1)
     engine_type = opd_mod.OpdVllmRolloutEngine
     original_sync = engine_type.sync_from_model
     original_generate = engine_type.generate
@@ -2392,11 +2426,8 @@ def test_opd_nondue_step_syncs_before_next_rollout(monkeypatch):
 
     opd_mod.run_opd()
 
-    # Generate-ahead (default for single-turn text) prefetches the next step's rollouts from the
-    # current pre-sync (1-step-stale) student, so step 0 generates its own slice AND prefetches slice 1
-    # before the optimizer sync. The final step reuses the prefetched slice (no generate) and skips the
-    # sync (no rollout remains): sync, generate(slice0), generate(prefetch slice1), sync.
-    assert events == ["sync", "generate", "generate", "sync"]
+    # step 0 syncs after its update before step 1 prefetches slice 2 from the updated weights.
+    assert events == ["sync", "generate", "generate", "sync", "generate"]
 
 
 def test_opd_skips_final_vllm_sync_after_last_optimizer_step(monkeypatch):
