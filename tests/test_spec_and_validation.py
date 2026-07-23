@@ -122,6 +122,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
+    assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -135,6 +136,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "structured_outputs",
             "save_at_steps",
             "credit_assignment",
+            "entropy_quantile",
         }
     } == {"0.2.0"}
 
@@ -218,10 +220,12 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. current adds save_at_steps and credit_assignment, and removes the legacy opd eos key.
+    # did. current adds save_at_steps, credit_assignment, and the entropy-control knobs, and removes
+    # the legacy opd eos key.
     assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
         "save_at_steps",
+        "entropy_quantile",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
