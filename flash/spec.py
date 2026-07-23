@@ -276,6 +276,7 @@ class TrainSpec:
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     advantage_clip: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
@@ -454,6 +455,7 @@ class JobSpec:
                 max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
+                entropy_quantile=_opt_float(train.get("entropy_quantile")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),

@@ -122,6 +122,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         "max_completion_tokens": 256,
         "advantage_clip": 1.5,
         "kl_penalty_coef": 0.02,
+        "entropy_quantile": 0.2,
         "thinking_length_penalty_coef": 0.001,
     }
     grpo_knobs = {
@@ -197,6 +198,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "max_completion_tokens": 256,
             "kl_penalty_coef": 0.02,
             "advantage_clip": 1.5,
+            "entropy_quantile": 0.2,
             "thinking_length_penalty_coef": 0.001,
         },
     }
@@ -206,13 +208,45 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.max_completion_tokens == 256
     assert spec.train.kl_penalty_coef == 0.02
     assert spec.train.advantage_clip == 1.5
+    assert spec.train.entropy_quantile == 0.2
     assert spec.train.thinking_length_penalty_coef == 0.001
     # survives the JSON round-trip the worker reconstructs from
     rt = JobSpec.from_dict(spec.to_dict()).train
     assert rt.group_size == 4
+    assert rt.entropy_quantile == 0.2
     assert rt.thinking_length_penalty_coef == 0.001
     # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
     assert spec.environment.params == {}
+
+
+def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypatch) -> None:
+    import flash.engine.worker as w
+    from flash.schema import spec_from_file
+
+    config = tmp_path / "grpo.toml"
+    config.write_text(
+        '\n'.join(
+            [
+                'model = "Qwen/Qwen3.5-0.8B"',
+                'algorithm = "grpo"',
+                "",
+                "[environment]",
+                'id = "owner/env"',
+                "",
+                "[train]",
+                "entropy_quantile = 0.2",
+            ]
+        )
+    )
+
+    spec = spec_from_file(str(config), run_id="entropy")
+    assert spec.train.entropy_quantile == 0.2
+
+    roundtripped = JobSpec.from_dict(spec.to_dict())
+    assert roundtripped.train.entropy_quantile == 0.2
+
+    monkeypatch.setattr(w, "JOB_SPEC", roundtripped)
+    assert w.grpo_overrides() == {"entropy_quantile": 0.2}
 
 
 def test_opt_int_float_reject_bools() -> None:
@@ -621,6 +655,8 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"learning_rate": -1e-5},
         {"temperature": -0.1},  # must be >= 0
         {"kl_penalty_coef": -1},
+        {"entropy_quantile": -0.01},
+        {"entropy_quantile": 1.01},
         {"batch_size": 1.5},  # non-integer
         {"batch_size": "16"},  # wrong type (string)
         {"learning_rate": [1]},  # wrong type (list) -> 400, not a 500 TypeError
@@ -635,6 +671,72 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     for bad in bad_cases:
         with pytest.raises(ConfigError):
             spec_from_dict({**base, "train": {**bad}}, run_id="bad")
+
+
+def test_apply_grpo_entropy_quantile_sets_key_only_when_configured() -> None:
+    from flash.engine.worker.rl import apply_grpo_entropy_quantile
+
+    d = {}
+    apply_grpo_entropy_quantile(d, None)
+    assert "top_entropy_quantile" not in d
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 0.0)
+    assert d["top_entropy_quantile"] == 0.0
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 0.2)
+    assert d["top_entropy_quantile"] == 0.2
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 1)
+    assert d["top_entropy_quantile"] == 1.0
+    assert isinstance(d["top_entropy_quantile"], float)
+
+    d = {"unrelated": "preserved"}
+    apply_grpo_entropy_quantile(d, 0.2)
+    assert d["unrelated"] == "preserved"
+
+
+def test_entropy_quantile_is_an_optional_grpoconfig_passthrough(tmp_path) -> None:
+    # this is the trl-gated constructor-compatibility check
+    GRPOConfig = pytest.importorskip("trl").GRPOConfig
+
+    from flash.engine.worker.rl import apply_grpo_entropy_quantile
+
+    unset_kwargs = {}
+    apply_grpo_entropy_quantile(unset_kwargs, None)
+    unset = GRPOConfig(
+        output_dir=str(tmp_path / "unset"),
+        loss_type="dr_grpo",
+        report_to=[],
+        bf16=False,
+        use_cpu=True,
+        **unset_kwargs,
+    )
+    assert unset.top_entropy_quantile == 1.0
+
+    configured_kwargs = {}
+    apply_grpo_entropy_quantile(configured_kwargs, 0.2)
+    configured = GRPOConfig(
+        output_dir=str(tmp_path / "configured"),
+        loss_type="dr_grpo",
+        report_to=[],
+        bf16=False,
+        use_cpu=True,
+        **configured_kwargs,
+    )
+    assert configured.top_entropy_quantile == 0.2
+
+
+def test_run_rl_threads_entropy_quantile_to_config() -> None:
+    import inspect
+
+    import flash.engine.worker as w
+
+    source = inspect.getsource(w.run_rl)
+    assert '_entropy_quantile = gcfg.get("entropy_quantile")' in source
+    assert "apply_grpo_entropy_quantile(grpo_kwargs, _entropy_quantile)" in source
 
 
 def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
