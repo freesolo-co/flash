@@ -47,6 +47,7 @@ class SharedGRPOConfig:
     max_response_length: int
     pad_token_id: int
     kl_coef: float = 0.0
+    reward_timeout_s: float = 180.0
 
     def __post_init__(self) -> None:
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -61,6 +62,8 @@ class SharedGRPOConfig:
             raise ValueError("pad_token_id must be an integer")
         if not math.isfinite(float(self.kl_coef)) or self.kl_coef < 0:
             raise ValueError("kl_coef must be non-negative and finite")
+        if not math.isfinite(float(self.reward_timeout_s)) or self.reward_timeout_s <= 0:
+            raise ValueError("reward_timeout_s must be positive and finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,7 @@ class SharedGRPOSample:
     action_token_ids: tuple[int, ...]
     rollout_log_probs: tuple[float, ...]
     truncated: bool
+    canonical_prompt: str
     query: str
     request_id: str
 
@@ -105,6 +109,18 @@ class SharedGRPOTrainingBatch:
     prompt_lengths: tuple[int, ...]
     action_lengths: tuple[int, ...]
 
+    def to(self, device: Any) -> SharedGRPOTrainingBatch:
+        """move every training tensor to the active run adapter device."""
+
+        return SharedGRPOTrainingBatch(
+            sequences=self.sequences.to(device),
+            attention_mask=self.attention_mask.to(device),
+            action_mask=self.action_mask.to(device),
+            rollout_log_probs=self.rollout_log_probs.to(device),
+            prompt_lengths=self.prompt_lengths,
+            action_lengths=self.action_lengths,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SharedGRPORolloutBatch:
@@ -112,6 +128,7 @@ class SharedGRPORolloutBatch:
 
     run_id: str
     step: int
+    prompt_cursor: int
     handle: AdapterHandle
     samples: tuple[SharedGRPOSample, ...]
     training_batch: SharedGRPOTrainingBatch
@@ -162,25 +179,31 @@ def _decode_rollout(
         raise ValueError("shared GRPO rollout must contain exactly one completion")
     generated = outputs[0]
     action_token_ids = tuple(int(token) for token in getattr(generated, "token_ids", ()))
-    if not action_token_ids:
-        raise ValueError("shared GRPO rollout returned an empty completion")
     if len(action_token_ids) > max_response_length:
         raise ValueError("shared GRPO rollout exceeded max_response_length")
     raw_log_probs = getattr(generated, "logprobs", None)
+    if not action_token_ids and raw_log_probs is None:
+        raw_log_probs = ()
     if not isinstance(raw_log_probs, Sequence) or len(raw_log_probs) != len(action_token_ids):
         raise ValueError("shared GRPO rollout requires one log probability per action token")
     rollout_log_probs = tuple(
         _selected_rollout_log_prob(value, token_id)
         for token_id, value in zip(action_token_ids, raw_log_probs, strict=True)
     )
+    canonical_prompt = decode_tokens(prompt.token_ids)
     query = decode_tokens((*prompt.token_ids, *action_token_ids))
+    if not isinstance(canonical_prompt, str) or not canonical_prompt:
+        raise ValueError("decoded shared GRPO prompt must not be empty")
     if not isinstance(query, str) or not query:
         raise ValueError("decoded shared GRPO query must not be empty")
+    if not query.startswith(canonical_prompt):
+        raise ValueError("decoded shared GRPO query does not start with its canonical prompt")
     return SharedGRPOSample(
         prompt=prompt,
         action_token_ids=action_token_ids,
         rollout_log_probs=rollout_log_probs,
         truncated=getattr(generated, "finish_reason", None) == "length",
+        canonical_prompt=canonical_prompt,
         query=query,
         request_id=envelope.request_id,
     )
@@ -201,7 +224,7 @@ def _collate_training_batch(
         prompt_length + action_length
         for prompt_length, action_length in zip(prompt_lengths, action_lengths, strict=True)
     )
-    max_action_length = max(action_lengths)
+    max_action_length = max(1, max(action_lengths))
     batch_size = len(samples)
     sequences = torch.full(
         (batch_size, max_sequence_length),
@@ -289,7 +312,7 @@ class SharedGRPORunAdapter:
         decode_tokens: DecodeTokens,
         policy_log_probs: PolicyLogProbFunction,
         reference_log_probs: ReferenceLogProbFunction | None = None,
-        reward_request: RewardRequest = post_reward_request,
+        reward_request: RewardRequest | None = None,
     ) -> None:
         normalized_run_id = str(run_id).strip()
         if not normalized_run_id:
@@ -302,7 +325,7 @@ class SharedGRPORunAdapter:
             raise TypeError("policy_log_probs must be callable")
         if config.kl_coef > 0 and not callable(reference_log_probs):
             raise ValueError("KL-enabled shared GRPO requires reference_log_probs")
-        if not callable(reward_request):
+        if reward_request is not None and not callable(reward_request):
             raise TypeError("reward_request must be callable")
 
         state = training_actor.run_state(normalized_run_id)
@@ -318,6 +341,16 @@ class SharedGRPORunAdapter:
         self.config = config
         self._training_actor = training_actor
         self._rollout_engine = rollout_engine
+        if reward_request is None:
+
+            def request_with_timeout(url: str, payload: dict[str, Any]) -> Mapping[str, Any]:
+                return post_reward_request(
+                    url,
+                    payload,
+                    timeout=config.reward_timeout_s,
+                )
+
+            reward_request = request_with_timeout
         self._reward_bridge = bind_scoring_bridge(
             _validate_reward_url(reward_url),
             reward_request,
@@ -342,6 +375,7 @@ class SharedGRPORunAdapter:
             rollout=self.rollout,
             scoring_payload=self.scoring_payload,
             update_and_publish=self.update_and_publish,
+            cleanup=self.cleanup,
         )
 
     def add_to_controller(
@@ -361,6 +395,13 @@ class SharedGRPORunAdapter:
             total_steps=total_steps,
             weight=weight,
         )
+
+    async def cleanup(self, run_id: str) -> None:
+        """remove this run's current adapter from the shared rollout engine."""
+
+        self._require_identity(run_id)
+        state = self._training_actor.run_state(self.run_id)
+        await self._rollout_engine.remove_run(self.run_id, state.handle.version)
 
     async def rollout(self, run_id: str, step: int) -> SharedGRPORolloutBatch:
         """generate one ordered GRPO batch through the run's current adapter handle."""
@@ -414,13 +455,10 @@ class SharedGRPORunAdapter:
             )
             for prompt, envelope in zip(ordered_prompts, envelopes, strict=True)
         )
-        self._training_actor.advance_prompt_cursor(
-            self.run_id,
-            self.config.prompts_per_step,
-        )
         return SharedGRPORolloutBatch(
             run_id=self.run_id,
             step=step,
+            prompt_cursor=prompt_cursor,
             handle=handle,
             samples=samples,
             training_batch=_collate_training_batch(
@@ -442,7 +480,7 @@ class SharedGRPORunAdapter:
             "samples": [
                 {
                     "query": [sample.query],
-                    "prompts": [sample.prompt.rendered],
+                    "prompts": [sample.canonical_prompt],
                     "labels": [sample.prompt.label],
                 }
                 for sample in rollout.samples
@@ -485,6 +523,8 @@ class SharedGRPORunAdapter:
         state = self._training_actor.run_state(self.run_id)
         if state.handle != rollout.handle:
             raise ValueError("shared GRPO update received a stale adapter rollout")
+        if state.prompt_cursor != rollout.prompt_cursor:
+            raise ValueError("shared GRPO update received a stale prompt cursor")
         reward_tensor = torch.tensor(
             [result.reward for result in rewards.results],
             dtype=torch.float32,
@@ -492,19 +532,20 @@ class SharedGRPORunAdapter:
         captured: list[OpenRLHFGRPOLoss] = []
 
         def loss_function(model: Any, active_state: TrainingRunState) -> Any:
+            device_batch = rollout.training_batch.to(active_state.adapter_parameters[0].device)
             model.eval()
             try:
                 with torch.no_grad():
                     old_action_log_probs = self._policy_log_probs(
                         model,
                         active_state,
-                        rollout.training_batch,
+                        device_batch,
                     ).detach()
                     base_action_log_probs = (
                         self._reference_log_probs(
                             model,
                             active_state,
-                            rollout.training_batch,
+                            device_batch,
                         ).detach()
                         if self._reference_log_probs is not None
                         else None
@@ -514,14 +555,14 @@ class SharedGRPORunAdapter:
             action_log_probs = self._policy_log_probs(
                 model,
                 active_state,
-                rollout.training_batch,
+                device_batch,
             )
             objective = openrlhf_grpo_loss(
                 action_log_probs,
                 old_action_log_probs,
-                rollout.training_batch.rollout_log_probs.to(action_log_probs.device),
+                device_batch.rollout_log_probs,
                 reward_tensor.to(action_log_probs.device),
-                rollout.training_batch.action_mask.to(action_log_probs.device),
+                device_batch.action_mask,
                 self.config.max_response_length,
                 self.config.group_size,
                 base_action_log_probs=base_action_log_probs,
@@ -533,6 +574,10 @@ class SharedGRPORunAdapter:
         training_step = await self._training_actor.step(self.run_id, loss_function)
         if len(captured) != 1:
             raise RuntimeError("shared GRPO loss hook did not execute exactly once")
+        self._training_actor.advance_prompt_cursor(
+            self.run_id,
+            self.config.prompts_per_step,
+        )
         objective = captured[0]
         detached_objective = OpenRLHFGRPOLoss(
             objective.loss.detach(),
