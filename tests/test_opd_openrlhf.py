@@ -1715,15 +1715,35 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     zero3_model = _TinyCausalLM()
     zero3_model.load_state_dict(initial_state)
     zero3_model.lm_head.weight.ds_id = 1
+    zero3_model.lm_head.weight.ds_process_group = object()
     zero3_actor = _ActorModel(zero3_model)
-    with attention_context():
-        zero3_logps = namespace["_flash_chunked_action_log_probs"](
-            zero3_actor,
-            sequences,
-            action_mask,
-            attention_mask,
+
+    def all_reduce(chunk_count, op=None, group=None):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is zero3_model.lm_head.weight.ds_process_group
+        chunk_count.fill_(3)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.distributed, "is_initialized", lambda: True)
+        patch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        patch.setattr(torch.distributed, "all_reduce", all_reduce)
+        with attention_context():
+            zero3_logps = namespace["_flash_chunked_action_log_probs"](
+                zero3_actor,
+                sequences,
+                action_mask,
+                attention_mask,
+            )
+        zero3_logps.sum().backward()
+        empty_zero3_hidden = torch.empty((0, 5), requires_grad=True)
+        empty_zero3_logps = namespace["_flash_chunked_token_logps"](
+            zero3_model.lm_head,
+            empty_zero3_hidden,
+            torch.empty((0,), dtype=torch.long),
+            temperature=0.7,
+            zero3_active=True,
         )
-    zero3_logps.sum().backward()
+        empty_zero3_logps.sum().backward()
 
     assert zero3_calls[0] == (
         "register",
@@ -1731,7 +1751,10 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         zero3_model.lm_head.weight,
         True,
     )
-    assert [call[0] for call in zero3_calls].count("checkpoint") == 1
+    assert [call[0] for call in zero3_calls].count("checkpoint") == 6
+    assert torch.allclose(zero3_logps, reference_logps, atol=1e-6, rtol=0)
+    assert empty_zero3_logps.shape == (0,)
+    assert empty_zero3_hidden.grad is not None
     assert zero3_model.lm_head.weight.grad is not None
 
     import torch.utils.checkpoint as checkpoint_mod

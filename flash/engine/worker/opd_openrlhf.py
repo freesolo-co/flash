@@ -1124,6 +1124,23 @@ def _flash_zero3_managed_parameters(module):
     return [parameter for parameter in module.parameters() if hasattr(parameter, "ds_id")]
 
 
+def _flash_zero3_synchronized_chunk_count(selected_count, chunk_size, output_head, device):
+    local_chunks = (int(selected_count) + int(chunk_size) - 1) // int(chunk_size)
+    parameters = _flash_zero3_managed_parameters(output_head)
+    if not parameters or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_chunks
+    process_group = getattr(parameters[0], "ds_process_group", None)
+    if torch.distributed.get_world_size(group=process_group) <= 1:
+        return local_chunks
+    max_chunks = torch.tensor(local_chunks, device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        max_chunks,
+        op=torch.distributed.ReduceOp.MAX,
+        group=process_group,
+    )
+    return int(max_chunks.item())
+
+
 def _flash_register_zero3_external_output_head(actor, output_head):
     parameters = _flash_zero3_managed_parameters(output_head)
     if not parameters:
@@ -1196,8 +1213,6 @@ def _flash_chunked_token_logps(
         raise ValueError("OpenRLHF OPD chunked projection token counts differ")
     if float(temperature) <= 0:
         raise ValueError("OpenRLHF OPD rollout temperature must be positive")
-    if hidden_states.shape[0] == 0:
-        return hidden_states.float().sum(dim=-1)
 
     def _logps(hidden_chunk, ids_chunk):
         logits = lm_head(hidden_chunk).float()
@@ -1207,6 +1222,8 @@ def _flash_chunked_token_logps(
 
     if zero3_active is None:
         zero3_active = bool(_flash_zero3_managed_parameters(lm_head))
+    if hidden_states.shape[0] == 0 and not zero3_active:
+        return hidden_states.float().sum(dim=-1)
 
     def checkpoint(function, *args):
         return torch_checkpoint(function, *args, use_reentrant=False)
@@ -1228,8 +1245,35 @@ def _flash_chunked_token_logps(
                 checkpoint = deepspeed_checkpoint
 
     size = max(1, int(chunk_size))
+    selected_count = int(hidden_states.shape[0])
+    if zero3_active:
+        synchronized_chunks = _flash_zero3_synchronized_chunk_count(
+            selected_count,
+            size,
+            lm_head,
+            hidden_states.device,
+        )
+        padded_count = synchronized_chunks * size
+        padding_count = padded_count - selected_count
+        if padding_count:
+            zero_hidden = (
+                hidden_states[:1] * 0.0
+                if selected_count
+                else hidden_states.sum(dim=0, keepdim=True) * 0.0
+            )
+            hidden_states = torch.cat(
+                [hidden_states, zero_hidden.expand(padding_count, -1)],
+                dim=0,
+            )
+            token_ids = torch.cat(
+                [token_ids, token_ids.new_zeros(padding_count)],
+                dim=0,
+            )
+    else:
+        padded_count = selected_count
+
     chunks = []
-    for start in range(0, hidden_states.shape[0], size):
+    for start in range(0, padded_count, size):
         hidden_chunk = hidden_states[start : start + size]
         ids_chunk = token_ids[start : start + size]
         if torch.is_grad_enabled():
@@ -1242,7 +1286,9 @@ def _flash_chunked_token_logps(
             )
         else:
             chunks.append(_logps(hidden_chunk, ids_chunk))
-    return torch.cat(chunks)
+    if not chunks:
+        return hidden_states.float().sum(dim=-1)
+    return torch.cat(chunks)[:selected_count]
 
 
 def _flash_chunked_action_log_probs(actor, sequences, action_mask, attention_mask, *, chunk_size=None):
