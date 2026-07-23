@@ -175,9 +175,6 @@ class SharedQueueAllocationBackend:
         from flash.runner import flash_code_prefix
 
         seed_spec = request.seed_spec
-        execution_timeout_ms = (
-            max(int(run.spec.gpu.max_wall_seconds) for run in request.runs) * 1000
-        )
         dependency_sets: list[tuple[str, ...]] = []
         for run in request.runs:
             dependencies = list(run.spec.environment.pip) or worker_pip_for_env(
@@ -203,6 +200,7 @@ class SharedQueueAllocationBackend:
                 code_prefix=code_prefix,
                 deadline_at=request.deadline_at,
             )
+        execution_timeout_ms = int(require_create_allowance(request.deadline_at)) * 1000
         payload = {
             "hf_repo": seed_spec.train.hf_repo,
             "job_spec_json": seed_spec.to_json(),
@@ -270,7 +268,7 @@ class SharedQueueAllocationBackend:
             raise TypeError("shared allocation handle must provide to_dict")
         canonical = JobHandle.from_dict(handle.to_dict())
         if not _strict_teardown_handle(canonical, bundle_id):
-            raise RuntimeError("shared allocation endpoint deletion was not confirmed")
+            self._persist_cleanup_handle(canonical.to_dict())
 
 
 class SharedBundleAllocationSession:
@@ -300,6 +298,7 @@ class SharedBundleAllocationSession:
         self._bundle = bundle
         self._backend = backend
         self._clock = clock
+        self._deadline_at = float(self._clock()) + wall_limits.pop()
         self._lock = threading.RLock()
         self._allocation_state = SharedAllocationState.NEW
         self._handle: object | None = None
@@ -379,14 +378,13 @@ class SharedBundleAllocationSession:
                 )
                 for snapshot in self._bundle.run_snapshots()
             )
-            max_wall_seconds = max(int(run.spec.gpu.max_wall_seconds) for run in runs)
             return SharedAllocationRequest(
                 bundle_id=self.bundle_id,
                 compatibility_key=self._bundle.compatibility_key,
                 runs=runs,
                 admitted_run_count=len(runs),
                 engine_adapter_capacity=len(runs) + 1,
-                deadline_at=float(self._clock()) + max_wall_seconds,
+                deadline_at=self._deadline_at,
             )
 
     def allocate(self) -> object:
@@ -397,8 +395,14 @@ class SharedBundleAllocationSession:
                 raise SharedAllocationStateError(
                     "shared bundle allocation may be created only once"
                 )
+            from flash.providers.base import UnreconciledCreateError
+
             request = self.allocation_request()
-            handle = self._backend.allocate(request)
+            try:
+                handle = self._backend.allocate(request)
+            except UnreconciledCreateError:
+                self._allocation_state = SharedAllocationState.RELEASED
+                raise
             self._handle = handle
             self._allocation_state = SharedAllocationState.ACTIVE
             return handle
@@ -435,10 +439,14 @@ class SharedBundleAllocationSession:
 
         with self._lock:
             normalized = self._authorize(run_id, token)
-            self._require_active_allocation()
             snapshot = self._bundle.run_snapshot(normalized)
             if snapshot.status is LogicalRunStatus.DONE:
+                if self._allocation_state is SharedAllocationState.ACTIVE:
+                    self._release_if_terminal()
+                elif self._allocation_state is not SharedAllocationState.RELEASED:
+                    self._require_active_allocation()
                 return self._control_snapshot(normalized)
+            self._require_active_allocation()
             if snapshot.status is LogicalRunStatus.ACTIVE:
                 self._bundle.transition_run(normalized, LogicalRunStatus.FINISHING)
             elif snapshot.status is not LogicalRunStatus.FINISHING:
@@ -453,10 +461,14 @@ class SharedBundleAllocationSession:
 
         with self._lock:
             normalized = self._authorize(run_id, token)
-            self._require_active_allocation()
             snapshot = self._bundle.run_snapshot(normalized)
             if snapshot.status is LogicalRunStatus.FAILED:
+                if self._allocation_state is SharedAllocationState.ACTIVE:
+                    self._release_if_terminal()
+                elif self._allocation_state is not SharedAllocationState.RELEASED:
+                    self._require_active_allocation()
                 return self._control_snapshot(normalized)
+            self._require_active_allocation()
             if snapshot.status in _TERMINAL_RUN_STATUSES:
                 raise SharedAllocationStateError("a terminal logical run cannot fail again")
             was_started = snapshot.status in {
@@ -475,10 +487,14 @@ class SharedBundleAllocationSession:
 
         with self._lock:
             normalized = self._authorize(run_id, token)
-            self._require_active_allocation()
             snapshot = self._bundle.run_snapshot(normalized)
             if snapshot.status is LogicalRunStatus.CANCELLED:
+                if self._allocation_state is SharedAllocationState.ACTIVE:
+                    self._release_if_terminal()
+                elif self._allocation_state is not SharedAllocationState.RELEASED:
+                    self._require_active_allocation()
                 return self._control_snapshot(normalized)
+            self._require_active_allocation()
             if snapshot.status in _TERMINAL_RUN_STATUSES:
                 raise SharedAllocationStateError("a terminal logical run cannot be cancelled")
             self._bundle.transition_run(normalized, LogicalRunStatus.CANCELLED)
