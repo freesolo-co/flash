@@ -18,7 +18,7 @@ from flash.spec import JobSpec, WandbSpec
 
 def _base(**extra: object) -> dict:
     cfg = {
-        "model": "openbmb/MiniCPM5-1B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
         "train": {"hf_repo": "me/repo", "max_examples": 8},
@@ -100,7 +100,7 @@ def test_wandb_section_must_be_a_table():
 def _toml(tmp_path) -> str:
     cfg = tmp_path / "run.toml"
     cfg.write_text(
-        'model = "openbmb/MiniCPM5-1B"\n'
+        'model = "Qwen/Qwen3.5-0.8B"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
         'id = "github:owner/repo@main:some-env/environment.py"\n'
@@ -217,7 +217,7 @@ def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, m
     from flash.client.runtime_secrets import runtime_secrets_from_local_env
 
     cfg = tmp_path / "run.toml"
-    cfg.write_text('model = "openbmb/MiniCPM5-1B"\n')
+    cfg.write_text('model = "Qwen/Qwen3.5-0.8B"\n')
     (tmp_path / ".env").write_text(
         "WANDB_API_KEY=wb-from-user-file\n"
         "SERPAPI_API_KEY=serp-from-user-file\n"

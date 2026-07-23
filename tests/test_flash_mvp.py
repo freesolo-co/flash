@@ -121,5 +121,9 @@ def test_cli_train_dry_run(monkeypatch, capsys):
         rc = main(["train", config, "--dry-run"])
         assert rc == 0
         assert seen["dry_run"] is True
-        payload = json.loads(capsys.readouterr().out)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
         assert payload["state"] == "dry_run"
+        assert "dry-run validated" not in captured.out
+        assert "dry-run validated: config/schema" in captured.err
+        assert "did NOT import or run your environment.py" in captured.err

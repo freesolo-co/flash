@@ -109,6 +109,40 @@ def test_setup_vs_training_gate_contract():
     assert is_training_heartbeat("sft_trained", None) is True
 
 
+def test_format_heartbeat_includes_rl_step_metrics():
+    from flash.providers._poll import _format_heartbeat
+
+    rendered = _format_heartbeat(
+        {
+            "stage": "rl_step",
+            "step": 4,
+            "reward": 0.75,
+            "reward_std": 0.12,
+            "grad_norm": 1.5,
+            "kl": 0.03,
+            "entropy": 0.82,
+            "frac_reward_zero_std": 0.25,
+            "mean_completion_tokens": 48.5,
+            "truncation_rate": 0.125,
+            "max_completion_tokens": 256,
+        }
+    )
+
+    for field in (
+        "step=4",
+        "reward=0.750",
+        "reward_std=0.120",
+        "grad_norm=1.500",
+        "kl=0.030",
+        "entropy=0.820",
+        "frac_reward_zero_std=0.250",
+        "mean_completion_tokens=48.500",
+        "truncation_rate=0.125",
+        "max_completion_tokens=256",
+    ):
+        assert field in rendered
+
+
 def test_runpod_provider_implements_the_interface():
     from flash.providers import get_provider
     from flash.providers.base import Provider

@@ -44,6 +44,28 @@ def test_sft_max_context_tokens_at_cap_allowed():
     )
 
 
+def test_27b_sft_context_at_serving_cap_allowed():
+    preflight_train_context_within_serving(
+        _spec(model="Qwen/Qwen3.6-27B", algorithm="sft", max_context_tokens=32768)
+    )
+
+
+def test_27b_sft_context_above_serving_cap_rejected():
+    spec = _spec(model="Qwen/Qwen3.6-27B", algorithm="sft", max_context_tokens=32769)
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+        preflight_train_context_within_serving(spec)
+
+
+def test_27b_grpo_effective_rollout_above_serving_cap_rejected():
+    spec = _spec(
+        model="Qwen/Qwen3.6-27B",
+        algorithm="grpo",
+        max_completion_tokens=40000,
+    )
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+        preflight_train_context_within_serving(spec)
+
+
 def test_sft_unset_max_context_tokens_allowed():
     # Unset -> the worker's small recipe default, always within the cap.
     preflight_train_context_within_serving(_spec(model="Qwen/Qwen3.5-4B", algorithm="sft"))
@@ -70,10 +92,33 @@ def test_grpo_unset_rollout_within_35b_cap_allowed():
 
 
 def test_grpo_big_max_completion_tokens_pushes_rollout_over_cap_rejected():
-    # A large completion budget makes prompt+completion (grpo_rollout_seq_len) exceed the served ctx.
+    # a large completion budget makes prompt+completion exceed the served context.
     spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="grpo", max_completion_tokens=40000)
     with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
         preflight_train_context_within_serving(spec)
+
+
+def test_opd_rollout_context_above_serving_cap_rejected():
+    spec = _spec(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="opd",
+        max_completion_tokens=3500,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"OPD rollout prompt\+completion\)=4524 exceeds .*max_model_len=4096",
+    ):
+        preflight_train_context_within_serving(spec)
+
+
+def test_opd_rollout_context_within_serving_cap_allowed():
+    preflight_train_context_within_serving(
+        _spec(
+            model="Qwen/Qwen3.6-35B-A3B",
+            algorithm="opd",
+            max_completion_tokens=3000,
+        )
+    )
 
 
 def test_open_policy_uncataloged_model_skipped():
