@@ -1319,17 +1319,7 @@ def _install_chunked_loss_forward(actor):
             )
         kwargs.pop("use_cache", None)
         kwargs.pop("logits_to_keep", None)
-        multimodal = is_vlm and any(
-            kwargs.get(key) is not None
-            for key in (
-                "pixel_values",
-                "pixel_values_videos",
-                "image_grid_thw",
-                "video_grid_thw",
-                "image_sizes",
-            )
-        )
-        if multimodal:
+        if is_vlm:
             hidden_states = vlm_hidden_states(input_ids, attention_mask, kwargs)
             outputs = None
         else:

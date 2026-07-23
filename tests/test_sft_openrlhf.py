@@ -721,17 +721,19 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
         def forward(
             self,
             input_ids,
-            pixel_values,
-            image_grid_thw,
-            mm_token_type_ids,
+            pixel_values=None,
+            image_grid_thw=None,
+            mm_token_type_ids=None,
             **_kwargs,
         ):
             del image_grid_thw
             self.full_forward_calls += 1
-            self.seen_mm_token_type_ids = mm_token_type_ids.detach().clone()
-            vision_hidden = self.visual.patch_embed(pixel_values)
-            vision_hidden = checkpoint(self.vision_block, vision_hidden, use_reentrant=True)
-            hidden = self.embedding(input_ids) + vision_hidden.sum()
+            hidden = self.embedding(input_ids)
+            if pixel_values is not None:
+                self.seen_mm_token_type_ids = mm_token_type_ids.detach().clone()
+                vision_hidden = self.visual.patch_embed(pixel_values)
+                vision_hidden = checkpoint(self.vision_block, vision_hidden, use_reentrant=True)
+                hidden = hidden + vision_hidden.sum()
             return SimpleNamespace(logits=self.output_head(hidden))
 
     class PeftModel(torch.nn.Module):
@@ -803,6 +805,31 @@ def test_rendered_runtime_uses_full_vlm_forward_without_full_head_projection(mon
     assert base_lm.output_head.weight.grad is not None
     assert base_lm.output_head.projection_shapes == [(2, 5)] * 4
     assert len(base_lm.visual.patch_embed._forward_hooks) == 1
+
+    base_lm.zero_grad(set_to_none=True)
+    base_lm.output_head.projection_shapes.clear()
+    text_hidden = base_lm.embedding(input_ids)
+    text_expected = functional.cross_entropy(
+        functional.linear(
+            text_hidden[:, :-1, :], base_lm.output_head.weight, base_lm.output_head.bias
+        )[shifted_mask],
+        input_ids[:, 1:][shifted_mask],
+    )
+    text_output = patched_engine(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        flash_loss_denominator=shifted_mask.sum(),
+        flash_dp_size=1,
+    )
+
+    assert base_lm.full_forward_calls == 2
+    assert base_lm.base_model.direct_calls == 0
+    assert text_output.loss.item() == pytest.approx(text_expected.item(), abs=1e-5)
+    text_output.loss.backward()
+    assert base_lm.embedding.weight.grad is not None
+    assert base_lm.output_head.weight.grad is not None
+    assert base_lm.output_head.projection_shapes == [(2, 5)] * 4
 
 
 @requires_torch
