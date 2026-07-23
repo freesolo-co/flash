@@ -421,6 +421,22 @@ def _cached_model_path(model_id: str, model_revision: str) -> str:
     )
 
 
+def _zero3_managed_parameters(module):
+    return [parameter for parameter in module.parameters() if hasattr(parameter, "ds_id")]
+
+
+def _register_zero3_external_output_head(forward_module, output_head) -> bool:
+    parameters = _zero3_managed_parameters(output_head)
+    if not parameters:
+        return False
+    import deepspeed
+
+    register = deepspeed.zero.register_external_parameter
+    for parameter in parameters:
+        register(forward_module, parameter)
+    return True
+
+
 def _selected_token_nll_chunk(
     hidden_states,
     output_head,
@@ -450,10 +466,11 @@ def _chunked_selected_token_nll(
     dp_size: int = 1,
     logit_scale: float = 1.0,
     final_logit_softcapping: float | None = None,
+    zero3_active: bool | None = None,
 ):
     """compute exact completion-only next-token nll without full-sequence logits."""
     import torch
-    from torch.utils.checkpoint import checkpoint
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
     if int(chunk_size) <= 0:
         raise ValueError("chunk_size must be positive")
@@ -467,6 +484,28 @@ def _chunked_selected_token_nll(
     if selected_count == 0:
         raise ValueError("chunked SFT loss received no completion target")
 
+    if zero3_active is None:
+        zero3_active = bool(_zero3_managed_parameters(output_head))
+
+    def checkpoint(function, *args):
+        return torch_checkpoint(function, *args, use_reentrant=False)
+
+    if zero3_active:
+
+        def checkpoint(function, *args):
+            return torch_checkpoint(function, *args, use_reentrant=True)
+
+        try:
+            import deepspeed
+        except ImportError:
+            pass
+        else:
+            deepspeed_checkpoint = getattr(
+                getattr(deepspeed, "checkpointing", None), "checkpoint", None
+            )
+            if callable(deepspeed_checkpoint):
+                checkpoint = deepspeed_checkpoint
+
     loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
     for start in range(0, selected_count, int(chunk_size)):
         end = min(start + int(chunk_size), selected_count)
@@ -477,7 +516,6 @@ def _chunked_selected_token_nll(
             selected_labels[start:end],
             float(logit_scale),
             final_logit_softcapping,
-            use_reentrant=False,
         )
         loss_sum = loss_sum + chunk_loss
 
@@ -1340,6 +1378,8 @@ def _install_chunked_loss_forward(actor):
                 **kwargs,
             )
             hidden_states = outputs.last_hidden_state
+        # delay registration until after the backbone forward, then hold the head for recompute
+        zero3_output_head = _register_zero3_external_output_head(base_lm, output_head)
         loss = _chunked_selected_token_nll(
             hidden_states,
             output_head,
@@ -1350,6 +1390,7 @@ def _install_chunked_loss_forward(actor):
             dp_size=int(flash_dp_size),
             logit_scale=logit_scale,
             final_logit_softcapping=final_logit_softcapping,
+            zero3_active=zero3_output_head,
         )
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1552,6 +1593,8 @@ def apply_flash_openrlhf_sft_patches():
         inspect.getsource(function)
         for function in (
             enable_multimodal_input_require_grads,
+            _zero3_managed_parameters,
+            _register_zero3_external_output_head,
             _selected_token_nll_chunk,
             _chunked_selected_token_nll,
         )

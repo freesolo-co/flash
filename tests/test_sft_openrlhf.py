@@ -18,6 +18,7 @@ from flash.engine.worker.sft_openrlhf import (
     _OpenRLHFCheckpointWatcher,
     _probe_gpu_in_subprocess,
     _processor_tokenized_row,
+    _register_zero3_external_output_head,
     _resolve_immutable_model_revision,
     _serialize_multimodal_inputs,
     _training_batch_shape,
@@ -500,6 +501,84 @@ def test_chunked_selected_token_nll_matches_full_loss_and_gradients(chunk_size):
     assert torch.allclose(hidden.grad, full_hidden_grad, atol=1e-5, rtol=1e-5)
     assert torch.allclose(output_head.weight.grad, full_weight_grad, atol=1e-5, rtol=1e-5)
     assert torch.allclose(output_head.bias.grad, full_bias_grad, atol=1e-5, rtol=1e-5)
+
+
+@requires_torch
+def test_zero3_chunked_nll_registers_output_head_and_uses_deepspeed_checkpoint(monkeypatch):
+    import torch
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    calls = []
+
+    def register_external_parameter(module, parameter):
+        calls.append(("register", module, parameter))
+
+    def checkpoint(function, *args):
+        calls.append(("checkpoint", function))
+        return torch_checkpoint(function, *args, use_reentrant=True)
+
+    deepspeed = ModuleType("deepspeed")
+    deepspeed.checkpointing = SimpleNamespace(checkpoint=checkpoint)
+    deepspeed.zero = SimpleNamespace(register_external_parameter=register_external_parameter)
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed)
+
+    forward_module = torch.nn.Module()
+    output_head = torch.nn.Linear(3, 7)
+    output_head.weight.ds_id = 1
+    hidden_states = torch.randn(1, 3, 3, requires_grad=True)
+    input_ids = torch.tensor([[0, 1, 5]])
+    loss_mask = torch.tensor([[0, 1, 1]], dtype=torch.bool)
+
+    assert _register_zero3_external_output_head(forward_module, output_head) is True
+    loss = _chunked_selected_token_nll(
+        hidden_states,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=2,
+        zero3_active=True,
+    )
+    loss.backward()
+
+    assert calls[0] == ("register", forward_module, output_head.weight)
+    assert [call[0] for call in calls].count("checkpoint") == 1
+    assert hidden_states.grad is not None
+    assert output_head.weight.grad is not None
+
+
+@requires_torch
+def test_zero3_chunked_nll_falls_back_to_torch_reentrant(monkeypatch):
+    import torch
+    import torch.utils.checkpoint as checkpoint_mod
+
+    checkpoint_calls = []
+    original_checkpoint = checkpoint_mod.checkpoint
+
+    def checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs.get("use_reentrant"))
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_mod, "checkpoint", checkpoint)
+    monkeypatch.setitem(sys.modules, "deepspeed", ModuleType("deepspeed"))
+
+    output_head = torch.nn.Linear(3, 7)
+    output_head.weight.ds_id = 1
+    hidden_states = torch.randn(1, 3, 3, requires_grad=True)
+    input_ids = torch.tensor([[0, 1, 5]])
+    loss_mask = torch.tensor([[0, 1, 1]], dtype=torch.bool)
+
+    loss = _chunked_selected_token_nll(
+        hidden_states,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=2,
+        zero3_active=True,
+    )
+    loss.backward()
+
+    assert checkpoint_calls == [True]
+    assert hidden_states.grad is not None
 
 
 @requires_torch
