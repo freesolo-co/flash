@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -842,13 +843,18 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
     if images:
         raise RuntimeError("OpenRLHF OPD multimodal support is deferred")
     base_identity = _flash_identity(label)
-    rollout_key = (base_identity["global_step"], base_identity["example_index"])
+    rollout_key = (
+        base_identity["global_step"],
+        base_identity["example_index"],
+        base_identity["rollout_ordinal"],
+    )
     rollout_ordinals = getattr(self, "_flash_opd_rollout_ordinals", None)
     if rollout_ordinals is None:
         rollout_ordinals = {}
         self._flash_opd_rollout_ordinals = rollout_ordinals
-    base_identity["rollout_ordinal"] = rollout_ordinals.get(rollout_key, 0)
-    rollout_ordinals[rollout_key] = base_identity["rollout_ordinal"] + 1
+    sample_ordinal = rollout_ordinals.get(rollout_key, 0)
+    rollout_ordinals[rollout_key] = sample_ordinal + 1
+    base_identity["rollout_ordinal"] += sample_ordinal
     bare_executor = _FlashSingleTurnExecutor(None)
     for attempt in range(_FLASH_OPD_MAX_ATTEMPTS):
         identity = dict(base_identity)
@@ -1066,6 +1072,7 @@ def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_s
     periodic_due = (
         not _FLASH_OPD_EXACT_SAVE_STEPS
         and original_save_steps != float("inf")
+        and int(original_save_steps) > 0
         and global_step % int(original_save_steps) == 0
     )
     save_due = (
@@ -1091,7 +1098,8 @@ def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_s
 
 
 _FlashPPOTrainerRuntime.save_logs_and_checkpoints = _flash_save_logs_and_checkpoints
-_original_ppo_fit = _FlashPPOTrainerRuntime.fit
+_grpo_ppo_fit = _FlashPPOTrainerRuntime.fit
+_original_ppo_fit = getattr(_grpo_ppo_fit, "__wrapped__", _grpo_ppo_fit)
 
 
 @functools.wraps(_original_ppo_fit)
@@ -1684,20 +1692,28 @@ def _write_scheduled_dataset(
     *,
     steps: int,
     prompts_per_step: int,
+    group_size: int,
 ) -> int:
     if not prompts:
         raise ValueError("cannot schedule an empty OpenRLHF OPD prompt dataset")
+    if isinstance(group_size, bool) or int(group_size) < 1:
+        raise ValueError("OpenRLHF OPD group_size must be positive")
     scheduled_count = int(steps) * int(prompts_per_step)
     if scheduled_count <= 0:
         raise ValueError("OpenRLHF OPD prompt schedule must contain at least one row")
+    rollout_ordinals: Counter[int] = Counter()
     with open(path, "w", encoding="utf-8") as dataset_file:
         for ordinal in range(scheduled_count):
             global_step = ordinal // prompts_per_step
+            if ordinal % prompts_per_step == 0:
+                rollout_ordinals.clear()
             example_index = ordinal % len(prompts)
+            rollout_ordinal = rollout_ordinals[example_index] * int(group_size)
+            rollout_ordinals[example_index] += 1
             identity = {
                 "global_step": global_step,
                 "example_index": example_index,
-                "rollout_ordinal": 0,
+                "rollout_ordinal": rollout_ordinal,
                 "no_signal_attempt": 0,
             }
             dataset_file.write(
@@ -1933,6 +1949,7 @@ def run_opd_openrlhf() -> None:
         inputs["prompts"],
         steps=inputs["steps"],
         prompts_per_step=inputs["prompts_per_step"],
+        group_size=inputs["group_size"],
     )
     qwen35_language_model_only = bool(
         _w.is_vl_checkpoint(inputs["model_id"], inputs["model_revision"])

@@ -159,6 +159,20 @@ class SharedOPDTrainingBatch:
     action_lengths: tuple[int, ...]
     coverage: Any
 
+    def to(self, device: Any) -> SharedOPDTrainingBatch:
+        """move every training tensor to the active run adapter device."""
+
+        return SharedOPDTrainingBatch(
+            sequences=self.sequences.to(device),
+            attention_mask=self.attention_mask.to(device),
+            response_mask=self.response_mask.to(device),
+            group_ids=self.group_ids.to(device),
+            teacher_logsums=self.teacher_logsums.to(device),
+            prompt_lengths=self.prompt_lengths,
+            action_lengths=self.action_lengths,
+            coverage=self.coverage.to(device),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SharedOPDUpdateResult:
@@ -423,6 +437,7 @@ class SharedOPDRunAdapter:
             rollout=self.rollout,
             scoring_payload=self.scoring_payload,
             update_and_publish=self.update_and_publish,
+            cleanup=self.cleanup,
         )
 
     def add_to_controller(
@@ -442,6 +457,13 @@ class SharedOPDRunAdapter:
             total_steps=total_steps,
             weight=weight,
         )
+
+    async def cleanup(self, run_id: str) -> None:
+        """remove this run's current adapter from the shared rollout engine."""
+
+        self._require_identity(run_id)
+        state = self._training_actor.run_state(self.run_id)
+        await self._rollout_engine.remove_run(self.run_id, state.handle.version)
 
     async def rollout(self, run_id: str, step: int) -> SharedOPDRolloutBatch:
         """generate one ordered OPD batch through the run's current adapter handle."""
@@ -656,19 +678,17 @@ class SharedOPDRunAdapter:
             return result
 
         def loss_function(model: Any, active_state: TrainingRunState) -> Any:
-            student_logprobs = self._policy_log_probs(model, active_state, training_batch)
-            if student_logprobs.shape != training_batch.response_mask.shape:
+            device_batch = training_batch.to(active_state.adapter_parameters[0].device)
+            student_logprobs = self._policy_log_probs(model, active_state, device_batch)
+            if student_logprobs.shape != device_batch.response_mask.shape:
                 raise ValueError(
                     "shared OPD policy log probabilities do not match the action tensor shape"
                 )
             objective = flash_groupwise_reverse_kl(
                 student_logprobs,
-                training_batch.teacher_logsums.to(
-                    device=student_logprobs.device,
-                    dtype=student_logprobs.dtype,
-                ),
-                training_batch.group_ids.to(student_logprobs.device),
-                training_batch.response_mask.to(student_logprobs.device),
+                device_batch.teacher_logsums.to(dtype=student_logprobs.dtype),
+                device_batch.group_ids,
+                device_batch.response_mask,
                 self.config.kl_penalty_coef,
             )
             captured.append(objective)

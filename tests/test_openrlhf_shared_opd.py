@@ -22,6 +22,7 @@ from flash.engine.worker.openrlhf_shared_opd import (
     SharedOPDConfig,
     SharedOPDPrompt,
     SharedOPDRunAdapter,
+    SharedOPDTrainingBatch,
     _collate_training_batch,
 )
 from flash.engine.worker.openrlhf_shared_scheduler import RunPhase, SharedEngineRunController
@@ -58,6 +59,7 @@ class _SamplingParams:
 class _FakeVLLMEngine:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.removed: list[int] = []
 
     async def add_lora(self, _request: _FakeLoRARequest) -> bool:
         return True
@@ -65,7 +67,8 @@ class _FakeVLLMEngine:
     async def pin_lora(self, _int_id: int) -> bool:
         return True
 
-    async def remove_lora(self, _int_id: int) -> bool:
+    async def remove_lora(self, int_id: int) -> bool:
+        self.removed.append(int_id)
         return True
 
     def generate(
@@ -658,6 +661,57 @@ def test_opd_all_no_signal_advances_without_optimizer_or_adapter_mutation(tmp_pa
         assert _optimizer_bytes(state.optimizer) == optimizer_before
 
     asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_opd_run_unloads_adapter_and_frees_engine_capacity(tmp_path):
+    async def scenario():
+        actor, engine, backend = _build_runtime(tmp_path, 1)
+        state = await _register(actor, "run-a", [_prompt()])
+        driver = _driver(
+            "run-a",
+            actor,
+            engine,
+            "http://127.0.0.1:1/teacher/run-key",
+            request=lambda _url, _payload: {},
+        )
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            driver.add_to_controller(controller, total_steps=1)
+            removed = await controller.remove_run("run-a")
+
+        assert removed.phase is RunPhase.CANCELLED
+        assert (await engine.health()).adapters == ()
+        assert backend.removed == [state.handle.lora_int_id]
+        replacement = await _register(actor, "run-b", [_prompt(1)])
+        assert replacement.handle.run_id == "run-b"
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_training_batch_moves_every_tensor_to_active_adapter_device():
+    import torch
+
+    batch = SharedOPDTrainingBatch(
+        sequences=torch.ones((1, 2), dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        response_mask=torch.ones((1, 1), dtype=torch.bool),
+        group_ids=torch.zeros((1, 1), dtype=torch.long),
+        teacher_logsums=torch.zeros((1, 1), dtype=torch.float64),
+        prompt_lengths=(1,),
+        action_lengths=(1,),
+        coverage=torch.ones(1, dtype=torch.float64),
+    )
+
+    moved = batch.to(torch.device("meta"))
+
+    assert moved.sequences.device.type == "meta"
+    assert moved.attention_mask.device.type == "meta"
+    assert moved.response_mask.device.type == "meta"
+    assert moved.group_ids.device.type == "meta"
+    assert moved.teacher_logsums.device.type == "meta"
+    assert moved.coverage.device.type == "meta"
 
 
 def test_teacher_request_retry_matches_transport_only_single_run_contract(monkeypatch):

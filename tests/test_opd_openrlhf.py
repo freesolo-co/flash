@@ -71,6 +71,16 @@ def _install_ray_shaped_opd_extension(
             self.original_fit_calls.append((args, kwargs))
             return "fit-result"
 
+    native_fit = _PPOTrainerRuntime.fit
+
+    @functools.wraps(native_fit)
+    def grpo_warmstart_fit(self, *args, **kwargs):
+        if warmstart:
+            self.broadcast_to_vllm()
+        return native_fit(self, *args, **kwargs)
+
+    _PPOTrainerRuntime.fit = grpo_warmstart_fit
+
     class _PolicyModelActorRuntime:
         def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
             return (tag, client_states, metric_value, metric_key)
@@ -888,6 +898,27 @@ def test_checkpoint_hook_uses_exact_steps_plus_final_boundary(monkeypatch):
     assert trainer.args.ckpt.save_steps == float("inf")
 
 
+def test_checkpoint_hook_keeps_negative_periodic_interval_disabled(monkeypatch):
+    namespace, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch)
+    callbacks = []
+    observed_save_steps = []
+    namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
+
+    def save(trainer, *_args, **_kwargs):
+        observed_save_steps.append(trainer.args.ckpt.save_steps)
+
+    namespace["_original_save_logs_and_checkpoints"] = save
+    trainer = runtime()
+    trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=-1, load_enable=False))
+    logs = {"policy_loss": 0.2, "teacher_coverage": 0.75}
+
+    trainer.save_logs_and_checkpoints(1, logs, {"global_step": 1})
+
+    assert observed_save_steps == [float("inf")]
+    assert callbacks == [{"metrics": {"step": 1, "loss": 0.2, "coverage": 0.75}}]
+    assert trainer.args.ckpt.save_steps == -1
+
+
 def test_ray_modified_class_fit_does_not_prebroadcast_resumed_warmstart(monkeypatch):
     _, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch, warmstart=True)
     trainer = runtime()
@@ -937,6 +968,54 @@ def test_child_seed_matches_optimizer_example_rollout_retry_identity(monkeypatch
         2,
         no_signal_attempt_ordinal=1,
     )
+
+
+def test_child_preserves_scheduled_ordinal_base_for_group_samples(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    identities = []
+
+    async def execute(*_args, **_kwargs):
+        return {
+            "action_ranges": [(2, 4)],
+            "observation_tokens": [10, 11, 20, 21],
+            "truncated": False,
+        }
+
+    namespace["_original_execute"] = execute
+    namespace["_flash_post_teacher"] = lambda payload: (
+        identities.append(json.loads(payload["label"]))
+        or {
+            "signal_count": 1,
+            "teacher_group_ids": [-1, 0, 1],
+            "teacher_logsums": [0.0, -0.2, -0.4],
+            "teacher_signal_mask": [False, True, True],
+            "coverage": 1.0,
+        }
+    )
+    label = json.dumps(
+        {
+            "global_step": 0,
+            "example_index": 0,
+            "rollout_ordinal": 8,
+            "no_signal_attempt": 0,
+        }
+    )
+    executor = SimpleNamespace()
+
+    for _ in range(2):
+        asyncio.run(
+            namespace["_flash_opd_execute"](
+                executor,
+                "prompt",
+                label,
+                SimpleNamespace(),
+                10,
+                object(),
+                object(),
+            )
+        )
+
+    assert [identity["rollout_ordinal"] for identity in identities] == [8, 9]
 
 
 def test_child_passes_native_non_length_termination_to_teacher_bridge(monkeypatch):
@@ -1287,18 +1366,21 @@ def test_scheduled_dataset_carries_stable_step_and_example_identity(tmp_path):
         str(path),
         prompts,
         steps=2,
-        prompts_per_step=2,
+        prompts_per_step=3,
+        group_size=2,
     )
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     identities = [json.loads(row["label"]) for row in rows]
 
-    assert count == 4
-    assert [row["input"] for row in rows] == ["one", "two", "one", "two"]
+    assert count == 6
+    assert [row["input"] for row in rows] == ["one", "two", "one", "two", "one", "two"]
     assert identities == [
         {"example_index": 0, "global_step": 0, "no_signal_attempt": 0, "rollout_ordinal": 0},
         {"example_index": 1, "global_step": 0, "no_signal_attempt": 0, "rollout_ordinal": 0},
-        {"example_index": 0, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 0, "global_step": 0, "no_signal_attempt": 0, "rollout_ordinal": 2},
         {"example_index": 1, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 0, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 0},
+        {"example_index": 1, "global_step": 1, "no_signal_attempt": 0, "rollout_ordinal": 2},
     ]
 
 
