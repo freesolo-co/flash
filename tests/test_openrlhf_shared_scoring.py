@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -12,8 +12,10 @@ import pytest
 from flash.engine.worker.openrlhf_shared_scoring import (
     ScoringBatchIdentity,
     ScoringCapacityError,
+    ScoringFuture,
     ScoringIdentityError,
     ScoringKind,
+    ScoringRegistryError,
     SharedScoringPool,
     bind_scoring_bridge,
 )
@@ -249,6 +251,30 @@ def test_direct_future_cancel_releases_capacity_and_rejects_result():
         assert pool.consume(second_identity, second, timeout=1).value == 2
 
 
+def test_rejected_future_translates_executor_cancellation_to_identity_error():
+    class _ObservedFuture(Future):
+        def result(self, timeout=None):
+            result_entered.set()
+            return super().result(timeout=timeout)
+
+    identity = ScoringBatchIdentity("run-a", 2, "cancelled")
+    result_entered = threading.Event()
+    raw_future = _ObservedFuture()
+    future = ScoringFuture(
+        identity,
+        ScoringKind.REWARD,
+        raw_future,
+        lambda _future: None,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as consumers:
+        result = consumers.submit(future.result_for, identity, 1)
+        assert result_entered.wait(timeout=1)
+        assert future.cancel() is True
+        with pytest.raises(ScoringIdentityError, match="rejected"):
+            result.result(timeout=1)
+
+
 def test_only_one_consumer_can_claim_a_scoring_result():
     started = threading.Event()
     release = threading.Event()
@@ -296,6 +322,38 @@ def test_timed_out_consume_keeps_the_future_for_later_delivery():
         assert pool.pending_identities == (identity,)
         release.set()
         assert pool.consume(identity, future, timeout=1).value == {"value": 8}
+
+
+def test_consumer_interrupt_preserves_unfinished_future(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge(payload):
+        started.set()
+        assert release.wait(timeout=2)
+        return payload
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.REWARD, bridge=bridge)
+        identity = ScoringBatchIdentity("run-a", 5, "interrupted")
+        future = pool.submit(identity, {"value": 9})
+        assert started.wait(timeout=1)
+        original_result_for = ScoringFuture.result_for
+
+        def interrupt_result(_self, _identity, timeout=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ScoringFuture, "result_for", interrupt_result)
+        with pytest.raises(KeyboardInterrupt):
+            pool.consume(identity, future, timeout=1)
+        assert pool.pending_identities == (identity,)
+        assert pool.outstanding_count == 1
+        with pytest.raises(ScoringRegistryError, match="already has an outstanding"):
+            pool.submit(identity, {"value": 10})
+
+        monkeypatch.setattr(ScoringFuture, "result_for", original_result_for)
+        release.set()
+        assert pool.consume(identity, future, timeout=1).value == {"value": 9}
 
 
 def test_worker_timeout_error_is_delivered_and_releases_capacity():
@@ -371,15 +429,15 @@ def test_cancelled_run_rejects_a_waiting_consumer_and_late_result():
 
     try:
         with ThreadPoolExecutor(max_workers=1) as consumers:
-            consumption = consumers.submit(pool.consume, identity, future, timeout=1)
+            consumption = consumers.submit(pool.consume, identity, future, timeout=0.05)
             while True:
                 with pool._lock:
                     if identity in pool._consuming:
                         break
             assert pool.cancel_run("run-a") == 1
-            release.set()
             with pytest.raises(ScoringIdentityError, match="rejected"):
                 consumption.result(timeout=1)
+            release.set()
         with pytest.raises(ScoringIdentityError, match="cancellation"):
             future.result_for(identity, timeout=1)
         with pytest.raises(ScoringIdentityError, match="no outstanding"):

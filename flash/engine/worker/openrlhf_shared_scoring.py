@@ -172,7 +172,11 @@ class ScoringFuture:
                 "scoring future identity does not match the requested run, step, and batch"
             )
         self._raise_if_rejected()
-        result = self._future.result(timeout=timeout)
+        try:
+            result = self._future.result(timeout=timeout)
+        except BaseException:
+            self._raise_if_rejected()
+            raise
         self._raise_if_rejected()
         if result.identity != self.identity or result.kind is not self.kind:
             raise ScoringIdentityError("scoring worker returned a mismatched result envelope")
@@ -349,10 +353,13 @@ class SharedScoringPool:
                 if terminal and self._futures.get(identity) is future:
                     self._futures.pop(identity)
             raise
-        except BaseException:
+        except BaseException as exc:
+            terminal = future._raised_by_worker(exc)
             with self._lock:
                 self._consuming.discard(identity)
-                if self._futures.get(identity) is future:
+                if (terminal or isinstance(exc, Exception)) and self._futures.get(
+                    identity
+                ) is future:
                     self._futures.pop(identity)
             raise
 
