@@ -529,7 +529,7 @@ def _chunked_selected_token_nll(
     def checkpoint(function, *args):
         return torch_checkpoint(function, *args, use_reentrant=False)
 
-    if zero3_active:
+    if zero3_active and selected_hidden.requires_grad:
 
         def checkpoint(function, *args):
             return torch_checkpoint(function, *args, use_reentrant=True)
@@ -545,6 +545,11 @@ def _chunked_selected_token_nll(
             if callable(deepspeed_checkpoint):
                 checkpoint = deepspeed_checkpoint
 
+    def project_chunk(function, *args):
+        if zero3_active and not selected_hidden.requires_grad:
+            return function(*args)
+        return checkpoint(function, *args)
+
     if selected_count:
         loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
     else:
@@ -557,6 +562,8 @@ def _chunked_selected_token_nll(
             selected_hidden.device,
         )
         padded_count = synchronized_chunks * int(chunk_size)
+        if not selected_hidden.requires_grad:
+            padded_count = max(padded_count, 1)
         padding_count = padded_count - selected_count
         if padding_count:
             zero_hidden = (
@@ -575,7 +582,7 @@ def _chunked_selected_token_nll(
         valid_mask = torch.arange(padded_count, device=selected_hidden.device).lt(selected_count)
         for start in range(0, padded_count, int(chunk_size)):
             end = start + int(chunk_size)
-            chunk_loss = checkpoint(
+            chunk_loss = project_chunk(
                 _selected_token_nll_padded_chunk,
                 selected_hidden[start:end],
                 output_head,
@@ -588,7 +595,7 @@ def _chunked_selected_token_nll(
     else:
         for start in range(0, selected_count, int(chunk_size)):
             end = min(start + int(chunk_size), selected_count)
-            chunk_loss = checkpoint(
+            chunk_loss = project_chunk(
                 _selected_token_nll_chunk,
                 selected_hidden[start:end],
                 output_head,

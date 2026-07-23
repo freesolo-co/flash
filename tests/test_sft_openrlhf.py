@@ -565,6 +565,53 @@ def test_zero3_chunked_nll_registers_output_head_and_uses_deepspeed_checkpoint(m
 
 
 @requires_torch
+def test_zero3_chunked_nll_head_only_adapter_skips_reentrant_checkpoint(monkeypatch):
+    import torch
+
+    deepspeed = ModuleType("deepspeed")
+    deepspeed.checkpointing = SimpleNamespace(
+        checkpoint=lambda *_args, **_kwargs: pytest.fail(
+            "head-only loss must not use reentrant checkpointing"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed)
+
+    output_head = torch.nn.Linear(3, 7)
+    output_head.weight.ds_id = 1
+    hidden_states = torch.randn(1, 3, 3)
+    input_ids = torch.tensor([[0, 1, 5]])
+    loss_mask = torch.tensor([[0, 1, 1]], dtype=torch.bool)
+
+    loss = _chunked_selected_token_nll(
+        hidden_states,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=2,
+        zero3_active=True,
+    )
+    loss.backward()
+
+    assert loss.requires_grad
+    assert output_head.weight.grad is not None
+
+    output_head.zero_grad(set_to_none=True)
+    empty_loss = _chunked_selected_token_nll(
+        hidden_states,
+        output_head,
+        input_ids,
+        torch.zeros_like(loss_mask),
+        chunk_size=2,
+        zero3_active=True,
+    )
+    empty_loss.backward()
+
+    assert empty_loss.requires_grad
+    assert output_head.weight.grad is not None
+    assert torch.count_nonzero(output_head.weight.grad).item() == 0
+
+
+@requires_torch
 @pytest.mark.parametrize("use_global_denominator", [False, True])
 def test_zero3_chunked_nll_pads_empty_rank_to_global_chunk_count(
     monkeypatch, use_global_denominator
@@ -801,7 +848,10 @@ def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
             super().__init__()
             self.base_model = Backbone()
             self.output_head = torch.nn.Linear(5, 17)
-            self.config = SimpleNamespace(logit_scale=1.0)
+            self.config = SimpleNamespace(
+                logit_scale=0.75,
+                final_logit_softcapping=2.0,
+            )
             self.full_forward_calls = 0
 
         def get_output_embeddings(self):
@@ -840,8 +890,11 @@ def test_rendered_runtime_bypasses_full_lm_head_logits(monkeypatch, tmp_path):
     labels = input_ids.masked_fill(~loss_mask, -100)
     hidden = base_lm.base_model(input_ids=input_ids).last_hidden_state
     shifted_mask = loss_mask[:, 1:]
+    expected_logits = base_lm.output_head(hidden[:, :-1, :])[shifted_mask].float()
+    expected_logits.mul_(0.75)
+    expected_logits = 2.0 * torch.tanh(expected_logits / 2.0)
     expected = functional.cross_entropy(
-        base_lm.output_head(hidden[:, :-1, :])[shifted_mask],
+        expected_logits,
         input_ids[:, 1:][shifted_mask],
     )
 
