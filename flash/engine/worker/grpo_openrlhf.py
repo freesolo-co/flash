@@ -373,9 +373,11 @@ def _completion_from_openrlhf_query(query: str, prompt: str) -> str:
 
 
 def completion_from_tokenizer_query(tokenizer, query: str, prompt: str) -> str:
-    """Remove the prompt after reproducing OpenRLHF's tokenize-then-decode canonicalization."""
+    """Remove an exact prompt or reproduce OpenRLHF's tokenizer canonicalization."""
     if not isinstance(query, str) or not isinstance(prompt, str):
         raise TypeError("OpenRLHF reward query and prompt must be strings")
+    if query.startswith(prompt):
+        return _completion_from_openrlhf_query(query, prompt)
     prompt_ids = tokenizer(text=prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][
         0
     ]

@@ -959,6 +959,20 @@ def test_completion_split_matches_openrlhf_tokenizer_canonicalization():
     assert completion == "completion"
 
 
+def test_completion_split_accepts_expanded_prompt_without_retokenizing():
+    class _Tokenizer:
+        def __call__(self, **_kwargs):
+            raise AssertionError("expanded prompts must not be re-tokenized")
+
+    completion = grpo_openrlhf.completion_from_tokenizer_query(
+        _Tokenizer(),
+        "expanded <|image_pad|><|image_pad|> promptcompletion",
+        "expanded <|image_pad|><|image_pad|> prompt",
+    )
+
+    assert completion == "completion"
+
+
 def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
     calls = []
 
