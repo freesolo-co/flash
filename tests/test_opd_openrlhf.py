@@ -1530,6 +1530,17 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_BRIDGE_URL", "http://127.0.0.1:1/teacher")
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_KL_COEF", "0.37")
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_SEED", "42")
+    attention_context_depth = 0
+
+    @contextlib.contextmanager
+    def attention_context():
+        nonlocal attention_context_depth
+        attention_context_depth += 1
+        try:
+            yield
+        finally:
+            attention_context_depth -= 1
+
     namespace = {
         "__name__": "sitecustomize",
         "__file__": "sitecustomize.py",
@@ -1540,7 +1551,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
         "_original_process_response": lambda *_args, **_kwargs: None,
-        "_flash_attention_context": contextlib.nullcontext,
+        "_flash_attention_context": attention_context,
     }
     exec(
         compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
@@ -1565,6 +1576,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
             return None
 
         def __call__(self, *_args, **_kwargs):
+            assert attention_context_depth == 1
             return student, SimpleNamespace()
 
     class _Strategy:
@@ -1576,6 +1588,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
             return values
 
         def backward(self, loss, *_args):
+            assert attention_context_depth == 1
             self.loss = loss
 
         def optimizer_step(self, *_args, **_kwargs):
@@ -1629,7 +1642,7 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
 
     compile(source, "sitecustomize.py", "exec")
     assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
-    assert source.count("with _flash_attention_context():") == 2
+    assert source.count("with _flash_attention_context():") == 3
     assert "student_logprobs[row][group_mask].detach().sum()" in source
     assert "torch.stack(row_losses).mean()" in source
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source
