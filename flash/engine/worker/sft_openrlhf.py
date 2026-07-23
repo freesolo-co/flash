@@ -601,6 +601,10 @@ def _chunked_selected_token_nll(
     normalizer = selected_count if denominator is None else denominator
     if isinstance(normalizer, torch.Tensor):
         normalizer = normalizer.to(device=loss_sum.device, dtype=loss_sum.dtype)
+        if selected_count == 0:
+            normalizer = torch.where(normalizer == 0, torch.ones_like(normalizer), normalizer)
+    elif selected_count == 0 and normalizer == 0:
+        normalizer = 1
     return loss_sum / normalizer * int(dp_size)
 
 

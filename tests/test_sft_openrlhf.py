@@ -565,7 +565,10 @@ def test_zero3_chunked_nll_registers_output_head_and_uses_deepspeed_checkpoint(m
 
 
 @requires_torch
-def test_zero3_chunked_nll_pads_empty_rank_to_global_chunk_count(monkeypatch):
+@pytest.mark.parametrize("use_global_denominator", [False, True])
+def test_zero3_chunked_nll_pads_empty_rank_to_global_chunk_count(
+    monkeypatch, use_global_denominator
+):
     import torch
     from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
@@ -595,22 +598,70 @@ def test_zero3_chunked_nll_pads_empty_rank_to_global_chunk_count(monkeypatch):
         chunk_count.fill_(2)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    denominator = torch.tensor(4.0) if use_global_denominator else None
     loss = _chunked_selected_token_nll(
         hidden_states,
         output_head,
         input_ids,
         loss_mask,
         chunk_size=2,
-        denominator=torch.tensor(4.0),
+        denominator=denominator,
         zero3_active=True,
     )
     loss.backward()
 
     assert len(checkpoint_calls) == 2
+    assert torch.isfinite(loss)
     assert loss.item() == 0.0
     assert hidden_states.grad is not None
     assert output_head.weight.grad is not None
     assert torch.count_nonzero(output_head.weight.grad).item() == 0
+
+
+@requires_torch
+@pytest.mark.parametrize("denominator_kind", ["omitted", "global_zero"])
+def test_zero3_chunked_nll_all_empty_is_finite(monkeypatch, denominator_kind):
+    import torch
+
+    deepspeed = ModuleType("deepspeed")
+    deepspeed.checkpointing = SimpleNamespace(
+        checkpoint=lambda *_args, **_kwargs: pytest.fail("all-empty loss must not project a chunk")
+    )
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed)
+
+    output_head = torch.nn.Linear(3, 7)
+    output_head.weight.ds_id = 1
+    output_head.weight.ds_process_group = object()
+    hidden_states = torch.randn(1, 3, 3, requires_grad=True)
+    input_ids = torch.tensor([[0, 1, 5]])
+    loss_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    def all_reduce(chunk_count, op=None, group=None):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is output_head.weight.ds_process_group
+        assert chunk_count.item() == 0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    denominator = None if denominator_kind == "omitted" else torch.tensor(0.0)
+    loss = _chunked_selected_token_nll(
+        hidden_states,
+        output_head,
+        input_ids,
+        loss_mask,
+        chunk_size=2,
+        denominator=denominator,
+        zero3_active=True,
+    )
+    loss.backward()
+
+    assert loss.requires_grad
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    assert hidden_states.grad is not None
+    assert torch.count_nonzero(hidden_states.grad).item() == 0
 
 
 @requires_torch
