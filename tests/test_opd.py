@@ -2802,10 +2802,11 @@ def test_opd_filtering_prompts_is_throttled_like_sft_pretokenizing():
 
 
 def test_openrlhf_opd_liveness_stages_are_throttled():
-    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES
+    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES, _HB_UPLOAD_LIVENESS_STAGES
 
     assert "opd_openrlhf_training" in _HB_THROTTLED_STAGES
     assert "opd_openrlhf_finalizing" in _HB_THROTTLED_STAGES
+    assert "opd_openrlhf_finalizing" in _HB_UPLOAD_LIVENESS_STAGES
 
 
 def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):

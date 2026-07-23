@@ -47,7 +47,9 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
 # A ``checkpoint_uploading`` keepalive daemon (liveness_heartbeat(keepalive=True)) wraps the upload to
 # keep that clock fed; it rides the SAME tight, throttled cadence as a setup stage. Kept OUT of
 # _HB_SETUP_LIVENESS_STAGES so that set's "setup-phase" meaning (and its tests) stay honest.
-_HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
+_HB_UPLOAD_LIVENESS_STAGES = frozenset(
+    {"checkpoint_uploading", "opd_openrlhf_finalizing"}
+)
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 
@@ -65,7 +67,6 @@ _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset(
         "sft_step",
         "opd_step",
         "opd_openrlhf_training",
-        "opd_openrlhf_finalizing",
     }
 )
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
