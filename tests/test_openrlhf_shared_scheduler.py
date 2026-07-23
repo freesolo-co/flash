@@ -385,3 +385,159 @@ def test_one_outstanding_rollout_per_run_and_explicit_state_events():
         ]
 
     asyncio.run(scenario())
+
+
+def test_none_rollout_value_remains_outstanding_until_its_update():
+    async def scenario():
+        updates: list[tuple[Any, str]] = []
+
+        def rollout(_run_id: str, _step: int) -> GpuWorkResult:
+            return GpuWorkResult(None, 1)
+
+        def payload(run_id: str, step: int, rollout_value: Any) -> dict[str, Any]:
+            assert rollout_value is None
+            return {"run_id": run_id, "step": step}
+
+        def update(run_id: str, _step: int, rollout_value: Any, score) -> GpuWorkResult:
+            updates.append((rollout_value, score.identity.run_id))
+            assert run_id == score.identity.run_id
+            return GpuWorkResult(None, 1)
+
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            controller.add_run(
+                "run-none",
+                hooks=SchedulerRunHooks(rollout, payload, update),
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=_immediate_score,
+                total_steps=1,
+            )
+            final = (await controller.drain(timeout_s=2))[0]
+
+        assert final.phase is RunPhase.DONE
+        assert updates == [(None, "run-none")]
+
+    asyncio.run(scenario())
+
+
+def test_drain_timeout_uses_wall_time_when_scheduler_clock_is_frozen():
+    async def scenario():
+        started = threading.Event()
+        release = threading.Event()
+        events: list[str] = []
+
+        def score(payload):
+            started.set()
+            assert release.wait(timeout=2)
+            return {"scored_run": payload["run_id"], "step": payload["step"]}
+
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(
+                scoring_pool,
+                clock=lambda: 0.0,
+                deficit_quantum_ms=1,
+            )
+            controller.add_run(
+                "run-a",
+                hooks=_hooks(events),
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=score,
+                total_steps=1,
+            )
+            await controller.step_the_world()
+            assert started.wait(timeout=1)
+
+            with pytest.raises(TimeoutError, match="drain timed out"):
+                await controller.drain(timeout_s=0.02)
+
+            release.set()
+            final = (await controller.drain(timeout_s=2))[0]
+
+        assert final.phase is RunPhase.DONE
+
+    asyncio.run(scenario())
+
+
+def test_slow_failure_cleanup_does_not_hold_gpu_lease_from_peer():
+    async def scenario():
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        events: list[str] = []
+        failed_hooks = _hooks(events, update_error=RuntimeError("update failed"))
+
+        async def cleanup(_run_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        failed_hooks = SchedulerRunHooks(
+            failed_hooks.rollout,
+            failed_hooks.scoring_payload,
+            failed_hooks.update_and_publish,
+            cleanup,
+        )
+        with SharedScoringPool(pool_size=2) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            controller.add_run(
+                "failed",
+                hooks=failed_hooks,
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=_immediate_score,
+                total_steps=1,
+            )
+            controller.add_run(
+                "survivor",
+                hooks=_hooks(events),
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=_immediate_score,
+                total_steps=1,
+            )
+
+            while controller.run_snapshot("failed").phase is not RunPhase.FAILED:
+                await controller.step_the_world()
+                await asyncio.sleep(0.001)
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+            while controller.run_snapshot("survivor").phase is not RunPhase.DONE:
+                await controller.step_the_world()
+                await asyncio.sleep(0.001)
+            assert release_cleanup.is_set() is False
+            assert "survivor:update:0" in events
+
+            release_cleanup.set()
+            snapshots = await controller.drain(timeout_s=2)
+
+        assert snapshots[0].phase is RunPhase.FAILED
+        assert snapshots[1].phase is RunPhase.DONE
+
+    asyncio.run(scenario())
+
+
+def test_system_level_callback_exception_is_not_converted_to_run_failure():
+    class _SchedulerStop(BaseException):
+        pass
+
+    async def scenario():
+        def stop_rollout(_run_id: str, _step: int) -> None:
+            raise _SchedulerStop
+
+        hooks = SchedulerRunHooks(
+            rollout=stop_rollout,
+            scoring_payload=lambda _run_id, _step, _rollout: {},
+            update_and_publish=lambda _run_id, _step, _rollout, _score: None,
+        )
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            controller.add_run(
+                "run-stop",
+                hooks=hooks,
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=_immediate_score,
+                total_steps=1,
+            )
+
+            with pytest.raises(_SchedulerStop):
+                await controller.step_the_world()
+            assert controller.run_snapshot("run-stop").failure is None
+            await controller.remove_run("run-stop")
+
+    asyncio.run(scenario())

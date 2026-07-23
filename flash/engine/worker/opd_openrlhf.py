@@ -1113,7 +1113,19 @@ def _flash_pad_info(value, action_mask, pad_value):
     if isinstance(value, torch.Tensor):
         tensor = value
     elif isinstance(value, list) and value and all(isinstance(item, torch.Tensor) for item in value):
-        tensor = torch.nn.utils.rnn.pad_sequence(value, batch_first=True, padding_value=pad_value)
+        rows = []
+        for item in value:
+            if item.ndim == 1:
+                rows.append(item)
+            elif item.ndim == 2:
+                rows.extend(item.unbind(0))
+            else:
+                raise RuntimeError("OpenRLHF OPD teacher metadata has an invalid tensor rank")
+        tensor = torch.nn.utils.rnn.pad_sequence(
+            rows,
+            batch_first=True,
+            padding_value=pad_value,
+        )
     else:
         raise RuntimeError("OpenRLHF OPD teacher metadata was not preserved through replay batching")
     tensor = tensor.to(action_mask.device)
@@ -1237,7 +1249,6 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
     selected = response_mask & group_ids.ge(0)
     aligned_samples = _flash_aligned_sample_count(selected)
     has_current_signal = _flash_current_batch_has_signal(self.strategy, aligned_samples)
-    has_window_signal = global_batch_size > 0
     if bool(selected.any().item()):
         local_loss, selected = _flash_reverse_kl(
             action_log_probs,
@@ -1259,7 +1270,7 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         self,
         step,
         self.strategy.accumulated_gradient,
-        has_window_signal,
+        has_current_signal,
     )
     if should_mutate:
         _flash_post_teacher({"mutation": True})
@@ -1807,7 +1818,7 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     if not prompts:
         raise RuntimeError("every OpenRLHF OPD prompt exceeds the configured prompt budget")
 
-    prompts_per_step = min(knobs.prompts_per_step, len(prompts))
+    prompts_per_step = knobs.prompts_per_step
     derived_steps = on_policy_steps(
         epochs=knobs.epochs,
         prompt_count=len(prompts),

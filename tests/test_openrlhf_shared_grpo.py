@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from flash.engine.worker import openrlhf_shared_grpo
 from flash.engine.worker.grpo_openrlhf import (
     RewardBridge,
     RewardResult,
@@ -24,6 +25,7 @@ from flash.engine.worker.openrlhf_shared_grpo import (
     SharedGRPOConfig,
     SharedGRPOPrompt,
     SharedGRPORunAdapter,
+    SharedGRPOTrainingBatch,
 )
 from flash.engine.worker.openrlhf_shared_scheduler import RunPhase, SharedEngineRunController
 from flash.engine.worker.openrlhf_shared_scoring import (
@@ -59,6 +61,8 @@ class _SamplingParams:
 class _FakeVLLMEngine:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.removed: list[int] = []
+        self.empty_completions = False
 
     async def add_lora(self, _request: _FakeLoRARequest) -> bool:
         return True
@@ -66,7 +70,8 @@ class _FakeVLLMEngine:
     async def pin_lora(self, _int_id: int) -> bool:
         return True
 
-    async def remove_lora(self, _int_id: int) -> bool:
+    async def remove_lora(self, int_id: int) -> bool:
+        self.removed.append(int_id)
         return True
 
     def generate(
@@ -87,12 +92,18 @@ class _FakeVLLMEngine:
                 "prompt_token_ids": tuple(prompt["prompt_token_ids"]),
             }
         )
-        generated = SimpleNamespace(
-            token_ids=[token_id, token_id + 1],
-            logprobs=[
+        action_token_ids = [] if self.empty_completions else [token_id, token_id + 1]
+        logprobs = (
+            []
+            if self.empty_completions
+            else [
                 {token_id: SimpleNamespace(logprob=-0.3)},
                 {token_id + 1: SimpleNamespace(logprob=-0.4)},
-            ],
+            ]
+        )
+        generated = SimpleNamespace(
+            token_ids=action_token_ids,
+            logprobs=logprobs,
             finish_reason="stop",
         )
         return SimpleNamespace(outputs=[generated])
@@ -293,17 +304,18 @@ def test_single_run_shared_controller_matches_direct_grpo_loss_and_update(tmp_pa
             captured = []
 
             def direct_loss(model, state):
+                device_batch = rollout.training_batch.to(state.adapter_parameters[0].device)
                 model.eval()
                 with torch.no_grad():
-                    old_log_probs = _policy_log_probs(model, state, rollout.training_batch).detach()
+                    old_log_probs = _policy_log_probs(model, state, device_batch).detach()
                 model.train()
-                current_log_probs = _policy_log_probs(model, state, rollout.training_batch)
+                current_log_probs = _policy_log_probs(model, state, device_batch)
                 objective = openrlhf_grpo_loss(
                     current_log_probs,
                     old_log_probs,
-                    rollout.training_batch.rollout_log_probs,
+                    device_batch.rollout_log_probs,
                     reward_tensor,
-                    rollout.training_batch.action_mask,
+                    device_batch.action_mask,
                     4,
                     2,
                 )
@@ -433,3 +445,177 @@ def test_grpo_update_leaves_peer_adapter_and_optimizer_byte_identical(tmp_path):
         assert actor.run_state("run-a").handle.version == 1
 
     asyncio.run(scenario())
+
+
+@requires_torch
+def test_empty_completions_score_with_canonical_prompt_and_zero_mask(tmp_path):
+    async def scenario():
+        actor, engine, backend = _build_runtime(tmp_path, 1)
+        backend.empty_completions = True
+        prompts = [SharedGRPOPrompt("rendered form", 0, (1, 2))]
+        state = await _register(actor, "run-a", prompts)
+        completions = []
+
+        def score(_label, completion, prompt):
+            completions.append((completion, prompt))
+            return RewardResult(1.0, 1.0)
+
+        with (
+            RewardBridge(score, samples_per_step=2, first_step=1) as bridge,
+            SharedScoringPool(pool_size=1) as scoring_pool,
+        ):
+            driver = _driver("run-a", actor, engine, bridge)
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            driver.add_to_controller(controller, total_steps=1)
+            snapshots = await controller.drain(timeout_s=2)
+
+        assert snapshots[0].phase is RunPhase.DONE
+        assert completions == [("", "1 2"), ("", "1 2")]
+        assert driver.last_update is not None
+        assert driver.last_update.objective.loss.item() == 0
+        assert state.prompt_cursor == 1
+        assert state.global_step == 1
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_failed_grpo_update_does_not_commit_prompt_cursor(tmp_path):
+    async def scenario():
+        actor, engine, _backend = _build_runtime(tmp_path, 1)
+        state = await _register(actor, "run-a", _prompts())
+
+        def score(_label, _completion, _prompt):
+            return RewardResult(1.0, 1.0)
+
+        def failed_log_probs(_model, _state, _batch):
+            raise RuntimeError("log-prob failure")
+
+        with RewardBridge(score, samples_per_step=2, first_step=1) as bridge:
+            driver = SharedGRPORunAdapter(
+                "run-a",
+                config=_config(),
+                training_actor=actor,
+                rollout_engine=engine,
+                reward_url=bridge.url,
+                sampling_params_factory=_SamplingParams,
+                decode_tokens=_decode_tokens,
+                policy_log_probs=failed_log_probs,
+            )
+            rollout = await driver.rollout("run-a", 0)
+            assert state.prompt_cursor == 0
+            reward_batch = driver.score(driver.scoring_payload("run-a", 0, rollout))
+            scoring_result = ScoringResult(
+                ScoringBatchIdentity("run-a", 0, "run-a-step-0"),
+                ScoringKind.REWARD,
+                reward_batch,
+            )
+            with pytest.raises(RuntimeError, match="log-prob failure"):
+                await driver.update_and_publish("run-a", 0, rollout, scoring_result)
+
+        assert state.prompt_cursor == 0
+        assert state.global_step == 0
+        assert state.handle.version == 0
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_default_reward_request_uses_configured_production_timeout(tmp_path, monkeypatch):
+    async def scenario():
+        actor, engine, _backend = _build_runtime(tmp_path, 1)
+        await _register(actor, "run-a", _prompts())
+        observed_timeouts = []
+
+        def fake_post(_url, _payload, *, timeout):
+            observed_timeouts.append(timeout)
+            return {"rewards": [1.0], "scores": [1.0], "extra_logs": {}}
+
+        monkeypatch.setattr(openrlhf_shared_grpo, "post_reward_request", fake_post)
+        config = SharedGRPOConfig(
+            seed=123,
+            prompts_per_step=1,
+            group_size=2,
+            max_response_length=4,
+            pad_token_id=0,
+            reward_timeout_s=37.0,
+        )
+        driver = SharedGRPORunAdapter(
+            "run-a",
+            config=config,
+            training_actor=actor,
+            rollout_engine=engine,
+            reward_url="http://127.0.0.1:1234/reward/token",
+            sampling_params_factory=_SamplingParams,
+            decode_tokens=_decode_tokens,
+            policy_log_probs=_policy_log_probs,
+        )
+
+        result = driver.score(
+            {
+                "samples": [
+                    {"query": ["1 2"], "prompts": ["1 2"], "labels": [0]},
+                    {"query": ["1 2"], "prompts": ["1 2"], "labels": [0]},
+                ]
+            }
+        )
+
+        assert len(result.results) == 2
+        assert observed_timeouts == [37.0, 37.0]
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_grpo_run_unloads_adapter_and_frees_engine_capacity(tmp_path):
+    async def scenario():
+        actor, engine, backend = _build_runtime(tmp_path, 1)
+        state = await _register(actor, "run-a", _prompts())
+
+        def request(_url, _payload):
+            return {"rewards": [1.0], "scores": [1.0], "extra_logs": {}}
+
+        driver = SharedGRPORunAdapter(
+            "run-a",
+            config=_config(),
+            training_actor=actor,
+            rollout_engine=engine,
+            reward_url="http://127.0.0.1:1234/reward/token",
+            sampling_params_factory=_SamplingParams,
+            decode_tokens=_decode_tokens,
+            policy_log_probs=_policy_log_probs,
+            reward_request=request,
+        )
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            driver.add_to_controller(controller, total_steps=1)
+            removed = await controller.remove_run("run-a")
+
+        assert removed.phase is RunPhase.CANCELLED
+        assert (await engine.health()).adapters == ()
+        assert backend.removed == [state.handle.lora_int_id]
+        replacement = await _register(actor, "run-b", _prompts(10))
+        assert replacement.handle.run_id == "run-b"
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_training_batch_moves_every_tensor_to_active_adapter_device():
+    import torch
+
+    batch = SharedGRPOTrainingBatch(
+        sequences=torch.ones((1, 2), dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        action_mask=torch.ones((1, 1)),
+        rollout_log_probs=torch.zeros((1, 1)),
+        prompt_lengths=(1,),
+        action_lengths=(1,),
+    )
+
+    moved = batch.to(torch.device("meta"))
+
+    assert moved.sequences.device.type == "meta"
+    assert moved.attention_mask.device.type == "meta"
+    assert moved.action_mask.device.type == "meta"
+    assert moved.rollout_log_probs.device.type == "meta"

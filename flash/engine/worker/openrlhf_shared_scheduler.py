@@ -112,6 +112,8 @@ UpdateCallback = Callable[[str, int, Any, ScoringResult], Awaitable[Any] | Any]
 CleanupCallback = Callable[[str], Awaitable[None] | None]
 ScoringBridge = Callable[[dict[str, Any]], Any]
 
+_MISSING_ROLLOUT = object()
+
 
 @dataclass(frozen=True, slots=True)
 class SchedulerRunHooks:
@@ -135,7 +137,7 @@ class _RunState:
     deficit_ms: float = 0.0
     gpu_time_ms: float = 0.0
     ready_since: float | None = None
-    rollout: Any = None
+    rollout: Any = _MISSING_ROLLOUT
     scoring_payload: Mapping[str, Any] | None = None
     scoring_identity: ScoringBatchIdentity | None = None
     scoring_future: ScoringFuture | None = None
@@ -219,6 +221,7 @@ class SharedEngineRunController:
         self._runs: dict[str, _RunState] = {}
         self._event_queue: deque[tuple[SchedulerEvent, Any]] = deque()
         self._event_history: list[SchedulerEvent] = []
+        self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._gpu_lease = asyncio.Lock()
         self._registration_counter = 0
         self._last_gpu_run_id: str | None = None
@@ -249,7 +252,7 @@ class SharedEngineRunController:
             deficit_ms=state.deficit_ms,
             gpu_time_ms=state.gpu_time_ms,
             outstanding_identity=state.scoring_identity,
-            outstanding_rollout=state.rollout is not None,
+            outstanding_rollout=state.rollout is not _MISSING_ROLLOUT,
             failure=state.failure,
         )
 
@@ -329,12 +332,12 @@ class SharedEngineRunController:
             raise ValueError("timeout_s must be positive and finite")
         if not self._runs:
             return ()
-        deadline = None if timeout_s is None else self._clock() + timeout_s
-        while not self._all_terminal():
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while not self._is_drained():
             result = await self.step_the_world()
-            if self._all_terminal():
+            if self._is_drained():
                 break
-            if deadline is not None and self._clock() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("shared scheduler drain timed out")
             if not result.progressed:
                 await asyncio.sleep(self._scoring_poll_interval_s)
@@ -353,9 +356,11 @@ class SharedEngineRunController:
             if state.run_id in self._scoring_pool.registered_run_ids:
                 self._scoring_pool.cancel_run(state.run_id)
             self._clear_outstanding(state)
-            await self._cleanup_run(state)
+            cleanup_task = self._start_cleanup(state)
             self._drain_events_without_io()
-            return self.run_snapshot(state.run_id)
+        if cleanup_task is not None:
+            await cleanup_task
+        return self.run_snapshot(state.run_id)
 
     async def _execute_rollout(self, state: _RunState) -> None:
         self._enqueue(SchedulerEventKind.ROLLOUT_STARTED, state)
@@ -384,14 +389,14 @@ class SharedEngineRunController:
         except asyncio.CancelledError as exc:
             await asyncio.shield(self._fail_run(state, exc))
             raise
-        except BaseException as exc:
+        except Exception as exc:
             await self._fail_run(state, exc)
 
     async def _execute_update(self, state: _RunState) -> None:
         self._enqueue(SchedulerEventKind.UPDATE_STARTED, state)
         self._drain_events_without_io()
         try:
-            if state.rollout is None or state.scoring_result is None:
+            if state.rollout is _MISSING_ROLLOUT or state.scoring_result is None:
                 raise RunStateTransitionError(
                     f"run {state.run_id} has no complete rollout and score for update"
                 )
@@ -408,7 +413,7 @@ class SharedEngineRunController:
         except asyncio.CancelledError as exc:
             await asyncio.shield(self._fail_run(state, exc))
             raise
-        except BaseException as exc:
+        except Exception as exc:
             await self._fail_run(state, exc)
 
     async def _submit_waiting_scores(self) -> bool:
@@ -433,7 +438,7 @@ class SharedEngineRunController:
                 future = self._scoring_pool.submit(identity, state.scoring_payload)
             except ScoringCapacityError:
                 break
-            except BaseException as exc:
+            except Exception as exc:
                 await self._fail_run(state, exc)
                 progressed = True
                 continue
@@ -465,7 +470,7 @@ class SharedEngineRunController:
                 continue
             try:
                 result = self._scoring_pool.consume(identity, future, timeout=0)
-            except BaseException as exc:
+            except Exception as exc:
                 await self._fail_run(state, exc)
             else:
                 self._enqueue(SchedulerEventKind.SCORING_COMPLETED, state, result)
@@ -549,14 +554,41 @@ class SharedEngineRunController:
         if state.run_id in self._scoring_pool.registered_run_ids:
             self._scoring_pool.cancel_run(state.run_id)
         self._clear_outstanding(state)
-        try:
-            await self._cleanup_run(state)
-        except BaseException as cleanup_error:
-            state.failure = BaseExceptionGroup(
-                f"run {state.run_id} failed and cleanup also failed",
-                [error, cleanup_error],
-            )
+        self._start_cleanup(state)
         self._drain_events_without_io()
+
+    def _start_cleanup(self, state: _RunState) -> asyncio.Task[None] | None:
+        if state.cleaned_up:
+            return None
+        existing = self._cleanup_tasks.get(state.run_id)
+        if existing is not None:
+            return existing
+        if state.hooks.cleanup is None:
+            state.cleaned_up = True
+            return None
+        task = asyncio.create_task(self._cleanup_run(state))
+        self._cleanup_tasks[state.run_id] = task
+        task.add_done_callback(
+            lambda completed, run_id=state.run_id: self._finish_cleanup(run_id, completed)
+        )
+        return task
+
+    def _finish_cleanup(self, run_id: str, task: asyncio.Task[None]) -> None:
+        if self._cleanup_tasks.get(run_id) is task:
+            self._cleanup_tasks.pop(run_id)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        state = self._runs[run_id]
+        if state.failure is None:
+            state.failure = error
+        else:
+            state.failure = BaseExceptionGroup(
+                f"run {run_id} failed and cleanup also failed",
+                [state.failure, error],
+            )
 
     async def _cleanup_run(self, state: _RunState) -> None:
         if state.cleaned_up or state.hooks.cleanup is None:
@@ -644,7 +676,7 @@ class SharedEngineRunController:
 
     @staticmethod
     def _clear_outstanding(state: _RunState) -> None:
-        state.rollout = None
+        state.rollout = _MISSING_ROLLOUT
         state.scoring_payload = None
         state.scoring_identity = None
         state.scoring_future = None
@@ -652,24 +684,26 @@ class SharedEngineRunController:
 
     @staticmethod
     def _assert_outstanding_bound(state: _RunState) -> None:
-        if state.phase is RunPhase.READY_ROLLOUT and any(
-            value is not None
-            for value in (
-                state.rollout,
-                state.scoring_payload,
-                state.scoring_identity,
-                state.scoring_future,
-                state.scoring_result,
+        if state.phase is RunPhase.READY_ROLLOUT and (
+            state.rollout is not _MISSING_ROLLOUT
+            or any(
+                value is not None
+                for value in (
+                    state.scoring_payload,
+                    state.scoring_identity,
+                    state.scoring_future,
+                    state.scoring_result,
+                )
             )
         ):
             raise RunStateTransitionError(
                 f"run {state.run_id} retained an outstanding rollout while ready to generate"
             )
-        if state.scoring_future is not None and state.rollout is None:
+        if state.scoring_future is not None and state.rollout is _MISSING_ROLLOUT:
             raise RunStateTransitionError(
                 f"run {state.run_id} has a scoring future without its originating rollout"
             )
-        if state.scoring_result is not None and state.rollout is None:
+        if state.scoring_result is not None and state.rollout is _MISSING_ROLLOUT:
             raise RunStateTransitionError(
                 f"run {state.run_id} has a scoring result without its originating rollout"
             )
@@ -685,3 +719,6 @@ class SharedEngineRunController:
         return bool(self._runs) and all(
             state.phase in _TERMINAL_PHASES for state in self._runs.values()
         )
+
+    def _is_drained(self) -> bool:
+        return self._all_terminal() and not self._cleanup_tasks

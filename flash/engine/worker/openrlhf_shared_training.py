@@ -345,6 +345,24 @@ class SharedMultiLoRATrainingActor:
                 handle=new_handle,
             )
 
+    async def advance_without_update(self, run_id: str) -> TrainingStepResult:
+        """advance one logical step without optimizer, scheduler, or publication mutation."""
+
+        async with self._training_lease:
+            state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
+            self._assert_registry_isolation()
+            self._clear_all_gradients()
+            self._freeze_all_parameters()
+            self._assert_frozen_base()
+            state.global_step += 1
+            return TrainingStepResult(
+                run_id=state.run_id,
+                global_step=state.global_step,
+                loss=0.0,
+                handle=state.handle,
+            )
+
     async def publish_pending_adapter(self, run_id: str) -> AdapterHandle:
         """retry a failed post-step publication without another optimizer update."""
 
