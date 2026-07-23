@@ -542,7 +542,7 @@ class SharedMultiLoRARolloutEngine:
             for int_id in int_ids:
                 try:
                     await self._evict_state_locked(int_id)
-                except BaseException:
+                except Exception:
                     async with self._condition:
                         self._condition.notify_all()
 

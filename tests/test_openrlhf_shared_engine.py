@@ -428,6 +428,22 @@ def test_cancelled_remove_finishes_drain_and_cleanup(tmp_path):
     asyncio.run(scenario())
 
 
+def test_remove_run_does_not_swallow_eviction_cancellation(tmp_path):
+    async def scenario():
+        engine = _FakeEngine(max_loaded=2)
+        manager = _manager(engine, run_capacity=1)
+        await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+
+        async def cancel_remove(_int_id: int) -> bool:
+            raise asyncio.CancelledError
+
+        engine.remove_lora = cancel_remove
+        with pytest.raises(asyncio.CancelledError):
+            await manager.remove_run("run-a", 0)
+
+    asyncio.run(scenario())
+
+
 def test_remove_eviction_failure_is_deferred_without_blocking_free_capacity(tmp_path):
     async def scenario():
         engine = _FakeEngine(max_loaded=3)
