@@ -27,7 +27,7 @@ GRPO_RAW = {
         "max_context_tokens": 2048,
         "hf_repo": "owner/runs",
     },
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {},
 }
 
 
@@ -230,7 +230,7 @@ def test_sft_steps_derived_from_examples():
                 "epochs": 2,
                 "hf_repo": "owner/runs",
             },
-            "gpu": {"type": "RTX 4090"},
+            "gpu": {},
         }
     )
     # batch_size 16 is a multiple of the per-device micro-batch (4) so realized == requested:
@@ -248,7 +248,7 @@ def _sft_spec(**train):
         "algorithm": "sft",
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {"hf_repo": "owner/runs", **train},
-        "gpu": {"type": "RTX 4090"},
+        "gpu": {},
     }
     return spec_from_dict(raw)
 
@@ -343,7 +343,7 @@ def test_sft_steps_price_gdn_packing_conservatively():
             "epochs": 2,
             "max_context_tokens": 1024,
         },
-        "gpu": {"type": "RTX 4090"},
+        "gpu": {},
     }
     spec = spec_from_dict(raw)
     v = vocab_size_for("Qwen/Qwen3.5-0.8B")
@@ -371,7 +371,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "batch_size = 16\n"
         'hf_repo = "owner/runs"\n'
         "[gpu]\n"
-        'type = "RTX 5090"\n'
+        ''
     )
     args = types.SimpleNamespace(
         config=str(cfg),

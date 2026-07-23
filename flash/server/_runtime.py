@@ -538,8 +538,8 @@ def recover_runs() -> None:
         _mark_warmstart_source,
         _update,
         attach_run,
-        effective_spec_from_status,
         get_status,
+        reallocation_spec_from_status,
     )
 
     active: set[str] = set()
@@ -623,7 +623,7 @@ def recover_runs() -> None:
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             try:
-                spec = effective_spec_from_status(status, verify_source=True)
+                spec = reallocation_spec_from_status(status, verify_source=True)
                 # refresh the warm-start marker so recovery keeps an aged source protected.
                 _mark_warmstart_source(spec, spec.run_id)
             except Exception as exc:

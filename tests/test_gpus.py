@@ -146,8 +146,8 @@ def test_cheapest_gpu_policy(monkeypatch):
 def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
-    # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
-    # model. 0.8B GRPO -> cheapest validated >=24G (RTX 4090). 9B is now bf16 (QLoRA dropped: the
+    # provisional_gpu remains the offline auto-sizing path and returns the cheapest fitting
+    # validated class. 0.8B GRPO -> cheapest validated >=24G (RTX 4090). 9B is now bf16 (QLoRA dropped: the
     # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
     # -> the cheapest validated 80G class (A100 PCIe).
     assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 4090"
@@ -156,26 +156,25 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="grpo") == "B200"
 
 
-def test_config_cheapest_policy_validated_pool(monkeypatch):
-    from flash.schema import spec_from_dict
+def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
+    from flash.schema import ConfigError, spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
     }
-    spec = spec_from_dict(raw, run_id="x")
-    # Cheapest fitting VALIDATED class for a small model: 0.8B SFT needs ~12 GB, but 24 GB is the
-    # floor now (sub-24 GB classes dropped), so it resolves to the cheapest validated card,
-    # RTX 4090 ($0.69).
-    assert spec.gpu.type == "RTX 4090"
-    # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
-    # cheapest fitting VALIDATED class, no matter what class the config names.
-    for klass in ("L4", "A100 SXM", "A40"):
+    assert spec_from_dict(raw, run_id="x").gpu.type == ""
+
+    for klass in ("RTX 4090", "A100 SXM", "H100"):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 4090"
+        assert spec_from_dict(raw, run_id="x").gpu.type == klass
+
+    raw["gpu"] = {"type": "cheapest"}
+    with pytest.raises(ConfigError, match="unsupported gpu"):
+        spec_from_dict(raw, run_id="x")
 
 
 def test_flash_gpu_enum_members():
@@ -197,7 +196,7 @@ def test_gpu_short():
     assert gpu_short("rtx_4090") == "4090"
 
 
-def test_config_defaults_gpu_from_model():
+def test_config_defaults_gpu_to_auto():
     from flash.schema import spec_from_dict
 
     raw = {
@@ -207,8 +206,7 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # chunked nll bounds the 248k-vocab projection, so the default 9b sft fits the 32 gb tier.
-    assert spec.gpu.type == "RTX 5090"
+    assert spec.gpu.type == ""
 
 
 def test_build_worker_env():

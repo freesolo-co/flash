@@ -52,7 +52,7 @@ def _representative_config() -> dict:
             "temperature": 0.9,
             "max_completion_tokens": 512,
         },
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
     }
 
 
@@ -108,7 +108,7 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:my-env/environment.py"},
         "train": {"hf_repo": "owner/my-runs", "epochs": 3, "max_examples": 64, "batch_size": 8},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
     }
     spec = spec_from_dict(config, run_id="flash-sft-1")
     assert spec.algorithm == "sft"
@@ -129,7 +129,7 @@ def test_backend_config_missing_required_fields_is_rejected_consistently() -> No
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 10},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
     }
     with pytest.raises(ConfigError):
         spec_from_dict(no_env)
@@ -146,7 +146,7 @@ def test_stale_local_env_path_is_rejected_at_both_layers() -> None:
         "algorithm": "grpo",
         "environment": {"path": "environments/local_env.py"},
         "train": {"hf_repo": "owner/my-runs", "epochs": 1, "max_examples": 10},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
     }
     with pytest.raises(ConfigError):
         spec_from_dict(stale)

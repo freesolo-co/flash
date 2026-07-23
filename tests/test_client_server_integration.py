@@ -43,7 +43,7 @@ SPEC = {
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {},
 }
 
 _USER_PREFIX = "fslo-user-"

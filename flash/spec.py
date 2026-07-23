@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
-from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
+from .catalog import DEFAULT_MODEL, normalize_algorithm
 from .opd_retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -305,8 +305,8 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # gpu.type does NOT pin — allocator re-picks cheapest fitting validated class at submit time.
-    type: str = DEFAULT_GPU
+    # empty selects managed auto-allocation; a set value hard-pins that validated gpu class.
+    type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     max_retries: int = 5
@@ -314,7 +314,6 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     provider: str = ""
-    exact_type: str = ""
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
@@ -403,28 +402,27 @@ class JobSpec:
         unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
         if unknown_gpu:
             raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
-        gpu_type = _validated_gpu_type(gpu.get("type", DEFAULT_GPU), field_name="gpu.type")
+        gpu_type_raw = gpu.get("type", "")
+        if not isinstance(gpu_type_raw, str):
+            raise TypeError("gpu.type must be a string")
+        gpu_type = (
+            _validated_gpu_type(gpu_type_raw, field_name="gpu.type")
+            if gpu_type_raw.strip()
+            else ""
+        )
         provider = gpu.get("provider", "")
         if not isinstance(provider, str):
             raise TypeError("gpu.provider must be a string")
         provider = provider.strip().lower()
-        exact_type_raw = gpu.get("exact_type", "")
-        if not isinstance(exact_type_raw, str):
-            raise TypeError("gpu.exact_type must be a string")
-        exact_type = (
-            _validated_gpu_type(exact_type_raw, field_name="gpu.exact_type")
-            if exact_type_raw.strip()
-            else ""
-        )
-        if provider or exact_type:
+        if provider or gpu_type:
             from flash.providers import PROVIDER_NAMES
             from flash.providers.base import providers_for
 
             if provider and provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {provider!r}")
-            if exact_type and provider and provider not in providers_for(exact_type):
+            if gpu_type and provider and provider not in providers_for(gpu_type):
                 raise ValueError(
-                    f"gpu.provider {provider!r} cannot provision gpu.exact_type {exact_type!r}"
+                    f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
                 )
         return cls(
             model=data.get("model", cls.model),
@@ -465,7 +463,6 @@ class JobSpec:
             gpu=GpuSpec(
                 type=gpu_type,
                 provider=provider,
-                exact_type=exact_type,
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),

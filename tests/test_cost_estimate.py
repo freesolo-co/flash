@@ -102,7 +102,7 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.environment == "owner/environment"
     assert config.train_tokens == 16_000
     assert config.save_at_steps == (2, 5)
-    assert config.exact_type == ""
+    assert config.gpu_type == ""
 
 
 def test_estimate_reports_the_runs_provider():
@@ -117,7 +117,7 @@ def test_estimate_reports_the_runs_provider():
 
 def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10))
-    exact = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
+    exact = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
 
     assert unconstrained.gpu == "RTX 4090"
     assert exact.gpu == "H100"
@@ -144,7 +144,7 @@ def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypat
     monkeypatch.setattr(lambda_api, "instance_type_price_usd_hr", advertised_price)
     monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *args, **kwargs: [])
 
-    config = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100")
+    config = RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100")
     allocation = allocator.allocate(
         config.model_id,
         config.method,
@@ -152,7 +152,7 @@ def test_estimate_exact_h100_matches_cheapest_live_allocator_candidate(monkeypat
         thinking=config.thinking,
         max_wall_seconds=24 * 3600,
         provider="",
-        exact_type=config.exact_type,
+        gpu_type=config.gpu_type,
         model_revision=config.model_revision,
     )
     estimate = estimate_cost(config)
@@ -183,10 +183,10 @@ def test_estimate_exact_gpu_enforces_provider_support_and_vram():
             "grpo",
             10,
             provider="lambda",
-            exact_type="RTX 4090",
+            gpu_type="RTX 4090",
         )
     with pytest.raises(ValueError, match="requires at least"):
-        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, exact_type="RTX 4090"))
+        estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="RTX 4090"))
 
 
 def test_runconfig_from_spec_preserves_gpu_constraints():
@@ -197,12 +197,12 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, max_examples=8),
-        gpu=GpuSpec(provider="runpod", exact_type="H100", disk_gb=200),
+        gpu=GpuSpec(provider="runpod", type="H100", disk_gb=200),
     )
 
     config = runconfig_from_spec(spec)
     assert config.provider == "runpod"
-    assert config.exact_type == "H100"
+    assert config.gpu_type == "H100"
     # the run's disk floor threads through so an exact-auto quote allocates the same disk as launch
     assert config.disk_gb == 200.0
 
@@ -221,7 +221,7 @@ def test_estimate_exact_auto_threads_disk_floor_into_allocation(monkeypatch):
         return SimpleNamespace(gpu="H100", provider="runpod", hourly_usd=3.29, min_vram_gb=80)
 
     monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
-    estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100", disk_gb=200.0))
+    estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100", disk_gb=200.0))
     assert seen["disk_gb"] == 200.0
 
 
@@ -360,8 +360,8 @@ def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
 
     seen: list[str] = []
 
-    def fake_usable(min_vram_gb, disk_gb, *args, exact_type="", **kwargs):
-        seen.append(exact_type)
+    def fake_usable(min_vram_gb, disk_gb, *args, gpu_type="", **kwargs):
+        seen.append(gpu_type)
         return [SimpleNamespace(gpu="A100 SXM 40GB", dph_total=0.77)]
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -371,7 +371,7 @@ def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
         "A100 SXM 40GB",
         provider="vast",
         min_vram_gb=40,
-        exact_type="A100 SXM 40GB",
+        gpu_type="A100 SXM 40GB",
     )
     unconstrained = gpu_hourly_usd(
         "A100 SXM 40GB",
@@ -392,8 +392,8 @@ def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
 
     seen: list[str] = []
 
-    def fake_usable(min_vram_gb, disk_gb, *args, exact_type="", **kwargs):
-        seen.append(exact_type)
+    def fake_usable(min_vram_gb, disk_gb, *args, gpu_type="", **kwargs):
+        seen.append(gpu_type)
         return [SimpleNamespace(gpu="H100", dph_total=2.17)]
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -406,10 +406,10 @@ def test_estimate_exact_vast_explicit_and_auto_use_same_live_class(monkeypatch):
             "grpo",
             10,
             provider="vast",
-            exact_type="H100",
+            gpu_type="H100",
         )
     )
-    automatic = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
+    automatic = estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
 
     assert (explicit.provider, explicit.gpu_hourly_usd) == ("vast", 2.17)
     assert (automatic.provider, automatic.gpu_hourly_usd) == ("vast", 2.17)
@@ -426,7 +426,7 @@ def test_estimate_auto_exact_vast_requires_constrained_live_capacity(monkeypatch
     monkeypatch.setattr(allocator, "available_providers", lambda: ("vast",))
 
     with pytest.raises(CapacityLookupError, match="currently has no capacity"):
-        estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, exact_type="H100"))
+        estimate_cost(RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, gpu_type="H100"))
 
 
 def test_a100_sxm_40gb_has_real_tflops_not_default():
@@ -450,9 +450,9 @@ def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
 
 
 def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monkeypatch):
-    # regression (PR #538 finding 1): a PINNED provider + exact_type must quote through the same
+    # regression (PR #538 finding 1): a PINNED provider + gpu_type must quote through the same
     # disk-aware allocate path as launch, forwarding the pinned provider and the run's disk floor.
-    # pre-fix only provider="auto" + exact_type took this path, so a pinned provider was quoted off the
+    # pre-fix only provider="auto" + gpu_type took this path, so a pinned provider was quoted off the
     # non-disk-aware gpu_hourly_usd branch and could misprice against the wrong class.
     from types import SimpleNamespace
 
@@ -467,12 +467,12 @@ def test_estimate_exact_pinned_provider_routes_through_disk_aware_allocate(monke
     monkeypatch.setattr(allocator_mod, "allocate", fake_allocate)
     est = estimate_cost(
         RunConfig(
-            "Qwen/Qwen3.5-0.8B", "grpo", 10, provider="runpod", exact_type="H100", disk_gb=200.0
+            "Qwen/Qwen3.5-0.8B", "grpo", 10, provider="runpod", gpu_type="H100", disk_gb=200.0
         )
     )
     # the pinned provider and disk floor thread through to allocate (not "" and not 0).
     assert seen["provider"] == "runpod"
-    assert seen["exact_type"] == "H100"
+    assert seen["gpu_type"] == "H100"
     assert seen["disk_gb"] == 200.0
     # and the quote reflects the live allocation rather than a static gpu_hourly_usd lookup.
     assert (est.provider, est.gpu, est.gpu_hourly_usd) == ("runpod", "H100", 3.29)
@@ -496,9 +496,9 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo(monkeypatch):
         return fake_allocate
 
     monkeypatch.setattr(allocator_mod, "allocate", alloc_as("H200"))
-    h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, exact_type="H200"))
+    h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="H200"))
     monkeypatch.setattr(allocator_mod, "allocate", alloc_as("B200"))
-    b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, exact_type="B200"))
+    b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="B200"))
 
     assert gpu_hourly_usd("B200") > gpu_hourly_usd("H200")  # b200 is the pricier card
     # same effective training throughput => b200 is no faster than h200 ...

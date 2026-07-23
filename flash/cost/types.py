@@ -41,9 +41,9 @@ class RunConfig:
     # from this token count instead of the padded batch_size * seq_len slot estimate.
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
-    exact_type: str = ""
+    gpu_type: str = ""
     model_revision: str = ""
-    # Spec gpu.disk_gb, carried so an exact-auto quote allocates at the run's real disk floor (parity
+    # spec gpu.disk_gb, carried so a pinned quote allocates at the run's real disk floor (parity
     # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
     disk_gb: float = 0.0
     # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
@@ -61,14 +61,14 @@ class RunConfig:
             )
         object.__setattr__(self, "provider", prov)
         exact = ""
-        if self.exact_type:
-            exact = canonical_gpu(self.exact_type)
+        if self.gpu_type:
+            exact = canonical_gpu(self.gpu_type)
             info = GPU_INFO.get(exact)
             if info is None or not info.validated:
-                raise ValueError(f"exact_type {exact!r} must name an active validated GPU class")
+                raise ValueError(f"gpu_type {exact!r} must name an active validated GPU class")
             if prov != "auto" and prov not in providers_for(exact):
-                raise ValueError(f"provider {prov!r} cannot provision exact_type {exact!r}")
-        object.__setattr__(self, "exact_type", exact)
+                raise ValueError(f"provider {prov!r} cannot provision gpu_type {exact!r}")
+        object.__setattr__(self, "gpu_type", exact)
         if not isinstance(self.model_revision, str):
             raise TypeError("model_revision must be a string")
         object.__setattr__(self, "model_revision", self.model_revision.strip())
