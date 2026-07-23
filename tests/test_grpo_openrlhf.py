@@ -1231,6 +1231,71 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     assert output["truncated"] is False
 
 
+def test_sitecustomize_does_not_neutralize_content_fused_with_first_stop_token():
+    captured = {}
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            if not token_ids:
+                return ""
+            assert token_ids == [2]
+            return "yes</answer>"
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            generation = SimpleNamespace(
+                token_ids=[2],
+                text="yes</answer>",
+                finish_reason="stop",
+                stop_reason="</answer>",
+                logprobs=["fused-logprob"],
+            )
+            captured["generation"] = generation
+            return SimpleNamespace(outputs=[generation])
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "observation_tokens": [10, *generation.token_ids],
+            "action_ranges": [(1, 1 + len(generation.token_ids))],
+            "rollout_log_probs": [0.0, *generation.logprobs],
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {"answer": [1.0]},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            _ReadOnlyStopSamplingParams(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert captured["generation"].token_ids == []
+    assert captured["generation"].text == ""
+    assert captured["generation"].logprobs == []
+    assert output["truncated"] is False
+    assert output["reward"] == 1.0
+    assert output["scores"] == 1.0
+    assert output["extra_logs"] == {"answer": 1.0}
+
+
 def test_sitecustomize_trims_the_reported_trailing_stop_not_an_earlier_match():
     class _Tokenizer:
         def decode(self, token_ids, *, skip_special_tokens):
@@ -1412,6 +1477,71 @@ def test_sitecustomize_trims_special_token_stop_from_raw_decode():
     assert output["token_ids"] == [1]
     assert output["action_text"] == "ok"
     assert output["logprobs"] == ["ok"]
+
+
+def test_sitecustomize_trims_terminal_eos_id_before_scoring():
+    captured = {}
+
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            pieces = {1: "ok", 99: "" if skip_special_tokens else "<eos>"}
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            generation = SimpleNamespace(
+                token_ids=[1, 99],
+                text="ok<eos>",
+                finish_reason="stop",
+                stop_reason=99,
+                logprobs=["ok-logprob", "eos-logprob"],
+            )
+            captured["generation"] = generation
+            return SimpleNamespace(outputs=[generation])
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "observation_tokens": [10, *generation.token_ids],
+            "action_ranges": [(1, 1 + len(generation.token_ids))],
+            "rollout_log_probs": [0.0, *generation.logprobs],
+            "action_text": generation.text,
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            _ReadOnlyStopSamplingParams(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert captured["generation"].token_ids == [1]
+    assert captured["generation"].text == "ok"
+    assert captured["generation"].logprobs == ["ok-logprob"]
+    assert output["observation_tokens"] == [10, 1]
+    assert output["action_ranges"] == [(1, 2)]
+    assert output["rollout_log_probs"] == [0.0, "ok-logprob"]
+    assert output["action_text"] == "ok"
+    assert output["truncated"] is False
 
 
 def test_sitecustomize_preserves_native_output_when_no_stop_is_trimmed():
