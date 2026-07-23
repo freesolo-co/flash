@@ -56,6 +56,7 @@ _OPENRLHF_REWARD_MAX_BODY_BYTES = 2 * 1024 * 1024
 _OPENRLHF_TARGET_MODULES = "all-linear"
 _OPENRLHF_PPO_EPOCHS = 1
 _OPENRLHF_REWARD_CLIP_BOUND = "1000000000"
+OPENRLHF_GRPO_TIS_C_MAX = 2.0
 _SITE_CUSTOMIZE_NAME = "sitecustomize.py"
 _CHILD_ENV_EXACT = frozenset(
     {
@@ -109,6 +110,16 @@ class RewardResult:
     reward: float
     scores: float
     extra_logs: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OpenRLHFGRPOLoss:
+    """exact differentiable GRPO terms shared with the multi-run controller."""
+
+    loss: Any
+    policy_loss: Any
+    kl_loss: Any
+    advantages: Any
 
 
 @dataclass(frozen=True)
@@ -330,6 +341,121 @@ def tis_weighted_dr_grpo_normalize(
             ]
         )
     return dr_grpo_fixed_length_normalize(weighted, action_masks, max_response_length)
+
+
+def openrlhf_dr_grpo_advantages(rewards: Any, action_mask: Any, group_size: int) -> Any:
+    """match OpenRLHF's group-mean DR-GRPO advantages without std scaling."""
+
+    import torch
+
+    if isinstance(group_size, bool) or int(group_size) <= 1:
+        raise ValueError("OpenRLHF DR-GRPO requires group_size greater than 1")
+    if rewards.ndim != 1:
+        raise ValueError("GRPO rewards must have shape [batch]")
+    if (
+        action_mask.ndim != 2
+        or action_mask.shape[0] != rewards.shape[0]
+        or action_mask.shape[1] == 0
+    ):
+        raise ValueError("GRPO action mask must have shape [batch, actions]")
+    if rewards.numel() == 0 or rewards.numel() % int(group_size) != 0:
+        raise ValueError("GRPO reward batch must contain complete prompt groups")
+    if not bool(torch.isfinite(rewards).all()):
+        raise ValueError("GRPO rewards must be finite")
+
+    grouped = rewards.reshape(-1, int(group_size))
+    centered = (grouped - grouped.mean(dim=-1, keepdim=True)).clamp(
+        min=-float(_OPENRLHF_REWARD_CLIP_BOUND),
+        max=float(_OPENRLHF_REWARD_CLIP_BOUND),
+    )
+    eos_indices = (
+        action_mask.size(1)
+        - 1
+        - action_mask.long()
+        .fliplr()
+        .argmax(
+            dim=1,
+            keepdim=True,
+        )
+    )
+    terminal_rewards = torch.zeros(
+        action_mask.shape,
+        dtype=rewards.dtype,
+        device=rewards.device,
+    ).scatter_(
+        dim=1,
+        index=eos_indices,
+        src=centered.reshape(-1, 1),
+    )
+    masked_rewards = terminal_rewards * action_mask.to(rewards.dtype)
+    return torch.flip(
+        torch.cumsum(torch.flip(masked_rewards, dims=(1,)), dim=1),
+        dims=(1,),
+    )
+
+
+def openrlhf_grpo_loss(
+    action_log_probs: Any,
+    old_action_log_probs: Any,
+    rollout_log_probs: Any,
+    rewards: Any,
+    action_mask: Any,
+    max_response_length: int,
+    group_size: int,
+    *,
+    base_action_log_probs: Any | None = None,
+    kl_coef: float = 0.0,
+) -> OpenRLHFGRPOLoss:
+    """apply the existing OpenRLHF PPO, token TIS, DR-GRPO, and k2 KL math."""
+
+    import torch
+
+    tensors = (action_log_probs, old_action_log_probs, rollout_log_probs, action_mask)
+    if any(tensor.ndim != 2 for tensor in tensors):
+        raise ValueError("GRPO log probabilities and action mask must be rank two")
+    if any(tensor.shape != action_mask.shape for tensor in tensors[:-1]):
+        raise ValueError("GRPO log probabilities and action mask must have identical shapes")
+    if int(max_response_length) <= 0:
+        raise ValueError("max_response_length must be positive")
+    if not math.isfinite(float(kl_coef)) or float(kl_coef) < 0:
+        raise ValueError("kl_coef must be non-negative and finite")
+
+    advantages = openrlhf_dr_grpo_advantages(rewards, action_mask, group_size)
+    raw_policy_log_ratio = action_log_probs - old_action_log_probs
+    ratio = raw_policy_log_ratio.clamp(min=-20.0, max=20.0).exp()
+    surrogate = ratio * advantages
+    clipped_surrogate = ratio.clamp(0.8, 1.2) * advantages
+    per_token_policy_loss = -torch.minimum(surrogate, clipped_surrogate)
+
+    rollout_log_ratio = old_action_log_probs - rollout_log_probs
+    token_tis = (
+        torch.exp(rollout_log_ratio)
+        .clamp(
+            min=0.0,
+            max=OPENRLHF_GRPO_TIS_C_MAX,
+        )
+        .detach()
+    )
+    per_token_policy_loss = token_tis * per_token_policy_loss
+    denominator = action_mask.shape[0] * int(max_response_length)
+    if denominator <= 0:
+        raise ValueError("GRPO fixed-length denominator must be positive")
+    policy_loss = (per_token_policy_loss * action_mask).sum() / denominator
+
+    if float(kl_coef) > 0:
+        if base_action_log_probs is None or base_action_log_probs.shape != action_mask.shape:
+            raise ValueError("KL-enabled GRPO requires aligned base action log probabilities")
+        per_token_kl = (
+            (action_log_probs.float() - base_action_log_probs.float()) ** 2 / 2.0
+        ).clamp(
+            min=-10.0,
+            max=10.0,
+        )
+        kl_loss = (per_token_kl * action_mask).sum() / denominator
+    else:
+        kl_loss = policy_loss.new_zeros(())
+    loss = policy_loss + kl_loss * float(kl_coef)
+    return OpenRLHFGRPOLoss(loss, policy_loss, kl_loss, advantages)
 
 
 def _completion_from_openrlhf_query(query: str, prompt: str) -> str:

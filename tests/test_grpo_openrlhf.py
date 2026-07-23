@@ -1045,6 +1045,60 @@ def test_sitecustomize_applies_token_tis_inside_fixed_dr_grpo_loss(monkeypatch):
 
 @requires_openrlhf_source
 @requires_torch
+def test_shared_grpo_objective_matches_single_run_policy_tis_dr_grpo_and_kl(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, loss_module, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    current = torch.tensor(
+        [[-0.1, -0.4, -0.2], [-0.3, -0.2, -0.5]],
+        requires_grad=True,
+    )
+    old = torch.tensor([[-0.2, -0.2, -0.1], [-0.4, -0.1, -0.6]])
+    rollout = torch.tensor([[-0.3, -1.2, -0.1], [-0.7, -0.1, -0.8]])
+    base = torch.tensor([[-0.4, -0.5, -0.3], [-0.2, -0.4, -0.7]])
+    action_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    rewards = torch.tensor([3.0, 1.0])
+    advantages = grpo_openrlhf.openrlhf_dr_grpo_advantages(rewards, action_mask, 2)
+    loss_fn = loss_module.PolicyLoss()
+    token = namespace["_fixed_dr_grpo_loss"].set(True)
+    try:
+        policy_loss, _, _, _ = loss_fn(
+            current,
+            old,
+            advantages,
+            action_mask=action_mask,
+            rollout_log_probs=rollout,
+        )
+        per_token_kl = ((current.float() - base.float()) ** 2 / 2.0).clamp(-10, 10)
+        kl_loss = loss_module.aggregate_loss(per_token_kl, action_mask)
+    finally:
+        namespace["_fixed_dr_grpo_loss"].reset(token)
+
+    expected = policy_loss + 0.3 * kl_loss
+    actual = grpo_openrlhf.openrlhf_grpo_loss(
+        current,
+        old,
+        rollout,
+        rewards,
+        action_mask,
+        5,
+        2,
+        base_action_log_probs=base,
+        kl_coef=0.3,
+    )
+
+    torch.testing.assert_close(actual.loss, expected, rtol=0, atol=1e-7)
+    torch.testing.assert_close(actual.policy_loss, policy_loss, rtol=0, atol=1e-7)
+    torch.testing.assert_close(actual.kl_loss, kl_loss, rtol=0, atol=1e-7)
+    torch.testing.assert_close(
+        actual.advantages,
+        torch.tensor([[1.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
+@requires_openrlhf_source
+@requires_torch
 def test_sitecustomize_masks_truncated_response_but_retains_row(monkeypatch):
     torch = pytest.importorskip("torch")
     _, _, _, samples_module, _ = _install_pinned_sitecustomize_modules(monkeypatch)
