@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import math
 import time
@@ -356,6 +357,11 @@ class SharedEngineRunController:
                 )
                 try:
                     result = await asyncio.wait_for(asyncio.shield(step_task), timeout=remaining)
+                except asyncio.CancelledError:
+                    step_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await step_task
+                    raise
                 except TimeoutError as exc:
                     raise TimeoutError("shared scheduler drain timed out") from exc
             if deadline is not None and time.monotonic() >= deadline:

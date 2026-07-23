@@ -535,6 +535,50 @@ def test_drain_timeout_bounds_a_final_gpu_callback_without_cancelling_it():
     asyncio.run(scenario())
 
 
+def test_timed_drain_propagates_cancellation_to_inflight_gpu_work():
+    async def scenario():
+        rollout_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_rollout(_run_id: str, _step: int) -> None:
+            rollout_started.set()
+            await asyncio.Event().wait()
+
+        async def cleanup(_run_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        hooks = SchedulerRunHooks(
+            blocked_rollout,
+            lambda _run_id, _step, _rollout: {},
+            lambda _run_id, _step, _rollout, _score: None,
+            cleanup,
+        )
+        with SharedScoringPool(pool_size=1) as scoring_pool:
+            controller = SharedEngineRunController(scoring_pool, deficit_quantum_ms=1)
+            controller.add_run(
+                "cancelled-drain",
+                hooks=hooks,
+                scoring_kind=ScoringKind.REWARD,
+                scoring_bridge=_immediate_score,
+                total_steps=1,
+            )
+
+            drain_task = asyncio.create_task(controller.drain(timeout_s=10))
+            await asyncio.wait_for(rollout_started.wait(), timeout=1)
+            drain_task.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert drain_task.done() is False
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await drain_task
+
+        assert controller.run_snapshot("cancelled-drain").phase is RunPhase.FAILED
+
+    asyncio.run(scenario())
+
+
 def test_slow_failure_cleanup_does_not_hold_gpu_lease_from_peer():
     async def scenario():
         cleanup_started = asyncio.Event()
