@@ -275,6 +275,33 @@ def test_rejected_future_translates_executor_cancellation_to_identity_error():
             result.result(timeout=1)
 
 
+def test_rejected_future_does_not_mask_wait_interrupt():
+    class _InterruptingFuture(Future):
+        def result(self, timeout=None):
+            result_entered.set()
+            assert interrupt_release.wait(timeout=timeout)
+            raise KeyboardInterrupt
+
+    identity = ScoringBatchIdentity("run-a", 2, "interrupted")
+    result_entered = threading.Event()
+    interrupt_release = threading.Event()
+    raw_future = _InterruptingFuture()
+    future = ScoringFuture(
+        identity,
+        ScoringKind.REWARD,
+        raw_future,
+        lambda _future: None,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as consumers:
+        result = consumers.submit(future.result_for, identity, 1)
+        assert result_entered.wait(timeout=1)
+        assert future.cancel() is True
+        interrupt_release.set()
+        with pytest.raises(KeyboardInterrupt):
+            result.result(timeout=1)
+
+
 def test_only_one_consumer_can_claim_a_scoring_result():
     started = threading.Event()
     release = threading.Event()

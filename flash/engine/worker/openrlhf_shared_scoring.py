@@ -174,8 +174,9 @@ class ScoringFuture:
         self._raise_if_rejected()
         try:
             result = self._future.result(timeout=timeout)
-        except BaseException:
-            self._raise_if_rejected()
+        except BaseException as exc:
+            if isinstance(exc, Exception) or self._raised_by_worker(exc):
+                self._raise_if_rejected()
             raise
         self._raise_if_rejected()
         if result.identity != self.identity or result.kind is not self.kind:
