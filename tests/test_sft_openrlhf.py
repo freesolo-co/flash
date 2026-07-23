@@ -13,6 +13,7 @@ import pytest
 from flash.engine.worker import sft as sft_mod
 from flash.engine.worker.sft_openrlhf import (
     _attention_implementation,
+    _child_output_is_cuda_oom,
     _OpenRLHFCheckpointWatcher,
     _probe_gpu_in_subprocess,
     _processor_tokenized_row,
@@ -473,12 +474,19 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
     hf_dir.mkdir()
     monkeypatch.setattr(openrlhf_mod, "_export_checkpoint_adapter", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        openrlhf_mod._w, "publish_deployable_checkpoint", lambda *args, **kwargs: None
+        openrlhf_mod._w,
+        "publish_deployable_checkpoint",
+        lambda *args, **kwargs: "checkpoints/step-3/adapter",
     )
+
+    def upload_resume_checkpoint(*_args, before_upload, **_kwargs):
+        before_upload()
+        return True
+
     monkeypatch.setattr(
         openrlhf_mod._w,
         "upload_resume_checkpoint",
-        lambda *args, **kwargs: True,
+        upload_resume_checkpoint,
     )
     watcher = _OpenRLHFCheckpointWatcher(
         checkpoint_dir=str(checkpoint_dir),
@@ -493,8 +501,39 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
     watcher._publish(3, str(ds_dir), str(hf_dir))
 
     assert 3 in watcher.processed_steps
+    assert 3 in watcher.published_steps
     assert (checkpoint_dir / ".flash-required-step-3.done").read_text() == "durable\n"
     assert (checkpoint_dir / ".flash-upload-step-3.done").read_text() == "uploaded\n"
+
+    def fail_resume_checkpoint(*_args, before_upload, **_kwargs):
+        before_upload()
+        return False
+
+    monkeypatch.setattr(
+        openrlhf_mod._w,
+        "upload_resume_checkpoint",
+        fail_resume_checkpoint,
+    )
+    retry_watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "retry-exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(3,),
+    )
+    with pytest.raises(openrlhf_mod._w.RetriableInfraError, match="full-state checkpoint"):
+        retry_watcher._publish(3, str(ds_dir), str(hf_dir))
+
+
+def test_final_checkpoint_retry_uses_deployable_publication_state():
+    source = Path(importlib.util.find_spec("flash.engine.worker.sft_openrlhf").origin).read_text(
+        encoding="utf-8"
+    )
+
+    assert "final_step not in watcher.published_steps" in source
+    assert "final_step not in watcher.processed_steps" not in source
 
 
 def test_checkpoint_watcher_waits_for_authoritative_zero3_export(tmp_path):
@@ -599,6 +638,7 @@ def test_checkpoint_watcher_failed_periodic_upload_does_not_hang(monkeypatch, tm
 
     assert not watcher._thread.is_alive()
     assert 2 in watcher.processed_steps
+    assert 2 not in watcher.published_steps
     assert (checkpoint_dir / ".flash-upload-step-2.failed").is_file()
     assert ds_dir.is_dir()
     assert hf_dir.is_dir()
@@ -818,16 +858,16 @@ def test_openrlhf_runtime_disables_unpatchable_blackwell_fla(monkeypatch, tmp_pa
     assert not any(name == "fla" or name.startswith("fla.") for name in sys.modules)
 
 
-def test_runtime_backpressures_every_checkpoint_until_upload_and_prune_finish():
+def test_runtime_backpressures_only_required_checkpoints_until_upload_finishes():
     source = render_openrlhf_sft_runtime()
     save_block = source.split("if save_due:", 1)[1].split("consumed_in_epoch = 0", 1)[0]
 
     save_model = save_block.index("self.strategy.save_model(")
     export_ready = save_block.index("_mark_hf_export_ready(args.ckpt.path, global_step)")
+    required_gate = save_block.index("if global_step in required:")
     upload_wait = save_block.index("_wait_for_checkpoint_upload(args.ckpt.path, global_step)")
 
-    assert save_model < export_ready < upload_wait
-    assert "if global_step in required:" not in save_block
+    assert save_model < export_ready < required_gate < upload_wait
 
 
 def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, tmp_path):
@@ -837,6 +877,7 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
             {
                 "lora_rank": 16,
                 "model_id": "org/model",
+                "model_revision": "a" * 40,
                 "warmstart_adapter": "/adapter",
             }
         ),
@@ -861,6 +902,12 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
     class AdapterModel:
         def __init__(self):
             self.input_grads_enabled = False
+            self.peft_config = {
+                "default": SimpleNamespace(
+                    base_model_name_or_path="org/model",
+                    revision="main",
+                )
+            }
 
         def enable_input_require_grads(self):
             self.input_grads_enabled = True
@@ -908,6 +955,8 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
 
     assert isinstance(patched.model, AdapterModel)
     assert patched.model.input_grads_enabled is True
+    assert patched.model.peft_config["default"].base_model_name_or_path == "org/model"
+    assert patched.model.peft_config["default"].revision == "a" * 40
     assert "from flash.engine.worker.lora import" not in source
 
 
@@ -1141,10 +1190,23 @@ def test_gpu_probe_uses_configured_openrlhf_interpreter(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = _probe_gpu_in_subprocess("/opt/openrlhf/bin/python", "H100")
+    result = _probe_gpu_in_subprocess(
+        "/opt/openrlhf/bin/python",
+        "H100",
+        required_gpu_count=2,
+    )
 
     assert calls[0][0][0] == "/opt/openrlhf/bin/python"
+    assert json.loads(calls[0][0][3]) == ["H100", "", 2]
+    assert "torch.cuda.device_count()" in calls[0][0][2]
+    assert "for index in range(required_count)" in calls[0][0][2]
     assert result["capability"] == [9, 0]
+
+
+def test_child_output_cuda_oom_detection_uses_explicit_child_markers():
+    assert _child_output_is_cuda_oom("torch.OutOfMemoryError: CUDA out of memory")
+    assert _child_output_is_cuda_oom("torch.cuda.OutOfMemoryError: allocation failed")
+    assert not _child_output_is_cuda_oom("OpenRLHF SFT subprocess exited with status 1")
 
 
 def test_attention_implementation_matches_gpu_capability():

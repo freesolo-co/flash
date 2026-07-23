@@ -542,6 +542,7 @@ class _OpenRLHFCheckpointWatcher:
         self.required_steps = frozenset(required_steps)
         self.max_num_checkpoints = max(1, int(max_num_checkpoints))
         self.processed_steps: set[int] = set()
+        self.published_steps: set[int] = set()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -623,12 +624,14 @@ class _OpenRLHFCheckpointWatcher:
             )
 
             def publish_adapter() -> None:
-                _w.publish_deployable_checkpoint(
+                published = _w.publish_deployable_checkpoint(
                     adapter_dir,
                     step,
                     required=required,
                     _provenance_ready=True,
                 )
+                if published is not None:
+                    self.published_steps.add(step)
 
             uploaded = _w.upload_resume_checkpoint(
                 step,
@@ -637,7 +640,9 @@ class _OpenRLHFCheckpointWatcher:
             )
             if not uploaded:
                 if required:
-                    raise RuntimeError(f"save step {step} full-state checkpoint was not published")
+                    raise _w.RetriableInfraError(
+                        f"save step {step} full-state checkpoint was not published"
+                    )
                 self.processed_steps.add(step)
                 marker = _checkpoint_upload_marker(self.checkpoint_dir, step, failed=True)
                 with open(marker, "w", encoding="utf-8") as file:
@@ -1000,6 +1005,11 @@ def _install_warmstart_actor_patch():
             model_id = str(CONFIG["model_id"])
             assert_lora_applied(model, model_id)
             assert_adapter_delta_nonzero(model, model_id)
+            adapter_config = getattr(model, "peft_config", {}).get("default")
+            if adapter_config is None:
+                raise RuntimeError("OpenRLHF warm-start model has no default PEFT config")
+            adapter_config.base_model_name_or_path = model_id
+            adapter_config.revision = str(CONFIG["model_revision"])
             self.model = model
 
     openrlhf.models.Actor = FlashWarmstartActor
@@ -1331,7 +1341,8 @@ def _install_trainer_patch():
                     )
                     if self.strategy.is_rank_0():
                         _mark_hf_export_ready(args.ckpt.path, global_step)
-                    _wait_for_checkpoint_upload(args.ckpt.path, global_step)
+                    if global_step in required:
+                        _wait_for_checkpoint_upload(args.ckpt.path, global_step)
             consumed_in_epoch = 0
 
         if self._wandb is not None and self.strategy.is_rank_0():
@@ -1363,7 +1374,10 @@ def apply_flash_openrlhf_sft_patches():
 
 
 def _probe_gpu_in_subprocess(
-    python_bin: str, requested_gpu: str | None, exact_type: str = ""
+    python_bin: str,
+    requested_gpu: str | None,
+    exact_type: str = "",
+    required_gpu_count: int = 1,
 ) -> dict:
     script = r"""
 import json
@@ -1371,9 +1385,22 @@ import sys
 
 from flash.engine.worker.perf.lifecycle import wait_for_gpu
 
-requested, exact = json.loads(sys.argv[1])
+requested, exact, required_count = json.loads(sys.argv[1])
 wait_for_gpu(requested, exact_type=exact)
 import torch
+required_count = max(1, int(required_count))
+visible_count = torch.cuda.device_count()
+if visible_count < required_count:
+    raise RuntimeError(
+        f"requested {required_count} GPUs but only {visible_count} CUDA devices are visible"
+    )
+for index in range(required_count):
+    probe = torch.empty(1, device=f"cuda:{index}")
+    torch.cuda.synchronize(index)
+    del probe
+    torch.cuda.get_device_name(index)
+    torch.cuda.get_device_properties(index)
+    torch.cuda.get_device_capability(index)
 try:
     from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
     fa2_available = bool(is_flash_attn_2_available())
@@ -1385,13 +1412,19 @@ print("FLASH_GPU_PROBE=" + json.dumps({
     "name": torch.cuda.get_device_name(0),
     "memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
     "capability": list(torch.cuda.get_device_capability(0)),
+    "visible_device_count": visible_count,
     "fa2_available": fa2_available,
     "fa3_available": fa3_available,
 }), flush=True)
 """
     try:
         result = subprocess.run(
-            [python_bin, "-c", script, json.dumps([requested_gpu, exact_type])],
+            [
+                python_bin,
+                "-c",
+                script,
+                json.dumps([requested_gpu, exact_type, max(1, int(required_gpu_count))]),
+            ],
             capture_output=True,
             text=True,
             timeout=150,
@@ -1450,6 +1483,11 @@ class _NvidiaSmiPeakSampler:
         return round(self.peak_mib / 1024, 3)
 
 
+def _child_output_is_cuda_oom(line: str) -> bool:
+    normalized = line.lower()
+    return "cuda out of memory" in normalized or "torch.cuda.outofmemoryerror" in normalized
+
+
 def _parse_step_line(line: str) -> dict | None:
     index = line.find(_STEP_PREFIX)
     if index < 0:
@@ -1504,10 +1542,12 @@ def run_sft_openrlhf(spec=None) -> None:
     started_at = time.time()
     _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
     python_bin = resolve_openrlhf_python("")
+    gpu_count = int(getattr(getattr(spec, "gpu", None), "count", 1) or 1)
     gpu_probe = _probe_gpu_in_subprocess(
         python_bin,
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.exact_type if spec else "",
+        required_gpu_count=gpu_count,
     )
 
     model_id = spec.model if spec else RECIPE.hf_model_id
@@ -1533,7 +1573,6 @@ def run_sft_openrlhf(spec=None) -> None:
     max_steps = int(train_opt("max_steps", 0) or 0)
     save_at_steps = tuple(getattr(train_spec, "save_at_steps", ()) or ())
     save_every = int(train_opt("save_every", 50))
-    gpu_count = int(getattr(getattr(spec, "gpu", None), "count", 1) or 1)
 
     workdir = os.path.join("/tmp", "flash-sft-openrlhf", _w.RUN_ID, f"seed-{_w.SEED}")
     shutil.rmtree(workdir, ignore_errors=True)
@@ -1801,6 +1840,7 @@ def run_sft_openrlhf(spec=None) -> None:
         "lora_rank": lora_rank,
         "loraplus_ratio": _SFT_LORAPLUS_RATIO,
         "model_id": model_id,
+        "model_revision": model_revision,
         "optimizer_name": "paged_adamw_8bit",
         "resume_step": resume_step,
         "save_at_steps": list(save_at_steps),
@@ -1871,10 +1911,13 @@ def run_sft_openrlhf(spec=None) -> None:
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     loss_curve: list[float] = []
     loraplus_applied = False
+    child_cuda_oom = False
 
     def on_line(line: str) -> None:
-        nonlocal loraplus_applied
+        nonlocal child_cuda_oom, loraplus_applied
         watcher.raise_if_failed()
+        if _child_output_is_cuda_oom(line):
+            child_cuda_oom = True
         if _LORAPLUS_READY_MARKER in line:
             loraplus_applied = True
         payload = _parse_step_line(line)
@@ -1937,6 +1980,12 @@ def run_sft_openrlhf(spec=None) -> None:
             device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at
     if return_code != 0:
+        if child_cuda_oom:
+            import torch
+
+            raise torch.cuda.OutOfMemoryError(
+                f"OpenRLHF SFT subprocess exited with status {return_code} after a CUDA OOM"
+            )
         raise RuntimeError(f"OpenRLHF SFT subprocess exited with status {return_code}")
     if not loraplus_applied:
         raise RuntimeError("required OpenRLHF LoRA+ shim did not emit its success marker")
@@ -1978,7 +2027,7 @@ def run_sft_openrlhf(spec=None) -> None:
             python_bin=python_bin,
         )
         _w.hf_upload_folder(adapter_dir, "adapter", required=True)
-        if final_save_due(final_step, save_at_steps) and final_step not in watcher.processed_steps:
+        if final_save_due(final_step, save_at_steps) and final_step not in watcher.published_steps:
             _w.publish_deployable_checkpoint(adapter_dir, final_step)
 
     _w.heartbeat(
