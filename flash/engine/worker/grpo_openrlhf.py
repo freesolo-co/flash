@@ -895,15 +895,15 @@ def _flash_trim_trailing_stop(tokenizer, token_ids, raw_text, output_text, stop_
     if isinstance(stop_reason, str) and stop_reason in _FLASH_STOP_SEQUENCES:
         candidates.append(stop_reason)
     if not candidates:
-        return ids, None
+        return ids, None, False
     stop = max(candidates, key=len)
     keep_length = raw_text.rfind(stop)
     if keep_length < 0:
-        return ids, None
+        return ids, None, False
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
         kept -= 1
-    return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True)
+    return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True), keep_length == 0
 
 
 def _flash_finalize_reward_record(output, neutralize):
@@ -986,19 +986,22 @@ class _FlashTerminationCapture:
             token_ids,
             stop_text,
         )
-        kept_ids, kept_text = _flash_trim_trailing_stop(
+        kept_ids, kept_text, stop_only = _flash_trim_trailing_stop(
             self._tokenizer,
             token_ids,
             stop_text,
             generation_output.text,
             self.stop_reason,
         )
+        if kept_text is None and token_ids and token_ids[-1] in _FLASH_EOS_TOKEN_IDS:
+            kept_ids = token_ids[:-1]
+            kept_text = self._tokenizer.decode(kept_ids, skip_special_tokens=True)
         if kept_text is not None:
             generation_output.token_ids = kept_ids
             generation_output.text = kept_text
             if generation_output.logprobs is not None:
                 generation_output.logprobs = generation_output.logprobs[: len(kept_ids)]
-            self.empty_after_stop = not kept_ids
+            self.empty_after_stop = stop_only
         return request_output
 
 
