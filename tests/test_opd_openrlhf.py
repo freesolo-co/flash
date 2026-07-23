@@ -1463,6 +1463,23 @@ def test_pinned_openrlhf_hooks_target_concrete_ray_runtime(monkeypatch):
 @requires_torch
 def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch):
     torch = pytest.importorskip("torch")
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    zero3_calls = []
+
+    def register_external_parameter(module, parameter):
+        zero3_calls.append(
+            ("register", module, parameter, getattr(module, "_forward_active", None))
+        )
+
+    def deepspeed_checkpoint(function, *args):
+        zero3_calls.append(("checkpoint", function))
+        return torch_checkpoint(function, *args, use_reentrant=True)
+
+    deepspeed = types.ModuleType("deepspeed")
+    deepspeed.checkpointing = SimpleNamespace(checkpoint=deepspeed_checkpoint)
+    deepspeed.zero = SimpleNamespace(register_external_parameter=register_external_parameter)
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed)
 
     class _ActorPPOTrainer:
         def ppo_train(self, *_args, **_kwargs):
@@ -1588,8 +1605,12 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         def forward(self, input_ids, attention_mask=None, position_ids=None):
             del attention_mask, position_ids
             assert attention_context_depth == 1
-            hidden_states = torch.tanh(self.body(self.embed(input_ids)))
-            return {"logits": self.lm_head(hidden_states)}
+            self._forward_active = True
+            try:
+                hidden_states = torch.tanh(self.body(self.embed(input_ids)))
+                return {"logits": self.lm_head(hidden_states)}
+            finally:
+                self._forward_active = False
 
     class _ActorModel:
         is_vlm = False
@@ -1690,6 +1711,57 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         assert chunked_loss.item() == pytest.approx(expected_chunked.item(), abs=1e-6)
         for actual_grad, expected_grad in zip(chunked_grads, expected_grads, strict=True):
             assert torch.allclose(actual_grad, expected_grad, atol=1e-6, rtol=0)
+
+    zero3_model = _TinyCausalLM()
+    zero3_model.load_state_dict(initial_state)
+    zero3_model.lm_head.weight.ds_id = 1
+    zero3_actor = _ActorModel(zero3_model)
+    with attention_context():
+        zero3_logps = namespace["_flash_chunked_action_log_probs"](
+            zero3_actor,
+            sequences,
+            action_mask,
+            attention_mask,
+        )
+    zero3_logps.sum().backward()
+
+    assert zero3_calls[0] == (
+        "register",
+        zero3_model,
+        zero3_model.lm_head.weight,
+        True,
+    )
+    assert [call[0] for call in zero3_calls].count("checkpoint") == 1
+    assert zero3_model.lm_head.weight.grad is not None
+
+    import torch.utils.checkpoint as checkpoint_mod
+
+    fallback_calls = []
+    original_checkpoint = checkpoint_mod.checkpoint
+
+    def fallback_checkpoint(function, *args, **kwargs):
+        fallback_calls.append(kwargs.get("use_reentrant"))
+        return original_checkpoint(function, *args, **kwargs)
+
+    deepspeed.checkpointing = SimpleNamespace()
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint_mod, "checkpoint", fallback_checkpoint)
+        fallback_head = torch.nn.Linear(5, 13, bias=False)
+        fallback_head.weight.ds_id = 2
+        fallback_hidden = torch.randn(3, 5, requires_grad=True)
+        fallback_ids = torch.tensor([1, 2, 3])
+        fallback_logps = namespace["_flash_chunked_token_logps"](
+            fallback_head,
+            fallback_hidden,
+            fallback_ids,
+            temperature=0.7,
+            zero3_active=True,
+        )
+        fallback_logps.sum().backward()
+    deepspeed.checkpointing = SimpleNamespace(checkpoint=deepspeed_checkpoint)
+
+    assert fallback_calls == [True]
+    assert fallback_hidden.grad is not None
 
     training_model = _TinyCausalLM()
     training_model.load_state_dict(initial_state)

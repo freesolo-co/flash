@@ -1120,18 +1120,39 @@ def _flash_output_embeddings(actor):
     return output_embeddings
 
 
+def _flash_zero3_managed_parameters(module):
+    return [parameter for parameter in module.parameters() if hasattr(parameter, "ds_id")]
+
+
+def _flash_register_zero3_external_output_head(actor, output_head):
+    parameters = _flash_zero3_managed_parameters(output_head)
+    if not parameters:
+        return False
+    import deepspeed
+
+    forward_module = getattr(actor.model, "module", actor.model)
+    register = deepspeed.zero.register_external_parameter
+    for parameter in parameters:
+        register(forward_module, parameter)
+    return True
+
+
 def _flash_action_hidden_states(actor, sequences, attention_mask):
     if sequences.ndim != 2 or attention_mask.shape != sequences.shape:
         raise ValueError("OpenRLHF OPD chunked projection expects matching sequence and attention tensors")
     output_embeddings = _flash_output_embeddings(actor)
     captured = {}
+    zero3_output_head = False
     had_instance_forward = "forward" in output_embeddings.__dict__
     original_instance_forward = output_embeddings.__dict__.get("forward")
 
     def _capture_hidden(hidden_states, *_args, **_kwargs):
+        nonlocal zero3_output_head
         if "hidden_states" in captured:
             raise RuntimeError("OpenRLHF OPD output embedding was invoked more than once")
         captured["hidden_states"] = hidden_states
+        # register after the backbone, while the enclosing actor forward is still active
+        zero3_output_head = _flash_register_zero3_external_output_head(actor, output_embeddings)
         return hidden_states[..., :1] * 0
 
     output_embeddings.forward = _capture_hidden
@@ -1155,7 +1176,7 @@ def _flash_action_hidden_states(actor, sequences, attention_mask):
     hidden_states = captured.get("hidden_states")
     if hidden_states is None or hidden_states.shape[:2] != sequences.shape:
         raise RuntimeError("OpenRLHF OPD could not capture full-sequence hidden states")
-    return hidden_states
+    return hidden_states, zero3_output_head
 
 
 def _flash_chunked_token_logps(
@@ -1165,8 +1186,9 @@ def _flash_chunked_token_logps(
     *,
     temperature,
     chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE,
+    zero3_active=None,
 ):
-    from torch.utils.checkpoint import checkpoint
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
     if hidden_states.ndim != 2 or token_ids.ndim != 1:
         raise ValueError("OpenRLHF OPD chunked projection expects [tokens, hidden] states and [tokens] ids")
@@ -1183,6 +1205,28 @@ def _flash_chunked_token_logps(
             logits.div_(float(temperature))
         return -torch.nn.functional.cross_entropy(logits, ids_chunk, reduction="none")
 
+    if zero3_active is None:
+        zero3_active = bool(_flash_zero3_managed_parameters(lm_head))
+
+    def checkpoint(function, *args):
+        return torch_checkpoint(function, *args, use_reentrant=False)
+
+    if zero3_active:
+
+        def checkpoint(function, *args):
+            return torch_checkpoint(function, *args, use_reentrant=True)
+
+        try:
+            import deepspeed
+        except ImportError:
+            pass
+        else:
+            deepspeed_checkpoint = getattr(
+                getattr(deepspeed, "checkpointing", None), "checkpoint", None
+            )
+            if callable(deepspeed_checkpoint):
+                checkpoint = deepspeed_checkpoint
+
     size = max(1, int(chunk_size))
     chunks = []
     for start in range(0, hidden_states.shape[0], size):
@@ -1194,7 +1238,6 @@ def _flash_chunked_token_logps(
                     _logps,
                     hidden_chunk,
                     ids_chunk,
-                    use_reentrant=False,
                 )
             )
         else:
@@ -1206,14 +1249,19 @@ def _flash_chunked_action_log_probs(actor, sequences, action_mask, attention_mas
     if action_mask.shape != (sequences.shape[0], sequences.shape[1] - 1):
         raise ValueError("OpenRLHF OPD action mask must align with next-token predictions")
     response_mask = action_mask.bool()
-    hidden_states = _flash_action_hidden_states(actor, sequences, attention_mask)[:, :-1]
+    hidden_states, zero3_output_head = _flash_action_hidden_states(
+        actor, sequences, attention_mask
+    )
+    hidden_states = hidden_states[:, :-1]
     target_ids = sequences[:, 1:]
+    output_head = _flash_output_embeddings(actor)
     flat_logps = _flash_chunked_token_logps(
-        _flash_output_embeddings(actor),
+        output_head,
         hidden_states[response_mask],
         target_ids[response_mask],
         temperature=actor.temperature,
         chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE if chunk_size is None else chunk_size,
+        zero3_active=zero3_output_head,
     )
     return flat_logps.new_zeros(action_mask.shape).masked_scatter(response_mask, flat_logps)
 
