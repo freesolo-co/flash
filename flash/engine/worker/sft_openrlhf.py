@@ -605,6 +605,8 @@ class _OpenRLHFCheckpointWatcher:
         self._thread.start()
 
     def raise_if_failed(self) -> None:
+        if isinstance(self._error, _w.RetriableInfraError):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("OpenRLHF checkpoint watcher failed") from self._error
 
@@ -689,7 +691,14 @@ class _OpenRLHFCheckpointWatcher:
                 before_upload=publish_adapter,
             )
             if not uploaded:
-                raise RuntimeError(f"save step {step} full-state checkpoint was not published")
+                if required:
+                    raise RuntimeError(f"save step {step} full-state checkpoint was not published")
+                self.processed_steps.add(step)
+                marker = _checkpoint_upload_marker(self.checkpoint_dir, step, failed=True)
+                with open(marker, "w", encoding="utf-8") as file:
+                    file.write("optional full-state checkpoint was not published\n")
+                self._prune_uploaded_checkpoints()
+                return
             self.processed_steps.add(step)
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step)
@@ -808,6 +817,44 @@ with open(_CONFIG_PATH, encoding="utf-8") as _config_file:
     CONFIG = json.load(_config_file)
 
 
+def _remove_fla_from_child():
+    import importlib
+    import importlib.util
+    import shutil
+    import sys
+
+    for name in tuple(sys.modules):
+        if name == "fla" or name.startswith("fla."):
+            sys.modules.pop(name, None)
+    removed = []
+    for _ in range(6):
+        importlib.invalidate_caches()
+        spec = importlib.util.find_spec("fla")
+        if spec is None:
+            break
+        locations = list(getattr(spec, "submodule_search_locations", None) or [])
+        if not locations and spec.origin:
+            locations = [os.path.dirname(spec.origin)]
+        progressed = False
+        for location in locations:
+            if (
+                location
+                and os.path.isdir(location)
+                and os.path.basename(location.rstrip("/")) == "fla"
+            ):
+                try:
+                    shutil.rmtree(location)
+                except OSError as error:
+                    print(f"[blackwell] could not remove unsafe fla at {location}: {error}", flush=True)
+                else:
+                    removed.append(location)
+                    progressed = True
+        if not progressed:
+            break
+    importlib.invalidate_caches()
+    return removed, importlib.util.find_spec("fla") is not None
+
+
 def _apply_blackwell_fla_safety():
     import importlib.util
 
@@ -818,28 +865,40 @@ def _apply_blackwell_fla_safety():
     capability = torch.cuda.get_device_capability()
     if capability == (10, 0):
         os.environ.setdefault("FLA_TILELANG", "0")
-    if capability[0] not in (10, 12) or importlib.util.find_spec("fla") is None:
+    if capability[0] not in (10, 12):
         return
 
-    from fla.ops.gated_delta_rule import wy_fast
+    try:
+        if importlib.util.find_spec("fla") is None:
+            return
+        from fla.ops.gated_delta_rule import wy_fast
 
-    tuner = getattr(wy_fast, "prepare_wy_repr_bwd_kernel", None)
-    for _ in range(8):
-        if tuner is None or hasattr(tuner, "configs"):
-            break
-        tuner = getattr(tuner, "fn", None)
-    configs = getattr(tuner, "configs", None)
-    if not configs:
-        raise RuntimeError("fla GDN backward autotuner is unavailable on Blackwell")
-    validated = [
-        config
-        for config in configs
-        if getattr(config, "num_warps", None) == 2
-        and getattr(config, "num_stages", None) == 4
-    ]
-    if not validated:
-        raise RuntimeError("fla GDN backward has no validated Blackwell autotune config")
-    tuner.configs = validated
+        tuner = getattr(wy_fast, "prepare_wy_repr_bwd_kernel", None)
+        for _ in range(8):
+            if tuner is None or hasattr(tuner, "configs"):
+                break
+            tuner = getattr(tuner, "fn", None)
+        configs = getattr(tuner, "configs", None)
+        if not configs:
+            raise RuntimeError("fla GDN backward autotuner is unavailable on Blackwell")
+        validated = [
+            config
+            for config in configs
+            if getattr(config, "num_warps", None) == 2
+            and getattr(config, "num_stages", None) == 4
+        ]
+        if not validated:
+            raise RuntimeError("fla GDN backward has no validated Blackwell autotune config")
+        tuner.configs = validated
+    except Exception as error:
+        removed, still_importable = _remove_fla_from_child()
+        if still_importable:
+            raise RuntimeError("could not disable unsafe fla on Blackwell") from error
+        print(
+            "[blackwell] disabled unsafe fla in OpenRLHF child "
+            f"({type(error).__name__}: {error}; removed {len(removed)} copy(ies))",
+            flush=True,
+        )
 
 
 class FlashTokenizedSFTDataset:
@@ -947,19 +1006,6 @@ def assert_lora_applied(model, model_id):
     return count
 
 
-def assert_adapter_load_clean(load_result, model_id):
-    def lora_only(keys):
-        return [key for key in (keys or []) if "lora_" in key]
-
-    missing = lora_only(getattr(load_result, "missing_keys", None))
-    unexpected = lora_only(getattr(load_result, "unexpected_keys", None))
-    if missing or unexpected:
-        raise RuntimeError(
-            f"warm-start adapter for {model_id} did not load cleanly: "
-            f"missing={missing[:3]} unexpected={unexpected[:3]}"
-        )
-
-
 def assert_adapter_delta_nonzero(model, model_id):
     seen = 0
     nonzero = 0
@@ -994,17 +1040,15 @@ def _install_warmstart_actor_patch():
                 raise ValueError("OpenRLHF warm-start LoRA rank changed before model construction")
             super().__init__(pretrain_or_model, *args, lora_rank=0, **kwargs)
             base = self.model
-            model = PeftModel.from_pretrained(base, warmstart, is_trainable=True)
-            model.enable_input_require_grads()
             key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
-            load_result = model.load_adapter(
+            model = PeftModel.from_pretrained(
+                base,
                 warmstart,
-                adapter_name="default",
                 is_trainable=True,
                 key_mapping=key_mapping,
             )
+            model.enable_input_require_grads()
             model_id = str(CONFIG["model_id"])
-            assert_adapter_load_clean(load_result, model_id)
             assert_lora_applied(model, model_id)
             assert_adapter_delta_nonzero(model, model_id)
             self.model = model

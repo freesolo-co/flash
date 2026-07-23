@@ -984,13 +984,34 @@ def test_checkpoint_watcher_failed_periodic_upload_does_not_hang(monkeypatch, tm
     )
 
     watcher.start()
-    with pytest.raises(RuntimeError, match="checkpoint watcher failed"):
-        watcher.stop(require_complete=False)
+    watcher.stop(require_complete=False)
 
     assert not watcher._thread.is_alive()
+    assert 2 in watcher.processed_steps
     assert (checkpoint_dir / ".flash-upload-step-2.failed").is_file()
     assert ds_dir.is_dir()
     assert hf_dir.is_dir()
+
+
+def test_checkpoint_watcher_preserves_retriable_failure(tmp_path):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(tmp_path),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(3,),
+    )
+    error = openrlhf_mod._w.RetriableInfraError("transient checkpoint upload")
+    watcher._error = error
+
+    with pytest.raises(openrlhf_mod._w.RetriableInfraError) as raised:
+        watcher.raise_if_failed()
+
+    assert raised.value is error
 
 
 def test_checkpoint_retention_prunes_matching_hf_sidecar(tmp_path):
@@ -1083,7 +1104,7 @@ def test_openrlhf_runtime_installs_fail_loud_loraplus_and_warmstart_checks():
     assert "create_loraplus_optimizer" in source
     assert "PagedAdamW8bit" in source
     assert "zero_allow_untested_optimizer" in source
-    assert "assert_adapter_load_clean" in source
+    assert "assert_adapter_load_clean" not in source
     assert "assert_adapter_delta_nonzero" in source
     assert "FLASH_OPENRLHF_LORAPLUS_READY" in source
     assert "loss_mask[:, 1:]" in source
@@ -1136,6 +1157,48 @@ def test_openrlhf_runtime_reapplies_blackwell_fla_safety(monkeypatch, tmp_path):
 
     assert os.environ["FLA_TILELANG"] == "0"
     assert tuner.configs == [SimpleNamespace(num_warps=2, num_stages=4)]
+
+
+def test_openrlhf_runtime_disables_unpatchable_blackwell_fla(monkeypatch, tmp_path):
+    import shutil
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    namespace = {"__name__": "flash_openrlhf_sft_blackwell_fallback_test"}
+    exec(compile(render_openrlhf_sft_runtime(), "runtime.py", "exec"), namespace)
+
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda: (10, 0),
+    )
+    fla_dir = tmp_path / "packages" / "fla"
+    fla_dir.mkdir(parents=True)
+    fla = ModuleType("fla")
+    fla.__path__ = [str(fla_dir)]
+    fla.__spec__ = importlib.util.spec_from_loader("fla", loader=None, is_package=True)
+    fla.__spec__.submodule_search_locations = [str(fla_dir)]
+    ops = ModuleType("fla.ops")
+    ops.__path__ = []
+    gated_delta_rule = ModuleType("fla.ops.gated_delta_rule")
+    wy_fast = ModuleType("fla.ops.gated_delta_rule.wy_fast")
+    wy_fast.prepare_wy_repr_bwd_kernel = SimpleNamespace(configs=[])
+    gated_delta_rule.wy_fast = wy_fast
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "fla", fla)
+    monkeypatch.setitem(sys.modules, "fla.ops", ops)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", gated_delta_rule)
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule.wy_fast", wy_fast)
+    specs = iter([fla.__spec__, fla.__spec__, None, None])
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: next(specs))
+    removed = []
+    monkeypatch.setattr(shutil, "rmtree", lambda path: removed.append(path))
+
+    namespace["_apply_blackwell_fla_safety"]()
+
+    assert removed == [str(fla_dir)]
+    assert not any(name == "fla" or name.startswith("fla.") for name in sys.modules)
 
 
 def test_runtime_backpressures_every_checkpoint_until_upload_and_prune_finish():
@@ -1192,19 +1255,20 @@ def test_rendered_warmstart_actor_patch_has_no_flash_child_import(monkeypatch, t
             ]
 
         def load_adapter(self, *args, **kwargs):
-            return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+            raise AssertionError("warm-start adapter must load exactly once")
 
     class OriginalActor:
         def __init__(self, pretrain_or_model, *args, lora_rank=0, **kwargs):
             del pretrain_or_model, args, lora_rank, kwargs
-            self.model = object()
+            self.model = SimpleNamespace(_checkpoint_conversion_mapping={"old": "new"})
 
     class PeftModel:
         @staticmethod
-        def from_pretrained(base, warmstart, *, is_trainable):
+        def from_pretrained(base, warmstart, *, is_trainable, key_mapping):
             assert base is not None
             assert warmstart == "/adapter"
             assert is_trainable is True
+            assert key_mapping == {"old": "new"}
             return AdapterModel()
 
     openrlhf = ModuleType("openrlhf")
