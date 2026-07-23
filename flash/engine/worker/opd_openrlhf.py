@@ -115,9 +115,16 @@ class _PromptRecord:
 class OpenRLHFTeacherBridgeError(RuntimeError):
     """Typed child-side bridge failure with the teacher retry classification."""
 
-    def __init__(self, message: str, *, classification: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str,
+        retry_transport: bool = False,
+    ) -> None:
         super().__init__(message)
         self.classification = classification
+        self.retry_transport = bool(retry_transport)
 
 
 def deterministic_rollout_seed(
@@ -524,6 +531,7 @@ def post_teacher_request(url: str, payload: dict[str, Any], *, timeout: float = 
         raise OpenRLHFTeacherBridgeError(
             f"flash OPD bridge transport failed: {type(exc).__name__}",
             classification="transient",
+            retry_transport=True,
         ) from exc
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -538,6 +546,25 @@ def post_teacher_request(url: str, payload: dict[str, Any], *, timeout: float = 
             classification="permanent",
         )
     return payload
+
+
+def post_teacher_request_with_retry(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 600.0,
+) -> dict:
+    """Preserve the single-run child's bounded transport-only retry contract."""
+
+    for attempt in range(_OPENRLHF_BRIDGE_TRANSPORT_ATTEMPTS):
+        try:
+            return post_teacher_request(url, payload, timeout=timeout)
+        except OpenRLHFTeacherBridgeError as error:
+            if error.retry_transport and attempt + 1 < _OPENRLHF_BRIDGE_TRANSPORT_ATTEMPTS:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            raise
+    raise AssertionError("unreachable flash OPD bridge retry state")
 
 
 def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
