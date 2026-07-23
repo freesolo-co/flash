@@ -143,6 +143,7 @@ class _RunState:
     scoring_future: ScoringFuture | None = None
     scoring_result: ScoringResult | None = None
     failure: BaseException | None = None
+    cleanup_started: bool = False
     cleaned_up: bool = False
 
 
@@ -302,28 +303,37 @@ class SharedEngineRunController:
     async def step_the_world(self) -> StepWorldResult:
         """poll external events and execute at most one ready GPU quantum."""
 
-        async with self._gpu_lease:
-            progressed = await self._collect_scoring_completions()
-            progressed = await self._submit_waiting_scores() or progressed
-            progressed = await self._collect_scoring_completions() or progressed
-            candidate = self._select_gpu_candidate()
-            if candidate is None:
-                return StepWorldResult(progressed=progressed)
+        candidate: _RunState | None = None
+        try:
+            async with self._gpu_lease:
+                progressed = await self._collect_scoring_completions()
+                progressed = await self._submit_waiting_scores() or progressed
+                progressed = await self._collect_scoring_completions() or progressed
+                candidate = self._select_gpu_candidate()
+                if candidate is None:
+                    return StepWorldResult(progressed=progressed)
 
-            scheduled_phase = candidate.phase
-            if scheduled_phase is RunPhase.READY_ROLLOUT:
-                await self._execute_rollout(candidate)
-            elif scheduled_phase is RunPhase.READY_UPDATE:
-                await self._execute_update(candidate)
-            else:
-                raise RunStateTransitionError(
-                    f"selected run {candidate.run_id} in non-ready phase {scheduled_phase}"
+                scheduled_phase = candidate.phase
+                if scheduled_phase is RunPhase.READY_ROLLOUT:
+                    await self._execute_rollout(candidate)
+                elif scheduled_phase is RunPhase.READY_UPDATE:
+                    await self._execute_update(candidate)
+                else:
+                    raise RunStateTransitionError(
+                        f"selected run {candidate.run_id} in non-ready phase {scheduled_phase}"
+                    )
+                return StepWorldResult(
+                    progressed=True,
+                    gpu_run_id=candidate.run_id,
+                    gpu_phase=scheduled_phase,
                 )
-            return StepWorldResult(
-                progressed=True,
-                gpu_run_id=candidate.run_id,
-                gpu_phase=scheduled_phase,
+        except asyncio.CancelledError:
+            cleanup_task = (
+                None if candidate is None else self._cleanup_tasks.get(candidate.run_id)
             )
+            if cleanup_task is not None:
+                await self._await_cleanup_completion(cleanup_task)
+            raise
 
     async def drain(self, *, timeout_s: float | None = None) -> tuple[RunSnapshot, ...]:
         """advance until every admitted run reaches a terminal state."""
@@ -359,7 +369,7 @@ class SharedEngineRunController:
             cleanup_task = self._start_cleanup(state)
             self._drain_events_without_io()
         if cleanup_task is not None:
-            await cleanup_task
+            await self._await_cleanup_completion(cleanup_task)
         return self.run_snapshot(state.run_id)
 
     async def _execute_rollout(self, state: _RunState) -> None:
@@ -479,16 +489,19 @@ class SharedEngineRunController:
         return progressed
 
     def _select_gpu_candidate(self) -> _RunState | None:
+        active = [
+            state for state in self._runs.values() if state.phase not in _TERMINAL_PHASES
+        ]
         ready = [
             state
-            for state in self._runs.values()
+            for state in active
             if state.phase in {RunPhase.READY_ROLLOUT, RunPhase.READY_UPDATE}
         ]
         if not ready:
             return None
 
-        total_weight = sum(state.weight for state in ready)
-        for state in ready:
+        total_weight = sum(state.weight for state in active)
+        for state in active:
             state.deficit_ms += self._deficit_quantum_ms * state.weight / total_weight
 
         now = self._clock()
@@ -558,11 +571,12 @@ class SharedEngineRunController:
         self._drain_events_without_io()
 
     def _start_cleanup(self, state: _RunState) -> asyncio.Task[None] | None:
-        if state.cleaned_up:
-            return None
         existing = self._cleanup_tasks.get(state.run_id)
         if existing is not None:
             return existing
+        if state.cleanup_started:
+            return None
+        state.cleanup_started = True
         if state.hooks.cleanup is None:
             state.cleaned_up = True
             return None
@@ -572,6 +586,22 @@ class SharedEngineRunController:
             lambda completed, run_id=state.run_id: self._finish_cleanup(run_id, completed)
         )
         return task
+
+    @staticmethod
+    async def _await_cleanup_completion(task: asyncio.Task[None]) -> None:
+        caller_cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is None or not current_task.cancelling():
+                    break
+                caller_cancelled = True
+            except Exception:
+                break
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     def _finish_cleanup(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._cleanup_tasks.get(run_id) is task:
