@@ -1018,9 +1018,7 @@ async def _flash_execute(self, *args, **kwargs):
         sampling_params.include_stop_str_in_output = True
     if _FLASH_EOS_TOKEN_IDS:
         sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)
-        sampling_params.all_stop_token_ids = set(
-            getattr(sampling_params, "all_stop_token_ids", ())
-        ) | set(_FLASH_EOS_TOKEN_IDS)
+        sampling_params.all_stop_token_ids.update(_FLASH_EOS_TOKEN_IDS)
     if _FLASH_ROLLOUT_SEED is not None:
         label = call_args[1] if len(call_args) > 1 else call_kwargs.get("label")
         identity = _flash_rollout_identity(label)
