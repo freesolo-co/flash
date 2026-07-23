@@ -21,6 +21,7 @@ from typing import Any
 from flash.adapter_artifacts import ADAPTER_WEIGHT_FILES
 
 _MAX_VLLM_LORA_ID = 0x7FFFFFFF
+_EVICTION_RETRY_DELAY_S = 0.01
 
 
 class AdapterRegistryError(RuntimeError):
@@ -201,7 +202,7 @@ class SharedMultiLoRARolloutEngine:
         self._run_slots: dict[str, int] = {}
         self._known_run_ids: set[str] = set()
         self._issued_lora_ids: set[int] = set()
-        self._published_adapter_dirs: set[str] = set()
+        self._active_adapter_dirs: set[str] = set()
 
     @property
     def run_capacity(self) -> int:
@@ -361,11 +362,9 @@ class SharedMultiLoRARolloutEngine:
         """stop admission, drain, and unload every live version for one run."""
 
         normalized_run_id = self._normalize_run_id(run_id)
-        async with self._mutation_lock:
-            states = await _complete_before_cancel(
-                self._begin_remove_run(normalized_run_id, expected_version)
-            )
-        await _complete_before_cancel(self._drain_and_remove_run(normalized_run_id, states))
+        await _complete_before_cancel(
+            self._remove_run_to_completion(normalized_run_id, expected_version)
+        )
 
     async def health(self) -> SharedEngineHealth:
         """return an immutable registry and in-flight reference snapshot."""
@@ -417,7 +416,7 @@ class SharedMultiLoRARolloutEngine:
         version: int,
         adapter_dir: str,
     ) -> tuple[AdapterHandle, Any]:
-        if adapter_dir in self._published_adapter_dirs:
+        if adapter_dir in self._active_adapter_dirs:
             raise AdapterRegistryError(
                 f"adapter directory was already published for another version: {adapter_dir}"
             )
@@ -464,7 +463,7 @@ class SharedMultiLoRARolloutEngine:
             async with self._condition:
                 self._run_slots[run_id] = run_slot
                 self._known_run_ids.add(run_id)
-                self._published_adapter_dirs.add(handle.adapter_dir)
+                self._active_adapter_dirs.add(handle.adapter_dir)
                 self._states[handle.lora_int_id] = _AdapterState(handle, request)
                 self._current_by_run[run_id] = handle
                 self._condition.notify_all()
@@ -489,7 +488,7 @@ class SharedMultiLoRARolloutEngine:
             async with self._condition:
                 old_state = self._states[old_handle.lora_int_id]
                 old_state.stale = True
-                self._published_adapter_dirs.add(new_handle.adapter_dir)
+                self._active_adapter_dirs.add(new_handle.adapter_dir)
                 self._states[new_handle.lora_int_id] = _AdapterState(new_handle, request)
                 self._current_by_run[run_id] = new_handle
                 evict_old = old_state.in_flight == 0
@@ -508,6 +507,11 @@ class SharedMultiLoRARolloutEngine:
                     self._condition.notify_all()
         return new_handle
 
+    async def _remove_run_to_completion(self, run_id: str, expected_version: int) -> None:
+        async with self._mutation_lock:
+            int_ids = await self._begin_remove_run(run_id, expected_version)
+        await self._drain_and_remove_run(int_ids)
+
     async def _begin_remove_run(
         self,
         run_id: str,
@@ -516,6 +520,7 @@ class SharedMultiLoRARolloutEngine:
         async with self._condition:
             self._require_expected_version(run_id, expected_version)
             self._current_by_run.pop(run_id)
+            self._run_slots.pop(run_id, None)
             states = tuple(
                 state for state in self._states.values() if state.handle.run_id == run_id
             )
@@ -524,7 +529,7 @@ class SharedMultiLoRARolloutEngine:
             self._condition.notify_all()
             return tuple(state.handle.lora_int_id for state in states)
 
-    async def _drain_and_remove_run(self, run_id: str, int_ids: tuple[int, ...]) -> None:
+    async def _drain_and_remove_run(self, int_ids: tuple[int, ...]) -> None:
         async with self._condition:
             await self._condition.wait_for(
                 lambda: all(
@@ -535,14 +540,29 @@ class SharedMultiLoRARolloutEngine:
 
         async with self._mutation_lock:
             for int_id in int_ids:
-                await self._evict_state_locked(int_id)
-            async with self._condition:
-                self._run_slots.pop(run_id, None)
-                self._condition.notify_all()
+                try:
+                    await self._evict_state_locked(int_id)
+                except BaseException:
+                    async with self._condition:
+                        self._condition.notify_all()
 
     async def _wait_for_hot_slot(self) -> None:
         while True:
-            await self._reclaim_stale_slots()
+            async with self._condition:
+                if len(self._states) < self._hot_slot_capacity:
+                    return
+                reclaimable = any(
+                    state.stale and state.in_flight == 0 for state in self._states.values()
+                )
+
+            if reclaimable:
+                await self._reclaim_stale_slots()
+                async with self._condition:
+                    if len(self._states) < self._hot_slot_capacity:
+                        return
+                await asyncio.sleep(_EVICTION_RETRY_DELAY_S)
+                continue
+
             async with self._condition:
                 if len(self._states) < self._hot_slot_capacity:
                     return
@@ -557,7 +577,11 @@ class SharedMultiLoRARolloutEngine:
                     if state.stale and state.in_flight == 0
                 )
             for int_id in reclaimable:
-                await _complete_before_cancel(self._evict_state_locked(int_id))
+                try:
+                    await _complete_before_cancel(self._evict_state_locked(int_id))
+                except Exception:
+                    async with self._condition:
+                        self._condition.notify_all()
 
     async def _add_lora(self, request: Any) -> None:
         try:
@@ -636,6 +660,7 @@ class SharedMultiLoRARolloutEngine:
         async with self._condition:
             removed = self._states.pop(int_id, None)
             if removed is not None:
+                self._active_adapter_dirs.discard(removed.handle.adapter_dir)
                 run_id = removed.handle.run_id
                 run_has_states = any(
                     candidate.handle.run_id == run_id for candidate in self._states.values()
