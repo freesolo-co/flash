@@ -1814,6 +1814,9 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
     assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
     assert "action_log_probs = _flash_chunked_action_log_probs(" in source
     assert "checkpoint(" in source
+    assert "_flash_register_zero3_external_output_head(actor, output_embeddings)" in source
+    assert 'getattr(deepspeed, "checkpointing", None)' in source
+    assert "zero3_active=zero3_output_head" in source
     assert "hidden_states[response_mask]" in source
     assert source.count("with _flash_attention_context():") == 3
     assert "student_logprobs[row][group_mask].detach().sum()" in source
