@@ -1076,6 +1076,7 @@ def run_rl():
                 "temperature": _temperature,
                 "advantage_clip": _adv_clip,
                 "thinking_length_penalty_coef": _think_penalty,
+                "entropy_quantile": _entropy_quantile,
                 "init_from_adapter": _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else "",
             },
         },
