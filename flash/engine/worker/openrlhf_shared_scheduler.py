@@ -344,11 +344,24 @@ class SharedEngineRunController:
             return ()
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while not self._is_drained():
-            result = await self.step_the_world()
-            if self._is_drained():
-                break
+            if deadline is None:
+                result = await self.step_the_world()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("shared scheduler drain timed out")
+                step_task = asyncio.create_task(self.step_the_world())
+                step_task.add_done_callback(
+                    lambda task: None if task.cancelled() else task.exception()
+                )
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(step_task), timeout=remaining)
+                except TimeoutError as exc:
+                    raise TimeoutError("shared scheduler drain timed out") from exc
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("shared scheduler drain timed out")
+            if self._is_drained():
+                break
             if not result.progressed:
                 await asyncio.sleep(self._scoring_poll_interval_s)
             else:
@@ -624,7 +637,8 @@ class SharedEngineRunController:
         if state.cleaned_up or state.hooks.cleanup is None:
             state.cleaned_up = True
             return
-        await _resolve_callback(state.hooks.cleanup(state.run_id))
+        cleanup_result = await asyncio.to_thread(state.hooks.cleanup, state.run_id)
+        await _resolve_callback(cleanup_result)
         state.cleaned_up = True
 
     def _enqueue(
