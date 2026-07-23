@@ -523,6 +523,9 @@ class SharedBundleAllocationSession:
         with self._lock:
             if self._allocation_state is SharedAllocationState.RELEASED:
                 self._drained = True
+                for snapshot in self._bundle.run_snapshots():
+                    if snapshot.status not in _TERMINAL_RUN_STATUSES:
+                        self._bundle.transition_run(snapshot.run_id, LogicalRunStatus.CANCELLED)
                 return
             self._require_active_allocation()
             self._drained = True

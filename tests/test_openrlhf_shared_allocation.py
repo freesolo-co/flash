@@ -179,6 +179,25 @@ def test_unreconciled_create_cannot_allocate_a_second_endpoint():
     assert len(backend.requests) == 1
 
 
+def test_drain_after_unreconciled_create_cancels_queued_runs():
+    backend = _UnreconciledBackend()
+    session = SharedBundleAllocationSession(_bundle("run-a", "run-b"), backend)
+    capabilities = {
+        run_id: session.capability(run_id) for run_id in ("run-a", "run-b")
+    }
+
+    with pytest.raises(UnreconciledCreateError, match="cleanup pending"):
+        session.allocate()
+
+    session.drain()
+
+    assert session.drained is True
+    assert session.allocation_state is SharedAllocationState.RELEASED
+    for run_id, capability in capabilities.items():
+        assert session.status(run_id, capability.token).status is LogicalRunStatus.CANCELLED
+        assert session.poll_commands(run_id, capability.token) == ()
+
+
 def test_session_rejects_mixed_wall_limits_before_allocation():
     bundle = _bundle_from_specs(
         _spec("run-a", max_wall_seconds=60),
