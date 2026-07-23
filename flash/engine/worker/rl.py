@@ -115,6 +115,12 @@ def _latest_named_reward_metrics(
     return dict(latest)
 
 
+def apply_grpo_entropy_quantile(grpo_kwargs: dict, entropy_quantile: float | None) -> None:
+    """pass an explicitly configured entropy quantile to trl and otherwise preserve its default."""
+    if entropy_quantile is not None:
+        grpo_kwargs["top_entropy_quantile"] = float(entropy_quantile)
+
+
 def select_grpo_trainer(
     base_trainer_class,
     *,
@@ -196,6 +202,7 @@ def run_rl():
     _temperature = float(_gcfg_temp if _gcfg_temp is not None else rl.sampling_temperature)
     _kl_beta = float(gcfg.get("kl_penalty_coef") or 0.0)
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
+    _entropy_quantile = gcfg.get("entropy_quantile")
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     sleep_mode, _grpo_ctx, _card_vram_gb, _fp8_kv = resolve_grpo_sleep_mode()
     print(
@@ -595,6 +602,7 @@ def run_rl():
         # 8-bit paged AdamW: colocated GRPO is memory-tight, so int8 state paged to host RAM.
         "optim": fused_optim_name(),
     }
+    apply_grpo_entropy_quantile(grpo_kwargs, _entropy_quantile)
     configure_trainer_save_schedule(grpo_kwargs, save_at_steps)
     if "use_liger_kernel" in _grpo_fields:
         grpo_kwargs["use_liger_kernel"] = False
@@ -1068,6 +1076,7 @@ def run_rl():
                 "temperature": _temperature,
                 "advantage_clip": _adv_clip,
                 "thinking_length_penalty_coef": _think_penalty,
+                "entropy_quantile": _entropy_quantile,
                 "init_from_adapter": _w.JOB_SPEC.train.init_from_adapter if _w.JOB_SPEC else "",
             },
         },

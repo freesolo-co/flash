@@ -133,6 +133,7 @@ def grpo_overrides() -> dict:
         "max_tokens": train.max_completion_tokens,
         "kl_penalty_coef": train.kl_penalty_coef,
         "advantage_clip": train.advantage_clip,
+        "entropy_quantile": train.entropy_quantile,
         "thinking_length_penalty_coef": train.thinking_length_penalty_coef,
     }
     return {k: v for k, v in cfg.items() if v is not None}
