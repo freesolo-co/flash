@@ -433,8 +433,12 @@ def test_remove_run_does_not_swallow_eviction_cancellation(tmp_path):
         engine = _FakeEngine(max_loaded=2)
         manager = _manager(engine, run_capacity=1)
         await manager.register_run("run-a", 0, _adapter_dir(tmp_path, "a-v0"))
+        remove_started = asyncio.Event()
+        release_remove = asyncio.Event()
 
         async def cancel_remove(_int_id: int) -> bool:
+            remove_started.set()
+            await release_remove.wait()
             raise asyncio.CancelledError
 
         async def wait_for_notification() -> None:
@@ -442,10 +446,13 @@ def test_remove_run_does_not_swallow_eviction_cancellation(tmp_path):
                 await manager._condition.wait()
 
         engine.remove_lora = cancel_remove
+        removal = asyncio.create_task(manager.remove_run("run-a", 0))
+        await remove_started.wait()
         waiter = asyncio.create_task(wait_for_notification())
         await asyncio.sleep(0)
+        release_remove.set()
         with pytest.raises(asyncio.CancelledError):
-            await manager.remove_run("run-a", 0)
+            await removal
         await asyncio.wait_for(waiter, timeout=1)
 
     asyncio.run(scenario())
