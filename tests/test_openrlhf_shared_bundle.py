@@ -17,7 +17,7 @@ from flash.runner.openrlhf_shared_bundle import (
 )
 from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-_REVISION = ""
+_REVISION = "1" * 40
 
 
 def _spec(
@@ -294,6 +294,44 @@ def test_unsupported_gpu_is_rejected_before_any_bundle_is_retained():
     assert decision.estimated_n == 0
     assert decision.reason == "shared bundle admission is not profiled for GPU class 'A100 SXM'"
     assert packer.bundles == ()
+
+
+def test_direct_bundle_rejects_unsupported_algorithm():
+    bundle = SharedEngineBundle("bundle-algorithm", _spec("seed"))
+
+    decision = bundle.try_admit(_spec("run-sft", algorithm="sft"))
+
+    assert decision.outcome is BundleAdmissionOutcome.REJECTED
+    assert decision.reason == "shared bundles support only GRPO and OPD"
+    assert bundle.member_run_ids == ()
+
+
+def test_unpinned_gpu_is_rejected_before_any_bundle_is_retained():
+    packer = SharedEngineBundlePacker()
+    spec = replace(_spec("run-a"), gpu=GpuSpec(type="H100"))
+
+    decision = packer.offer(spec)
+
+    assert decision.outcome is BundleAdmissionOutcome.REJECTED
+    assert decision.estimated_n == 0
+    assert decision.reason == "shared bundle admission requires pinned gpu.exact_type"
+    assert packer.bundles == ()
+    with pytest.raises(ValueError, match=r"requires pinned gpu\.exact_type"):
+        BundleCompatibilityKey.from_job_spec(spec)
+
+
+def test_unpinned_model_revision_is_rejected_before_any_bundle_is_retained():
+    packer = SharedEngineBundlePacker()
+    spec = _spec("run-a", revision="")
+
+    decision = packer.offer(spec)
+
+    assert decision.outcome is BundleAdmissionOutcome.REJECTED
+    assert decision.estimated_n == 0
+    assert decision.reason == "shared bundle admission requires an immutable model_revision"
+    assert packer.bundles == ()
+    with pytest.raises(ValueError, match="requires an immutable model_revision"):
+        BundleCompatibilityKey.from_job_spec(spec)
 
 
 def test_failed_status_requires_a_reason_and_terminal_status_is_sticky():

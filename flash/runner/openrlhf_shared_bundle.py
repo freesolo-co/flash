@@ -91,7 +91,12 @@ class BundleCompatibilityKey:
         """derive a deterministic compatibility key from a prepared worker spec."""
 
         info = _catalog_model_info(spec)
+        model_revision = str(spec.model_revision).strip()
+        if not model_revision:
+            raise ValueError("shared bundle admission requires an immutable model_revision")
         gpu_type = _gpu_type(spec)
+        if not gpu_type:
+            raise ValueError("shared bundle admission requires pinned gpu.exact_type")
         gpu = get_gpu_info(gpu_type)
         max_model_length = _rollout_context(spec)
         engine_mode = "language-model-only" if supports_image_training(info) else "single-turn-text"
@@ -104,7 +109,7 @@ class BundleCompatibilityKey:
         kernel_requirements = tuple(sorted((architecture, f"compute-capability:{gpu.sm}")))
         return cls(
             model_id=spec.model,
-            model_revision=spec.model_revision,
+            model_revision=model_revision,
             tokenizer_id=spec.model,
             processor_id=spec.model,
             engine_mode=engine_mode,
@@ -210,7 +215,7 @@ class _BundleRunRecord:
 
 
 def _gpu_type(spec: JobSpec) -> str:
-    return str(spec.gpu.exact_type or spec.gpu.type).strip()
+    return str(spec.gpu.exact_type).strip()
 
 
 def _rollout_context(spec: JobSpec) -> int:
@@ -274,6 +279,18 @@ def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
     """estimate safe max-N before provider allocation or live GPU measurement."""
 
     gpu_type = _gpu_type(spec)
+    if not gpu_type:
+        return _unsupported_estimate(
+            spec,
+            0.0,
+            "shared bundle admission requires pinned gpu.exact_type",
+        )
+    if not str(spec.model_revision).strip():
+        return _unsupported_estimate(
+            spec,
+            0.0,
+            "shared bundle admission requires an immutable model_revision",
+        )
     try:
         gpu = get_gpu_info(gpu_type)
     except ValueError as exc:
@@ -472,6 +489,12 @@ class SharedEngineBundle:
                 BundleAdmissionOutcome.REJECTED,
                 run_id,
                 f"run {run_id!r} is already a member of bundle {self.bundle_id}",
+            )
+        if spec.algorithm not in _SUPPORTED_ALGORITHMS:
+            return self._decision(
+                BundleAdmissionOutcome.REJECTED,
+                run_id,
+                "shared bundles support only GRPO and OPD",
             )
         if not self.sealed and self._runs and self._clock() >= self._packing_deadline:
             self.seal()
