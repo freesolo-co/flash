@@ -143,7 +143,7 @@ def _save_checkpoint_file(path: Path, checkpoint: Mapping[str, Any]) -> None:
 def _load_checkpoint_file(path: Path) -> Mapping[str, Any]:
     import torch
 
-    return torch.load(path, map_location="cpu", weights_only=True)
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 async def _await_completion_on_cancel(operation: Any) -> tuple[Any, bool]:
@@ -302,6 +302,24 @@ class SharedMultiLoRATrainingActor:
                 raise asyncio.CancelledError
             return state
 
+    async def remove_run(self, run_id: str) -> None:
+        """retire one run from the shared training and rollout engines."""
+
+        async with self._training_lease:
+            state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
+            _, removal_cancelled = await _await_completion_on_cancel(
+                self._rollout_engine.remove_run(state.run_id, state.adapter_version)
+            )
+            self._delete_adapter(state.adapter_name)
+            self._runs.pop(state.run_id)
+            self._adapter_parameter_ids.pop(state.run_id)
+            run_dir = self._adapter_root / hashlib.sha256(state.run_id.encode()).hexdigest()[:24]
+            shutil.rmtree(run_dir, ignore_errors=True)
+            self._assert_registry_isolation()
+            if removal_cancelled:
+                raise asyncio.CancelledError
+
     async def step(self, run_id: str, loss_function: LossFunction) -> TrainingStepResult:
         """run one isolated optimizer step and publish only that run's adapter."""
 
@@ -324,6 +342,11 @@ class SharedMultiLoRATrainingActor:
                 self._assert_inactive_gradients_absent(state.run_id)
                 self._assert_frozen_base()
                 optimizer.step()
+                state.pending_publication = _PendingAdapterPublication(
+                    adapter_dir=None,
+                    target_version=state.adapter_version + 1,
+                    target_global_step=state.global_step + 1,
+                )
                 state.lr_scheduler.step()
             finally:
                 optimizer.zero_grad(set_to_none=True)
@@ -331,12 +354,6 @@ class SharedMultiLoRATrainingActor:
                 self._freeze_all_parameters()
 
             loss_value = float(loss.detach().cpu().item())
-            new_version = state.adapter_version + 1
-            state.pending_publication = _PendingAdapterPublication(
-                adapter_dir=None,
-                target_version=new_version,
-                target_global_step=state.global_step + 1,
-            )
             new_handle = await self._publish_pending_adapter(state)
             return TrainingStepResult(
                 run_id=state.run_id,
@@ -356,15 +373,16 @@ class SharedMultiLoRATrainingActor:
                 )
             return await self._publish_pending_adapter(state)
 
-    def advance_prompt_cursor(self, run_id: str, count: int = 1) -> int:
+    async def advance_prompt_cursor(self, run_id: str, count: int = 1) -> int:
         """advance and return one run's independent prompt cursor."""
 
         if count < 0:
             raise ValueError("prompt cursor advance must be non-negative")
-        state = self.run_state(run_id)
-        self._require_no_pending_publication(state)
-        state.prompt_cursor += count
-        return state.prompt_cursor
+        async with self._training_lease:
+            state = self.run_state(run_id)
+            self._require_no_pending_publication(state)
+            state.prompt_cursor += count
+            return state.prompt_cursor
 
     async def save_run_checkpoint(
         self, run_id: str, checkpoint_path: str | os.PathLike[str]
@@ -389,7 +407,11 @@ class SharedMultiLoRATrainingActor:
                 "prompt_cursor": state.prompt_cursor,
                 "global_step": state.global_step,
             }
-            await asyncio.to_thread(_save_checkpoint_file, path, checkpoint)
+            _, save_cancelled = await _await_completion_on_cancel(
+                asyncio.to_thread(_save_checkpoint_file, path, checkpoint)
+            )
+            if save_cancelled:
+                raise asyncio.CancelledError
             return path
 
     async def restore_run_checkpoint(
@@ -503,7 +525,7 @@ class SharedMultiLoRATrainingActor:
                 target_global_step=pending.target_global_step,
             )
             state.pending_publication = pending
-        new_handle, publication_cancelled = await _await_completion_on_cancel(
+        new_handle, _publication_cancelled = await _await_completion_on_cancel(
             self._rollout_engine.publish_adapter(
                 state.run_id,
                 expected_old_version=state.adapter_version,
@@ -515,8 +537,6 @@ class SharedMultiLoRATrainingActor:
         state.handle = new_handle
         state.global_step = pending.target_global_step
         state.pending_publication = None
-        if publication_cancelled:
-            raise asyncio.CancelledError
         return new_handle
 
     @staticmethod

@@ -6,14 +6,17 @@ import asyncio
 import importlib.util
 import io
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from flash.engine.worker import openrlhf_shared_training as shared_training
 from flash.engine.worker.openrlhf_shared_engine import (
     AdapterHandle,
+    AdapterRegistryError,
     SharedMultiLoRARolloutEngine,
 )
 from flash.engine.worker.openrlhf_shared_training import (
@@ -268,6 +271,30 @@ def test_cancelled_registration_commits_matching_actor_and_rollout_state(tmp_pat
 
 
 @requires_torch
+def test_remove_run_retires_training_rollout_and_export_state(tmp_path):
+    async def scenario():
+        actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
+        run_a = await _register(actor, "run-a")
+        run_b = await _register(actor, "run-b")
+        run_a_dir = Path(run_a.handle.adapter_dir).parent
+        run_b_snapshot = actor.adapter_parameter_snapshot("run-b")
+
+        await actor.remove_run("run-a")
+
+        assert actor.run_ids == ("run-b",)
+        assert run_a.adapter_name not in actor.model.adapters
+        assert not run_a_dir.exists()
+        with pytest.raises(KeyError, match="unknown training run"):
+            actor.run_state("run-a")
+        with pytest.raises(AdapterRegistryError, match="unknown run"):
+            await rollout_manager.current_handle("run-a")
+        assert actor.adapter_parameter_snapshot("run-b") == run_b_snapshot
+        assert await rollout_manager.current_handle("run-b") == run_b.handle
+
+    asyncio.run(scenario())
+
+
+@requires_torch
 def test_step_mutates_only_active_adapter_and_optimizer_then_publishes(tmp_path):
     async def scenario():
         actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
@@ -347,7 +374,41 @@ def test_failed_publish_retries_same_update_without_cross_run_mutation(tmp_path)
 
 
 @requires_torch
-def test_cancelled_step_publication_commits_matching_actor_and_rollout_state(tmp_path):
+def test_scheduler_failure_blocks_duplicate_optimizer_update(tmp_path):
+    class _FailingScheduler:
+        def step(self):
+            raise RuntimeError("scheduler failed")
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, _state):
+            return None
+
+    async def scenario():
+        actor, _load_count, _rollout_manager = _build_actor(tmp_path, capacity=1)
+        state = await actor.register_run(
+            "run-a",
+            optimizer_config=RunOptimizerConfig(learning_rate=0.1),
+            dataloader=["run-a-prompt"],
+            lora_config=object(),
+            scheduler_factory=lambda _optimizer: _FailingScheduler(),
+        )
+
+        with pytest.raises(RuntimeError, match="scheduler failed"):
+            await actor.step("run-a", _loss_for(1.0))
+
+        assert state.pending_publication is not None
+        assert state.adapter_version == 0
+        assert state.global_step == 0
+        with pytest.raises(TrainingIsolationError, match="must publish adapter version 1"):
+            await actor.step("run-a", _loss_for(-1.0))
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_step_publication_returns_committed_result(tmp_path):
     async def scenario():
         rollout_engine = _FakeRolloutEngine()
         rollout_manager = _rollout_manager(2, rollout_engine)
@@ -366,9 +427,9 @@ def test_cancelled_step_publication_commits_matching_actor_and_rollout_state(tmp
         await rollout_engine.add_started.wait()
         update.cancel()
         rollout_engine.block_add.set()
-        with pytest.raises(asyncio.CancelledError):
-            await update
+        result = await update
 
+        assert result.global_step == 1
         assert run_a.adapter_version == 1
         assert run_a.global_step == 1
         assert run_a.pending_publication is None
@@ -381,6 +442,76 @@ def test_cancelled_step_publication_commits_matching_actor_and_rollout_state(tmp
 
 
 @requires_torch
+def test_prompt_cursor_waits_for_checkpoint_save(monkeypatch, tmp_path):
+    import torch
+
+    async def scenario():
+        actor, _load_count, _rollout_manager = _build_actor(tmp_path, capacity=1)
+        await _register(actor, "run-a")
+        save_started = threading.Event()
+        save_release = threading.Event()
+        original_save = shared_training._save_checkpoint_file
+
+        def blocking_save(path, checkpoint):
+            save_started.set()
+            if not save_release.wait(timeout=5):
+                raise TimeoutError("checkpoint save was not released")
+            original_save(path, checkpoint)
+
+        monkeypatch.setattr(shared_training, "_save_checkpoint_file", blocking_save)
+        checkpoint_path = tmp_path / "cursor-save.pt"
+        save = asyncio.create_task(actor.save_run_checkpoint("run-a", checkpoint_path))
+        assert await asyncio.to_thread(save_started.wait, 5)
+        advance = asyncio.create_task(actor.advance_prompt_cursor("run-a", 7))
+        await asyncio.sleep(0)
+        assert advance.done() is False
+
+        save_release.set()
+        checkpoint = await save
+        assert await advance == 7
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        assert saved["prompt_cursor"] == 0
+        assert actor.run_state("run-a").prompt_cursor == 7
+
+    asyncio.run(scenario())
+
+
+@requires_torch
+def test_cancelled_checkpoint_save_holds_lease_until_thread_finishes(monkeypatch, tmp_path):
+    async def scenario():
+        actor, _load_count, _rollout_manager = _build_actor(tmp_path, capacity=1)
+        await _register(actor, "run-a")
+        save_started = threading.Event()
+        save_release = threading.Event()
+        original_save = shared_training._save_checkpoint_file
+
+        def blocking_save(path, checkpoint):
+            save_started.set()
+            if not save_release.wait(timeout=5):
+                raise TimeoutError("checkpoint save was not released")
+            original_save(path, checkpoint)
+
+        monkeypatch.setattr(shared_training, "_save_checkpoint_file", blocking_save)
+        checkpoint_path = tmp_path / "cancel-save.pt"
+        save = asyncio.create_task(actor.save_run_checkpoint("run-a", checkpoint_path))
+        assert await asyncio.to_thread(save_started.wait, 5)
+        save.cancel()
+        step = asyncio.create_task(actor.step("run-a", _loss_for(1.0)))
+        await asyncio.sleep(0)
+        assert save.done() is False
+        assert step.done() is False
+
+        save_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await save
+        result = await step
+        assert checkpoint_path.is_file()
+        assert result.global_step == 1
+
+    asyncio.run(scenario())
+
+
+@requires_torch
 def test_checkpoint_restore_is_independent_per_run(tmp_path):
     async def scenario():
         actor, _load_count, rollout_manager = _build_actor(tmp_path, capacity=2)
@@ -388,7 +519,7 @@ def test_checkpoint_restore_is_independent_per_run(tmp_path):
         run_b = await _register(actor, "run-b")
 
         await actor.step("run-a", _loss_for(1.0))
-        actor.advance_prompt_cursor("run-a", 7)
+        await actor.advance_prompt_cursor("run-a", 7)
         checkpoint = await actor.save_run_checkpoint("run-a", tmp_path / "run-a.pt")
         saved_a_parameters = actor.adapter_parameter_snapshot("run-a")
         saved_a_optimizer = _serialized_state(run_a.optimizer.state_dict())
