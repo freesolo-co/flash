@@ -1107,11 +1107,14 @@ async def _flash_execute(self, *args, **kwargs):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
     if images:
         await _flash_apply_multimodal_reward(reward_executor, output, tokenizer)
+    if images or image_pad_token_id is not None:
         mm_train_inputs = output.get("mm_train_inputs")
+        if mm_train_inputs is None and not images:
+            mm_train_inputs = {}
         if not isinstance(mm_train_inputs, dict):
             raise RuntimeError("OpenRLHF multimodal rollout returned no processor tensors")
         mm_train_inputs = dict(mm_train_inputs)
-        image_count = len(images) if isinstance(images, (list, tuple)) else 1
+        image_count = len(images) if isinstance(images, (list, tuple)) else int(bool(images))
         mm_train_inputs["_flash_num_images"] = torch.tensor([image_count], dtype=torch.long)
         output["mm_train_inputs"] = mm_train_inputs
     output["finish_reason"] = capture.finish_reason
@@ -1154,6 +1157,34 @@ from openrlhf.models.actor import Actor as _Actor
 
 _original_actor_init = _Actor.__init__
 _original_actor_forward = _Actor.forward
+
+
+def _flash_enable_multimodal_input_require_grads(model):
+    existing_handle = getattr(model, "_mm_vision_require_grads_hook", None)
+    if existing_handle is not None:
+        existing_handle.remove()
+        model._mm_vision_require_grads_hook = None
+
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        base_model = get_base_model()
+    else:
+        peft_base_model = getattr(model, "base_model", None)
+        base_model = getattr(peft_base_model, "model", model)
+
+    for module_path, module in base_model.named_modules():
+        if not module_path.endswith("visual.patch_embed"):
+            continue
+
+        def require_output_grad(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) and output else output
+            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                tensor.requires_grad_(True)
+
+        handle = module.register_forward_hook(require_output_grad)
+        model._mm_vision_require_grads_hook = handle
+        return handle
+    return None
 
 
 def _flash_chunked_action_log_probs(
@@ -1469,11 +1500,15 @@ def _flash_assert_adapter_loaded(model, load_result):
 def _flash_actor_init(self, *args, **kwargs):
     if kwargs.get("target_modules") == ["all-linear"]:
         kwargs["target_modules"] = "all-linear"
+    requested_lora_rank = int(kwargs.get("lora_rank", 0) or 0)
     load_warm = bool(_WARMSTART_ADAPTER) and (
-        int(kwargs.get("lora_rank", 0) or 0) > 0 or _loading_warm_reference.get()
+        requested_lora_rank > 0 or _loading_warm_reference.get()
     )
     if not load_warm:
-        return _original_actor_init(self, *args, **kwargs)
+        result = _original_actor_init(self, *args, **kwargs)
+        if requested_lora_rank > 0 and getattr(self, "is_vlm", False):
+            _flash_enable_multimodal_input_require_grads(self.model)
+        return result
 
     kwargs["lora_rank"] = 0
     result = _original_actor_init(self, *args, **kwargs)
@@ -1513,6 +1548,8 @@ def _flash_actor_init(self, *args, **kwargs):
     if is_reference:
         self.model.requires_grad_(False)
         self.model.eval()
+    elif requested_lora_rank > 0 and getattr(self, "is_vlm", False):
+        _flash_enable_multimodal_input_require_grads(self.model)
     return result
 
 

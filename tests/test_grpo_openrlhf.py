@@ -1377,6 +1377,32 @@ def test_sitecustomize_multimodal_rollout_carries_processor_tensors_and_suppress
 
 @requires_openrlhf_source
 @requires_torch
+def test_sitecustomize_multimodal_rollout_carries_zero_image_count_for_text_rows(monkeypatch):
+    pytest.importorskip("torch")
+    _install_pinned_sitecustomize_modules(
+        monkeypatch,
+        image_pad_token_id=99,
+        image_merge_size=2,
+    )
+    executor_type = sys.modules["openrlhf.utils.agent"].SingleTurnAgentExecutor
+
+    response = asyncio.run(
+        executor_type().execute(
+            "prompt",
+            4,
+            SimpleNamespace(logprobs=None),
+            32,
+            object(),
+            object(),
+            None,
+        )
+    )
+
+    assert response["mm_train_inputs"]["_flash_num_images"].tolist() == [0]
+
+
+@requires_openrlhf_source
+@requires_torch
 def test_sitecustomize_multimodal_reward_uses_expanded_prompt_prefix(monkeypatch):
     pytest.importorskip("torch")
     _install_pinned_sitecustomize_modules(
@@ -2341,6 +2367,38 @@ def test_sitecustomize_vlm_actor_uses_full_forward_with_reconstructed_mm_token_t
     assert call["mm_token_type_ids"].dtype == torch.int32
     assert call["mm_token_type_ids"].tolist() == [[0, 1, 0, 0], [0, 1, 0, 0]]
     assert call["image_grid_thw"].tolist() == [[1, 2, 2], [1, 2, 2]]
+
+
+@requires_openrlhf_source
+@requires_torch
+def test_sitecustomize_vlm_actor_installs_vision_input_gradient_hook(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _, _ = _install_pinned_sitecustomize_modules(monkeypatch)
+    actor_type = sys.modules["openrlhf.models.actor"].Actor
+
+    class _ToyVLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = torch.nn.Module()
+            self.visual.patch_embed = torch.nn.Linear(2, 2)
+            self.requires_grad_(False)
+
+        def get_base_model(self):
+            return self
+
+    def actor_init(actor, *_args, **_kwargs):
+        actor.model = _ToyVLM()
+        actor.is_vlm = True
+        actor.packing_samples = False
+        actor.temperature = 1.0
+
+    namespace["_original_actor_init"] = actor_init
+    actor = actor_type("base", lora_rank=8)
+
+    output = actor.model.visual.patch_embed(torch.ones((1, 2)))
+
+    assert output.requires_grad is True
+    assert actor.model._mm_vision_require_grads_hook is not None
 
 
 @requires_openrlhf_source
