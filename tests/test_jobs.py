@@ -594,7 +594,7 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     submitted: dict = {}
     monkeypatch.setattr(
@@ -631,7 +631,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     original = RuntimeError("ambiguous queue post")
     handles = []
@@ -680,7 +680,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
@@ -783,7 +783,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     deadline_at = 12_345.0
     captured = []
@@ -824,7 +824,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     now = {"value": 100.0}
     monkeypatch.setattr(jobs.time, "time", lambda: now["value"])
@@ -1692,7 +1692,7 @@ def _spec(run_id):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1),
-        gpu=GpuSpec(type="RTX 4090", max_retries=2),
+        gpu=GpuSpec(type="", max_retries=2),
     )
 
 
@@ -2823,7 +2823,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            gpu=GpuSpec(type="", max_retries=0),
         )
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -2854,7 +2854,7 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            gpu=GpuSpec(type="", max_retries=0),
         )
 
         with pytest.raises(RuntimeError):
@@ -2904,7 +2904,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2996,7 +2996,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3030,7 +3030,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         with pytest.raises(RuntimeError, match="bad reward fn"):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -3101,7 +3101,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3166,7 +3166,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3228,7 +3228,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 

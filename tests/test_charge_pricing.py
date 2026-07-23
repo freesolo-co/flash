@@ -10,7 +10,7 @@ SPEC = {
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 20, "max_examples": 20, "batch_size": 20, "hf_repo": "org/test-runs"},
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {},
 }
 
 
