@@ -758,7 +758,7 @@ with open(_CONFIG_PATH, encoding="utf-8") as _config_file:
     CONFIG = json.load(_config_file)
 
 
-def _remove_fla_from_child():
+def _remove_fla_from_child_unlocked():
     import importlib
     import importlib.util
     import shutil
@@ -794,6 +794,14 @@ def _remove_fla_from_child():
             break
     importlib.invalidate_caches()
     return removed, importlib.util.find_spec("fla") is not None
+
+
+def _remove_fla_from_child():
+    import fcntl
+
+    with open(f"{_CONFIG_PATH}.fla.lock", "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        return _remove_fla_from_child_unlocked()
 
 
 def _apply_blackwell_fla_safety():

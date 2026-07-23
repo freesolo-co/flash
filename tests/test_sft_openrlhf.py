@@ -771,6 +771,7 @@ def test_openrlhf_runtime_reapplies_blackwell_fla_safety(monkeypatch, tmp_path):
 
 
 def test_openrlhf_runtime_disables_unpatchable_blackwell_fla(monkeypatch, tmp_path):
+    import fcntl
     import shutil
 
     config_path = tmp_path / "runtime.json"
@@ -804,10 +805,15 @@ def test_openrlhf_runtime_disables_unpatchable_blackwell_fla(monkeypatch, tmp_pa
     specs = iter([fla.__spec__, fla.__spec__, None, None])
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: next(specs))
     removed = []
+    lock_operations = []
     monkeypatch.setattr(shutil, "rmtree", lambda path: removed.append(path))
+    monkeypatch.setattr(
+        fcntl, "flock", lambda lock_file, operation: lock_operations.append(operation)
+    )
 
     namespace["_apply_blackwell_fla_safety"]()
 
+    assert lock_operations == [fcntl.LOCK_EX]
     assert removed == [str(fla_dir)]
     assert not any(name == "fla" or name.startswith("fla.") for name in sys.modules)
 
