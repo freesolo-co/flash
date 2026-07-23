@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
@@ -174,6 +175,10 @@ def cmd_env_delete(args) -> int:
 
 
 _ENV_ENTRYPOINT = "environment.py"
+_ENV_SYSPATH_BOOTSTRAP = (
+    "import os as _flash_os, sys as _flash_sys\n"
+    "_flash_sys.path.insert(0, _flash_os.path.dirname(__file__))\n"
+)
 _ENV_PUSH_IGNORED_NAMES = frozenset(
     {
         ".prime",
@@ -183,26 +188,47 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         ".venv",
         ".mypy_cache",
         ".pytest_cache",
-        "pyproject.toml",
-        "source",
+        ".ruff_cache",
+        ".idea",
+        ".vscode",
+        ".ds_store",
+        ".git-worktrees",
+        ".env",
+        ".netrc",
+        ".aws",
+        ".ssh",
+        "venv",
+        "node_modules",
+        "credentials",
+        "secrets",
     }
 )
-# ``.md`` is included so the ``TRAINING.md`` playbook `flash env setup` scaffolds (and any
-# user-authored README/NOTES) travels with the env into the hub and back out through
-# ``flash env pull`` — a published env should carry its own training guidance, not just code+data.
-_ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
-    {
-        ".csv",
-        ".json",
-        ".jsonl",
-        ".md",
-        ".parquet",
-        ".tsv",
-        ".txt",
-        ".yaml",
-        ".yml",
-    }
+_ENV_PUSH_ROOT_IGNORED_NAMES = frozenset({"pyproject.toml", "source"})
+_ENV_PUSH_SECRET_PATTERNS = (
+    ".env.*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.pfx",
+    "*.p12",
+    "credentials*",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
 )
+# secret patterns match secret data FILES only (see _ignore_env_push_path): they never prune a
+# directory, so a package tree like credentials_store/ still ships, and python source is exempt,
+# so helper modules like credentials.py or id_ed25519_loader.py travel instead of being silently
+# dropped and breaking the worker with ModuleNotFoundError. that keeps the prefixes broad enough
+# to catch backup variants (credentials_backup, id_rsa_backup) without eating code or packages.
+_ENV_PUSH_CODE_SUFFIXES = frozenset({".py", ".pyi"})
+_ENV_PUSH_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+
+try:
+    from flash.envs.archive_policy import ARCHIVE_MEMBER_LIMIT as _ENV_PUSH_MAX_FILES
+except ImportError:
+    _ENV_PUSH_MAX_FILES = 5000
 
 
 def _normalize_env_name(raw: str) -> str | None:
@@ -227,16 +253,12 @@ def _normalize_env_name(raw: str) -> str | None:
 
 def _with_syspath_bootstrap(env_source: str) -> str:
     """Prepend a sys.path bootstrap so a published env can resolve shipped sibling helpers."""
-    bootstrap = (
-        "import os as _flash_os, sys as _flash_sys\n"
-        "_flash_sys.path.insert(0, _flash_os.path.dirname(__file__))\n"
-    )
     import ast
 
     try:
         tree = ast.parse(env_source)
     except SyntaxError:
-        return bootstrap + env_source
+        return _ENV_SYSPATH_BOOTSTRAP + env_source
     insert_after = 0
     body = tree.body
     i = 0
@@ -252,7 +274,16 @@ def _with_syspath_bootstrap(env_source: str) -> str:
         insert_after = body[i].end_lineno or insert_after
         i += 1
     lines = env_source.splitlines(keepends=True)
-    return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
+    return (
+        "".join(lines[:insert_after])
+        + _ENV_SYSPATH_BOOTSTRAP
+        + "".join(lines[insert_after:])
+    )
+
+
+def _raise_walk_error(error: OSError) -> None:
+    """fail env packaging loudly instead of silently skipping an unreadable directory."""
+    raise error
 
 
 def _tar_b64(directory: Path) -> str:
@@ -266,44 +297,130 @@ def _tar_b64(directory: Path) -> str:
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for root, dirs, files in os.walk(directory):
             root_path = Path(root)
-            dirs[:] = sorted(d for d in dirs if d not in _ENV_PUSH_IGNORED_NAMES)
-            for name in dirs:
-                child = root_path / name
-                tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
+            dirs[:] = sorted(d for d in dirs if d.lower() not in _ENV_PUSH_IGNORED_NAMES)
             for name in sorted(files):
                 child = root_path / name
                 tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
-    """Copy helper code and data sidecars beside environment.py."""
+def _ignore_env_push_path(path: Path, *, env_root: Path, entrypoint: Path) -> bool:
+    """Return whether a source path must not be included in an env package."""
+    import fnmatch
+
+    name = path.name
+    lowered_name = name.lower()
+    if path.is_symlink():
+        return True
+    if path.is_dir() and (path / "pyvenv.cfg").is_file():
+        return True
+    if path == entrypoint or (
+        path.parent == env_root and lowered_name == _ENV_ENTRYPOINT.lower()
+    ):
+        return True
+    if lowered_name.startswith(".") or lowered_name in _ENV_PUSH_IGNORED_NAMES:
+        return True
+    if path.parent == env_root and lowered_name in _ENV_PUSH_ROOT_IGNORED_NAMES:
+        return True
+    if (
+        path.is_file()
+        and path.suffix.lower() not in _ENV_PUSH_CODE_SUFFIXES
+        and any(fnmatch.fnmatchcase(lowered_name, pattern) for pattern in _ENV_PUSH_SECRET_PATTERNS)
+    ):
+        return True
+    return not (path.is_dir() or path.is_file())
+
+
+def _iter_env_sidecar_files(
+    env_root: Path, *, entrypoint: Path, include_full_tree: bool
+) -> Iterator[tuple[Path, Path]]:
+    """Yield publishable sidecar files and their package-relative paths."""
+    import os
+
+    roots = [env_root]
+    if not include_full_tree:
+        # a single-file push carries only the entrypoint, its dataset sidecars, and its own
+        # docs. ship user-authored docs so the synthesized stub readme does not stand in for
+        # real training guidance the user shipped next to the module.
+        for doc_name in ("README.md", "TRAINING.md"):
+            doc = env_root / doc_name
+            if doc.is_file() and not _ignore_env_push_path(
+                doc, env_root=env_root, entrypoint=entrypoint
+            ):
+                yield doc, doc.relative_to(env_root)
+        roots = [
+            env_root / name
+            for name in ("dataset", "datasets")
+            if (env_root / name).is_dir() and not (env_root / name).is_symlink()
+        ]
+
+    for walk_root in roots:
+        for root, dirs, files in os.walk(
+            walk_root, topdown=True, followlinks=False, onerror=_raise_walk_error
+        ):
+            root_path = Path(root)
+            dirs[:] = sorted(
+                name
+                for name in dirs
+                if not _ignore_env_push_path(
+                    root_path / name, env_root=env_root, entrypoint=entrypoint
+                )
+            )
+            for name in sorted(files):
+                child = root_path / name
+                if _ignore_env_push_path(child, env_root=env_root, entrypoint=entrypoint):
+                    continue
+                yield child, child.relative_to(env_root)
+
+
+def _check_env_push_limits(
+    env_root: Path, *, entrypoint: Path, include_full_tree: bool, env_name: str
+) -> None:
+    """Reject oversized source trees before copying or building an in-memory archive."""
+    files = 1
+    total_bytes = entrypoint.stat().st_size + len(_ENV_SYSPATH_BOOTSTRAP.encode())
+    directories: set[Path] = set()
+    has_readme = False
+    for child, relative in _iter_env_sidecar_files(
+        env_root, entrypoint=entrypoint, include_full_tree=include_full_tree
+    ):
+        files += 1
+        total_bytes += child.stat().st_size
+        has_readme = has_readme or relative == Path("README.md")
+        # the server counts every file AND directory against the same member cap when it
+        # repackages the checkout for download, so count unique parent dirs here too.
+        directories.update(parent for parent in relative.parents if parent != Path("."))
+    if not has_readme:
+        files += 1
+        total_bytes += len(f"# {env_name}\n\nFlash Freesolo environment.\n".encode())
+
+    members = files + len(directories)
+    if total_bytes > _ENV_PUSH_MAX_TOTAL_BYTES:
+        raise ValueError(
+            f"environment package totals {_human_bytes(total_bytes)} "
+            f"(limit {_human_bytes(_ENV_PUSH_MAX_TOTAL_BYTES)}); "
+            "remove large artifacts or use a smaller dataset"
+        )
+    if members > _ENV_PUSH_MAX_FILES:
+        raise ValueError(
+            f"selected environment contains {members:,} files and directories "
+            f"(limit {_ENV_PUSH_MAX_FILES:,}); "
+            "remove large artifacts or use a smaller dataset"
+        )
+
+
+def _copy_env_sidecars(
+    env_root: Path, dest: Path, *, entrypoint: Path, include_full_tree: bool
+) -> None:
+    """Copy publishable sidecar files beside environment.py, creating directories lazily."""
     import shutil
 
-    for child in sorted(env_root.iterdir()):
-        if (
-            child == entrypoint
-            or child.name == _ENV_ENTRYPOINT
-            or child.name in _ENV_PUSH_IGNORED_NAMES
-        ):
-            continue
-        if child.name.startswith("."):
-            continue
-        target = dest / child.name
-        if child.is_dir():
-            if child.name == "dataset":
-                shutil.copytree(
-                    child,
-                    target,
-                    ignore=shutil.ignore_patterns(*_ENV_PUSH_IGNORED_NAMES),
-                )
-            continue
-        if not child.is_file():
-            continue
-        if (
-            child.suffix == ".py" and not child.name.startswith("__")
-        ) or child.suffix.lower() in _ENV_PUSH_SIDECAR_SUFFIXES:
-            shutil.copy2(child, target)
+    for child, relative in _iter_env_sidecar_files(
+        env_root, entrypoint=entrypoint, include_full_tree=include_full_tree
+    ):
+        target = dest / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(child, target)
 
 
 def _human_bytes(n: int) -> str:
@@ -377,26 +494,26 @@ def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress) -> 
     return 0
 
 
-def cmd_env_push(args) -> int:
-    env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
-    if not env_name:
-        return _err("env name required: pass `--name <name>`")
-
-    src = Path(args.path)
+def _resolve_local_env_entrypoint(path: str | Path) -> tuple[Path, Path, Path, bool]:
+    """Resolve a local environment path to its Python entrypoint and package root."""
+    src = Path(path)
     if not src.exists():
-        return _err(f"no such path: {src}")
+        raise ValueError(f"no such path: {src}")
+    if src.is_symlink():
+        raise ValueError(f"cannot publish {src}: symlinks are not allowed")
 
-    if src.is_dir():
+    include_full_tree = src.is_dir()
+    if include_full_tree:
         canonical_entrypoint = src / _ENV_ENTRYPOINT
         if canonical_entrypoint.is_file():
             entrypoint = canonical_entrypoint
             env_root = src
         elif (src / "pyproject.toml").is_file():
-            return _err(f"{src} has a pyproject.toml but no environment.py entrypoint")
+            raise ValueError(f"{src} has a pyproject.toml but no environment.py entrypoint")
         else:
             modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
             if len(modules) != 1:
-                return _err(
+                raise ValueError(
                     f"{src} has no environment.py and "
                     f"{'no' if not modules else 'multiple'} top-level .py module(s); "
                     "add an environment.py entrypoint or pass the exact .py file "
@@ -408,13 +525,45 @@ def cmd_env_push(args) -> int:
         env_root = src.parent
         entrypoint = src
     else:
-        return _err(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
+        raise ValueError(
+            f"cannot publish {src}: expected a Freesolo .py module or an env directory."
+        )
+
+    if entrypoint.is_symlink():
+        raise ValueError(f"cannot publish {entrypoint}: symlinks are not allowed")
+    return src, env_root, entrypoint, include_full_tree
+
+
+def cmd_env_push(args) -> int:
+    env_name = _normalize_env_name(str(getattr(args, "name", "") or ""))
+    if not env_name:
+        return _err("env name required: pass `--name <name>`")
+
+    try:
+        src, env_root, entrypoint, include_full_tree = _resolve_local_env_entrypoint(args.path)
+    except ValueError as exc:
+        return _err(str(exc))
+
+    try:
+        _check_env_push_limits(
+            env_root,
+            entrypoint=entrypoint,
+            include_full_tree=include_full_tree,
+            env_name=env_name,
+        )
+    except (OSError, ValueError) as exc:
+        return _err(f"cannot publish {src}: {exc}")
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
         module_source = entrypoint.read_text()
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
-        _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
+        _copy_env_sidecars(
+            env_root,
+            pkg,
+            entrypoint=entrypoint,
+            include_full_tree=include_full_tree,
+        )
         # Only synthesize a stub README when the env didn't ship its own (now carried as a
         # ``.md`` sidecar) — don't clobber a user-authored README with boilerplate.
         readme = pkg / "README.md"

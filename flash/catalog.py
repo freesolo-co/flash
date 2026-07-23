@@ -13,6 +13,22 @@ ALGORITHMS = ("sft", "grpo", "opd")
 # the cost model, VRAM sizing and worker allocator branch on — import ``samples_on_policy`` instead
 # of hand-rolling the ("grpo", "opd") tuple at each site.
 _ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+_IMAGE_TRAINING_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
+
+
+def supports_image_training(model: str | ModelInfo | None) -> bool:
+    """Return whether a curated model supports image-bearing SFT, GRPO, and OPD."""
+    model_id = model.id if isinstance(model, ModelInfo) else model
+    return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 
 
 def samples_on_policy(algorithm: str) -> bool:
@@ -111,8 +127,20 @@ class ModelInfo:
     # multimodal-nested config, so the curated values are what actually engage the gate.
     num_layers: int = 0
     hidden_size: int = 0
-    # vllm hybrid-mamba cache block size in tokens. 0 means the model has no catalogued mamba floor.
+    # vllm cache geometry. zero values mean the catalog has no architecture-aware sizing data.
+    num_attention_layers: int = 0
+    num_linear_attention_layers: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 0
+    # fp8 attention-token equivalent of one recurrent-state page, rounded to vllm's 16-token block.
     mamba_block_size: int = 0
+    # grouped (in_features, out_features, count) for peft all-linear on the full loaded model.
+    lora_target_shapes: tuple[tuple[int, int, int], ...] = ()
 
     @property
     def is_moe(self) -> bool:
@@ -128,6 +156,19 @@ class ModelInfo:
         data = asdict(self)
         if not data["mamba_block_size"]:
             del data["mamba_block_size"]
+        for key in (
+            "num_attention_layers",
+            "num_linear_attention_layers",
+            "num_key_value_heads",
+            "head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+            "lora_target_shapes",
+        ):
+            data.pop(key, None)
         serving = data["serving"]
         if serving is None:
             del data["serving"]
@@ -146,45 +187,53 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
-# The pre-quantized FP8 checkpoint each base model's serving engine LOADS (mirrors serving's
-# ``src.prequant_config``). Every dense model now serves a Freesolo-OWNED FP8_DYNAMIC checkpoint (no
-# community-repo dependence); the 35B VL MoE serves the OFFICIAL Qwen FP8 (it preserves the full
-# vision-language model). Informational for the catalog mirror — deploy gating reads only max_lora_rank.
+# the pre-quantized fp8 checkpoint each base model's serving engine loads (mirrors serving's
+# ``src.prequant_config``). every dense model serves a freesolo-owned fp8 checkpoint; the qwen3.6
+# 35b-a3b moe serves the official qwen fp8 variant. informational for the catalog mirror; deploy
+# gating reads only max_lora_rank.
 SERVING_FP8_MODEL_REPOS: dict[str, str] = {
-    "openbmb/MiniCPM5-1B": "Freesolo-Co/MiniCPM5-1B-FP8",
     "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
     "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
     "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
 }
 
 MODELS: dict[str, ModelInfo] = {
-    "openbmb/MiniCPM5-1B": ModelInfo(
-        id="openbmb/MiniCPM5-1B",
-        display_name="MiniCPM5 1B",
-        params="1.2B dense (Llama arch)",
-        params_b=1.2,
-        vocab_size=130_560,
-        algos=ALGORITHMS,
-        min_vram_gb=12,
-        recommended_gpu="RTX 4090",
-        serving=ServingCapacity(
-            gpu="L4",
-            serve_model_id=SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"],
-            max_loras=16,
-            max_lora_rank=128,
-            max_model_len=32768,
-        ),
-        thinking="hybrid",
-        notes="On-device class SLM (131k ctx); standard Llama architecture.",
-    ),
     "Qwen/Qwen3.5-0.8B": ModelInfo(
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",
-        params="0.9B (text-only fine-tune)",
+        params="0.9B",
         params_b=0.9,
         vocab_size=248_320,
+        num_layers=24,
+        hidden_size=1024,
+        num_attention_layers=6,
+        num_linear_attention_layers=18,
+        num_key_value_heads=2,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        lora_target_shapes=(
+            (768, 768, 12),
+            (768, 2304, 12),
+            (768, 3072, 12),
+            (1024, 16, 36),
+            (1024, 512, 12),
+            (1024, 2048, 18),
+            (1024, 3584, 48),
+            (1024, 4096, 6),
+            (1024, 6144, 18),
+            (2048, 1024, 24),
+            (3072, 768, 12),
+            (3072, 1024, 1),
+            (3072, 3072, 1),
+            (3584, 1024, 24),
+        ),
         algos=ALGORITHMS,
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
@@ -201,9 +250,34 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-2B": ModelInfo(
         id="Qwen/Qwen3.5-2B",
         display_name="Qwen3.5 2B",
-        params="2.3B (text-only fine-tune)",
+        params="2.3B",
         params_b=2.3,
         vocab_size=248_320,
+        num_layers=24,
+        hidden_size=2048,
+        num_attention_layers=6,
+        num_linear_attention_layers=18,
+        num_key_value_heads=2,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        lora_target_shapes=(
+            (1024, 1024, 24),
+            (1024, 3072, 24),
+            (1024, 4096, 24),
+            (2048, 16, 36),
+            (2048, 512, 12),
+            (2048, 2048, 42),
+            (2048, 4096, 6),
+            (2048, 6144, 66),
+            (4096, 1024, 24),
+            (4096, 2048, 1),
+            (4096, 4096, 1),
+            (6144, 2048, 24),
+        ),
         algos=ALGORITHMS,
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
@@ -219,9 +293,34 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-4B": ModelInfo(
         id="Qwen/Qwen3.5-4B",
         display_name="Qwen3.5 4B",
-        params="4.7B (text-only fine-tune)",
+        params="4.7B",
         params_b=4.7,
         vocab_size=248_320,
+        num_layers=32,
+        hidden_size=2560,
+        num_attention_layers=8,
+        num_linear_attention_layers=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        lora_target_shapes=(
+            (1024, 1024, 24),
+            (1024, 3072, 24),
+            (1024, 4096, 24),
+            (2560, 32, 48),
+            (2560, 1024, 16),
+            (2560, 4096, 24),
+            (2560, 8192, 32),
+            (2560, 9216, 64),
+            (4096, 1024, 24),
+            (4096, 2560, 33),
+            (4096, 4096, 1),
+            (9216, 2560, 32),
+        ),
         algos=ALGORITHMS,
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
@@ -241,9 +340,34 @@ MODELS: dict[str, ModelInfo] = {
     "Qwen/Qwen3.5-9B": ModelInfo(
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
-        params="9.7B (text-only fine-tune)",
+        params="9.7B",
         params_b=9.7,
         vocab_size=248_320,
+        num_layers=32,
+        hidden_size=4096,
+        num_attention_layers=8,
+        num_linear_attention_layers=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        lora_target_shapes=(
+            (1152, 1152, 27),
+            (1152, 3456, 27),
+            (1152, 4304, 27),
+            (4096, 32, 48),
+            (4096, 1024, 16),
+            (4096, 4096, 56),
+            (4096, 8192, 32),
+            (4096, 12288, 64),
+            (4304, 1152, 27),
+            (4608, 4096, 1),
+            (4608, 4608, 1),
+            (12288, 4096, 32),
+        ),
         algos=ALGORITHMS,
         min_vram_gb=48,
         # NOT QLoRA: peft bnb merge during GRPO rollout diverges trainer precision -> TRL ratio collapses to 0.
@@ -264,6 +388,61 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
+    "Qwen/Qwen3.6-27B": ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        display_name="Qwen3.6 27B",
+        params="27B dense (multimodal VL, hybrid GDN)",
+        params_b=27.0,
+        num_layers=64,
+        hidden_size=5120,
+        vocab_size=248_320,
+        num_attention_layers=16,
+        num_linear_attention_layers=48,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        lora_target_shapes=(
+            (1152, 1152, 27),
+            (1152, 3456, 27),
+            (1152, 4304, 27),
+            (4304, 1152, 27),
+            (4608, 4608, 1),
+            (4608, 5120, 1),
+            (5120, 48, 96),
+            (5120, 1024, 32),
+            (5120, 6144, 48),
+            (5120, 10240, 48),
+            (5120, 12288, 16),
+            (5120, 17408, 128),
+            (6144, 5120, 64),
+            (17408, 5120, 64),
+        ),
+        algos=("sft", "grpo", "opd"),
+        min_vram_gb=80,
+        grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
+        sft_min_vram_gb=80,
+        quant="bf16",
+        recommended_gpu="A100 PCIe",
+        min_disk_gb=160,
+        serving=ServingCapacity(
+            gpu="H100",
+            serve_model_id=SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"],
+            max_loras=16,
+            max_lora_rank=64,
+            max_model_len=32768,
+            max_num_seqs=8,
+            gpu_memory_utilization=0.98,
+        ),
+        thinking="hybrid",
+        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training. SFT fits "
+        "the 80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
+        "~54GB copies). Serves the owned VL-preserving FP8 on an H100 tier (dense, so no MoE expert "
+        "LoRA-buffer multiplier).",
+    ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
@@ -275,10 +454,35 @@ MODELS: dict[str, ModelInfo] = {
         # layers x 2048 hidden (hybrid GatedDeltaNet + full-attention, 256 experts / 8 active).
         num_layers=40,
         hidden_size=2048,
-        # vllm 0.19.1 model_executor/models/config.py derives this from the qwen config via
-        # mamba_utils.py: the 1,097,728-byte gdn state page needs 1072 fp8 attention tokens
-        # after the 16-token backend alignment applied by hybridattentionmambamodelconfig.
+        num_attention_layers=10,
+        num_linear_attention_layers=30,
+        num_key_value_heads=2,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        # vllm 0.19.1 derives the 1,097,728-byte gdn state page as 1072 fp8 attention
+        # tokens after the 16-token backend alignment.
         mamba_block_size=1072,
+        # peft targets shared-expert linears on every layer. fused routed-expert tensors are not
+        # nn.linear modules and are not adapter targets in the loaded model.
+        lora_target_shapes=(
+            (512, 2048, 40),
+            (1152, 1152, 27),
+            (1152, 3456, 27),
+            (1152, 4304, 27),
+            (2048, 1, 40),
+            (2048, 32, 60),
+            (2048, 512, 100),
+            (2048, 4096, 30),
+            (2048, 8192, 40),
+            (4096, 2048, 40),
+            (4304, 1152, 27),
+            (4608, 2048, 1),
+            (4608, 4608, 1),
+        ),
         vocab_size=248_320,
         algos=ALGORITHMS,
         min_vram_gb=141,

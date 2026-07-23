@@ -666,18 +666,10 @@ def _resume_after_confirmed_teardown(
         if current_remote is None or (
             current_attempt is not None and current_attempt >= next_attempt
         ):
-            clear_remote = current_remote is None
             if current_remote is not None:
-                try:
-                    clear_remote = _record_cleanup_remote(run_id, current_remote)
-                except Exception:
-                    clear_remote = False
-            _compare_and_fail_remote(
-                run_id,
-                current_remote,
-                str(exc),
-                clear_remote=clear_remote,
-            )
+                with contextlib.suppress(Exception):
+                    _record_cleanup_remote(run_id, current_remote)
+            _compare_and_fail_remote(run_id, current_remote, str(exc))
         raise
     return get_status(run_id)
 
@@ -699,11 +691,15 @@ def _reconcile_attached_remote(
         _load_run_deadline_at,
         _record_cleanup_remote,
         _remote_resource_identity,
+        _spec_with_remaining_wall,
         get_status,
     )
     from flash.runner.lifecycle import (
+        _RECOVERY_MARKER_GRACE_S,
         _adopt_completed_attempt,
         _completed_attempt_metrics,
+        _CompletedAttemptPending,
+        _runpod_completed_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -730,6 +726,66 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             return
+        try:
+            completed_metrics = _runpod_completed_metrics(
+                expected_remote,
+                deadline_at=deadline_at,
+            )
+        except _CompletedAttemptPending:
+            # the queue job already completed but its metrics are still landing; keep
+            # reconciling (do not tear it down) until they are readable -- but do not sleep
+            # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
+            # full interval beyond it before terminating.
+            pending_interval = _ATTACH_RECONCILE_INTERVAL_S
+            if deadline_at is not None:
+                pending_interval = min(
+                    pending_interval,
+                    max(0.0, deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()),
+                )
+            time.sleep(pending_interval)
+            continue
+        if completed_metrics is not None:
+            try:
+                if _adopt_completed_attempt(
+                    run_id,
+                    worker_spec,
+                    expected_remote,
+                    completed_metrics,
+                    log=log,
+                ):
+                    return
+            except Exception:
+                pass
+            # the job completed with metrics; keep retrying adoption (e.g. across a
+            # transient cleanup failure) until it sticks -- but never past the wall
+            # deadline plus the recovery grace, or a persistently failing adoption
+            # would leave the run non-terminal forever. past the grace, preserve the
+            # remote for cost reconciliation and fail the run.
+            if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
+                # best-effort: preserve the remote for cost reconciliation, but do NOT
+                # gate termination on it -- a persistently failing cleanup-persist must
+                # not leave the run non-terminal forever (the whole point of the grace
+                # cutoff). attempt the cleanup record, then fail the run regardless.
+                with contextlib.suppress(Exception):
+                    _record_cleanup_remote(run_id, expected_remote)
+                try:
+                    if _compare_and_fail_remote(
+                        run_id,
+                        expected_remote,
+                        "completed attempt could not be adopted within the recovery grace window",
+                    ):
+                        return
+                except Exception:
+                    pass
+                # past the grace window the terminal CAS is the only exit; if it raised or
+                # lost the compare-and-swap, rate-limit the retry at the full reconcile
+                # interval. remaining grace is <= 0 here, so falling through to the shared
+                # sleep below would sleep 0 and busy-spin the reconciler.
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
+            remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
+            time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
+            continue
         if time.time() >= deadline_at:
             try:
                 metrics = _completed_attempt_metrics(
@@ -777,6 +833,20 @@ def _reconcile_attached_remote(
         delay = min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time()))
         if delay > 0:
             time.sleep(delay)
+            if time.time() >= deadline_at:
+                continue
+        if time.time() < deadline_at:
+            # if a replacement cannot meet the 60-second provider minimum yet the run
+            # wall deadline is still open, keep reconciling (probe for completion) rather
+            # than tearing down and failing early — mirror handle-less recovery, which
+            # waits until the wall deadline.
+            try:
+                _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
+            except RuntimeError:
+                # cap the reconcile wait at the wall deadline so a near-deadline wake does
+                # not overshoot the run's wall deadline by a full interval.
+                time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time())))
+                continue
         try:
             resource_deleted = _strict_teardown_handle(handle, run_id)
             worker_gone = True
@@ -852,6 +922,13 @@ def _schedule_attach_reconciliation(
                 failure,
             )
         finally:
+            try:
+                from flash.runner import TERMINAL_STATES, _gc_run_endpoints, get_status
+
+                if get_status(run_id).state in TERMINAL_STATES:
+                    _gc_run_endpoints(worker_spec)
+            except Exception:
+                pass
             with _ATTACH_RECONCILING_LOCK:
                 _ATTACH_RECONCILING.discard(run_id)
 
@@ -906,6 +983,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner.lifecycle import (
         _adopt_completed_attempt,
         _completed_attempt_metrics,
+        _CompletedAttemptPending,
+        _runpod_completed_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -927,42 +1006,56 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:
+            deadline_at = _load_run_deadline_at(run_id)
+            metrics = _runpod_completed_metrics(
+                persisted_remote,
+                deadline_at=deadline_at,
+            )
             started_ts = persisted_remote.get("started_ts")
-            if started_ts is not None:
-                with contextlib.suppress(Exception):
-                    deadline_at = _load_run_deadline_at(run_id)
-                    metrics = _completed_attempt_metrics(
-                        worker_spec,
-                        provider=handle.provider,
-                        attempt=recovered_attempt,
-                        launch_floor=float(started_ts),
-                        deadline_at=deadline_at,
-                        log=log,
-                    )
-                    if metrics is not None and _adopt_completed_attempt(
+            if metrics is None and started_ts is not None:
+                metrics = _completed_attempt_metrics(
+                    worker_spec,
+                    provider=handle.provider,
+                    attempt=recovered_attempt,
+                    launch_floor=float(started_ts),
+                    deadline_at=deadline_at,
+                    log=log,
+                )
+            if metrics is not None:
+                try:
+                    adopted = _adopt_completed_attempt(
                         run_id,
                         worker_spec,
                         persisted_remote,
                         metrics,
                         log=log,
-                    ):
-                        print(
-                            f"attach: {run_id} adopted a completed attempt at the wall deadline",
-                            file=log,
-                        )
-                        return status_for_return()
+                    )
+                except Exception:
+                    adopted = False
+                if adopted:
+                    print(
+                        f"attach: {run_id} adopted a completed attempt at the wall deadline",
+                        file=log,
+                    )
+                    return status_for_return()
+                # completed work whose adoption is a transient defer (e.g. a cleanup blip) must NEVER be
+                # torn down at the wall deadline; defer to background reconciliation, which retries
+                # adoption until the deadline like the in-loop completion path.
+                _schedule_attach_reconciliation(
+                    run_id, persisted_remote, worker_spec, next_attempt, code_prefix, log, str(exc)
+                )
+                print(
+                    f"attach: {run_id} completed RunPod work at the wall deadline; deferring adoption to reconciliation",
+                    file=log,
+                )
+                return status_for_return()
             try:
                 resource_deleted = _strict_teardown_handle(handle, run_id)
             except Exception:
                 resource_deleted = False
             if not resource_deleted:
                 _record_cleanup_remote(run_id, persisted_remote)
-            _compare_and_fail_remote(
-                run_id,
-                persisted_remote,
-                str(exc),
-                clear_remote=resource_deleted,
-            )
+            _compare_and_fail_remote(run_id, persisted_remote, str(exc))
             print(f"attach: {run_id} {exc}", file=log)
             return status_for_return()
         print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
@@ -978,6 +1071,43 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if not res.ok:
             failure = f"{res.failure or 'job_failed'}: {res.detail or 'provider attempt failed'}"
             print(f"attach: {run_id} ended ({res.failure}); evaluating recovery", file=log)
+            completed_metrics = _runpod_completed_metrics(
+                persisted_remote,
+                deadline_at=_load_run_deadline_at(run_id),
+            )
+            if completed_metrics is not None:
+                # the job completed. adoption may return False (a transient defer, e.g. a
+                # cleanup-remote CAS lost) OR raise (e.g. a durable-confirmation exception);
+                # treat BOTH the same -- never tear down completed work, defer to background
+                # reconciliation, which retries adoption until the deadline like
+                # _reconcile_attached_remote.
+                try:
+                    adopted = _adopt_completed_attempt(
+                        run_id,
+                        worker_spec,
+                        persisted_remote,
+                        completed_metrics,
+                        log=log,
+                    )
+                except Exception:
+                    adopted = False
+                if adopted:
+                    print(f"attach: {run_id} adopted completed RunPod work", file=log)
+                    return status_for_return()
+                _schedule_attach_reconciliation(
+                    run_id,
+                    persisted_remote,
+                    worker_spec,
+                    next_attempt,
+                    code_prefix,
+                    log,
+                    failure,
+                )
+                print(
+                    f"attach: {run_id} completed RunPod work; deferring adoption to reconciliation",
+                    file=log,
+                )
+                return status_for_return()
             try:
                 resource_deleted = _strict_teardown_handle(handle, run_id)
                 worker_gone = True
@@ -1029,6 +1159,21 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 f"attach: {run_id} persisted remote changed before completion adoption",
                 file=log,
             )
+        return status_for_return()
+    except _CompletedAttemptPending as exc:
+        _schedule_attach_reconciliation(
+            run_id,
+            persisted_remote,
+            worker_spec,
+            next_attempt,
+            code_prefix,
+            log,
+            str(exc),
+        )
+        print(
+            f"attach: {run_id} completed successfully; waiting for metrics.json visibility",
+            file=log,
+        )
         return status_for_return()
     except _RunCancelled:
         with contextlib.suppress(Exception):

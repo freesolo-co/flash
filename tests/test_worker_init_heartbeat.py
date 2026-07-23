@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import re
 import sys
 import threading
@@ -314,6 +315,185 @@ def test_heartbeat_marks_progress_only_for_real_heartbeats(monkeypatch):
     assert seen[-1].get("liveness") is True, "a liveness ping is stamped liveness=True"
 
 
+def test_reward_heartbeat_projects_bounded_per_step_metrics(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    import flash.engine.worker as w
+
+    transformers = types.ModuleType("transformers")
+    transformers.TrainerCallback = type("TrainerCallback", (), {})
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
+    emitted = []
+    monkeypatch.setattr(w, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
+
+    callback = hb.make_reward_heartbeat_callback()
+    args = types.SimpleNamespace(max_completion_length=256)
+    state = types.SimpleNamespace(global_step=1)
+    callback.on_log(
+        args,
+        state,
+        None,
+        logs={
+            "reward": 0.75,
+            "reward_std": 0.12,
+            "grad_norm": 1.5,
+            "kl": 0.03,
+            "entropy": 0.82,
+            "frac_reward_zero_std": 0.25,
+            "completions/mean_length": 48.5,
+            "completions/clipped_ratio": 0.125,
+        },
+    )
+
+    stage, payload = emitted[-1]
+    assert stage == "rl_step"
+    expected = {
+        "step": 1,
+        "reward": 0.75,
+        "reward_std": 0.12,
+        "grad_norm": 1.5,
+        "kl": 0.03,
+        "entropy": 0.82,
+        "frac_reward_zero_std": 0.25,
+        "mean_completion_tokens": 48.5,
+        "truncation_rate": 0.125,
+        "max_completion_tokens": 256,
+    }
+    for key, value in expected.items():
+        assert payload[key] == value
+    assert payload["metrics_last"] == [expected]
+
+    state.global_step = 2
+    callback.on_log(
+        args,
+        state,
+        None,
+        logs={
+            "reward": 0.8,
+            "reward_std": float("nan"),
+            "grad_norm": float("inf"),
+            "entropy": 0.79,
+        },
+    )
+    payload = emitted[-1][1]
+    assert payload["reward"] == 0.8
+    assert payload["entropy"] == 0.79
+    for key in ("reward_std", "grad_norm", "kl"):
+        assert key not in payload
+        assert key not in payload["metrics_last"][-1]
+
+    for step in range(3, 1027):
+        state.global_step = step
+        callback.on_log(args, state, None, logs={"reward": step / 1027})
+    metrics_last = emitted[-1][1]["metrics_last"]
+    assert len(metrics_last) == 1024
+    assert [item["step"] for item in metrics_last] == list(range(3, 1027))
+
+
+def test_heartbeat_console_summarizes_metric_backlog():
+    import json
+
+    from flash.engine.worker.heartbeat import _console_heartbeat_snapshot
+
+    console = json.loads(
+        _console_heartbeat_snapshot(
+            {
+                "stage": "rl_step",
+                "step": 1024,
+                "metrics_last": [{"step": step} for step in range(1024)],
+            }
+        )
+    )
+
+    assert "metrics_last" not in console
+    assert console["metrics_last_count"] == 1024
+    assert console["step"] == 1024
+
+
+def test_rl_lifecycle_heartbeats_carry_latest_metrics():
+    import ast
+    import textwrap
+
+    from flash.engine.worker import rl
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl.run_rl)))
+    terminal_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "rl_trained"
+    ]
+    assert len(terminal_calls) == 1
+    terminal_keywords = {keyword.arg: keyword.value for keyword in terminal_calls[0].keywords}
+    assert "metrics_last" in terminal_keywords
+    assert "hb_cb" in ast.unparse(terminal_keywords["metrics_last"])
+
+    liveness_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "liveness_heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value in {"rl_step", "rl_finalizing"}
+    ]
+    assert len(liveness_calls) == 2
+    for call in liveness_calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "fields" in keywords
+        assert "metrics_last" in ast.unparse(keywords["fields"])
+        assert "hb_cb" in ast.unparse(keywords["fields"])
+
+    write_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write_train_meta"
+    ]
+    assert len(write_calls) == 1
+    write_keywords = {keyword.arg: keyword.value for keyword in write_calls[0].keywords}
+    assert "heartbeat_fields" in write_keywords
+    assert "metrics_last" in ast.unparse(write_keywords["heartbeat_fields"])
+    assert "hb_cb" in ast.unparse(write_keywords["heartbeat_fields"])
+
+
+def test_error_heartbeat_fallback_preserves_metric_backlog():
+    # regression (#591): the error_{RUN_MODE} heartbeat exists to surface the bounded metric
+    # backlog (metrics_last) for short failing RL runs. main() emits it twice -- a primary call
+    # (with gpu diagnostics) and an except-fallback used if that primary call raises. BOTH must
+    # splat **_err_metrics, or a failure inside the primary call (e.g. gpu_diagnostics() or the
+    # heartbeat upload itself) re-emits an error snapshot that drops the very backlog this path
+    # was added to preserve.
+    import ast
+    import textwrap
+
+    import flash.engine.worker as ne
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ne.main)))
+    error_hb_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "heartbeat"
+        and node.args
+        and isinstance(node.args[0], ast.JoinedStr)
+        and ast.unparse(node.args[0]).startswith(("f'error_", 'f"error_'))
+    ]
+    assert len(error_hb_calls) == 2, "expected a primary and a fallback error heartbeat in main()"
+    for call in error_hb_calls:
+        assert any(
+            keyword.arg is None and ast.unparse(keyword.value) == "_err_metrics"
+            for keyword in call.keywords
+        ), "both the primary and fallback error heartbeats must splat **_err_metrics (metrics_last)"
+
+
 def test_per_step_training_stages_are_throttled():
     """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
     _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
@@ -363,6 +543,40 @@ def test_opd_step_post_update_heartbeat_forces_through_throttle(monkeypatch):
     assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
     ne.heartbeat("opd_step", step=6, loss=0.1, coverage=1.0, force=True)  # post-update forces through
     assert len(uploads) == 2, "force=True must commit the stepped post-update ping despite the throttle"
+
+
+@pytest.mark.parametrize("stage", ["rl_step", "opd_step"])
+def test_forced_sample_payload_commits_after_same_step_liveness(monkeypatch, stage):
+    """a liveness commit for a step must not throttle the first sample payload for that step."""
+    import flash.engine.worker as ne
+
+    uploads: list = []
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(ne, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ne, "hf_upload_file", lambda local, *a, **k: uploads.append(local))
+    ne._HB_LAST_UPLOAD = 0.0
+    ne._HB_LAST_FORCED_UPLOAD = 0.0
+    ne._HB_LAST_COMMITTED_STEP = 0
+
+    ne.heartbeat(stage, step=1)
+    assert len(uploads) == 1
+
+    committed = ne.heartbeat(
+        stage,
+        step=1,
+        force=True,
+        sampled_completions=[
+            {
+                "prompt_tail": "prompt",
+                "completion": "completion",
+                "reward" if stage == "rl_step" else "loss": 1.0,
+                "generated_at_step": 0,
+            }
+        ],
+    )
+
+    assert committed is True
+    assert len(uploads) == 2
 
 
 def test_forced_opd_step_commits_each_distinct_step_advance(monkeypatch):
@@ -880,3 +1094,51 @@ def test_no_worker_side_stall_watchdog():
     hb = importlib.import_module("flash.engine.worker.heartbeat")
     assert not hasattr(hb, "_rearm_stall_faulthandler")
     assert not hasattr(hb, "_STALL_WATCHDOG_S")
+
+
+def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    long_name = "x" * 100_000
+
+    bounded = hb._bounded_reward_metrics(
+        {
+            long_name: 1.0,
+            "line\nbreak": 2.0,
+            "reward": 3.0,
+            "step": 4.0,
+        }
+    )
+
+    assert "x" * 64 in bounded
+    assert all(len(name) <= 64 for name in bounded)
+    assert "linebreak" in bounded
+    assert all("\n" not in name for name in bounded)
+    assert "reward" not in bounded
+    assert "step" not in bounded
+
+
+def test_reward_heartbeat_carries_bounded_finite_named_metrics(monkeypatch):
+    hb = importlib.import_module("flash.engine.worker.heartbeat")
+    worker = importlib.import_module("flash.engine.worker")
+    emitted = []
+    monkeypatch.setattr(worker, "heartbeat", lambda stage, **payload: emitted.append((stage, payload)))
+    monkeypatch.setattr(hb, "_maybe_attach_gpu_diag", lambda payload, last, now: last)
+
+    transformers = types.ModuleType("transformers")
+    transformers.TrainerCallback = type("TrainerCallback", (), {})
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    metrics = {
+        "nan_metric": float("nan"),
+        "inf_metric": float("inf"),
+        **{f"metric_{index:02d}": float(index) for index in reversed(range(14))},
+    }
+    callback = hb.make_reward_heartbeat_callback(lambda: metrics)
+    state = types.SimpleNamespace(global_step=3)
+    callback.on_log(None, state, None, logs={"reward": 0.65})
+
+    assert emitted[0][0] == "rl_step"
+    reward_metrics = emitted[0][1]["reward_metrics"]
+    assert list(reward_metrics) == [f"metric_{index:02d}" for index in range(12)]
+    assert all(math.isfinite(value) for value in reward_metrics.values())
+    assert callback.latest_fields() == {"reward_metrics": reward_metrics}

@@ -28,12 +28,6 @@ class ServingPrice:
 
 
 SERVING_PRICES: dict[str, ServingPrice] = {
-    "openbmb/MiniCPM5-1B": ServingPrice(
-        model_id="openbmb/MiniCPM5-1B",
-        typical_input_usd_per_mtok=0.01,
-        typical_output_usd_per_mtok=0.05,
-        typical_cached_input_usd_per_mtok=0.002,
-    ),
     "Qwen/Qwen3.5-0.8B": ServingPrice(
         model_id="Qwen/Qwen3.5-0.8B",
         typical_input_usd_per_mtok=0.01,
@@ -52,17 +46,26 @@ SERVING_PRICES: dict[str, ServingPrice] = {
         typical_output_usd_per_mtok=0.15,
         typical_cached_input_usd_per_mtok=0.006,
     ),
+    # Typical rates are the unweighted mean of active serverless providers' per-1M rates
+    # (SERVING_MARKUP adds the platform's 20%). Small models (<=4B) already matched the
+    # provider mean; 9B, 27B and 35B are set/updated from it (see the 27B provider survey).
     "Qwen/Qwen3.5-9B": ServingPrice(
         model_id="Qwen/Qwen3.5-9B",
-        typical_input_usd_per_mtok=0.10,
-        typical_output_usd_per_mtok=0.15,
-        typical_cached_input_usd_per_mtok=0.020,
+        typical_input_usd_per_mtok=0.114,
+        typical_output_usd_per_mtok=0.19,
+        typical_cached_input_usd_per_mtok=0.023,
+    ),
+    "Qwen/Qwen3.6-27B": ServingPrice(
+        model_id="Qwen/Qwen3.6-27B",
+        typical_input_usd_per_mtok=0.4254,
+        typical_output_usd_per_mtok=3.055,
+        typical_cached_input_usd_per_mtok=0.14,
     ),
     "Qwen/Qwen3.6-35B-A3B": ServingPrice(
         model_id="Qwen/Qwen3.6-35B-A3B",
-        typical_input_usd_per_mtok=0.15,
-        typical_output_usd_per_mtok=1.00,
-        typical_cached_input_usd_per_mtok=0.050,
+        typical_input_usd_per_mtok=0.198,
+        typical_output_usd_per_mtok=1.265,
+        typical_cached_input_usd_per_mtok=0.066,
     ),
 }
 

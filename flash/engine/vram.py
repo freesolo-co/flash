@@ -1,4 +1,4 @@
-"""Coarse VRAM-fit estimation for one-consumer-GPU LoRA jobs (±20% heuristics)."""
+"""Conservative architecture-aware VRAM fit estimation for single-GPU LoRA jobs."""
 
 from __future__ import annotations
 
@@ -27,6 +27,11 @@ _BYTES_PER_PARAM = {
 _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 _SFT_PER_DEVICE_BS_DEFAULT = 4
+_VOCAB_DEFAULT = 248_320
+_OPD_TRAINING_RESERVE_MULTIPLIER = 1.15
+_OPD_ALLOCATOR_MARGIN_MAX_GB = 6.0
+OPD_CE_CHUNK_SIZE = 64
+_OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
 
 def _sft_per_device_bs() -> int:
@@ -54,6 +59,13 @@ def sft_realized_batch(
 
 _KV_COEF = 2.0
 _KV_CAP = 8.0
+_KV_BLOCK_TOKENS = 16
+# vllm profile, graph, scheduler, and allocator costs beyond raw cache tensors. the 8 gb measured
+# floor remains authoritative at short context; longer contexts retain 1.5 gb plus 25% fragmentation.
+_KV_PROFILE_OVERHEAD_GB = 1.5
+_KV_FRAGMENTATION_MARGIN = 1.25
+_LORA_PAGED_BYTES_PER_PARAM = 10.0
+_LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
 
 def grpo_rollout_seq_len(
@@ -79,7 +91,9 @@ def opd_completion_len(max_tokens: int | None, thinking: bool) -> int:
     from flash.engine.recipe import RECIPE
 
     opd = RECIPE.opd
-    return int(max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len))
+    return int(
+        max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len)
+    )
 
 
 def opd_rollout_seq_len(
@@ -112,7 +126,7 @@ def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> i
 
 
 def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
-    """Loss microbatch size used by OPD's dense-logit GKD backward.
+    """Loss microbatch size used by OPD's GKD backward.
 
     Keep this in lockstep with worker.opd._opd_loss_microbatch_size without importing the worker from
     the sizing path. Small/medium catalog models run up to four loss samples per forward; 35B-class
@@ -124,13 +138,201 @@ def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: 
     return max(1, min(total, default))
 
 
-def _resident_kv_gb(
-    params_b: float | None, vllm_max_len: int, num_generations: int = 8, fp8_kv: bool = False
+def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
+    """Measured floor retained until the shape equation has broader live-GPU calibration."""
+    return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
+
+
+
+def opd_training_peak_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
 ) -> float:
-    """Resident KV GB for the rollout context and generation group."""
+    """Additional OPD loss-forward/backward memory above the resident student model."""
+    eff_b = float(active_params_b) if active_params_b else float(params_b)
+    width = math.sqrt(max(eff_b, 0.1))
+    loss_mb = opd_loss_microbatch(params_b, prompts_per_step, group_size)
+    activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
+    completion = opd_completion_len(max_tokens, thinking)
+    # the backward peak holds both full-sequence bf16 logits and fp32 completion rows plus gradients.
+    dense_logits = 2 * loss_mb * (seq_len * 2 + completion * 4) * vocab / 1e9
+    return activations + dense_logits
+
+
+def opd_training_reserve_gb(
+    params_b: float,
+    seq_len: int,
+    *,
+    max_tokens: int | None = None,
+    prompts_per_step: int = 1,
+    group_size: int = 1,
+    thinking: bool = False,
+    vocab: int = _VOCAB_DEFAULT,
+    active_params_b: float | None = None,
+) -> float:
+    """OPD loss-forward/backward peak with the runtime safety multiplier."""
+    return _OPD_TRAINING_RESERVE_MULTIPLIER * opd_training_peak_gb(
+        params_b,
+        seq_len,
+        max_tokens=max_tokens,
+        prompts_per_step=prompts_per_step,
+        group_size=group_size,
+        thinking=thinking,
+        vocab=vocab,
+        active_params_b=active_params_b,
+    )
+
+
+def opd_allocator_margin_gb(total_vram_gb: float) -> float:
+    """Allocator fragmentation slack protected by the OPD startup budget."""
+    return max(2.0, min(_OPD_ALLOCATOR_MARGIN_MAX_GB, float(total_vram_gb) * 0.05))
+
+
+def opd_post_init_reserve_gb(params_b: float, lora_rank: int) -> float:
+    """Pending LoRA gradient, AdamW state, and persistent post-init growth above model residency.
+
+    OPD trains all linear layers with bf16 LoRA parameters. PyTorch AdamW lazily allocates two
+    parameter-dtype moment tensors on the first step, so each estimated trainable parameter needs
+    2 bytes for its pending gradient plus 4 bytes for optimizer state. Use total model parameters for
+    the rank-linear geometry so MoE experts are not undercounted, then reserve the measured 35B-class
+    first-generation and post-init growth with a size-scaled 12 GB ceiling.
+    """
+    model_params_b = max(0.1, float(params_b))
+    rank = max(1, int(lora_rank))
+    trainable_params_b = (rank / 16.0) * (0.05 + model_params_b / 150.0)
+    gradient_gb = trainable_params_b * 2.0
+    adamw_state_gb = trainable_params_b * 4.0
+    persistent_growth_gb = max(1.0, min(12.0, model_params_b * 0.35))
+    return gradient_gb + adamw_state_gb + persistent_growth_gb
+
+
+
+def _lora_memory_gb(
+    lora_rank: int,
+    effective_params_b: float,
+    algorithm: str,
+    model_info=None,
+) -> float:
+    """Adapter, gradient, and optimizer memory for the actual PEFT all-linear targets."""
+    floor = _legacy_lora_floor_gb(lora_rank, effective_params_b)
+    shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
+    if not shapes:
+        return floor
+    target_dims = sum(
+        (int(in_features) + int(out_features)) * int(count)
+        for in_features, out_features, count in shapes
+    )
+    trainable_params = max(1, int(lora_rank)) * target_dims
+    bytes_per_param = (
+        _LORA_ADAMW_BYTES_PER_PARAM
+        if (algorithm or "").lower() == "opd"
+        else _LORA_PAGED_BYTES_PER_PARAM
+    )
+    exact = trainable_params * bytes_per_param / 1e9
+    return max(floor, exact)
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return max(multiple, math.ceil(max(1, value) / multiple) * multiple)
+
+
+def _architecture_kv_raw_gb(
+    model_info,
+    vllm_max_len: int,
+    num_generations: int,
+    fp8_kv: bool,
+) -> float | None:
+    """Raw per-layer attention KV plus recurrent-state pages from catalog geometry."""
+    attention_layers = int(getattr(model_info, "num_attention_layers", 0) or 0)
+    kv_heads = int(getattr(model_info, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(model_info, "head_dim", 0) or 0)
+    if not (attention_layers and kv_heads and head_dim):
+        return None
+
+    sequences = max(1, int(num_generations))
+    seq_len = max(1, int(vllm_max_len))
+    kv_bytes = 1 if fp8_kv else 2
+    attention_bytes_per_token = 2 * kv_heads * head_dim * kv_bytes
+    attention_tokens = _round_up(seq_len, _KV_BLOCK_TOKENS)
+    total_bytes = attention_layers * sequences * attention_tokens * attention_bytes_per_token
+
+    linear_layers = int(getattr(model_info, "num_linear_attention_layers", 0) or 0)
+    if linear_layers:
+        key_heads = int(getattr(model_info, "linear_num_key_heads", 0) or 0)
+        value_heads = int(getattr(model_info, "linear_num_value_heads", 0) or 0)
+        key_dim = int(getattr(model_info, "linear_key_head_dim", 0) or 0)
+        value_dim = int(getattr(model_info, "linear_value_head_dim", 0) or 0)
+        conv_kernel = int(getattr(model_info, "linear_conv_kernel_dim", 0) or 0)
+        if not all((key_heads, value_heads, key_dim, value_dim, conv_kernel)):
+            # linear-attention dims are absent from the catalog: we can't size the recurrent/conv
+            # state, but the standard attention KV already accumulated in total_bytes is a better
+            # (if partial) estimate than the params-only legacy heuristic. The caller floors this
+            # partial value with legacy so a hybrid model is never under-sized below the heuristic.
+            return total_bytes / 1e9
+        # vllm stores qwen gated-deltanet recurrent and convolution state in bf16 pages.
+        state_elements = value_heads * key_dim * value_dim
+        state_elements += (key_heads * key_dim + value_heads * value_dim) * conv_kernel
+        state_bytes = state_elements * 2
+        state_block_tokens = _round_up(
+            math.ceil(state_bytes / attention_bytes_per_token), _KV_BLOCK_TOKENS
+        )
+        catalog_block = int(getattr(model_info, "mamba_block_size", 0) or 0)
+        if fp8_kv and catalog_block:
+            state_block_tokens = max(state_block_tokens, catalog_block)
+        state_pages = math.ceil(seq_len / state_block_tokens)
+        total_bytes += linear_layers * sequences * state_pages * state_bytes
+
+    return total_bytes / 1e9
+
+
+def _resident_kv_gb(
+    params_b: float | None,
+    vllm_max_len: int,
+    num_generations: int = 8,
+    fp8_kv: bool = False,
+    model_info=None,
+    preserve_legacy_floor: bool = False,
+) -> float:
+    """Profiled vLLM cache budget from architecture, with measured conservative floors."""
     width = math.sqrt(max(float(params_b or 1.0), 0.1))
-    kv = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0)
-    return kv * 0.5 if fp8_kv else kv
+    legacy = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width
+    legacy *= max(1, num_generations) / 8.0
+    if fp8_kv:
+        legacy *= 0.5
+
+    raw = _architecture_kv_raw_gb(model_info, vllm_max_len, num_generations, fp8_kv)
+    if raw is None:
+        return legacy
+    profiled = max(_KV_CAP, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
+    # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
+    # conservative pool until the architecture equation is validated on those exact gpu paths.
+    # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV
+    # only); floor it with legacy so the dropped recurrent/conv state can't under-size it.
+    _declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
+    _linear_dims_known = all(
+        int(getattr(model_info, _f, 0) or 0)
+        for _f in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+        )
+    )
+    if (
+        preserve_legacy_floor
+        or getattr(model_info, "sleep_unsupported", False)
+        or (_declares_linear and not _linear_dims_known)
+    ):
+        profiled = max(profiled, legacy)
+    return profiled
 
 
 def _colocate_util_cap(weights_gb: float, total_vram_gb: float) -> float:
@@ -152,28 +354,25 @@ def colocate_kv_util(
     num_generations: int = 8,
     active_params_b: float | None = None,
     fp8_kv: bool = False,
+    model_info=None,
+    preserve_legacy_floor: bool = False,
 ) -> float:
     """vllm_gpu_memory_utilization for the colocated GRPO rollout engine.
 
     ``gpu_memory_utilization`` is vLLM's WHOLE model-executor budget — its (2nd) bf16 weight copy PLUS
     the KV cache — so we budget BOTH (budgeting KV alone would starve the weights and, for big models,
-    under-size the engine). The KV a GRPO rollout needs scales with the engine context AND the
-    concurrent generation group (``num_generations`` simultaneous sequences), so we size the pool as
-    ``_KV_COEF x seq x sqrt(params) x group/8`` with a 1.5x margin and an 8 GB floor — NOT capped, so
-    long-context / large-group runs keep a big pool (the 0.45 utilization cap bounds it like the old
-    blanket did). The old blanket sleep-path 0.45 reserved ~36 GB on an 80 GB A100 — MEASURED as the
-    dominant resident allocation that set the GRPO step peak (~46 GB). BOTH paths budget the weight
-    copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
-    4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
-    tighter 12 GB budget preempts, confirming this as the floor."""
+    under-size the engine). Curated models size attention KV and recurrent-state pages from catalog
+    geometry, then retain a profiled overhead, fragmentation margin, and the measured 8 GB floor.
+    Uncataloged models retain the legacy conservative equation. The old blanket sleep-path 0.45 reserved
+    ~36 GB on an 80 GB A100, measured as the dominant resident allocation that set the GRPO step peak
+    (~46 GB). Both paths budget the weight copy plus cache. At the validated 4B/group8/2k point, 0.25
+    utilization reduced the peak from 46 GB to 26 GB with byte-identical reward and neutral train wall;
+    a tighter 12 GB budget preempts, confirming the retained floor."""
     weights_gb = (
         max(0.5, float(params_b or 1.0)) * 2.0
     )  # vLLM's bf16 weight copy lives in the budget
-    # MoE: the KV pool scales with the per-token COMPUTE width (the ~3B active backbone), NOT the 35B
-    # total — exactly the split estimate_vram_gb/grpo_fits_resident use (active for KV, full for the
-    # weight copy). Keying the KV off total here would budget a LARGER pool than the resident-fit gate
-    # counted, so the gate could disable sleep while the engine reserves more KV than it sized — the
-    # near-margin 35B-A3B GRPO mismatch. Dense models leave active_params_b unset -> full params_b.
+    # catalog geometry is authoritative. active params remain only for the uncataloged fallback, while
+    # the weight copy always uses total parameters.
     kv_params_b = float(active_params_b) if active_params_b else params_b
     # Utilization ceiling. The blanket 0.45 was tuned on 80 GB cards, where it leaves healthy
     # headroom. On a BIG card carrying a BIG colocate weight copy (the 35B MoE on a 180 GB B200:
@@ -201,14 +400,30 @@ def colocate_kv_util(
         # the 0.45 util cap below). Matches the resident-fit estimate (estimate_vram_gb sleep_offload
         # =False) so grpo_sleep_mode's gate and this budget size the SAME KV.
         kv_gb = max(
-            _KV_CAP, _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv)
+            _KV_CAP,
+            _resident_kv_gb(
+                kv_params_b,
+                vllm_max_len,
+                num_generations,
+                fp8_kv=fp8_kv,
+                model_info=model_info,
+                preserve_legacy_floor=preserve_legacy_floor,
+            ),
         )
         return max(0.10, min(_util_cap, (weights_gb + kv_gb) / max(1.0, total_vram_gb)))
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
     kv_pool_gb = max(
         _KV_CAP,
-        1.5 * _resident_kv_gb(kv_params_b, vllm_max_len, num_generations, fp8_kv=fp8_kv),
+        1.5
+        * _resident_kv_gb(
+            kv_params_b,
+            vllm_max_len,
+            num_generations,
+            fp8_kv=fp8_kv,
+            model_info=model_info,
+            preserve_legacy_floor=preserve_legacy_floor,
+        ),
     )
     return min(_util_cap, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 
@@ -222,21 +437,30 @@ _VLLM_COLOCATE_FLOOR_GB = 28.0
 # init time. Keep 2B+ OPD off <=40 GB classes so the allocator picks an 80 GB-class card instead of a
 # consumer GPU that passes the aggregate estimate but fails the vLLM free-memory preflight.
 _OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
-_VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
-# Single source of truth for the SFT fused-CE gate. Keep the historical constant names because
-# engine.worker.perf and tests import them.
+_SFT_CHUNKED_NLL_TOKENS = 256
+# shared thresholds for the independent liger and worker memory gates.
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
+# trl 1.6 chunked_nll is validated against these model families. other models keep plain nll
+# until their output-head and backbone traversal are covered by the same parity tests.
+_SFT_CHUNKED_NLL_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
 
-def sft_logits_fused(params_b: float | None, seq_len: int) -> bool:
-    """True when the worker fuses SFT cross-entropy (>=3B model OR >=2048-token context)."""
-    if seq_len >= _LIGER_LONG_CTX_TOKENS:
-        return True
-    return (params_b or 0.0) >= _LIGER_MIN_PARAMS_B
+
+def sft_chunked_nll_enabled(model_id: str) -> bool:
+    """whether the sft worker uses trl's dense-logit-free chunked nll path."""
+    return model_id in _SFT_CHUNKED_NLL_MODELS
 
 
 def sft_logits_per_device_cap(seq_len: int, vocab: int) -> int:
@@ -269,6 +493,9 @@ def grpo_kv_floor_gb(
     vllm_max_len: int,
     group_size: int = 8,
     active_params_b: float | None = None,
+    fp8_kv: bool = False,
+    model_info=None,
+    preserve_legacy_floor: bool = False,
 ) -> int:
     """Smallest card (GB) whose colocated vLLM executor budget still leaves a viable KV pool.
 
@@ -285,13 +512,58 @@ def grpo_kv_floor_gb(
     with headroom) so the floor never overestimates the card a large model actually needs."""
     kv_params_b = float(active_params_b) if active_params_b else float(params_b)
     weights_gb = max(0.5, float(params_b)) * 2.0
-    need = weights_gb + 0.5 * _resident_kv_gb(kv_params_b, vllm_max_len, group_size)
+    need = weights_gb + 0.5 * _resident_kv_gb(
+        kv_params_b,
+        vllm_max_len,
+        group_size,
+        fp8_kv=fp8_kv,
+        model_info=model_info,
+        preserve_legacy_floor=preserve_legacy_floor,
+    )
     lower = math.ceil(need / 0.55)
     upper = math.ceil(need / 0.45)
     for total_vram_gb in range(lower, upper + 1):
         if _colocate_util_cap(weights_gb, total_vram_gb) * total_vram_gb >= need:
             return total_vram_gb
     return upper
+
+
+def _rollout_kv_floor_gb(
+    params_b: float,
+    vllm_max_len: int,
+    concurrency: int,
+    *,
+    active_params_b: float | None = None,
+    model_info=None,
+    preserve_legacy_floor: bool = False,
+) -> int:
+    floor = grpo_kv_floor_gb(
+        params_b,
+        vllm_max_len,
+        concurrency,
+        active_params_b=active_params_b,
+        model_info=model_info,
+        preserve_legacy_floor=preserve_legacy_floor,
+    )
+    from flash.providers.base import max_non_fp8_kv_vram_gb
+
+    ceiling = max_non_fp8_kv_vram_gb()
+    if floor <= ceiling:
+        return floor
+    # the bf16 floor exceeds the non-fp8 ceiling, so the run must land on an fp8-kv GPU. use the
+    # (smaller) fp8 floor rather than the oversized bf16 floor, but keep the routed requirement
+    # strictly above the ceiling: a fp8 floor that dips back under it would let routing pick a
+    # bf16-kv GPU that then OOMs on the real bf16 cache the fp8 estimate did not reserve.
+    fp8_floor = grpo_kv_floor_gb(
+        params_b,
+        vllm_max_len,
+        concurrency,
+        active_params_b=active_params_b,
+        fp8_kv=True,
+        model_info=model_info,
+        preserve_legacy_floor=preserve_legacy_floor,
+    )
+    return max(fp8_floor, ceiling + 1)
 
 
 @dataclass(frozen=True)
@@ -330,10 +602,11 @@ def estimate_vram_gb(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     sft_fused_ce: bool | None = None,
+    model_info=None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
-    MoE: active_params_b drives activations/KV/LoRA; weights term uses full params_b.
+    MoE: active_params_b drives activations; weights and actual LoRA targets cover the full model.
     """
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
@@ -341,19 +614,43 @@ def estimate_vram_gb(
     is_opd = (algorithm or "").lower() == "opd"
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
-    lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
+    lora_opt = _lora_memory_gb(lora_rank, eff_b, algorithm, model_info)
     base = weights + _BASE_OVERHEAD_GB + lora_opt
     if algo == "grpo":
         # Sleep mode: peak = max(rollout, train). Resident: both live at once, peak = sum.
         rollout = 0.0
         if use_vllm:
-            _kv_fp8_factor = 0.5 if fp8_kv else 1.0  # fp8 KV halves bytes/token (cc>=8.9)
             if sleep_offload:
-                rollout = weights + min(
-                    _KV_COEF * (seq_len / 1024.0) * width * _kv_fp8_factor, _KV_CAP
+                kv = _resident_kv_gb(
+                    eff_b,
+                    seq_len,
+                    group_size,
+                    fp8_kv=fp8_kv,
+                    model_info=model_info,
                 )
+                # the sleep-mode worker (colocate_kv_util) budgets max(_KV_CAP, 1.5 * kv) at the real
+                # group_size. only mirror that lift when kv is backed by real catalog geometry AND
+                # exceeds _KV_CAP -- that is the finding's case (architecture-aware KV above the cap),
+                # where the old min(kv, _KV_CAP) under-counted the pool by 4-11 gb and preflight
+                # admitted a gpu the sleep executor then overran. the generic legacy KV formula
+                # OVER-estimates long context, and its _KV_CAP clamp is what keeps the uncataloged
+                # estimate on its measured train/OOM boundary, so keep min(kv, _KV_CAP) whenever the
+                # geometry is absent (generic) or the arch-aware kv still fits the cap (short context).
+                arch_kv_known = (
+                    _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
+                )
+                if arch_kv_known and kv > _KV_CAP:
+                    rollout = weights + max(_KV_CAP, 1.5 * kv)
+                else:
+                    rollout = weights + min(kv, _KV_CAP)
             else:
-                rollout = weights + _resident_kv_gb(eff_b, seq_len, group_size, fp8_kv=fp8_kv)
+                rollout = weights + _resident_kv_gb(
+                    eff_b,
+                    seq_len,
+                    group_size,
+                    fp8_kv=fp8_kv,
+                    model_info=model_info,
+                )
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -368,46 +665,37 @@ def estimate_vram_gb(
         # ignored for OPD; it only exists for legacy GRPO sizing callers.
         rollout_concurrency = opd_rollout_concurrency(batch_size, group_size)
         rollout = weights + max(
-            _KV_CAP, _resident_kv_gb(eff_b, seq_len, rollout_concurrency, fp8_kv=fp8_kv)
+            _KV_CAP,
+            _resident_kv_gb(
+                eff_b,
+                seq_len,
+                rollout_concurrency,
+                fp8_kv=fp8_kv,
+                model_info=model_info,
+                preserve_legacy_floor=True,
+            ),
         )
-        # opd's gkd loss forward materializes DENSE logits — there is NO fused cross-entropy: the
-        # student forward yields full-sequence bf16 logits [seq, vocab], then the completion rows are
-        # gathered in fp32 [completion, vocab] for the logsumexp. The SFT fused path budgets ZERO
-        # vocab logits for >=3B models, so a long-completion opd job (e.g. max_tokens=8192) would be
-        # sized for an under-capacity card and OOM.
-        #
-        # Mirror opd_rollout_seq_len / run_opd's completion resolution: explicit max_tokens, else the
-        # OPD recipe default (thinking uses the longer max_completion_len_thinking). A GRPO-style
-        # min(seq_len, 1024) fallback would UNDER-budget a thinking opd job (1536-token completions).
+        # text opd projects only completion-prediction hidden states and computes exact full-vocabulary
+        # ce in checkpointed chunks. image samples still use the dense full-sequence logits path and are
+        # processed one at a time. allocation does not know the dataset modality, so reserve the larger
+        # of one text ce chunk and one dense image loss forward/backward peak.
         completion = opd_completion_len(max_tokens, thinking)
-        # run_opd backprops a small loss microbatch. Budget that actual dense-logit microbatch, not
-        # the full rollout/teacher batch and not a single sequence.
         loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
         activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        # Dense-logit peak spans BOTH the forward and the loss BACKWARD (OPD has no fused CE):
-        #   - forward:  bf16 full-sequence logits [seq, vocab]        (seq * 2)
-        #               fp32 completion rows [completion, vocab] for logsumexp, saved for backward
-        #                                                             (completion * 4)
-        #   - backward: fp32 gradient of those completion rows [completion, vocab]
-        #                                                             (completion * 4)
-        #               bf16 gradient scattered back into the full logits [seq, vocab] to reach lm_head
-        #                                                             (seq * 2)
-        # All four coexist at the backward peak. The old formula counted only the two FORWARD buffers,
-        # so a long-completion / large-vocab (248k) opd job under-budgeted the loss backward by
-        # ~(completion*4 + seq*2)*vocab bytes and could route to a GPU that OOMs in OPD loss backward
-        # (codex[bot]). Mirror the SFT dense-logit sizing by budgeting the backward buffers too.
-        logits_fwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits_bwd = loss_mb * (seq_len * 2 + completion * 4) * vocab
-        logits = (logits_fwd + logits_bwd) / 1e9
+        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * completion)
+        chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
+        dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
+        logits = max(chunked_logits, dense_image_logits)
         return base + rollout + activations + logits
-    # Actual TRL SFT keeps fused CE disabled (see worker/sft.py), so dense logits materialize even
-    # for long-context / >=3B models. Callers can pass sft_fused_ce=True only for theoretical
-    # comparisons; the default must mirror the worker.
+    # direct callers default to the conservative plain-nll estimate. model_required_vram_gb passes
+    # the worker's validated chunked-nll decision explicitly when it knows the model identity.
     fused = False if sft_fused_ce is None else bool(sft_fused_ce)
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
-    # Don't clamp to budget: pd=1 is irreducible and the logits can exceed the budget at near-2048 ctx.
-    logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
+    # plain nll retains every sequence position. chunked nll retains at most one 256-token vocab
+    # projection at a time, independent of micro-batch and context once the chunk is full.
+    projected_tokens = min(pd * seq_len, _SFT_CHUNKED_NLL_TOKENS) if fused else pd * seq_len
+    logits = projected_tokens * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
 
 
@@ -421,6 +709,7 @@ def grpo_fits_resident(
     thinking: bool = False,
     card_vram_gb: float = 0.0,
     fp8_kv: bool = False,
+    revision: str = "",
     margin: float = 1.15,
 ) -> bool:
     """True when GRPO fits resident (no sleep-mode offload); False on unknown model/card (safe default)."""
@@ -428,17 +717,20 @@ def grpo_fits_resident(
         return False
     from flash.catalog import MODELS, vocab_size_for
 
-    info = MODELS.get(model_id)
-    params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
+    catalog_info = MODELS.get(model_id)
+    if revision:
+        params_b = float(resolve_params_b(model_id, revision=revision) or 0.0)
+    else:
+        params_b = (
+            float(getattr(catalog_info, "params_b", 0.0) or 0.0) if catalog_info else 0.0
+        )
     if params_b <= 0:
         return False
-    quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
-    # MoE: size the resident peak's COMPUTE terms (KV pool, activations, rank-linear LoRA) on the ~3B
-    # ACTIVE backbone, exactly as model_required_vram_gb does — keying them on the 35B TOTAL inflates
-    # the resident estimate above the card and wrongly forces vLLM sleep mode on a B200 MoE GRPO run,
-    # where the sleep/wake cycle stalls the colocated rollout (the very failure this gate exists to
-    # avoid). The ``weights`` term still sizes the full params_b. Dense models leave active_params_b
-    # unset -> estimate_vram_gb falls back to params_b for every term (unchanged).
+    quant = (
+        (getattr(catalog_info, "quant", "bf16") or "bf16") if catalog_info else "bf16"
+    )
+    # pinned revisions use the conservative generic kv and lora geometry, matching the runtime budget.
+    info = None if revision else catalog_info
     active_b = float(getattr(info, "active_params_b", 0.0) or 0.0) if info else 0.0
     resident = estimate_vram_gb(
         params_b,
@@ -454,6 +746,7 @@ def grpo_fits_resident(
         sleep_offload=False,
         active_params_b=active_b,
         fp8_kv=fp8_kv,
+        model_info=info,
     )
     return resident * margin <= card_vram_gb
 
@@ -480,11 +773,12 @@ def sft_gc_off_peak_gb(
     batch: int = _SFT_PER_DEVICE_BS_DEFAULT,
     lora_rank: int = 32,
     quant: str = "bf16",
+    model_info=None,
 ) -> float:
-    """Estimated peak VRAM (GB) for a FUSED-CE LoRA SFT step with gradient checkpointing OFF: the
-    resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
-    Fused CE (chalk FLCE) is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that
-    made GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
+    """Estimated peak VRAM (GB) for a dense-logit-free LoRA SFT step with gradient checkpointing OFF:
+    the resident weights + optimizer/base + the no-recompute activations held across ALL ``num_layers``.
+    Chunked or fused CE is assumed, so there is no ``[B, T, vocab]`` logits term (the thing that made
+    GC-off impossible at a 248k vocab). Unknown architecture dims -> ``inf`` (caller keeps GC on).
 
     MoE: the activation backbone scales with the model's real ``hidden`` x ``num_layers`` (geometry),
     NOT params_b -- the ~3B-active expert FFN is already folded into ``_GC_OFF_ACT_K``. ``weights``
@@ -494,7 +788,7 @@ def sft_gc_off_peak_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     eff_b = float(active_params_b) if active_params_b else float(params_b)
     weights = float(params_b) * bpp
-    lora_opt = (lora_rank / 16.0) * (0.3 + 0.04 * eff_b)
+    lora_opt = _lora_memory_gb(lora_rank, eff_b, "sft", model_info)
     base = weights + _BASE_OVERHEAD_GB + lora_opt
     act = _GC_OFF_ACT_K * int(num_layers) * int(batch) * int(seq_len) * int(hidden) * 2.0 / 1e9
     return base + act
@@ -512,8 +806,9 @@ def sft_grad_checkpoint_can_disable(
     lora_rank: int = 32,
     quant: str = "bf16",
     margin_gb: float = 18.0,
+    model_info=None,
 ) -> bool:
-    """True when a FUSED-CE LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
+    """True when a dense-logit-free LoRA SFT step fits a ``card_vram_gb`` card WITHOUT gradient checkpointing,
     so GC -- a ~+33% recompute tax on every step -- can be turned off for the speed win.
 
     Conservative by construction: an unknown card / unknown architecture dims, or a peak that doesn't
@@ -532,6 +827,7 @@ def sft_grad_checkpoint_can_disable(
         batch=batch,
         lora_rank=lora_rank,
         quant=quant,
+        model_info=model_info,
     )
     return peak + float(margin_gb) <= float(card_vram_gb)
 
@@ -669,6 +965,7 @@ def model_required_vram_gb(
         vocab: int = _VOCAB_DEFAULT,
         active_params_b: float | None = None,
         fp8_kv: bool = False,
+        model_info=None,
     ) -> int:
         est = estimate_vram_gb(
             params_b,
@@ -685,6 +982,7 @@ def model_required_vram_gb(
             active_params_b=active_params_b,
             fp8_kv=fp8_kv,
             sft_fused_ce=sft_fused_ce,
+            model_info=model_info,
         )
         return math.ceil(est * headroom)
 
@@ -696,6 +994,7 @@ def model_required_vram_gb(
         use_vllm: bool = True,
         vocab: int = _VOCAB_DEFAULT,
         active_params_b: float | None = None,
+        model_info=None,
     ) -> int:
         """Re-size an OPD requirement with an fp8 KV cache once the run is provably modern-card-only.
 
@@ -719,6 +1018,7 @@ def model_required_vram_gb(
             vocab=vocab,
             active_params_b=active_params_b,
             fp8_kv=True,
+            model_info=model_info,
         )
         return fp8_need if fp8_need > ceiling else need
 
@@ -732,19 +1032,19 @@ def model_required_vram_gb(
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     )
-    # Worker parity: TRL SFT deliberately calls install_chalk_kernels(..., fused_ce=False), because
-    # SFTTrainer.compute_loss reads outputs.logits and crashes when fused CE returns logits=None. So
-    # every SFT run materializes dense logits, even for long context / >=3B models where the old
-    # allocator assumed a fused CE path. Size SFT with fused CE OFF up front or long-context Qwen SFT
-    # routes to consumer cards and OOMs on the first backward.
-    sft_fused_ce = None if is_grpo else False
+    # trl chunked_nll removes ignored positions before the lm head and projects valid tokens in
+    # bounded chunks. size validated qwen sft jobs without a dense [batch, seq, vocab] term; models
+    # outside that validated set keep the conservative plain-nll estimate and micro-batch cap.
+    sft_fused_ce = None if is_grpo else sft_chunked_nll_enabled(model_id)
     if info is not None:
         params_b = info.params_b
         if model_revision:
             params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
         quant = getattr(info, "quant", "bf16") or "bf16"
         use_vllm = True
-        active_b = float(getattr(info, "active_params_b", 0.0) or 0.0)
+        # pinned commits retain validated coarse geometry but use conservative generic architecture sizing.
+        sizing_info = None if model_revision else info
+        active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
         need = _need(
             params_b or 4.0,
             algorithm,
@@ -752,6 +1052,7 @@ def model_required_vram_gb(
             use_vllm=use_vllm,
             vocab=model_vocab,
             active_params_b=active_b,
+            model_info=sizing_info,
         )
         if is_opd:
             need = _opd_fp8_adjust(
@@ -761,6 +1062,7 @@ def model_required_vram_gb(
                 use_vllm=use_vllm,
                 vocab=model_vocab,
                 active_params_b=active_b,
+                model_info=sizing_info,
             )
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
@@ -792,12 +1094,19 @@ def model_required_vram_gb(
                         sleep_offload=False,
                         active_params_b=active_b,
                         fp8_kv=True,
+                        model_info=sizing_info,
                     )
                     # match grpo_fits_resident's 1.15 margin (NOT the looser 1.1 headroom) so the
                     # parse-time reject lands at the SAME resident wall the worker gate enforces.
                     * 1.15
                 )
                 floor = max(floor, resident_need)
+                # ``need`` above was sized with the default sleep estimate. Now that the sleep rollout
+                # honestly reserves the worker's colocate KV pool (max(_KV_CAP, 1.5 * arch KV)), that
+                # estimate can exceed this resident wall and FALSELY reject a config that fits resident
+                # on the big floor card. Sleep never runs for this model (it HANGS), so discard the
+                # sleep sizing and size purely on the resident peak.
+                need = floor
             else:
                 floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
         need = max(need, floor)
@@ -811,11 +1120,13 @@ def model_required_vram_gb(
             # memory for the cache blocks") on a card the training-peak estimate accepted.
             need = max(
                 need,
-                grpo_kv_floor_gb(
+                _rollout_kv_floor_gb(
                     params_b or 4.0,
                     seq_len,
                     vllm_concurrency,
                     active_params_b=active_b,
+                    model_info=sizing_info,
+                    preserve_legacy_floor=is_opd,
                 ),
             )
         return need
@@ -839,13 +1150,11 @@ def model_required_vram_gb(
         floor_gb = 24 if params_b <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
         if is_opd and params_b >= 2.0:
             floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
-        need = max(need, floor_gb, grpo_kv_floor_gb(params_b, seq_len, vllm_concurrency))
+        need = max(need, floor_gb, _rollout_kv_floor_gb(params_b, seq_len, vllm_concurrency))
     return need
 
 
-def fetch_hf_params_b(
-    model_id: str, revision: str = "", *, strict: bool = False
-) -> float | None:
+def fetch_hf_params_b(model_id: str, revision: str = "", *, strict: bool = False) -> float | None:
     """Total params in billions from revision-aware HF safetensors metadata."""
     try:
         from huggingface_hub import HfApi
