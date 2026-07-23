@@ -54,6 +54,7 @@ from flash.spec import DEFAULT_CREDIT_ASSIGNMENT
 
 _OPENRLHF_ENTRYPOINT = "openrlhf.cli.train_ppo_ray"
 _OPENRLHF_REWARD_MAX_BODY_BYTES = 2 * 1024 * 1024
+_FLASH_REWARD_RECORD_LOG_KEY = "__flash_reward_record_id"
 _OPENRLHF_TARGET_MODULES = "all-linear"
 _OPENRLHF_PPO_EPOCHS = 1
 _OPENRLHF_REWARD_CLIP_BOUND = "1000000000"
@@ -466,10 +467,14 @@ class RewardBridge:
         self._completion_from_query = completion_from_query
         self._token = token or secrets.token_urlsafe(32)
         self._path = f"/reward/{self._token}"
+        self._record_path = f"{self._path}/record"
         self._score_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._rewards: list[float] = []
         self._samples: dict[int, list[tuple[str, str, float]]] = {}
+        self._sample_record_ids: dict[int, list[int]] = {}
+        self._pending_records: dict[int, tuple[int, int]] = {}
+        self._next_record_id = 0
         self._samples_per_step = int(samples_per_step)
         self._sample_step = int(first_step)
         self._samples_in_step = 0
@@ -488,7 +493,10 @@ class RewardBridge:
                 self.wfile.write(body)
 
             def do_POST(self) -> None:
-                if not secrets.compare_digest(self.path, bridge._path):
+                if not any(
+                    secrets.compare_digest(self.path, path)
+                    for path in (bridge._path, bridge._record_path)
+                ):
                     self._send(401, {"error": "unauthorized"})
                     return
                 try:
@@ -499,6 +507,10 @@ class RewardBridge:
                     if length <= 0 or length > _OPENRLHF_REWARD_MAX_BODY_BYTES:
                         raise ValueError("invalid reward request size")
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if secrets.compare_digest(self.path, bridge._record_path):
+                        bridge._finalize_record(payload)
+                        self._send(200, {"ok": True})
+                        return
                     result = bridge._score_payload(payload)
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     self._send(400, {"error": "invalid reward request"})
@@ -528,6 +540,7 @@ class RewardBridge:
         self._thread.start()
         port = int(self._server.server_address[1])
         self.url = f"http://127.0.0.1:{port}{self._path}"
+        self.record_url = f"http://127.0.0.1:{port}{self._record_path}"
 
     def _score_payload(self, payload: Any) -> RewardResult:
         if not isinstance(payload, dict):
@@ -552,15 +565,51 @@ class RewardBridge:
         if not all(math.isfinite(float(value)) for value in result.extra_logs.values()):
             raise ValueError("reward metrics must be finite")
         with self._stats_lock:
+            record_id = self._next_record_id
+            self._next_record_id += 1
+            reward_index = len(self._rewards)
             self._rewards.append(float(result.reward))
-            samples = self._samples.setdefault(self._sample_step, [])
+            sample_step = self._sample_step
+            samples = self._samples.setdefault(sample_step, [])
+            sample_record_ids = self._sample_record_ids.setdefault(sample_step, [])
             samples.append((prompts[0], completion, float(result.reward)))
+            sample_record_ids.append(record_id)
             del samples[:-64]
+            del sample_record_ids[:-64]
+            self._pending_records[record_id] = (reward_index, sample_step)
             self._samples_in_step += 1
             if self._samples_in_step == self._samples_per_step:
                 self._sample_step += 1
                 self._samples_in_step = 0
-        return result
+        return RewardResult(
+            result.reward,
+            result.scores,
+            {**result.extra_logs, _FLASH_REWARD_RECORD_LOG_KEY: float(record_id)},
+        )
+
+    def _finalize_record(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            raise TypeError("reward record request must be an object")
+        record_id = payload.get("record_id")
+        neutralize = payload.get("neutralize")
+        if isinstance(record_id, bool) or not isinstance(record_id, int):
+            raise TypeError("reward record id must be an integer")
+        if not isinstance(neutralize, bool):
+            raise TypeError("reward neutralization flag must be boolean")
+        with self._stats_lock:
+            try:
+                reward_index, sample_step = self._pending_records.pop(record_id)
+            except KeyError as exc:
+                raise ValueError("unknown or already finalized reward record") from exc
+            if not neutralize:
+                return
+            self._rewards[reward_index] = 0.0
+            sample_record_ids = self._sample_record_ids.get(sample_step, [])
+            if record_id not in sample_record_ids:
+                return
+            sample_index = sample_record_ids.index(record_id)
+            prompt, completion, _reward = self._samples[sample_step][sample_index]
+            self._samples[sample_step][sample_index] = (prompt, completion, 0.0)
 
     @property
     def rewards(self) -> list[float]:
@@ -571,6 +620,7 @@ class RewardBridge:
         generated_at_step = int(generated_at_step)
         with self._stats_lock:
             samples = self._samples.pop(generated_at_step, [])
+            self._sample_record_ids.pop(generated_at_step, None)
         return select_rollout_samples(samples, generated_at_step=generated_at_step)
 
     @property
@@ -616,6 +666,7 @@ import math
 import os
 import threading
 import time
+import urllib.request
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -628,6 +679,8 @@ _FLASH_STOP_SEQUENCES = tuple(json.loads(os.environ.get("FLASH_OPENRLHF_STOP_SEQ
 _FLASH_EOS_TOKEN_IDS = frozenset(
     int(token_id) for token_id in json.loads(os.environ.get("FLASH_OPENRLHF_EOS_TOKEN_IDS", "[]"))
 )
+_FLASH_REWARD_RECORD_URL = os.environ.get("FLASH_OPENRLHF_REWARD_RECORD_URL", "")
+_FLASH_REWARD_RECORD_LOG_KEY = "__flash_reward_record_id"
 _ATTN_IMPLEMENTATION = os.environ.get("FLASH_OPENRLHF_ATTN_IMPLEMENTATION")
 _LANGUAGE_MODEL_ONLY = os.environ.get("FLASH_OPENRLHF_LANGUAGE_MODEL_ONLY") == "1"
 _SM120_VLLM_BACKEND = os.environ.get("FLASH_OPENRLHF_SM120_VLLM_BACKEND") == "1"
@@ -812,26 +865,58 @@ def _flash_rollout_seed(identity):
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
-def _flash_trim_trailing_stop(tokenizer, token_ids, output_text, stop_reason=None):
+def _flash_trim_trailing_stop(tokenizer, token_ids, raw_text, output_text, stop_reason=None):
     ids = [int(token_id) for token_id in token_ids]
-    candidates = []
-    for value in _FLASH_STOP_SEQUENCES:
-        if not value:
-            continue
-        index = output_text.find(value)
-        if index >= 0:
-            candidates.append((index, -len(value), value))
     if isinstance(stop_reason, str) and stop_reason in _FLASH_STOP_SEQUENCES:
-        index = output_text.find(stop_reason)
-        if index >= 0:
-            candidates = [(index, -len(stop_reason), stop_reason)]
-    if not candidates:
+        stop = stop_reason
+    else:
+        candidates = [
+            value for value in _FLASH_STOP_SEQUENCES if value and output_text.endswith(value)
+        ]
+        if not candidates:
+            return ids, None
+        stop = max(candidates, key=len)
+    keep_length = raw_text.rfind(stop)
+    if keep_length < 0:
         return ids, None
-    keep_length, _negative_length, _stop = min(candidates)
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
         kept -= 1
     return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True)
+
+
+def _flash_finalize_reward_record(output, neutralize):
+    extra_logs = output.get("extra_logs")
+    if not isinstance(extra_logs, dict):
+        if _FLASH_REWARD_RECORD_URL:
+            raise RuntimeError("OpenRLHF reward output is missing record metadata")
+        return
+    record_id = extra_logs.pop(_FLASH_REWARD_RECORD_LOG_KEY, None)
+    if isinstance(record_id, list):
+        if len(record_id) != 1:
+            raise RuntimeError("OpenRLHF reward record metadata is invalid")
+        record_id = record_id[0]
+    if not _FLASH_REWARD_RECORD_URL:
+        return
+    if (
+        isinstance(record_id, bool)
+        or not isinstance(record_id, (int, float))
+        or not float(record_id).is_integer()
+    ):
+        raise RuntimeError("OpenRLHF reward output is missing record metadata")
+    body = json.dumps(
+        {"record_id": int(record_id), "neutralize": bool(neutralize)},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        _FLASH_REWARD_RECORD_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError("OpenRLHF reward record finalization failed")
 
 
 def _flash_naturally_terminated(finish_reason, stop_reason, token_ids, stop_text):
@@ -883,6 +968,7 @@ class _FlashTerminationCapture:
         kept_ids, kept_text = _flash_trim_trailing_stop(
             self._tokenizer,
             token_ids,
+            stop_text,
             generation_output.text,
             self.stop_reason,
         )
@@ -908,6 +994,9 @@ async def _flash_execute(self, *args, **kwargs):
         sampling_params.include_stop_str_in_output = True
     if _FLASH_EOS_TOKEN_IDS:
         sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)
+        sampling_params.all_stop_token_ids = set(
+            getattr(sampling_params, "all_stop_token_ids", ())
+        ) | set(_FLASH_EOS_TOKEN_IDS)
     if _FLASH_ROLLOUT_SEED is not None:
         label = call_args[1] if len(call_args) > 1 else call_kwargs.get("label")
         identity = _flash_rollout_identity(label)
@@ -944,6 +1033,7 @@ async def _flash_execute(self, *args, **kwargs):
     output = await _original_execute(self, *call_args, **call_kwargs)
     if not isinstance(output, dict):
         raise RuntimeError("OpenRLHF reward executor returned a non-object output")
+    _flash_finalize_reward_record(output, capture.empty_after_stop)
     output["finish_reason"] = capture.finish_reason
     output["stop_reason"] = capture.stop_reason
     output["truncated"] = capture.empty_after_stop or (
@@ -1570,6 +1660,7 @@ def build_openrlhf_child_env(
     warmstart_adapter: str = "",
     save_at_steps: tuple[int, ...] = (),
     actor_attn_implementation: str | None = None,
+    reward_record_url: str = "",
 ) -> dict[str, str]:
     """Build a minimal child environment without Flash environment or provider secrets."""
     child = {
@@ -1600,6 +1691,8 @@ def build_openrlhf_child_env(
         child["FLASH_OPENRLHF_SM120_VLLM_BACKEND"] = "1"
     if actor_attn_implementation:
         child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] = actor_attn_implementation
+    if reward_record_url:
+        child["FLASH_OPENRLHF_REWARD_RECORD_URL"] = reward_record_url
     return child
 
 
@@ -2128,6 +2221,7 @@ def run_rl_openrlhf() -> None:
             warmstart_adapter=inputs["warmstart_adapter"],
             save_at_steps=inputs["save_at_steps"],
             actor_attn_implementation=actor_attn_implementation,
+            reward_record_url=bridge.record_url,
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())

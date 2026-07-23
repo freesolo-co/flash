@@ -741,6 +741,11 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
                 "labels": [7],
             },
         )
+        record_id = int(response["extra_logs"].pop("__flash_reward_record_id")[0])
+        grpo_openrlhf.post_reward_request(
+            bridge.record_url,
+            {"record_id": record_id, "neutralize": False},
+        )
 
     assert response == {
         "rewards": [1.25],
@@ -774,10 +779,17 @@ def test_reward_bridge_scores_empty_completion_with_environment():
             bridge.url,
             {"query": ["prompt"], "prompts": ["prompt"], "labels": [3]},
         )
+        record_id = int(response["extra_logs"].pop("__flash_reward_record_id")[0])
+        grpo_openrlhf.post_reward_request(
+            bridge.record_url,
+            {"record_id": record_id, "neutralize": True},
+        )
+        samples = bridge.drain_sampled_completions(1)
 
     assert response == {"rewards": [-1.0], "scores": [-1.0], "extra_logs": {"blank": [1.0]}}
     assert calls == [(3, "", "prompt")]
-    assert bridge.rewards == [-1.0]
+    assert bridge.rewards == [0.0]
+    assert samples[0]["reward"] == 0.0
 
 
 def test_reward_bridge_keeps_samples_with_their_generation_step():
@@ -788,13 +800,18 @@ def test_reward_bridge_keeps_samples_with_their_generation_step():
         score, samples_per_step=2, first_step=7, token="step-token"
     ) as bridge:
         for label in range(4):
-            grpo_openrlhf.post_reward_request(
+            response = grpo_openrlhf.post_reward_request(
                 bridge.url,
                 {
                     "query": [f"promptcompletion-{label}"],
                     "prompts": ["prompt"],
                     "labels": [label],
                 },
+            )
+            record_id = int(response["extra_logs"]["__flash_reward_record_id"][0])
+            grpo_openrlhf.post_reward_request(
+                bridge.record_url,
+                {"record_id": record_id, "neutralize": False},
             )
 
         step_7 = bridge.drain_sampled_completions(7)
@@ -890,6 +907,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
         warmstart_adapter="/work/incoming-adapter",
         save_at_steps=(3, 7),
         actor_attn_implementation="sdpa",
+        reward_record_url="http://127.0.0.1:1234/reward/token/record",
     )
 
     assert child["PATH"] == "/usr/bin"
@@ -905,6 +923,7 @@ def test_child_env_excludes_environment_and_provider_secrets(monkeypatch):
     assert child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] == "/work/incoming-adapter"
     assert child["FLASH_OPENRLHF_SAVE_AT_STEPS"] == "3,7"
     assert child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "sdpa"
+    assert child["FLASH_OPENRLHF_REWARD_RECORD_URL"].endswith("/reward/token/record")
     assert "USER_ENV_SECRET" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -948,6 +967,7 @@ def test_sitecustomize_carries_fail_closed_and_fixed_length_hooks():
     assert "sampling_params.stop = list(_FLASH_STOP_SEQUENCES)" in source
     assert "sampling_params.include_stop_str_in_output = True" in source
     assert "sampling_params.stop_token_ids = sorted(_FLASH_EOS_TOKEN_IDS)" in source
+    assert "sampling_params.all_stop_token_ids" in source
     assert 'output["finish_reason"] = capture.finish_reason' in source
     assert 'output["stop_reason"] = capture.stop_reason' in source
     assert "_flash_trim_trailing_stop" in source
@@ -1018,6 +1038,7 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
             "_flash_rollout_identity",
             "_flash_rollout_seed",
             "_flash_trim_trailing_stop",
+            "_flash_finalize_reward_record",
             "_flash_naturally_terminated",
             "_FlashTerminationCapture",
             "_flash_execute",
@@ -1038,6 +1059,8 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
         "_FLASH_ROLLOUT_SEED": 42,
         "_FLASH_STOP_SEQUENCES": (),
         "_FLASH_EOS_TOKEN_IDS": frozenset(),
+        "_FLASH_REWARD_RECORD_URL": "",
+        "_FLASH_REWARD_RECORD_LOG_KEY": "__flash_reward_record_id",
         "_original_execute": execute,
     }
     exec(
@@ -1086,6 +1109,7 @@ def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_t
         "_flash_rollout_identity",
         "_flash_rollout_seed",
         "_flash_trim_trailing_stop",
+        "_flash_finalize_reward_record",
         "_flash_naturally_terminated",
         "_FlashTerminationCapture",
         "_flash_execute",
@@ -1105,6 +1129,8 @@ def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_t
         "_FLASH_ROLLOUT_SEED": None,
         "_FLASH_STOP_SEQUENCES": tuple(stop_sequences),
         "_FLASH_EOS_TOKEN_IDS": frozenset(eos_token_ids),
+        "_FLASH_REWARD_RECORD_URL": "",
+        "_FLASH_REWARD_RECORD_LOG_KEY": "__flash_reward_record_id",
         "_original_execute": execute,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "sitecustomize.py", "exec"), namespace)
@@ -1181,6 +1207,7 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     assert request_params.stop == ["</answer>"]
     assert request_params.include_stop_str_in_output is True
     assert request_params.stop_token_ids == [99]
+    assert request_params.all_stop_token_ids == {99}
     assert not hasattr(original_params, "stop")
     assert captured["generation"].token_ids == [1]
     assert captured["generation"].text == "ok"
@@ -1192,6 +1219,127 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
     assert output["finish_reason"] == "length"
     assert output["stop_reason"] == "</answer>"
     assert output["truncated"] is False
+
+
+def test_sitecustomize_trims_the_reported_trailing_stop_not_an_earlier_match():
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            pieces = {1: "before</answer>middle", 2: "after", 3: "</answer>"}
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        token_ids=[1, 2, 3],
+                        text="before</answer>middleafter</answer>",
+                        finish_reason="stop",
+                        stop_reason="</answer>",
+                        logprobs=["first", "second", "stop"],
+                    )
+                ]
+            )
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "token_ids": generation.token_ids,
+            "action_text": generation.text,
+            "logprobs": generation.logprobs,
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(execute=execute)
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert output["token_ids"] == [1, 2]
+    assert output["action_text"] == "before</answer>middleafter"
+    assert output["logprobs"] == ["first", "second"]
+
+
+def test_sitecustomize_trims_special_token_stop_from_raw_decode():
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            pieces = {1: "ok", 2: "" if skip_special_tokens else "<|im_end|>"}
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        token_ids=[1, 2],
+                        text="ok",
+                        finish_reason="stop",
+                        stop_reason="<|im_end|>",
+                        logprobs=["ok", "stop"],
+                    )
+                ]
+            )
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "token_ids": generation.token_ids,
+            "action_text": generation.text,
+            "logprobs": generation.logprobs,
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(
+        execute=execute,
+        stop_sequences=("<|im_end|>",),
+    )
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert output["token_ids"] == [1]
+    assert output["action_text"] == "ok"
+    assert output["logprobs"] == ["ok"]
 
 
 def test_sitecustomize_preserves_native_output_when_no_stop_is_trimmed():
