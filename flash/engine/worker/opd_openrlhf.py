@@ -1593,6 +1593,11 @@ class _OpenRLHFOPDCheckpointPublisher:
             self.model_revision,
             self.python_bin,
         )
+        _w.write_base_model_provenance(
+            adapter_export,
+            self.model_id,
+            self.model_revision,
+        )
         for name in os.listdir(adapter_export):
             shutil.copy2(os.path.join(adapter_export, name), os.path.join(stage, name))
         optimizer = _find_checkpoint_state_file(actor_tag, "optim")
@@ -1607,10 +1612,12 @@ class _OpenRLHFOPDCheckpointPublisher:
         return stage
 
     def _publish(self, step: int) -> None:
+        required_deployable = step in self.required_steps
+        if required_deployable and not getattr(_w, "HF_REPO", ""):
+            raise RuntimeError(f"required OpenRLHF OPD save step {step} has no artifact repository")
+
         actor_tag, hf_export = self._wait_for_checkpoint(step)
         stage = self._stage(step, actor_tag, hf_export)
-
-        required_deployable = step in self.required_steps
         periodic_deployable = (
             not self.required_steps
             and step != self.final_step
@@ -1618,25 +1625,29 @@ class _OpenRLHFOPDCheckpointPublisher:
             and step % self.save_every == 0
         )
 
-        def publish_deployable() -> None:
-            if required_deployable or periodic_deployable:
-                _w.publish_deployable_checkpoint(
-                    os.path.join(stage, "_adapter_export"),
-                    step,
-                    required=required_deployable,
-                    _provenance_ready=True,
-                )
+        try:
 
-        uploaded = _w.upload_resume_checkpoint(
-            step,
-            stage,
-            after_upload=publish_deployable,
-        )
-        resume_required = required_deployable or step == self.final_step
-        if resume_required and not uploaded:
-            raise _w.RetriableInfraError(
-                f"required OpenRLHF OPD checkpoint step {step} was not published"
+            def publish_deployable() -> None:
+                if required_deployable or periodic_deployable:
+                    _w.publish_deployable_checkpoint(
+                        os.path.join(stage, "_adapter_export"),
+                        step,
+                        required=required_deployable,
+                        _provenance_ready=True,
+                    )
+
+            uploaded = _w.upload_resume_checkpoint(
+                step,
+                stage,
+                after_upload=publish_deployable,
             )
+            resume_required = required_deployable or step == self.final_step
+            if resume_required and not uploaded:
+                raise _w.RetriableInfraError(
+                    f"required OpenRLHF OPD checkpoint step {step} was not published"
+                )
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def _restore_openrlhf_resume(

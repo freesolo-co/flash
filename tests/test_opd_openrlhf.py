@@ -659,6 +659,7 @@ def test_child_ray_actor_runtime_writes_flash_rng_after_native_checkpoint(monkey
 
 def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
     events = []
+    monkeypatch.setattr(opd_openrlhf._w, "HF_REPO", "owner/repo")
     publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
     publisher.required_steps = frozenset({2})
     publisher.save_every = 20
@@ -685,6 +686,47 @@ def test_required_checkpoint_uploads_resume_before_deployable(monkeypatch):
         "resume",
         ("deployable", "/staged/checkpoint-2/_adapter_export", 2),
     ]
+
+
+def test_required_checkpoint_rejects_missing_artifact_repo(monkeypatch):
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.required_steps = frozenset({2})
+    monkeypatch.setattr(opd_openrlhf._w, "HF_REPO", "")
+    monkeypatch.setattr(
+        publisher,
+        "_wait_for_checkpoint",
+        lambda _step: pytest.fail("checkpoint staging started without an artifact repository"),
+    )
+
+    with pytest.raises(RuntimeError, match="required OpenRLHF OPD save step 2"):
+        publisher._publish(2)
+
+
+@pytest.mark.parametrize("upload_fails", [False, True])
+def test_checkpoint_stage_is_removed_after_upload(monkeypatch, tmp_path, upload_fails):
+    publisher = object.__new__(opd_openrlhf._OpenRLHFOPDCheckpointPublisher)
+    publisher.required_steps = frozenset()
+    publisher.save_every = 20
+    publisher.final_step = 3
+    stage = tmp_path / "checkpoint-2"
+    stage.mkdir()
+    monkeypatch.setattr(publisher, "_wait_for_checkpoint", lambda _step: ("actor", "hf"))
+    monkeypatch.setattr(publisher, "_stage", lambda *_args: str(stage))
+
+    def upload(*_args, **_kwargs):
+        if upload_fails:
+            raise RuntimeError("upload failed")
+        return True
+
+    monkeypatch.setattr(opd_openrlhf._w, "upload_resume_checkpoint", upload)
+
+    if upload_fails:
+        with pytest.raises(RuntimeError, match="upload failed"):
+            publisher._publish(2)
+    else:
+        publisher._publish(2)
+
+    assert not stage.exists()
 
 
 def test_periodic_checkpoint_publishes_best_effort_deployable(monkeypatch):
@@ -746,6 +788,8 @@ def test_checkpoint_stage_copies_child_trainer_rng_blob(monkeypatch, tmp_path):
     deployable = stage / "_adapter_export"
     assert deployable.joinpath("adapter_config.json").is_file()
     assert deployable.joinpath("adapter_model.bin").is_file()
+    assert deployable.joinpath("base_model_provenance.json").is_file()
+    assert stage.joinpath("base_model_provenance.json").is_file()
     assert not deployable.joinpath("_actor").exists()
 
 
