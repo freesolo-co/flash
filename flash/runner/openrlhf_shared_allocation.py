@@ -147,14 +147,22 @@ class SharedQueueAllocationBackend:
         persist_cleanup_handle: Callable[[dict], None],
         code_prefix: str | None = None,
         process_env: dict[str, str] | None = None,
+        worker_runtime_available: bool = False,
     ) -> None:
         self._persist_cleanup_handle = persist_cleanup_handle
         self._code_prefix = code_prefix
         self._process_env = dict(process_env or {})
+        self._worker_runtime_available = bool(worker_runtime_available)
 
     def allocate(self, request: SharedAllocationRequest) -> object:
+        if not self._worker_runtime_available:
+            raise SharedAllocationStateError(
+                "shared multi-run worker runtime is not yet available; live shared submission "
+                "is gated until the shared GPU runtime lands in PR9"
+            )
+
         from flash.envs.registry import worker_pip_for_env
-        from flash.providers._worker import chalk_extra_pip, weight_cache_env
+        from flash.providers._worker import chalk_extra_pip, upload_code, weight_cache_env
         from flash.providers.base import UnreconciledCreateError
         from flash.providers.runpod import api as queue_api
         from flash.providers.runpod.jobs import (
@@ -169,17 +177,16 @@ class SharedQueueAllocationBackend:
         execution_timeout_ms = (
             max(int(run.spec.gpu.max_wall_seconds) for run in request.runs) * 1000
         )
-        extra_pip: list[str] = []
-        seen_dependencies: set[str] = set()
+        dependency_sets: list[tuple[str, ...]] = []
         for run in request.runs:
             dependencies = list(run.spec.environment.pip) or worker_pip_for_env(
                 run.spec.environment.id
             )
             dependencies += chalk_extra_pip(run.spec)
-            for dependency in dependencies:
-                if dependency not in seen_dependencies:
-                    seen_dependencies.add(dependency)
-                    extra_pip.append(dependency)
+            dependency_sets.append(tuple(dependencies))
+        if any(dependencies != dependency_sets[0] for dependencies in dependency_sets[1:]):
+            raise ValueError("shared bundle runs require identical worker Python dependencies")
+        extra_pip = list(dependency_sets[0])
 
         env = {"FLASH_ARM": "runpod", **self._process_env}
         for key in ("HF_TOKEN", "GITHUB_TOKEN"):
@@ -188,6 +195,13 @@ class SharedQueueAllocationBackend:
         if seed_spec.gpu.network_volume:
             env.update(weight_cache_env())
 
+        code_prefix = self._code_prefix or flash_code_prefix()
+        if self._code_prefix is None:
+            upload_code(
+                seed_spec.train.hf_repo,
+                code_prefix=code_prefix,
+                deadline_at=request.deadline_at,
+            )
         payload = {
             "hf_repo": seed_spec.train.hf_repo,
             "job_spec_json": seed_spec.to_json(),
@@ -195,7 +209,7 @@ class SharedQueueAllocationBackend:
             "seed": seed_spec.seed,
             "env": env,
             "extra_pip": extra_pip,
-            "code_prefix": self._code_prefix or flash_code_prefix(),
+            "code_prefix": code_prefix,
             "deadline_at": request.deadline_at,
             "shared_bundle_manifest_json": json.dumps(
                 request.worker_manifest(), sort_keys=True, separators=(",", ":")
@@ -273,6 +287,14 @@ class SharedBundleAllocationSession:
         snapshots = bundle.run_snapshots()
         if not snapshots:
             raise ValueError("shared allocation requires at least one run")
+        specs = tuple(snapshot.spec for snapshot in snapshots)
+        wall_limits = {int(spec.gpu.max_wall_seconds) for spec in specs}
+        if len(wall_limits) != 1:
+            raise ValueError("shared bundle runs require identical wall-clock limits")
+        if any(spec.environment.secrets for spec in specs):
+            raise ValueError(
+                "shared bundle runtime-secret environments require isolated secret delivery from PR9"
+            )
         self._bundle = bundle
         self._backend = backend
         self._clock = clock

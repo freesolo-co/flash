@@ -11,6 +11,7 @@ from flash.providers.base import UnreconciledCreateError
 from flash.runner.openrlhf_shared_allocation import (
     SharedAllocationRequest,
     SharedAllocationState,
+    SharedAllocationStateError,
     SharedBundleAllocationSession,
     SharedQueueAllocationBackend,
     SharedRunAuthenticationError,
@@ -21,7 +22,7 @@ from flash.runner.openrlhf_shared_bundle import (
     LogicalRunStatus,
     SharedEngineBundle,
 )
-from flash.spec import GpuSpec, JobSpec, TrainSpec
+from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
 @dataclass(frozen=True)
@@ -53,11 +54,18 @@ class _Clock:
         self.value += seconds
 
 
-def _spec(run_id: str, *, algorithm: str = "grpo") -> JobSpec:
+def _spec(
+    run_id: str,
+    *,
+    algorithm: str = "grpo",
+    max_wall_seconds: int = 120,
+    environment: EnvironmentSpec | None = None,
+) -> JobSpec:
     return JobSpec(
         model="Qwen/Qwen3.5-9B",
         algorithm=algorithm,
         run_id=run_id,
+        environment=environment or EnvironmentSpec(),
         train=TrainSpec(
             lora_rank=64,
             lora_alpha=128,
@@ -66,7 +74,11 @@ def _spec(run_id: str, *, algorithm: str = "grpo") -> JobSpec:
             group_size=4,
             max_steps=2,
         ),
-        gpu=GpuSpec(type="H100", exact_type="H100", max_wall_seconds=120),
+        gpu=GpuSpec(
+            type="H100",
+            exact_type="H100",
+            max_wall_seconds=max_wall_seconds,
+        ),
     )
 
 
@@ -75,6 +87,15 @@ def _bundle(*run_ids: str) -> SharedEngineBundle:
     for index, run_id in enumerate(run_ids):
         algorithm = "opd" if index % 2 else "grpo"
         decision = bundle.try_admit(_spec(run_id, algorithm=algorithm))
+        assert decision.outcome is BundleAdmissionOutcome.ADMITTED
+    bundle.seal()
+    return bundle
+
+
+def _bundle_from_specs(*specs: JobSpec) -> SharedEngineBundle:
+    bundle = SharedEngineBundle("bundle-custom", specs[0])
+    for spec in specs:
+        decision = bundle.try_admit(spec)
         assert decision.outcome is BundleAdmissionOutcome.ADMITTED
     bundle.seal()
     return bundle
@@ -117,6 +138,57 @@ def test_one_sealed_bundle_creates_one_allocation_sized_for_admitted_runs():
     assert len(backend.requests) == 1
 
 
+def test_session_rejects_mixed_wall_limits_before_allocation():
+    bundle = _bundle_from_specs(
+        _spec("run-a", max_wall_seconds=60),
+        _spec("run-b", max_wall_seconds=120),
+    )
+
+    with pytest.raises(ValueError, match="identical wall-clock limits"):
+        SharedBundleAllocationSession(bundle, _FakeBackend())
+
+
+def test_session_rejects_runtime_secret_environments_until_isolated_delivery_lands():
+    bundle = _bundle_from_specs(
+        _spec(
+            "run-a",
+            environment=EnvironmentSpec(secrets=("PRIVATE_TOKEN",)),
+        )
+    )
+
+    with pytest.raises(ValueError, match="isolated secret delivery from PR9"):
+        SharedBundleAllocationSession(bundle, _FakeBackend())
+
+
+def test_queue_backend_fails_closed_until_shared_worker_runtime_lands():
+    session, _backend, _clock = _session("run-a")
+    backend = SharedQueueAllocationBackend(persist_cleanup_handle=lambda _handle: None)
+
+    with pytest.raises(SharedAllocationStateError, match="runtime is not yet available"):
+        backend.allocate(session.allocation_request())
+
+
+def test_queue_backend_rejects_conflicting_worker_dependencies():
+    bundle = _bundle_from_specs(
+        _spec("run-a", environment=EnvironmentSpec(pip=("package-a==1",))),
+        _spec("run-b", environment=EnvironmentSpec(pip=("package-a==2",))),
+    )
+    tokens = iter(("token-a", "token-b"))
+    session = SharedBundleAllocationSession(
+        bundle,
+        _FakeBackend(),
+        token_factory=lambda: next(tokens),
+    )
+    backend = SharedQueueAllocationBackend(
+        persist_cleanup_handle=lambda _handle: None,
+        code_prefix="code/0123456789abcdef0123456789abcdef/flash",
+        worker_runtime_available=True,
+    )
+
+    with pytest.raises(ValueError, match="identical worker Python dependencies"):
+        backend.allocate(session.allocation_request())
+
+
 def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch):
     session, _backend, _clock = _session("run-a", "run-b")
     request = session.allocation_request()
@@ -134,21 +206,33 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
         calls["teardown"] = (handle.to_dict(), bundle_id)
         return True
 
+    def upload(repo, *, code_prefix, deadline_at):
+        calls["upload"] = (repo, code_prefix, deadline_at)
+
     monkeypatch.setattr("flash.providers.runpod.jobs.deploy_train_endpoint", deploy)
     monkeypatch.setattr("flash.providers.runpod.jobs.build_function_input", lambda payload: payload)
     monkeypatch.setattr("flash.providers.runpod.api.submit_job", submit)
     monkeypatch.setattr("flash.envs.registry.worker_pip_for_env", lambda _env_id: ["env-dep"])
     monkeypatch.setattr("flash.providers._worker.chalk_extra_pip", lambda _spec: ["chalk-dep"])
+    monkeypatch.setattr("flash.providers._worker.upload_code", upload)
+    monkeypatch.setattr(
+        "flash.runner.flash_code_prefix",
+        lambda: "code/0123456789abcdef0123456789abcdef/flash",
+    )
     monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", teardown)
 
     backend = SharedQueueAllocationBackend(
         persist_cleanup_handle=lambda _handle: None,
-        code_prefix="code/0123456789abcdef0123456789abcdef/flash",
+        worker_runtime_available=True,
     )
     handle = backend.allocate(request)
     backend.release(handle, request.bundle_id)
 
-    assert set(calls) == {"deploy", "submit", "teardown"}
+    assert set(calls) == {"upload", "deploy", "submit", "teardown"}
+    upload_repo, upload_prefix, upload_deadline = calls["upload"]
+    assert upload_repo == request.seed_spec.train.hf_repo
+    assert upload_prefix == "code/0123456789abcdef0123456789abcdef/flash"
+    assert upload_deadline == request.deadline_at
     gpu_type, deploy_kwargs = calls["deploy"]
     assert gpu_type == "H100"
     assert deploy_kwargs["execution_timeout_ms"] == 120_000
@@ -199,6 +283,7 @@ def test_unconfirmed_submit_failure_persists_exact_cleanup_handle(monkeypatch):
     backend = SharedQueueAllocationBackend(
         persist_cleanup_handle=lambda handle: cleanup_handles.append(handle),
         code_prefix="code/0123456789abcdef0123456789abcdef/flash",
+        worker_runtime_available=True,
     )
 
     with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
