@@ -1103,6 +1103,16 @@ def test_sitecustomize_sets_unique_reproducible_seed_on_each_rollout_request():
     assert not hasattr(original_params, "seed")
 
 
+class _ReadOnlyStopSamplingParams:
+    def __init__(self, **values):
+        self.__dict__.update(values)
+        self._all_stop_token_ids = set()
+
+    @property
+    def all_stop_token_ids(self):
+        return self._all_stop_token_ids
+
+
 def _termination_hook_namespace(*, execute, stop_sequences=("</answer>",), eos_token_ids=(99,)):
     tree = ast.parse(grpo_openrlhf._sitecustomize_source())
     names = {
@@ -1190,7 +1200,7 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
         }
 
     namespace = _termination_hook_namespace(execute=execute)
-    original_params = SimpleNamespace(logprobs=1)
+    original_params = _ReadOnlyStopSamplingParams(logprobs=1)
     output = asyncio.run(
         namespace["_flash_execute"](
             SimpleNamespace(),
@@ -1268,7 +1278,7 @@ def test_sitecustomize_trims_the_reported_trailing_stop_not_an_earlier_match():
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=1),
+            _ReadOnlyStopSamplingParams(logprobs=1),
             32,
             _Tokenizer(),
             _Engine(),
@@ -1330,7 +1340,7 @@ def test_sitecustomize_prefers_longest_overlapping_trailing_stop():
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=1),
+            _ReadOnlyStopSamplingParams(logprobs=1),
             32,
             _Tokenizer(),
             _Engine(),
@@ -1392,7 +1402,7 @@ def test_sitecustomize_trims_special_token_stop_from_raw_decode():
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=1),
+            _ReadOnlyStopSamplingParams(logprobs=1),
             32,
             _Tokenizer(),
             _Engine(),
@@ -1451,7 +1461,7 @@ def test_sitecustomize_preserves_native_output_when_no_stop_is_trimmed():
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=1),
+            _ReadOnlyStopSamplingParams(logprobs=1),
             32,
             _Tokenizer(),
             _Engine(),
@@ -1516,7 +1526,7 @@ def test_sitecustomize_masks_and_neutralizes_stop_only_completion():
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=1),
+            _ReadOnlyStopSamplingParams(logprobs=1),
             32,
             _Tokenizer(),
             _Engine(),
@@ -1591,7 +1601,7 @@ def test_sitecustomize_preserves_and_maps_native_termination(
             SimpleNamespace(),
             "prompt",
             0,
-            SimpleNamespace(logprobs=None),
+            _ReadOnlyStopSamplingParams(logprobs=None),
             32,
             _Tokenizer(),
             _Engine(),
