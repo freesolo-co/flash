@@ -372,64 +372,34 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
         )
 
-    exact_type_raw = gpu_raw.get("exact_type", "")
-    if not isinstance(exact_type_raw, str):
-        raise ConfigError("gpu.exact_type must be a string")
-    exact_type = ""
-    if exact_type_raw.strip():
+    gpu_type_raw = gpu_raw.get("type", "")
+    if not isinstance(gpu_type_raw, str):
+        raise ConfigError("gpu.type must be a string")
+    gpu_type = ""
+    if gpu_type_raw.strip():
         try:
-            exact_type = canonical_gpu(exact_type_raw)
+            gpu_type = canonical_gpu(gpu_type_raw)
         except UnsupportedGpuError as exc:
-            raise ConfigError(f"gpu.exact_type: {exc}") from exc
-        exact_info = GPU_INFO.get(exact_type)
-        if exact_info is None or not exact_info.validated:
+            raise ConfigError(f"gpu.type: {exc}") from exc
+        gpu_info = GPU_INFO.get(gpu_type)
+        if gpu_info is None or not gpu_info.validated:
             raise ConfigError(
-                f"gpu.exact_type {exact_type!r} must name an active validated GPU class"
+                f"gpu.type {gpu_type!r} must name an active validated GPU class"
             )
-        if gpu_provider and gpu_provider not in providers_for(exact_type):
+        if gpu_provider and gpu_provider not in providers_for(gpu_type):
             raise ConfigError(
-                f"gpu.provider {gpu_provider!r} cannot provision gpu.exact_type {exact_type!r}"
+                f"gpu.provider {gpu_provider!r} cannot provision gpu.type {gpu_type!r}"
             )
 
     try:
-        # offline sizing/display only; allocator re-resolves at submit time.
-        gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
-        # the note deliberately does not name a concrete "selected" class: gpu_type is only the
-        # offline RunPod-static sizing estimate, while the submit-time allocator re-resolves the
-        # cheapest fitting class across all live providers (so it can differ even with no provider
-        # pinned). it is also scoped to provider-agnostic runs, since under a [gpu] provider pin the
-        # exact_type it suggests might not be provisionable there.
-        if "type" in gpu_raw and not exact_type and not gpu_provider:
-            authored_type_raw = gpu_raw["type"]
-            # only an active validated class is a usable exact_type pin; an unrecognized string must
-            # not be echoed back as an exact_type, since the exact_type validation above would then
-            # reject the very config the note suggested.
-            pinnable: str | None = None
-            if isinstance(authored_type_raw, str):
-                try:
-                    canonical = canonical_gpu(authored_type_raw)
-                except UnsupportedGpuError:
-                    canonical = None
-                info = GPU_INFO.get(canonical) if canonical else None
-                if info is not None and info.validated:
-                    pinnable = canonical
-            if pinnable is None:
-                print(
-                    f"note: [gpu] type={authored_type_raw!r} is not an active GPU class and was "
-                    "ignored; the allocator automatically picks the cheapest validated class "
-                    "that fits at submit time. run `flash gpus` to list valid classes; to pin "
-                    'one, add exact_type = "<CLASS>" to your [gpu] section.',
-                    file=sys.stderr,
-                )
-            elif pinnable != gpu_type:
-                print(
-                    f"note: [gpu] type={authored_type_raw!r} is a non-pinning hint and was not "
-                    "applied; the allocator automatically picks the cheapest validated class "
-                    "that fits at submit time. to require a specific class, add "
-                    f'exact_type = "{pinnable}" to your [gpu] section.',
-                    file=sys.stderr,
-                )
-        if exact_type and not model_revision:
+        # offline sizing/display only; allocator re-resolves auto runs at submit time.
+        provisional_type = provisional_gpu(
+            model,
+            algorithm=algorithm,
+            train=train_raw,
+            thinking=thinking,
+        )
+        if gpu_type and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
             required_vram = required_vram_gb(
@@ -438,15 +408,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                 train=train_raw,
                 thinking=thinking,
             )
-            if get_gpu_info(exact_type).vram_gb < required_vram:
+            if get_gpu_info(gpu_type).vram_gb < required_vram:
                 raise ConfigError(
-                    f"gpu.exact_type {exact_type!r} has {get_gpu_info(exact_type).vram_gb} GB VRAM, "
+                    f"gpu.type {gpu_type!r} has {get_gpu_info(gpu_type).vram_gb} GB VRAM, "
                     f"but this run requires at least {required_vram} GB"
                 )
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=exact_type or gpu_type)
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type or provisional_type)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -536,7 +506,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         gpu=GpuSpec(
             type=gpu_type,
             provider=gpu_provider,
-            exact_type=exact_type,
             **gpu_options,
         ),
         run_id=run_id or "local",  # server-assigned at create_run; never user-set
@@ -620,21 +589,20 @@ _ALGO_VALIDATORS = {"sft": _validate_sft, "grpo": _validate_grpo, "opd": _valida
 
 
 def _validate_spec(spec: JobSpec) -> None:
-    try:
-        canonical_gpu(spec.gpu.type)
-    except UnsupportedGpuError as exc:
-        raise ConfigError(str(exc)) from exc
+    if spec.gpu.type:
+        try:
+            canonical_gpu(spec.gpu.type)
+        except UnsupportedGpuError as exc:
+            raise ConfigError(str(exc)) from exc
+        gpu_info = GPU_INFO.get(spec.gpu.type)
+        if gpu_info is None or not gpu_info.validated:
+            raise ConfigError("gpu.type must name an active validated GPU class")
+        if spec.gpu.provider and spec.gpu.provider not in providers_for(spec.gpu.type):
+            raise ConfigError(
+                f"gpu.provider {spec.gpu.provider!r} cannot provision gpu.type {spec.gpu.type!r}"
+            )
     if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
         raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")
-    if spec.gpu.exact_type:
-        exact = GPU_INFO.get(spec.gpu.exact_type)
-        if exact is None or not exact.validated:
-            raise ConfigError("gpu.exact_type must name an active validated GPU class")
-        if spec.gpu.provider and spec.gpu.provider not in providers_for(spec.gpu.exact_type):
-            raise ConfigError(
-                f"gpu.provider {spec.gpu.provider!r} cannot provision "
-                f"gpu.exact_type {spec.gpu.exact_type!r}"
-            )
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)

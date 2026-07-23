@@ -27,7 +27,7 @@ BASE_RAW = {
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
     "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
-    "gpu": {"type": "RTX 4090"},
+    "gpu": {},
 }
 
 
@@ -469,11 +469,11 @@ def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
         assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
 
     authored_raw = _raw(**{"gpu.max_retries": 7.0, "gpu.max_wall_seconds": 1234.0})
-    authored_raw["gpu"].update({"type": "not-a-real-gpu", "disk_gb": 999})
+    authored_raw["gpu"].update({"type": "H100", "disk_gb": 999})
     authored = spec_from_dict(authored_raw)
     assert authored.gpu.max_retries == 7
     assert authored.gpu.max_wall_seconds == 1234
-    assert authored.gpu.type == spec_from_dict(_raw()).gpu.type
+    assert authored.gpu.type == "H100"
     assert authored.gpu.disk_gb == defaults.disk_gb
     assert spec_from_dict(_raw(**{"gpu.max_retries": 0})).gpu.max_retries == 0
 
@@ -663,7 +663,7 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
                 "gpu.max_retries": 0,
                 "gpu.max_wall_seconds": 60,
                 "gpu.provider": " RunPod ",
-                "gpu.exact_type": "rtx-4090",
+                "gpu.type": "rtx-4090",
             }
         ),
         run_id="gpu-rt",
@@ -672,28 +672,28 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     assert payload["gpu"]["max_retries"] == 0
     assert payload["gpu"]["max_wall_seconds"] == 60
     assert payload["gpu"]["provider"] == "runpod"
-    assert payload["gpu"]["exact_type"] == "RTX 4090"
+    assert payload["gpu"]["type"] == "RTX 4090"
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.max_retries == 0
     assert reparsed.gpu.max_wall_seconds == 60
     assert reparsed.gpu.provider == "runpod"
-    assert reparsed.gpu.exact_type == "RTX 4090"
+    assert reparsed.gpu.type == "RTX 4090"
     assert reparsed.gpu.type == spec.gpu.type
 
 
 def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
     with pytest.raises(ConfigError, match=r"gpu\.provider"):
         spec_from_dict(_raw(**{"gpu.provider": "aws"}))
-    with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
-        spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
+    with pytest.raises(ConfigError, match=r"gpu\.type"):
+        spec_from_dict(_raw(**{"gpu.type": "Tesla T4"}))
     with pytest.raises(ConfigError, match=r"unsupported gpu 'RTX A6000'"):
-        spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
+        spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
     with pytest.raises(ConfigError, match="requires at least"):
         spec_from_dict(
             _raw(
                 model="Qwen/Qwen3.5-9B",
-                **{"gpu.exact_type": "RTX 4090"},
+                **{"gpu.type": "RTX 4090"},
             )
         )
     with pytest.raises(ConfigError, match="cannot provision"):
@@ -701,66 +701,33 @@ def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> No
             _raw(
                 **{
                     "gpu.provider": "lambda",
-                    "gpu.exact_type": "RTX 4090",
+                    "gpu.type": "RTX 4090",
                 }
             )
         )
 
 
-def test_gpu_type_is_non_pinning_managed_input() -> None:
-    baseline = spec_from_dict(_raw())
-    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    assert authored.gpu.type == baseline.gpu.type
-    assert authored.gpu.exact_type == ""
-
-
-def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
-    spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    warning = capsys.readouterr().err
-    assert "[gpu] type='B200' is a non-pinning hint and was not applied" in warning
-    # the provisional is an offline RunPod-static estimate, not the final pick, so the note must not
-    # label any class "selected"; the submit-time allocator re-resolves across live providers.
-    assert "picks the cheapest validated class that fits at submit time" in warning
-    assert "selected" not in warning
-    # the suggested pin must paste into the user's existing [gpu] table as-is: a bare
-    # `exact_type = "..."` key, never the `[gpu] exact_type=...` one-line header form (invalid TOML)
-    # nor a dotted `gpu.exact_type` (which nests to gpu.gpu.exact_type when written inside [gpu]).
-    assert 'add exact_type = "B200" to your [gpu] section.' in warning
-    assert "[gpu] exact_type" not in warning
-    assert "gpu.exact_type" not in warning
-
-    spec_from_dict(_raw(**{"gpu.type": "H10O"}))
-    invalid_warning = capsys.readouterr().err
-    assert "[gpu] type='H10O' is not an active GPU class and was ignored" in invalid_warning
-    assert "`flash gpus` to list valid classes" in invalid_warning
-    assert 'add exact_type = "H10O"' not in invalid_warning
-
-    # an unrecognized type hint (e.g. a removed/retired class name) must be treated like any unknown
-    # string and never echoed back as an exact_type the schema would immediately reject.
-    spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
-    retired_warning = capsys.readouterr().err
-    assert "[gpu] type='RTX A6000' is not an active GPU class and was ignored" in retired_warning
-    assert 'add exact_type = "RTX A6000"' not in retired_warning
-
+def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
     automatic_raw = _raw()
-    automatic_raw["gpu"].pop("type")
-    spec_from_dict(automatic_raw)
+    automatic_raw["gpu"].pop("type", None)
+
+    automatic = spec_from_dict(automatic_raw)
+    pinned = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+
+    assert automatic.gpu.type == ""
+    assert pinned.gpu.type == "B200"
     assert capsys.readouterr().err == ""
 
-    selected = spec_from_dict(automatic_raw).gpu.type
-    capsys.readouterr()
-    spec_from_dict(_raw(**{"gpu.type": selected}))
-    assert capsys.readouterr().err == ""
 
+def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
+    removed_key = "exact" + "_type"
+    raw = _raw()
+    raw["gpu"][removed_key] = "H100"
 
-def test_gpu_type_override_warning_suppressed_for_provider_pinned_runs(capsys) -> None:
-    # without a provider pin, an authored non-pinning type fires the clarity note...
-    spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    assert "non-pinning hint" in capsys.readouterr().err
-    # ...but the note is scoped to provider-agnostic runs (under a provider pin the exact_type it
-    # would suggest might not be provisionable there), so pinning a provider suppresses it.
-    spec_from_dict(_raw(**{"gpu.type": "B200", "gpu.provider": "lambda"}))
-    assert capsys.readouterr().err == ""
+    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key"):
+        spec_from_dict(raw)
+    with pytest.raises(ValueError, match=r"gpu has unknown key"):
+        JobSpec.from_dict({"gpu": {removed_key: "H100"}})
 
 
 def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
@@ -800,16 +767,16 @@ def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
         JobSpec.from_dict({"gpu": {"exact_typ": "H100"}})
     with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
         JobSpec.from_dict({"gpu": {"provider": 1}})
-    with pytest.raises(TypeError, match=r"gpu\.exact_type must be a string"):
-        JobSpec.from_dict({"gpu": {"exact_type": 1}})
+    with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
+        JobSpec.from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match="cannot provision"):
-        JobSpec.from_dict({"gpu": {"provider": "lambda", "exact_type": "RTX 4090"}})
+        JobSpec.from_dict({"gpu": {"provider": "lambda", "type": "RTX 4090"}})
 
-    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "exact_type": "h100"}})
+    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "type": "h100"}})
     assert restored.gpu.provider == "lambda"
-    assert restored.gpu.exact_type == "H100"
+    assert restored.gpu.type == "H100"
     assert JobSpec.from_dict({}).gpu.provider == ""
-    assert JobSpec.from_dict({}).gpu.exact_type == ""
+    assert JobSpec.from_dict({}).gpu.type == ""
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:

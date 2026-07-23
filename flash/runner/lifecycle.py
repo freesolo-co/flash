@@ -725,7 +725,7 @@ def _submit_seed_supervised(
                 # the remaining run-global wall cap, so retries cannot reset the duration budget.
                 max_wall_seconds=float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
                 provider=getattr(attempt_spec.gpu, "provider", ""),
-                exact_type=getattr(attempt_spec.gpu, "exact_type", ""),
+                gpu_type=getattr(attempt_spec.gpu, "type", ""),
                 model_revision=attempt_spec.model_revision,
             )
         except Exception as exc:

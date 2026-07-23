@@ -611,7 +611,7 @@ def run_opd():
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+        gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
 

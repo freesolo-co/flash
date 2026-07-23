@@ -172,7 +172,7 @@ def test_allocate_rejects_unconfigured_provider(monkeypatch):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
 
 
-def test_allocate_exact_type_never_widens_or_escalates(monkeypatch):
+def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate
 
@@ -195,14 +195,14 @@ def test_allocate_exact_type_never_widens_or_escalates(monkeypatch):
     allocation = allocator.allocate(
         "Qwen/Qwen3.5-0.8B",
         "grpo",
-        exact_type="h100",
+        gpu_type="h100",
     )
 
     assert allocation.gpu == "H100"
     assert {candidate.gpu for candidate in allocation.candidates} == {"H100"}
 
 
-def test_allocate_exact_type_enforces_vram_and_provider_support(monkeypatch):
+def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
@@ -212,7 +212,7 @@ def test_allocate_exact_type_enforces_vram_and_provider_support(monkeypatch):
         allocator.allocate(
             "Qwen/Qwen3.5-9B",
             "grpo",
-            exact_type="RTX 4090",
+            gpu_type="RTX 4090",
         )
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     with pytest.raises(UnsupportedGpuError, match="cannot provision"):
@@ -220,7 +220,7 @@ def test_allocate_exact_type_enforces_vram_and_provider_support(monkeypatch):
             "Qwen/Qwen3.5-0.8B",
             "grpo",
             provider="lambda",
-            exact_type="RTX 4090",
+            gpu_type="RTX 4090",
         )
 
 
@@ -238,7 +238,7 @@ def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provide
             "Qwen/Qwen3.5-0.8B",
             "grpo",
             provider=provider,
-            exact_type="H100",
+            gpu_type="H100",
         )
 
 
@@ -255,11 +255,11 @@ def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
             "Qwen/Qwen3.5-0.8B",
             "grpo",
             provider="runpod",
-            exact_type="H100",
+            gpu_type="H100",
         )
 
 
-def test_allocate_exact_type_ignores_ineligible_provider_blip(monkeypatch):
+def test_allocate_gpu_type_ignores_ineligible_provider_blip(monkeypatch):
     from flash.providers import allocator, get_provider
     from flash.providers.base import CapacityLookupError, UnsupportedGpuError
 
@@ -282,7 +282,7 @@ def test_allocate_exact_type_ignores_ineligible_provider_blip(monkeypatch):
         allocator.allocate(
             "Qwen/Qwen3.5-0.8B",
             "grpo",
-            exact_type="H200",
+            gpu_type="H200",
         )
 
     assert not isinstance(exc_info.value, CapacityLookupError)
@@ -742,7 +742,7 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, la
             "algorithm": "opd",
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": dict(train),
-            "gpu": {"type": "RTX 5090"},
+            "gpu": {},
         },
         run_id=f"opd-sweep-{label}",
     )
@@ -750,7 +750,7 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(monkeypatch, la
     assert preview_gpu == expected_gpu
     assert alloc.gpu == expected_gpu
     assert estimate.gpu == expected_gpu
-    assert spec.gpu.type == expected_gpu
+    assert spec.gpu.type == ""
     assert alloc.min_vram_gb == need
     assert estimate.required_vram_gb == need
     assert get_gpu_info(expected_gpu).vram_gb >= need
@@ -819,11 +819,11 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
         providers_for,
         provisional_gpu,
     )
-    from flash.schema import spec_from_dict
+    from flash.schema import ConfigError, spec_from_dict
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     max_managed_vram = max(g.vram_gb for g in GPU_INFO.values() if g.validated)
-    configured_gpu_types = tuple(GPU_INFO)
+    configured_gpu_types = tuple(name for name, gpu_info in GPU_INFO.items() if gpu_info.validated)
     configs = {
         # Matches the failed continuation shape from the OPD/vLLM RTX 5090 report.
         "observed_2b_128tok_r32": {
@@ -914,19 +914,22 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             assert estimate.gpu_vram_gb >= need, (model_id, label, estimate.gpu, need)
 
             for configured_gpu in configured_gpu_types:
-                spec = spec_from_dict(
-                    {
-                        "model": model_id,
-                        "algorithm": "opd",
-                        "environment": {
-                            "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
-                        },
-                        "train": dict(train),
-                        "gpu": {"type": configured_gpu},
+                raw = {
+                    "model": model_id,
+                    "algorithm": "opd",
+                    "environment": {
+                        "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
                     },
-                    run_id="opd-matrix",
-                )
-                assert spec.gpu.type == preview_gpu, (model_id, label, configured_gpu, preview_gpu)
+                    "train": dict(train),
+                    "gpu": {"type": configured_gpu},
+                }
+                if get_gpu_info(configured_gpu).vram_gb < need:
+                    with pytest.raises(ConfigError, match="requires at least"):
+                        spec_from_dict(raw, run_id="opd-matrix")
+                    continue
+
+                spec = spec_from_dict(raw, run_id="opd-matrix")
+                assert spec.gpu.type == configured_gpu
                 assert providers_for(spec.gpu.type)
                 assert get_gpu_info(spec.gpu.type).vram_gb >= need
 
@@ -991,16 +994,15 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     assert {algo for _, algo in checked} == set(ALGORITHMS)
 
 
-def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(monkeypatch):
-    """Every model x algorithm x configured GPU class must still resolve through the no-pin policy
-    to a validated, provider-backed card with enough VRAM."""
+def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
+    """Every active validated GPU pin is preserved when it fits and rejected when it does not."""
     from flash.catalog import ALGORITHMS, MODELS
     from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, get_gpu_info, providers_for, provisional_gpu
-    from flash.schema import spec_from_dict
+    from flash.providers.base import GPU_INFO, get_gpu_info, providers_for
+    from flash.schema import ConfigError, spec_from_dict
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    configured_gpu_types = tuple(GPU_INFO)
+    configured_gpu_types = tuple(name for name, gpu_info in GPU_INFO.items() if gpu_info.validated)
     expected = {
         (model_id, algo, configured_gpu)
         for model_id, info in MODELS.items()
@@ -1009,6 +1011,7 @@ def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(mon
         for configured_gpu in configured_gpu_types
     }
     checked = set()
+    rejected = set()
 
     for model_id, info in MODELS.items():
         for algo in ALGORITHMS:
@@ -1016,31 +1019,35 @@ def test_catalog_model_algorithm_config_gpu_matrix_resolves_to_fitting_cards(mon
                 continue
             train = {"epochs": 1, "max_examples": 8}
             need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
-            expected_gpu = provisional_gpu(model_id, algo, train=train, thinking=False)
 
             for configured_gpu in configured_gpu_types:
-                spec = spec_from_dict(
-                    {
-                        "model": model_id,
-                        "algorithm": algo,
-                        "environment": {
-                            "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
-                        },
-                        "train": train,
-                        "gpu": {"type": configured_gpu},
+                raw = {
+                    "model": model_id,
+                    "algorithm": algo,
+                    "environment": {
+                        "id": "github:freesolo-co/envs@main:gsm8k/environment.py"
                     },
-                    run_id="matrix",
-                )
-                # gpu.type is compatibility input, not a pin. The schema resolves every spelling to
-                # the same cheapest fitting class that submit-time allocation will use.
-                assert spec.gpu.type == expected_gpu, (model_id, algo, configured_gpu, expected_gpu)
+                    "train": train,
+                    "gpu": {"type": configured_gpu},
+                }
+                key = (model_id, algo, configured_gpu)
+                if get_gpu_info(configured_gpu).vram_gb < need:
+                    with pytest.raises(ConfigError, match="requires at least"):
+                        spec_from_dict(raw, run_id="matrix")
+                    rejected.add(key)
+                    continue
+
+                spec = spec_from_dict(raw, run_id="matrix")
+                assert spec.gpu.type == configured_gpu
                 resolved_info = get_gpu_info(spec.gpu.type)
                 assert resolved_info.validated
                 assert providers_for(spec.gpu.type)
-                assert resolved_info.vram_gb >= need, (model_id, algo, configured_gpu, spec.gpu.type, need)
-                checked.add((model_id, algo, configured_gpu))
+                assert resolved_info.vram_gb >= need
+                checked.add(key)
 
-    assert checked == expected
+    assert checked | rejected == expected
+    assert checked
+    assert rejected
 
 
 def test_sft_big_vocab_logits_term_present_and_bounded():
