@@ -425,6 +425,64 @@ def test_scheduler_failure_blocks_duplicate_optimizer_update(tmp_path):
 
 
 @requires_torch
+@pytest.mark.parametrize("fail_first_step", [False, True])
+def test_scheduler_transition_state_is_prepared_before_advancing(
+    monkeypatch, tmp_path, fail_first_step
+):
+    class _GuardedScheduler:
+        def __init__(self):
+            self.failures = int(fail_first_step)
+            self.steps = 0
+
+        def step(self):
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("scheduler failed")
+            self.steps += 1
+
+        def state_dict(self):
+            return {"steps": self.steps}
+
+        def load_state_dict(self, state):
+            self.steps = state["steps"]
+
+    async def scenario():
+        scheduler = _GuardedScheduler()
+        actor, _load_count, _rollout_manager = _build_actor(tmp_path, capacity=1)
+        state = await actor.register_run(
+            "run-a",
+            optimizer_config=RunOptimizerConfig(learning_rate=0.1),
+            dataloader=["run-a-prompt"],
+            lora_config=object(),
+            scheduler_factory=lambda _optimizer: scheduler,
+        )
+        original_pending = shared_training._PendingAdapterPublication
+
+        def guarded_pending(*args, **kwargs):
+            if (
+                scheduler.steps > 0
+                and kwargs.get("adapter_dir") is None
+                and kwargs.get("scheduler_step_pending") is False
+            ):
+                raise AssertionError("scheduler transition state was prepared too late")
+            return original_pending(*args, **kwargs)
+
+        monkeypatch.setattr(shared_training, "_PendingAdapterPublication", guarded_pending)
+        if fail_first_step:
+            with pytest.raises(RuntimeError, match="scheduler failed"):
+                await actor.step("run-a", _loss_for(1.0))
+            handle = await actor.publish_pending_adapter("run-a")
+        else:
+            handle = (await actor.step("run-a", _loss_for(1.0))).handle
+
+        assert handle.version == 1
+        assert scheduler.steps == 1
+        assert state.pending_publication is None
+
+    asyncio.run(scenario())
+
+
+@requires_torch
 def test_cancelled_step_publication_returns_committed_result(tmp_path):
     async def scenario():
         rollout_engine = _FakeRolloutEngine()

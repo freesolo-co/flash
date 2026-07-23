@@ -351,17 +351,18 @@ class SharedMultiLoRATrainingActor:
                     scheduler_step_pending=True,
                 )
                 state.pending_publication = pending
-                try:
-                    state.lr_scheduler.step()
-                except BaseException:
-                    state.lr_scheduler.load_state_dict(scheduler_state)
-                    raise
-                state.pending_publication = _PendingAdapterPublication(
+                scheduler_advanced = _PendingAdapterPublication(
                     adapter_dir=pending.adapter_dir,
                     target_version=pending.target_version,
                     target_global_step=pending.target_global_step,
                     scheduler_step_pending=False,
                 )
+                try:
+                    state.lr_scheduler.step()
+                except BaseException:
+                    state.lr_scheduler.load_state_dict(scheduler_state)
+                    raise
+                state.pending_publication = scheduler_advanced
             finally:
                 optimizer.zero_grad(set_to_none=True)
                 self._clear_all_gradients()
@@ -531,17 +532,18 @@ class SharedMultiLoRATrainingActor:
             )
         if pending.scheduler_step_pending:
             scheduler_state = copy.deepcopy(state.lr_scheduler.state_dict())
-            try:
-                state.lr_scheduler.step()
-            except BaseException:
-                state.lr_scheduler.load_state_dict(scheduler_state)
-                raise
-            pending = _PendingAdapterPublication(
+            scheduler_advanced = _PendingAdapterPublication(
                 adapter_dir=pending.adapter_dir,
                 target_version=pending.target_version,
                 target_global_step=pending.target_global_step,
                 scheduler_step_pending=False,
             )
+            try:
+                state.lr_scheduler.step()
+            except BaseException:
+                state.lr_scheduler.load_state_dict(scheduler_state)
+                raise
+            pending = scheduler_advanced
             state.pending_publication = pending
         if pending.adapter_dir is None:
             adapter_dir = self._export_version(
