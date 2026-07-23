@@ -12,9 +12,14 @@ from enum import StrEnum
 
 from flash.catalog import ModelInfo, get_model, supports_image_training
 from flash.engine.recipe import RECIPE
-from flash.engine.vram import grpo_rollout_seq_len, opd_rollout_seq_len
+from flash.engine.vram import (
+    estimate_vram_gb,
+    grpo_rollout_seq_len,
+    opd_completion_len,
+    opd_rollout_seq_len,
+)
 from flash.providers.base import get_gpu_info, supports_fp8_kv
-from flash.spec import JobSpec
+from flash.spec import DEFAULT_CREDIT_ASSIGNMENT, JobSpec
 
 _TARGET_MODULES = ("all-linear",)
 _SUPPORTED_ALGORITHMS = frozenset({"grpo", "opd"})
@@ -77,6 +82,7 @@ class BundleCompatibilityKey:
     lora_geometry_identity: str
     reference_adapter_required: bool
     max_model_length: int
+    max_completion_tokens: int
     rollout_concurrency: int
     parameter_dtype: str
     kv_cache_dtype: str
@@ -119,6 +125,7 @@ class BundleCompatibilityKey:
             lora_geometry_identity=_lora_geometry_identity(spec),
             reference_adapter_required=_requires_reference_adapter(spec),
             max_model_length=max_model_length,
+            max_completion_tokens=_completion_budget(spec),
             rollout_concurrency=_rollout_concurrency(spec),
             parameter_dtype="bf16",
             kv_cache_dtype="fp8" if supports_fp8_kv(gpu_type) else "bf16",
@@ -226,6 +233,20 @@ def _rollout_context(spec: JobSpec) -> int:
     return grpo_rollout_seq_len(max_context, max_completion, spec.thinking)
 
 
+def _completion_budget(spec: JobSpec) -> int:
+    configured = spec.train.max_completion_tokens
+    if spec.algorithm == "opd":
+        return opd_completion_len(configured, spec.thinking)
+    return int(
+        configured
+        or (
+            RECIPE.rl.max_completion_len_thinking
+            if spec.thinking
+            else RECIPE.rl.max_completion_len
+        )
+    )
+
+
 def _rollout_concurrency(spec: JobSpec) -> int:
     if spec.algorithm == "opd":
         default_batch = RECIPE.opd.prompts_per_step
@@ -275,6 +296,22 @@ def _gib(byte_count: float) -> float:
     return float(byte_count) / float(1024**3)
 
 
+def _unsupported_openrlhf_reason(spec: JobSpec) -> str | None:
+    if spec.algorithm != "grpo":
+        return None
+    if spec.train.save_every is not None:
+        return "shared OpenRLHF GRPO does not support train.save_every"
+    if spec.train.stop_sequences:
+        return "shared OpenRLHF GRPO does not support train.stop_sequences"
+    if spec.train.structured_outputs:
+        return "shared OpenRLHF GRPO does not support train.structured_outputs"
+    if spec.train.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
+        return "shared OpenRLHF GRPO does not support per-turn credit assignment"
+    if float(RECIPE.lora.dropout) != 0.0:
+        return "shared OpenRLHF GRPO requires the managed zero LoRA dropout"
+    return None
+
+
 def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
     """estimate safe max-N before provider allocation or live GPU measurement."""
 
@@ -309,6 +346,9 @@ def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
 
     if spec.algorithm not in _SUPPORTED_ALGORITHMS:
         return _unsupported_estimate(spec, gpu.vram_gb, "shared bundles support only GRPO and OPD")
+    unsupported_reason = _unsupported_openrlhf_reason(spec)
+    if unsupported_reason is not None:
+        return _unsupported_estimate(spec, gpu.vram_gb, unsupported_reason)
     if int(spec.gpu.count) != 1:
         return _unsupported_estimate(
             spec,
@@ -338,6 +378,26 @@ def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
             gpu.vram_gb,
             "shared-resident one-GPU admission is limited to models at or below 10B before PR9",
         )
+    if spec.algorithm == "opd":
+        required_gib = estimate_vram_gb(
+            info.params_b,
+            "opd",
+            seq_len=_rollout_context(spec),
+            max_tokens=_completion_budget(spec),
+            lora_rank=int(spec.train.lora_rank),
+            batch_size=int(spec.train.batch_size or RECIPE.opd.prompts_per_step),
+            group_size=int(spec.train.group_size or RECIPE.opd.group_size),
+            thinking=bool(spec.thinking),
+            active_params_b=float(info.active_params_b or 0.0) or None,
+            fp8_kv=supports_fp8_kv(gpu_type),
+            model_info=info,
+        )
+        if required_gib > float(gpu.vram_gb):
+            return _unsupported_estimate(
+                spec,
+                gpu.vram_gb,
+                f"OpenRLHF OPD requires an estimated {required_gib:.1f} GiB on {gpu_type}",
+            )
 
     lora_parameters = _lora_parameter_count(info, spec.train.lora_rank)
     if lora_parameters <= 0:

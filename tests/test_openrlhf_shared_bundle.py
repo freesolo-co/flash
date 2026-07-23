@@ -27,6 +27,7 @@ def _spec(
     revision: str = _REVISION,
     rank: int = 64,
     max_context_tokens: int = 8192,
+    max_completion_tokens: int = 512,
     batch_size: int = 8,
     group_size: int = 4,
     kl_penalty_coef: float | None = None,
@@ -44,7 +45,7 @@ def _spec(
             lora_rank=rank,
             lora_alpha=rank * 2,
             max_context_tokens=max_context_tokens,
-            max_completion_tokens=512,
+            max_completion_tokens=max_completion_tokens,
             batch_size=batch_size,
             group_size=group_size,
             kl_penalty_coef=kl_penalty_coef,
@@ -60,7 +61,7 @@ def test_compatible_runs_share_one_bundle_and_geometry_mismatches_split():
     packer = SharedEngineBundlePacker(packing_delay_s=10)
 
     first = packer.offer(_spec("run-a"))
-    second = packer.offer(_spec("run-b", algorithm="opd"))
+    second = packer.offer(_spec("run-b"))
     different_base = packer.offer(_spec("run-c", model="Qwen/Qwen3.5-4B"))
     different_rank = packer.offer(_spec("run-d", rank=32))
     different_context = packer.offer(_spec("run-e", max_context_tokens=4096))
@@ -275,6 +276,37 @@ def test_rollout_concurrency_is_keyed_and_reduces_capacity():
     assert high_estimate.estimated_n == 1
 
 
+def test_completion_budget_is_part_of_compatibility():
+    short = BundleCompatibilityKey.from_job_spec(
+        _spec("short", max_context_tokens=8192, max_completion_tokens=256)
+    )
+    long = BundleCompatibilityKey.from_job_spec(
+        _spec("long", max_context_tokens=8192, max_completion_tokens=2048)
+    )
+
+    assert short.max_model_length == long.max_model_length
+    assert short.max_completion_tokens == 256
+    assert long.max_completion_tokens == 2048
+    assert short != long
+
+
+def test_opd_admission_reuses_existing_peak_vram_model():
+    estimate = estimate_bundle_admission(
+        _spec(
+            "opd-too-large",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="opd",
+            max_context_tokens=16384,
+            batch_size=8,
+            group_size=1,
+        )
+    )
+
+    assert estimate.estimated_n == 0
+    assert estimate.reason is not None
+    assert "OpenRLHF OPD requires an estimated" in estimate.reason
+
+
 def test_exact_model_revision_is_part_of_compatibility():
     first = BundleCompatibilityKey.from_job_spec(_spec("run-a", revision="1" * 40))
     second = BundleCompatibilityKey.from_job_spec(_spec("run-b", revision="2" * 40))
@@ -304,6 +336,28 @@ def test_direct_bundle_rejects_unsupported_algorithm():
     assert decision.outcome is BundleAdmissionOutcome.REJECTED
     assert decision.reason == "shared bundles support only GRPO and OPD"
     assert bundle.member_run_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("train_changes", "reason"),
+    [
+        ({"save_every": 10}, "train.save_every"),
+        ({"stop_sequences": ("</answer>",)}, "train.stop_sequences"),
+        ({"structured_outputs": '{"type":"json_object"}'}, "train.structured_outputs"),
+        ({"credit_assignment": "per_turn"}, "per-turn credit assignment"),
+    ],
+)
+def test_grpo_worker_deferred_options_are_rejected_during_admission(train_changes, reason):
+    packer = SharedEngineBundlePacker()
+    base = _spec("unsupported-grpo")
+    spec = replace(base, train=replace(base.train, **train_changes))
+
+    decision = packer.offer(spec)
+
+    assert decision.outcome is BundleAdmissionOutcome.REJECTED
+    assert decision.reason is not None
+    assert reason in decision.reason
+    assert packer.bundles == ()
 
 
 def test_unpinned_gpu_is_rejected_before_any_bundle_is_retained():
