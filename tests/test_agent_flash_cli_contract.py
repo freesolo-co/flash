@@ -104,7 +104,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
         "epochs = 1\n"
         "max_examples = 10\n"
         "[gpu]\n"
-        'type = "RTX 5090"\n'
+        ''
     )
 
     seen: dict = {}

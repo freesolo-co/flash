@@ -967,7 +967,7 @@ def prepare_job(
             preflight_train_context_within_serving(spec)
         except ValueError as exc:
             raise ServingPreflightError(str(exc)) from exc
-    if spec.gpu.provider or spec.gpu.exact_type:
+    if spec.gpu.provider or spec.gpu.type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for
 
@@ -978,15 +978,15 @@ def prepare_job(
                 raise ValueError(f"unknown gpu.provider {spec.gpu.provider!r}")
             if provider not in configured:
                 raise ValueError(f"requested gpu.provider {provider!r} is not configured")
-        elif not any(name in configured for name in providers_for(spec.gpu.exact_type)):
+        elif not any(name in configured for name in providers_for(spec.gpu.type)):
             raise ValueError(
-                f"no configured provider can provision gpu.exact_type {spec.gpu.exact_type!r}"
+                f"no configured provider can provision gpu.type {spec.gpu.type!r}"
             )
     info = resolve_model(
         spec.model,
         spec.algorithm,
         policy=spec.model_policy,
-        gpu=spec.gpu.exact_type or spec.gpu.type,
+        gpu=spec.gpu.type,
         model_revision=spec.model_revision,
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()

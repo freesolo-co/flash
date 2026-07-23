@@ -187,7 +187,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
         "train": {
             "epochs": 1,
             "max_examples": 10,
@@ -253,7 +253,7 @@ def _spec_raw(ref: str) -> dict:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
         "train": {"epochs": 1, "max_examples": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
     }
 
@@ -325,7 +325,7 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
         "train": {
             "epochs": 1,
             "max_examples": 10,
@@ -367,7 +367,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
         "train": {
             "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
@@ -609,7 +609,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
     }
     bad_cases = [
         {"batch_size": 0},  # must be >= 1
@@ -679,7 +679,7 @@ def test_epochs_reject_non_integer_at_parse() -> None:
         "algorithm": "sft",
         "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "gpu": {"type": "cheapest"},
+        "gpu": {},
     }
     for bad in ({"epochs": 2.5}, {"epochs": -1}):
         with pytest.raises(ConfigError):

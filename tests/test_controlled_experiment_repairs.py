@@ -76,13 +76,13 @@ def test_schema_defers_exact_vram_rejection_for_authored_revision(monkeypatch):
 
     raw = _minimal_spec_dict()
     raw.update(model="Qwen/Qwen3.5-9B", model_revision="refs/pr/123")
-    raw["gpu"] = {"exact_type": "RTX 4090"}
+    raw["gpu"] = {"type": "RTX 4090"}
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("revision-authored parse must defer exact sizing")
 
     monkeypatch.setattr(allocator, "required_vram_gb", fail_if_called)
-    assert spec_from_dict(raw).gpu.exact_type == "RTX 4090"
+    assert spec_from_dict(raw).gpu.type == "RTX 4090"
 
     raw["model_revision"] = ""
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *args, **kwargs: 80)

@@ -836,7 +836,7 @@ def _supervised_walk(monkeypatch, failures):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
         assert orch.get_status("wc-walk").state == "done"
