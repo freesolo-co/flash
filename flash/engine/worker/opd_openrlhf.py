@@ -1120,6 +1120,19 @@ def _flash_output_embeddings(actor):
     return output_embeddings
 
 
+def _flash_logit_transforms(actor):
+    model = getattr(actor.model, "module", actor.model)
+    config = getattr(model, "config", None)
+    if config is None:
+        raise RuntimeError("OpenRLHF OPD chunked projection requires an accessible model config")
+    text_config = getattr(config, "text_config", None) or config
+    logit_scale = float(getattr(text_config, "logit_scale", 1.0))
+    final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
+    if final_logit_softcapping is not None:
+        final_logit_softcapping = float(final_logit_softcapping)
+    return logit_scale, final_logit_softcapping
+
+
 def _flash_zero3_managed_parameters(module):
     return [parameter for parameter in module.parameters() if hasattr(parameter, "ds_id")]
 
@@ -1202,6 +1215,8 @@ def _flash_chunked_token_logps(
     token_ids,
     *,
     temperature,
+    logit_scale=1.0,
+    final_logit_softcapping=None,
     chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE,
     zero3_active=None,
 ):
@@ -1216,6 +1231,11 @@ def _flash_chunked_token_logps(
 
     def _logps(hidden_chunk, ids_chunk):
         logits = lm_head(hidden_chunk).float()
+        if float(logit_scale) != 1.0:
+            logits.mul_(float(logit_scale))
+        if final_logit_softcapping is not None:
+            softcap = float(final_logit_softcapping)
+            logits = softcap * torch.tanh(logits / softcap)
         if float(temperature) != 1.0:
             logits.div_(float(temperature))
         return -torch.nn.functional.cross_entropy(logits, ids_chunk, reduction="none")
@@ -1228,7 +1248,7 @@ def _flash_chunked_token_logps(
     def checkpoint(function, *args):
         return torch_checkpoint(function, *args, use_reentrant=False)
 
-    if zero3_active:
+    if zero3_active and hidden_states.requires_grad:
 
         def checkpoint(function, *args):
             return torch_checkpoint(function, *args, use_reentrant=True)
@@ -1254,6 +1274,8 @@ def _flash_chunked_token_logps(
             hidden_states.device,
         )
         padded_count = synchronized_chunks * size
+        if not hidden_states.requires_grad:
+            padded_count = max(padded_count, 1)
         padding_count = padded_count - selected_count
         if padding_count:
             zero_hidden = (
@@ -1276,7 +1298,7 @@ def _flash_chunked_token_logps(
     for start in range(0, padded_count, size):
         hidden_chunk = hidden_states[start : start + size]
         ids_chunk = token_ids[start : start + size]
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() and (not zero3_active or hidden_chunk.requires_grad):
             chunks.append(
                 checkpoint(
                     _logps,
@@ -1301,11 +1323,14 @@ def _flash_chunked_action_log_probs(actor, sequences, action_mask, attention_mas
     hidden_states = hidden_states[:, :-1]
     target_ids = sequences[:, 1:]
     output_head = _flash_output_embeddings(actor)
+    logit_scale, final_logit_softcapping = _flash_logit_transforms(actor)
     flat_logps = _flash_chunked_token_logps(
         output_head,
         hidden_states[response_mask],
         target_ids[response_mask],
         temperature=actor.temperature,
+        logit_scale=logit_scale,
+        final_logit_softcapping=final_logit_softcapping,
         chunk_size=_FLASH_OPD_LOGIT_CHUNK_SIZE if chunk_size is None else chunk_size,
         zero3_active=zero3_output_head,
     )

@@ -1595,6 +1595,12 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
             self.embed = torch.nn.Embedding(13, 5)
             self.body = torch.nn.Linear(5, 5)
             self.lm_head = torch.nn.Linear(5, 13, bias=False)
+            self.config = SimpleNamespace(
+                text_config=SimpleNamespace(
+                    logit_scale=0.8,
+                    final_logit_softcapping=1.7,
+                )
+            )
 
         def get_input_embeddings(self):
             return self.embed
@@ -1667,6 +1673,8 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
 
     hidden_states = torch.tanh(reference_model.body(reference_model.embed(sequences)))
     full_logits = reference_model.lm_head(hidden_states[:, :-1]).float()
+    full_logits.mul_(0.8)
+    full_logits = 1.7 * torch.tanh(full_logits / 1.7)
     full_logits.div_(0.7)
     full_logps = -torch.nn.functional.cross_entropy(
         full_logits.flatten(0, 1),
@@ -1756,6 +1764,37 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     assert empty_zero3_logps.shape == (0,)
     assert empty_zero3_hidden.grad is not None
     assert zero3_model.lm_head.weight.grad is not None
+
+    checkpoint_count = [call[0] for call in zero3_calls].count("checkpoint")
+    head_only_head = torch.nn.Linear(5, 13, bias=False)
+    head_only_head.weight.ds_id = 2
+    head_only_logps = namespace["_flash_chunked_token_logps"](
+        head_only_head,
+        torch.randn(3, 5),
+        torch.tensor([1, 2, 3]),
+        temperature=0.7,
+        zero3_active=True,
+    )
+    head_only_logps.sum().backward()
+
+    assert head_only_logps.requires_grad
+    assert head_only_head.weight.grad is not None
+
+    empty_head_only_head = torch.nn.Linear(5, 13, bias=False)
+    empty_head_only_head.weight.ds_id = 3
+    empty_head_only_logps = namespace["_flash_chunked_token_logps"](
+        empty_head_only_head,
+        torch.empty((0, 5)),
+        torch.empty((0,), dtype=torch.long),
+        temperature=0.7,
+        zero3_active=True,
+    )
+    empty_head_only_logps.sum().backward()
+
+    assert empty_head_only_logps.requires_grad
+    assert empty_head_only_head.weight.grad is not None
+    assert torch.count_nonzero(empty_head_only_head.weight.grad).item() == 0
+    assert [call[0] for call in zero3_calls].count("checkpoint") == checkpoint_count
 
     import torch.utils.checkpoint as checkpoint_mod
 
