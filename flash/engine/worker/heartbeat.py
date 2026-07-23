@@ -59,7 +59,15 @@ LATEST_GRPO_METRICS_LAST: list = []
 # emits a REAL (non-liveness) heartbeat every scan tick — ~120/hr on a large split before model load —
 # so unthrottled the setup stages blow the cap; throttle them exactly like their sft_pretokenizing
 # analogue (codex[bot]). checkpoint_uploading keepalive re-emits every 30s too, so it MUST be throttled.
-_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
+_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset(
+    {
+        "rl_step",
+        "sft_step",
+        "opd_step",
+        "opd_openrlhf_training",
+        "opd_openrlhf_finalizing",
+    }
+)
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0

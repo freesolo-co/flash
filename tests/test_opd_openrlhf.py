@@ -150,6 +150,7 @@ def _config(**overrides) -> opd_openrlhf.OpenRLHFOPDConfig:
         "seed": 42,
         "lora_rank": 32,
         "lora_alpha": 64,
+        "lora_dropout": 0.0,
         "lora_target_modules": ("all-linear",),
         "kl_penalty_coef": 0.3,
         "save_every": 20,
@@ -1204,6 +1205,7 @@ def test_warmstart_config_preserves_source_lora_shape(tmp_path):
             {
                 "r": 16,
                 "lora_alpha": 32,
+                "lora_dropout": 0.15,
                 "target_modules": ["q_proj", "v_proj"],
             }
         ),
@@ -1213,6 +1215,7 @@ def test_warmstart_config_preserves_source_lora_shape(tmp_path):
     assert opd_openrlhf._warmstart_config(str(tmp_path), "Qwen/Qwen3.5-0.8B") == (
         16,
         32,
+        0.15,
         ("q_proj", "v_proj"),
     )
 
@@ -1266,10 +1269,17 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert "--train.full_determinism_enable" not in args
     assert _value(args, "--ds.lora.rank") == "32"
     assert _value(args, "--ds.lora.alpha") == "64"
+    assert _value(args, "--ds.lora.dropout") == "0.0"
     assert _value(args, "--ds.lora.target_modules") == "all-linear"
     assert "--actor.gradient_checkpointing_reentrant" in args
     assert _value(args, "--ds.attn_implementation") == "eager"
     assert "--train.colocate_all" in args
+
+
+def test_build_openrlhf_opd_args_honors_lora_dropout():
+    args = opd_openrlhf.build_openrlhf_opd_args(_config(lora_dropout=0.15))
+
+    assert _value(args, "--ds.lora.dropout") == "0.15"
 
 
 @pytest.mark.parametrize(

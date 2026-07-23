@@ -100,6 +100,7 @@ class OpenRLHFOPDConfig:
     seed: int
     lora_rank: int
     lora_alpha: int
+    lora_dropout: float
     lora_target_modules: tuple[str, ...]
     kl_penalty_coef: float
     save_every: int
@@ -633,7 +634,7 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         "--ds.lora.target_modules",
         *target_modules,
         "--ds.lora.dropout",
-        "0.0",
+        str(config.lora_dropout),
         "--ds.zero_stage",
         "3",
         "--ds.param_dtype",
@@ -1731,23 +1732,26 @@ def _generation_eos_from_cached_config(
     return _generation_eos_ids(model_like, tokenizer)
 
 
-def _warmstart_config(adapter_dir: str | None, model_id: str) -> tuple[int, int, tuple[str, ...]]:
+def _warmstart_config(
+    adapter_dir: str | None, model_id: str
+) -> tuple[int, int, float, tuple[str, ...]]:
     if not adapter_dir:
         lora = _w.make_lora(model_id)
         targets = lora.target_modules
         target_modules = (targets,) if isinstance(targets, str) else tuple(sorted(targets))
-        return int(lora.r), int(lora.lora_alpha), target_modules
+        return int(lora.r), int(lora.lora_alpha), float(lora.lora_dropout), target_modules
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as config_file:
         config = json.load(config_file)
     rank = int(config["r"])
     alpha = int(config["lora_alpha"])
+    dropout = float(config.get("lora_dropout", 0.0))
     targets = config.get("target_modules") or _OPENRLHF_TARGET_MODULES
     target_modules = (
         (targets,) if isinstance(targets, str) else tuple(str(item) for item in targets)
     )
-    if rank <= 0 or alpha <= 0 or not target_modules:
+    if rank <= 0 or alpha <= 0 or not 0.0 <= dropout < 1.0 or not target_modules:
         raise RuntimeError("OpenRLHF OPD warm-start adapter configuration is invalid")
-    return rank, alpha, target_modules
+    return rank, alpha, dropout, target_modules
 
 
 def _resolve_single_turn_inputs() -> dict[str, Any]:
@@ -1899,7 +1903,7 @@ def run_opd_openrlhf() -> None:
         warmstart_adapter = _download_adapter(_w.JOB_SPEC.train.init_from_adapter)
         if not warmstart_adapter:
             raise RuntimeError("OpenRLHF OPD warm-start adapter could not be materialized")
-    lora_rank, lora_alpha, target_modules = _warmstart_config(
+    lora_rank, lora_alpha, lora_dropout, target_modules = _warmstart_config(
         warmstart_adapter,
         inputs["model_id"],
     )
@@ -1974,6 +1978,7 @@ def run_opd_openrlhf() -> None:
             seed=inputs["seed"],
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
             lora_target_modules=target_modules,
             kl_penalty_coef=inputs["kl_penalty_coef"],
             save_every=inputs["save_every"],

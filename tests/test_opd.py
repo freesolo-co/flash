@@ -2801,6 +2801,13 @@ def test_opd_filtering_prompts_is_throttled_like_sft_pretokenizing():
     assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
 
 
+def test_openrlhf_opd_liveness_stages_are_throttled():
+    from flash.engine.worker.heartbeat import _HB_THROTTLED_STAGES
+
+    assert "opd_openrlhf_training" in _HB_THROTTLED_STAGES
+    assert "opd_openrlhf_finalizing" in _HB_THROTTLED_STAGES
+
+
 def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
     """Regression (codex[bot], heartbeat.py): the liveness thread emits stage=<stage> with NO step,
     and because it shares the opd_step upload-throttle slot it can win the slot and overwrite the
