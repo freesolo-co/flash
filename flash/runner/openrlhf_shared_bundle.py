@@ -297,14 +297,14 @@ def _gib(byte_count: float) -> float:
 
 
 def _unsupported_openrlhf_reason(spec: JobSpec) -> str | None:
+    if spec.train.structured_outputs:
+        return f"shared OpenRLHF {spec.algorithm.upper()} does not support train.structured_outputs"
     if spec.algorithm != "grpo":
         return None
     if spec.train.save_every is not None:
         return "shared OpenRLHF GRPO does not support train.save_every"
     if spec.train.stop_sequences:
         return "shared OpenRLHF GRPO does not support train.stop_sequences"
-    if spec.train.structured_outputs:
-        return "shared OpenRLHF GRPO does not support train.structured_outputs"
     if spec.train.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
         return "shared OpenRLHF GRPO does not support per-turn credit assignment"
     if float(RECIPE.lora.dropout) != 0.0:

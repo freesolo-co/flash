@@ -360,6 +360,21 @@ def test_grpo_worker_deferred_options_are_rejected_during_admission(train_change
     assert packer.bundles == ()
 
 
+def test_opd_structured_outputs_are_rejected_during_admission():
+    packer = SharedEngineBundlePacker()
+    base = _spec("unsupported-opd", algorithm="opd")
+    spec = replace(
+        base,
+        train=replace(base.train, structured_outputs='{"type":"json_object"}'),
+    )
+
+    decision = packer.offer(spec)
+
+    assert decision.outcome is BundleAdmissionOutcome.REJECTED
+    assert decision.reason == "shared OpenRLHF OPD does not support train.structured_outputs"
+    assert packer.bundles == ()
+
+
 def test_unpinned_gpu_is_rejected_before_any_bundle_is_retained():
     packer = SharedEngineBundlePacker()
     spec = replace(_spec("run-a"), gpu=GpuSpec(type="H100"))
