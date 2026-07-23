@@ -144,9 +144,11 @@ class SharedQueueAllocationBackend:
     def __init__(
         self,
         *,
+        persist_cleanup_handle: Callable[[dict], None],
         code_prefix: str | None = None,
         process_env: dict[str, str] | None = None,
     ) -> None:
+        self._persist_cleanup_handle = persist_cleanup_handle
         self._code_prefix = code_prefix
         self._process_env = dict(process_env or {})
 
@@ -205,6 +207,7 @@ class SharedQueueAllocationBackend:
             name_suffix=_run_suffix(request.bundle_id),
             disk_gb=max(int(run.spec.gpu.disk_gb) for run in request.runs),
             spec=seed_spec,
+            deadline_at=request.deadline_at,
         )
         submitted_at = time.time()
         try:
@@ -212,6 +215,7 @@ class SharedQueueAllocationBackend:
                 endpoint_id,
                 build_function_input(payload),
                 key_fingerprint=key_fingerprint,
+                deadline_at=request.deadline_at,
             )
         except Exception as exc:
             deletion_confirmed = False
@@ -221,6 +225,15 @@ class SharedQueueAllocationBackend:
                 )
             if deletion_confirmed:
                 raise
+            cleanup_handle = JobHandle(
+                endpoint_id=endpoint_id,
+                endpoint_name=endpoint_name,
+                key_fingerprint=key_fingerprint,
+                job_id=None,
+                attempt=0,
+                started_ts=submitted_at,
+            )
+            self._persist_cleanup_handle(cleanup_handle.to_dict())
             raise UnreconciledCreateError(
                 "shared queue submission could not be reconciled and endpoint deletion was unconfirmed"
             ) from exc
@@ -354,6 +367,8 @@ class SharedBundleAllocationSession:
 
     def allocate(self) -> object:
         with self._lock:
+            if self._drained:
+                raise SharedAllocationStateError("a drained shared bundle cannot be allocated")
             if self._allocation_state is not SharedAllocationState.NEW:
                 raise SharedAllocationStateError(
                     "shared bundle allocation may be created only once"
@@ -420,7 +435,13 @@ class SharedBundleAllocationSession:
                 return self._control_snapshot(normalized)
             if snapshot.status in _TERMINAL_RUN_STATUSES:
                 raise SharedAllocationStateError("a terminal logical run cannot fail again")
+            was_started = snapshot.status in {
+                LogicalRunStatus.ACTIVE,
+                LogicalRunStatus.FINISHING,
+            }
             self._bundle.transition_run(normalized, LogicalRunStatus.FAILED, error=error)
+            if was_started:
+                self._enqueue(normalized, SharedRunCommandKind.CANCEL)
             result = self._control_snapshot(normalized)
             self._release_if_terminal()
             return result
@@ -460,10 +481,11 @@ class SharedBundleAllocationSession:
         """cancel every remaining run and release the one allocation."""
 
         with self._lock:
-            self._drained = True
             if self._allocation_state is SharedAllocationState.RELEASED:
+                self._drained = True
                 return
             self._require_active_allocation()
+            self._drained = True
             for snapshot in self._bundle.run_snapshots():
                 if snapshot.status in _TERMINAL_RUN_STATUSES:
                     continue

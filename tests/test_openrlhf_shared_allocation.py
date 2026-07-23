@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from flash.providers.base import UnreconciledCreateError
 from flash.runner.openrlhf_shared_allocation import (
     SharedAllocationRequest,
     SharedAllocationState,
@@ -125,8 +126,8 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
         calls["deploy"] = (gpu_type, kwargs)
         return "endpoint-id", "endpoint-name", "rpk-0123456789ab"
 
-    def submit(endpoint_id, function_input, *, key_fingerprint):
-        calls["submit"] = (endpoint_id, function_input, key_fingerprint)
+    def submit(endpoint_id, function_input, *, key_fingerprint, deadline_at):
+        calls["submit"] = (endpoint_id, function_input, key_fingerprint, deadline_at)
         return "job-id"
 
     def teardown(handle, bundle_id):
@@ -141,7 +142,8 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
     monkeypatch.setattr("flash.runner.lifecycle._strict_teardown_handle", teardown)
 
     backend = SharedQueueAllocationBackend(
-        code_prefix="code/0123456789abcdef0123456789abcdef/flash"
+        persist_cleanup_handle=lambda _handle: None,
+        code_prefix="code/0123456789abcdef0123456789abcdef/flash",
     )
     handle = backend.allocate(request)
     backend.release(handle, request.bundle_id)
@@ -152,10 +154,12 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
     assert deploy_kwargs["execution_timeout_ms"] == 120_000
     assert deploy_kwargs["disk_gb"] == 60
     assert deploy_kwargs["spec"].run_id == "run-a"
+    assert deploy_kwargs["deadline_at"] == request.deadline_at
 
-    endpoint_id, payload, key_fingerprint = calls["submit"]
+    endpoint_id, payload, key_fingerprint, deadline_at = calls["submit"]
     assert endpoint_id == "endpoint-id"
     assert key_fingerprint == "rpk-0123456789ab"
+    assert deadline_at == request.deadline_at
     assert payload["phase"] == "shared"
     assert payload["extra_pip"] == ["env-dep", "chalk-dep"]
     manifest = json.loads(payload["shared_bundle_manifest_json"])
@@ -168,6 +172,44 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
     assert teardown_handle["endpoint_id"] == "endpoint-id"
     assert teardown_handle["job_id"] == "job-id"
     assert teardown_bundle_id == "bundle-one"
+
+
+def test_unconfirmed_submit_failure_persists_exact_cleanup_handle(monkeypatch):
+    session, _backend, _clock = _session("run-a")
+    request = session.allocation_request()
+    cleanup_handles: list[dict] = []
+
+    monkeypatch.setattr(
+        "flash.providers.runpod.jobs.deploy_train_endpoint",
+        lambda *_args, **_kwargs: ("endpoint-id", "endpoint-name", "rpk-0123456789ab"),
+    )
+
+    def fail_submit(*_args, **_kwargs):
+        raise RuntimeError("submit failed")
+
+    monkeypatch.setattr("flash.providers.runpod.jobs.build_function_input", lambda payload: payload)
+    monkeypatch.setattr("flash.providers.runpod.api.submit_job", fail_submit)
+    monkeypatch.setattr(
+        "flash.providers.runpod.api.delete_endpoint_for_fingerprint",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr("flash.envs.registry.worker_pip_for_env", lambda _env_id: [])
+    monkeypatch.setattr("flash.providers._worker.chalk_extra_pip", lambda _spec: [])
+
+    backend = SharedQueueAllocationBackend(
+        persist_cleanup_handle=lambda handle: cleanup_handles.append(handle),
+        code_prefix="code/0123456789abcdef0123456789abcdef/flash",
+    )
+
+    with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
+        backend.allocate(request)
+
+    assert len(cleanup_handles) == 1
+    assert cleanup_handles[0]["provider"] == "runpod"
+    assert cleanup_handles[0]["endpoint_id"] == "endpoint-id"
+    assert cleanup_handles[0]["endpoint_name"] == "endpoint-name"
+    assert cleanup_handles[0]["key_fingerprint"] == "rpk-0123456789ab"
+    assert "job_id" not in cleanup_handles[0]
 
 
 def test_cancel_isolated_to_authorized_run_and_frees_only_its_slot():
@@ -231,6 +273,9 @@ def test_allocation_releases_only_after_every_run_is_terminal():
     assert failed.status is LogicalRunStatus.FAILED
     assert failed.error == "reward bridge failed"
     assert session.status("run-b", capabilities["run-b"].token).status is LogicalRunStatus.ACTIVE
+    assert [
+        command.kind for command in session.poll_commands("run-a", capabilities["run-a"].token)
+    ] == [SharedRunCommandKind.START, SharedRunCommandKind.CANCEL]
     assert backend.releases == []
     assert session.available_slots == 1
 
@@ -243,6 +288,21 @@ def test_allocation_releases_only_after_every_run_is_terminal():
     assert session.allocation_state is SharedAllocationState.RELEASED
     assert session.available_slots == 3
     assert session.release_if_terminal() is False
+    assert backend.releases == [(handle, "bundle-one")]
+
+
+def test_drain_before_allocation_does_not_mutate_session_state():
+    session, backend, _clock = _session("run-a")
+
+    with pytest.raises(RuntimeError, match="allocation is not active"):
+        session.drain()
+
+    assert session.drained is False
+    assert session.allocation_state is SharedAllocationState.NEW
+    handle = session.allocate()
+    run_a = session.capability("run-a")
+    session.submit("run-a", run_a.token)
+    session.complete("run-a", run_a.token)
     assert backend.releases == [(handle, "bundle-one")]
 
 
