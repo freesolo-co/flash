@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import importlib.util
 import io
@@ -120,6 +121,7 @@ def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
         "_original_process_response": lambda *_args, **_kwargs: None,
+        "_flash_attention_context": contextlib.nullcontext,
     }
     exec(
         compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
@@ -154,7 +156,7 @@ def _config(**overrides) -> opd_openrlhf.OpenRLHFOPDConfig:
         "save_at_steps": (),
         "final_step": 3,
         "gpu_count": 2,
-        "qwen35_language_model_only": True,
+        "actor_attn_implementation": "eager",
     }
     values.update(overrides)
     return opd_openrlhf.OpenRLHFOPDConfig(**values)
@@ -1082,8 +1084,25 @@ def test_child_empty_window_advances_without_optimizer_update(monkeypatch):
     ]
 
 
+def test_child_empty_microbatch_keeps_loss_metric_keys(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    metrics, weights = namespace["_flash_loss_metrics"](0.0, 0.0, False)
+
+    assert metrics == {
+        "policy_loss": 0.0,
+        "distillation_loss": 0.0,
+        "teacher_coverage": 0.0,
+    }
+    assert weights == {
+        "policy_loss": None,
+        "distillation_loss": None,
+        "teacher_coverage": None,
+    }
+
+
 def test_child_actor_status_defaults_empty_signal_metrics(monkeypatch):
-    _, actor_trainer, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+    namespace, actor_trainer, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
     trainer = actor_trainer()
     trainer.original_actor_status = {"actor_lr": 1e-5}
 
@@ -1095,6 +1114,26 @@ def test_child_actor_status_defaults_empty_signal_metrics(monkeypatch):
         "distillation_loss": 0.0,
         "teacher_coverage": 0.0,
     }
+
+    def empty_status(*_args, **_kwargs):
+        raise ZeroDivisionError("empty sample aggregation")
+
+    namespace["_original_actor_ppo_train"] = empty_status
+    status = trainer.ppo_train(0.0)
+
+    assert status == {
+        "policy_loss": 0.0,
+        "distillation_loss": 0.0,
+        "teacher_coverage": 0.0,
+    }
+
+
+def test_child_checkpoint_ack_has_no_network_timeout(monkeypatch):
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
+
+    assert namespace["_flash_bridge_timeout"]({"checkpoint": 3}) is None
+    assert namespace["_flash_bridge_timeout"]({"mutation": True}) == 600
+    assert namespace["_flash_bridge_timeout"]({"metrics": {}}) == 600
 
 
 def test_child_bridge_retries_transport_then_exits_transient(monkeypatch):
@@ -1229,7 +1268,7 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert _value(args, "--ds.lora.alpha") == "64"
     assert _value(args, "--ds.lora.target_modules") == "all-linear"
     assert "--actor.gradient_checkpointing_reentrant" in args
-    assert "--ds.attn_implementation" in args
+    assert _value(args, "--ds.attn_implementation") == "eager"
     assert "--train.colocate_all" in args
 
 
@@ -1248,6 +1287,20 @@ def test_build_openrlhf_opd_args_rejects_invalid_actor_global_batch(
                 gpu_count=gpu_count,
             )
         )
+
+
+def test_opd_actor_attention_preserves_qwen_eager_and_forwards_blackwell(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opd_openrlhf,
+        "optimal_attn_impl",
+        lambda: calls.append(True) or "sdpa",
+    )
+
+    assert opd_openrlhf._resolve_opd_actor_attn(True) == "eager"
+    assert calls == []
+    assert opd_openrlhf._resolve_opd_actor_attn(False) == "sdpa"
+    assert calls == [True]
 
 
 def test_build_openrlhf_opd_args_enables_native_resume():
@@ -1286,6 +1339,7 @@ def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
         save_at_steps=(2,),
         final_step=3,
         warmstart_adapter="/work/warmstart",
+        actor_attn_implementation="sdpa",
     )
 
     assert child["PATH"] == "/usr/bin"
@@ -1297,6 +1351,7 @@ def test_child_env_excludes_fireworks_and_other_provider_secrets(monkeypatch):
     assert json.loads(child["FLASH_OPENRLHF_OPD_EOS_TOKEN_IDS"]) == [2, 3]
     assert json.loads(child["FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS"]) == [2]
     assert child["FLASH_OPENRLHF_OPD_FINAL_STEP"] == "3"
+    assert child["FLASH_OPENRLHF_ATTN_IMPLEMENTATION"] == "sdpa"
     assert "FIREWORKS_API_KEY" not in child
     assert "RUNPOD_API_KEY" not in child
     assert "HF_TOKEN" not in child
@@ -1485,6 +1540,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
         "_original_process_response": lambda *_args, **_kwargs: None,
+        "_flash_attention_context": contextlib.nullcontext,
     }
     exec(
         compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
@@ -1573,6 +1629,7 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
 
     compile(source, "sitecustomize.py", "exec")
     assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
+    assert source.count("with _flash_attention_context():") == 2
     assert "student_logprobs[row][group_mask].detach().sum()" in source
     assert "torch.stack(row_losses).mean()" in source
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source

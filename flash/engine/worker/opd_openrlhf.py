@@ -59,7 +59,12 @@ from flash.engine.worker.openrlhf_common import (
     resolve_openrlhf_python,
     run_openrlhf_training,
 )
-from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
+from flash.engine.worker.perf import (
+    gpu_diagnostics,
+    optimal_attn_impl,
+    setup_perf_backends,
+    wait_for_gpu,
+)
 from flash.engine.worker.rng import backend_seed
 from flash.engine.worker.teacher import TeacherError
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
@@ -101,7 +106,7 @@ class OpenRLHFOPDConfig:
     save_at_steps: tuple[int, ...]
     final_step: int
     gpu_count: int
-    qwen35_language_model_only: bool
+    actor_attn_implementation: str | None
     resume: bool = False
 
 
@@ -673,8 +678,8 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
 
     if grpo_use_reentrant(config.model_id):
         args.append("--actor.gradient_checkpointing_reentrant")
-    if config.qwen35_language_model_only:
-        args.extend(["--ds.attn_implementation", "eager"])
+    if config.actor_attn_implementation:
+        args.extend(["--ds.attn_implementation", config.actor_attn_implementation])
     return args
 
 
@@ -744,6 +749,10 @@ class _FlashTeacherBridgeError(RuntimeError):
         self.retry_transport = retry_transport
 
 
+def _flash_bridge_timeout(payload):
+    return None if set(payload) == {"checkpoint"} else 600
+
+
 def _flash_post_teacher_once(payload):
     request = urllib.request.Request(
         _FLASH_OPD_BRIDGE_URL,
@@ -752,7 +761,7 @@ def _flash_post_teacher_once(payload):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request, timeout=_flash_bridge_timeout(payload)) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
         try:
@@ -1159,6 +1168,22 @@ def _flash_global_sequence_mean_loss(
     return local_loss * (aligned_samples * int(world_size) / global_batch_size)
 
 
+def _flash_loss_metrics(loss, coverage, has_signal):
+    metric_weight = "sample" if has_signal else None
+    return (
+        {
+            "policy_loss": loss,
+            "distillation_loss": loss,
+            "teacher_coverage": coverage,
+        },
+        {
+            "policy_loss": metric_weight,
+            "distillation_loss": metric_weight,
+            "teacher_coverage": metric_weight,
+        },
+    )
+
+
 def _flash_advance_empty_accumulation(trainer):
     engine = trainer.actor.model
     previous_boundary = getattr(engine, "_is_gradient_accumulation_boundary", None)
@@ -1188,15 +1213,16 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         global_batch_size = global_batch_size.item()
     global_batch_size = float(global_batch_size)
     self.actor.train()
-    action_log_probs, _output = self.actor(
-        experience.sequences,
-        experience.action_mask,
-        attention_mask=experience.attention_mask,
-        return_output=True,
-        ring_attn_group=self.strategy.ring_attn_group,
-        packed_seq_lens=None,
-        return_entropy=False,
-    )
+    with _flash_attention_context():
+        action_log_probs, _output = self.actor(
+            experience.sequences,
+            experience.action_mask,
+            attention_mask=experience.attention_mask,
+            return_output=True,
+            ring_attn_group=self.strategy.ring_attn_group,
+            packed_seq_lens=None,
+            return_entropy=False,
+        )
     group_ids = _flash_pad_info(
         experience.info["flash_teacher_group_ids"], action_log_probs, -1
     ).long()
@@ -1267,21 +1293,16 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         "actor_lr": None,
         "actor_grad_norm": None,
     }
-    if has_current_signal:
-        metrics.update(
-            {
-                "policy_loss": local_loss.detach(),
-                "distillation_loss": local_loss.detach(),
-                "teacher_coverage": coverage.detach(),
-            }
-        )
-        weights.update(
-            {
-                "policy_loss": "sample",
-                "distillation_loss": "sample",
-                "teacher_coverage": "sample",
-            }
-        )
+    loss_metrics, loss_weights = _flash_loss_metrics(
+        local_loss.detach(),
+        coverage.detach(),
+        has_current_signal,
+    )
+    metrics.update(loss_metrics)
+    weights.update(loss_weights)
+    self._flash_opd_ppo_has_signal = bool(
+        getattr(self, "_flash_opd_ppo_has_signal", False) or has_current_signal
+    )
     return {
         "metrics": metrics,
         "weights": weights,
@@ -1296,7 +1317,13 @@ _original_actor_ppo_train = _ActorPPOTrainer.ppo_train
 
 @functools.wraps(_original_actor_ppo_train)
 def _flash_actor_ppo_train(self, *args, **kwargs):
-    status = _original_actor_ppo_train(self, *args, **kwargs)
+    self._flash_opd_ppo_has_signal = False
+    try:
+        status = _original_actor_ppo_train(self, *args, **kwargs)
+    except ZeroDivisionError:
+        if self._flash_opd_ppo_has_signal:
+            raise
+        status = {}
     status.setdefault("policy_loss", 0.0)
     status.setdefault("distillation_loss", 0.0)
     status.setdefault("teacher_coverage", 0.0)
@@ -1377,6 +1404,7 @@ def build_openrlhf_opd_child_env(
     save_at_steps: tuple[int, ...] = (),
     final_step: int = 0,
     warmstart_adapter: str | None = None,
+    actor_attn_implementation: str | None = None,
 ) -> dict[str, str]:
     """Build the isolated child env with bridge capability but no provider credential."""
     child = build_openrlhf_child_env(
@@ -1384,6 +1412,7 @@ def build_openrlhf_opd_child_env(
         max_response_length=max_response_length,
         language_model_only=language_model_only,
         sm120_vllm_backend=_is_sm120(),
+        actor_attn_implementation=actor_attn_implementation,
     )
     child.update(
         {
@@ -1813,6 +1842,10 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     }
 
 
+def _resolve_opd_actor_attn(language_model_only: bool) -> str | None:
+    return "eager" if language_model_only else optimal_attn_impl()
+
+
 def _raise_training_failure(returncode: int, failure: tuple[str, str] | None) -> None:
     if returncode == 0:
         return
@@ -1899,6 +1932,7 @@ def run_opd_openrlhf() -> None:
     qwen35_language_model_only = bool(
         _w.is_vl_checkpoint(inputs["model_id"], inputs["model_revision"])
     )
+    actor_attn_implementation = _resolve_opd_actor_attn(qwen35_language_model_only)
     resumed_step = int(resume_state["opt_steps"]) if resume_state else 0
     last_step = [resumed_step]
     loss_curve: list[float] = list(resume_state.get("loss_curve", [])) if resume_state else []
@@ -1945,7 +1979,7 @@ def run_opd_openrlhf() -> None:
             save_at_steps=inputs["save_at_steps"],
             final_step=inputs["steps"],
             gpu_count=inputs["gpu_count"],
-            qwen35_language_model_only=qwen35_language_model_only,
+            actor_attn_implementation=actor_attn_implementation,
             resume=bool(resume_dir),
         )
         args = build_openrlhf_opd_args(config)
@@ -1961,6 +1995,7 @@ def run_opd_openrlhf() -> None:
             save_at_steps=inputs["save_at_steps"],
             final_step=inputs["steps"],
             warmstart_adapter=warmstart_adapter,
+            actor_attn_implementation=actor_attn_implementation,
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("opd_train_start", gpu=gpu_diagnostics())
