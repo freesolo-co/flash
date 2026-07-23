@@ -722,6 +722,143 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
 
 
+def test_tool_env_reward_scores_native_list_transcript_as_full_episode() -> None:
+    import ast
+    import inspect
+    import time
+    from types import SimpleNamespace
+
+    from flash.engine.worker import rl
+    from flash.engine.worker.rollout_samples import select_rollout_samples
+
+    tree = ast.parse(inspect.getsource(rl.run_rl))
+    reward_node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "reward_fn"
+    )
+    reward_module = ast.fix_missing_locations(ast.Module(body=[reward_node], type_ignores=[]))
+
+    transcript = [
+        {"role": "assistant", "tool_calls": [{"name": "lookup", "arguments": {"q": "x"}}]},
+        {"role": "tool", "name": "lookup", "content": "result"},
+        {"role": "assistant", "content": "final"},
+    ]
+    example = {"id": "tool-example"}
+    scored = []
+
+    class _Env:
+        def reward_from_messages(self, messages, record):
+            scored.append((messages, record))
+            return 0.75
+
+        def reward(self, completion, record, state):
+            return -1.0
+
+    namespace = {
+        "env": _Env(),
+        "is_multi_turn": False,
+        "is_tool_env": True,
+        "rollout_examples": [example],
+        "_prompt_opens_thinking": False,
+        "_think_penalty": 0.0,
+        "tok": object(),
+        "time": time,
+        "pending_named_breakdowns": [],
+        "latest_samples": [],
+        "select_rollout_samples": select_rollout_samples,
+        "_w": SimpleNamespace(
+            THINKING=False,
+            ATTEMPT=1,
+            RUN_ID="run",
+            RUN_MODE="test",
+            SEED=0,
+            graded_text=lambda value, **kwargs: value,
+            upload_debug_jsonl=lambda *args, **kwargs: None,
+        ),
+    }
+    exec(compile(reward_module, "<reward_fn>", "exec"), namespace)
+
+    rewards = namespace["reward_fn"]([transcript], example_idx=[0])
+
+    assert rewards == [0.75]
+    assert scored == [(transcript, example)]
+    assert scored[0][0] is transcript
+
+
+def test_single_turn_multimodal_grpo_applies_thinking_penalty(monkeypatch) -> None:
+    """Single-turn multimodal GRPO completions arrive as message lists but are converted to plain
+    text and scored like text, so the thinking-length penalty MUST apply to them exactly as it does
+    for text-only single-turn. Regression: the old `not is_message_completion` guard keyed on the
+    list shape and silently skipped the penalty for image runs, losing thinking-length shaping."""
+    import ast
+    import inspect
+    import time
+    from types import SimpleNamespace
+
+    from flash.engine.worker import rl
+    from flash.engine.worker.rollout_samples import select_rollout_samples
+
+    tree = ast.parse(inspect.getsource(rl.run_rl))
+    reward_node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "reward_fn"
+    )
+    reward_module = ast.fix_missing_locations(ast.Module(body=[reward_node], type_ignores=[]))
+
+    # stub the multimodal->text conversion so the test is deterministic and processor-independent.
+    import flash.multimodal
+
+    monkeypatch.setattr(
+        flash.multimodal, "assistant_completion_text", lambda comp: "<think>a b c</think>ans"
+    )
+
+    example = {"id": "mm"}
+
+    class _Env:
+        def reward(self, completion, record, state):
+            return 1.0
+
+    def _namespace() -> dict:
+        return {
+            "env": _Env(),
+            "is_multi_turn": False,
+            "is_tool_env": False,
+            "rollout_examples": [example],
+            "_prompt_opens_thinking": False,
+            "_think_penalty": 0.5,
+            "tok": object(),
+            "time": time,
+            "pending_named_breakdowns": [],
+            "latest_samples": [],
+            "select_rollout_samples": select_rollout_samples,
+            "_w": SimpleNamespace(
+                THINKING=True,
+                ATTEMPT=1,
+                RUN_ID="run",
+                RUN_MODE="test",
+                SEED=0,
+                graded_text=lambda value, **kwargs: value,
+                thinking_text=lambda value, **kwargs: value,
+                think_token_count=lambda value, tok, **kwargs: 3,
+                upload_debug_jsonl=lambda *args, **kwargs: None,
+            ),
+        }
+
+    # single-turn multimodal completion (message list) -> penalty applies: 1.0 - 0.5*3 = -0.5
+    mm_ns = _namespace()
+    exec(compile(reward_module, "<reward_fn>", "exec"), mm_ns)
+    mm_rewards = mm_ns["reward_fn"]([[{"role": "assistant", "content": "x"}]], example_idx=[0])
+    assert mm_rewards == [-0.5]
+
+    # text-only single-turn gets the identical penalty (parity control).
+    txt_ns = _namespace()
+    exec(compile(reward_module, "<reward_fn>", "exec"), txt_ns)
+    txt_rewards = txt_ns["reward_fn"](["<think>a b c</think>ans"], example_idx=[0])
+    assert txt_rewards == [-0.5]
+
+
 def test_grpo_masks_truncated_completions_by_default() -> None:
     """GRPO drops truncated (non-EOS) completions from the loss by default.
 
@@ -900,6 +1037,17 @@ def test_run_rl_keeps_logits_cap_without_chalk_grpo_fused_loss() -> None:
     assert fused_kw.value.value is False
     assert 'grpo_kwargs["use_liger_kernel"] = False' in src
     assert '"use_liger_kernel": True' not in src
+
+
+def test_run_rl_drops_catalog_kv_geometry_for_pinned_revision() -> None:
+    import inspect
+
+    import flash.engine.worker as w
+
+    src = inspect.getsource(w.run_rl)
+    assert "_model_info = None if model_revision else MODELS.get(model_id)" in src
+    assert "active_params_b=_active_b" in src
+    assert "model_info=_model_info" in src
 
 
 def test_trl_grpoconfig_truncation_default_is_the_footgun_we_override(tmp_path) -> None:

@@ -8,7 +8,17 @@ flat 0.45 demonstrably starved the KV pool).
 
 from __future__ import annotations
 
-from flash.engine.vram import _KV_CAP, _resident_kv_gb, colocate_kv_util
+import pytest
+
+from flash.catalog import MODELS
+from flash.engine.vram import (
+    _BASE_OVERHEAD_GB,
+    _KV_CAP,
+    _lora_memory_gb,
+    _resident_kv_gb,
+    colocate_kv_util,
+    estimate_vram_gb,
+)
 
 
 def test_fp8_kv_halves_the_resident_kv_estimate():
@@ -45,6 +55,45 @@ def test_scales_with_generation_group():
     u8 = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=True, num_generations=8)
     u16 = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=True, num_generations=16)
     assert u16 > u8
+
+
+def test_grpo_sleep_preflight_matches_worker_kv_budget_and_group_size():
+    info = MODELS["Qwen/Qwen3.5-4B"]
+    seq_len = 8192
+    rank = 32
+    weights = info.params_b * 2.0
+    base = weights + _BASE_OVERHEAD_GB + _lora_memory_gb(rank, info.params_b, "grpo", info)
+    sleep_estimates = {}
+
+    for group_size in (8, 16):
+        resident_kv = _resident_kv_gb(
+            info.params_b,
+            seq_len,
+            group_size,
+            model_info=info,
+        )
+        if group_size == 8:
+            assert resident_kv > _KV_CAP
+        worker_kv_budget = max(_KV_CAP, 1.5 * resident_kv)
+        sleep_estimate = estimate_vram_gb(
+            info.params_b,
+            "grpo",
+            "bf16",
+            seq_len=seq_len,
+            max_tokens=1,
+            lora_rank=rank,
+            group_size=group_size,
+            use_vllm=True,
+            vocab=1,
+            sleep_offload=True,
+            model_info=info,
+        )
+        preflight_kv_budget = sleep_estimate - base - weights
+
+        assert preflight_kv_budget == pytest.approx(worker_kv_budget)
+        sleep_estimates[group_size] = sleep_estimate
+
+    assert sleep_estimates[16] > sleep_estimates[8]
 
 
 def test_preserves_kv_for_long_contexts():

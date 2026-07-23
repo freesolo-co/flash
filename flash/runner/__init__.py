@@ -950,6 +950,23 @@ def prepare_job(
     spec = _resolve_model_revision(spec)
     _require_priced_sft_examples(spec)
     _require_supported_adapter_continuation(spec)
+    if spec.train.structured_outputs:
+        from flash.serve.preflight import preflight_serving_path
+
+        preflight_serving_path(spec)
+    else:
+        from flash.lora_rank import (
+            ServingPreflightError,
+            preflight_train_context_within_serving,
+        )
+
+        # mirror preflight_serving_path: surface the specific context error as a
+        # ServingPreflightError so create_run re-raises it unchanged instead of the
+        # warm-start path masking it with a generic preparation message
+        try:
+            preflight_train_context_within_serving(spec)
+        except ValueError as exc:
+            raise ServingPreflightError(str(exc)) from exc
     if spec.gpu.provider or spec.gpu.exact_type:
         from flash.providers import PROVIDER_NAMES, available_providers
         from flash.providers.base import providers_for
@@ -984,9 +1001,7 @@ def prepare_job(
         token=os.environ.get("HF_TOKEN"),
     )
     from flash.cost.spec import estimate_for_spec
-    from flash.lora_rank import preflight_train_context_within_serving
 
-    preflight_train_context_within_serving(worker_spec)
     estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
     return PreparedJob(
         public_spec=public_spec,
@@ -1023,6 +1038,28 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
+# algorithms whose trainer can shard a single job across gpu.count > 1 cards. empty until the
+# per-algorithm multi-gpu trainers land (the sft/opd verl migrations add themselves here). keeping
+# this empty makes the multi-gpu *plumbing* landable now while multi-gpu *training* stays impossible
+# to trigger, so a count > 1 job can never silently provision and bill idle cards.
+_MULTI_GPU_ALGORITHMS: frozenset[str] = frozenset()
+
+
+def _require_supported_gpu_count(spec: JobSpec) -> None:
+    """reject gpu.count > 1 until the job's algorithm has a multi-gpu trainer.
+
+    gpu.count already provisions and bills n cards (runpod/vast payloads + cost), but every trainer
+    is single-process today, so a count > 1 job would overbill for idle cards. later prs add each
+    algorithm to _MULTI_GPU_ALGORITHMS as its trainer gains sharding.
+    """
+    count = getattr(spec.gpu, "count", 1)
+    if count > 1 and spec.algorithm not in _MULTI_GPU_ALGORITHMS:
+        raise ValueError(
+            f"multi-gpu training (gpu.count={count}) is not yet supported for algorithm "
+            f"{spec.algorithm!r}; set gpu.count to 1"
+        )
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -1034,6 +1071,9 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
 ) -> RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
+    # fail closed on unsupported multi-gpu before any provisioning or billing (also in dry-run, so
+    # the user learns early). removed per-algorithm as each trainer gains sharding.
+    _require_supported_gpu_count(spec)
     prepared = prepared_job or prepare_job(
         spec,
         billing_context=billing_context,
@@ -1042,7 +1082,15 @@ def submit_job(
     )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
+    # Re-gate on the EFFECTIVE worker spec: the check above validated the public ``spec``, but a caller
+    # can supply ``prepared_job`` whose worker_spec carries a different gpu.count, which is what
+    # allocation and training actually provision. Fail closed here too (dry-run included) so the
+    # mismatch can never provision or bill multiple cards.
+    _require_supported_gpu_count(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
+    from flash.multimodal import preflight_validate_image_opd
+
+    preflight_validate_image_opd(worker_spec)
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     if not dry_run:
@@ -1227,7 +1275,11 @@ def get_logs(run_id: str) -> str:
         return f.read()
 
 
-def _sanitize_status_value(value, *, depth: int = 0):
+_STATUS_LIST_LIMIT = 16
+_STATUS_METRICS_HISTORY_LIMIT = 1024
+
+
+def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
     """Bound a heartbeat payload before persisting it in run status JSON."""
     if depth > 5:
         return str(value)[:200]
@@ -1236,14 +1288,21 @@ def _sanitize_status_value(value, *, depth: int = 0):
     if isinstance(value, str):
         return value[:1000]
     if isinstance(value, list):
-        return [_sanitize_status_value(v, depth=depth + 1) for v in value[:16]]
+        if field == "metrics_last":
+            values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
+        else:
+            values = value[:_STATUS_LIST_LIMIT]
+        return [_sanitize_status_value(v, depth=depth + 1) for v in values]
     if isinstance(value, dict):
         out = {}
         for i, (k, v) in enumerate(value.items()):
             if i >= 64:
                 out["truncated"] = True
                 break
-            out[str(k)[:120]] = _sanitize_status_value(v, depth=depth + 1)
+            sanitized_key = str(k)[:120]
+            out[sanitized_key] = _sanitize_status_value(
+                v, depth=depth + 1, field=sanitized_key
+            )
         return out
     return str(value)[:500]
 
@@ -1261,6 +1320,17 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             status = get_status(run_id)
         except FileNotFoundError:
             return
+        # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
+        # the existing per-step backlog forward so `flash log -f` doesn't drop it mid-save until the next
+        # metrics-bearing heartbeat lands.
+        if isinstance(hb, dict) and not hb.get("metrics_last"):
+            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+            prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
+            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
+            # new attempt must not inherit the prior attempt's stale per-step metrics.
+            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
+            if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
+                hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
@@ -1405,8 +1475,6 @@ def _compare_and_fail_remote(
     run_id: str,
     expected_remote: dict | None,
     error: str,
-    *,
-    clear_remote: bool = True,
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
     report_status: RunStatus | None = None
@@ -1418,8 +1486,6 @@ def _compare_and_fail_remote(
             return False
         previous_updated_at = status.updated_at
         status.state = "failed"
-        if clear_remote:
-            status.remote = None
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
@@ -1427,7 +1493,7 @@ def _compare_and_fail_remote(
         _save_status_unlocked(status)
         report_status = status
     confirmed = get_status(run_id)
-    expected_after = None if clear_remote else expected_remote
+    expected_after = expected_remote
     if (
         confirmed.state != "failed"
         or not _expected_remote_matches(confirmed.remote, expected_after)
@@ -1465,7 +1531,6 @@ def _compare_and_complete_remote(
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = _status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
-        status.remote = None
         status.cost_usd = charge_usd
         status.artifacts_dir = artifacts_dir(spec)
         status.updated_at = time.time()
@@ -1474,7 +1539,9 @@ def _compare_and_complete_remote(
         _save_status_unlocked(status)
         report_status = status
     confirmed = get_status(run_id)
-    if confirmed.state != "done" or confirmed.remote is not None:
+    if confirmed.state != "done" or not _expected_remote_matches(
+        confirmed.remote, expected_remote
+    ):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         _report_status(report_status)

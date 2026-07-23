@@ -68,13 +68,6 @@ def test_thinking_capability_values_are_valid():
 
 def test_serving_capacity_matches_validated_matrix():
     expected = {
-        "openbmb/MiniCPM5-1B": {
-            "gpu": "L4",
-            "serve_model_id": "Freesolo-Co/MiniCPM5-1B-FP8",
-            "max_loras": 16,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-        },
         "Qwen/Qwen3.5-0.8B": {
             "gpu": "L4",
             "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
@@ -101,6 +94,15 @@ def test_serving_capacity_matches_validated_matrix():
         "Qwen/Qwen3.5-9B": {
             "gpu": "H100",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "gpu_memory_utilization": 0.98,
+        },
+        "Qwen/Qwen3.6-27B": {
+            "gpu": "H100",
+            "serve_model_id": "Freesolo-Co/Qwen3.6-27B-FP8",
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
@@ -136,12 +138,11 @@ def test_public_rows_include_serving_capacity():
 
 
 def test_public_rows_prune_unset_serving_capacity_fields():
-    row = get_model("openbmb/MiniCPM5-1B").to_dict()
-    # serve_model_id is now set (owned FP8 checkpoint) so it survives; the zero-valued fields
-    # (max_num_seqs, max_num_batched_tokens, tensor_parallel_size, gpu_memory_utilization) still prune.
+    row = get_model("Qwen/Qwen3.5-0.8B").to_dict()
+    # serve_model_id survives while zero-valued optional capacity fields are pruned.
     assert row["serving"] == {
         "gpu": "L4",
-        "serve_model_id": "Freesolo-Co/MiniCPM5-1B-FP8",
+        "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
         "max_loras": 16,
         "max_lora_rank": 128,
         "max_model_len": 32768,
@@ -149,14 +150,24 @@ def test_public_rows_prune_unset_serving_capacity_fields():
 
 
 def test_serving_fp8_repos_match_current_serving_matrix() -> None:
-    # Dense models serve Freesolo-OWNED FP8 checkpoints (no community-repo dependence); the 35B VL MoE
-    # serves the official Qwen FP8 (VL-preserving).
-    assert SERVING_FP8_MODEL_REPOS["openbmb/MiniCPM5-1B"] == "Freesolo-Co/MiniCPM5-1B-FP8"
+    # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves official qwen fp8.
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
     assert SERVING_FP8_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B-FP8"
+
+
+def test_qwen36_27b_geometry_is_dense_hybrid():
+    info = MODELS["Qwen/Qwen3.6-27B"]
+    assert info.vocab_size == 248_320
+    assert info.hidden_size == 5120
+    assert info.num_layers == 64
+    assert info.active_params_b == 0.0
+    assert info.is_moe is False
+    assert info.thinking == "hybrid"
+    assert info.params_b == 27.0
 
 
 def test_default_model_is_thinking_capable():

@@ -71,9 +71,9 @@ def _patch_cfg(monkeypatch, cfg):
 
 
 def test_pure_attention_plain_decoder(monkeypatch):
-    # Llama/Qwen3/MiniCPM: no per-layer types, no linear-attn dims -> every layer reads the mask.
+    # a plain-attention llama config has no per-layer types or linear-attention dimensions.
     _patch_cfg(monkeypatch, types.SimpleNamespace())
-    assert model_is_pure_attention("any/dense") is True
+    assert model_is_pure_attention("meta-llama/Llama-3.2-1B") is True
 
 
 def test_pure_attention_all_full_layer_types(monkeypatch):
@@ -203,6 +203,72 @@ def test_packer_conserves_tokens_and_never_splits():
     assert Counter(t for r in rows for t in r["input_ids"]) == Counter(t for s in seqs for t in s)
 
 
+def test_packer_preserves_legacy_ffd_order_and_is_deterministic():
+    sequences = [
+        list(range(0, 10)),
+        list(range(10, 16)),
+        list(range(16, 21)),
+        list(range(21, 25)),
+        list(range(25, 28)),
+        list(range(28, 31)),
+        list(range(31, 33)),
+        list(range(33, 35)),
+        [35],
+        [],
+    ]
+    masks = [[index % 2 for index in range(len(sequence))] for sequence in sequences]
+
+    def alternating(*lengths):
+        return [index % 2 for length in lengths for index in range(length)]
+
+    expected = [
+        {"input_ids": list(range(0, 8)), "seq_lengths": [8], "completion_mask": alternating(8)},
+        {
+            "input_ids": [*range(10, 16), *range(31, 33)],
+            "seq_lengths": [6, 2],
+            "completion_mask": alternating(6, 2),
+        },
+        {
+            "input_ids": [*range(16, 21), *range(25, 28)],
+            "seq_lengths": [5, 3],
+            "completion_mask": alternating(5, 3),
+        },
+        {
+            "input_ids": [*range(21, 25), *range(28, 31), 35],
+            "seq_lengths": [4, 3, 1],
+            "completion_mask": alternating(4, 3, 1),
+        },
+        {
+            "input_ids": list(range(33, 35)),
+            "seq_lengths": [2],
+            "completion_mask": alternating(2),
+        },
+    ]
+    first = pack_token_ids(sequences, 8, completion_masks=masks)
+    second = pack_token_ids(sequences, 8, completion_masks=masks)
+
+    assert first == expected
+    assert second == first
+    for row in first:
+        assert sum(row["seq_lengths"]) == len(row["input_ids"]) == len(row["completion_mask"])
+        assert len(row["input_ids"]) <= 8
+
+    from collections import Counter
+
+    expected_pairs = Counter(
+        pair
+        for sequence, mask in zip(sequences, masks, strict=True)
+        if sequence
+        for pair in zip(sequence[:8], mask[:8], strict=True)
+    )
+    packed_pairs = Counter(
+        pair
+        for row in first
+        for pair in zip(row["input_ids"], row["completion_mask"], strict=True)
+    )
+    assert packed_pairs == expected_pairs
+
+
 def test_packer_truncates_overlong_example():
     rows = pack_token_ids([list(range(20))], max_length=8)
     assert len(rows) == 1
@@ -317,7 +383,7 @@ def test_packed_forward_matches_separate(arch):
             attn_implementation="sdpa",
         )
         model = transformers.Qwen3ForCausalLM(cfg).eval()
-    else:  # MiniCPM5 is the Llama arch
+    else:  # uncataloged plain-attention llama architecture
         cfg = transformers.LlamaConfig(
             vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
             num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
@@ -650,10 +716,9 @@ def test_packed_completion_loss_matches_unpacked():
     )
 
 
-# ------------------------------------------------ end-to-end across arches (Qwen3 + MiniCPM/Llama)
+# ------------------------------------------------ end-to-end across qwen3 and llama architectures
 def _tiny(arch, transformers):
-    """Tiny model per arch — qwen3 (pure-attn flagship tier) and llama (the MiniCPM5-1B tier, which
-    really is LlamaForCausalLM: verified model_is_pure_attention(openbmb/MiniCPM5-1B) is True)."""
+    """Tiny qwen3 and uncataloged plain-attention llama models for packing parity coverage."""
     common = {
         "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
         "num_attention_heads": 4, "num_key_value_heads": 2, "max_position_embeddings": 64,

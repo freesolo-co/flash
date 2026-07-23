@@ -186,6 +186,42 @@ def test_poll_job_completes(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    recorded = []
+    heartbeat = {
+        "run_id": "terminal-heartbeat",
+        "stage": "done",
+        "ts": 123.0,
+        "attempt": 0,
+        "metrics_last": [{"step": 4, "reward": 0.75}],
+    }
+    forces = []
+    monkeypatch.setattr("flash.providers._poll._record_heartbeat", recorded.append)
+    monkeypatch.setattr(jobs, "decode_output", lambda _output: {"acc": 1.0})
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda _endpoint_id, _job_id, **_kwargs: {"status": "COMPLETED", "output": {}},
+    )
+    def read_heartbeat(force=False, **_kwargs):
+        forces.append(force)
+        return heartbeat
+
+    res = jobs.poll_job(
+        _runpod_handle(jobs),
+        interval_s=0,
+        heartbeat_reader=read_heartbeat,
+    )
+
+    assert res.ok
+    assert forces == [True]
+    assert recorded == [heartbeat]
+
+
 def test_surface_heartbeat_logs_gpu_status(monkeypatch):
     from flash.providers._poll import surface_heartbeat
 
@@ -1660,6 +1696,31 @@ def _spec(run_id):
     )
 
 
+def test_unstructured_prepare_does_not_import_serving_preflight(monkeypatch):
+    import builtins
+
+    import flash.runner as runner
+
+    class ReachedModelResolution(Exception):
+        pass
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "flash.serve.preflight":
+            pytest.fail("unstructured preparation imported optional serving dependencies")
+        return original_import(name, *args, **kwargs)
+
+    def stop_at_model_resolution(*_args, **_kwargs):
+        raise ReachedModelResolution
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(runner, "resolve_model", stop_at_model_resolution)
+
+    with pytest.raises(ReachedModelResolution):
+        runner.prepare_job(_spec("base-install-dry-run"))
+
+
 def _adapter_config(*, rank=32, alpha=64):
     return {
         "peft_type": "LORA",
@@ -1668,6 +1729,96 @@ def _adapter_config(*, rank=32, alpha=64):
         "r": rank,
         "lora_alpha": alpha,
     }
+
+
+@pytest.mark.parametrize("cancel_during_status", [False, True])
+def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_during_status):
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers as providers
+        import flash.providers.allocator as allocator
+        import flash.runner.lifecycle as lifecycle
+        from flash.providers.base import Allocation, Candidate, PollResult
+        from flash.providers.runpod import api as runpod_api
+
+        spec = _spec("completed-before-retry")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
+        orch._save_status(
+            orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+            _next_attempt=0,
+        )
+        candidate = Candidate("runpod", "RTX 4090", 0.5, 24)
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *args, **kwargs: Allocation(
+                provider="runpod",
+                gpu="RTX 4090",
+                hourly_usd=0.5,
+                min_vram_gb=24,
+                candidates=(candidate,),
+            ),
+        )
+        calls = {"n": 0}
+
+        class Provider:
+            supports_weight_cache = False
+
+            def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
+                calls["n"] += 1
+                if on_handle:
+                    on_handle(
+                        {
+                            "provider": "runpod",
+                            "endpoint_id": "ep-completed",
+                            "endpoint_name": "completed",
+                            "key_fingerprint": _RUNPOD_FINGERPRINT,
+                            "job_id": "job-completed",
+                            "attempt": attempt,
+                            "started_ts": 1.0,
+                        }
+                    )
+                return PollResult(False, failure="poll_error", detail="provider api outage")
+
+            def cancel(self, _handle):
+                return None
+
+            def destroy(self, _handle):
+                return None
+
+            def gc(self, _spec):
+                return None
+
+        monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+        def job_status(*_args, **_kwargs):
+            if cancel_during_status:
+                orch._update(spec.run_id, "cancelled")
+            return {
+                "status": "COMPLETED",
+                "output": {"wall_seconds": 5.0, "trained_eval_acc": 0.9},
+            }
+
+        monkeypatch.setattr(runpod_api, "job_status", job_status)
+
+        if cancel_during_status:
+            with pytest.raises(orch._RunCancelled):
+                lifecycle._submit_seed_supervised(
+                    spec,
+                    spec.seed,
+                    io.StringIO(),
+                    code_prefix="code/revision",
+                )
+        else:
+            metrics = lifecycle._submit_seed_supervised(
+                spec,
+                spec.seed,
+                io.StringIO(),
+                code_prefix="code/revision",
+            )
+            assert metrics["trained_eval_acc"] == 0.9
+        assert calls["n"] == 1
 
 
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
@@ -2421,7 +2572,7 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
         status = orch.attach_run("warm-recover", log_stream=sys.stderr)
 
         assert status.state == "failed"
-        assert status.remote is None
+        assert status.remote == remote
         assert "original preparation snapshot is unavailable" in (status.error or "")
         assert "source-run/step-40" in (status.error or "")
 
@@ -3094,6 +3245,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
+        from flash.providers.runpod import api as runpod_api
 
         status = orch.RunStatus(
             run_id="walked",
@@ -3112,17 +3264,30 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
             },
         )
         orch._save_status(status)
-        # Worker output carries wall time but neither cost nor allocated_gpu (the in-process
-        # success path that stamps allocated_gpu is bypassed on recovery).
+        # worker output carries wall time but neither cost nor allocated_gpu, and the failed
+        # poll forces the job-status recovery shortcut to preserve the persisted gpu class.
         monkeypatch.setattr(
             jobs,
             "poll_job",
-            lambda *a, **k: jobs.PollResult(True, metrics={"wall_seconds": 3600.0}),
+            lambda *a, **k: jobs.PollResult(False, failure="poll_error", detail="api outage"),
         )
+        status_deadlines = []
+
+        def completed_status(*_args, **kwargs):
+            status_deadlines.append(kwargs.get("deadline_at"))
+            return {"status": "COMPLETED", "output": {"wall_seconds": 3600.0}}
+
+        monkeypatch.setattr(runpod_api, "job_status", completed_status)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
+        # the completion probe uses a short fresh timeout cap, never the far-future run wall
+        # deadline (which would let a status-api outage burn the full retry budget and stall
+        # recovery). the exact cap is pinned by
+        # test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_future.
+        assert len(status_deadlines) == 1
+        assert status_deadlines[0] < orch._load_run_deadline_at("walked")
         import json
         import os
 
@@ -3655,7 +3820,7 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.state == "failed"
         assert status.error == "stalled: host vanished"
         assert training_calls == []
-        assert status.remote is None
+        assert status.remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
@@ -3793,7 +3958,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             "attach must attempt a checkpoint resume on any non-ok poll"
         )
         assert st.state == "failed", "a resume that fails again must terminate the run"
-        assert st.remote is None
+        assert st.remote == replacement_remote
         assert "bad reward fn" in (st.error or "")
         assert orch._load_status_json("g1")[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
@@ -4113,6 +4278,51 @@ def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
         assert run_id not in deploy_mod._ATTACH_RECONCILING
 
 
+def test_attach_reconciliation_cleans_endpoint_after_background_completion(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.deploy as deploy_mod
+
+        run_id = "attach-reconcile-cleanup"
+        remote = _vast_recovery_remote()
+        spec = _spec(run_id)
+        orch._save_status(
+            orch.RunStatus(
+                run_id=run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+
+        def complete_recovery(*_args, **_kwargs):
+            orch._update(run_id, "done")
+
+        cleaned = []
+        monkeypatch.setattr(deploy_mod, "_reconcile_attached_remote", complete_recovery)
+        monkeypatch.setattr(orch, "_gc_run_endpoints", lambda current: cleaned.append(current.run_id))
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(deploy_mod.threading, "Thread", ImmediateThread)
+
+        assert deploy_mod._schedule_attach_reconciliation(
+            run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+        assert cleaned == [run_id]
+
+
 def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
@@ -4206,7 +4416,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         status = orch.get_status(spec.run_id)
         assert len(calls) == 2
         assert status.state == "failed"
-        assert status.remote is None
+        assert status.remote == remote
         assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in remote.items() if key != "code_prefix"}
         ]
@@ -4250,11 +4460,191 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
 
         status = orch.get_status(spec.run_id)
         assert status.state == "done"
-        assert status.remote is None
+        assert status.remote == remote
         assert status.error is None
         assert orch._load_status_json(spec.run_id)[orch._CLEANUP_REMOTES_KEY] == [
             {key: value for key, value in remote.items() if key != "code_prefix"}
         ]
+
+
+def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-adoption-grace")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S - 1.0}
+        sleeps = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+
+        def advance(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        monkeypatch.setattr(deploy_mod.time, "sleep", advance)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_runpod_completed_metrics",
+            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+        )
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert sleeps == [1.0]
+        assert orch.get_status(spec.run_id).state == "failed"
+        assert "could not be adopted" in orch.get_status(spec.run_id).error
+
+
+def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-deadline-reprobe")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        clock = {"now": deadline - 1.0}
+        probes = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(
+            deploy_mod.time,
+            "sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        def completed_metrics(*_args, **_kwargs):
+            probes.append(clock["now"])
+            if clock["now"] >= deadline:
+                return {"wall_seconds": 60.0}
+            return None
+
+        monkeypatch.setattr(lifecycle_mod, "_runpod_completed_metrics", completed_metrics)
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_strict_teardown_handle",
+            lambda *_args, **_kwargs: pytest.fail("completed attempt must not be torn down"),
+        )
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        assert probes == [deadline - 1.0, deadline]
+
+
+def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatch):
+    # past the recovery grace window the terminal compare-and-fail CAS is the only exit
+    # from the completed-but-unadoptable branch. if that CAS transiently raises, the
+    # reconciler must rate-limit each retry at the full reconcile interval instead of
+    # sleeping 0 (remaining grace is <= 0 past the window) and busy-spinning the loop.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.runner.deploy as deploy_mod
+        import flash.runner.lifecycle as lifecycle_mod
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-cas-ratelimit")
+        orch._save_status(
+            orch.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                remote=remote,
+            )
+        )
+        deadline = 1_000.0
+        # start already past the recovery grace window so remaining grace is <= 0.
+        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S}
+        sleeps = []
+        monkeypatch.setattr(orch, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(deploy_mod.time, "time", lambda: clock["now"])
+
+        def advance(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        monkeypatch.setattr(deploy_mod.time, "sleep", advance)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_runpod_completed_metrics",
+            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+        )
+        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+        # the reconciler imports _compare_and_fail_remote / _record_cleanup_remote from
+        # flash.runner (== orch), so patch them there rather than on lifecycle.
+        monkeypatch.setattr(orch, "_record_cleanup_remote", lambda *_a, **_k: True)
+
+        real_fail = orch._compare_and_fail_remote
+        cas_calls = {"n": 0}
+
+        def flaky_fail(run_id, expected_remote, reason):
+            cas_calls["n"] += 1
+            if cas_calls["n"] <= 2:
+                raise RuntimeError("transient status store failure")
+            return real_fail(run_id, expected_remote, reason)
+
+        monkeypatch.setattr(orch, "_compare_and_fail_remote", flaky_fail)
+
+        deploy_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            "code/revision",
+            io.StringIO(),
+            "stalled: host vanished",
+        )
+
+        # two transient CAS failures -> two full-interval rate-limited retries (never sleep 0),
+        # then the third CAS sticks and fails the run.
+        assert sleeps == [
+            deploy_mod._ATTACH_RECONCILE_INTERVAL_S,
+            deploy_mod._ATTACH_RECONCILE_INTERVAL_S,
+        ]
+        assert cas_calls["n"] == 3
+        assert orch.get_status(spec.run_id).state == "failed"
+        assert "could not be adopted" in orch.get_status(spec.run_id).error
 
 
 def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
@@ -4471,6 +4861,72 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     ep_id, _name, _fingerprint = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     assert ep_id == "ep-on-kB"
     assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
+
+
+def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
+    """An out-of-balance account fails the deploy over to the next account WITHOUT sweeping idle
+    endpoints (sweeping can't add balance)."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+    swept = {"count": 0}
+
+    class FakeResource:
+        id = "ep-on-kB"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            if keys.active_key() == "kA":
+                raise RuntimeError(
+                    "GraphQL errors: You must have at least $0.01 in your account "
+                    "balance to create an endpoint."
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
+        swept["count"] += 1
+        return 0
+
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", fake_sweep)
+
+    ep_id, _name, _fingerprint = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kB"
+    assert keys.active_key() == "kB"
+    assert swept["count"] == 0, "balance failover must not sweep idle endpoints (can't add balance)"
+
+
+def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
+    """A balance error on the only account re-raises (not swallowed) and fails fast without
+    sweep-and-retry on the same broke account."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "solo-key")
+    keys.reset()
+    attempts = {"count": 0}
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            attempts["count"] += 1
+            raise RuntimeError(
+                "GraphQL errors: You must have at least $0.01 in your account "
+                "balance to create an endpoint."
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    with pytest.raises(RuntimeError, match="account balance"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert attempts["count"] == 1, "balance error must fail fast, not sweep-retry the broke account"
 
 
 def test_deploy_captures_owner_before_concurrent_failover_after_sdk_create(monkeypatch):
@@ -4830,3 +5286,175 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
         assert not done.wait(0.2)
     t.join(timeout=2)
     assert done.is_set()  # completes as soon as the lock is released
+
+
+def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkeypatch):
+    # regression (#613): a terminal-ok RunPod job whose output metrics are present but not yet
+    # DECODABLE (decode_output raises, not merely returns a non-dict) must be treated as pending
+    # within the recovery grace. previously the raise fell through to the broad handler and
+    # returned None, letting callers tear down / resubmit a job that had already completed.
+    import time as _time
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {"status": "COMPLETED", "output": {"present": "but-bad"}},
+    )
+
+    def _raise(_output):
+        raise RuntimeError("output envelope not decodable yet")
+
+    monkeypatch.setattr(jobs, "decode_output", _raise)
+    handle = _runpod_handle(jobs)
+    now = _time.time()
+    # within the grace window -> keep reconciling (raise pending), never return None
+    with pytest.raises(lifecycle._CompletedAttemptPending):
+        lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0)
+    # once the grace has expired -> give up (return None)
+    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
+
+
+def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    now = 1_000.0
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
+    probe_deadlines = []
+
+    def completed_status(_endpoint_id, _job_id, **kwargs):
+        probe_deadlines.append(kwargs["deadline_at"])
+        return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
+
+    monkeypatch.setattr(runpod_api, "job_status", completed_status)
+    metrics = lifecycle._runpod_completed_metrics(
+        _runpod_handle(jobs),
+        deadline_at=now - lifecycle._RECOVERY_MARKER_GRACE_S - 1.0,
+    )
+
+    assert metrics == {"wall_seconds": 60.0}
+    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
+
+
+def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_future(monkeypatch):
+    # regression (#613): the status probe timeout must stay a short fresh cap even when the run's
+    # wall deadline is hours away. otherwise job_status is handed a multi-hour deadline and, during
+    # a runpod api outage, burns its full per-request retry budget (~minutes) before returning,
+    # stalling the attach/recovery reconciler each pass. the wall+grace value governs only the
+    # pending-output decision, never the per-probe timeout.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    now = 1_000.0
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
+    probe_deadlines = []
+
+    def completed_status(_endpoint_id, _job_id, **kwargs):
+        probe_deadlines.append(kwargs["deadline_at"])
+        return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
+
+    monkeypatch.setattr(runpod_api, "job_status", completed_status)
+    metrics = lifecycle._runpod_completed_metrics(
+        _runpod_handle(jobs),
+        deadline_at=now + 7_200.0,  # wall deadline hours in the future
+    )
+
+    assert metrics == {"wall_seconds": 60.0}
+    # short fresh cap, NOT now + 7200 + grace (which would let an outage stall the reconciler)
+    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
+
+
+def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
+    # regression (#613): a terminal-ok RunPod job whose output is a READABLE worker-failure
+    # envelope (success=False) is a definitive completion-with-failure, not lagging metrics.
+    # it must return None (not raise _CompletedAttemptPending), so callers take the failed
+    # path instead of reconciling a job that already failed.
+    import time as _time
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+    from flash.runner import lifecycle
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid, **_kw: {
+            "status": "COMPLETED",
+            "output": {"success": False, "error": "boom"},
+        },
+    )
+    handle = _runpod_handle(jobs)
+    now = _time.time()
+    # even well within the grace window, a readable failure envelope is never pending
+    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0) is None
+
+
+def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):
+    """gpu.count from the job spec becomes the runpod Endpoint gpu_count (multi-gpu pod)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+    from flash.spec import GpuSpec, JobSpec
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-multi"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    spec = JobSpec(gpu=GpuSpec(count=2))
+    # endpoint_kwargs={} bypasses weight_cache_endpoint_kwargs so the base gpu_count is asserted directly.
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", spec=spec, endpoint_kwargs={})
+    assert captured["gpu_count"] == 2
+
+
+def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
+    """No spec keeps the historical single-gpu Endpoint payload (count == 1)."""
+    import sys
+
+    import flash.providers.runpod.jobs as jobs
+
+    captured: dict = {}
+
+    class FakeResource:
+        id = "ep-single"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    class CapturingEndpoint:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _build_resource_config(self):
+            return {}
+
+    sys.modules["runpod_flash"].Endpoint = CapturingEndpoint
+
+    jobs.deploy_train_endpoint("A100", name_suffix="testrun", endpoint_kwargs={})
+    assert captured["gpu_count"] == 1
