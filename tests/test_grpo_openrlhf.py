@@ -760,12 +760,12 @@ def test_reward_bridge_round_trip_preserves_label_reward_and_metrics():
     assert bridge.drain_sampled_completions(5) == []
 
 
-def test_reward_bridge_neutralizes_empty_completion_without_environment_scoring():
+def test_reward_bridge_scores_empty_completion_with_environment():
     calls = []
 
     def score(label, completion, prompt):
         calls.append((label, completion, prompt))
-        return grpo_openrlhf.RewardResult(1.0, 1.0, {"unexpected": 1.0})
+        return grpo_openrlhf.RewardResult(-1.0, -1.0, {"blank": 1.0})
 
     with grpo_openrlhf.RewardBridge(
         score, samples_per_step=1, first_step=1, token="empty-token"
@@ -775,9 +775,9 @@ def test_reward_bridge_neutralizes_empty_completion_without_environment_scoring(
             {"query": ["prompt"], "prompts": ["prompt"], "labels": [3]},
         )
 
-    assert response == {"rewards": [0.0], "scores": [0.0], "extra_logs": {}}
-    assert calls == []
-    assert bridge.rewards == [0.0]
+    assert response == {"rewards": [-1.0], "scores": [-1.0], "extra_logs": {"blank": [1.0]}}
+    assert calls == [(3, "", "prompt")]
+    assert bridge.rewards == [-1.0]
 
 
 def test_reward_bridge_keeps_samples_with_their_generation_step():
@@ -1118,7 +1118,7 @@ def test_sitecustomize_applies_and_exactly_trims_stop_per_request():
         def decode(self, token_ids, *, skip_special_tokens):
             pieces = {
                 1: "ok",
-                2: "B</answer>",
+                2: "B</answer> trailing",
                 10: "prompt",
                 99: "" if skip_special_tokens else "<eos>",
             }

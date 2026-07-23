@@ -543,11 +543,8 @@ class RewardBridge:
         if isinstance(labels[0], bool):
             raise TypeError("reward label must be an integer")
         label = int(labels[0])
-        if completion:
-            with self._score_lock:
-                result = self._score_by_label(label, completion, prompts[0])
-        else:
-            result = RewardResult(0.0, 0.0, {})
+        with self._score_lock:
+            result = self._score_by_label(label, completion, prompts[0])
         if not isinstance(result, RewardResult):
             raise TypeError("reward scorer must return RewardResult")
         if not all(math.isfinite(value) for value in (result.reward, result.scores)):
@@ -815,16 +812,22 @@ def _flash_rollout_seed(identity):
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
-def _flash_trim_trailing_stop(tokenizer, token_ids, stop_text):
+def _flash_trim_trailing_stop(tokenizer, token_ids, output_text, stop_reason=None):
     ids = [int(token_id) for token_id in token_ids]
-    stop = max(
-        (value for value in _FLASH_STOP_SEQUENCES if value and stop_text.endswith(value)),
-        key=len,
-        default="",
-    )
-    if not stop:
+    candidates = []
+    for value in _FLASH_STOP_SEQUENCES:
+        if not value:
+            continue
+        index = output_text.find(value)
+        if index >= 0:
+            candidates.append((index, -len(value), value))
+    if isinstance(stop_reason, str) and stop_reason in _FLASH_STOP_SEQUENCES:
+        index = output_text.find(stop_reason)
+        if index >= 0:
+            candidates = [(index, -len(stop_reason), stop_reason)]
+    if not candidates:
         return ids, None
-    keep_length = len(stop_text) - len(stop)
+    keep_length, _negative_length, _stop = min(candidates)
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
         kept -= 1
@@ -877,7 +880,12 @@ class _FlashTerminationCapture:
             token_ids,
             stop_text,
         )
-        kept_ids, kept_text = _flash_trim_trailing_stop(self._tokenizer, token_ids, stop_text)
+        kept_ids, kept_text = _flash_trim_trailing_stop(
+            self._tokenizer,
+            token_ids,
+            generation_output.text,
+            self.stop_reason,
+        )
         if kept_text is not None:
             generation_output.token_ids = kept_ids
             generation_output.text = kept_text
