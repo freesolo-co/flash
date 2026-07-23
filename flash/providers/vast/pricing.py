@@ -35,7 +35,7 @@ def live_candidate_rates(
     min_vram_gb: int,
     disk_gb: float = 0.0,
     max_wall_seconds: float = 0.0,
-    exact_type: str = "",
+    gpu_type: str = "",
 ) -> dict[str, float]:
     """Friendly-name -> cheapest LIVE verified-datacenter $/hr per managed class that currently has a
     rentable offer at/above ``min_vram_gb``, using the SAME effective disk floor
@@ -51,14 +51,14 @@ def live_candidate_rates(
         min_vram_gb,
         max(float(disk_gb or 0.0), MIN_DISK_GB),
         max_wall_seconds=max_wall_seconds,
-        exact_type=exact_type,
+        gpu_type=gpu_type,
     ):
         rates.setdefault(offer.gpu, offer.dph_total)  # price-sorted, first seen per class is cheapest
     return rates
 
 
 def _fetch_offer_rates(
-    max_wall_seconds: float, min_vram_gb: int = 0, exact_type: str = ""
+    max_wall_seconds: float, min_vram_gb: int = 0, gpu_type: str = ""
 ) -> dict[str, float]:
     """Friendly-name -> cheapest LIVE $/hr for the managed classes with a usable offer (NO static
     merge). Raises on fetch failure; assumes ``VAST_API_KEY`` is set (callers gate on it).
@@ -79,7 +79,7 @@ def _fetch_offer_rates(
     return live_candidate_rates(
         max(vram_floor, int(min_vram_gb)),
         max_wall_seconds=max_wall_seconds,
-        exact_type=exact_type,
+        gpu_type=gpu_type,
     )
 
 
@@ -117,7 +117,7 @@ def live_rates(refresh: bool = False, max_wall_seconds: float = 0.0) -> dict[str
 
 
 def live_offer_rates(
-    max_wall_seconds: float = 0.0, min_vram_gb: int = 0, exact_type: str = ""
+    max_wall_seconds: float = 0.0, min_vram_gb: int = 0, gpu_type: str = ""
 ) -> dict[str, float]:
     """Friendly-name -> cheapest live $/hr for ONLY classes with a rentable offer (NO static merge);
     ``{}`` offline / without ``VAST_API_KEY`` / on any fetch failure.
@@ -136,7 +136,7 @@ def live_offer_rates(
         return _fetch_offer_rates(
             max_wall_seconds,
             min_vram_gb=min_vram_gb,
-            exact_type=exact_type,
+            gpu_type=gpu_type,
         )
     except Exception as exc:
         logger.warning("live vast offer rates unavailable (%s)", exc)
@@ -147,7 +147,7 @@ def hourly_rate(
     gpu_name: str,
     max_wall_seconds: float = 0.0,
     min_vram_gb: int = 0,
-    exact_type: str = "",
+    gpu_type: str = "",
 ) -> float:
     """$/hr for one friendly GPU name (cheapest live offer if available, else static).
 
@@ -161,11 +161,11 @@ def hourly_rate(
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
-    if exact_type:
+    if gpu_type:
         exact = live_offer_rates(
             max_wall_seconds=max_wall_seconds,
             min_vram_gb=min_vram_gb,
-            exact_type=exact_type,
+            gpu_type=gpu_type,
         )
         if name in exact:
             return exact[name]

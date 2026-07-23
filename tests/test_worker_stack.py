@@ -1450,12 +1450,12 @@ def test_exact_gpu_validation_accepts_alias_and_rejects_neighbor_classes(monkeyp
     torch = SimpleNamespace(cuda=cuda)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
-    verify_gpu("H100", exact_type="h100")
+    verify_gpu("H100", gpu_type="h100")
 
     for observed in ("NVIDIA H200", "NVIDIA B200"):
         monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index, name=observed: name)
         with pytest.raises(RetriableInfraError, match=r"requested='H100'.*observed="):
-            verify_gpu("H100", exact_type="H100")
+            verify_gpu("H100", gpu_type="H100")
 
 
 def test_exact_gpu_validation_accepts_pytorch_a100_sxm4_40gb_name(monkeypatch):
@@ -1471,7 +1471,7 @@ def test_exact_gpu_validation_accepts_pytorch_a100_sxm4_40gb_name(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
     monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
 
-    lifecycle.verify_gpu("A100 SXM 40GB", exact_type="A100 SXM 40GB")
+    lifecycle.verify_gpu("A100 SXM 40GB", gpu_type="A100 SXM 40GB")
 
 
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
@@ -2027,8 +2027,8 @@ def test_non_sm100_fla_tilelang_untouched(monkeypatch, cc):
     assert "FLA_TILELANG" not in os.environ
 
 
-def test_exact_type_pin_overrides_larger_requested_gpu_hint(monkeypatch):
-    # regression (PR #538 finding 2): exact_type is the authoritative hardware pin. once the live card
+def test_gpu_type_pin_overrides_larger_requested_gpu_hint(monkeypatch):
+    # regression (PR #538 finding 2): gpu_type is the authoritative hardware pin. once the live card
     # matches the pinned class, the softer requested_gpu hint (gpu.type) must NOT be re-checked against
     # _gpu_mismatch_reason, which can name a larger class and reject a correctly-provisioned card.
     from types import SimpleNamespace
@@ -2036,7 +2036,7 @@ def test_exact_type_pin_overrides_larger_requested_gpu_hint(monkeypatch):
     import flash.engine.worker.perf.lifecycle as lifecycle
     from flash.engine.worker.perf import RetriableInfraError
 
-    # live card is an 80 GB H100 (sm90). exact_type pins H100 (a match); the requested hint names the
+    # live card is an 80 GB H100 (sm90). gpu_type pins H100 (a match); the requested hint names the
     # larger B200 class, which a bare _gpu_mismatch_reason would reject (80 GB < B200 need, sm90 < sm100).
     cuda = SimpleNamespace(
         get_device_capability=lambda _index: (9, 0),
@@ -2047,15 +2047,15 @@ def test_exact_type_pin_overrides_larger_requested_gpu_hint(monkeypatch):
     monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
 
     # pin matches the live card -> accept, despite the larger requested hint (pre-fix this raised).
-    lifecycle.verify_gpu("B200", exact_type="H100")
+    lifecycle.verify_gpu("B200", gpu_type="H100")
 
     # control: when the pin itself does not match the live card, it still raises.
     with pytest.raises(RetriableInfraError, match="exact-class mismatch"):
-        lifecycle.verify_gpu("B200", exact_type="B200")
+        lifecycle.verify_gpu("B200", gpu_type="B200")
 
 
-def test_exact_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
-    # regression (PR #538 finding 2): honoring the exact_type pin must NOT drop the live safety net.
+def test_gpu_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch):
+    # regression (PR #538 finding 2): honoring the gpu_type pin must NOT drop the live safety net.
     # a card whose NAME canonicalizes to the pinned class but is under-provisioned (a mig slice with
     # reduced vram, or a too-old host driver) has no quote-time equivalent check, so it must still be
     # caught here -- validated against the pinned class itself, not the softer requested hint.
@@ -2075,4 +2075,4 @@ def test_exact_type_pin_still_rejects_underprovisioned_matching_card(monkeypatch
     monkeypatch.setattr(lifecycle, "_host_driver_cuda", lambda: 13.0)
 
     with pytest.raises(RetriableInfraError, match="does not match requested"):
-        lifecycle.verify_gpu("H100", exact_type="H100")
+        lifecycle.verify_gpu("H100", gpu_type="H100")

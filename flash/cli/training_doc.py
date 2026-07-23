@@ -116,11 +116,10 @@ lora_alpha = 64
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
-GPU and HF artifacts are **managed by default**: `gpu.type` is a non-pinning managed
-hint and `train.hf_repo` remains platform-managed. For controlled
-experiments, `[gpu] provider` restricts allocation to one provider and `[gpu] exact_type`
-pins one active validated GPU class; otherwise the allocator picks the cheapest fitting
-class. Run artifacts are stored in a private environment-scoped repo with content-addressed
+GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
+let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
+platform-managed. For controlled experiments, `[gpu] provider` restricts allocation to one
+provider and `[gpu] type` pins one exact active validated GPU class. Run artifacts are stored in a private environment-scoped repo with content-addressed
 Flash code snapshots. Set `seed` only at the top level; `[worker_env]` cannot override
 `SEED`, `RUN_ID`, `HF_REPO`, or `FLASH_ARM`. Compose or tweak configs without editing files: `--config
 extra.toml` (deep-merge) and `--set key=value` (e.g. `--set train.epochs=3`).
@@ -257,7 +256,7 @@ spending another GPU run:
 | Environment id is blank or stale | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --name my-env .` after every environment/data edit and paste the returned id into every config you submit. |
 | Local-only env path in config | Config validation says there is no local path mode | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths. |
 | Config knobs are in the wrong table | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`. |
-| Trying to pin managed infrastructure | `gpu.type`, `train.hf_repo`, or `model_policy` changes do not do what you expected | Treat GPU choice, model policy, and the run artifact repo as managed. Tune the model, algorithm, environment, and `[train]` knobs instead. |
+| GPU selection is not what you expected | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change | Set `[gpu] type` to an active validated class to hard-pin it, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` and `model_policy` remain platform-managed. |
 | Secrets are not available on the worker | Reward code works locally but remote logs show missing API keys or auth failures | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never put secret values in `[worker_env]` or hard-code them in the config. |
 | Wrong model / thinking setting | Config validation fails, or chat behavior does not match the run | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash chat` does not expose an override flag. |
 | Thinking reward grades the wrong text | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields. |

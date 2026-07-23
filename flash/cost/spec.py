@@ -162,7 +162,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         thinking=spec.thinking,
         teacher_model=teacher_model,
         provider=g.provider or "auto",
-        exact_type=g.exact_type,
+        gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
         gpu_count=g.count,

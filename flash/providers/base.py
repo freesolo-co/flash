@@ -434,7 +434,7 @@ class AllocationConstraints:
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
-    exact_type: str = ""
+    gpu_type: str = ""
 
 
 @runtime_checkable
