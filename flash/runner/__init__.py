@@ -982,11 +982,26 @@ def prepare_job(
             raise ValueError(
                 f"no configured provider can provision gpu.type {spec.gpu.type!r}"
             )
+    preflight_gpu = spec.gpu.type
+    if not preflight_gpu and spec.model_policy == "allow":
+        # open-model auto runs size this fit preflight against the provisional class the schema
+        # already validated against, not the empty public gpu.type: resolve_model ->
+        # _resolve_open_model falls back to DEFAULT_GPU on empty, which would reject an uncatalogued
+        # model larger than the default but fitting a managed class -- after it passed schema.
+        from flash.providers.base import provisional_gpu
+
+        preflight_gpu = provisional_gpu(
+            spec.model,
+            spec.algorithm,
+            train=spec.train,
+            thinking=spec.thinking,
+            model_revision=spec.model_revision,
+        )
     info = resolve_model(
         spec.model,
         spec.algorithm,
         policy=spec.model_policy,
-        gpu=spec.gpu.type,
+        gpu=preflight_gpu,
         model_revision=spec.model_revision,
     )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
@@ -1247,6 +1262,26 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "recovery was refused"
             )
     return worker_spec
+
+
+def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
+    """Effective worker spec for RE-ALLOCATING a recovered run.
+
+    Identical to effective_spec_from_status, except gpu.type is restored to the run's original
+    public value: empty for an auto run, the pinned class for a pinned run. The persisted effective
+    snapshot bakes the *allocated* class into gpu.type via _spec_with_gpu, so feeding it straight
+    back to allocate() would hard-pin an originally-unpinned run to the prior attempt's class after a
+    control-plane restart or attach -- blocking OOM escalation and retries on other providers/classes.
+    Use this only where recovery re-enters allocate(); polling a live attempt and endpoint cleanup
+    keep the concrete effective spec.
+    """
+    worker_spec = effective_spec_from_status(status, verify_source=verify_source)
+    public_type = JobSpec.from_dict(status.spec).gpu.type
+    if worker_spec.gpu.type == public_type:
+        return worker_spec
+    restored = worker_spec.to_internal_dict()
+    restored["gpu"] = {**restored["gpu"], "type": public_type}
+    return JobSpec.from_dict(restored)
 
 
 def list_runs() -> list[RunStatus]:
