@@ -209,12 +209,16 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
     def upload(repo, *, code_prefix, deadline_at):
         calls["upload"] = (repo, code_prefix, deadline_at)
 
+    def require_allowance(deadline_at):
+        calls["allowance"] = deadline_at
+
     monkeypatch.setattr("flash.providers.runpod.jobs.deploy_train_endpoint", deploy)
     monkeypatch.setattr("flash.providers.runpod.jobs.build_function_input", lambda payload: payload)
     monkeypatch.setattr("flash.providers.runpod.api.submit_job", submit)
     monkeypatch.setattr("flash.envs.registry.worker_pip_for_env", lambda _env_id: ["env-dep"])
     monkeypatch.setattr("flash.providers._worker.chalk_extra_pip", lambda _spec: ["chalk-dep"])
     monkeypatch.setattr("flash.providers._worker.upload_code", upload)
+    monkeypatch.setattr("flash.providers._deadline.require_create_allowance", require_allowance)
     monkeypatch.setattr(
         "flash.runner.flash_code_prefix",
         lambda: "code/0123456789abcdef0123456789abcdef/flash",
@@ -228,7 +232,8 @@ def test_queue_backend_reuses_existing_endpoint_submit_and_teardown(monkeypatch)
     handle = backend.allocate(request)
     backend.release(handle, request.bundle_id)
 
-    assert set(calls) == {"upload", "deploy", "submit", "teardown"}
+    assert set(calls) == {"upload", "deploy", "allowance", "submit", "teardown"}
+    assert calls["allowance"] == request.deadline_at
     upload_repo, upload_prefix, upload_deadline = calls["upload"]
     assert upload_repo == request.seed_spec.train.hf_repo
     assert upload_prefix == "code/0123456789abcdef0123456789abcdef/flash"
@@ -272,6 +277,9 @@ def test_unconfirmed_submit_failure_persists_exact_cleanup_handle(monkeypatch):
         raise RuntimeError("submit failed")
 
     monkeypatch.setattr("flash.providers.runpod.jobs.build_function_input", lambda payload: payload)
+    monkeypatch.setattr(
+        "flash.providers._deadline.require_create_allowance", lambda _deadline: None
+    )
     monkeypatch.setattr("flash.providers.runpod.api.submit_job", fail_submit)
     monkeypatch.setattr(
         "flash.providers.runpod.api.delete_endpoint_for_fingerprint",

@@ -162,6 +162,7 @@ class SharedQueueAllocationBackend:
             )
 
         from flash.envs.registry import worker_pip_for_env
+        from flash.providers._deadline import require_create_allowance
         from flash.providers._worker import chalk_extra_pip, upload_code, weight_cache_env
         from flash.providers.base import UnreconciledCreateError
         from flash.providers.runpod import api as queue_api
@@ -225,6 +226,7 @@ class SharedQueueAllocationBackend:
         )
         submitted_at = time.time()
         try:
+            require_create_allowance(request.deadline_at)
             job_id = queue_api.submit_job(
                 endpoint_id,
                 build_function_input(payload),
