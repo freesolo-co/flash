@@ -1550,6 +1550,17 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     )
     namespace["_flash_post_teacher"] = lambda _payload: {"ok": True}
 
+    empty_hidden = torch.empty((0, 5), requires_grad=True)
+    empty_logps = namespace["_flash_chunked_token_logps"](
+        torch.nn.Linear(5, 13, bias=False),
+        empty_hidden,
+        torch.empty((0,), dtype=torch.long),
+        temperature=0.7,
+    )
+    assert empty_logps.requires_grad
+    empty_logps.sum().backward()
+    assert empty_hidden.grad is not None
+
     class _TinyCausalLM(torch.nn.Module):
         def __init__(self):
             super().__init__()

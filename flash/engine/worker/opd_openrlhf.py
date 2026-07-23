@@ -1175,7 +1175,7 @@ def _flash_chunked_token_logps(
     if float(temperature) <= 0:
         raise ValueError("OpenRLHF OPD rollout temperature must be positive")
     if hidden_states.shape[0] == 0:
-        return hidden_states.new_empty((0,), dtype=torch.float32)
+        return hidden_states.float().sum(dim=-1)
 
     def _logps(hidden_chunk, ids_chunk):
         logits = lm_head(hidden_chunk).float()
