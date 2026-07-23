@@ -286,7 +286,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
             "algorithm": "grpo",
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
-            "gpu": {"type": "RTX 5090"},
+            "gpu": {},
         },
         run_id="r-adv",
     )

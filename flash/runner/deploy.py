@@ -591,9 +591,9 @@ def _resume_after_confirmed_teardown(
         _spec_with_remaining_wall,
         _update,
         _verified_opd_next_attempt,
-        effective_spec_from_status,
         flash_code_prefix,
         get_status,
+        reallocation_spec_from_status,
     )
 
     if int(worker_spec.gpu.max_retries) == 0:
@@ -617,7 +617,7 @@ def _resume_after_confirmed_teardown(
         _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         print(f"attach: {run_id} {exc}", file=log)
         return get_status(run_id)
-    worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
+    worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
