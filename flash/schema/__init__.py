@@ -476,6 +476,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
+            entropy_quantile=_train_float(
+                train_raw, "entropy_quantile", minimum=0.0, maximum=1.0
+            ),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
