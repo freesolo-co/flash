@@ -1280,6 +1280,68 @@ def test_sitecustomize_trims_the_reported_trailing_stop_not_an_earlier_match():
     assert output["logprobs"] == ["first", "second"]
 
 
+def test_sitecustomize_prefers_longest_overlapping_trailing_stop():
+    class _Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            pieces = {1: "hi", 2: "\n", 3: "\n"}
+            return "".join(pieces[int(token_id)] for token_id in token_ids)
+
+    class _Engine:
+        async def generate(self, _prompt_ids, _sampling_params):
+            return SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        token_ids=[1, 2, 3],
+                        text="hi\n\n",
+                        finish_reason="stop",
+                        stop_reason="\n",
+                        logprobs=["hi", "newline-1", "newline-2"],
+                    )
+                ]
+            )
+
+    async def execute(
+        _self,
+        _prompt,
+        _label,
+        sampling_params,
+        _max_length,
+        _tokenizer,
+        llm_engine,
+        images=None,
+    ):
+        generation = (await llm_engine.generate([], sampling_params)).outputs[0]
+        return {
+            "token_ids": generation.token_ids,
+            "action_text": generation.text,
+            "logprobs": generation.logprobs,
+            "reward": [1.0],
+            "scores": [1.0],
+            "extra_logs": {},
+            "truncated": False,
+        }
+
+    namespace = _termination_hook_namespace(
+        execute=execute,
+        stop_sequences=("\n", "\n\n"),
+    )
+    output = asyncio.run(
+        namespace["_flash_execute"](
+            SimpleNamespace(),
+            "prompt",
+            0,
+            SimpleNamespace(logprobs=1),
+            32,
+            _Tokenizer(),
+            _Engine(),
+        )
+    )
+
+    assert output["token_ids"] == [1]
+    assert output["action_text"] == "hi"
+    assert output["logprobs"] == ["hi"]
+
+
 def test_sitecustomize_trims_special_token_stop_from_raw_decode():
     class _Tokenizer:
         def decode(self, token_ids, *, skip_special_tokens):

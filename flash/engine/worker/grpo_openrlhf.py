@@ -867,15 +867,14 @@ def _flash_rollout_seed(identity):
 
 def _flash_trim_trailing_stop(tokenizer, token_ids, raw_text, output_text, stop_reason=None):
     ids = [int(token_id) for token_id in token_ids]
+    candidates = [
+        value for value in _FLASH_STOP_SEQUENCES if value and output_text.endswith(value)
+    ]
     if isinstance(stop_reason, str) and stop_reason in _FLASH_STOP_SEQUENCES:
-        stop = stop_reason
-    else:
-        candidates = [
-            value for value in _FLASH_STOP_SEQUENCES if value and output_text.endswith(value)
-        ]
-        if not candidates:
-            return ids, None
-        stop = max(candidates, key=len)
+        candidates.append(stop_reason)
+    if not candidates:
+        return ids, None
+    stop = max(candidates, key=len)
     keep_length = raw_text.rfind(stop)
     if keep_length < 0:
         return ids, None
