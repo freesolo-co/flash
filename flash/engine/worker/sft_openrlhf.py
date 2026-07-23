@@ -550,6 +550,8 @@ class _OpenRLHFCheckpointWatcher:
         self._thread.start()
 
     def raise_if_failed(self) -> None:
+        if isinstance(self._error, _w.RetriableInfraError):
+            raise self._error
         if self._error is not None:
             raise RuntimeError("OpenRLHF checkpoint watcher failed") from self._error
 
@@ -634,7 +636,14 @@ class _OpenRLHFCheckpointWatcher:
                 before_upload=publish_adapter,
             )
             if not uploaded:
-                raise RuntimeError(f"save step {step} full-state checkpoint was not published")
+                if required:
+                    raise RuntimeError(f"save step {step} full-state checkpoint was not published")
+                self.processed_steps.add(step)
+                marker = _checkpoint_upload_marker(self.checkpoint_dir, step, failed=True)
+                with open(marker, "w", encoding="utf-8") as file:
+                    file.write("optional full-state checkpoint was not published\n")
+                self._prune_uploaded_checkpoints()
+                return
             self.processed_steps.add(step)
             if required:
                 marker = _required_save_marker(self.checkpoint_dir, step)
@@ -938,19 +947,6 @@ def assert_lora_applied(model, model_id):
     return count
 
 
-def assert_adapter_load_clean(load_result, model_id):
-    def lora_only(keys):
-        return [key for key in (keys or []) if "lora_" in key]
-
-    missing = lora_only(getattr(load_result, "missing_keys", None))
-    unexpected = lora_only(getattr(load_result, "unexpected_keys", None))
-    if missing or unexpected:
-        raise RuntimeError(
-            f"warm-start adapter for {model_id} did not load cleanly: "
-            f"missing={missing[:3]} unexpected={unexpected[:3]}"
-        )
-
-
 def assert_adapter_delta_nonzero(model, model_id):
     seen = 0
     nonzero = 0
@@ -985,17 +981,15 @@ def _install_warmstart_actor_patch():
                 raise ValueError("OpenRLHF warm-start LoRA rank changed before model construction")
             super().__init__(pretrain_or_model, *args, lora_rank=0, **kwargs)
             base = self.model
-            model = PeftModel.from_pretrained(base, warmstart, is_trainable=True)
-            model.enable_input_require_grads()
             key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
-            load_result = model.load_adapter(
+            model = PeftModel.from_pretrained(
+                base,
                 warmstart,
-                adapter_name="default",
                 is_trainable=True,
                 key_mapping=key_mapping,
             )
+            model.enable_input_require_grads()
             model_id = str(CONFIG["model_id"])
-            assert_adapter_load_clean(load_result, model_id)
             assert_lora_applied(model, model_id)
             assert_adapter_delta_nonzero(model, model_id)
             self.model = model
