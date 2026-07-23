@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 
@@ -219,7 +222,139 @@ def test_submit_snapshots_payload_before_worker_execution():
     assert result.value == {"query": ["original"], "nested": {"label": 4}}
 
 
-def test_cancelled_run_rejects_a_late_result():
+def test_direct_future_cancel_releases_capacity_and_rejects_result():
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge(payload):
+        started.set()
+        assert release.wait(timeout=2)
+        return payload["value"]
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.REWARD, bridge=bridge)
+        first_identity = ScoringBatchIdentity("run-a", 1, "first")
+        second_identity = ScoringBatchIdentity("run-a", 2, "second")
+        first = pool.submit(first_identity, {"value": 1})
+        assert started.wait(timeout=1)
+
+        assert first.cancel() is True
+        assert first.cancel() is False
+        assert pool.outstanding_count == 0
+        second = pool.submit(second_identity, {"value": 2})
+        release.set()
+
+        with pytest.raises(ScoringIdentityError, match="cancellation"):
+            first.result_for(first_identity, timeout=1)
+        assert pool.consume(second_identity, second, timeout=1).value == 2
+
+
+def test_only_one_consumer_can_claim_a_scoring_result():
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge(payload):
+        started.set()
+        assert release.wait(timeout=2)
+        return payload
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.TEACHER, bridge=bridge)
+        identity = ScoringBatchIdentity("run-a", 3, "single-consumer")
+        future = pool.submit(identity, {"value": 7})
+        assert started.wait(timeout=1)
+
+        with ThreadPoolExecutor(max_workers=1) as consumers:
+            first = consumers.submit(pool.consume, identity, future, timeout=1)
+            while True:
+                with pool._lock:
+                    if identity in pool._consuming:
+                        break
+            with pytest.raises(ScoringIdentityError, match="active consumer"):
+                pool.consume(identity, future, timeout=0)
+            release.set()
+            assert first.result(timeout=1).value == {"value": 7}
+
+
+def test_timed_out_consume_keeps_the_future_for_later_delivery():
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge(payload):
+        started.set()
+        assert release.wait(timeout=2)
+        return payload
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.REWARD, bridge=bridge)
+        identity = ScoringBatchIdentity("run-a", 4, "timeout")
+        future = pool.submit(identity, {"value": 8})
+        assert started.wait(timeout=1)
+
+        with pytest.raises(TimeoutError):
+            pool.consume(identity, future, timeout=0)
+        assert pool.pending_identities == (identity,)
+        release.set()
+        assert pool.consume(identity, future, timeout=1).value == {"value": 8}
+
+
+def test_worker_timeout_error_is_delivered_and_releases_capacity():
+    expected = TimeoutError("bridge timed out")
+
+    def bridge(_payload):
+        raise expected
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.REWARD, bridge=bridge)
+        identity = ScoringBatchIdentity("run-a", 5, "bridge-timeout")
+        future = pool.submit(identity, {"value": 1})
+
+        with pytest.raises(TimeoutError) as error:
+            pool.consume(identity, future, timeout=1)
+        assert error.value is expected
+        assert pool.outstanding_count == 0
+
+
+def test_full_pool_rejects_before_touching_the_next_payload():
+    class _ExplodingPayload(Mapping[str, Any]):
+        def __init__(self):
+            self.touched = False
+
+        def __getitem__(self, _key: str) -> Any:
+            self.touched = True
+            raise AssertionError("full-pool payload must not be read")
+
+        def __iter__(self) -> Iterator[str]:
+            self.touched = True
+            raise AssertionError("full-pool payload must not be read")
+
+        def __len__(self) -> int:
+            return 1
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge(payload):
+        started.set()
+        assert release.wait(timeout=2)
+        return payload
+
+    with SharedScoringPool(pool_size=1) as pool:
+        pool.register_run("run-a", kind=ScoringKind.REWARD, bridge=bridge)
+        first_identity = ScoringBatchIdentity("run-a", 1, "first")
+        second_identity = ScoringBatchIdentity("run-a", 2, "second")
+        first = pool.submit(first_identity, {"value": 1})
+        assert started.wait(timeout=1)
+        payload = _ExplodingPayload()
+
+        with pytest.raises(ScoringCapacityError, match="pool is full"):
+            pool.submit(second_identity, payload)
+        assert payload.touched is False
+        release.set()
+        pool.consume(first_identity, first, timeout=1)
+
+
+def test_cancelled_run_rejects_a_waiting_consumer_and_late_result():
     started = threading.Event()
     release = threading.Event()
 
@@ -233,11 +368,22 @@ def test_cancelled_run_rejects_a_late_result():
     identity = ScoringBatchIdentity("run-a", 6, "late")
     future = pool.submit(identity, {"value": "late"})
     assert started.wait(timeout=1)
-    assert pool.cancel_run("run-a") == 1
-    release.set()
 
     try:
+        with ThreadPoolExecutor(max_workers=1) as consumers:
+            consumption = consumers.submit(pool.consume, identity, future, timeout=1)
+            while True:
+                with pool._lock:
+                    if identity in pool._consuming:
+                        break
+            assert pool.cancel_run("run-a") == 1
+            release.set()
+            with pytest.raises(ScoringIdentityError, match="rejected"):
+                consumption.result(timeout=1)
+        with pytest.raises(ScoringIdentityError, match="cancellation"):
+            future.result_for(identity, timeout=1)
         with pytest.raises(ScoringIdentityError, match="no outstanding"):
             pool.consume(identity, future, timeout=1)
     finally:
+        release.set()
         pool.shutdown()

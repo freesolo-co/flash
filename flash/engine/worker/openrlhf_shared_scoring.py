@@ -6,6 +6,7 @@ import copy
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -102,17 +103,28 @@ def _score_submission(
 class ScoringFuture:
     """future whose result can only be retrieved for its originating identity."""
 
-    __slots__ = ("_future", "_identity", "_kind")
+    __slots__ = (
+        "_cancel_callback",
+        "_future",
+        "_identity",
+        "_kind",
+        "_rejected",
+        "_state_lock",
+    )
 
     def __init__(
         self,
         identity: ScoringBatchIdentity,
         kind: ScoringKind,
         future: Future[ScoringResult],
+        cancel_callback: Callable[[ScoringFuture], None],
     ) -> None:
         self._identity = identity
         self._kind = kind
         self._future = future
+        self._cancel_callback = cancel_callback
+        self._state_lock = threading.Lock()
+        self._rejected = False
 
     @property
     def identity(self) -> ScoringBatchIdentity:
@@ -132,14 +144,21 @@ class ScoringFuture:
         return self._future.done()
 
     def cancelled(self) -> bool:
-        """return whether scoring was cancelled before execution."""
+        """return whether this scoring result has been logically rejected."""
 
-        return self._future.cancelled()
+        with self._state_lock:
+            return self._rejected
 
     def cancel(self) -> bool:
-        """cancel scoring if its worker has not started."""
+        """reject this result and release its pool capacity."""
 
-        return self._future.cancel()
+        with self._state_lock:
+            if self._rejected:
+                return False
+            self._rejected = True
+        self._future.cancel()
+        self._cancel_callback(self)
+        return True
 
     def result_for(
         self,
@@ -152,10 +171,22 @@ class ScoringFuture:
             raise ScoringIdentityError(
                 "scoring future identity does not match the requested run, step, and batch"
             )
+        self._raise_if_rejected()
         result = self._future.result(timeout=timeout)
+        self._raise_if_rejected()
         if result.identity != self.identity or result.kind is not self.kind:
             raise ScoringIdentityError("scoring worker returned a mismatched result envelope")
         return result
+
+    def _raise_if_rejected(self) -> None:
+        with self._state_lock:
+            if self._rejected:
+                raise ScoringIdentityError("scoring result was rejected after cancellation")
+
+    def _raised_by_worker(self, error: BaseException) -> bool:
+        if not self._future.done() or self._future.cancelled():
+            return False
+        return self._future.exception(timeout=0) is error
 
 
 class SharedScoringPool:
@@ -179,6 +210,8 @@ class SharedScoringPool:
         self._runs: dict[str, _RunScorer] = {}
         self._known_run_ids: set[str] = set()
         self._futures: dict[ScoringBatchIdentity, ScoringFuture] = {}
+        self._reserved: set[ScoringBatchIdentity] = set()
+        self._consuming: set[ScoringBatchIdentity] = set()
         self._closed = False
 
     @property
@@ -189,10 +222,10 @@ class SharedScoringPool:
 
     @property
     def outstanding_count(self) -> int:
-        """return the number of submitted results not yet consumed or cancelled."""
+        """return the number of capacity slots reserved or awaiting consumption."""
 
         with self._lock:
-            return len(self._futures)
+            return len(self._reserved) + len(self._futures)
 
     @property
     def pending_identities(self) -> tuple[ScoringBatchIdentity, ...]:
@@ -235,13 +268,12 @@ class SharedScoringPool:
         identity: ScoringBatchIdentity,
         payload: Mapping[str, Any],
     ) -> ScoringFuture:
-        """submit a snapshotted bridge payload and return its future immediately."""
+        """reserve capacity, snapshot a bridge payload, and return its future."""
 
         if not isinstance(identity, ScoringBatchIdentity):
             raise TypeError("scoring identity must be ScoringBatchIdentity")
         if not isinstance(payload, Mapping):
             raise TypeError("scoring payload must be a mapping")
-        payload_snapshot = copy.deepcopy(dict(payload))
 
         with self._lock:
             self._require_open()
@@ -249,21 +281,41 @@ class SharedScoringPool:
                 scorer = self._runs[identity.run_id]
             except KeyError as exc:
                 raise ScoringRegistryError(f"unknown scoring run: {identity.run_id}") from exc
-            if identity in self._futures:
+            if identity in self._reserved or identity in self._futures:
                 raise ScoringRegistryError("scoring identity already has an outstanding future")
-            if len(self._futures) >= self._pool_size:
+            if len(self._reserved) + len(self._futures) >= self._pool_size:
                 raise ScoringCapacityError(
                     f"scoring pool is full at {self._pool_size} outstanding submissions"
                 )
-            raw_future = self._executor.submit(
-                _score_submission,
-                identity,
-                scorer,
-                payload_snapshot,
-            )
-            future = ScoringFuture(identity, scorer.kind, raw_future)
-            self._futures[identity] = future
-            return future
+            self._reserved.add(identity)
+
+        try:
+            payload_snapshot = copy.deepcopy(dict(payload))
+            with self._lock:
+                self._require_open()
+                if identity not in self._reserved or identity.run_id not in self._runs:
+                    raise ScoringIdentityError(
+                        "scoring submission was rejected before worker admission"
+                    )
+                raw_future = self._executor.submit(
+                    _score_submission,
+                    identity,
+                    scorer,
+                    payload_snapshot,
+                )
+                future = ScoringFuture(
+                    identity,
+                    scorer.kind,
+                    raw_future,
+                    self._cancel_future,
+                )
+                self._reserved.remove(identity)
+                self._futures[identity] = future
+                return future
+        except BaseException:
+            with self._lock:
+                self._reserved.discard(identity)
+            raise
 
     def consume(
         self,
@@ -272,7 +324,7 @@ class SharedScoringPool:
         *,
         timeout: float | None = None,
     ) -> ScoringResult:
-        """consume one exact future, preserving the bridge result or exception."""
+        """claim and consume one exact future at most once."""
 
         with self._lock:
             tracked = self._futures.get(identity)
@@ -284,13 +336,32 @@ class SharedScoringPool:
                 raise ScoringIdentityError(
                     "the supplied future is not registered for the requested identity"
                 )
+            if identity in self._consuming:
+                raise ScoringIdentityError("scoring future already has an active consumer")
+            self._consuming.add(identity)
+
         try:
-            return future.result_for(identity, timeout=timeout)
-        finally:
-            if future.done():
-                with self._lock:
-                    if self._futures.get(identity) is future:
-                        self._futures.pop(identity)
+            result = future.result_for(identity, timeout=timeout)
+        except FutureTimeoutError as exc:
+            terminal = future._raised_by_worker(exc)
+            with self._lock:
+                self._consuming.discard(identity)
+                if terminal and self._futures.get(identity) is future:
+                    self._futures.pop(identity)
+            raise
+        except BaseException:
+            with self._lock:
+                self._consuming.discard(identity)
+                if self._futures.get(identity) is future:
+                    self._futures.pop(identity)
+            raise
+
+        with self._lock:
+            self._consuming.discard(identity)
+            if self._futures.get(identity) is not future:
+                raise ScoringIdentityError("scoring result was rejected before delivery")
+            self._futures.pop(identity)
+        return result
 
     def cancel_run(self, run_id: str) -> int:
         """remove one run bridge and reject all of its current or late results."""
@@ -300,14 +371,19 @@ class SharedScoringPool:
             if normalized_run_id not in self._runs:
                 raise ScoringRegistryError(f"unknown scoring run: {normalized_run_id}")
             self._runs.pop(normalized_run_id)
+            reserved = tuple(
+                identity for identity in self._reserved if identity.run_id == normalized_run_id
+            )
+            self._reserved.difference_update(reserved)
             futures = []
             for identity, future in tuple(self._futures.items()):
                 if identity.run_id == normalized_run_id:
                     self._futures.pop(identity)
+                    self._consuming.discard(identity)
                     futures.append(future)
         for future in futures:
             future.cancel()
-        return len(futures)
+        return len(reserved) + len(futures)
 
     def shutdown(self, *, wait: bool = True) -> None:
         """close submission and stop the worker pool."""
@@ -318,6 +394,8 @@ class SharedScoringPool:
             self._closed = True
             futures = tuple(self._futures.values())
             self._futures.clear()
+            self._reserved.clear()
+            self._consuming.clear()
             self._runs.clear()
         for future in futures:
             future.cancel()
@@ -328,6 +406,13 @@ class SharedScoringPool:
 
     def __exit__(self, *_exc_info: object) -> None:
         self.shutdown()
+
+    def _cancel_future(self, future: ScoringFuture) -> None:
+        with self._lock:
+            identity = future.identity
+            if self._futures.get(identity) is future:
+                self._futures.pop(identity)
+                self._consuming.discard(identity)
 
     def _require_open(self) -> None:
         if self._closed:
