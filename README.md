@@ -129,12 +129,12 @@ for serving. If the run is not deployed yet, `/v1/runs/<run_id>/chat` returns `4
 with a hint to deploy first.
 
 Operators can also call the serving backend directly after the adapter is registered.
-The default serving backend is `https://clado-ai--freesolo-lora-serving.modal.run`, and
+The default serving backend is `https://serve.freesolo.co`, and
 operators can point Flash at another backend by setting `FREESOLO_SERVING_URL`.
 Use that same base URL when calling the backend directly; pass the run id as `model`:
 
 ```bash
-export FREESOLO_SERVING_URL=https://clado-ai--freesolo-lora-serving.modal.run
+export FREESOLO_SERVING_URL=https://serve.freesolo.co
 
 curl -X POST "$FREESOLO_SERVING_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \

@@ -63,6 +63,7 @@ from flash.engine.worker.heartbeat import (
     _HB_UPLOAD_LOCK,
     _SFT_HEARTBEAT_INTERVAL_S,
     _STEP_GPU_DIAG_INTERVAL_S,
+    LATEST_GRPO_METRICS_LAST,
     heartbeat,
     make_reward_heartbeat_callback,
     make_sft_heartbeat_callback,
@@ -71,6 +72,7 @@ from flash.engine.worker.hf import (
     _hf_upload,
     _latest_checkpoint_dir,
     error_artifact_name,
+    flush_optional_uploads,
     hf_api,
     hf_prefix,
     hf_resume_checkpoint,
@@ -273,7 +275,9 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
-def _finalize(metrics: RunMetrics):
+def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
+    if not flush_optional_uploads():
+        print("optional upload flush timed out before final publication")
     metrics.save("/tmp/metrics.json")
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as f:
@@ -286,7 +290,7 @@ def _finalize(metrics: RunMetrics):
     # completed optimizer updates for opd; None (other phases) -> stepless as before.
     _step = metrics.step
     _step_field = {"step": int(_step)} if isinstance(_step, (int, float)) and _step > 0 else {}
-    heartbeat("done", **_step_field, gpu=gpu_diagnostics())
+    heartbeat("done", **_step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 
@@ -386,6 +390,8 @@ def main():
         os._exit(0)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
+        if not flush_optional_uploads():
+            print("optional upload flush timed out on worker error")
         try:
             err_name = error_artifact_name(RUN_MODE, ATTEMPT)
             err_path = f"/tmp/{err_name}"
@@ -397,11 +403,21 @@ def main():
         # A CUDA OOM -> stamp an ``oom`` flag so the runner retries on a LARGER GPU. Infra failures
         # keep same-size retry semantics and must never be reclassified as OOM.
         hb_flags = _worker_failure_flags(e)
+        detail = sanitize_diagnostic(e, limit=500)
+        # preserve the bounded metric backlog on BOTH the primary and the fallback error
+        # heartbeat. compute it (and detail) before the guarded call -- both are cheap and
+        # cannot raise -- so that if the primary heartbeat fails (most likely gpu_diagnostics()
+        # or the upload itself), the fallback still carries metrics_last, which is the backlog
+        # this path exists to surface for short failing RL runs.
+        _err_metrics = (
+            {"metrics_last": list(LATEST_GRPO_METRICS_LAST)} if LATEST_GRPO_METRICS_LAST else {}
+        )
         try:
-            detail = sanitize_diagnostic(e, limit=500)
-            heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, diag=gpu_diagnostics())
+            heartbeat(
+                f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics, diag=gpu_diagnostics()
+            )
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=sanitize_diagnostic(e, limit=500), **hb_flags)
+            heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
         wandb_finish(exit_code=1)
         remaining = _remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)
@@ -480,6 +496,7 @@ __all__ = [
     "disable_liger_grpo_torch_compile",
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",
+    "flush_optional_uploads",
     "force_vit_sdpa_on_blackwell",
     "force_vllm_backend_for_sm120",
     "free_gpu",

@@ -177,7 +177,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
             {
                 "vocab_size": 248320,
                 "hidden_size": 1024,
-                "num_hidden_layers": 28,
+                "num_hidden_layers": 24,
             }
         )
     )
@@ -197,6 +197,20 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(
         "Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40
     )
     assert need > 0
+
+    captured = {}
+
+    def capture_estimate(*args, **kwargs):
+        captured.update(kwargs)
+        return 10.0
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vram, "estimate_vram_gb", capture_estimate)
+        vram.model_required_vram_gb(
+            "Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40
+        )
+    assert captured["model_info"] is None
+    assert captured["active_params_b"] == 0.0
 
     class DriftApi(Api):
         def model_info(self, model, **kwargs):
@@ -219,7 +233,7 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
 
     config = tmp_path / "config.json"
     config.write_text(
-        json.dumps({"vocab_size": 248320, "hidden_size": 1024, "num_hidden_layers": 28})
+        json.dumps({"vocab_size": 248320, "hidden_size": 1024, "num_hidden_layers": 24})
     )
     monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(config))
 

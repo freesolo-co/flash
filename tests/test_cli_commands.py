@@ -14,6 +14,17 @@ import types
 import pytest
 
 import flash.cli as cli
+from flash.providers._poll import _format_heartbeat
+
+
+def test_format_heartbeat_appends_named_reward_metrics() -> None:
+    heartbeat = {"stage": "rl_step", "step": 4, "reward": 0.65}
+    base_line = _format_heartbeat(heartbeat)
+
+    assert base_line == "worker: stage=rl_step step=4 reward=0.650"
+    assert _format_heartbeat(
+        {**heartbeat, "reward_metrics": {"success": 0.8, "format": 0.5}}
+    ) == (base_line + " success=0.800 format=0.500")
 
 
 class _FakeClient:
@@ -228,8 +239,8 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.6-27B" in out
     assert "Qwen/Qwen3.5-2B" in out
-    assert "openbmb/MiniCPM5-1B" in out
     # only bare model ids, none of the extra per-model detail columns
     assert "2.3B" not in out
     assert "dense" not in out
@@ -239,15 +250,18 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "GPU class selection is fully automatic" in out
-    assert "cheapest validated managed class" in out
+    assert "GPU allocation is automatic by default" in out
+    assert "cheapest validated class" in out
+    assert 'exact_type = "<CLASS>"' in out
+    assert "[gpu] exact_type" not in out
+    assert "gpu.exact_type" not in out
+    assert "don't pin" not in out
+    assert "cannot pin" not in out
     assert "runpod" not in out.lower()
     assert "lambda" not in out.lower()
-    assert "You can still tune" not in out
-    assert "[gpu] config table" not in out
 
 
 def _train_config(tmp_path, *, extra_train: str = ""):
@@ -588,6 +602,101 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     assert "realized_cost=$1.2346" in err
 
 
+def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys) -> None:
+    metric_one = {
+        "step": 1,
+        "reward": 0.75,
+        "reward_std": 0.12,
+        "grad_norm": 1.5,
+        "kl": 0.03,
+        "entropy": 0.82,
+        "frac_reward_zero_std": 0.25,
+        "mean_completion_tokens": 48.5,
+        "truncation_rate": 0.125,
+        "max_completion_tokens": 256,
+    }
+    metric_two = {
+        "step": 2,
+        "reward": 0.8,
+        "reward_std": 0.1,
+        "grad_norm": 1.25,
+        "kl": None,
+        "entropy": 0.79,
+        "frac_reward_zero_std": 0.0,
+        "mean_completion_tokens": 51.0,
+        "truncation_rate": 0.25,
+        "max_completion_tokens": 256,
+    }
+
+    class _MetricClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = iter(
+                [
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "running",
+                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_one]},
+                    },
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "running",
+                        "last_heartbeat": {
+                            "stage": "rl_step",
+                            "metrics_last": [metric_one, metric_two],
+                        },
+                    },
+                    {
+                        "run_id": "flash-metrics",
+                        "state": "done",
+                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_two]},
+                    },
+                ]
+            )
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "running"}
+
+        def get_run(self, run_id: str) -> dict:
+            return next(self.statuses)
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    state, printed_any = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+
+    assert state == "done"
+    assert printed_any is False
+    metric_lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")]
+    assert metric_lines == [
+        "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
+        "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 max_comp_tokens=256",
+        "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
+        "comp_len=51 trunc=0.25 max_comp_tokens=256",
+    ]
+
+
+def test_log_follow_metric_dedup_is_attempt_aware() -> None:
+    from flash.cli.commands import _log_follow_metric_rows
+
+    seen = set()
+    attempt_one = {
+        "last_heartbeat": {
+            "attempt": 1,
+            "metrics_last": [{"step": 7, "reward": 0.5}],
+        }
+    }
+    attempt_two = {
+        "last_heartbeat": {
+            "attempt": 2,
+            "metrics_last": [{"step": 7, "reward": 0.6}],
+        }
+    }
+
+    assert _log_follow_metric_rows(attempt_one, seen) == ["step=7 reward=0.5"]
+    assert _log_follow_metric_rows(attempt_one, seen) == []
+    assert _log_follow_metric_rows(attempt_two, seen) == ["step=7 reward=0.6"]
+
+
 def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     """`state=cancelled` + adapter_ref=null + cost=0 reads as discardable, yet the per-step
     deployable checkpoints streamed before the cancel survive it — the cancel output must say
@@ -687,10 +796,12 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat_stream"
 
 
-def test_chat_checkpoint_ref_is_rejected(fake_client, capsys) -> None:
-    assert _run(["chat", "flash-1/step-40", "-m", "What is 6*7?"]) == 1
-    assert "full immutable adapter revision" in capsys.readouterr().err
-    assert not any(call[0] == "chat_stream" for call in fake_client.calls)
+def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
+    target = "flash-1/step-40"
+
+    assert _run(["chat", target, "-m", "What is 6*7?"]) == 0
+    assert fake_client.calls[-1][0] == "chat_stream"
+    assert fake_client.calls[-1][1] == target
 
 
 def test_chat_accepts_full_immutable_revision(fake_client) -> None:
@@ -1068,3 +1179,78 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
     _, progress = _log_follow_progress(malformed, "unknown")
     assert "hb=" not in progress  # non-numeric ts -> no fabricated age
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "typically several minutes, sometimes 15-20 min" in progress
+    assert "setup is not billed" in progress
+    assert "do not cancel" in progress
+
+    status["last_heartbeat"]["stage"] = "rl_step"
+    _, progress = _log_follow_progress(status, "unknown")
+    assert "warming up" not in progress
+    assert "not billed" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "hb=20m" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
+    # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
+    status = {
+        "state": "running",
+        "remote": {"attempt": 1},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"stage={stage}" in progress
+    assert "warming up" not in progress
+    assert "do not cancel" not in progress
+
+
+@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
+def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
+    import time as _time
+
+    from flash.cli.commands import _log_follow_progress
+
+    status = {
+        "state": "running",
+        "remote": {"attempt": 3},
+        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 3},
+    }
+    _, progress = _log_follow_progress(status, "unknown")
+
+    assert f"warming up (stage={stage})" in progress
+    assert "do not cancel" in progress

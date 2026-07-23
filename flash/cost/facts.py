@@ -30,6 +30,31 @@ def gpu_tflops(name: str) -> float:
     return GPU_COMPUTE_TFLOPS.get(name, _DEFAULT_TFLOPS)
 
 
+# realized TRAINING throughput sits well below peak when a class's training kernels don't reach it.
+# b200 (sm100) has no arch-tuned training kernels yet and falls back to the same portable paths as
+# h200 (sm90), so its 2.25 pflops dense-bf16 peak does not materialize for training -- realized
+# throughput is h200-class (and frequently lower for rl/grpo). cap b200 at h200 so the analytical
+# cost model does not rank it as faster/cheaper than h200 on peak flops alone (it is not, and is
+# often slower). this is a conservative floor: it never prices b200 above h200-equivalent training
+# time, so it cannot over-charge, and it removes the "b200 looks cheapest" inversion at the source.
+# refine per-workload once real b200 training samples exist. the vram/serving paths keep the true
+# peak via gpu_tflops; only the training-time model uses this.
+_TRAIN_TFLOPS_CAP: dict[str, float] = {
+    "B200": 990.0,  # h200-class realized training throughput, not the 2250 dense-bf16 peak
+}
+
+
+def effective_train_tflops(name: str) -> float:
+    """Realized bf16 TRAINING throughput for the analytical cost model.
+
+    Equal to ``gpu_tflops`` (peak) except where a class's training kernels fall short of peak: b200
+    training falls back to portable kernels, so it is capped at h200-class throughput rather than
+    its raw 2.25 pflops peak."""
+    peak = gpu_tflops(name)
+    cap = _TRAIN_TFLOPS_CAP.get(name)
+    return min(peak, cap) if cap is not None else peak
+
+
 def gpu_hourly_usd(
     name: str,
     provider: str | None = None,

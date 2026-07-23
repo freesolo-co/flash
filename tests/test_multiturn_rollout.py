@@ -20,6 +20,7 @@ from flash.engine.multiturn_rollout import (
     rollout_async,
     rollout_one,
 )
+from flash.envs.base import BaseEnvironment
 
 
 def test_prompt_key_is_insensitive_to_arrow_null_injection():
@@ -65,6 +66,7 @@ class FakeEnv:
     """Minimal MultiTurnEnv-shaped adapter: one env (user) turn, stops after 2 model turns."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {
@@ -116,6 +118,7 @@ class _VarTurnEnv:
     rollouts of different depths (exercises rollouts finishing at different turns)."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {
@@ -332,6 +335,7 @@ class _OneTurnEnv:
     """multi-turn-shaped env that stops after the first model turn (no env reply)."""
 
     multi_turn = True
+    rollout_rewards_many = BaseEnvironment.rollout_rewards_many
 
     def new_rollout_state(self, example):
         return {"prompt": [{"role": "user", "content": "hi"}], "completion": []}
@@ -559,7 +563,7 @@ def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
     the real engine finishes requests in completion-length order, not submission order."""
     pending = []  # (req_id, prefix_ids, max_tokens)
 
-    def submit(req_id, prefix_ids, max_tokens, initial):
+    def submit(req_id, prefix_ids, max_tokens, initial, images):
         pending.append((req_id, list(prefix_ids), max_tokens))
 
     def poll():
@@ -721,9 +725,9 @@ def _run_async(examples, active_env):
     )
 
 
-# _score_rollouts thread-pool fallback (PR #224): when the env has NO reward_many, the per-rollout
-# reward — often an IO-bound judge/tool round-trip — is scored concurrently, in input order, with a
-# reward_thread_safe opt-out. Exercised via rollout_async (the one shipped path through _score_rollouts).
+# score_rollouts uses the base thread-pool fallback when the env has no reward_many. per-rollout
+# rewards are scored concurrently in input order, with a reward_thread_safe opt-out. this is
+# exercised via rollout_async, the one shipped path through score_rollouts.
 def test_async_scores_rewards_concurrently():
     """No reward_many -> the fallback scores the batch CONCURRENTLY: correct + in INPUT ORDER, and N
     slow rewards take ~1x (not Nx) the per-call latency."""

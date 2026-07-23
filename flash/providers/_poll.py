@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from flash.diagnostics import neutralize_control_chars
 from flash.providers._deadline import remaining_seconds
 
 # Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
@@ -194,6 +195,19 @@ def format_gpu_status(gpu: Any) -> str:
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
+def _sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
+    """Return a sample's scalar as (label, finite value): GRPO ``reward`` or OPD ``loss``."""
+    for key in ("reward", "loss"):
+        if key not in sample:
+            continue
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            return None
+        return (key, value) if math.isfinite(value) else None
+    return None
+
+
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
     if hb.get("liveness"):
@@ -202,8 +216,15 @@ def _format_heartbeat(hb: dict) -> str:
         ("step", 0),
         ("epoch", 3),
         ("reward", 3),
+        ("reward_std", 3),
         ("loss", 4),
         ("grad_norm", 3),
+        ("kl", 3),
+        ("entropy", 3),
+        ("frac_reward_zero_std", 3),
+        ("mean_completion_tokens", 3),
+        ("truncation_rate", 3),
+        ("max_completion_tokens", 0),
         ("learning_rate", 8),
         ("setup_seconds", 1),
         ("train_wall", 1),
@@ -218,7 +239,53 @@ def _format_heartbeat(hb: dict) -> str:
                 msg += f" {key}={value:.{digits}f}"
         else:
             msg += f" {key}={value}"
+    reward_metrics = hb.get("reward_metrics")
+    if isinstance(reward_metrics, dict):
+        for name, value in reward_metrics.items():
+            if isinstance(value, (int, float)):
+                msg += f" {name}={value:.3f}"
     msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))
+    sample_lines: list[str] = []
+    rendered_samples = 0
+    samples = hb.get("sampled_completions")
+    if isinstance(samples, list):
+        for sample in samples:
+            if rendered_samples >= 3:
+                break
+            if not isinstance(sample, dict):
+                continue
+            prompt_tail = sample.get("prompt_tail")
+            completion = sample.get("completion")
+            if not isinstance(prompt_tail, str) or not isinstance(completion, str):
+                continue
+            # A sample carries exactly one scalar: GRPO reward (3dp) or OPD distillation loss (4dp).
+            scalar = _sampled_completion_scalar(sample)
+            if scalar is None:
+                continue
+            scalar_label, scalar_value = scalar
+            generated_at_step = sample.get("generated_at_step")
+            if generated_at_step is None:
+                step_suffix = ""
+            else:
+                try:
+                    step_suffix = f" step={int(generated_at_step)}"
+                except (TypeError, ValueError):
+                    continue
+            rendered_samples += 1
+            # Neutralize control chars (defense against a malformed heartbeat.json) but show the full
+            # prompt and completion — samples are surfaced untruncated by design.
+            prompt_tail = neutralize_control_chars(prompt_tail)
+            completion = neutralize_control_chars(completion)
+            digits = 4 if scalar_label == "loss" else 3
+            sample_lines.extend(
+                [
+                    f"  sample {rendered_samples} {scalar_label}={scalar_value:.{digits}f}{step_suffix}",
+                    f"    prompt: {prompt_tail.replace(chr(10), chr(10) + '      ')}",
+                    f"    completion: {completion.replace(chr(10), chr(10) + '      ')}",
+                ]
+            )
+    if sample_lines:
+        msg += "\n" + "\n".join(sample_lines)
     return msg
 
 

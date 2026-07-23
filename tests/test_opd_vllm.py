@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -117,6 +119,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_kwargs["max_num_batched_tokens"] == 8192
     assert _FakeLLM.last_kwargs["attention_backend"] == "TRITON_ATTN"
     assert _FakeLLM.last_kwargs["mm_encoder_attn_backend"] == "TORCH_SDPA"
+    assert "enable_tower_connector_lora" not in _FakeLLM.last_kwargs
     assert _FakeLLM.last_kwargs["enforce_eager"] is True
     assert _FakeLLM.last_kwargs["compilation_config"] == {
         "mode": 0,
@@ -134,6 +137,7 @@ def test_opd_vllm_engine_syncs_versioned_lora_and_generates(monkeypatch, tmp_pat
     assert _FakeLLM.last_generate["use_tqdm"] is False
     assert _SamplingParams.last_kwargs["stop"] == ["</answer>"]
     assert _SamplingParams.last_kwargs["include_stop_str_in_output"] is True
+    assert "logit_bias" not in _SamplingParams.last_kwargs
     assert out[0].token_ids == [3, 4]
     assert out[0].terminated is True
 
@@ -316,7 +320,7 @@ def test_opd_vllm_output_uses_stop_vs_length_for_skip_semantics():
     assert stop_over_eos_over_length.terminal_eos_id == 99
 
 
-def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80):
+def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80, free_gb=None):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
 
@@ -328,6 +332,11 @@ def _install_opd_kwargs_test_gpu(monkeypatch, *, card_gb=80):
         @staticmethod
         def get_device_properties(_idx):
             return SimpleNamespace(total_memory=card_gb * 1024**3)
+
+    if free_gb is not None:
+        _Cuda.mem_get_info = staticmethod(
+            lambda: (int(free_gb * 1024**3), int(card_gb * 1024**3))
+        )
 
     torch_mod = types.ModuleType("torch")
     torch_mod.cuda = _Cuda
@@ -417,6 +426,238 @@ def test_opd_vllm_kwargs_sizes_memory_for_full_prompt_batch(monkeypatch):
     assert out["gpu_memory_utilization"] == 0.37
 
 
+def test_opd_vllm_kwargs_drops_catalog_geometry_for_pinned_revision(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker import gpu_setup
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    class _Cuda:
+        @staticmethod
+        def get_device_capability():
+            return (8, 9)
+
+        @staticmethod
+        def get_device_properties(_idx):
+            return SimpleNamespace(total_memory=80e9)
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = _Cuda
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setattr(gpu_setup, "force_vllm_backend_for_sm120", lambda: None)
+    monkeypatch.setattr(gpu_setup, "force_vit_sdpa_on_blackwell", lambda: None)
+    captured = {}
+
+    def _resolve_params(_model_id, revision=""):
+        captured["revision"] = revision
+        return 35.0
+
+    def _capture_util(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0.37
+
+    monkeypatch.setattr(vram, "resolve_params_b", _resolve_params)
+    monkeypatch.setattr(vram, "colocate_kv_util", _capture_util)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.6-35B-A3B",
+        SimpleNamespace(prompts_per_step=1, group_size=1),
+        4096,
+        model_revision="a" * 40,
+    )
+
+    assert captured["revision"] == "a" * 40
+    assert captured["active_params_b"] == 0.0
+    assert captured["model_info"] is None
+    assert out["gpu_memory_utilization"] == 0.37
+
+    import inspect
+
+    from flash.engine.worker import opd as opd_mod
+
+    assert "model_revision=model_revision" in inspect.getsource(opd_mod.run_opd)
+
+
+@pytest.mark.parametrize(("card_gb", "free_gb"), [(80.0, 68.0), (141.0, 125.0)])
+def test_opd_vllm_kwargs_raises_util_toward_free_memory_after_training_reserve(
+    monkeypatch, card_gb, free_gb
+):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=card_gb, free_gb=free_gb)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.7)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512, lora_rank=32),
+        1536,
+    )
+
+    training_reserve_gb = vram.opd_training_reserve_gb(
+        4.7,
+        1536,
+        max_tokens=512,
+        prompts_per_step=8,
+        group_size=1,
+        vocab=248_320,
+    )
+    post_init_reserve_gb = vram.opd_post_init_reserve_gb(4.7, 32)
+    allocator_margin_gb = vram.opd_allocator_margin_gb(card_gb)
+    expected = min(
+        0.80,
+        (free_gb - training_reserve_gb - post_init_reserve_gb - allocator_margin_gb) / card_gb,
+    )
+    assert out["gpu_memory_utilization"] == pytest.approx(expected)
+    assert out["gpu_memory_utilization"] > 0.45
+    assert (
+        out["gpu_memory_utilization"] * card_gb
+        + training_reserve_gb
+        + post_init_reserve_gb
+        + allocator_margin_gb
+        <= free_gb
+    )
+
+
+def test_opd_vllm_kwargs_uses_resolved_prompt_count_for_training_reserve(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    captured = {}
+    training_reserve = vram.opd_training_reserve_gb
+
+    def _capture_training_reserve(*args, **kwargs):
+        captured.update(kwargs)
+        return training_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(vram, "opd_training_reserve_gb", _capture_training_reserve)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512, lora_rank=32),
+        1536,
+        prompts_per_step=2,
+    )
+
+    assert captured["prompts_per_step"] == 2
+    assert out["max_num_seqs"] == 2
+    assert out["rollout_batch_size"] == 2
+
+
+def test_opd_vllm_kwargs_uses_resolved_warm_start_rank_for_uplift(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 4.7)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+    captured = {}
+    post_init_reserve = vram.opd_post_init_reserve_gb
+
+    def _capture_post_init_reserve(params_b, lora_rank):
+        captured["params_b"] = params_b
+        captured["lora_rank"] = lora_rank
+        return post_init_reserve(params_b, lora_rank)
+
+    monkeypatch.setattr(vram, "opd_post_init_reserve_gb", _capture_post_init_reserve)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512, lora_rank=32),
+        1536,
+        lora_rank=64,
+    )
+
+    assert captured == {"params_b": 4.7, "lora_rank": 64}
+    assert out["gpu_memory_utilization"] == 0.22
+
+
+def test_opd_vllm_kwargs_keeps_conservative_util_for_35b_rank64_post_init_growth(monkeypatch):
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    card_gb = 180.0
+    free_gb = 114.0
+    dev_util = 0.45
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=card_gb, free_gb=free_gb)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: 35.0)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: dev_util)
+
+    out = opd_vllm_kwargs(
+        model_id,
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=1024, lora_rank=64),
+        2816,
+    )
+
+    active_b = float(MODELS[model_id].active_params_b)
+    loss_backward_reserve_gb = vram.opd_training_reserve_gb(
+        35.0,
+        2816,
+        max_tokens=1024,
+        prompts_per_step=8,
+        group_size=1,
+        vocab=vocab_size_for(model_id),
+        active_params_b=active_b,
+    )
+    post_init_reserve_gb = vram.opd_post_init_reserve_gb(35.0, 64)
+    allocator_margin_gb = vram.opd_allocator_margin_gb(card_gb)
+
+    assert out["gpu_memory_utilization"] == dev_util
+    assert (
+        out["gpu_memory_utilization"] * card_gb
+        + loss_backward_reserve_gb
+        + post_init_reserve_gb
+        + allocator_margin_gb
+        <= free_gb
+    )
+    old_incomplete_budget_util = (
+        free_gb - loss_backward_reserve_gb - allocator_margin_gb
+    ) / card_gb
+    assert old_incomplete_budget_util > out["gpu_memory_utilization"]
+
+
+def test_opd_vllm_kwargs_keeps_010_fallback_when_budget_sizing_fails(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80, free_gb=68)
+
+    def _fail(_model_id):
+        raise RuntimeError("geometry unavailable")
+
+    monkeypatch.setattr(vram, "resolve_params_b", _fail)
+
+    out = opd_vllm_kwargs(
+        "Qwen/Qwen3.5-4B",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512),
+        1536,
+    )
+
+    assert out["gpu_memory_utilization"] == 0.10
+
+
+def test_opd_vllm_kwargs_sizes_unknown_model_without_enabling_uplift(monkeypatch):
+    from flash.engine import vram
+    from flash.engine.worker.opd_vllm import opd_vllm_kwargs
+
+    _install_opd_kwargs_test_gpu(monkeypatch, card_gb=80.0, free_gb=68.0)
+    monkeypatch.setattr(vram, "resolve_params_b", lambda _model_id: None)
+    monkeypatch.setattr(vram, "colocate_kv_util", lambda *args, **kwargs: 0.22)
+
+    out = opd_vllm_kwargs(
+        "uncataloged/model",
+        SimpleNamespace(prompts_per_step=8, group_size=1, max_completion=512),
+        1536,
+    )
+
+    assert out["gpu_memory_utilization"] == 0.22
+    assert out["max_num_seqs"] == 8
+    assert out["rollout_batch_size"] == 8
+
+
 def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monkeypatch):
     from flash.engine import vram
     from flash.engine.worker import gpu_setup
@@ -433,7 +674,7 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
 
         @staticmethod
         def mem_get_info():
-            return 23 * 1024**3, 80 * 1024**3
+            return 29 * 1024**3, 80 * 1024**3
 
     torch_mod = types.ModuleType("torch")
     torch_mod.cuda = _Cuda
@@ -446,10 +687,12 @@ def test_opd_vllm_kwargs_reduces_rollout_batch_when_startup_memory_is_tight(monk
         return {8: 0.40, 7: 0.36, 6: 0.32, 5: 0.28, 4: 0.22}[num_generations]
 
     monkeypatch.setattr(vram, "colocate_kv_util", _util_for)
+    monkeypatch.setattr(vram, "opd_training_peak_gb", lambda *args, **kwargs: 4.0)
 
     out = opd_vllm_kwargs("test/model", SimpleNamespace(prompts_per_step=8, group_size=1), 4096)
 
-    assert out["gpu_memory_utilization"] == 0.22
+    protected_gb = 4.0 * 1.15 + vram.opd_post_init_reserve_gb(4.0, 32) + 4.0
+    assert out["gpu_memory_utilization"] == pytest.approx((29.0 - protected_gb) / 80.0)
     assert out["max_num_seqs"] == 4
     assert out["rollout_batch_size"] == 4
 
@@ -637,9 +880,12 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 
     class _SamplingParams:
         last_kwargs: ClassVar[dict] = {}
+        instances: ClassVar[list] = []
 
         def __init__(self, **kwargs):
-            _SamplingParams.last_kwargs = dict(kwargs)
+            self.kwargs = dict(kwargs)
+            _SamplingParams.last_kwargs = self.kwargs
+            _SamplingParams.instances.append(self)
 
     class _StructuredOutputsParams:
         def __init__(self, **kwargs):
@@ -653,12 +899,14 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
 
     class _FakeLLM:
         last_kwargs: ClassVar[dict] = {}
+        last_prompts: ClassVar[list] = []
 
         def __init__(self, **kwargs):
             _FakeLLM.last_kwargs = dict(kwargs)
             self.llm_engine = SimpleNamespace(remove_lora=lambda _id: None)
 
         def generate(self, prompts, *, sampling_params, lora_request, use_tqdm):
+            _FakeLLM.last_prompts = list(prompts)
             comp = SimpleNamespace(token_ids=[3], text="x", finish_reason="stop", stop_reason=None)
             return [SimpleNamespace(outputs=[comp]) for _ in prompts]
 
@@ -676,6 +924,184 @@ def _install_fake_vllm(monkeypatch, *, with_structured_outputs=True):
     monkeypatch.setitem(sys.modules, "vllm.lora.request", req_mod)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", sp_mod)
     return _SamplingParams, _StructuredOutputsParams
+
+
+def test_opd_vllm_sync_atomically_publishes_before_dropping_old_adapter(
+    monkeypatch, tmp_path
+):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    events = []
+
+    class _Model:
+        def save_pretrained(self, path):
+            events.append(("save", os.path.basename(path)))
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    events.clear()
+
+    real_replace = opd_vllm.os.replace
+
+    def _replace(source, destination):
+        real_replace(source, destination)
+        events.append(("replace", os.path.basename(destination)))
+
+    def _remove(old_lora_id):
+        events.append(
+            (
+                "remove",
+                old_lora_id,
+                engine._lora_request.lora_int_id,
+                Path(engine._lora_request.lora_path, "adapter_config.json").is_file(),
+            )
+        )
+        return True
+
+    monkeypatch.setattr(opd_vllm.os, "replace", _replace)
+    monkeypatch.setattr(engine, "_remove_lora", _remove)
+
+    engine.sync_from_model(_Model())
+
+    assert events[0][0] == "save"
+    assert events[0][1].startswith(".adapter-000002-")
+    assert events[1] == ("replace", "adapter-000002")
+    assert events[2] == ("remove", 1, 2, True)
+    assert engine.sync_count == 2
+    assert engine._sync_dirs == [str(tmp_path / "sync" / "adapter-000002")]
+    assert not any(path.name.startswith(".adapter-") for path in (tmp_path / "sync").iterdir())
+
+
+def test_opd_vllm_sync_replaces_stale_version_directory(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    adapter_root = tmp_path / "sync"
+    stale_dir = adapter_root / "adapter-000001"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+    class _Model:
+        def save_pretrained(self, path):
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        adapter_root=str(adapter_root),
+    )
+    engine.sync_from_model(_Model())
+
+    assert engine.sync_count == 1
+    assert not (stale_dir / "stale.txt").exists()
+    assert (stale_dir / "adapter_config.json").is_file()
+
+
+def test_opd_vllm_adapter_store_prefers_tmpfs(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    expected = tmp_path / "memory-backed"
+    seen = []
+
+    def _mkdtemp(*, prefix, dir=None):
+        seen.append((prefix, dir))
+        return str(expected)
+
+    monkeypatch.setattr(opd_vllm.tempfile, "mkdtemp", _mkdtemp)
+
+    assert opd_vllm._make_adapter_root() == (str(expected), True)
+    assert seen == [("flash_opd_vllm_lora_", opd_vllm._ADAPTER_TMPFS_ROOT)]
+
+
+def test_opd_vllm_adapter_store_falls_back_when_tmpfs_save_fails(monkeypatch, tmp_path):
+    from flash.engine.worker import opd_vllm
+
+    _install_fake_vllm(monkeypatch)
+    tmpfs_root = tmp_path / "tmpfs"
+    tmpfs_root.mkdir()
+    fallback_parent = tmp_path / "fallback"
+    fallback_parent.mkdir()
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _mkdtemp(*, prefix, dir=None):
+        if dir is None:
+            dir = fallback_parent
+        return real_mkdtemp(prefix=prefix, dir=dir)
+
+    saved = []
+
+    class _Model:
+        def save_pretrained(self, path):
+            saved.append(path)
+            if Path(path).parent == tmpfs_root:
+                raise OSError("tmpfs full")
+            Path(path, "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(opd_vllm, "_make_adapter_root", lambda: (str(tmpfs_root), True))
+    monkeypatch.setattr(opd_vllm.tempfile, "mkdtemp", _mkdtemp)
+    engine = opd_vllm.OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+    )
+    engine.sync_from_model(_Model())
+
+    assert len(saved) == 2
+    assert Path(saved[0]).parent == tmpfs_root
+    assert Path(engine.adapter_root).parent == fallback_parent
+    assert Path(saved[1]).parent == Path(engine.adapter_root)
+    assert Path(engine._lora_request.lora_path, "adapter_config.json").is_file()
+    assert engine.sync_count == 1
+    assert engine._adapter_root_is_tmpfs is False
+
+
+def test_opd_vllm_image_requests_include_multimodal_data_and_tower_lora(monkeypatch, tmp_path):
+    from flash.engine.worker.opd_vllm import OpdVllmRolloutEngine
+
+    sampling_params, _ = _install_fake_vllm(monkeypatch)
+    fake_llm = sys.modules["vllm"].LLM
+
+    class _Model:
+        def save_pretrained(self, path):
+            pass
+
+    image = object()
+    engine = OpdVllmRolloutEngine(
+        model_source="base",
+        max_model_len=2048,
+        temperature=0.7,
+        top_p=0.9,
+        enable_tower_connector_lora=True,
+        image_pad_token_id=99,
+        adapter_root=str(tmp_path / "sync"),
+    )
+    engine.sync_from_model(_Model())
+    engine.generate(
+        [[1, 99, 2], [7, 8]],
+        max_tokens=5,
+        multi_modal_data_batch=[{"image": image}, None],
+    )
+
+    assert fake_llm.last_kwargs["enable_tower_connector_lora"] is True
+    assert fake_llm.last_prompts == [
+        {"prompt_token_ids": [1, 99, 2], "multi_modal_data": {"image": image}},
+        {"prompt_token_ids": [7, 8]},
+    ]
+    assert sampling_params.instances[-2].kwargs["logit_bias"] == {99: -100.0}
+    assert "logit_bias" not in sampling_params.instances[-1].kwargs
+    with pytest.raises(ValueError, match="multimodal data count"):
+        engine.generate([[1], [2]], max_tokens=1, multi_modal_data_batch=[None])
 
 
 def test_opd_vllm_structured_outputs_reaches_sampling_params(monkeypatch, tmp_path):

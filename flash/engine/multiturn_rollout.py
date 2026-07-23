@@ -16,9 +16,10 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TypedDict
+
+from flash.engine.multiturn_reward_scoring import RolloutScoreRequest, score_rollouts
 
 
 class RolloutResult(TypedDict):
@@ -29,6 +30,8 @@ class RolloutResult(TypedDict):
     logprobs: list[float]
     env_mask: list[int]
     reward: float
+    turn_spans: list[tuple[int, int]]
+    turn_rewards: list[float] | None
 
 
 RolloutCompletion = tuple[str, list[int], list[float], str]
@@ -71,6 +74,8 @@ _ROLLOUT_FIELDS: tuple[str, ...] = (
     "logprobs",
     "env_mask",
     "reward",
+    "turn_spans",
+    "turn_rewards",
 )
 
 
@@ -174,6 +179,7 @@ def rollout_one(
     completion_ids: list[int] = []
     logprobs: list[float] = []
     env_mask: list[int] = []
+    turn_spans: list[tuple[int, int]] = []
 
     turns = 0
     while True:
@@ -184,7 +190,9 @@ def rollout_one(
                 break
             max_new = min(max_new, remaining)
         asst_ids, asst_lp, text = generate(cur_ids, max_new)
+        turn_start = len(completion_ids)
         completion_ids.extend(asst_ids)
+        turn_spans.append((turn_start, len(completion_ids)))
         logprobs.extend(asst_lp)
         env_mask.extend([1] * len(asst_ids))
         cur_ids.extend(asst_ids)
@@ -212,13 +220,18 @@ def rollout_one(
         env_mask.extend([0] * len(glue))
         cur_ids.extend(glue)
 
-    reward = active_env.reward("", example, state)
+    score = score_rollouts(
+        active_env,
+        [RolloutScoreRequest(example=example, state=state, turn_count=len(turn_spans))],
+    )[0]
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
         "logprobs": logprobs,
         "env_mask": env_mask,
-        "reward": float(reward),
+        "reward": score.episode,
+        "turn_spans": turn_spans,
+        "turn_rewards": list(score.turns) if score.turns is not None else None,
     }
 
 
@@ -326,33 +339,39 @@ class _RolloutState:
         "done",
         "env_mask",
         "example",
+        "images",
         "logprobs",
         "messages",
         "prompt_ids",
         "state",
+        "turn_spans",
         "turns",
     )
 
-    def __init__(self, example, messages, prompt_ids, state, budget):
+    def __init__(self, example, messages, prompt_ids, state, budget, images=None):
         self.example = example
+        self.images = images
         self.messages = messages
         self.prompt_ids = prompt_ids
         self.cur_ids = list(prompt_ids)  # invariant: cur_ids == prompt_ids + completion_ids so far
         self.completion_ids: list[int] = []
         self.logprobs: list[float] = []
         self.env_mask: list[int] = []
+        self.turn_spans: list[tuple[int, int]] = []
         self.state = state
         self.turns = 0
         self.budget = budget
         self.done = False
 
-    def result(self, reward: float) -> RolloutResult:
+    def result(self, reward: float, turn_rewards: list[float] | None) -> RolloutResult:
         return {
             "prompt_ids": self.prompt_ids,
             "completion_ids": self.completion_ids,
             "logprobs": self.logprobs,
             "env_mask": self.env_mask,
             "reward": float(reward),
+            "turn_spans": self.turn_spans,
+            "turn_rewards": turn_rewards,
         }
 
 
@@ -367,7 +386,9 @@ def _advance_after_turn(
     max_turns: int,
 ) -> None:
     """Fold one assistant turn into ``r`` and run its env step. Sets ``r.done`` when finished."""
+    turn_start = len(r.completion_ids)
     r.completion_ids.extend(asst_ids)
+    r.turn_spans.append((turn_start, len(r.completion_ids)))
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
     r.cur_ids.extend(asst_ids)
@@ -398,23 +419,56 @@ def _advance_after_turn(
     r.cur_ids.extend(glue)
 
 
+def _extract_prompt_images(messages: list[dict]) -> list[object]:
+    """Extract decoded PIL images from TRL-injected prompt content blocks."""
+    from PIL import Image
+
+    images = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in {
+                "image",
+                "image_url",
+                "input_image",
+            }:
+                continue
+            image = part.get("image")
+            if not isinstance(image, Image.Image):
+                raise ValueError(
+                    "multimodal rollout image blocks must carry a PIL image at part['image']"
+                )
+            images.append(image)
+    return images
+
+
 def _build_rollout_states(
     examples: list[dict],
     active_env,
     render: Callable[[list, bool], list[int]],
     engine_max_len: int | None,
+    *,
+    extract_images: bool = False,
+    rollout_prompts: list[list[dict]] | None = None,
 ) -> list[_RolloutState]:
     """Initialise one :class:`_RolloutState` per example for :func:`rollout_async`."""
+    if rollout_prompts is not None and len(rollout_prompts) != len(examples):
+        raise ValueError("rollout prompts must align one-to-one with examples")
     rollouts: list[_RolloutState] = []
-    for example in examples:
+    for index, example in enumerate(examples):
         state = active_env.new_rollout_state(example)
         initial_messages = state.get("prompt") or state.get("messages")
+        if rollout_prompts is not None:
+            initial_messages = rollout_prompts[index]
         if not isinstance(initial_messages, list):
             raise KeyError("multi-turn rollout state must include prompt or messages")
         messages = [dict(m) for m in initial_messages]
+        images = _extract_prompt_images(messages) if extract_images else None
         prompt_ids = render(messages, True)
         budget = (engine_max_len - len(prompt_ids) - 8) if engine_max_len else None
-        rollouts.append(_RolloutState(example, messages, prompt_ids, state, budget))
+        rollouts.append(_RolloutState(example, messages, prompt_ids, state, budget, images))
     return rollouts
 
 
@@ -428,31 +482,6 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
             return None
         max_new = min(max_new, remaining)
     return max(1, max_new)
-
-
-def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
-    """Reward each rollout in input order, using reward_many, concurrent, or serial scoring."""
-    reward_many = getattr(active_env, "reward_many", None)
-    if callable(reward_many):
-        rewards = reward_many([(r.example, r.state) for r in rollouts])
-        if len(rewards) != len(rollouts):
-            raise RuntimeError("env.reward_many returned the wrong number of rewards")
-        return [float(x) for x in rewards]
-
-    def _score(r: _RolloutState) -> float:
-        return float(active_env.reward("", r.example, r.state))
-
-    if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
-        return [_score(r) for r in rollouts]
-    pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
-    try:
-        futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
-        scores: list[float] = [0.0] * len(rollouts)
-        for fut in as_completed(futures):
-            scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-    return scores
 
 
 _PHYSICAL_REQUEST_COUNTER = itertools.count()
@@ -481,6 +510,7 @@ class _LogicalRequest:
     prefix_ids: tuple[int, ...]
     max_tokens: int
     initial: bool
+    images: list[object] | None
     attempts: int = 0
     started_at: float = 0.0
 
@@ -490,7 +520,7 @@ def rollout_async(
     examples: list[dict],
     active_env,
     render: Callable[[list, bool], list[int]],
-    submit: Callable[[str, list[int], int, bool], None],
+    submit: Callable[[str, list[int], int, bool, list[object] | None], None],
     poll: Callable[[], list[RolloutCompletion]],
     busy: Callable[[], bool],
     abort: Callable[[list[str]], None],
@@ -498,6 +528,8 @@ def rollout_async(
     max_turns: int,
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
+    extract_images: bool = False,
+    rollout_prompts: list[list[dict]] | None = None,
     request_timeout_seconds: float | None = None,
     request_max_attempts: int = 2,
     monotonic: Callable[[], float] = time.monotonic,
@@ -516,7 +548,14 @@ def rollout_async(
     if request_timeout_seconds is not None and request_timeout_seconds <= 0:
         raise ValueError("request_timeout_seconds must be positive when set")
 
-    rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
+    rollouts = _build_rollout_states(
+        examples,
+        active_env,
+        render,
+        engine_max_len,
+        extract_images=extract_images,
+        rollout_prompts=rollout_prompts,
+    )
     by_id: dict[str, _LogicalRequest] = {}
     to_env: queue.Queue = queue.Queue()
     to_submit: queue.Queue = queue.Queue()
@@ -527,7 +566,13 @@ def rollout_async(
         logical.started_at = monotonic()
         by_id[req_id] = logical
         try:
-            submit(req_id, list(logical.prefix_ids), logical.max_tokens, logical.initial)
+            submit(
+                req_id,
+                list(logical.prefix_ids),
+                logical.max_tokens,
+                logical.initial,
+                logical.images,
+            )
         except Exception:
             by_id.pop(req_id, None)
             with contextlib.suppress(Exception):
@@ -541,6 +586,7 @@ def rollout_async(
                 prefix_ids=tuple(prefix),
                 max_tokens=int(max_new),
                 initial=bool(initial),
+                images=r.images,
             )
         )
 
@@ -638,8 +684,22 @@ def rollout_async(
         to_env.put(None)
         worker.join()
 
-    rewards = _score_rollouts(active_env, rollouts)
-    return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
+    requests = [
+        RolloutScoreRequest(
+            example=rollout.example,
+            state=rollout.state,
+            turn_count=len(rollout.turn_spans),
+        )
+        for rollout in rollouts
+    ]
+    scores = score_rollouts(active_env, requests)
+    return [
+        rollout.result(
+            score.episode,
+            list(score.turns) if score.turns is not None else None,
+        )
+        for rollout, score in zip(rollouts, scores, strict=True)
+    ]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
@@ -718,6 +778,8 @@ def build_rollout_func(
     active_env,
     tok,
     examples_by_key: dict,
+    processor=None,
+    multimodal: bool = False,
     max_completion: int,
     max_turns: int,
     temperature: float,
@@ -751,18 +813,47 @@ def build_rollout_func(
 
         _SOParams = StructuredOutputsParams
 
-    _render_cache = _LRUCache(8192)
-
-    def render(messages: list, add_generation_prompt: bool) -> list[int]:
-        cache_key = (
-            f"{add_generation_prompt}\x00{json.dumps(messages, sort_keys=True, default=str)}"
+    image_pad_id = None
+    if multimodal:
+        if processor is None:
+            raise ValueError("multimodal rollout requires a processor")
+        from flash.multimodal import (
+            collapse_image_pad_runs,
+            multimodal_prompt_key,
+            resolve_image_pad_token_id,
         )
-        cached = _render_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        ids = render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
-        _render_cache.put(cache_key, ids)
-        return ids
+
+        image_pad_id = resolve_image_pad_token_id(processor, tok)
+
+        def render(messages: list, add_generation_prompt: bool) -> list[int]:
+            rendered = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                return_dict=True,
+                enable_thinking=thinking,
+            )
+            input_ids = rendered["input_ids"]
+            if hasattr(input_ids, "tolist"):
+                input_ids = input_ids.tolist()
+            ids = list(input_ids)
+            if ids and isinstance(ids[0], (list, tuple)):
+                ids = list(ids[0])
+            return [int(token_id) for token_id in ids]
+
+    else:
+        _render_cache = _LRUCache(8192)
+
+        def render(messages: list, add_generation_prompt: bool) -> list[int]:
+            cache_key = (
+                f"{add_generation_prompt}\x00{json.dumps(messages, sort_keys=True, default=str)}"
+            )
+            cached = _render_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            ids = render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
+            _render_cache.put(cache_key, ids)
+            return ids
 
     env_glue = make_env_glue(tok, thinking=thinking)
 
@@ -774,7 +865,13 @@ def build_rollout_func(
         vocab_size = _engine_vocab_size(engine)
         active_ids: set[str] = set()
 
-        def submit(req_id: str, prefix_ids: list[int], max_tokens: int, initial: bool) -> None:
+        def submit(
+            req_id: str,
+            prefix_ids: list[int],
+            max_tokens: int,
+            initial: bool,
+            images: list[object] | None,
+        ) -> None:
             """Enqueue one assistant-turn request."""
             if not prefix_ids:
                 raise ValueError(
@@ -801,9 +898,21 @@ def build_rollout_func(
                 # env contract has no per-turn schema channel; unconstrained env/tool turns are
                 # not generated here.
                 sp_kwargs["structured_outputs"] = _SOParams(**copy.deepcopy(structured_outputs))
-            llm_engine.add_request(
-                req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs)
-            )
+            if images:
+                if image_pad_id is None:
+                    raise ValueError("multimodal rollout is missing the image-pad token id")
+                collapsed = collapse_image_pad_runs(list(prefix_ids), image_pad_id, len(images))
+                prompt = {
+                    "prompt_token_ids": collapsed,
+                    "multi_modal_data": {"image": images if len(images) > 1 else images[0]},
+                }
+                # suppress the image-pad token during generation: a stray pad emitted into the
+                # assistant turn would corrupt the next turn's collapse_image_pad_runs count and
+                # misalign vision data, aborting the rollout. mirrors the single-turn opd guard.
+                sp_kwargs["logit_bias"] = {int(image_pad_id): -100.0}
+            else:
+                prompt = {"prompt_token_ids": list(prefix_ids)}
+            llm_engine.add_request(req_id, prompt, SamplingParams(**sp_kwargs))
             active_ids.add(req_id)
 
         def poll() -> list[RolloutCompletion]:
@@ -838,7 +947,12 @@ def build_rollout_func(
             if sleep_mode:
                 engine.wake_up(tags=["kv_cache"])
                 woke = True
-            examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
+            if multimodal:
+                examples = [
+                    examples_by_key.get(multimodal_prompt_key(p), {"prompt": p}) for p in prompts
+                ]
+            else:
+                examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
             rollouts = rollout_async(
                 examples=examples,
                 active_env=active_env,
@@ -850,16 +964,18 @@ def build_rollout_func(
                 max_turns=max_turns,
                 per_turn_max_tokens=max_completion,
                 engine_max_len=engine_max_len,
+                extract_images=multimodal,
+                rollout_prompts=prompts if multimodal else None,
                 abort=abort,
                 request_timeout_seconds=request_timeout_seconds,
                 request_max_attempts=request_max_attempts,
                 monotonic=monotonic,
                 request_id_factory=request_id_factory,
             )
-            out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
-            for r in rollouts:
-                for k in out:
-                    out[k].append(r[k])
+            out: dict[str, list] = {key: [] for key in _ROLLOUT_FIELDS}
+            for rollout in rollouts:
+                for key in out:
+                    out[key].append(rollout[key])
             return out
         finally:
             # Abort in-flight requests on error so they don't corrupt the next GRPO step.
