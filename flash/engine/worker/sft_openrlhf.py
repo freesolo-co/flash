@@ -613,6 +613,8 @@ class _OpenRLHFCheckpointWatcher:
     def _publish(self, step: int, ds_dir: str, hf_dir: str) -> None:
         required = step in self.required_steps
         try:
+            if required and not _w.HF_REPO:
+                raise RuntimeError("required SFT saves have no artifact repository")
             adapter_dir = os.path.join(self.export_root, f"step-{step}")
             _export_checkpoint_adapter(
                 hf_dir,

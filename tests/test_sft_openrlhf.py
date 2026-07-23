@@ -468,6 +468,7 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
 
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
+    monkeypatch.setattr(openrlhf_mod._w, "HF_REPO", "org/artifacts")
     ds_dir = checkpoint_dir / "global_step3"
     hf_dir = checkpoint_dir / "global_step3_hf"
     ds_dir.mkdir()
@@ -525,6 +526,42 @@ def test_required_checkpoint_publish_writes_durability_marker(monkeypatch, tmp_p
     )
     with pytest.raises(openrlhf_mod._w.RetriableInfraError, match="full-state checkpoint"):
         retry_watcher._publish(3, str(ds_dir), str(hf_dir))
+
+
+def test_required_checkpoint_rejects_missing_artifact_repository(monkeypatch, tmp_path):
+    import flash.engine.worker.sft_openrlhf as openrlhf_mod
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    monkeypatch.setattr(openrlhf_mod._w, "HF_REPO", "")
+    export_calls = []
+    upload_calls = []
+    monkeypatch.setattr(
+        openrlhf_mod,
+        "_export_checkpoint_adapter",
+        lambda *args, **kwargs: export_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        openrlhf_mod._w,
+        "upload_resume_checkpoint",
+        lambda *args, **kwargs: upload_calls.append((args, kwargs)),
+    )
+    watcher = _OpenRLHFCheckpointWatcher(
+        checkpoint_dir=str(checkpoint_dir),
+        export_root=str(tmp_path / "exports"),
+        processing_dir=str(tmp_path / "processing"),
+        python_bin="python",
+        model_id="org/model",
+        model_revision="a" * 40,
+        required_steps=(3,),
+    )
+
+    with pytest.raises(RuntimeError, match="no artifact repository"):
+        watcher._publish(3, str(checkpoint_dir / "global_step3"), str(checkpoint_dir / "global_step3_hf"))
+
+    assert export_calls == []
+    assert upload_calls == []
+    assert (checkpoint_dir / ".flash-required-step-3.failed").is_file()
 
 
 def test_final_checkpoint_retry_uses_deployable_publication_state():
