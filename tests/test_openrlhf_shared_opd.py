@@ -610,6 +610,56 @@ def test_opd_no_signal_uses_bounded_attempt_identity_before_update(tmp_path):
     asyncio.run(scenario())
 
 
+@requires_torch
+def test_opd_all_no_signal_advances_without_optimizer_or_adapter_mutation(tmp_path):
+    async def scenario():
+        actor, engine, _backend = _build_runtime(tmp_path, 1)
+        state = await _register(actor, "run-a", [_prompt()])
+        initial_handle = state.handle
+        parameters_before = _parameter_bytes(state.adapter_parameters)
+        optimizer_before = _optimizer_bytes(state.optimizer)
+
+        def request(_url, payload):
+            action_length = len(payload["sequence_ids"]) - 1
+            return {
+                "teacher_group_ids": [-1] * action_length,
+                "teacher_logsums": [0.0] * action_length,
+                "teacher_signal_mask": [False] * action_length,
+                "signal_count": 0,
+                "coverage": 0.0,
+            }
+
+        driver = _driver(
+            "run-a",
+            actor,
+            engine,
+            "http://127.0.0.1:1/teacher/run-key",
+            no_signal_attempts=3,
+            request=request,
+        )
+        rollout = await driver.rollout("run-a", 0)
+        teacher = driver.score(driver.scoring_payload("run-a", 0, rollout))
+        scoring_result = ScoringResult(
+            ScoringBatchIdentity("run-a", 0, "run-a-step-0"),
+            ScoringKind.TEACHER,
+            teacher,
+        )
+
+        result = await driver.update_and_publish("run-a", 0, rollout, scoring_result)
+        next_rollout = await driver.rollout("run-a", 1)
+
+        assert result.aligned_samples == 0
+        assert result.objective.item() == 0.0
+        assert result.training_step.handle == initial_handle
+        assert next_rollout.handle == initial_handle
+        assert state.global_step == 1
+        assert state.handle.version == 0
+        assert _parameter_bytes(state.adapter_parameters) == parameters_before
+        assert _optimizer_bytes(state.optimizer) == optimizer_before
+
+    asyncio.run(scenario())
+
+
 def test_teacher_request_retry_matches_transport_only_single_run_contract(monkeypatch):
     calls = []
 

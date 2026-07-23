@@ -27,6 +27,11 @@ def _spec(
     revision: str = _REVISION,
     rank: int = 64,
     max_context_tokens: int = 8192,
+    batch_size: int = 8,
+    group_size: int = 4,
+    kl_penalty_coef: float | None = None,
+    init_from_adapter: str = "",
+    init_from_adapter_revision: str = "",
     algorithm: str = "grpo",
     gpu: str = "H100",
 ) -> JobSpec:
@@ -40,7 +45,11 @@ def _spec(
             lora_alpha=rank * 2,
             max_context_tokens=max_context_tokens,
             max_completion_tokens=512,
-            group_size=4,
+            batch_size=batch_size,
+            group_size=group_size,
+            kl_penalty_coef=kl_penalty_coef,
+            init_from_adapter=init_from_adapter,
+            init_from_adapter_revision=init_from_adapter_revision,
             max_steps=2,
         ),
         gpu=GpuSpec(type=gpu, exact_type=gpu),
@@ -109,6 +118,22 @@ def test_bundle_admits_to_estimated_n_then_queues_with_reason():
     assert bundle.member_run_ids == ("run-0", "run-1", "run-2", "run-3")
 
 
+def test_packer_rejects_run_id_already_assigned_to_a_sealed_bundle():
+    packer = SharedEngineBundlePacker()
+    decisions = [packer.offer(_spec(f"run-{index}")) for index in range(4)]
+    bundle = packer.bundles[0]
+
+    assert all(decision.outcome is BundleAdmissionOutcome.ADMITTED for decision in decisions)
+    assert bundle.sealed is True
+
+    duplicate = packer.offer(_spec("run-0"))
+
+    assert duplicate.outcome is BundleAdmissionOutcome.REJECTED
+    assert duplicate.bundle_id == bundle.bundle_id
+    assert duplicate.reason == f"run 'run-0' is already assigned to bundle {bundle.bundle_id}"
+    assert len(packer.bundles) == 1
+
+
 def test_run_status_transitions_are_independent_between_siblings():
     bundle = SharedEngineBundle("bundle-status", _spec("seed"))
     for run_id in ("run-a", "run-b", "run-c"):
@@ -144,29 +169,34 @@ class _Clock:
         self.value += seconds
 
 
-def test_packing_window_seals_on_deadline_and_rejects_late_membership():
+def test_offer_self_enforces_packing_deadline_and_opens_a_new_bundle():
     clock = _Clock()
     packer = SharedEngineBundlePacker(packing_delay_s=3, clock=clock)
-    decision = packer.offer(_spec("run-a"))
-    bundle = packer.bundles[0]
+    first = packer.offer(_spec("run-a"))
+    first_bundle = packer.bundles[0]
 
-    assert decision.outcome is BundleAdmissionOutcome.ADMITTED
-    assert bundle.sealed is False
-    clock.advance(2.9)
-    assert packer.seal_ready() == ()
-    clock.advance(0.1)
-    assert packer.seal_ready() == (bundle,)
-    assert bundle.sealed is True
-    assert bundle.member_run_ids == ("run-a",)
+    assert first.outcome is BundleAdmissionOutcome.ADMITTED
+    clock.advance(3)
+    late = packer.offer(_spec("run-b"))
+
+    assert first_bundle.sealed is True
+    assert first_bundle.member_run_ids == ("run-a",)
+    assert late.outcome is BundleAdmissionOutcome.ADMITTED
+    assert late.bundle_id != first.bundle_id
+    assert len(packer.bundles) == 2
+
+
+def test_direct_bundle_queues_late_member_without_external_seal_tick():
+    clock = _Clock()
+    bundle = SharedEngineBundle("bundle-deadline", _spec("seed"), packing_delay_s=3, clock=clock)
+    bundle.try_admit(_spec("run-a"))
+    clock.advance(3)
 
     late = bundle.try_admit(_spec("run-b"))
+
+    assert bundle.sealed is True
     assert late.outcome is BundleAdmissionOutcome.QUEUED
-    assert (
-        late.reason
-        == "bundle shared-"
-        + bundle.compatibility_key.digest[:12]
-        + "-1 is sealed; create a new compatible bundle"
-    )
+    assert late.reason == "bundle bundle-deadline is sealed; create a new compatible bundle"
     assert bundle.member_run_ids == ("run-a",)
 
 
@@ -182,6 +212,67 @@ def test_compatibility_key_is_deterministic_and_stable_for_equal_specs():
     assert len(first.digest) == 64
     assert first.max_model_length == grpo_rollout_seq_len(8192, 512, False)
     assert first.lora_target_modules == ("all-linear",)
+
+
+def test_reference_adapter_requirement_is_keyed_and_charged():
+    without_reference = _spec("run-a")
+    with_reference = _spec("run-b", kl_penalty_coef=0.1)
+
+    plain_key = BundleCompatibilityKey.from_job_spec(without_reference)
+    reference_key = BundleCompatibilityKey.from_job_spec(with_reference)
+    plain_estimate = estimate_bundle_admission(without_reference)
+    reference_estimate = estimate_bundle_admission(with_reference)
+
+    assert plain_key.reference_adapter_required is False
+    assert reference_key.reference_adapter_required is True
+    assert plain_key != reference_key
+    assert reference_estimate.per_run_persistent_gib > plain_estimate.per_run_persistent_gib
+
+
+def test_warm_start_geometry_is_isolated_by_immutable_source_identity():
+    fresh = BundleCompatibilityKey.from_job_spec(_spec("fresh"))
+    warm_a = BundleCompatibilityKey.from_job_spec(
+        _spec(
+            "warm-a",
+            init_from_adapter="repo:rl/source-a",
+            init_from_adapter_revision="1" * 40,
+        )
+    )
+    warm_a_equal = BundleCompatibilityKey.from_job_spec(
+        _spec(
+            "warm-a-equal",
+            init_from_adapter="repo:rl/source-a",
+            init_from_adapter_revision="1" * 40,
+        )
+    )
+    warm_b = BundleCompatibilityKey.from_job_spec(
+        _spec(
+            "warm-b",
+            init_from_adapter="repo:rl/source-b",
+            init_from_adapter_revision="1" * 40,
+        )
+    )
+
+    assert fresh.lora_geometry_identity == "managed:all-linear"
+    assert warm_a == warm_a_equal
+    assert warm_a != fresh
+    assert warm_a != warm_b
+
+
+def test_rollout_concurrency_is_keyed_and_reduces_capacity():
+    baseline = _spec("baseline", batch_size=8, group_size=4)
+    high_concurrency = _spec("high", batch_size=64, group_size=8)
+
+    baseline_key = BundleCompatibilityKey.from_job_spec(baseline)
+    high_key = BundleCompatibilityKey.from_job_spec(high_concurrency)
+    baseline_estimate = estimate_bundle_admission(baseline)
+    high_estimate = estimate_bundle_admission(high_concurrency)
+
+    assert baseline_key.rollout_concurrency == 32
+    assert high_key.rollout_concurrency == 512
+    assert baseline_key != high_key
+    assert baseline_estimate.estimated_n == 4
+    assert high_estimate.estimated_n == 1
 
 
 def test_exact_model_revision_is_part_of_compatibility():

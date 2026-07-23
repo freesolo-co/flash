@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 
 from flash.catalog import ModelInfo, get_model, supports_image_training
+from flash.engine.recipe import RECIPE
 from flash.engine.vram import grpo_rollout_seq_len, opd_rollout_seq_len
 from flash.providers.base import get_gpu_info, supports_fp8_kv
 from flash.spec import JobSpec
@@ -23,6 +24,7 @@ _SHARED_RUNTIME_RESERVE_GIB = {"H100": 24.0, "H200": 28.0}
 _LORA_PERSISTENT_BYTES_PER_PARAM = 9.0
 _LORA_ACTIVE_BYTES_PER_PARAM = 4.0
 _REFERENCE_ADAPTER_BYTES_PER_PARAM = 2.0
+_BASELINE_ROLLOUT_CONCURRENCY = 32
 
 
 class BundleAdmissionOutcome(StrEnum):
@@ -72,7 +74,10 @@ class BundleCompatibilityKey:
     tensor_parallel_size: int
     lora_rank: int
     lora_target_modules: tuple[str, ...]
+    lora_geometry_identity: str
+    reference_adapter_required: bool
     max_model_length: int
+    rollout_concurrency: int
     parameter_dtype: str
     kv_cache_dtype: str
     attention_backend: str
@@ -106,7 +111,10 @@ class BundleCompatibilityKey:
             tensor_parallel_size=1,
             lora_rank=int(spec.train.lora_rank),
             lora_target_modules=_TARGET_MODULES,
+            lora_geometry_identity=_lora_geometry_identity(spec),
+            reference_adapter_required=_requires_reference_adapter(spec),
             max_model_length=max_model_length,
+            rollout_concurrency=_rollout_concurrency(spec),
             parameter_dtype="bf16",
             kv_cache_dtype="fp8" if supports_fp8_kv(gpu_type) else "bf16",
             attention_backend=attention_backend,
@@ -213,6 +221,31 @@ def _rollout_context(spec: JobSpec) -> int:
     return grpo_rollout_seq_len(max_context, max_completion, spec.thinking)
 
 
+def _rollout_concurrency(spec: JobSpec) -> int:
+    if spec.algorithm == "opd":
+        default_batch = RECIPE.opd.prompts_per_step
+        default_group = RECIPE.opd.group_size
+    else:
+        default_batch = RECIPE.rl.prompts_per_step
+        default_group = RECIPE.rl.group_size
+    prompts_per_step = int(spec.train.batch_size or default_batch)
+    group_size = int(spec.train.group_size or default_group)
+    return max(1, prompts_per_step) * max(1, group_size)
+
+
+def _requires_reference_adapter(spec: JobSpec) -> bool:
+    return spec.algorithm == "grpo" and float(spec.train.kl_penalty_coef or 0.0) > 0
+
+
+def _lora_geometry_identity(spec: JobSpec) -> str:
+    adapter_ref = str(spec.train.init_from_adapter or "").strip()
+    if not adapter_ref:
+        return "managed:all-linear"
+    revision = str(spec.train.init_from_adapter_revision or "").strip()
+    identity = hashlib.sha256(f"{adapter_ref}\0{revision}".encode()).hexdigest()
+    return f"warm-start:{identity}"
+
+
 def _catalog_model_info(spec: JobSpec) -> ModelInfo:
     try:
         return get_model(spec.model)
@@ -301,7 +334,7 @@ def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
     shared_runtime_reserve_gib = _SHARED_RUNTIME_RESERVE_GIB[gpu_type]
     active_adapter_workspace_gib = _gib(lora_parameters * _LORA_ACTIVE_BYTES_PER_PARAM)
     per_run_bytes = lora_parameters * _LORA_PERSISTENT_BYTES_PER_PARAM
-    if float(spec.train.kl_penalty_coef or 0.0) > 0:
+    if _requires_reference_adapter(spec):
         per_run_bytes += lora_parameters * _REFERENCE_ADAPTER_BYTES_PER_PARAM
     per_run_persistent_gib = _gib(per_run_bytes)
     usable_per_run_gib = max(
@@ -315,9 +348,11 @@ def estimate_bundle_admission(spec: JobSpec) -> BundleAdmissionEstimate:
 
     rank = max(1, int(spec.train.lora_rank))
     context_scale = max(1, math.ceil(_rollout_context(spec) / 8192))
+    concurrency_ratio = _rollout_concurrency(spec) / _BASELINE_ROLLOUT_CONCURRENCY
+    concurrency_scale = max(1, math.ceil(math.sqrt(concurrency_ratio)))
     base_cap = _SUPPORTED_GPU_CAPS[gpu_type]
     rank_adjusted_cap = max(1, math.floor(base_cap * 64 / rank))
-    safety_cap = max(1, rank_adjusted_cap // context_scale)
+    safety_cap = max(1, rank_adjusted_cap // context_scale // concurrency_scale)
     estimated_n = max(0, min(memory_cap, safety_cap))
     reason = None
     if estimated_n < 1:
@@ -438,6 +473,8 @@ class SharedEngineBundle:
                 run_id,
                 f"run {run_id!r} is already a member of bundle {self.bundle_id}",
             )
+        if not self.sealed and self._runs and self._clock() >= self._packing_deadline:
+            self.seal()
         try:
             candidate_key = BundleCompatibilityKey.from_job_spec(spec)
         except (TypeError, ValueError) as exc:
@@ -543,6 +580,7 @@ class SharedEngineBundlePacker:
         self._packing_delay_s = float(packing_delay_s)
         self._clock = clock
         self._bundles: list[SharedEngineBundle] = []
+        self._bundle_by_run_id: dict[str, SharedEngineBundle] = {}
         self._bundle_counter = 0
 
     @property
@@ -552,6 +590,17 @@ class SharedEngineBundlePacker:
     def offer(self, spec: JobSpec) -> BundleAdmissionDecision:
         """admit to an open compatible bundle or create the next packing window."""
 
+        run_id = str(spec.run_id).strip()
+        existing_bundle = self._bundle_by_run_id.get(run_id)
+        if existing_bundle is not None:
+            return BundleAdmissionDecision(
+                outcome=BundleAdmissionOutcome.REJECTED,
+                run_id=run_id,
+                bundle_id=existing_bundle.bundle_id,
+                estimated_n=existing_bundle.estimated_n,
+                reason=f"run {run_id!r} is already assigned to bundle {existing_bundle.bundle_id}",
+            )
+        self.seal_ready()
         estimate = estimate_bundle_admission(spec)
         if estimate.estimated_n < 1:
             return BundleAdmissionDecision(
@@ -567,6 +616,7 @@ class SharedEngineBundlePacker:
                 continue
             decision = bundle.try_admit(spec)
             if decision.outcome is BundleAdmissionOutcome.ADMITTED:
+                self._bundle_by_run_id[run_id] = bundle
                 if bundle.full:
                     bundle.seal()
                 return decision
@@ -577,6 +627,7 @@ class SharedEngineBundlePacker:
         decision = bundle.try_admit(spec)
         if decision.outcome is BundleAdmissionOutcome.ADMITTED:
             self._bundles.append(bundle)
+            self._bundle_by_run_id[run_id] = bundle
             if bundle.full:
                 bundle.seal()
         return decision

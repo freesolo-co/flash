@@ -644,6 +644,16 @@ class SharedOPDRunAdapter:
         aligned_samples = int(
             (training_batch.response_mask & training_batch.group_ids.ge(0)).any(dim=-1).sum().item()
         )
+        if not aligned_samples:
+            training_step = await self._training_actor.advance_without_update(self.run_id)
+            result = SharedOPDUpdateResult(
+                training_step=training_step,
+                objective=training_batch.teacher_logsums.new_zeros(()),
+                aligned_samples=0,
+                teacher_coverage=float(training_batch.coverage.mean().item()),
+            )
+            self._last_update = result
+            return result
 
         def loss_function(model: Any, active_state: TrainingRunState) -> Any:
             student_logprobs = self._policy_log_probs(model, active_state, training_batch)
@@ -651,19 +661,16 @@ class SharedOPDRunAdapter:
                 raise ValueError(
                     "shared OPD policy log probabilities do not match the action tensor shape"
                 )
-            if aligned_samples:
-                objective = flash_groupwise_reverse_kl(
-                    student_logprobs,
-                    training_batch.teacher_logsums.to(
-                        device=student_logprobs.device,
-                        dtype=student_logprobs.dtype,
-                    ),
-                    training_batch.group_ids.to(student_logprobs.device),
-                    training_batch.response_mask.to(student_logprobs.device),
-                    self.config.kl_penalty_coef,
-                )
-            else:
-                objective = student_logprobs.sum() * 0.0
+            objective = flash_groupwise_reverse_kl(
+                student_logprobs,
+                training_batch.teacher_logsums.to(
+                    device=student_logprobs.device,
+                    dtype=student_logprobs.dtype,
+                ),
+                training_batch.group_ids.to(student_logprobs.device),
+                training_batch.response_mask.to(student_logprobs.device),
+                self.config.kl_penalty_coef,
+            )
             captured.append(objective)
             return objective
 
