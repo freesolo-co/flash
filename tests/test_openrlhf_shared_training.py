@@ -376,14 +376,21 @@ def test_failed_publish_retries_same_update_without_cross_run_mutation(tmp_path)
 @requires_torch
 def test_scheduler_failure_blocks_duplicate_optimizer_update(tmp_path):
     class _FailingScheduler:
+        def __init__(self):
+            self.failures = 1
+            self.steps = 0
+
         def step(self):
-            raise RuntimeError("scheduler failed")
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("scheduler failed")
+            self.steps += 1
 
         def state_dict(self):
-            return {}
+            return {"steps": self.steps}
 
-        def load_state_dict(self, _state):
-            return None
+        def load_state_dict(self, state):
+            self.steps = state["steps"]
 
     async def scenario():
         actor, _load_count, _rollout_manager = _build_actor(tmp_path, capacity=1)
@@ -399,10 +406,20 @@ def test_scheduler_failure_blocks_duplicate_optimizer_update(tmp_path):
             await actor.step("run-a", _loss_for(1.0))
 
         assert state.pending_publication is not None
+        assert state.pending_publication.scheduler_step_pending is True
+        assert state.lr_scheduler.steps == 0
         assert state.adapter_version == 0
         assert state.global_step == 0
         with pytest.raises(TrainingIsolationError, match="must publish adapter version 1"):
             await actor.step("run-a", _loss_for(-1.0))
+
+        handle = await actor.publish_pending_adapter("run-a")
+
+        assert handle.version == 1
+        assert state.pending_publication is None
+        assert state.lr_scheduler.steps == 1
+        assert state.adapter_version == 1
+        assert state.global_step == 1
 
     asyncio.run(scenario())
 

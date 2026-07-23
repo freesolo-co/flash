@@ -37,6 +37,7 @@ class _PendingAdapterPublication:
     adapter_dir: Path | None
     target_version: int
     target_global_step: int
+    scheduler_step_pending: bool
 
 
 @dataclass(slots=True)
@@ -341,13 +342,26 @@ class SharedMultiLoRATrainingActor:
                 loss.backward()
                 self._assert_inactive_gradients_absent(state.run_id)
                 self._assert_frozen_base()
+                scheduler_state = copy.deepcopy(state.lr_scheduler.state_dict())
                 optimizer.step()
-                state.pending_publication = _PendingAdapterPublication(
+                pending = _PendingAdapterPublication(
                     adapter_dir=None,
                     target_version=state.adapter_version + 1,
                     target_global_step=state.global_step + 1,
+                    scheduler_step_pending=True,
                 )
-                state.lr_scheduler.step()
+                state.pending_publication = pending
+                try:
+                    state.lr_scheduler.step()
+                except BaseException:
+                    state.lr_scheduler.load_state_dict(scheduler_state)
+                    raise
+                state.pending_publication = _PendingAdapterPublication(
+                    adapter_dir=pending.adapter_dir,
+                    target_version=pending.target_version,
+                    target_global_step=pending.target_global_step,
+                    scheduler_step_pending=False,
+                )
             finally:
                 optimizer.zero_grad(set_to_none=True)
                 self._clear_all_gradients()
@@ -515,6 +529,20 @@ class SharedMultiLoRATrainingActor:
             raise TrainingIsolationError(
                 f"training run {state.run_id} has no pending adapter publication"
             )
+        if pending.scheduler_step_pending:
+            scheduler_state = copy.deepcopy(state.lr_scheduler.state_dict())
+            try:
+                state.lr_scheduler.step()
+            except BaseException:
+                state.lr_scheduler.load_state_dict(scheduler_state)
+                raise
+            pending = _PendingAdapterPublication(
+                adapter_dir=pending.adapter_dir,
+                target_version=pending.target_version,
+                target_global_step=pending.target_global_step,
+                scheduler_step_pending=False,
+            )
+            state.pending_publication = pending
         if pending.adapter_dir is None:
             adapter_dir = self._export_version(
                 state.adapter_name, state.run_id, pending.target_version
@@ -523,6 +551,7 @@ class SharedMultiLoRATrainingActor:
                 adapter_dir=adapter_dir,
                 target_version=pending.target_version,
                 target_global_step=pending.target_global_step,
+                scheduler_step_pending=pending.scheduler_step_pending,
             )
             state.pending_publication = pending
         new_handle, _publication_cancelled = await _await_completion_on_cancel(
