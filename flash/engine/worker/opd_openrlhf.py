@@ -1361,7 +1361,8 @@ def _flash_opd_training_step(self, experience, kl_ctl, step, loss_batch_info=Non
         global_batch_size,
         self.strategy.world_size,
     )
-    self.strategy.backward(loss, self.actor, self.actor_optim)
+    with _flash_attention_context():
+        self.strategy.backward(loss, self.actor, self.actor_optim)
     is_optimizer_update = _flash_is_optimizer_update(step, self.strategy.accumulated_gradient)
     should_mutate = _flash_should_mark_mutation(
         self,

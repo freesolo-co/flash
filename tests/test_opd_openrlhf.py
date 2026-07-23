@@ -1532,6 +1532,17 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_BRIDGE_URL", "http://127.0.0.1:1/teacher")
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_KL_COEF", "0.37")
     monkeypatch.setenv("FLASH_OPENRLHF_OPD_SEED", "42")
+    attention_context_depth = 0
+
+    @contextlib.contextmanager
+    def attention_context():
+        nonlocal attention_context_depth
+        attention_context_depth += 1
+        try:
+            yield
+        finally:
+            attention_context_depth -= 1
+
     namespace = {
         "__name__": "sitecustomize",
         "__file__": "sitecustomize.py",
@@ -1542,7 +1553,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         "_Actor": _Actor,
         "_original_execute": lambda *_args, **_kwargs: None,
         "_original_process_response": lambda *_args, **_kwargs: None,
-        "_flash_attention_context": contextlib.nullcontext,
+        "_flash_attention_context": attention_context,
     }
     exec(
         compile(opd_openrlhf._opd_sitecustomize_extension(), "sitecustomize.py", "exec"),
@@ -1576,6 +1587,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
 
         def forward(self, input_ids, attention_mask=None, position_ids=None):
             del attention_mask, position_ids
+            assert attention_context_depth == 1
             hidden_states = torch.tanh(self.body(self.embed(input_ids)))
             return {"logits": self.lm_head(hidden_states)}
 
@@ -1598,6 +1610,7 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
             return values
 
         def backward(self, loss, *_args):
+            assert attention_context_depth == 1
             self.loss = loss
 
         def optimizer_step(self, *_args, **_kwargs):
@@ -1657,13 +1670,14 @@ def test_sitecustomize_training_step_backpropagates_exact_reverse_kl(monkeypatch
         chunked_model = _TinyCausalLM()
         chunked_model.load_state_dict(initial_state)
         chunked_actor = _ActorModel(chunked_model)
-        chunked_logps = namespace["_flash_chunked_action_log_probs"](
-            chunked_actor,
-            sequences,
-            action_mask,
-            attention_mask,
-            chunk_size=chunk_size,
-        )
+        with attention_context():
+            chunked_logps = namespace["_flash_chunked_action_log_probs"](
+                chunked_actor,
+                sequences,
+                action_mask,
+                attention_mask,
+                chunk_size=chunk_size,
+            )
         chunked_loss = namespace["_flash_reverse_kl"](
             chunked_logps,
             teacher_logsums,
@@ -1729,7 +1743,7 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
     assert "action_log_probs = _flash_chunked_action_log_probs(" in source
     assert "checkpoint(" in source
     assert "hidden_states[response_mask]" in source
-    assert source.count("with _flash_attention_context():") == 2
+    assert source.count("with _flash_attention_context():") == 3
     assert "student_logprobs[row][group_mask].detach().sum()" in source
     assert "torch.stack(row_losses).mean()" in source
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source
