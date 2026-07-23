@@ -425,6 +425,25 @@ def _zero3_managed_parameters(module):
     return [parameter for parameter in module.parameters() if hasattr(parameter, "ds_id")]
 
 
+def _zero3_synchronized_chunk_count(selected_count, chunk_size, output_head, device):
+    import torch
+
+    local_chunks = (int(selected_count) + int(chunk_size) - 1) // int(chunk_size)
+    parameters = _zero3_managed_parameters(output_head)
+    if not parameters or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_chunks
+    process_group = getattr(parameters[0], "ds_process_group", None)
+    if torch.distributed.get_world_size(group=process_group) <= 1:
+        return local_chunks
+    max_chunks = torch.tensor(local_chunks, device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        max_chunks,
+        op=torch.distributed.ReduceOp.MAX,
+        group=process_group,
+    )
+    return int(max_chunks.item())
+
+
 def _register_zero3_external_output_head(forward_module, output_head) -> bool:
     parameters = _zero3_managed_parameters(output_head)
     if not parameters:
@@ -455,6 +474,26 @@ def _selected_token_nll_chunk(
     return functional.cross_entropy(logits, labels, reduction="sum")
 
 
+def _selected_token_nll_padded_chunk(
+    hidden_states,
+    output_head,
+    labels,
+    valid_mask,
+    logit_scale: float,
+    final_logit_softcapping: float | None,
+):
+    import torch
+    import torch.nn.functional as functional
+
+    logits = output_head(hidden_states).float()
+    if logit_scale != 1.0:
+        logits = logits * logit_scale
+    if final_logit_softcapping is not None:
+        logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+    token_losses = functional.cross_entropy(logits, labels, reduction="none")
+    return token_losses.masked_fill(~valid_mask, 0.0).sum()
+
+
 def _chunked_selected_token_nll(
     hidden_states,
     output_head,
@@ -481,11 +520,11 @@ def _chunked_selected_token_nll(
     selected_hidden = hidden_states[:, :-1, :][shifted_mask]
     selected_labels = input_ids[:, 1:][shifted_mask]
     selected_count = int(selected_labels.numel())
-    if selected_count == 0:
-        raise ValueError("chunked SFT loss received no completion target")
 
     if zero3_active is None:
         zero3_active = bool(_zero3_managed_parameters(output_head))
+    if selected_count == 0 and not zero3_active:
+        raise ValueError("chunked SFT loss received no completion target")
 
     def checkpoint(function, *args):
         return torch_checkpoint(function, *args, use_reentrant=False)
@@ -506,18 +545,58 @@ def _chunked_selected_token_nll(
             if callable(deepspeed_checkpoint):
                 checkpoint = deepspeed_checkpoint
 
-    loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
-    for start in range(0, selected_count, int(chunk_size)):
-        end = min(start + int(chunk_size), selected_count)
-        chunk_loss = checkpoint(
-            _selected_token_nll_chunk,
-            selected_hidden[start:end],
+    if selected_count:
+        loss_sum = selected_hidden.new_zeros((), dtype=torch.float32)
+    else:
+        loss_sum = selected_hidden.float().sum() * 0.0
+    if zero3_active:
+        synchronized_chunks = _zero3_synchronized_chunk_count(
+            selected_count,
+            int(chunk_size),
             output_head,
-            selected_labels[start:end],
-            float(logit_scale),
-            final_logit_softcapping,
+            selected_hidden.device,
         )
-        loss_sum = loss_sum + chunk_loss
+        padded_count = synchronized_chunks * int(chunk_size)
+        padding_count = padded_count - selected_count
+        if padding_count:
+            zero_hidden = (
+                selected_hidden[:1] * 0.0
+                if selected_count
+                else selected_hidden.sum(dim=0, keepdim=True) * 0.0
+            )
+            selected_hidden = torch.cat(
+                [selected_hidden, zero_hidden.expand(padding_count, -1)],
+                dim=0,
+            )
+            selected_labels = torch.cat(
+                [selected_labels, selected_labels.new_zeros(padding_count)],
+                dim=0,
+            )
+        valid_mask = torch.arange(padded_count, device=selected_hidden.device).lt(selected_count)
+        for start in range(0, padded_count, int(chunk_size)):
+            end = start + int(chunk_size)
+            chunk_loss = checkpoint(
+                _selected_token_nll_padded_chunk,
+                selected_hidden[start:end],
+                output_head,
+                selected_labels[start:end],
+                valid_mask[start:end],
+                float(logit_scale),
+                final_logit_softcapping,
+            )
+            loss_sum = loss_sum + chunk_loss
+    else:
+        for start in range(0, selected_count, int(chunk_size)):
+            end = min(start + int(chunk_size), selected_count)
+            chunk_loss = checkpoint(
+                _selected_token_nll_chunk,
+                selected_hidden[start:end],
+                output_head,
+                selected_labels[start:end],
+                float(logit_scale),
+                final_logit_softcapping,
+            )
+            loss_sum = loss_sum + chunk_loss
 
     normalizer = selected_count if denominator is None else denominator
     if isinstance(normalizer, torch.Tensor):
@@ -1594,8 +1673,10 @@ def apply_flash_openrlhf_sft_patches():
         for function in (
             enable_multimodal_input_require_grads,
             _zero3_managed_parameters,
+            _zero3_synchronized_chunk_count,
             _register_zero3_external_output_head,
             _selected_token_nll_chunk,
+            _selected_token_nll_padded_chunk,
             _chunked_selected_token_nll,
         )
     )
