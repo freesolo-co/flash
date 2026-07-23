@@ -673,14 +673,39 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
             spec_from_dict({**base, "train": {**bad}}, run_id="bad")
 
 
+def test_apply_grpo_entropy_quantile_sets_key_only_when_configured() -> None:
+    from flash.engine.worker.rl import apply_grpo_entropy_quantile
+
+    d = {}
+    apply_grpo_entropy_quantile(d, None)
+    assert "top_entropy_quantile" not in d
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 0.0)
+    assert d["top_entropy_quantile"] == 0.0
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 0.2)
+    assert d["top_entropy_quantile"] == 0.2
+
+    d = {}
+    apply_grpo_entropy_quantile(d, 1)
+    assert d["top_entropy_quantile"] == 1.0
+    assert isinstance(d["top_entropy_quantile"], float)
+
+    d = {"unrelated": "preserved"}
+    apply_grpo_entropy_quantile(d, 0.2)
+    assert d["unrelated"] == "preserved"
+
+
 def test_entropy_quantile_is_an_optional_grpoconfig_passthrough(tmp_path) -> None:
+    # this is the trl-gated constructor-compatibility check
     GRPOConfig = pytest.importorskip("trl").GRPOConfig
 
     from flash.engine.worker.rl import apply_grpo_entropy_quantile
 
     unset_kwargs = {}
     apply_grpo_entropy_quantile(unset_kwargs, None)
-    assert "top_entropy_quantile" not in unset_kwargs
     unset = GRPOConfig(
         output_dir=str(tmp_path / "unset"),
         loss_type="dr_grpo",
