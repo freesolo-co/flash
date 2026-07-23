@@ -39,7 +39,12 @@ def _value(args: list[str], flag: str) -> str:
     return args[index + 1]
 
 
-def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
+def _install_ray_shaped_opd_extension(
+    monkeypatch,
+    *,
+    warmstart: bool = False,
+    torch_module=None,
+):
     class _ActorPPOTrainer:
         def ppo_train(self, *_args, **_kwargs):
             return dict(self.original_actor_status)
@@ -80,7 +85,7 @@ def _install_ray_shaped_opd_extension(monkeypatch, *, warmstart: bool = False):
     ppo_trainer.PPOTrainer = _PPOTrainer
     ppo_trainer.prepare_datasets = lambda strategy, tokenizer: (strategy, tokenizer)
     modules = {
-        "torch": types.ModuleType("torch"),
+        "torch": torch_module or types.ModuleType("torch"),
         "openrlhf": types.ModuleType("openrlhf"),
         "openrlhf.utils": types.ModuleType("openrlhf.utils"),
         "openrlhf.utils.agent": types.ModuleType("openrlhf.utils.agent"),
@@ -176,6 +181,69 @@ class _Teacher:
             TeacherToken(text="a", logprob=-0.2, start=0, end=1),
             TeacherToken(text="b", logprob=-0.4, start=1, end=2),
         ]
+
+
+def test_resolve_inputs_keeps_configured_batch_for_small_prompt_pool(monkeypatch):
+    import flash.multimodal as multimodal
+
+    class _Env:
+        multi_turn = False
+        is_tool_env = False
+
+        def dataset(self):
+            return [{"id": index} for index in range(3)]
+
+        def prompt_messages(self, example):
+            return [{"role": "user", "content": f"prompt {example['id']}"}]
+
+    class _Tokenizer:
+        pad_token = None
+        eos_token = "</s>"
+
+        def apply_chat_template(self, messages, **_kwargs):
+            return messages[0]["content"]
+
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=[1, 2])
+
+    knobs = SimpleNamespace(
+        max_length=16,
+        max_completion=4,
+        prompts_per_step=4,
+        epochs=1,
+        max_steps=None,
+        save_at_steps=(),
+        group_size=1,
+        temperature=0.7,
+        top_p=0.95,
+        kl_coef=0.37,
+        learning_rate=1e-5,
+        save_every=-1,
+        stop_sequences=(),
+    )
+    spec = SimpleNamespace(
+        algorithm="opd",
+        train=SimpleNamespace(structured_outputs="", max_examples=0),
+        model="Qwen/Qwen3.5-0.8B",
+        model_revision="a" * 40,
+        gpu=SimpleNamespace(count=2),
+        seed=7,
+    )
+    monkeypatch.setattr(opd_openrlhf._w, "JOB_SPEC", spec)
+    monkeypatch.setattr(opd_openrlhf._w, "THINKING", False)
+    monkeypatch.setattr(opd_openrlhf._w, "require_active_env", lambda: _Env())
+    monkeypatch.setattr(opd_openrlhf._w, "load_tokenizer", lambda *_args, **_kwargs: _Tokenizer())
+    monkeypatch.setattr(opd_openrlhf, "_resolve_opd_knobs", lambda: knobs)
+    monkeypatch.setattr(opd_openrlhf, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(opd_openrlhf, "backend_seed", lambda seed: seed)
+    monkeypatch.setattr(multimodal, "record_has_images", lambda *_args, **_kwargs: False)
+
+    inputs = opd_openrlhf._resolve_single_turn_inputs()
+
+    assert len(inputs["prompts"]) == 3
+    assert inputs["prompts_per_step"] == 4
+    assert inputs["prompts_per_step"] * inputs["group_size"] % inputs["gpu_count"] == 0
+    assert inputs["steps"] == 1
 
 
 @requires_torch
@@ -991,6 +1059,36 @@ def test_child_process_response_drops_no_signal_action_tokens(monkeypatch):
     assert not bool(result.action_mask.any().item())
 
 
+@requires_torch
+def test_child_pads_variable_length_per_sample_teacher_tensors(monkeypatch):
+    torch = pytest.importorskip("torch")
+    namespace, _, _, _ = _install_ray_shaped_opd_extension(
+        monkeypatch,
+        torch_module=torch,
+    )
+    action_mask = torch.ones((2, 4), dtype=torch.bool)
+
+    padded = namespace["_flash_pad_info"](
+        [
+            torch.tensor([[1, 2]], dtype=torch.long),
+            torch.tensor([[3, 4, 5]], dtype=torch.long),
+        ],
+        action_mask,
+        -1,
+    )
+
+    assert torch.equal(
+        padded,
+        torch.tensor(
+            [
+                [1, 2, -1, -1],
+                [3, 4, 5, -1],
+            ],
+            dtype=torch.long,
+        ),
+    )
+
+
 def test_child_mutation_marker_requires_signal_in_accumulation_window(monkeypatch):
     namespace, _, _, _ = _install_ray_shaped_opd_extension(monkeypatch)
     trainer = SimpleNamespace()
@@ -1575,6 +1673,8 @@ def test_sitecustomize_carries_reverse_kl_teacher_and_lora_hooks():
     assert "_ActorPPOTrainer.training_step = _flash_opd_training_step" in source
     assert "student_logprobs[row][group_mask].detach().sum()" in source
     assert "torch.stack(row_losses).mean()" in source
+    assert "has_window_signal" not in source
+    assert "self.strategy.accumulated_gradient,\n        has_current_signal," in source
     assert "self._flash_opd_rollout_ordinals = rollout_ordinals" in source
     assert "_FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch" in source
     assert (
