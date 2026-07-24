@@ -113,7 +113,7 @@ def spec_steps(spec) -> int:
     SFT derives from examples and realized batch. GRPO/OPD derive passes over retained prompts.
     For every algorithm, positive ``max_steps`` replaces the derived optimizer-update count.
     """
-    if spec.algorithm in ("grpo", "opd"):
+    if spec.algorithm in ("grpo", "opd", "opsd"):
         examples = _on_policy_example_count(spec)
         derived = on_policy_steps(
             epochs=_on_policy_epochs(spec),
@@ -162,7 +162,7 @@ def runconfig_from_spec(spec) -> RunConfig:
         thinking=spec.thinking,
         teacher_model=teacher_model,
         provider=g.provider or "auto",
-        exact_type=g.exact_type,
+        gpu_type=g.type,
         model_revision=spec.model_revision,
         disk_gb=float(getattr(g, "disk_gb", 0.0) or 0.0),
         gpu_count=g.count,

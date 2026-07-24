@@ -21,7 +21,6 @@ import json
 import urllib.request
 
 from flash.runner.checkpoints import list_checkpoints
-from flash.spec import JobSpec
 
 from ._internal_client import DEFAULT_TIMEOUT_S, build_internal_request, internal_key, run_org_id
 
@@ -76,7 +75,11 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     if not token:
         return 0  # local/dev control plane: HF still has the checkpoints
     try:
-        spec = JobSpec.from_dict(status.spec)
+        # run_id + hf_repo are platform-managed and stripped from the public spec; read the
+        # authoritative values from the internal worker-spec carrier (see _internal_spec_from_status).
+        from flash.runner import _internal_spec_from_status
+
+        spec = _internal_spec_from_status(status)
     except Exception as exc:
         _log(f"[ckpt] register skipped ({status.run_id}): bad spec: {exc}")
         return 0

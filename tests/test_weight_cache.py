@@ -47,13 +47,22 @@ def _ndc() -> int:
 
 
 # ---------------------------------------------------------------------------
-# spec carrier round-trips (the field must survive every to_dict()->from_dict() hop)
+# spec carrier round-trips (network_volume is platform-managed: it must survive every
+# to_internal_dict()->from_dict() hop, the control-plane/worker carrier. it is intentionally
+# absent from the public to_dict().)
 # ---------------------------------------------------------------------------
 def test_network_volume_round_trips():
     spec = _vol_spec(gb=123)
-    again = JobSpec.from_dict(spec.to_dict())
+    again = JobSpec.from_dict(spec.to_internal_dict())
     assert again.gpu.network_volume == "flash-weights"
     assert again.gpu.network_volume_gb == 123
+
+
+def test_network_volume_absent_from_public_spec():
+    # network_volume / network_volume_gb are platform-managed and must NOT appear in the public spec.
+    public = _vol_spec(gb=123).to_dict()
+    assert "network_volume" not in public["gpu"]
+    assert "network_volume_gb" not in public["gpu"]
 
 
 def test_default_spec_has_no_volume():
@@ -329,10 +338,11 @@ def test_build_worker_env_per_run_override_wins():
     from flash.providers._worker import build_worker_env
 
     spec = _vol_spec()
+    # network_volume is managed -> carried by the internal dict, so the cache redirect is present
+    # and the per-run [worker_env] override (merged last) genuinely wins over it.
     spec = JobSpec.from_dict(
-        {**spec.to_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}}
+        {**spec.to_internal_dict(), "worker_env": {"FLASH_WEIGHT_CACHE_DIR": "/custom/hub"}}
     )
-    # a per-run [worker_env] override is merged last and must win over the cache redirect.
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"] == "/custom/hub"
 
 
@@ -480,7 +490,11 @@ def test_instance_payload_strips_runpod_volume_redirect():
     from flash.providers import _instance
     from flash.providers._worker import build_worker_env
 
-    spec = JobSpec.from_dict({**_vol_spec().to_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"})
+    # network_volume is managed -> carried by the internal dict (the leak source that build_worker_env
+    # turns into the /runpod-volume redirect).
+    spec = JobSpec.from_dict(
+        {**_vol_spec().to_internal_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"}
+    )
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
     )  # leak source
@@ -583,7 +597,8 @@ def test_assign_weight_cache_does_not_override_existing():
     from flash import runner
 
     spec = _vol_spec(name="explicit-vol")
-    spec = JobSpec.from_dict({**spec.to_dict(), "model_policy": "catalog", "run_id": "r"})
+    # network_volume is managed -> carried by the internal dict; an already-pinned volume is honored.
+    spec = JobSpec.from_dict({**spec.to_internal_dict(), "model_policy": "catalog", "run_id": "r"})
     out = runner._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "explicit-vol"  # an explicit/test value is never clobbered
 
@@ -700,7 +715,9 @@ def test_fits_weight_cache_is_size_based():
 
 
 def test_submit_job_assigns_weight_cache(monkeypatch):
-    # Integration: the assignment is wired into submit_job and visible on the dry-run spec.
+    # Integration: the assignment is wired into submit_job and visible on the effective worker spec.
+    # network_volume is platform-managed -> stripped from the public status.spec, so observe the
+    # managed assignment on the effective-preparation worker spec the worker actually runs.
     from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -714,9 +731,12 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
                 "run_id": "flash-wc-1",
             }
         )
-        out = runner.submit_job(spec, dry_run=True).spec
-    assert out["gpu"]["network_volume"] == "flash-weights"
-    assert out["gpu"]["network_volume_gb"] == 100
+        status = runner.submit_job(spec, dry_run=True)
+    gpu = status.effective_preparation["worker_spec"]["gpu"]
+    assert gpu["network_volume"] == "flash-weights"
+    assert gpu["network_volume_gb"] == 100
+    # and it must NOT leak into the public spec
+    assert "network_volume" not in status.spec["gpu"]
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +772,9 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
 
 
 def test_effective_spec_persists_managed_cache_removal(monkeypatch):
+    # The SHARED platform cache may be dropped on a capacity fallback. network_volume is managed and
+    # lives only in the prior preparation snapshot, so the committed shared cache is recorded there;
+    # the re-prepared cache-less spec must persist without the removal guard firing.
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -759,6 +782,7 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
         public = JobSpec.from_dict(
             {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
         )
+        assert public.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
         selected_dict = public.to_internal_dict()
         selected_dict["gpu"]["network_volume"] = None
         selected = JobSpec.from_dict(selected_dict)
@@ -767,6 +791,11 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
                 run_id=public.run_id,
                 state="provisioning",
                 spec=public.to_dict(),
+                effective_preparation={
+                    "worker_spec": public.to_internal_dict(),  # committed WITH the shared cache
+                    "adapter_identity": None,
+                    "preparation_digest": "seed",
+                },
             )
         )
 
@@ -779,28 +808,37 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
 
 
 def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
+    # A per-org escape-hatch volume an open-model run opted into must never be silently removed.
+    # network_volume is managed and no longer travels in the public spec, so the committed custom
+    # volume lives only in the prior preparation snapshot; dropping it there must fail closed.
     import pytest
 
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
         runner = fresh_runner(tmp, monkeypatch)
-        public = JobSpec.from_dict(
+        committed = JobSpec.from_dict(
             {
                 **_vol_spec(name="org-1234-private").to_internal_dict(),
                 "run_id": "custom-cache-fallback",
             }
         )
-        selected_dict = public.to_internal_dict()
-        selected_dict["gpu"]["network_volume"] = None
-        selected = JobSpec.from_dict(selected_dict)
+        assert committed.gpu.network_volume != runner.WEIGHT_CACHE_VOLUME_NAME
         runner._save_status(
             runner.RunStatus(
-                run_id=public.run_id,
+                run_id=committed.run_id,
                 state="provisioning",
-                spec=public.to_dict(),
+                spec=committed.to_dict(),
+                effective_preparation={
+                    "worker_spec": committed.to_internal_dict(),  # committed WITH the custom volume
+                    "adapter_identity": None,
+                    "preparation_digest": "seed",
+                },
             )
         )
+        selected_dict = committed.to_internal_dict()
+        selected_dict["gpu"]["network_volume"] = None
+        selected = JobSpec.from_dict(selected_dict)
 
         with pytest.raises(ValueError, match="effective preparation"):
             runner._persist_effective_worker_spec(selected)
@@ -836,7 +874,7 @@ def _supervised_walk(monkeypatch, failures):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
         assert orch.get_status("wc-walk").state == "done"

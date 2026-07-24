@@ -29,8 +29,8 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
-    "gpu": {"type": "RTX 5090"},
+    "train": {"epochs": 1, "max_examples": 1},
+    "gpu": {},
 }
 
 # Tokens shaped like a verified freesolo user key. The fixture's stub verify accepts any
@@ -479,7 +479,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
             "max_completion_tokens": max_completion_tokens,
             "structured_outputs": {"choice": ["4"]},
         },
-        "gpu": {"type": "B200"},
+        "gpu": {},
     }
 
     response = api.post(
@@ -756,7 +756,11 @@ def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+    # lora_alpha is platform-derived (2x rank) and stripped from the public spec; the resolved
+    # warm-start source alpha is persisted in the internal worker-spec carrier.
+    assert "lora_alpha" not in resp.json()["spec"]["train"]
+    status = runner.get_status(resp.json()["run_id"])
+    assert status.effective_preparation["worker_spec"]["train"]["lora_alpha"] == 32
 
 
 def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(api, monkeypatch):
@@ -780,7 +784,8 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
             "train": {**SPEC["train"], "init_from_adapter": "source-run"},
         }
     ).to_dict()
-    assert normalized["train"]["lora_alpha"] == 64
+    # lora_alpha is platform-derived and stripped from the public spec; a normalized spec omits it.
+    assert "lora_alpha" not in normalized["train"]
 
     resp = api.post(
         "/v1/runs",
@@ -789,7 +794,9 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+    assert "lora_alpha" not in resp.json()["spec"]["train"]
+    status = runner.get_status(resp.json()["run_id"])
+    assert status.effective_preparation["worker_spec"]["train"]["lora_alpha"] == 32
 
 
 def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
@@ -831,10 +838,9 @@ def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert resp.json()["detail"] == (
-        "train.lora_alpha=64 does not match the train.init_from_adapter source adapter "
-        "lora_alpha=32; omit train.lora_alpha because source adapter alpha metadata is authoritative"
-    )
+    # lora_alpha is a platform-managed field (always 2x rank); the user parser rejects it outright,
+    # so an explicit value is refused before any warm-start alpha-conflict check runs.
+    assert "[train] unknown key(s): lora_alpha" in resp.json()["detail"]
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -2555,34 +2561,16 @@ def test_post_activation_recovery_failure_logs_divergence(api, monkeypatch):
     assert "ready-state recovery failed" in divergences[0]
 
 
-def test_deploy_ignores_legacy_spec_gpu(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
-
+def test_create_rejects_retired_gpu_class(api):
     key = _login()
-    legacy_spec = {**SPEC, "gpu": {"type": "RTX A6000"}}
-    run_id = api.post(
-        "/v1/runs", json={"spec": legacy_spec, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.state = "done"
-    status.remote = {"provider": "runpod", "allocated_gpu": "RTX 5090"}
-    runner._save_status(status)
+    retired_spec = {**SPEC, "gpu": {"type": "RTX A6000"}}
 
-    seen: dict = {}
+    response = api.post(
+        "/v1/runs", json={"spec": retired_spec, "dry_run": True}, headers=_bearer(key)
+    )
 
-    def fake_start(target, **kwargs):
-        seen.update({"target": target, **kwargs})
-        return False
-
-    monkeypatch.setattr(app_mod, "start_deployment_job", fake_start)
-
-    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "queued"
-    assert "gpu" not in resp.json()
-    assert "gpu_name" not in seen["deploy_kwargs"]
+    assert response.status_code == 400
+    assert "unsupported gpu" in response.json()["detail"]
 
 
 def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
@@ -3092,7 +3080,8 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     status.spec["gpu"]["type"] = "H200"
-    status.effective_preparation = None
+    # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
+    # and stripped from the public spec, so deploy resolves them from effective_preparation.
     runner._save_status(status)
     seen: dict = {}
 
@@ -4197,7 +4186,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "nohandle-1",
     }
     runner._save_status(
@@ -4313,6 +4302,13 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
             state="provisioning",
             spec=spec.to_dict(),
             created_at=created_at,
+            # run_id is platform-managed and stripped from the public spec; a provisioned run always
+            # carries the internal worker-spec carrier, which is where recovery resolves its identity.
+            effective_preparation={
+                "worker_spec": spec.to_internal_dict(),
+                "adapter_identity": None,
+                "preparation_digest": None,
+            },
         ),
         _run_deadline_at=deadline,
         _next_attempt=0,
@@ -4355,7 +4351,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "phantom-1",
     }
     runner._save_status(
@@ -4420,7 +4416,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "unconf-1",
     }
     runner._save_status(
@@ -4480,7 +4476,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "queued-1",
     }
     runner._save_status(
@@ -4547,7 +4543,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "novast-1",
     }
     runner._save_status(
@@ -4597,7 +4593,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "newvast-1",
     }
     runner._save_status(
@@ -4660,7 +4656,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "retry-1",
     }
     runner._save_status(
@@ -4720,7 +4716,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "clear-1",
     }
     runner._save_status(
@@ -4785,7 +4781,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             "init_from_adapter": "source-run",
             "lora_rank": 8,
         },
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "nohandle-warm",
     }
     worker_spec = {
@@ -4973,7 +4969,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {},
         "run_id": "good-2",
     }
     runner._save_status(
@@ -5654,8 +5650,9 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     key = _login()
     run_id = _finished_run(api, key)
     # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
-    # only the control plane (operator token) can read the source — read it back from the run.
-    src_repo = runner.get_status(run_id).spec["train"]["hf_repo"]
+    # only the control plane (operator token) can read the source. hf_repo is platform-managed and
+    # stripped from the public spec, so read it back from the internal worker-spec carrier.
+    src_repo = runner.get_status(run_id).effective_preparation["worker_spec"]["train"]["hf_repo"]
 
     seen: dict = {}
 

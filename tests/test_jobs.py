@@ -11,6 +11,8 @@ import tempfile
 
 import pytest
 
+from tests._helpers.runner import provisioned_status
+
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
@@ -594,7 +596,7 @@ def test_submit_run_payload_carries_code_prefix(monkeypatch):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     submitted: dict = {}
     monkeypatch.setattr(
@@ -631,7 +633,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     original = RuntimeError("ambiguous queue post")
     handles = []
@@ -680,7 +682,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
@@ -783,7 +785,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     deadline_at = 12_345.0
     captured = []
@@ -824,7 +826,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
         model="Qwen/Qwen3.5-0.8B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     now = {"value": 100.0}
     monkeypatch.setattr(jobs.time, "time", lambda: now["value"])
@@ -1692,7 +1694,7 @@ def _spec(run_id):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1),
-        gpu=GpuSpec(type="RTX 4090", max_retries=2),
+        gpu=GpuSpec(type="", max_retries=2),
     )
 
 
@@ -1889,7 +1891,14 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                 },
             }
         )
-        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
+        )
         monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
         monkeypatch.setattr(
             checkpoints,
@@ -1907,6 +1916,9 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         spec = JobSpec.from_dict(
             {
                 **base,
+                # run_id is platform-managed and stripped from to_dict(); restore it so the child
+                # submits under "warm-run" instead of the from_dict "local" default.
+                "run_id": "warm-run",
                 "train": {
                     **base["train"],
                     "init_from_adapter": "source-run/step-40",
@@ -1932,10 +1944,14 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
 
         st = orch.get_status("warm-run")
         assert st.spec["train"]["init_from_adapter"] == "source-run/step-40"
+        # lora_rank and lora_alpha are platform-managed for warm-start: the child inherits the
+        # source adapter's rank and derived alpha, so both are stripped from the public spec. the
+        # authoritative resolved values live in the worker spec — what the worker actually trains
+        # with, and what the launch captures below.
         assert "lora_rank" not in st.spec["train"]
-        # the public spec reports the source adapter's authoritative alpha so status matches
-        # what the worker actually trains with
-        assert st.spec["train"]["lora_alpha"] == 64
+        assert "lora_alpha" not in st.spec["train"]
+        worker_train = st.effective_preparation["worker_spec"]["train"]
+        assert (worker_train["lora_rank"], worker_train["lora_alpha"]) == (32, 64)
         assert (
             launched["init_from_adapter"]
             == "Freesolo-Co/flashrun-source-env:rl/source-run/checkpoints/step-40"
@@ -1961,6 +1977,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -1995,7 +2012,14 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
-        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
+        )
         import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
 
@@ -2046,7 +2070,14 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
-        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
+        )
         import flash.lora_rank as rank_mod
         import flash.runner.checkpoints as checkpoints
 
@@ -2083,10 +2114,13 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
 
         assert status.state == "dry_run"
         assert "lora_rank" not in status.spec["train"]
+        assert "lora_alpha" not in status.spec["train"]
         assert "init_from_adapter_revision" not in status.spec["train"]
-        # dry-run displays the source adapter's authoritative alpha, not the submitted value,
-        # so preflight and execution report the same effective spec
-        assert status.spec["train"]["lora_alpha"] == 128
+        # lora_rank/lora_alpha are platform-managed and stripped from the public spec; the dry-run
+        # still resolves the source adapter's authoritative rank and derived alpha into the worker
+        # spec, so preflight and execution report the same effective spec.
+        worker_train = status.effective_preparation["worker_spec"]["train"]
+        assert (worker_train["lora_rank"], worker_train["lora_alpha"]) == (64, 128)
         assert status.to_dict()["spec"] == status.spec
 
 
@@ -2104,7 +2138,12 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
             }
         )
         orch._save_status(
-            orch.RunStatus(run_id="source-run", state="running", spec=source.to_dict())
+            orch.RunStatus(
+                run_id="source-run",
+                state="running",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
         )
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
@@ -2133,7 +2172,14 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
-        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
+        )
         monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
         monkeypatch.setattr(
             checkpoints,
@@ -2166,7 +2212,14 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
         )
-        orch._save_status(orch.RunStatus(run_id="source-run", state="done", spec=source.to_dict()))
+        orch._save_status(
+            orch.RunStatus(
+                run_id="source-run",
+                state="done",
+                spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
+            )
+        )
         monkeypatch.setattr(db, "run_owner", lambda run_id: 8 if run_id == "source-run" else None)
         base = _spec("warm-run").to_dict()
         spec = JobSpec.from_dict(
@@ -2206,6 +2259,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -2252,6 +2306,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
                 run_id="source-run",
                 state="done",
                 spec=source.to_dict(),
+                effective_preparation={"worker_spec": source.to_internal_dict()},
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -2293,6 +2348,10 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
         public_spec = JobSpec.from_dict(
             {
                 **base,
+                # run_id is platform-managed and stripped from to_dict(); restore it so the public
+                # and worker specs stay keyed to the persisted status ("warm-recover"), not the
+                # from_dict "local" default.
+                "run_id": "warm-recover",
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
@@ -2373,6 +2432,9 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
         public_spec = JobSpec.from_dict(
             {
                 **base,
+                # run_id is platform-managed and stripped from to_dict(); restore it so the specs
+                # stay keyed to the persisted status rather than the from_dict "local" default.
+                "run_id": "warm-recover",
                 "train": {
                     **base["train"],
                     "init_from_adapter": "source-run/step-40",
@@ -2380,12 +2442,18 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                 },
             }
         )
-        worker_dict = public_spec.to_dict()
+        # the worker spec is the complete internal carrier (run_id, hf_repo, ... retained), so build
+        # it from to_internal_dict() -- to_dict() would strip the managed fields recovery reads back.
+        worker_dict = public_spec.to_internal_dict()
         worker_dict["train"] = {
             **worker_dict["train"],
             "init_from_adapter": "Freesolo-Co/source:rl/source-run/checkpoints/step-40",
             "init_from_adapter_revision": "a" * 40,
+            # the resolved warm-start topology carries the source adapter's rank AND its derived
+            # alpha together (runner sets both from the source metadata); source revalidation checks
+            # both, so the worker carrier must pin lora_alpha=64 to match _adapter_config(rank=64).
             "lora_rank": 64,
+            "lora_alpha": 64,
         }
         worker_spec = JobSpec.from_dict(worker_dict)
         identity = rank_mod.AdapterArtifactIdentity(
@@ -2459,10 +2527,15 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
         public_spec = JobSpec.from_dict(
             {
                 **base,
+                # run_id is platform-managed and stripped from to_dict(); restore it so the specs
+                # stay keyed to the persisted status rather than the from_dict "local" default.
+                "run_id": "warm-recover",
                 "train": {**base["train"], "init_from_adapter": "source-run/step-40"},
             }
         )
-        worker_dict = public_spec.to_dict()
+        # the worker spec is the complete internal carrier (run_id, hf_repo, ... retained), so build
+        # it from to_internal_dict() -- to_dict() would strip the managed fields recovery reads back.
+        worker_dict = public_spec.to_internal_dict()
         worker_dict["train"] = {
             **worker_dict["train"],
             "init_from_adapter": "private-owner/private-repo:rl/source-run/checkpoints/step-40",
@@ -2823,7 +2896,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            gpu=GpuSpec(type="", max_retries=0),
         )
         with pytest.raises(RuntimeError):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -2854,7 +2927,7 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=0),
+            gpu=GpuSpec(type="", max_retries=0),
         )
 
         with pytest.raises(RuntimeError):
@@ -2904,7 +2977,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -2996,7 +3069,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             model="Qwen/Qwen3.5-4B",
             algorithm="opd",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3030,7 +3103,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         with pytest.raises(RuntimeError, match="bad reward fn"):
             orch.submit_job(spec, dry_run=False, background=False)
@@ -3101,7 +3174,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3166,7 +3239,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3228,7 +3301,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="RTX 4090", max_retries=2),
+            gpu=GpuSpec(type="", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -3247,10 +3320,10 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         import flash.providers.runpod.train as flash_train
         from flash.providers.runpod import api as runpod_api
 
-        status = orch.RunStatus(
-            run_id="walked",
+        status = provisioned_status(
+            orch,
+            _spec("walked"),
             state="running",
-            spec=_spec("walked").to_dict(),  # provisional spec.gpu.type == "RTX 4090"
             remote={
                 "provider": "runpod",
                 "endpoint_id": "epW",
@@ -3487,10 +3560,10 @@ def test_attach_completes_run(monkeypatch):
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.train as flash_train
 
-        status = orch.RunStatus(
-            run_id="a1",
+        status = provisioned_status(
+            orch,
+            _spec("a1"),
             state="running",
-            spec=_spec("a1").to_dict(),
             remote={
                 "provider": "runpod",
                 "endpoint_id": "epA",
@@ -3527,10 +3600,10 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
 
         run_id = "attach-finally-status"
         orch._save_status(
-            orch.RunStatus(
-                run_id=run_id,
+            provisioned_status(
+                orch,
+                _spec(run_id),
                 state="running",
-                spec=_spec(run_id).to_dict(),
                 remote={
                     "provider": "runpod",
                     "endpoint_id": "ep-finally",
@@ -3582,10 +3655,10 @@ def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch)
 
         run_id = "attach-confirmed-cancel"
         orch._save_status(
-            orch.RunStatus(
-                run_id=run_id,
+            provisioned_status(
+                orch,
+                _spec(run_id),
                 state="running",
-                spec=_spec(run_id).to_dict(),
                 remote={
                     "provider": "runpod",
                     "endpoint_id": "ep-cancel",
@@ -3658,10 +3731,10 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "started_ts": 2.0,
         }
         orch._save_status(
-            orch.RunStatus(
-                run_id=run_id,
+            provisioned_status(
+                orch,
+                _spec(run_id),
                 state="running",
-                spec=_spec(run_id).to_dict(),
                 remote=stale_remote,
             )
         )
@@ -3722,10 +3795,10 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         import flash.providers.runpod.train as flash_train
 
         orch._save_status(
-            orch.RunStatus(
-                run_id="i1",
+            provisioned_status(
+                orch,
+                _spec("i1"),
                 state="running",
-                spec=_spec("i1").to_dict(),
                 cost_usd=0.0,
                 remote={
                     "provider": "runpod",
@@ -3790,10 +3863,10 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         spec = _spec("one-shot-recovery")
         spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
         orch._save_status(
-            orch.RunStatus(
-                run_id=spec.run_id,
+            provisioned_status(
+                orch,
+                spec,
                 state="running",
-                spec=spec.to_dict(),
                 remote={
                     "provider": "runpod",
                     "endpoint_id": "epA",
@@ -3831,10 +3904,10 @@ def test_attach_resume_reuses_persisted_code_prefix(monkeypatch):
         import flash.providers.runpod.train as flash_train
 
         orch._save_status(
-            orch.RunStatus(
-                run_id="pinned-code",
+            provisioned_status(
+                orch,
+                _spec("pinned-code"),
                 state="running",
-                spec=_spec("pinned-code").to_dict(),
                 cost_usd=0.25,
                 remote={
                     "provider": "runpod",
@@ -3894,10 +3967,10 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         import flash.providers.runpod.train as flash_train
 
         orch._save_status(
-            orch.RunStatus(
-                run_id="g1",
+            provisioned_status(
+                orch,
+                _spec("g1"),
                 state="running",
-                spec=_spec("g1").to_dict(),
                 remote={
                     "provider": "runpod",
                     "endpoint_id": "epA",
@@ -4000,10 +4073,10 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
             "started_ts": 1.0,
         }
         orch._save_status(
-            orch.RunStatus(
-                run_id="runpod-unconfirmed",
+            provisioned_status(
+                orch,
+                _spec("runpod-unconfirmed"),
                 state="running",
-                spec=_spec("runpod-unconfirmed").to_dict(),
                 remote=remote,
             )
         )
@@ -4085,10 +4158,10 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
             "started_ts": 2.0,
         }
         orch._save_status(
-            orch.RunStatus(
-                run_id="attach-newer-remote",
+            provisioned_status(
+                orch,
+                _spec("attach-newer-remote"),
                 state="running",
-                spec=_spec("attach-newer-remote").to_dict(),
                 remote=old_remote,
             )
         )
@@ -4135,10 +4208,10 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
         from flash.providers.vast import api as vast_api
 
         orch._save_status(
-            orch.RunStatus(
-                run_id="v1",
+            provisioned_status(
+                orch,
+                _spec("v1"),
                 state="running",
-                spec=_spec("v1").to_dict(),
                 cost_usd=0.0,
                 remote={
                     "provider": "vast",

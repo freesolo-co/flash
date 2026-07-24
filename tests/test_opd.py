@@ -695,7 +695,7 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"epochs": 1, "max_examples": 5, "hf_repo": "owner/runs", **train_extra},
+                "train": {"epochs": 1, "max_examples": 5, **train_extra},
             },
             run_id="x",
         )
@@ -796,7 +796,7 @@ def test_all_skip_step_emits_stall_refresh_opd_step_heartbeat(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=0,
@@ -916,9 +916,8 @@ def _opd_harness(
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            # exact_type mirrors the real jobspec.gpu attribute run_opd reads at startup, so the
-            # shared harness can drive run_opd end-to-end (e.g. the sample-completion capture test).
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            # type mirrors the real jobspec.gpu attribute read by the worker harness.
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=0,
@@ -1139,7 +1138,7 @@ def test_opd_accepts_single_turn_image_prompts_in_cached_filter_render(monkeypat
             train=SimpleNamespace(init_from_adapter="", max_examples=1),
             model="Qwen/Qwen3.5-4B",
             model_revision="",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=7,
@@ -1258,7 +1257,7 @@ def test_opd_worker_rejects_nonvision_teacher_before_gpu_or_teacher_use(
                 train=train,
                 model="Qwen/Qwen3.5-4B",
                 model_revision="",
-                gpu=SimpleNamespace(type=None, exact_type=""),
+                gpu=SimpleNamespace(type=None),
             ),
             heartbeat=lambda *args, **kwargs: None,
         ),
@@ -1607,7 +1606,7 @@ def test_opd_multi_turn_distills_every_assistant_turn(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=0,
@@ -3250,7 +3249,7 @@ def test_run_opd_seeds_torch_before_building_student_model(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=1234,
@@ -3362,7 +3361,7 @@ def test_run_opd_releases_torch_cache_before_vllm_sizing(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=1234,
@@ -3471,7 +3470,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         JOB_SPEC=SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
-            gpu=SimpleNamespace(type=None, exact_type=""),
+            gpu=SimpleNamespace(type=None),
         ),
         THINKING=False,
         SEED=0,
@@ -4997,7 +4996,6 @@ def test_opd_spec_json_round_trip():
                 "epochs": 25,
                 "max_examples": 8,
                 "batch_size": 8,
-                "hf_repo": "owner/runs",
             },
         },
         run_id="x",
@@ -5020,7 +5018,7 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 30, "hf_repo": "owner/runs"},
+            "train": {"epochs": 30},
         },
         run_id="x",
     )

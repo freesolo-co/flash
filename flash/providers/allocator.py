@@ -52,7 +52,7 @@ def allocate(
     disk_gb: float = 0.0,
     max_wall_seconds: float = 0.0,
     provider: str = "",
-    exact_type: str = "",
+    gpu_type: str = "",
     model_revision: str = "",
 ) -> Allocation:
     """Pick the cheapest fitting (provider, GPU class) able to run the job."""
@@ -75,8 +75,8 @@ def allocate(
         available = (provider,)
 
     exact = ""
-    if exact_type:
-        exact = canonical_gpu(exact_type)
+    if gpu_type:
+        exact = canonical_gpu(gpu_type)
         exact_info = GPU_INFO.get(exact)
         if exact_info is None or not exact_info.validated:
             raise UnsupportedGpuError(
@@ -97,7 +97,7 @@ def allocate(
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
-        exact_type=exact,
+        gpu_type=exact,
     )
     candidates: list[Candidate] = []
     lookup_failed = False

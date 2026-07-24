@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
-from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
+from .catalog import DEFAULT_MODEL, normalize_algorithm
 from .opd_retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
@@ -254,15 +254,21 @@ class EnvironmentSpec:
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     lora_rank: int = field(default=32, metadata={"introduced_in": "0.2.0"})
-    lora_alpha: int = field(default=64, metadata={"introduced_in": "0.2.0"})
+    # Derived, not a user knob: always 2 x lora_rank. No ``introduced_in`` so it is absent from
+    # TRAIN_SCHEMA_KEYS and ``[train] lora_alpha`` is rejected; spec_from_dict recomputes it from
+    # lora_rank and to_dict() omits it. The internal from_dict still round-trips the stored value so
+    # a warm-start's inherited parent alpha survives control-plane -> worker serialization.
+    lora_alpha: int = 64
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
     # control-plane jobspec payloads; the public config schema does not accept this key.
     init_from_adapter_revision: str = ""
-    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
-    hf_repo: str = field(default="", metadata={"introduced_in": "0.2.0"})
+    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo. Not a user config key: it has no
+    # ``introduced_in`` so it is absent from TRAIN_SCHEMA_KEYS and ``[train] hf_repo`` is rejected.
+    # JobSpec.from_dict still round-trips the control-plane-assigned value; to_dict() omits it.
+    hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -276,6 +282,7 @@ class TrainSpec:
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     advantage_clip: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
@@ -305,8 +312,8 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # gpu.type does NOT pin — allocator re-picks cheapest fitting validated class at submit time.
-    type: str = DEFAULT_GPU
+    # empty selects managed auto-allocation; a set value hard-pins that validated gpu class.
+    type: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     max_retries: int = 5
@@ -314,7 +321,6 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     provider: str = ""
-    exact_type: str = ""
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
     # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
     count: int = 1
@@ -322,6 +328,16 @@ class GpuSpec:
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
         object.__setattr__(self, "count", _gpu_count(self.count))
+
+
+# platform-managed [gpu] fields: the runner assigns disk sizing, the shared weight-cache volume, and
+# retry/wall-clock lifecycle policy; the user never authors them. single-sourced here so the public
+# serializer (JobSpec.to_dict), the user-facing parser (flash.schema), and the runner's effective-spec
+# validator strip, reject, and exclude exactly the same set. divergence would leak a managed field
+# into the public surface or fail the submit round trip.
+MANAGED_GPU_KEYS = frozenset(
+    {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
+)
 
 
 @dataclass(frozen=True)
@@ -357,12 +373,28 @@ class JobSpec:
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the public/API representation of this job specification."""
+        """Return the public/API representation of this job specification.
+
+        This is the user-authorable config surface: platform-managed fields are omitted because they
+        are assigned by the control plane / runner, never by the user, and re-validating this dict
+        through the user-facing parser (the client -> server submit round trip) rejects them. The
+        control plane and worker use to_internal_dict(), which retains every field.
+        """
         data = asdict(self)
+        # server-assigned identity and internal-only policy — never authored in a config.
+        data.pop("run_id", None)
+        data.pop("model_policy", None)
         train = data["train"]
         train.pop("init_from_adapter_revision", None)
+        train.pop("hf_repo", None)  # control-plane-assigned artifact repo
+        train.pop("lora_alpha", None)  # derived (2 x lora_rank), recomputed on parse
         if train.get("init_from_adapter"):
             train.pop("lora_rank", None)
+        # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
+        gpu = data["gpu"]
+        for managed in MANAGED_GPU_KEYS:
+            gpu.pop(managed, None)
+        data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
@@ -403,28 +435,27 @@ class JobSpec:
         unknown_gpu = sorted(set(gpu) - {item.name for item in fields(GpuSpec)})
         if unknown_gpu:
             raise ValueError(f"gpu has unknown key(s): {', '.join(unknown_gpu)}")
-        gpu_type = _validated_gpu_type(gpu.get("type", DEFAULT_GPU), field_name="gpu.type")
+        gpu_type_raw = gpu.get("type", "")
+        if not isinstance(gpu_type_raw, str):
+            raise TypeError("gpu.type must be a string")
+        gpu_type = (
+            _validated_gpu_type(gpu_type_raw, field_name="gpu.type")
+            if gpu_type_raw.strip()
+            else ""
+        )
         provider = gpu.get("provider", "")
         if not isinstance(provider, str):
             raise TypeError("gpu.provider must be a string")
         provider = provider.strip().lower()
-        exact_type_raw = gpu.get("exact_type", "")
-        if not isinstance(exact_type_raw, str):
-            raise TypeError("gpu.exact_type must be a string")
-        exact_type = (
-            _validated_gpu_type(exact_type_raw, field_name="gpu.exact_type")
-            if exact_type_raw.strip()
-            else ""
-        )
-        if provider or exact_type:
+        if provider or gpu_type:
             from flash.providers import PROVIDER_NAMES
             from flash.providers.base import providers_for
 
             if provider and provider not in PROVIDER_NAMES:
                 raise ValueError(f"unknown gpu.provider {provider!r}")
-            if exact_type and provider and provider not in providers_for(exact_type):
+            if gpu_type and provider and provider not in providers_for(gpu_type):
                 raise ValueError(
-                    f"gpu.provider {provider!r} cannot provision gpu.exact_type {exact_type!r}"
+                    f"gpu.provider {provider!r} cannot provision gpu.type {gpu_type!r}"
                 )
         return cls(
             model=data.get("model", cls.model),
@@ -440,7 +471,13 @@ class JobSpec:
             train=TrainSpec(
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
-                lora_alpha=int(train.get("lora_alpha", 64)),
+                # round-trip a stored alpha (internal carrier + warm-start's inherited parent alpha);
+                # derive 2 x rank when absent (a stripped public to_dict() being reconstructed).
+                lora_alpha=(
+                    int(train["lora_alpha"])
+                    if "lora_alpha" in train
+                    else 2 * int(train.get("lora_rank", 32))
+                ),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
@@ -456,6 +493,7 @@ class JobSpec:
                 max_completion_tokens=_opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
                 advantage_clip=_opt_float(train.get("advantage_clip")),
+                entropy_quantile=_opt_float(train.get("entropy_quantile")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
@@ -465,7 +503,6 @@ class JobSpec:
             gpu=GpuSpec(
                 type=gpu_type,
                 provider=provider,
-                exact_type=exact_type,
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),
