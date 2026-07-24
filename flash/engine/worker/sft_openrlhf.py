@@ -1042,6 +1042,29 @@ def _apply_blackwell_fla_safety():
         )
 
 
+def _sft_packing_mode() -> str:
+    # packing mode for the pure-attention openrlhf sft path.
+    # "unpacked" (default) keeps the padded one-example-per-row behaviour. "sdpa_block_diagonal"
+    # packs multiple examples per block with a 4d block-diagonal causal mask and per-example
+    # position_ids (plain sdpa/eager attention). it engages only for pure-attention (non-gdn) text
+    # models with no multimodal rows; gdn, sliding-window, unsupported archs, and any multimodal
+    # batch stay unpacked. default is unpacked until a real-gpu smoke validates the packed forward
+    # for a given arch. the flashattention-2/3 "varlen" mode (bfd packing via per-example
+    # position_ids / cu_seqlens) and gdn varlen packing are the immediate follow-ups: they need a
+    # real fa/gdn kernel to validate at the model level, so they are intentionally not enabled in
+    # this pr and fail loud if configured.
+    mode = str(CONFIG.get("sft_packing_mode") or "unpacked").strip().lower()
+    if mode == "varlen":
+        raise NotImplementedError(
+            "sft_packing_mode='varlen' (FlashAttention/GDN varlen packing) is not enabled yet; it "
+            "requires a real-GPU FA/GDN kernel to validate the varlen forward. Use "
+            "'sdpa_block_diagonal' or 'unpacked'."
+        )
+    if mode not in ("unpacked", "sdpa_block_diagonal"):
+        raise ValueError(f"unknown sft_packing_mode {mode!r}")
+    return mode
+
+
 class FlashTokenizedSFTDataset:
     def __init__(
         self,
@@ -1063,8 +1086,65 @@ class FlashTokenizedSFTDataset:
         self.max_length = int(max_length)
         if len(dataset) <= 0:
             raise ValueError("flash OpenRLHF SFT dataset is empty")
+        # Packing is decided once at construction: only for a pure-attention text model with no
+        # multimodal rows, and only when explicitly enabled. Deciding here keeps __getitem__/collate
+        # branch-free per item and lets us pre-compute the block layout + effective-batch accounting.
+        self.packing_mode = _sft_packing_mode()
+        self.packed_blocks: list[dict] | None = None
+        self.packed_examples_per_block: float | None = None
+        if self.packing_mode != "unpacked":
+            self._build_packed_blocks()
+
+    def _has_multimodal_rows(self) -> bool:
+        for index in range(len(self.dataset)):
+            payload = self.dataset[int(index)].get("multimodal_inputs")
+            if payload is not None and bytes(
+                payload.as_py() if hasattr(payload, "as_py") else payload
+            ):
+                return True
+        return False
+
+    def _build_packed_blocks(self) -> None:
+        from flash.engine.worker.packing import model_is_pure_attention, pack_token_ids
+
+        # SDPA block-diagonal packing is only boundary-correct for pure-attention (non-GDN) archs: the
+        # 4D mask isolates examples for softmax attention, but linear-attention/GDN recurrence and the
+        # causal conv would still leak across examples without cu_seqlens/seq_idx (the varlen PR #15).
+        if not model_is_pure_attention(str(CONFIG["model_id"]), revision=str(CONFIG.get("model_revision") or "")):
+            raise ValueError(
+                "sft_packing_mode='sdpa_block_diagonal' requires a pure-attention model; GDN/hybrid "
+                "and sliding-window archs must stay 'unpacked' (their varlen packing is a follow-up PR)"
+            )
+        if self._has_multimodal_rows():
+            raise ValueError(
+                "sft_packing_mode must be 'unpacked' for multimodal SFT (packing is text-only)"
+            )
+        sequences: list[list[int]] = []
+        completion_masks: list[list[int]] = []
+        for index in range(len(self.dataset)):
+            row = self.dataset[int(index)]
+            ids = self._list(row["input_ids"])
+            loss_mask = self._list(row["loss_mask"])
+            if len(ids) != len(loss_mask):
+                raise ValueError("input_ids and loss_mask must have identical lengths")
+            if len(ids) > self.max_length:
+                raise ValueError("pretokenized row exceeds data.max_len")
+            if not any(loss_mask):
+                raise ValueError("pretokenized row has no completion target")
+            sequences.append(ids)
+            completion_masks.append(loss_mask)
+        blocks = pack_token_ids(sequences, self.max_length, completion_masks=completion_masks)
+        if not blocks:
+            raise ValueError("packing produced no blocks")
+        self.packed_blocks = blocks
+        total_examples = sum(len(b["seq_lengths"]) for b in blocks)
+        # Effective-batch accounting: how many real examples a packed block carries on average, so the
+        # trainer can scale its per-block batch to TRL's per-example effective batch.
+        self.packed_examples_per_block = total_examples / len(blocks)
 
     def __len__(self):
+        if self.packed_blocks is not None:
+            return len(self.packed_blocks)
         return len(self.dataset)
 
     @staticmethod
@@ -1093,6 +1173,10 @@ class FlashTokenizedSFTDataset:
     def __getitem__(self, index):
         import torch
 
+        if self.packed_blocks is not None:
+            # A packed item is one bin-packed block; BlockDiagonalCollator turns it into the batch.
+            return self.packed_blocks[int(index)]
+
         row = self.dataset[int(index)]
         input_ids = self._list(row["input_ids"])
         loss_mask = self._list(row["loss_mask"])
@@ -1108,7 +1192,41 @@ class FlashTokenizedSFTDataset:
         mm_inputs = self._multimodal_inputs(row.get("multimodal_inputs"))
         return inputs, attention, mask, mm_inputs
 
+    def _packed_collate(self, block_list):
+        # collate pre-packed blocks into the (inputs, attention_mask, loss_mask, mm_inputs) tuple the
+        # sft loop consumes. reuses BlockDiagonalCollator so the mask/position/boundary parity is the
+        # exact trl packing contract. mm_inputs carries per-example position_ids (a real model kwarg)
+        # plus the private token count for telemetry (popped before the forward).
+        import torch
+
+        from flash.engine.worker.packing import BlockDiagonalCollator
+
+        collator = BlockDiagonalCollator(
+            pad_token_id=int(self.tokenizer.pad_token_id),
+            emit_varlen=False,  # sdpa_block_diagonal only; varlen is a GPU-validated follow-up
+        )
+        batch = collator(block_list)
+        input_ids = batch["input_ids"].unsqueeze(1)  # [B,1,T] so the loop's squeeze(1) recovers [B,T]
+        # 4D block-diagonal mask [B,1,T,T]; the loop leaves 4D masks unsqueezed (dim()==4 branch).
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+        # loss_mask marks completion targets with example boundaries and pad already excluded (labels
+        # sets -100 at the first token of each example and at pad); the loop re-derives identical labels
+        # via inputs.masked_fill(~loss_mask.bool(), -100), and the chunked loss's shift stays boundary-safe.
+        loss_mask = labels.ne(-100).to(torch.float32).unsqueeze(1)  # [B,1,T]
+        num_real_tokens = int(sum(len(b["input_ids"]) for b in block_list))
+        mm_inputs = {
+            "position_ids": batch["position_ids"],
+            "flash_packed_num_tokens": torch.tensor(num_real_tokens, dtype=torch.long),
+        }
+        return input_ids, attention_mask, loss_mask, mm_inputs
+
     def collate_fn(self, item_list):
+        # the packed path is self-contained (BlockDiagonalCollator); only the unpacked path needs
+        # openrlhf's zero_pad_sequences, so import it lazily inside that branch.
+        if self.packed_blocks is not None:
+            return self._packed_collate(item_list)
+
         import torch
         from openrlhf.utils.utils import zero_pad_sequences
 
@@ -1567,12 +1685,18 @@ def _install_trainer_patch():
                 for micro_index, batch in enumerate(window):
                     inputs, attention_masks, loss_masks, mm_inputs = batch
                     inputs = inputs.to(device, non_blocking=True).squeeze(1)
-                    attention_mask = attention_masks.to(device, non_blocking=True).squeeze(1)
+                    attention_masks = attention_masks.to(device, non_blocking=True)
+                    # Packed batches carry a 4D block-diagonal mask [B,1,T,T]; keep it 4D. Unpacked
+                    # batches are [B,1,T] and squeeze to the [B,T] padding mask.
+                    packed_batch = attention_masks.dim() == 4
+                    attention_mask = attention_masks if packed_batch else attention_masks.squeeze(1)
                     loss_mask = loss_masks.to(device, non_blocking=True).squeeze(1)
                     mm_inputs = {
                         key: value.to(device, non_blocking=True)
                         for key, value in mm_inputs.items()
                     }
+                    # Private packing telemetry key is not a model kwarg; pop before the forward.
+                    packed_num_tokens = mm_inputs.pop("flash_packed_num_tokens", None)
                     engine.set_gradient_accumulation_boundary(micro_index + 1 == len(window))
                     labels = inputs.masked_fill(~loss_mask.bool(), -100)
                     with _attention_context():
@@ -1589,7 +1713,11 @@ def _install_trainer_patch():
                         self.strategy.backward(loss, self.model, self.optimizer)
                     self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
                     step_loss += float(gpt_loss.item())
-                    step_tokens += int(attention_mask.sum().item())
+                    step_tokens += (
+                        int(packed_num_tokens.item())
+                        if packed_num_tokens is not None
+                        else int(attention_mask.sum().item())
+                    )
                     step_examples += int(inputs.shape[0])
                 global_step += 1
                 global_examples = _global_count(step_examples, device)
@@ -2153,6 +2281,10 @@ def run_sft_openrlhf(spec=None) -> None:
     final_state_path = os.path.join(workdir, _FINAL_STATE_FILE)
     attn_implementation = _attention_implementation(gpu_probe)
     capability = tuple(gpu_probe.get("capability") or ())
+    # Sequence packing is private, default-off A/B instrumentation: sourced from an env var (not a
+    # public spec field yet) and plumbed into the child CONFIG so the child validates it. It stays
+    # "unpacked" until a real-GPU smoke validates the packed model forward for a given architecture.
+    sft_packing_mode = (os.environ.get("FLASH_SFT_PACKING_MODE") or "unpacked").strip().lower()
     runtime_config = {
         "adam_betas": [0.9, 0.999],
         "adam_epsilon": 1e-8,
@@ -2169,6 +2301,7 @@ def run_sft_openrlhf(spec=None) -> None:
         "resume_step": resume_step,
         "save_at_steps": list(save_at_steps),
         "save_every": save_every,
+        "sft_packing_mode": sft_packing_mode,
         "total_steps": update_horizon,
         "warmstart_adapter": warmstart_adapter,
         "weight_decay": 0.0,
@@ -2384,7 +2517,9 @@ def run_sft_openrlhf(spec=None) -> None:
             "runtime_max_length": runtime_max_length,
             "per_device_train_batch_size": micro_batch,
             "gradient_accumulation_steps": gradient_accumulation,
-            "packing": "unpacked_openrlhf",
+            "packing": (
+                "unpacked_openrlhf" if sft_packing_mode == "unpacked" else sft_packing_mode
+            ),
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,

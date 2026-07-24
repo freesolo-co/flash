@@ -2001,3 +2001,145 @@ def test_rendered_dataset_collates_mixed_text_and_image_rows(tmp_path, monkeypat
     assert loss_mask.tolist() == [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
     assert mm_inputs["pixel_values"].tolist() == [[1.0, 2.0]]
     assert mm_inputs["image_grid_thw"].tolist() == [[1, 2, 3]]
+
+
+# --- SFT sequence packing (plan PR #14: pure-attention SDPA block-diagonal) -----------------
+
+
+class _PadTokenizer:
+    pad_token_id = 0
+
+
+def _exec_sft_packing_runtime(monkeypatch, tmp_path, config, name):
+    # Render + exec the child runtime with a given CONFIG (the packing knobs live in CONFIG). A
+    # unique module name per exec keeps runtimes exec'd in the same process from colliding.
+    config_path = tmp_path / f"{name}.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("FLASH_OPENRLHF_SFT_CONFIG", str(config_path))
+    runtime = ModuleType(f"flash_sft_packing_runtime_{name}")
+    exec(compile(render_openrlhf_sft_runtime(), runtime.__name__, "exec"), runtime.__dict__)
+    return runtime
+
+
+def test_sft_packing_mode_default_and_validation(monkeypatch, tmp_path):
+    runtime = _exec_sft_packing_runtime(monkeypatch, tmp_path, {}, "modes")
+    # Default is unpacked so existing runs are untouched until packing is explicitly enabled.
+    runtime.CONFIG = {}
+    assert runtime._sft_packing_mode() == "unpacked"
+    runtime.CONFIG = {"sft_packing_mode": "sdpa_block_diagonal"}
+    assert runtime._sft_packing_mode() == "sdpa_block_diagonal"
+    # varlen (FlashAttention/GDN) is intentionally not enabled in this PR; it must fail loud rather
+    # than silently fall back to an unvalidated forward.
+    runtime.CONFIG = {"sft_packing_mode": "varlen"}
+    with pytest.raises(NotImplementedError, match="varlen"):
+        runtime._sft_packing_mode()
+    runtime.CONFIG = {"sft_packing_mode": "nonsense"}
+    with pytest.raises(ValueError, match="unknown sft_packing_mode"):
+        runtime._sft_packing_mode()
+
+
+def test_sft_packing_rejects_gdn_and_multimodal(monkeypatch, tmp_path):
+    import flash.engine.worker.packing as packing
+
+    # GDN/hybrid archs are not block-diagonal-safe (linear-attention recurrence leaks across
+    # examples without cu_seqlens/seq_idx), so packing must refuse rather than silently corrupt.
+    monkeypatch.setattr(packing, "model_is_pure_attention", lambda *a, **k: False)
+    runtime = _exec_sft_packing_runtime(
+        monkeypatch,
+        tmp_path,
+        {"sft_packing_mode": "sdpa_block_diagonal", "model_id": "test/gdn", "model_revision": ""},
+        "gdn",
+    )
+    with pytest.raises(ValueError, match="pure-attention"):
+        runtime.FlashTokenizedSFTDataset(
+            [{"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1]}],
+            _PadTokenizer(),
+            max_length=16,
+            strategy=object(),
+        )
+
+    # A pure-attention model still refuses packing when any row is multimodal (packing is text-only).
+    monkeypatch.setattr(packing, "model_is_pure_attention", lambda *a, **k: True)
+    runtime = _exec_sft_packing_runtime(
+        monkeypatch,
+        tmp_path,
+        {"sft_packing_mode": "sdpa_block_diagonal", "model_id": "test/pure", "model_revision": ""},
+        "mm",
+    )
+    with pytest.raises(ValueError, match="text-only"):
+        runtime.FlashTokenizedSFTDataset(
+            [{"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1], "multimodal_inputs": b"\x00\x01"}],
+            _PadTokenizer(),
+            max_length=16,
+            strategy=object(),
+        )
+
+
+@requires_torch
+def test_sft_packing_block_diagonal_batch_is_boundary_correct(monkeypatch, tmp_path):
+    import flash.engine.worker.packing as packing
+
+    monkeypatch.setattr(packing, "model_is_pure_attention", lambda *a, **k: True)
+    runtime = _exec_sft_packing_runtime(
+        monkeypatch,
+        tmp_path,
+        {"sft_packing_mode": "sdpa_block_diagonal", "model_id": "test/pure", "model_revision": ""},
+        "batch",
+    )
+    # Two examples; each marks its last two tokens as the completion target.
+    rows = [
+        {"input_ids": [5, 6, 7, 8], "loss_mask": [0, 0, 1, 1]},
+        {"input_ids": [9, 10, 11], "loss_mask": [0, 1, 1]},
+    ]
+    ds = runtime.FlashTokenizedSFTDataset(rows, _PadTokenizer(), max_length=16, strategy=object())
+    # Both examples (4 + 3 = 7 tokens) fit one block; effective batch = 2 examples per block.
+    assert len(ds) == 1
+    assert ds.packed_examples_per_block == pytest.approx(2.0)
+
+    inputs, attention_mask, loss_mask, mm_inputs = ds.collate_fn([ds[0]])
+    assert inputs.dim() == 3  # [B,1,T] so the loop's squeeze(1) -> [B,T]
+    assert inputs.shape[0] == 1
+    assert attention_mask.dim() == 4  # [B,1,T,T] block-diagonal mask kept 4D through the loop
+
+    ids = inputs.squeeze(1)[0]
+    position_ids = mm_inputs["position_ids"][0]
+    completion = loss_mask.squeeze(1)[0]
+    assert ids[:7].tolist() == [5, 6, 7, 8, 9, 10, 11]
+    # position_ids reset per example (0..3 then 0..2), never a running 0..6.
+    assert position_ids[:7].tolist() == [0, 1, 2, 3, 0, 1, 2]
+    # Completion targets only, with each example's first token excluded (no in-example predecessor).
+    assert completion[:7].tolist() == [0, 0, 1, 1, 0, 1, 1]
+    assert int(mm_inputs["flash_packed_num_tokens"]) == 7
+
+    mask = attention_mask[0, 0]
+    # Example B (indices 4-6) and example A (0-3) cannot attend across the boundary either way.
+    assert not bool(mask[5, 3])
+    assert not bool(mask[3, 5])
+    # Within an example the mask is causal.
+    assert bool(mask[6, 4])
+    assert bool(mask[3, 0])
+    assert not bool(mask[0, 3])
+
+    # The loop re-derives labels as inputs.masked_fill(~loss_mask.bool(), -100); it must equal the
+    # collator's boundary+completion labels so the chunked loss's shift stays boundary-safe.
+    labels = ids.masked_fill(~completion.bool(), -100)
+    assert labels[:7].tolist() == [-100, -100, 7, 8, -100, 10, 11]
+
+
+@requires_torch
+def test_sft_packing_unpacked_default_is_unchanged(monkeypatch, tmp_path):
+    # The default (no sft_packing_mode) keeps the padded one-row-per-example path byte-identical:
+    # a per-example [1,T] row, a 2D padding mask, and no position_ids / packing telemetry.
+    runtime = _exec_sft_packing_runtime(monkeypatch, tmp_path, {"model_id": "test/pure"}, "unpacked")
+    rows = [
+        {"input_ids": [5, 6, 7, 8], "loss_mask": [0, 0, 1, 1]},
+        {"input_ids": [9, 10, 11], "loss_mask": [0, 1, 1]},
+    ]
+    ds = runtime.FlashTokenizedSFTDataset(rows, _PadTokenizer(), max_length=16, strategy=object())
+    assert ds.packing_mode == "unpacked"
+    assert ds.packed_blocks is None
+    assert len(ds) == 2
+    inputs, attention, _loss_mask, mm_inputs = ds[0]
+    assert tuple(inputs.shape) == (1, 4)  # one example per row
+    assert attention.dim() == 2  # [1,T] padding mask, not a 4D block mask
+    assert mm_inputs == {}  # no position_ids / packing telemetry on the unpacked path
