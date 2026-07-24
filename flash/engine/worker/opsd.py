@@ -378,9 +378,12 @@ def run_opsd():
                 if not (generation.truncated or generation.skip or not generation.completion_ids)
             ]
             if not usable:
-                raise RuntimeError(
-                    f"opsd step {step + 1} produced no usable naturally terminated student rollout"
-                )
+                # every student rollout truncated before naturally terminating, so this step has
+                # no teacher-forceable target (opsd distills only over naturally-completed
+                # rollouts). on long-trace thinking envs an occasional all-truncate step is
+                # expected, so skip it (no optimizer update) instead of aborting the whole run.
+                _w.heartbeat("opsd_step_skipped", step=step + 1, reason="all_rollouts_truncated")
+                continue
             optimizer.zero_grad(set_to_none=True)
             # per-sample backward with gradient accumulation: mathematically identical to
             # torch.stack(losses).mean().backward() (grad of a mean == mean of the grads), but it

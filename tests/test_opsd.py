@@ -294,3 +294,44 @@ def test_opsd_empty_gold_fails_loudly(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires a nonempty gold completion"):
         opsd_mod.run_opsd()
+
+
+def test_opsd_all_truncated_step_is_skipped_not_fatal(monkeypatch):
+    # a step where every student rollout hit the max-token cap (truncated) has no naturally
+    # terminated completion to teacher-force, so opsd must skip it (opsd_step_skipped heartbeat, no
+    # optimizer update) instead of aborting. long-trace thinking envs emit occasional all-truncate
+    # steps and the paid run must survive them rather than crash near the end.
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.opd_vllm import OpdVllmOutput
+
+    opsd_mod, model, metadata, fake_rollout = _patch_opsd_run(monkeypatch)
+
+    class _TruncatingRollout(fake_rollout):
+        def generate(
+            self,
+            prompt_ids_batch,
+            *,
+            max_tokens,
+            request_seeds=None,
+            multi_modal_data_batch=None,
+        ):
+            # finish_reason="length" -> _generate_many_vllm marks the record truncated=True
+            return [
+                OpdVllmOutput([3, 4], "ab", finish_reason="length")
+                for _prompt_ids in prompt_ids_batch
+            ]
+
+    monkeypatch.setattr(opsd_mod, "OpdVllmRolloutEngine", _TruncatingRollout)
+
+    events: list[str] = []
+    monkeypatch.setattr(opsd_mod._w, "heartbeat", lambda stage, **kwargs: events.append(stage))
+
+    before_lora = model.w.detach().clone()
+
+    opsd_mod.run_opsd()  # must not raise on an all-truncate step
+
+    assert "opsd_step_skipped" in events
+    # a skipped step performs no optimizer update, so the lora weights stay unchanged
+    assert torch.equal(before_lora, model.w.detach())
+    # no step contributed a loss
+    assert metadata["notes"]["loss_curve"] == []
