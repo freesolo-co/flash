@@ -1556,9 +1556,6 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        runner, "_resolve_init_from_adapter", lambda public_spec, **_kwargs: public_spec
-    )
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
