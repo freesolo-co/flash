@@ -109,7 +109,8 @@ def test_opsd_requires_thinking_true():
     with pytest.raises(ConfigError) as ei:
         spec_from_dict(_raw(algorithm="opsd", thinking=False))
     msg = str(ei.value)
-    assert "opsd" in msg and "thinking = true" in msg
+    assert "opsd" in msg
+    assert "thinking = true" in msg
 
 
 def test_opsd_rejects_default_off_thinking():
