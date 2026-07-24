@@ -353,6 +353,173 @@ def test_teacher_bridge_scores_requests_concurrently():
     assert teacher.max_active == 2
 
 
+class _CountingTeacher:
+    """Records every echo request and returns deterministic per-character teacher tokens."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def score(self, prompt, completion):
+        self.calls.append((prompt, completion))
+        # character-dependent logprob so distinct completions produce distinct alignments while every
+        # scoring of the same completion stays byte-identical (the frozen teacher is deterministic).
+        return [
+            TeacherToken(
+                text=ch,
+                logprob=-0.1 * (index + 1) - 0.001 * ord(ch),
+                start=index,
+                end=index + 1,
+            )
+            for index, ch in enumerate(completion)
+        ]
+
+
+def _post_completion(bridge, sequence_ids, *, global_step=0, rollout_ordinal=0):
+    return opd_openrlhf.post_teacher_request(
+        bridge.url,
+        {
+            "label": json.dumps(
+                {
+                    "global_step": global_step,
+                    "example_index": 0,
+                    "rollout_ordinal": rollout_ordinal,
+                    "no_signal_attempt": 0,
+                }
+            ),
+            "prompt_length": 2,
+            "sequence_ids": sequence_ids,
+            "terminated": True,
+        },
+        timeout=5,
+    )
+
+
+def _dedup_bridge(teacher):
+    return opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[
+            opd_openrlhf._PromptRecord(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                rendered="P:",
+            )
+        ],
+        tokenizer=_Tokenizer(),
+        teacher=teacher,
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        token="test-token",
+    )
+
+
+def test_teacher_echo_requests_dedup_within_step():
+    # two rollouts of the same example that produce the identical completion issue one remote echo
+    # request; the second reuses the memoized teacher tokens and returns a byte-identical alignment.
+    teacher = _CountingTeacher()
+    with _dedup_bridge(teacher) as bridge:
+        first = _post_completion(bridge, [10, 11, 20, 21, 2], rollout_ordinal=0)
+        second = _post_completion(bridge, [10, 11, 20, 21, 2], rollout_ordinal=1)
+        snapshot = bridge.snapshot()
+
+    assert teacher.calls == [("User: question\nAssistant: ", "ab")]
+    assert first == second
+    assert snapshot["teacher_echo_deduped"] == 1
+    assert snapshot["teacher_ok"] == 2
+
+
+def test_teacher_echo_memo_clears_on_step_advance():
+    # the memo is bounded to one optimizer step: the same completion re-scored in the next step is a
+    # fresh remote request, so a prior step's teacher tokens never leak past the single-update boundary.
+    teacher = _CountingTeacher()
+    with _dedup_bridge(teacher) as bridge:
+        _post_completion(bridge, [10, 11, 20, 21, 2], global_step=0)
+        _post_completion(bridge, [10, 11, 20, 21, 2], global_step=1)
+        snapshot = bridge.snapshot()
+
+    assert teacher.calls == [
+        ("User: question\nAssistant: ", "ab"),
+        ("User: question\nAssistant: ", "ab"),
+    ]
+    assert snapshot["teacher_echo_deduped"] == 0
+    assert snapshot["teacher_ok"] == 2
+
+
+def test_teacher_echo_dedup_preserves_distinct_request_overlap():
+    # distinct completions must still overlap: the memo lock guards only the dict lookup/store, never
+    # the remote call, so two different echo requests are scored concurrently exactly as before.
+    class _BarrierTeacher:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def score(self, _prompt, completion):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=2)
+                return [
+                    TeacherToken(text=ch, logprob=-0.1 * (index + 1), start=index, end=index + 1)
+                    for index, ch in enumerate(completion)
+                ]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    teacher = _BarrierTeacher()
+    with (
+        _dedup_bridge(teacher) as bridge,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        results = list(
+            pool.map(
+                lambda seq: _post_completion(bridge, seq),
+                ([10, 11, 20, 2], [10, 11, 21, 2]),
+            )
+        )
+        snapshot = bridge.snapshot()
+
+    assert teacher.max_active == 2
+    assert snapshot["teacher_echo_deduped"] == 0
+    assert [result["signal_count"] for result in results] == [1, 1]
+
+
+def test_teacher_echo_dedup_matches_trl_unique_prompt_scatter():
+    # parity with the TRL worker's unique_prompts/scatter_indexes: a step's mixed duplicate + unique
+    # completions issue exactly one remote call per unique (teacher_prompt, completion) pair, and each
+    # post is scattered its own completion's alignment.
+    teacher = _CountingTeacher()
+    sequences = {
+        "ab": [10, 11, 20, 21, 2],
+        "a": [10, 11, 20, 2],
+        "b": [10, 11, 21, 2],
+    }
+    order = ["ab", "a", "ab", "b", "a"]
+    with _dedup_bridge(teacher) as bridge:
+        results = {
+            completion: [] for completion in set(order)
+        }
+        for rollout_ordinal, completion in enumerate(order):
+            results[completion].append(
+                _post_completion(bridge, sequences[completion], rollout_ordinal=rollout_ordinal)
+            )
+        snapshot = bridge.snapshot()
+
+    # TRL dedup reference: one remote call per unique (prompt, completion) pair.
+    prompt_text = "User: question\nAssistant: "
+    expected_unique = {(prompt_text, completion) for completion in set(order)}
+    assert set(teacher.calls) == expected_unique
+    assert len(teacher.calls) == len(expected_unique) == 3
+    assert snapshot["teacher_echo_deduped"] == len(order) - len(expected_unique) == 2
+    # scatter correctness: every post for a completion receives that completion's identical alignment.
+    for completion, completion_results in results.items():
+        assert all(result == completion_results[0] for result in completion_results), completion
+    # and distinct completions receive distinct alignments.
+    assert results["a"][0] != results["b"][0] != results["ab"][0]
+
+
 @pytest.mark.parametrize(
     ("permanent", "classification"),
     [(True, "permanent"), (False, "transient")],
@@ -475,6 +642,7 @@ def test_checkpoint_state_is_valid_full_resume_sidecar():
             "teacher_error": 0,
             "samples_seen": 20,
             "no_signal_resamples": 2,
+            "teacher_echo_deduped": 3,
         },
         loss_curve=[0.4, 0.3],
         coverage_curve=[0.7, 0.8],
@@ -486,6 +654,7 @@ def test_checkpoint_state_is_valid_full_resume_sidecar():
     assert state["loss_curve"] == [0.4, 0.3]
     assert state["coverage_curve"] == [0.7, 0.8]
     assert state["skip_counts"] == {"empty_alignment": 2}
+    assert state["teacher_echo_deduped"] == 3
 
 
 def test_teacher_bridge_runs_checkpoint_callback_before_reply():
@@ -754,6 +923,7 @@ def test_ray_modified_class_checkpoint_and_warmstart_fit_hooks_execute(monkeypat
     namespace["_flash_post_teacher"] = lambda payload: callbacks.append(payload)
     trainer = runtime()
     trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=1, load_enable=False))
+    trainer.strategy = SimpleNamespace(is_rank_0=lambda: True)
     trainer.original_saves = []
     trainer.original_fit_calls = []
     trainer.broadcast_to_vllm = lambda: callbacks.append("broadcast")
@@ -826,6 +996,7 @@ def test_ray_modified_class_fit_does_not_prebroadcast_resumed_warmstart(monkeypa
     _, _, _, runtime = _install_ray_shaped_opd_extension(monkeypatch, warmstart=True)
     trainer = runtime()
     trainer.args = SimpleNamespace(ckpt=SimpleNamespace(save_steps=1, load_enable=True))
+    trainer.strategy = SimpleNamespace(is_rank_0=lambda: True)
     trainer.original_fit_calls = []
     broadcasts = []
     trainer.broadcast_to_vllm = lambda: broadcasts.append(True)
@@ -885,7 +1056,7 @@ def test_child_passes_native_non_length_termination_to_teacher_bridge(monkeypatc
         }
 
     namespace["_original_execute"] = execute
-    namespace["_flash_post_teacher"] = lambda payload: (
+    namespace["_flash_post_teacher"] = lambda payload, skippable=False: (
         payloads.append(payload)
         or {
             "signal_count": 1,
@@ -932,7 +1103,7 @@ def test_child_drops_no_signal_rollout_after_bounded_resampling(monkeypatch):
         }
 
     namespace["_original_execute"] = execute
-    namespace["_flash_post_teacher"] = lambda payload: (
+    namespace["_flash_post_teacher"] = lambda payload, skippable=False: (
         attempts.append(payload)
         or {
             "signal_count": 0,

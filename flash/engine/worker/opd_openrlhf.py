@@ -68,7 +68,7 @@ from flash.engine.worker.perf import (
     wait_for_gpu,
 )
 from flash.engine.worker.rng import backend_seed
-from flash.engine.worker.teacher import TeacherError
+from flash.engine.worker.teacher import TeacherError, TeacherToken
 from flash.engine.worker.tokenizer_align import groupwise_alignment, groupwise_coverage
 from flash.opd_retry_contract import OPD_RESUME_STATE_VERSION, validate_opd_resume_state_metadata
 
@@ -262,6 +262,14 @@ class TeacherAlignmentBridge:
         self._mutation_notified = False
         self._stats_lock = threading.Lock()
         self._failure: tuple[str, str] | None = None
+        # per-step teacher echo memo: identical (teacher_prompt, completion_text) echo requests are
+        # deterministic under the frozen temperature=0 teacher, so collapse them to one remote call
+        # (parity with the TRL worker's unique_prompts dedup). scoped to one optimizer step because
+        # rollouts are collected step-synchronously before the single update, which bounds the memo to
+        # one step's unique completions and clears it on step advance.
+        self._echo_lock = threading.Lock()
+        self._echo_step: int | None = None
+        self._echo_cache: dict[tuple[str, str], list[TeacherToken]] = {}
         state = initial_state or {}
         skip_counts = state.get("skip_counts", {})
         self._stats = {
@@ -276,6 +284,7 @@ class TeacherAlignmentBridge:
             "teacher_error": int(state.get("teacher_error", 0)),
             "samples_seen": int(state.get("samples_seen", 0)),
             "no_signal_resamples": int(state.get("no_signal_resamples", 0)),
+            "teacher_echo_deduped": int(state.get("teacher_echo_deduped", 0)),
         }
         bridge = self
 
@@ -345,6 +354,35 @@ class TeacherAlignmentBridge:
     def snapshot(self) -> dict[str, int | float]:
         with self._stats_lock:
             return dict(self._stats)
+
+    def _scored_teacher_tokens(
+        self, global_step: int, teacher_prompt: str, completion_text: str
+    ) -> list[TeacherToken]:
+        """Echo-score ``completion_text`` against ``teacher_prompt``, deduplicating within the step.
+
+        The remote teacher call runs outside the memo lock so distinct echo requests still overlap
+        (the ThreadingHTTPServer scores concurrent rollout posts in parallel); only the dict lookup
+        and store are serialized. Concurrent identical requests may both miss and both call, which is
+        benign because the frozen temperature=0 teacher returns identical tokens; this matches TRL,
+        whose per-batch dedup likewise does not collapse identical requests across concurrent batches.
+        """
+        key = (teacher_prompt, completion_text)
+        with self._echo_lock:
+            if global_step != self._echo_step:
+                self._echo_step = global_step
+                self._echo_cache = {}
+            cached = self._echo_cache.get(key)
+        if cached is not None:
+            with self._stats_lock:
+                self._stats["teacher_echo_deduped"] += 1
+            return cached
+        tokens = self.teacher.score(teacher_prompt, completion_text)
+        with self._echo_lock:
+            # only retain the result if the step has not advanced while we were scoring, so the memo
+            # never carries a prior step's completions past the single-update boundary.
+            if global_step == self._echo_step:
+                self._echo_cache[key] = tokens
+        return tokens
 
     def score_payload(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -449,7 +487,9 @@ class TeacherAlignmentBridge:
             return self._response(*empty)
 
         teacher_prompt = _teacher_prompt_text(prompt.messages, self.thinking_prefill)
-        teacher_tokens = self.teacher.score(teacher_prompt, completion_text)
+        teacher_tokens = self._scored_teacher_tokens(
+            identity["global_step"], teacher_prompt, completion_text
+        )
         student_ids, student_tokens = student_tokens_with_offsets(
             self.tokenizer,
             kept_ids,
@@ -1853,6 +1893,7 @@ def _checkpoint_state(
         "teacher_transient": int(accounting["teacher_transient"]),
         "teacher_error": int(accounting["teacher_error"]),
         "no_signal_resamples": int(accounting["no_signal_resamples"]),
+        "teacher_echo_deduped": int(accounting["teacher_echo_deduped"]),
         "no_signal_skipped_steps": 0,
         "episodes_seen": int(accounting["samples_seen"]),
         "mt_turn_records": 0,
