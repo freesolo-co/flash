@@ -372,31 +372,38 @@ def run_opsd():
                 max_tokens=knobs.max_completion,
                 request_seeds=request_seeds,
             )
-            losses = []
-            for record, generation in zip(batch, generations, strict=True):
-                if generation.truncated or generation.skip or not generation.completion_ids:
-                    continue
-                generated_tokens += generation.gen_tokens
-                losses.append(
-                    _opsd_sample_loss(
-                        model,
-                        record,
-                        list(generation.completion_ids),
-                        device,
-                    )
-                )
-            if not losses:
+            usable = [
+                (record, generation)
+                for record, generation in zip(batch, generations, strict=True)
+                if not (generation.truncated or generation.skip or not generation.completion_ids)
+            ]
+            if not usable:
                 raise RuntimeError(
                     f"opsd step {step + 1} produced no usable naturally terminated student rollout"
                 )
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.stack(losses).mean()
-            loss.backward()
+            # per-sample backward with gradient accumulation: mathematically identical to
+            # torch.stack(losses).mean().backward() (grad of a mean == mean of the grads), but it
+            # holds only one sample's dense-vocab autograd graph at a time instead of every usable
+            # rollout's at once. thinking-mode opsd emits long completions, so each sample's
+            # [completion, vocab] teacher/student/contribution tensors are large; accumulating them
+            # across a full step overflows even the largest single gpu. dividing each sample loss by
+            # the usable count keeps the effective objective the batch mean.
+            usable_count = len(usable)
+            step_loss = 0.0
+            for record, generation in usable:
+                generated_tokens += generation.gen_tokens
+                sample_loss = (
+                    _opsd_sample_loss(model, record, list(generation.completion_ids), device)
+                    / usable_count
+                )
+                sample_loss.backward()
+                step_loss += float(sample_loss.detach())
             trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable, _OPSD_MAX_GRAD_NORM)
             optimizer.step()
             rollout.sync_from_model(model)
-            loss_curve.append(float(loss.detach()))
+            loss_curve.append(step_loss)
             _w.heartbeat("opsd_step", step=step + 1, loss=loss_curve[-1])
 
         train_wall = time.time() - train_started
