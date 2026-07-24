@@ -232,7 +232,7 @@ def _lora_memory_gb(
     trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
         _LORA_ADAMW_BYTES_PER_PARAM
-        if (algorithm or "").lower() == "opd"
+        if (algorithm or "").lower() in ("opd", "opsd")
         else _LORA_PAGED_BYTES_PER_PARAM
     )
     exact = trainable_params * bytes_per_param / 1e9
@@ -611,7 +611,7 @@ def estimate_vram_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
     eff_b = float(active_params_b) if active_params_b else params_b
-    is_opd = (algorithm or "").lower() == "opd"
+    is_opd = (algorithm or "").lower() in ("opd", "opsd")
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = _lora_memory_gb(lora_rank, eff_b, algorithm, model_info)
@@ -938,14 +938,14 @@ def model_required_vram_gb(
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
-    elif _algo == "opd":
-        # OPD generates on-policy like GRPO, so size for prompt+completion, not the SFT 1024 default.
+    elif _algo in ("opd", "opsd"):
+        # opd-style algorithms size prompt plus completion for the resident rollout path.
         _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
         _default_len = 1024
     seq_len = _pos_int(_get(train, "max_context_tokens"), _default_len)
     lora_rank = _pos_int(_get(train, "lora_rank"), 32)
-    if _algo == "opd":
+    if _algo in ("opd", "opsd"):
         from flash.engine.recipe import RECIPE
 
         batch_size_default = int(RECIPE.opd.prompts_per_step)
@@ -1027,7 +1027,7 @@ def model_required_vram_gb(
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
     is_grpo = _algo in ("grpo", "rl")
-    is_opd = _algo == "opd"
+    is_opd = _algo in ("opd", "opsd")
     is_vllm_rollout = is_grpo or is_opd
     vllm_concurrency = (
         opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size

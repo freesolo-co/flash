@@ -6,13 +6,11 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
-ALGORITHMS = ("sft", "grpo", "opd")
+ALGORITHMS = ("sft", "grpo", "opd", "opsd")
 
-# Algorithms whose training step SAMPLES on-policy student completions (a rollout): GRPO and OPD,
-# versus SFT which trains on a fixed dataset. Single source of truth for the "has rollouts" concept
-# the cost model, VRAM sizing and worker allocator branch on — import ``samples_on_policy`` instead
-# of hand-rolling the ("grpo", "opd") tuple at each site.
-_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+# algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
+# import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
+_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd", "opsd"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
@@ -32,7 +30,7 @@ def supports_image_training(model: str | ModelInfo | None) -> bool:
 
 
 def samples_on_policy(algorithm: str) -> bool:
-    """True when a training step samples on-policy student completions (GRPO or OPD).
+    """True when a training step samples on-policy student completions.
 
     Tolerant of the ``rl`` phase-name alias for grpo (``JobSpec.phase``) so callers that pass a
     phase rather than an algorithm resolve identically."""
@@ -421,7 +419,7 @@ MODELS: dict[str, ModelInfo] = {
             (6144, 5120, 64),
             (17408, 5120, 64),
         ),
-        algos=("sft", "grpo", "opd"),
+        algos=("sft", "grpo", "opd", "opsd"),
         min_vram_gb=80,
         grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
