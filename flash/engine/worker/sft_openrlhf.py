@@ -1655,10 +1655,17 @@ def _install_trainer_patch():
         consumed_in_epoch = consumed_total % epoch_samples
         self.model.train()
         device = next(self.model.parameters()).device
+        # the chunked selected-token nll never materialises full [b, t, vocab] logits, so router aux
+        # loss is unsupported and entropy / mean-token-accuracy are omitted from telemetry (parity
+        # with trl, which likewise skips those metrics when its fused loss returns logits=none).
         if self.aux_loss:
             raise RuntimeError("OpenRLHF chunked SFT loss does not support a router auxiliary objective")
         engine = _install_chunked_loss_forward(self.model)
 
+        # reset the torch peak so peak_gpu_gb reflects the training-loop allocation, not model load.
+        from flash.engine.worker.perf.diagnostics import _peak_gpu_gb, _reset_peak_gpu
+
+        _reset_peak_gpu()
         for epoch in range(start_epoch, self.epochs):
             if global_step >= total_steps:
                 break
@@ -1792,6 +1799,9 @@ def _install_trainer_patch():
                 "consumed_samples": consumed_total,
                 "tokens": token_count,
                 "loss_curve": loss_curve,
+                # rank-0 local torch peak (excludes managed optimizer pages); the parent trains
+                # out-of-process so it cannot read this itself and reports what the child measured.
+                "torch_peak_gpu_gb": _peak_gpu_gb(),
             }
             with open(CONFIG["final_state_path"], "w", encoding="utf-8") as state_file:
                 json.dump(state, state_file, sort_keys=True)
@@ -1979,6 +1989,22 @@ def _training_batch_shape(
     )
     train_batch = micro_batch * gpu_count * accumulation
     return micro_batch, accumulation, train_batch
+
+
+def _resolve_peak_gpu_gb(final_state: dict, device_peak_gpu_gb: float) -> float:
+    """Torch-allocated training peak (GiB) the rank-0 subprocess reported in ``final_state``.
+
+    OpenRLHF trains out-of-process, so ``torch.cuda.max_memory_allocated`` in this parent is ~0;
+    the child measures its own torch peak and ships it back. Fall back to the nvidia-smi device peak
+    when it is absent (older runs / missing rank-0 state) or non-positive. Mirrors TRL ``sft.py``,
+    where ``peak_gpu_gb`` is the torch peak (excludes managed optimizer pages) and
+    ``device_peak_gpu_gb`` is the true device peak.
+    """
+    try:
+        value = float(final_state.get("torch_peak_gpu_gb"))
+    except (TypeError, ValueError):
+        return float(device_peak_gpu_gb)
+    return value if value > 0 else float(device_peak_gpu_gb)
 
 
 def run_sft_openrlhf(spec=None) -> None:
@@ -2461,6 +2487,7 @@ def run_sft_openrlhf(spec=None) -> None:
     state_loss_curve = [round(float(value), 4) for value in final_state.get("loss_curve", [])]
     if state_loss_curve:
         loss_curve = state_loss_curve
+    torch_peak_gpu_gb = _resolve_peak_gpu_gb(final_state, device_peak_gpu_gb)
 
     train_tokens = sft_completed_train_tokens(
         total_tokens_per_epoch,
@@ -2521,10 +2548,15 @@ def run_sft_openrlhf(spec=None) -> None:
                 "unpacked_openrlhf" if sft_packing_mode == "unpacked" else sft_packing_mode
             ),
             "loss_curve": loss_curve[:400],
-            "peak_gpu_gb": device_peak_gpu_gb,
+            "peak_gpu_gb": torch_peak_gpu_gb,
+            # device_peak_gpu_gb (nvidia-smi) includes managed/bnb optimizer pages; peak_gpu_gb
+            # (torch max_memory_allocated, measured in the training subprocess) does not.
             "device_peak_gpu_gb": device_peak_gpu_gb,
             "loraplus_optim": "PagedAdamW8bit",
             "loraplus_applied": loraplus_applied,
+            # chalk standalone kernels are not installed on the openrlhf zero3 path: flash's own
+            # _chunked_selected_token_nll replaces chalk's fused-linear-ce and no other chalk kernel
+            # is applied here (unlike trl, which runs install_chalk_kernels(fused_ce=false)).
             "chalk_kernels": None,
             "openrlhf_backend": "deepspeed_zero3",
             "wandb_project": wandb_project if wandb_enabled else None,

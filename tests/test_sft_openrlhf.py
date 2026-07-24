@@ -20,6 +20,7 @@ from flash.engine.worker.sft_openrlhf import (
     _processor_tokenized_row,
     _register_zero3_external_output_head,
     _resolve_immutable_model_revision,
+    _resolve_peak_gpu_gb,
     _serialize_multimodal_inputs,
     _training_batch_shape,
     build_openrlhf_sft_child_env,
@@ -2143,3 +2144,24 @@ def test_sft_packing_unpacked_default_is_unchanged(monkeypatch, tmp_path):
     assert tuple(inputs.shape) == (1, 4)  # one example per row
     assert attention.dim() == 2  # [1,T] padding mask, not a 4D block mask
     assert mm_inputs == {}  # no position_ids / packing telemetry on the unpacked path
+
+
+def test_resolve_peak_gpu_gb_prefers_child_reported_torch_peak():
+    # openrlhf trains out-of-process; the parent must report the child's torch peak (not the
+    # nvidia-smi device peak) as peak_gpu_gb, matching trl's torch-vs-device distinction.
+    assert _resolve_peak_gpu_gb({"torch_peak_gpu_gb": 5.0}, device_peak_gpu_gb=9.0) == 5.0
+
+
+@pytest.mark.parametrize(
+    "final_state",
+    [
+        {},  # older child that predates torch-peak plumbing
+        {"torch_peak_gpu_gb": None},  # rank!=0 / not measured
+        {"torch_peak_gpu_gb": 0},  # no-cuda child (_peak_gpu_gb returns 0.0)
+        {"torch_peak_gpu_gb": "nan-ish"},  # malformed value
+    ],
+)
+def test_resolve_peak_gpu_gb_falls_back_to_device_peak(final_state):
+    # when the child did not report a usable torch peak, fall back to the device peak so the field
+    # is never silently zero or missing.
+    assert _resolve_peak_gpu_gb(final_state, device_peak_gpu_gb=7.25) == 7.25
