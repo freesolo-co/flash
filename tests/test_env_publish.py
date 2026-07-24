@@ -434,6 +434,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "algorithm": "grpo",
                 "phase": "rl",
                 "environment": {"id": "acme/my-env"},
+                "project": "proj-xyz",
                 "gpu": {"type": "RTX 5090"},
             },
             platform_context={
@@ -452,7 +453,34 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["runId"] == "flash-1"
     assert body["status"] == "running"
     assert body["environmentSlug"] == "acme/my-env"
+    # the toml `project` grouping id rides to the platform as projectId (written to
+    # flash_training_runs.project_id); an absent/empty project reports None (ungrouped).
+    assert body["projectId"] == "proj-xyz"
     assert body["model"] == "Qwen/Qwen3.5-4B"
+
+
+def test_record_training_run_reports_null_project_when_ungrouped(monkeypatch):
+    # a run with no `project` toml field is ungrouped: projectId must be JSON null (not "",
+    # not omitted) so the platform stores a clean NULL flash_training_runs.project_id.
+    from flash.runner import RunStatus
+    from flash.server import run_registry
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        run_registry, "_post", lambda path, body: seen.update(body=body) or True
+    )
+
+    ok = run_registry.record_training_run(
+        status=RunStatus(
+            run_id="flash-2",
+            state="running",
+            spec={"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "gpu": {}},
+            platform_context={"org_id": "org-1"},
+        )
+    )
+
+    assert ok is True
+    assert seen["body"]["projectId"] is None
 
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
