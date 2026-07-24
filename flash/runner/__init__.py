@@ -26,7 +26,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import JobSpec
+from flash.spec import MANAGED_GPU_KEYS, JobSpec
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -904,17 +904,11 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
-    # and stripped from the public spec, so the reconstructed public spec carries only defaults for
-    # them. exclude them from the structural comparison; their integrity is covered by the sha256
-    # preparation digest, and the committed weight-cache volume is guarded against illegitimate
-    # removal at the persist boundary (see _reject_managed_volume_removal).
-    for managed_gpu in (
-        "disk_gb",
-        "network_volume",
-        "network_volume_gb",
-        "max_retries",
-        "max_wall_seconds",
-    ):
+    # (MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
+    # only defaults for them. exclude them from the structural comparison; their integrity is covered
+    # by the sha256 preparation digest, and the committed weight-cache volume is guarded against
+    # illegitimate removal at the persist boundary (see _reject_managed_volume_removal).
+    for managed_gpu in MANAGED_GPU_KEYS:
         effective_gpu[managed_gpu] = public_gpu.get(managed_gpu)
     effective["gpu"] = effective_gpu
     if effective != public:

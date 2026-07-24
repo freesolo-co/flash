@@ -330,6 +330,16 @@ class GpuSpec:
         object.__setattr__(self, "count", _gpu_count(self.count))
 
 
+# platform-managed [gpu] fields: the runner assigns disk sizing, the shared weight-cache volume, and
+# retry/wall-clock lifecycle policy; the user never authors them. single-sourced here so the public
+# serializer (JobSpec.to_dict), the user-facing parser (flash.schema), and the runner's effective-spec
+# validator strip, reject, and exclude exactly the same set. divergence would leak a managed field
+# into the public surface or fail the submit round trip.
+MANAGED_GPU_KEYS = frozenset(
+    {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
+)
+
+
 @dataclass(frozen=True)
 class WandbSpec:
     project: str | None = None
@@ -382,13 +392,7 @@ class JobSpec:
             train.pop("lora_rank", None)
         # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
         gpu = data["gpu"]
-        for managed in (
-            "disk_gb",
-            "network_volume",
-            "network_volume_gb",
-            "max_retries",
-            "max_wall_seconds",
-        ):
+        for managed in MANAGED_GPU_KEYS:
             gpu.pop(managed, None)
         data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
         return data

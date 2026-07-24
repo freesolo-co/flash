@@ -36,6 +36,7 @@ from flash.schema.fields import (
 )
 from flash.spec import (
     FIXED_SEED,
+    MANAGED_GPU_KEYS,
     EnvironmentSpec,
     GpuSpec,
     JobSpec,
@@ -250,15 +251,14 @@ _TOP_LEVEL_KEYS = frozenset(
         "wandb",
     }
 )
-# runner-assigned; excluded from the user-facing [gpu] surface. GpuSpec still carries them so the
-# internal JobSpec.from_dict round trip preserves the runner's disk sizing, weight-cache volume, and
-# platform retry/wall-clock lifecycle policy.
-_GPU_MANAGED_KEYS = frozenset(
-    {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
-)
-_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - _GPU_MANAGED_KEYS
-# [environment] user-authorable keys; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
-_ENVIRONMENT_KEYS = frozenset({"id", "params", "pip", "secrets"})
+# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
+# user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
+# preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
+_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
+# [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
+# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
+_ENVIRONMENT_KEYS = frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
     for item in dataclass_fields(TrainSpec)
