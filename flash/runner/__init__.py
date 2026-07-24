@@ -794,17 +794,6 @@ def _prepare_init_from_adapter(
     return public_spec, worker_spec, identity
 
 
-def _resolve_init_from_adapter(
-    spec: JobSpec, *, owner_org_id: str = "", owner_key_id: int | None = None
-) -> JobSpec:
-    return _prepare_init_from_adapter(
-        spec,
-        owner_org_id=owner_org_id,
-        owner_key_id=owner_key_id,
-        token=os.environ.get("HF_TOKEN"),
-    )[1]
-
-
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
     """Drop a 0-byte ``referenced_by/<child_run_id>`` marker into the warm-start SOURCE run's HF repo.
 
