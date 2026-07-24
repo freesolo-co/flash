@@ -250,14 +250,12 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
     assert "GPU allocation is automatic by default" in out
     assert "cheapest validated class" in out
-    assert 'exact_type = "<CLASS>"' in out
-    assert "[gpu] exact_type" not in out
-    assert "gpu.exact_type" not in out
+    assert 'type = "<CLASS>"' in out
     assert "don't pin" not in out
     assert "cannot pin" not in out
     assert "runpod" not in out.lower()
@@ -878,7 +876,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "how to actually improve a model with Flash" in training_text
     assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
     assert "## Common Flash issues and mitigations" in training_text
-    assert "Trying to pin managed infrastructure" in training_text
+    assert "GPU selection is not what you expected" in training_text
     assert "response_text.thinking" in training_text
     assert "Qwen3.5 thinking multi-turn SFT" in training_text
     assert "longest shared token prefix" in training_text
@@ -1045,7 +1043,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.54"]
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.60"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
