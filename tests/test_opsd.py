@@ -96,7 +96,9 @@ def test_opsd_forward_completion_logits_slices_shifted_completion_positions():
     assert out[0, 1, 0].item() == pytest.approx(4.0)
 
 
-def _patch_opsd_run(monkeypatch, *, gold="worked solution: add one and one to get two", max_steps=1):
+def _patch_opsd_run(
+    monkeypatch, *, gold="worked solution: add one and one to get two", max_steps=1
+):
     torch = pytest.importorskip("torch")
     import flash.engine.worker.hf as hf_mod
     from flash.engine.worker import opsd as opsd_mod
