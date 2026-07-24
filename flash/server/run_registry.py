@@ -76,6 +76,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "status": status.state,
         "userId": context.get("user_id"),
         "apiKeyId": context.get("api_key_id"),
+        "projectId": (spec.get("project") or None) if isinstance(spec.get("project"), str) else None,
         "environmentSlug": _managed_environment_slug(spec),
         "model": spec.get("model") if isinstance(spec.get("model"), str) else None,
         "algorithm": spec.get("algorithm") if isinstance(spec.get("algorithm"), str) else None,
