@@ -49,9 +49,8 @@ def test_config_to_job_spec():
                 "[train]\n"
                 "epochs = 1\n"
                 "max_examples = 10\n"
-                'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
-                'type = "RTX 5090"\n'
+                ''
             )
         spec = spec_from_file(path, run_id="test-run")
         assert spec.run_id == "test-run"
@@ -96,14 +95,11 @@ def test_cli_train_dry_run(monkeypatch, capsys):
                 'algorithm = "grpo"\n'
                 "[environment]\n"
                 'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-                # A user-set [train] hf_repo is silently ignored (platform-managed, assigned
-                # per-run); the dry-run still validates and the resolved hf_repo comes back blank.
                 "[train]\n"
                 "epochs = 1\n"
                 "max_examples = 1\n"
-                'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
-                'type = "RTX 5090"\n'
+                ''
             )
 
         seen = {}

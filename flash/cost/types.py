@@ -41,9 +41,9 @@ class RunConfig:
     # from this token count instead of the padded batch_size * seq_len slot estimate.
     train_tokens: int | None = None
     save_at_steps: tuple[int, ...] = ()
-    exact_type: str = ""
+    gpu_type: str = ""
     model_revision: str = ""
-    # Spec gpu.disk_gb, carried so an exact-auto quote allocates at the run's real disk floor (parity
+    # spec gpu.disk_gb, carried so a pinned quote allocates at the run's real disk floor (parity
     # with the launch allocate call), keeping the persisted quote aligned with the pinned hardware.
     disk_gb: float = 0.0
     # Spec gpu.count: cards the job occupies. total cost scales linearly with it (n cards for the
@@ -61,14 +61,14 @@ class RunConfig:
             )
         object.__setattr__(self, "provider", prov)
         exact = ""
-        if self.exact_type:
-            exact = canonical_gpu(self.exact_type)
+        if self.gpu_type:
+            exact = canonical_gpu(self.gpu_type)
             info = GPU_INFO.get(exact)
             if info is None or not info.validated:
-                raise ValueError(f"exact_type {exact!r} must name an active validated GPU class")
+                raise ValueError(f"gpu_type {exact!r} must name an active validated GPU class")
             if prov != "auto" and prov not in providers_for(exact):
-                raise ValueError(f"provider {prov!r} cannot provision exact_type {exact!r}")
-        object.__setattr__(self, "exact_type", exact)
+                raise ValueError(f"provider {prov!r} cannot provision gpu_type {exact!r}")
+        object.__setattr__(self, "gpu_type", exact)
         if not isinstance(self.model_revision, str):
             raise TypeError("model_revision must be a string")
         object.__setattr__(self, "model_revision", self.model_revision.strip())
@@ -105,16 +105,21 @@ class RunConfig:
         return self.method == "opd"
 
     @property
+    def uses_opd_rollout(self) -> bool:
+        """True for algorithms that reuse the resident OPD rollout and sizing path."""
+        return self.method in ("opd", "opsd")
+
+    @property
     def has_rollout(self) -> bool:
-        """True when a step samples on-policy student completions (GRPO or opd)."""
+        """True when a step samples on-policy student completions."""
         return samples_on_policy(self.method)
 
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
         if self.has_rollout:
-            # GRPO and opd both sample on-policy: identical sizing, only the recipe table differs.
-            rc = RECIPE.opd if self.is_opd else RECIPE.rl
+            # rollout algorithms use either the opd-style single-rollout recipe or grpo's group recipe.
+            rc = RECIPE.opd if self.uses_opd_rollout else RECIPE.rl
             comp = self.completion_len
             if comp is None:
                 comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len

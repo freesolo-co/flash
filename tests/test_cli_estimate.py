@@ -25,9 +25,8 @@ GRPO_RAW = {
         "batch_size": 16,
         "max_completion_tokens": 512,
         "max_context_tokens": 2048,
-        "hf_repo": "owner/runs",
     },
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {},
 }
 
 
@@ -228,9 +227,8 @@ def test_sft_steps_derived_from_examples():
                 "max_examples": 320,
                 "batch_size": 16,
                 "epochs": 2,
-                "hf_repo": "owner/runs",
             },
-            "gpu": {"type": "RTX 4090"},
+            "gpu": {},
         }
     )
     # batch_size 16 is a multiple of the per-device micro-batch (4) so realized == requested:
@@ -247,8 +245,8 @@ def _sft_spec(**train):
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
-        "train": {"hf_repo": "owner/runs", **train},
-        "gpu": {"type": "RTX 4090"},
+        "train": {**train},
+        "gpu": {},
     }
     return spec_from_dict(raw)
 
@@ -337,13 +335,12 @@ def test_sft_steps_price_gdn_packing_conservatively():
         "algorithm": "sft",
         "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
         "train": {
-            "hf_repo": "owner/runs",
             "max_examples": 320,
             "batch_size": 6,
             "epochs": 2,
             "max_context_tokens": 1024,
         },
-        "gpu": {"type": "RTX 4090"},
+        "gpu": {},
     }
     spec = spec_from_dict(raw)
     v = vocab_size_for("Qwen/Qwen3.5-0.8B")
@@ -369,9 +366,8 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         "epochs = 1\n"
         "max_examples = 800\n"
         "batch_size = 16\n"
-        'hf_repo = "owner/runs"\n'
         "[gpu]\n"
-        'type = "RTX 5090"\n'
+        ''
     )
     args = types.SimpleNamespace(
         config=str(cfg),
@@ -402,7 +398,6 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
         "epochs = 1\n"
         "max_examples = 8\n"
         "max_context_tokens = 33000\n"
-        'hf_repo = "owner/runs"\n'
     )
     args = types.SimpleNamespace(
         config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False
@@ -421,14 +416,12 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "some-org/unlisted-7b"\n'
-        'model_policy = "allow"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\n"
         "epochs = 1\n"
         "max_examples = 10\n"
-        'hf_repo = "owner/runs"\n'
     )
     args = types.SimpleNamespace(
         config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False

@@ -26,8 +26,8 @@ BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/gsm8k"},
-    "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8, "hf_repo": "owner/runs"},
-    "gpu": {"type": "RTX 4090"},
+    "train": {"epochs": 1, "max_examples": 10, "lora_rank": 8},
+    "gpu": {},
 }
 
 
@@ -60,15 +60,13 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         # `seeds` is no longer a valid [train] key (multi-seed removed); it's now rejected
         # as an unknown key rather than seed-validated.
         ({"train.seeds": [0]}, "unknown key"),
-        # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
-        # are rejected at parse time with the shared ">= 1" message (a non-positive int
-        # never reaches the later "must be positive" guard).
+        # lora_rank now parses via _train_int(minimum=1), so out-of-range values are rejected at
+        # parse time with the shared ">= 1" message (a non-positive int never reaches the later
+        # "must be positive" guard). lora_alpha is not a user knob (managed, derived as 2 x
+        # lora_rank), so it has no value-validation case here; authoring it is an unknown key.
         ({"train.lora_rank": 0}, "lora_rank must be >= 1"),
-        ({"train.lora_alpha": 0}, "lora_alpha must be >= 1"),
-        ({"train.lora_alpha": -8}, "lora_alpha must be >= 1"),
         # bools must be rejected (bool is an int subclass: True would coerce to 1).
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
-        ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
         # it must be a clean ConfigError like every other scalar.
@@ -115,13 +113,17 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert train_schema_metadata() == {
         key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)
     }
-    assert TRAIN_KEY_MIN_VERSIONS["hf_repo"] == "0.2.0"
+    # hf_repo is platform-managed (no introduced_in), so it is absent from both the user-facing
+    # train schema and the min-version registry.
+    assert "hf_repo" not in TRAIN_SCHEMA_KEYS
+    assert "hf_repo" not in TRAIN_KEY_MIN_VERSIONS
     assert TRAIN_KEY_MIN_VERSIONS["max_context_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
+    assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -135,6 +137,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "structured_outputs",
             "save_at_steps",
             "credit_assignment",
+            "entropy_quantile",
         }
     } == {"0.2.0"}
 
@@ -217,11 +220,19 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     }
     baseline = {"epochs", "hf_repo", "max_examples"}
 
-    # the historical snapshots are immutable and still carry opd_eos_loss_coef because those commits
-    # did. current adds save_at_steps and credit_assignment, and removes the legacy opd eos key.
-    assert historical_shapes["861571e7"] - {"opd_eos_loss_coef"} == TRAIN_SCHEMA_KEYS - {
+    # the historical snapshots are immutable and still carry opd_eos_loss_coef, hf_repo, and
+    # lora_alpha because those commits did (hf_repo was a user key then and lora_alpha a user knob;
+    # both are now platform-managed and dropped from the user schema - hf_repo assigned server-side,
+    # lora_alpha derived as 2 x lora_rank). current adds save_at_steps, credit_assignment, and the
+    # entropy-control knobs, and removes the legacy opd eos key.
+    assert historical_shapes["861571e7"] - {
+        "opd_eos_loss_coef",
+        "hf_repo",
+        "lora_alpha",
+    } == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
         "save_at_steps",
+        "entropy_quantile",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert all(baseline <= shape for shape in historical_shapes.values())
@@ -350,14 +361,15 @@ def test_missing_model_is_rejected() -> None:
 
 
 def test_hf_repo_is_managed_not_user_set() -> None:
-    # [train] hf_repo is platform-managed (assigned server-side per run), so it is NEITHER
-    # required NOR honored from a user config: a config without it parses fine, and a user-
-    # supplied value is ignored (left blank for the control plane to assign at submit).
+    # [train] hf_repo is platform-managed (assigned server-side per run), so it is NOT a user config
+    # key: a config without it parses fine, and a user who sets it is rejected loudly rather than
+    # having their value silently dropped.
     raw = _raw()
     raw["train"] = {"epochs": 1, "max_examples": 10, "lora_rank": 8}
     assert spec_from_dict(raw).train.hf_repo == ""
     raw["train"]["hf_repo"] = "someone-else/their-repo"
-    assert spec_from_dict(raw).train.hf_repo == ""
+    with pytest.raises(ConfigError, match=r"\[train\] unknown key\(s\): hf_repo"):
+        spec_from_dict(raw)
 
 
 def test_lora_rank_allows_rank128_for_small_serving_models() -> None:
@@ -458,54 +470,25 @@ def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
         spec_from_dict(raw)
 
 
-def test_gpu_retry_and_wall_defaults_and_authored_values() -> None:
+def test_gpu_retry_and_wall_are_managed_defaults_not_user_authored() -> None:
+    # max_retries / max_wall_seconds are platform-managed lifecycle policy: a user config never sets
+    # them (the GpuSpec default applies), and authoring either - with any value - is rejected loudly
+    # as an unknown key rather than silently honored.
     defaults = GpuSpec()
-    missing = _raw()
-    missing["gpu"] = {}
-    explicit_none = _raw(**{"gpu.max_retries": None, "gpu.max_wall_seconds": None})
-    for raw in (missing, explicit_none):
-        spec = spec_from_dict(raw)
-        assert spec.gpu.max_retries == defaults.max_retries
-        assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
+    spec = spec_from_dict(_raw())
+    assert spec.gpu.max_retries == defaults.max_retries
+    assert spec.gpu.max_wall_seconds == defaults.max_wall_seconds
 
-    authored_raw = _raw(**{"gpu.max_retries": 7.0, "gpu.max_wall_seconds": 1234.0})
-    authored_raw["gpu"].update({"type": "not-a-real-gpu", "disk_gb": 999})
-    authored = spec_from_dict(authored_raw)
-    assert authored.gpu.max_retries == 7
-    assert authored.gpu.max_wall_seconds == 1234
-    assert authored.gpu.type == spec_from_dict(_raw()).gpu.type
-    assert authored.gpu.disk_gb == defaults.disk_gb
-    assert spec_from_dict(_raw(**{"gpu.max_retries": 0})).gpu.max_retries == 0
+    for managed in ("max_retries", "max_wall_seconds"):
+        raw = _raw()
+        raw["gpu"][managed] = 7
+        with pytest.raises(ConfigError, match=rf"\[gpu\] unknown key\(s\): {managed}"):
+            spec_from_dict(raw)
 
     unknown = _raw()
     unknown["gpu"]["future_gpu_field"] = "rejected"
     with pytest.raises(ConfigError, match=r"\[gpu\] unknown key\(s\): future_gpu_field"):
         spec_from_dict(unknown)
-
-
-@pytest.mark.parametrize("key", ["max_retries", "max_wall_seconds"])
-@pytest.mark.parametrize(
-    ("value", "match"),
-    [
-        (True, "must be an integer"),
-        ("5", "must be an integer"),
-        (1.5, "must be a finite integer"),
-        (float("inf"), "must be a finite integer"),
-        (float("nan"), "must be a finite integer"),
-    ],
-)
-def test_gpu_integer_fields_reject_invalid_values(key: str, value, match: str) -> None:
-    with pytest.raises(ConfigError, match=rf"gpu\.{key} {match}"):
-        spec_from_dict(_raw(**{f"gpu.{key}": value}))
-
-
-def test_gpu_retry_and_wall_minimums() -> None:
-    with pytest.raises(ConfigError, match=r"gpu\.max_retries must be >= 0"):
-        spec_from_dict(_raw(**{"gpu.max_retries": -1}))
-    for value in (59, 1, 0, -1, -3600):
-        with pytest.raises(ConfigError, match=r"gpu\.max_wall_seconds must be >= 60"):
-            spec_from_dict(_raw(**{"gpu.max_wall_seconds": value}))
-    assert spec_from_dict(_raw(**{"gpu.max_wall_seconds": 60})).gpu.max_wall_seconds == 60
 
 
 def test_environment_subfields_reject_wrong_types() -> None:
@@ -657,43 +640,39 @@ def test_job_spec_json_round_trip() -> None:
 def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
     from flash.client.specs import spec_payload
 
+    defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(
-            **{
-                "gpu.max_retries": 0,
-                "gpu.max_wall_seconds": 60,
-                "gpu.provider": " RunPod ",
-                "gpu.exact_type": "rtx-4090",
-            }
-        ),
+        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "rtx-4090"}),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
-    assert payload["gpu"]["max_retries"] == 0
-    assert payload["gpu"]["max_wall_seconds"] == 60
+    # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
     assert payload["gpu"]["provider"] == "runpod"
-    assert payload["gpu"]["exact_type"] == "RTX 4090"
+    assert payload["gpu"]["type"] == "RTX 4090"
+    assert "max_retries" not in payload["gpu"]
+    assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
-    assert reparsed.gpu.max_retries == 0
-    assert reparsed.gpu.max_wall_seconds == 60
     assert reparsed.gpu.provider == "runpod"
-    assert reparsed.gpu.exact_type == "RTX 4090"
+    assert reparsed.gpu.type == "RTX 4090"
     assert reparsed.gpu.type == spec.gpu.type
+    # managed lifecycle fields reconstitute to their defaults on the server reparse.
+    assert reparsed.gpu.max_retries == defaults.max_retries
+    assert reparsed.gpu.max_wall_seconds == defaults.max_wall_seconds
 
 
 def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
     with pytest.raises(ConfigError, match=r"gpu\.provider"):
         spec_from_dict(_raw(**{"gpu.provider": "aws"}))
-    with pytest.raises(ConfigError, match=r"gpu\.exact_type"):
-        spec_from_dict(_raw(**{"gpu.exact_type": "Tesla T4"}))
+    with pytest.raises(ConfigError, match=r"gpu\.type"):
+        spec_from_dict(_raw(**{"gpu.type": "Tesla T4"}))
     with pytest.raises(ConfigError, match=r"unsupported gpu 'RTX A6000'"):
-        spec_from_dict(_raw(**{"gpu.exact_type": "RTX A6000"}))
+        spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
     with pytest.raises(ConfigError, match="requires at least"):
         spec_from_dict(
             _raw(
                 model="Qwen/Qwen3.5-9B",
-                **{"gpu.exact_type": "RTX 4090"},
+                **{"gpu.type": "RTX 4090"},
             )
         )
     with pytest.raises(ConfigError, match="cannot provision"):
@@ -701,66 +680,33 @@ def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> No
             _raw(
                 **{
                     "gpu.provider": "lambda",
-                    "gpu.exact_type": "RTX 4090",
+                    "gpu.type": "RTX 4090",
                 }
             )
         )
 
 
-def test_gpu_type_is_non_pinning_managed_input() -> None:
-    baseline = spec_from_dict(_raw())
-    authored = spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    assert authored.gpu.type == baseline.gpu.type
-    assert authored.gpu.exact_type == ""
-
-
-def test_gpu_type_override_warning_requires_an_authored_hint(capsys) -> None:
-    spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    warning = capsys.readouterr().err
-    assert "[gpu] type='B200' is a non-pinning hint and was not applied" in warning
-    # the provisional is an offline RunPod-static estimate, not the final pick, so the note must not
-    # label any class "selected"; the submit-time allocator re-resolves across live providers.
-    assert "picks the cheapest validated class that fits at submit time" in warning
-    assert "selected" not in warning
-    # the suggested pin must paste into the user's existing [gpu] table as-is: a bare
-    # `exact_type = "..."` key, never the `[gpu] exact_type=...` one-line header form (invalid TOML)
-    # nor a dotted `gpu.exact_type` (which nests to gpu.gpu.exact_type when written inside [gpu]).
-    assert 'add exact_type = "B200" to your [gpu] section.' in warning
-    assert "[gpu] exact_type" not in warning
-    assert "gpu.exact_type" not in warning
-
-    spec_from_dict(_raw(**{"gpu.type": "H10O"}))
-    invalid_warning = capsys.readouterr().err
-    assert "[gpu] type='H10O' is not an active GPU class and was ignored" in invalid_warning
-    assert "`flash gpus` to list valid classes" in invalid_warning
-    assert 'add exact_type = "H10O"' not in invalid_warning
-
-    # an unrecognized type hint (e.g. a removed/retired class name) must be treated like any unknown
-    # string and never echoed back as an exact_type the schema would immediately reject.
-    spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
-    retired_warning = capsys.readouterr().err
-    assert "[gpu] type='RTX A6000' is not an active GPU class and was ignored" in retired_warning
-    assert 'add exact_type = "RTX A6000"' not in retired_warning
-
+def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
     automatic_raw = _raw()
-    automatic_raw["gpu"].pop("type")
-    spec_from_dict(automatic_raw)
+    automatic_raw["gpu"].pop("type", None)
+
+    automatic = spec_from_dict(automatic_raw)
+    pinned = spec_from_dict(_raw(**{"gpu.type": "B200"}))
+
+    assert automatic.gpu.type == ""
+    assert pinned.gpu.type == "B200"
     assert capsys.readouterr().err == ""
 
-    selected = spec_from_dict(automatic_raw).gpu.type
-    capsys.readouterr()
-    spec_from_dict(_raw(**{"gpu.type": selected}))
-    assert capsys.readouterr().err == ""
 
+def test_removed_gpu_pin_key_is_rejected_as_unknown() -> None:
+    removed_key = "exact" + "_type"
+    raw = _raw()
+    raw["gpu"][removed_key] = "H100"
 
-def test_gpu_type_override_warning_suppressed_for_provider_pinned_runs(capsys) -> None:
-    # without a provider pin, an authored non-pinning type fires the clarity note...
-    spec_from_dict(_raw(**{"gpu.type": "B200"}))
-    assert "non-pinning hint" in capsys.readouterr().err
-    # ...but the note is scoped to provider-agnostic runs (under a provider pin the exact_type it
-    # would suggest might not be provisionable there), so pinning a provider suppresses it.
-    spec_from_dict(_raw(**{"gpu.type": "B200", "gpu.provider": "lambda"}))
-    assert capsys.readouterr().err == ""
+    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key"):
+        spec_from_dict(raw)
+    with pytest.raises(ValueError, match=r"gpu has unknown key"):
+        JobSpec.from_dict({"gpu": {removed_key: "H100"}})
 
 
 def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
@@ -800,16 +746,16 @@ def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
         JobSpec.from_dict({"gpu": {"exact_typ": "H100"}})
     with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
         JobSpec.from_dict({"gpu": {"provider": 1}})
-    with pytest.raises(TypeError, match=r"gpu\.exact_type must be a string"):
-        JobSpec.from_dict({"gpu": {"exact_type": 1}})
+    with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
+        JobSpec.from_dict({"gpu": {"type": 1}})
     with pytest.raises(ValueError, match="cannot provision"):
-        JobSpec.from_dict({"gpu": {"provider": "lambda", "exact_type": "RTX 4090"}})
+        JobSpec.from_dict({"gpu": {"provider": "lambda", "type": "RTX 4090"}})
 
-    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "exact_type": "h100"}})
+    restored = JobSpec.from_dict({"gpu": {"provider": " LAMBDA ", "type": "h100"}})
     assert restored.gpu.provider == "lambda"
-    assert restored.gpu.exact_type == "H100"
+    assert restored.gpu.type == "H100"
     assert JobSpec.from_dict({}).gpu.provider == ""
-    assert JobSpec.from_dict({}).gpu.exact_type == ""
+    assert JobSpec.from_dict({}).gpu.type == ""
 
 
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
@@ -895,7 +841,9 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     assert orch.adapter_prefix(spec) == "rl/flash-1-x"
     assert orch.adapter_ref(spec) is None
 
-    d = spec.to_dict()
+    # hf_repo and run_id are platform-managed: they survive the INTERNAL round trip
+    # (to_internal_dict -> from_dict), which is what the worker/control plane use, not to_dict().
+    d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = JobSpec.from_dict(d)
     assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"

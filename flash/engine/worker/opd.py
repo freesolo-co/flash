@@ -401,6 +401,14 @@ def _resolve_opd_knobs() -> OpdKnobs:
     )
 
 
+def _render_prompt_ids(tok, messages, *, thinking: bool) -> list[int]:
+    """Render one prompt through the model tokenizer's chat-template path."""
+    text = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
+    )
+    return list(tok(text, add_special_tokens=False).input_ids)
+
+
 def _thinking_prefill_text(tok) -> str:
     """The trailing text a thinking-mode chat template opens after the generation prompt (Qwen's
     ``<think>\\n``), i.e. the delta between the enable_thinking=True and =False renders. Returns "" when
@@ -611,7 +619,7 @@ def run_opd():
     teacher = TeacherClient(api_key, knobs.teacher_base_url, knobs.teacher_model)
     wait_for_gpu(
         _w.JOB_SPEC.gpu.type if _w.JOB_SPEC else None,
-        exact_type=_w.JOB_SPEC.gpu.exact_type if _w.JOB_SPEC else "",
+        gpu_type=_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else "",
     )
     setup_perf_backends()
 
@@ -665,12 +673,6 @@ def run_opd():
     else:
         prompt_budget = RECIPE.opd.max_prompt_len
 
-    def _render_prompt_ids(messages):
-        text = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
-        )
-        return tok(text, add_special_tokens=False).input_ids
-
     # Build the on-policy pool from ONLY the prompts that fit the budget (GRPO-style pre-filter). The
     # step loop visits a deterministic examples[(step*prompts_per_step+i) % len] slice, so a whole-dataset
     # `any(fits)` precheck could pass while every prompt in the visited slice is over-budget and
@@ -719,7 +721,7 @@ def run_opd():
                     descriptors=descriptors,
                 )
             else:
-                prompt_ids = _render_prompt_ids(messages)
+                prompt_ids = _render_prompt_ids(tok, messages, thinking=_w.THINKING)
                 record = _PromptRecord(
                     example=ex,
                     student_messages=messages,

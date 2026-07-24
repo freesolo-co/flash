@@ -510,12 +510,7 @@ def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     assert h.offer_id == 99
 
 
-def test_deploy_refresh_threads_user_pin_not_allocated_class(monkeypatch):
-    # regression: the refresh re-search must key its exact-alias narrowing on the user's hard pin
-    # (spec.gpu.exact_type), NOT the single allocated class inferred from the in-flight offers. A
-    # non-exact run's offers are pre-filtered to one canonical class, so inferring exact_type from
-    # ``allowed`` forced an exact refresh and dropped the fungible cross-architecture capacity the
-    # first broad search had matched.
+def test_deploy_refresh_uses_transient_concrete_gpu_type(monkeypatch):
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
@@ -526,21 +521,15 @@ def test_deploy_refresh_threads_user_pin_not_allocated_class(monkeypatch):
             raise vast_api.VastCreateRejected("taken")
         return 7
 
-    def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
-        seen["exact_type"] = exact_type
+    def capture(min_vram_gb, disk_gb, *a, gpu_type="", **k):
+        seen["gpu_type"] = gpu_type
         return [_offer(offer_id=99, machine_id=99, gpu="RTX 4090")]
 
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     monkeypatch.setattr(vast, "usable_offers", capture)
 
-    # non-exact run: the refresh keeps the broad fungible search (exact_type stays empty)
     _deploy(vast, _spec(), seed=0, offers=[_offer(offer_id=1)], attempt=0)
-    assert seen["exact_type"] == ""
-
-    # exact-pinned run (type == exact_type): the refresh narrows on the pinned class
-    seen.clear()
-    _deploy(vast, _spec(exact_type="RTX 4090"), seed=0, offers=[_offer(offer_id=1)], attempt=0)
-    assert seen["exact_type"] == "RTX 4090"
+    assert seen["gpu_type"] == "RTX 4090"
 
 
 def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
@@ -2181,27 +2170,18 @@ def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
         _submit(vast,spec, seed=0)
 
 
-def test_submit_gates_exact_search_on_user_pin_not_allocated_class(monkeypatch):
-    # regression: the submit-time exact-alias narrowing must key on the user's hard pin
-    # (gpu.exact_type), not the allocated gpu.type. passing gpu.type unconditionally dropped
-    # fungible cross-architecture capacity (e.g. a 40GB "A100 PCIE" board usable as A100 SXM 40GB)
-    # for non-exact runs, whose verify_gpu is soft and would have accepted those boards.
+def test_submit_uses_transient_concrete_gpu_type_for_exact_search(monkeypatch):
     seen: dict[str, str] = {}
 
-    def capture(min_vram_gb, disk_gb, *a, exact_type="", **k):
-        seen["exact_type"] = exact_type
+    def capture(min_vram_gb, disk_gb, *a, gpu_type="", **k):
+        seen["gpu_type"] = gpu_type
         return [_offer(gpu="H100")]
 
     vast, _ = _wire_submit(monkeypatch)
     monkeypatch.setattr(vast, "usable_offers", capture)
 
-    # non-exact run: keep the broad fungible search so cross-arch capacity still counts
     _submit(vast, _spec(gpu_type="H100"), seed=0)
-    assert seen["exact_type"] == ""
-
-    # exact-pinned run (type == exact_type): attestation-safe narrowing on the pinned class
-    _submit(vast, _spec(gpu_type="H100", exact_type="H100"), seed=0)
-    assert seen["exact_type"] == "H100"
+    assert seen["gpu_type"] == "H100"
 
 
 def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
