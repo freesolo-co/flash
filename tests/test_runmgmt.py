@@ -8,6 +8,8 @@ import tempfile
 
 import pytest
 
+from tests._helpers.runner import provisioned_status
+
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
@@ -767,12 +769,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
         gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -854,12 +851,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
         gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -1443,12 +1435,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
         gpu=GpuSpec(max_wall_seconds=60),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=99.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=99.0),
         _run_deadline_at=159.0,
         _next_attempt=0,
     )
@@ -1475,12 +1462,7 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
         gpu=GpuSpec(max_wall_seconds=200),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="provisioning",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="provisioning", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -1530,13 +1512,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         code_prefix="code/revision",
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=300.0,
         _next_attempt=2,
     )
@@ -1590,13 +1566,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -1669,13 +1639,7 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -1763,10 +1727,10 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         gpu=GpuSpec(max_wall_seconds=120),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
+        provisioned_status(
+            runner,
+            spec,
             state="running",
-            spec=spec.to_dict(),
             created_at=100.0,
             remote=_runpod_remote("endpoint-old", "job-old", attempt=0),
         ),
@@ -1830,13 +1794,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     )
     remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -2121,12 +2079,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         gpu=GpuSpec(max_wall_seconds=120),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="provisioning",
-            spec=spec.to_dict(),
-            created_at=10.0,
-        ),
+        provisioned_status(runner, spec, state="provisioning", created_at=10.0),
         _run_deadline_at=130.0,
         _next_attempt=0,
     )

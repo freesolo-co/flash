@@ -129,7 +129,7 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     toml.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
         '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-        '[train]\nepochs = 1\nmax_examples = 1\nhf_repo = "owner/runs"\n'
+        '[train]\nepochs = 1\nmax_examples = 1\n'
     )
     proc = _run(["train", str(toml), "--background"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr

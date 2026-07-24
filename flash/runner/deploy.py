@@ -971,8 +971,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    public_spec = JobSpec.from_dict(status.spec)
-    worker_spec = public_spec
+    # Seed from the lossy public view so the except/finally handlers always have a spec, then
+    # upgrade to the authoritative worker spec (real run_id + managed fields) inside the try.
+    worker_spec = JobSpec.from_dict(status.spec)
     persisted_remote = dict(status.remote)
     next_attempt = 0
     code_prefix = None
@@ -1150,7 +1151,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         if not _adopt_completed_attempt(
             run_id,
-            public_spec,
+            worker_spec,
             persisted_remote,
             res.metrics,
             log=log,

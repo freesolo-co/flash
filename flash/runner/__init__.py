@@ -26,7 +26,7 @@ from flash.opd_retry_contract import (
     require_opd_retry_contract_version,
 )
 from flash.providers._poll import _MAX_ATTEMPT_ID, _attempt_int
-from flash.spec import JobSpec
+from flash.spec import MANAGED_GPU_KEYS, JobSpec
 
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -69,16 +69,39 @@ def adapter_ref(spec: JobSpec) -> str | None:
     return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
-def _adapter_ref_from_status_spec(raw: dict) -> str | None:
-    """The public short adapter reference (`<run_id>`) shown by `flash status` — exactly what
-    users paste into train.init_from_adapter; `<run_id>/step-N` targets a saved checkpoint."""
-    try:
-        spec = JobSpec.from_dict(raw)
-    except Exception:
+def _internal_spec_from_status(status: RunStatus) -> JobSpec:
+    """Reconstruct the run's complete internal job spec for the runner's lifecycle logic.
+
+    status.spec is the public representation and omits platform-managed fields (hf_repo,
+    max_wall_seconds, run_id, ...); their authoritative values are persisted verbatim in the internal
+    worker spec under effective_preparation (recorded for every provisioned run). Prefer that
+    carrier; fall back to the public spec for runs recorded before an effective worker spec exists,
+    where those fields carry their managed defaults.
+    """
+    snapshot = status.effective_preparation
+    raw_worker = snapshot.get("worker_spec") if isinstance(snapshot, dict) else None
+    if isinstance(raw_worker, dict):
+        try:
+            return JobSpec.from_dict(raw_worker)
+        except Exception:
+            pass
+    return JobSpec.from_dict(status.spec)
+
+
+def _adapter_ref_for_status(status: RunStatus) -> str | None:
+    """The public short adapter reference (`<run_id>`) shown by `flash status` once a run's trained
+    adapter is registered; exactly what users paste into train.init_from_adapter (`<run_id>/step-N`
+    targets a saved checkpoint).
+
+    hf_repo, the control-plane-assigned artifact repo that signals the adapter exists, is
+    platform-managed and read from the internal worker spec (see _internal_spec_from_status); run_id
+    comes from the RunStatus itself.
+    """
+    if not (status.effective_preparation or {}).get("worker_spec"):
         return None
-    if not spec.train.hf_repo:
+    if not _internal_spec_from_status(status).train.hf_repo:
         return None
-    return spec.run_id
+    return status.run_id
 
 
 def _gpu_rate(gpu_type: str) -> float:
@@ -172,7 +195,9 @@ def _require_valid_deadline(value: object) -> float:
 
 def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     status = _runstatus_from_json(raw)
-    spec = JobSpec.from_dict(status.spec)
+    # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
+    # run-global wall budget from the internal worker spec (the same value submit recorded).
+    spec = _internal_spec_from_status(status)
     created_at = _require_valid_deadline(status.created_at)
     max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
     return status, _require_valid_deadline(created_at + max_wall_seconds)
@@ -245,7 +270,9 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None]:
     with _status_guard(run_id):
         raw = _load_status_json(run_id)
         status = _runstatus_from_json(raw)
-        spec = JobSpec.from_dict(status.spec)
+        # hf_repo is platform-managed and stripped from the public status.spec; the opd replacement
+        # locates its resume checkpoint by hf_repo, so source the complete internal worker spec.
+        spec = _internal_spec_from_status(status)
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
         try:
@@ -442,7 +469,7 @@ def _status_storage_dict(status: RunStatus) -> dict:
     """Serialize status for persistence without filtering internal deployment state."""
     data = asdict(status)
     data["adapter_ref"] = (
-        _adapter_ref_from_status_spec(status.spec) if status.state in {"done", "deployed"} else None
+        _adapter_ref_for_status(status) if status.state in {"done", "deployed"} else None
     )
     return data
 
@@ -738,7 +765,10 @@ def _prepare_init_from_adapter(
             raise ValueError(
                 "train.init_from_adapter source run must belong to the same Freesolo org"
             )
-    src_spec = JobSpec.from_dict(src_status.spec)
+    # hf_repo is platform-managed and stripped from the source run's public spec; its authoritative
+    # value lives in that run's internal worker spec (see _internal_spec_from_status), which the
+    # warm-start needs to locate the source adapter artifacts.
+    src_spec = _internal_spec_from_status(src_status)
     if src_spec.model != spec.model:
         raise ValueError(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
@@ -840,6 +870,12 @@ def _preparation_digest(
 def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None:
     public = public_spec.to_internal_dict()
     effective = worker_spec.to_internal_dict()
+    # run_id and model_policy are platform-managed top-level fields stripped from the public spec, so
+    # the reconstructed public spec carries only their defaults ("local"/"catalog"). exclude them from
+    # the structural check; their integrity is covered by the sha256 preparation digest, and the
+    # worker spec is already keyed by run_id at the persist boundary.
+    for managed_top in ("run_id", "model_policy"):
+        effective[managed_top] = public.get(managed_top)
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -849,6 +885,9 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "init_from_adapter_revision",
         "lora_rank",
         "lora_alpha",
+        # platform-managed artifact repo: stripped from the public spec (digest-protected), so the
+        # reconstructed public spec carries only the default. exclude it from the structural check.
+        "hf_repo",
     ):
         effective_train[train_field] = public_train.get(train_field)
     effective["train"] = effective_train
@@ -864,11 +903,13 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["environment"] = effective_environment
     public_gpu = dict(public["gpu"])
     effective_gpu = {**effective["gpu"], "type": public_gpu["type"]}
-    if (
-        public_gpu.get("network_volume") == WEIGHT_CACHE_VOLUME_NAME
-        and effective_gpu.get("network_volume") is None
-    ):
-        effective_gpu["network_volume"] = WEIGHT_CACHE_VOLUME_NAME
+    # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
+    # (MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
+    # only defaults for them. exclude them from the structural comparison; their integrity is covered
+    # by the sha256 preparation digest, and the committed weight-cache volume is guarded against
+    # illegitimate removal at the persist boundary (see _reject_managed_volume_removal).
+    for managed_gpu in MANAGED_GPU_KEYS:
+        effective_gpu[managed_gpu] = public_gpu.get(managed_gpu)
     effective["gpu"] = effective_gpu
     if effective != public:
         raise ValueError("persisted effective preparation does not match the public run")
@@ -1015,6 +1056,23 @@ def prepare_job(
     )
 
 
+def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> None:
+    """Fail closed if a re-prepared worker spec drops a non-shared weight-cache volume.
+
+    network_volume is platform-managed and no longer travels in the public spec, so the committed
+    volume lives only in the prior preparation snapshot. The SHARED platform cache
+    (WEIGHT_CACHE_VOLUME_NAME) may be dropped on a capacity fallback, but a per-org escape-hatch
+    volume an open-model run opted into must never be silently removed or swapped.
+    """
+    if not isinstance(snapshot, dict):
+        return
+    committed = ((snapshot.get("worker_spec") or {}).get("gpu") or {}).get("network_volume")
+    if not committed or committed == WEIGHT_CACHE_VOLUME_NAME:
+        return
+    if worker_spec.gpu.network_volume != committed:
+        raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
+
+
 def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     """Persist the selected worker spec before provider provisioning starts."""
     status = get_status(worker_spec.run_id)
@@ -1029,6 +1087,7 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
         adapter_identity = snapshot.get("adapter_identity")
     else:
         adapter_identity = None
+    _reject_managed_volume_removal(snapshot, worker_spec)
     _validate_effective_spec(public_spec, worker_spec)
     effective_preparation = {
         "worker_spec": worker_spec.to_internal_dict(),
@@ -1812,7 +1871,10 @@ def _save_status(
                 raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
             if _run_deadline_at is _PRIVATE_VALUE_UNSET:
-                spec = JobSpec.from_dict(status.spec)
+                # max_wall_seconds is managed and stripped from the public status.spec; source the
+                # run-global wall budget from the internal worker spec so the auto-computed deadline
+                # reloads consistently (see _canonical_run_deadline).
+                spec = _internal_spec_from_status(status)
                 _run_deadline_at = _require_valid_deadline(
                     _require_valid_deadline(status.created_at)
                     + _require_valid_deadline(spec.gpu.max_wall_seconds)

@@ -268,7 +268,7 @@ def _train_config(tmp_path, *, extra_train: str = ""):
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\n'
-        f'[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n{extra_train}'
+        f"[train]\nepochs = 1\nmax_examples = 2\n{extra_train}"
     )
     return path
 
@@ -330,8 +330,8 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert expected in captured.err
     assert call[2] is None
     assert call[3] is True
-    assert call[4]["authored_keys"] == ["epochs", "hf_repo", "max_examples"]
-    assert call[1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+    assert call[4]["authored_keys"] == ["epochs", "max_examples"]
+    assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
 def test_train_dry_run_sends_declared_runtime_secrets(
@@ -342,7 +342,7 @@ def test_train_dry_run_sends_declared_runtime_secrets(
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
-        '[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
     )
     monkeypatch.setenv("SERPAPI_API_KEY", "serp-secret")
 
@@ -443,7 +443,7 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
     calls = [call for call in fake_client.calls if call[0] == "create_run"]
 
     assert calls[0][1] == calls[1][1]
-    assert calls[0][1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+    assert calls[0][1]["train"] == {"epochs": 1, "max_examples": 2}
     assert calls[0][3] is True
     assert calls[0][4] is not None
     assert calls[1][3] is False
