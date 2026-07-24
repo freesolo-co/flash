@@ -69,7 +69,7 @@ def adapter_ref(spec: JobSpec) -> str | None:
     return f"{spec.train.hf_repo}:{adapter_prefix(spec)}"
 
 
-def _internal_spec_from_status(status: "RunStatus") -> JobSpec:
+def _internal_spec_from_status(status: RunStatus) -> JobSpec:
     """Reconstruct the run's complete internal job spec for the runner's lifecycle logic.
 
     status.spec is the public representation and omits platform-managed fields (hf_repo,
@@ -88,7 +88,7 @@ def _internal_spec_from_status(status: "RunStatus") -> JobSpec:
     return JobSpec.from_dict(status.spec)
 
 
-def _adapter_ref_for_status(status: "RunStatus") -> str | None:
+def _adapter_ref_for_status(status: RunStatus) -> str | None:
     """The public short adapter reference (`<run_id>`) shown by `flash status` once a run's trained
     adapter is registered; exactly what users paste into train.init_from_adapter (`<run_id>/step-N`
     targets a saved checkpoint).
