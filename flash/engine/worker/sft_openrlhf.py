@@ -928,6 +928,114 @@ def build_openrlhf_sft_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[
     return child
 
 
+def length_grouped_indices(lengths, batch_size, *, generator=None, mega_batch_mult=None):
+    """return a length-grouped permutation of ``range(len(lengths))``.
+
+    port of the algorithm trl's ``group_by_length`` uses (huggingface
+    ``get_length_grouped_indices``): randomly permute the indices, cut them into mega-batches of
+    ``mega_batch_mult * batch_size``, sort each mega-batch by length descending, then surface the
+    single globally-longest example first so an oom shows up on the first step. the result is always
+    a permutation of ``range(n)`` (every index exactly once), so routing it through an unchanged
+    shard/pad tail keeps sampling lossless. correctness is independent of ``batch_size`` (it only
+    tunes grouping granularity).
+    """
+    import torch
+
+    n = len(lengths)
+    if n == 0:
+        return []
+    batch_size = max(1, int(batch_size))
+    if mega_batch_mult is None:
+        mega_batch_mult = min(n // (batch_size * 4), 50)
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+    permuted = torch.randperm(n, generator=generator).tolist()
+    megabatch_size = mega_batch_mult * batch_size
+    megabatches = [permuted[i : i + megabatch_size] for i in range(0, n, megabatch_size)]
+    megabatches = [sorted(mb, key=lambda index: lengths[index], reverse=True) for mb in megabatches]
+    # move the single longest example to the very front (oom early-detection), matching trl/hf.
+    maxima = [lengths[mb[0]] for mb in megabatches]
+    longest = max(range(len(maxima)), key=lambda i: maxima[i])
+    megabatches[0][0], megabatches[longest][0] = megabatches[longest][0], megabatches[0][0]
+    return [index for mb in megabatches for index in mb]
+
+
+def distributed_shard(
+    indices, *, num_replicas, rank, total_size, num_samples, drop_last, consumed_indices
+):
+    """openrlhf ``DistributedSampler``'s pad/subsample/skip tail, kept byte-identical.
+
+    (openrlhf ``utils/distributed_sampler.py`` lines 115-131.) a length-grouped permutation is fed
+    through this unchanged tail so it shards to the same per-rank count and the same global multiset
+    as the plain shuffle it replaces; that parity is what makes length-grouped sampling lossless.
+    """
+    import math
+
+    indices = list(indices)
+    if not drop_last:
+        padding_size = total_size - len(indices)
+        if padding_size <= len(indices):
+            indices += indices[:padding_size]
+        else:
+            indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+    else:
+        indices = indices[:total_size]
+    if len(indices) != total_size:
+        raise ValueError("distributed shard: padded index count does not match total_size")
+    indices = indices[rank:total_size:num_replicas]
+    indices = indices[consumed_indices:]
+    if len(indices) != num_samples - consumed_indices:
+        raise ValueError("distributed shard: per-rank count does not match num_samples")
+    return indices
+
+
+def install_length_grouped_distributed_sampler(batch_size):
+    """rebind openrlhf's deepspeed ``DistributedSampler`` to a length-grouped subclass.
+
+    openrlhf's ``setup_dataloader`` constructs ``DistributedSampler(replay_buffer, seed=..., ...)``
+    from the symbol imported into its deepspeed module, so rebinding that symbol lets openrlhf pass
+    the correct dp-group / rank / seed / consumed-samples while we swap only the per-epoch
+    permutation. the subclass inherits from ``openrlhf.utils.distributed_sampler.DistributedSampler``
+    so the sft loop's ``isinstance(sampler, DistributedSampler)`` ``set_epoch`` call still fires
+    (epoch advance + resume preserved). the ``shuffle=False`` path (eval) keeps the base range order,
+    so grouping only reorders the shuffled training epochs.
+    """
+    import torch
+    from openrlhf.utils.distributed_sampler import DistributedSampler
+
+    grouping_batch_size = max(1, int(batch_size))
+
+    class DistributedLengthGroupedSampler(DistributedSampler):
+        def __iter__(self):
+            if self.shuffle:
+                generator = torch.Generator()
+                generator.manual_seed(self.seed + self.epoch)
+                lengths = getattr(self.dataset, "example_lengths", None)
+                if lengths is None:
+                    raise ValueError(
+                        "length-grouped sft sampling requires the dataset to expose "
+                        "example_lengths (unpacked path only)"
+                    )
+                full = length_grouped_indices(lengths, grouping_batch_size, generator=generator)
+            else:
+                full = list(range(len(self.dataset)))
+            sharded = distributed_shard(
+                full,
+                num_replicas=self.num_replicas,
+                rank=self.rank,
+                total_size=self.total_size,
+                num_samples=self.num_samples,
+                drop_last=self.drop_last,
+                consumed_indices=self.consumed_indicies,
+            )
+            return iter(sharded)
+
+    import openrlhf.utils.deepspeed.deepspeed as deepspeed_module
+
+    deepspeed_module.DistributedSampler = DistributedLengthGroupedSampler
+    return DistributedLengthGroupedSampler
+
+
 def _render_sitecustomize() -> str:
     return "from flash_openrlhf_sft_runtime import apply_flash_openrlhf_sft_patches\n\napply_flash_openrlhf_sft_patches()\n"
 
@@ -1065,6 +1173,21 @@ def _sft_packing_mode() -> str:
     return mode
 
 
+def _sft_sampling_mode() -> str:
+    # sampler ordering for the unpacked openrlhf sft path. "default" keeps openrlhf's plain per-epoch
+    # shuffle (the current, gpu-validated behaviour). "group_by_length" restores trl's
+    # group_by_length parity: similar-length examples share a micro-batch so each batch pads to a
+    # shorter width, cutting wasted pad-token compute. private default-off a/b instrumentation
+    # (FLASH_SFT_SAMPLING_MODE): correctness is cpu-proved (lossless + deterministic + every example
+    # once per epoch); the throughput win and peak-memory safety on the chunked 32k path (grouping
+    # the longest sequences together raises that batch's peak) are gpu-deferred. moot under packing
+    # (packing already removes intra-batch padding), so it engages only when unpacked.
+    mode = str(CONFIG.get("sft_sampling_mode") or "default").strip().lower()
+    if mode not in ("default", "group_by_length"):
+        raise ValueError(f"unknown sft_sampling_mode {mode!r}")
+    return mode
+
+
 class FlashTokenizedSFTDataset:
     def __init__(
         self,
@@ -1092,6 +1215,7 @@ class FlashTokenizedSFTDataset:
         self.packing_mode = _sft_packing_mode()
         self.packed_blocks: list[dict] | None = None
         self.packed_examples_per_block: float | None = None
+        self._example_lengths: list[int] | None = None
         if self.packing_mode != "unpacked":
             self._build_packed_blocks()
 
@@ -1141,6 +1265,20 @@ class FlashTokenizedSFTDataset:
         # Effective-batch accounting: how many real examples a packed block carries on average, so the
         # trainer can scale its per-block batch to TRL's per-example effective batch.
         self.packed_examples_per_block = total_examples / len(blocks)
+
+    @property
+    def example_lengths(self):
+        # per-example token length in __getitem__ order; unpacked path only (packing has no
+        # per-example sampler). computed once and cached so length-grouped sampling reads the
+        # dataset a single time.
+        if self.packed_blocks is not None:
+            raise ValueError("example_lengths is only defined on the unpacked sft path")
+        if self._example_lengths is None:
+            self._example_lengths = [
+                len(self._list(self.dataset[int(index)]["input_ids"]))
+                for index in range(len(self.dataset))
+            ]
+        return self._example_lengths
 
     def __len__(self):
         if self.packed_blocks is not None:
@@ -1357,6 +1495,12 @@ def _install_dataloader_and_scheduler_patches():
     DeepspeedStrategy.setup_dataloader = setup_dataloader
     DeepspeedStrategy.prepare = prepare
     DeepspeedStrategy.load_ckpt = load_ckpt
+
+    # length-grouped sampling (trl group_by_length parity) is opt-in and unpacked-only: rebind
+    # openrlhf's deepspeed DistributedSampler so setup_dataloader builds the grouped subclass. moot
+    # under packing (no intra-batch padding to save), so it engages only when unpacked.
+    if _sft_sampling_mode() == "group_by_length" and _sft_packing_mode() == "unpacked":
+        install_length_grouped_distributed_sampler(int(CONFIG["micro_batch_size"]))
 
 
 def _install_loraplus_patch():
@@ -1827,6 +1971,9 @@ def apply_flash_openrlhf_sft_patches():
             _selected_token_nll_chunk,
             _selected_token_nll_padded_chunk,
             _chunked_selected_token_nll,
+            length_grouped_indices,
+            distributed_shard,
+            install_length_grouped_distributed_sampler,
         )
     )
     return runtime.replace("__FLASH_CHUNKED_SELECTED_TOKEN_NLL__", helper_source)
@@ -2311,6 +2458,11 @@ def run_sft_openrlhf(spec=None) -> None:
     # public spec field yet) and plumbed into the child CONFIG so the child validates it. It stays
     # "unpacked" until a real-GPU smoke validates the packed model forward for a given architecture.
     sft_packing_mode = (os.environ.get("FLASH_SFT_PACKING_MODE") or "unpacked").strip().lower()
+    # Length-grouped sampling is private, default-off A/B instrumentation (like packing above):
+    # sourced from an env var, plumbed into the child CONFIG. It restores TRL's group_by_length
+    # parity on the unpacked path and stays "default" until a real-GPU smoke validates its peak
+    # memory + throughput on the chunked path.
+    sft_sampling_mode = (os.environ.get("FLASH_SFT_SAMPLING_MODE") or "default").strip().lower()
     runtime_config = {
         "adam_betas": [0.9, 0.999],
         "adam_epsilon": 1e-8,
@@ -2328,6 +2480,8 @@ def run_sft_openrlhf(spec=None) -> None:
         "save_at_steps": list(save_at_steps),
         "save_every": save_every,
         "sft_packing_mode": sft_packing_mode,
+        "sft_sampling_mode": sft_sampling_mode,
+        "micro_batch_size": micro_batch,
         "total_steps": update_horizon,
         "warmstart_adapter": warmstart_adapter,
         "weight_decay": 0.0,
@@ -2546,6 +2700,11 @@ def run_sft_openrlhf(spec=None) -> None:
             "gradient_accumulation_steps": gradient_accumulation,
             "packing": (
                 "unpacked_openrlhf" if sft_packing_mode == "unpacked" else sft_packing_mode
+            ),
+            "sampling": (
+                "group_by_length"
+                if sft_sampling_mode == "group_by_length"
+                else "default_openrlhf"
             ),
             "loss_curve": loss_curve[:400],
             "peak_gpu_gb": torch_peak_gpu_gb,
