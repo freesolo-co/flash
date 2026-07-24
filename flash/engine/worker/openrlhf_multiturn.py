@@ -181,7 +181,10 @@ def build_multiturn_action_ranges(
 # the stream byte-identical to TRL/SFT/OPD, Flash drives the loop through a token-exact executor that
 # appends the bridge's glue *token ids* verbatim and records assistant ``action_ranges``. Live
 # generation (colocated ``llm_engine``) + the HTTP bridge client are GPU-path only; the mask
-# assembly below is pure and CPU-proved.
+# assembly and multimodal request construction below are pure and CPU-proved. Multi-turn multimodal
+# (parity plan #10) reuses the single-turn vision path's flash.multimodal primitives so the
+# per-request payload is byte-identical to the TRL multimodal rollout; see
+# :func:`build_multiturn_multimodal_request`.
 
 _MT_TOKENS = _OBS_TOKENS
 _MT_ENV_MASK = _OBS_ENV_MASK
@@ -240,6 +243,46 @@ def assemble_multiturn_rollout(
         "action_ranges": action_ranges,
         "response_mask": response_mask,
     }
+
+
+def build_multiturn_multimodal_request(
+    prefix_ids: list[int],
+    images: list[Any] | None,
+    image_pad_id: int | None,
+) -> tuple[dict[str, Any], dict[int, float] | None]:
+    """One multi-turn generation-request payload, byte-identical to the TRL multimodal rollout submit.
+
+    The multi-turn executor re-submits the whole accumulated prefix each turn. For a multimodal
+    episode that prefix still carries the processor-expanded image-pad runs from the initial prompt,
+    so before every request the runs are collapsed back to one pad per image (vLLM re-expands them
+    from ``multi_modal_data``), the images are re-attached, and the image-pad token is biased out of
+    the sampler so a stray pad generated into an assistant turn cannot corrupt the next turn's
+    collapse count or misalign vision features. Text-only turns get a bare ``prompt_token_ids``
+    payload and no bias.
+
+    Mirrors :func:`flash.engine.multiturn_rollout.build_rollout_func`'s ``submit`` exactly, reusing
+    the shared :func:`flash.multimodal.collapse_image_pad_runs` primitive, so the request is identical
+    to TRL by construction. Returns ``(prompt, logit_bias)`` where ``logit_bias`` is ``None`` on
+    text-only turns. This builder is pure and CPU-proved; live colocated generation over the payload
+    is GPU-path only and stays fail-closed behind the multi-turn gate
+    (``grpo_openrlhf._openrlhf_multiturn_gpu_verified``), together with the rest of the live loop.
+    """
+    if not prefix_ids:
+        raise ValueError("multi-turn rollout produced an empty prompt for the generation request")
+    if images:
+        if image_pad_id is None:
+            raise ValueError("multimodal multi-turn rollout is missing the image-pad token id")
+        # lazy import keeps this module torch-free at import (see module docstring); the same
+        # primitive the TRL rollout and single-turn OPD/GRPO paths use, so collapse is identical.
+        from flash.multimodal import collapse_image_pad_runs
+
+        collapsed = collapse_image_pad_runs(list(prefix_ids), int(image_pad_id), len(images))
+        prompt = {
+            "prompt_token_ids": collapsed,
+            "multi_modal_data": {"image": images if len(images) > 1 else images[0]},
+        }
+        return prompt, {int(image_pad_id): -100.0}
+    return {"prompt_token_ids": list(prefix_ids)}, None
 
 
 def build_openrlhf_perturn_advantages(
