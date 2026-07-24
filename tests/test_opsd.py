@@ -33,10 +33,10 @@ def test_opsd_knobs_use_paper_recipe_defaults(monkeypatch):
     assert knobs.learning_rate == pytest.approx(5e-6)
     assert knobs.temperature == pytest.approx(1.1)
     assert knobs.top_p == pytest.approx(0.95)
-    assert opsd_mod._OPSD_LEARNING_RATE == pytest.approx(5e-6)
-    assert opsd_mod._OPSD_MAX_GRAD_NORM == pytest.approx(0.1)
-    assert opsd_mod._OPSD_TEMPERATURE == pytest.approx(1.1)
-    assert opsd_mod._OPSD_CLIP_TAU == pytest.approx(0.05)
+    assert pytest.approx(5e-6) == opsd_mod._OPSD_LEARNING_RATE
+    assert pytest.approx(0.1) == opsd_mod._OPSD_MAX_GRAD_NORM
+    assert pytest.approx(1.1) == opsd_mod._OPSD_TEMPERATURE
+    assert pytest.approx(0.05) == opsd_mod._OPSD_CLIP_TAU
 
 
 def test_opsd_forward_kl_pointwise_clip_can_go_negative_with_student_only_gradient():
