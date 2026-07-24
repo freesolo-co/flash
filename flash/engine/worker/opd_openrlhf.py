@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from flash.catalog import MODELS
 from flash.engine.recipe import RECIPE
 from flash.engine.steps import (
     final_save_due,
@@ -33,6 +34,7 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
+from flash.engine.vram import opd_rollout_concurrency
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.adapter import _download_adapter
 from flash.engine.worker.grpo_openrlhf import (
@@ -654,7 +656,10 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
         "--vllm.sync_backend",
         "nccl",
         "--vllm.enable_prefix_caching",
-        "--vllm.enforce_eager",
+        # enforce_eager is decided per gpu family in the rollout actor (see the vLLM runtime shim in
+        # _opd_sitecustomize_extension): validated a100/h100 keep cuda graphs, unvalidated families on
+        # vllm>=0.19 fall back to eager, blackwell uses decode-only graphs. leaving openrlhf's default
+        # (False) here lets the shim be the sole authority instead of pinning eager for every gpu.
         "--vllm.enable_sleep",
         "--ds.enable_sleep",
         "--train.colocate_all",
@@ -686,7 +691,19 @@ def build_openrlhf_opd_args(config: OpenRLHFOPDConfig) -> list[str]:
 
 
 def _opd_sitecustomize_extension() -> str:
-    return r"""
+    import inspect
+
+    from flash.engine.worker import opd_vllm_runtime as _opd_vllm_runtime_mod
+
+    # embed the pure vLLM-runtime decision module verbatim. the isolated child runs with
+    # PYTHONPATH=plugin_dir and cannot import flash, so sharing one source of truth with the
+    # parent-side unit tests means embedding the module text into the sitecustomize. strip its future
+    # import (it would land mid-file after the grpo sitecustomize -> SyntaxError); the child is python
+    # 3.12, so the ``X | None`` annotations evaluate natively without it.
+    _runtime_src = inspect.getsource(_opd_vllm_runtime_mod).replace(
+        "from __future__ import annotations\n", ""
+    )
+    return _runtime_src + "\n" + r"""
 import asyncio
 import copy
 import hashlib
@@ -964,6 +981,64 @@ def _flash_make_experience_batch(self, rollout_samples):
 
 
 _FlashExperienceMaker.make_experience_batch = _flash_make_experience_batch
+
+
+# --- opd rollout vLLM runtime shim ---------------------------------------------------------------
+# restore fp8 kv cache, chunked prefill, dynamic max_num_seqs, the mamba scheduler-budget floor, and
+# the gpu-family enforce_eager safeguard on the openrlhf rollout engine. the decision and the async
+# actor __init__ wrapping both live in the embedded opd_vllm_runtime module (shared with parent-side
+# unit tests); here we only supply the live-gpu plan provider and the sidecar meta writer.
+_FLASH_OPD_VLLM_MAX_NUM_SEQS = int(os.environ.get("FLASH_OPENRLHF_OPD_VLLM_MAX_NUM_SEQS", "0"))
+_FLASH_OPD_VLLM_MAMBA_BLOCK = int(os.environ.get("FLASH_OPENRLHF_OPD_VLLM_MAMBA_BLOCK_SIZE", "0"))
+_FLASH_OPD_VLLM_SEQ_CAP = int(os.environ.get("FLASH_OPENRLHF_MAX_RESPONSE_LENGTH", "0"))
+_FLASH_OPD_VLLM_META_PATH = os.environ.get("FLASH_OPENRLHF_OPD_VLLM_META_PATH", "")
+
+
+def _flash_write_opd_vllm_meta(meta):
+    if not _FLASH_OPD_VLLM_META_PATH:
+        return
+    try:
+        directory = os.path.dirname(_FLASH_OPD_VLLM_META_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = _FLASH_OPD_VLLM_META_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+        os.replace(tmp, _FLASH_OPD_VLLM_META_PATH)
+    except OSError as exc:
+        print("[opd][warn] could not write vLLM runtime meta: " + str(exc))
+
+
+def _flash_opd_vllm_plan_provider():
+    import vllm as _flash_vllm_module
+
+    cc = None
+    card_gb = None
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        card_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    return opd_rollout_runtime_plan(
+        cc=cc,
+        vllm_version=getattr(_flash_vllm_module, "__version__", ""),
+        seq_cap=_FLASH_OPD_VLLM_SEQ_CAP,
+        max_num_seqs=_FLASH_OPD_VLLM_MAX_NUM_SEQS or None,
+        card_gb=card_gb,
+        mamba_block_size=_FLASH_OPD_VLLM_MAMBA_BLOCK,
+    )
+
+
+try:
+    from openrlhf.trainer.ray import vllm_engine as _flash_vllm_engine_module
+
+    install_rollout_runtime_shim(
+        _flash_vllm_engine_module.RolloutRayActor,
+        _flash_opd_vllm_plan_provider,
+        meta_writer=_flash_write_opd_vllm_meta,
+    )
+    print("[opd] installed vLLM rollout runtime shim on RolloutRayActor")
+except Exception as exc:
+    print("[opd][warn] could not install vLLM rollout runtime shim: " + str(exc))
+
 
 from openrlhf.trainer import ppo_trainer as _flash_ppo_trainer_module
 
@@ -1714,6 +1789,9 @@ def build_openrlhf_opd_child_env(
     final_step: int = 0,
     warmstart_adapter: str | None = None,
     actor_attn_implementation: str | None = None,
+    rollout_max_num_seqs: int = 0,
+    mamba_block_size: int = 0,
+    vllm_meta_path: str | None = None,
 ) -> dict[str, str]:
     """Build the isolated child env with bridge capability but no provider credential."""
     child = build_openrlhf_child_env(
@@ -1733,8 +1811,15 @@ def build_openrlhf_opd_child_env(
             "FLASH_OPENRLHF_OPD_NO_SIGNAL_ATTEMPTS": str(_OPENRLHF_NO_SIGNAL_ATTEMPTS),
             "FLASH_OPENRLHF_OPD_EXACT_SAVE_STEPS": json.dumps(list(save_at_steps)),
             "FLASH_OPENRLHF_OPD_FINAL_STEP": str(int(final_step)),
+            # inputs for the rollout-actor vLLM runtime shim (fp8 kv / chunked prefill / max_num_seqs /
+            # mamba floor / enforce_eager are decided in-actor where the gpu is visible). seq_cap comes
+            # from FLASH_OPENRLHF_MAX_RESPONSE_LENGTH, already set by build_openrlhf_child_env.
+            "FLASH_OPENRLHF_OPD_VLLM_MAX_NUM_SEQS": str(int(rollout_max_num_seqs)),
+            "FLASH_OPENRLHF_OPD_VLLM_MAMBA_BLOCK_SIZE": str(int(mamba_block_size)),
         }
     )
+    if vllm_meta_path:
+        child["FLASH_OPENRLHF_OPD_VLLM_META_PATH"] = vllm_meta_path
     if warmstart_adapter:
         child["FLASH_OPENRLHF_WARMSTART_ADAPTER"] = warmstart_adapter
     return child
@@ -2292,6 +2377,10 @@ def run_opd_openrlhf() -> None:
             resume=bool(resume_dir),
         )
         args = build_openrlhf_opd_args(config)
+        _opd_model_info = MODELS.get(inputs["model_id"])
+        _opd_mamba_block = (
+            int(getattr(_opd_model_info, "mamba_block_size", 0) or 0) if _opd_model_info else 0
+        )
         child_env = build_openrlhf_opd_child_env(
             plugin_dir=plugin_dir,
             max_response_length=inputs["max_completion"],
@@ -2305,6 +2394,11 @@ def run_opd_openrlhf() -> None:
             final_step=inputs["steps"],
             warmstart_adapter=warmstart_adapter,
             actor_attn_implementation=actor_attn_implementation,
+            rollout_max_num_seqs=opd_rollout_concurrency(
+                inputs["prompts_per_step"], inputs["group_size"]
+            ),
+            mamba_block_size=_opd_mamba_block,
+            vllm_meta_path=os.path.join(config.checkpoint_dir, "_opd_vllm_runtime.json"),
         )
         python_bin = resolve_openrlhf_python(workdir)
         _w.heartbeat("opd_train_start", gpu=gpu_diagnostics())
@@ -2419,6 +2513,17 @@ def run_opd_openrlhf() -> None:
         step=last_step[0],
         gpu=gpu_diagnostics(),
     )
+    # the rollout actor recorded the applied vLLM runtime (fp8 kv / chunked prefill / max_num_seqs /
+    # mamba floor / enforce_eager) to a sidecar because it computed the plan in-actor where the gpu is
+    # visible; fold it into train_meta so the served-checkpoint record carries the real rollout config.
+    vllm_runtime_meta = None
+    vllm_runtime_sidecar = os.path.join(config.checkpoint_dir, "_opd_vllm_runtime.json")
+    if os.path.exists(vllm_runtime_sidecar):
+        try:
+            with open(vllm_runtime_sidecar, encoding="utf-8") as vllm_meta_handle:
+                vllm_runtime_meta = json.load(vllm_meta_handle)
+        except (OSError, ValueError):
+            vllm_runtime_meta = None
     _w.write_train_meta(
         phase="opd",
         step=last_step[0],
@@ -2429,6 +2534,7 @@ def run_opd_openrlhf() -> None:
         generated_tokens=int(accounting["generated_tokens"]),
         notes={
             "backend": "openrlhf",
+            "vllm_runtime": vllm_runtime_meta,
             "steps": last_step[0],
             "retained_prompts": len(inputs["prompts"]),
             "scheduled_prompts": scheduled_prompt_count,

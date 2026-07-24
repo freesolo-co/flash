@@ -1270,7 +1270,9 @@ def test_build_openrlhf_opd_args_maps_distillation_job():
     assert _value(args, "--ds.ring_attn_size") == "1"
     assert "--actor.gradient_checkpointing_reentrant" in args
     assert _value(args, "--ds.attn_implementation") == "eager"
-    assert "--vllm.enforce_eager" in args
+    # enforce_eager is no longer pinned on the cli: the rollout-actor vLLM runtime shim decides it per
+    # gpu family (validated a100/h100 keep cuda graphs, unvalidated families fall back to eager).
+    assert "--vllm.enforce_eager" not in args
     assert "--train.colocate_all" in args
 
 
