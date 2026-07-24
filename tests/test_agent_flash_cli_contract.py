@@ -100,7 +100,6 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
         "[environment]\n"
         'id = "owner/env"\n'
         "[train]\n"
-        'hf_repo = "owner/runs"\n'
         "epochs = 1\n"
         "max_examples = 10\n"
         "[gpu]\n"
@@ -228,9 +227,20 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
             },
         }
     )
-    runner._save_status(RunStatus(run_id=rid, state="running", spec=spec.to_dict()))
+    # hf_repo is platform-managed and stripped from the public spec, so the adapter ref is resolved
+    # from the internal worker spec persisted in effective_preparation (present for every
+    # provisioned run), exactly as submit_job records it.
+    worker_prep = {"worker_spec": spec.to_internal_dict()}
+    runner._save_status(
+        RunStatus(
+            run_id=rid, state="running", spec=spec.to_dict(), effective_preparation=worker_prep
+        )
+    )
+    # a non-terminal run does not expose the adapter ref even once its worker spec is prepared
     assert get_status(rid).to_dict()["adapter_ref"] is None
 
-    runner._save_status(RunStatus(run_id=rid, state="done", spec=spec.to_dict()))
+    runner._save_status(
+        RunStatus(run_id=rid, state="done", spec=spec.to_dict(), effective_preparation=worker_prep)
+    )
     # the public short ref: exactly what train.init_from_adapter accepts
     assert get_status(rid).to_dict()["adapter_ref"] == rid

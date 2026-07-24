@@ -111,8 +111,7 @@ max_examples = 2            # rows to train on (the starter dataset has 2)
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
 # multi-turn GRPO defaults to one reward per rollout; choose "per_turn" for turn-level credit.
 # credit_assignment = "per_episode"
-lora_rank = 32
-lora_alpha = 64
+lora_rank = 32              # lora_alpha is managed: always derived as 2 x lora_rank
 # All SFT/GRPO knobs live under [train]. Do not add [sft] or [grpo] tables.
 ```
 
@@ -429,8 +428,9 @@ algorithm = "grpo"
 # the SFT run id (as printed by `flash status`); add /step-N to warm-start from a
 # specific checkpoint listed by `flash checkpoints <run-id>`
 init_from_adapter = "<sft-run-id>"
-# do NOT set lora_rank / lora_alpha for a warm-start: the source adapter's rank and alpha
-# metadata are authoritative, and setting lora_rank alongside init_from_adapter is rejected
+# do NOT set lora_rank for a warm-start: the source adapter's rank and alpha metadata are
+# authoritative (lora_alpha is always managed as 2 x rank), and setting lora_rank alongside
+# init_from_adapter is rejected
 ```
 
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,

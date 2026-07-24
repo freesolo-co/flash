@@ -27,27 +27,35 @@ def _spec(**train) -> JobSpec:
     )
 
 
-def _submit(monkeypatch, spec: JobSpec) -> dict:
+def _submit_worker_spec(monkeypatch, spec: JobSpec) -> tuple[str, dict]:
+    # hf_repo and run_id are platform-managed: they live in the internal worker spec + the
+    # RunStatus.run_id field, NOT the public status.spec (which omits managed fields). Read the
+    # managed assignment from the effective-preparation worker spec, which the worker executes.
     from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        return runner.submit_job(spec, dry_run=True).spec
+        status = runner.submit_job(spec, dry_run=True)
+        return status.run_id, status.effective_preparation["worker_spec"]
 
 
 def test_managed_hf_repo_assigned_per_environment(monkeypatch):
     from flash import runner
 
-    spec = _submit(monkeypatch, _spec())
-    assert spec["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(spec["environment"]["id"])
+    _run_id, worker = _submit_worker_spec(monkeypatch, _spec())
+    assert worker["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(
+        worker["environment"]["id"]
+    )
 
 
 def test_managed_hf_repo_overrides_user_value(monkeypatch):
     from flash import runner
 
     # Even if a legacy/old-client spec carries a user namespace, the control plane overrides it.
-    spec = _submit(monkeypatch, _spec(hf_repo="freesolo-founders/whatever"))
-    assert spec["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(spec["environment"]["id"])
+    _run_id, worker = _submit_worker_spec(monkeypatch, _spec(hf_repo="freesolo-founders/whatever"))
+    assert worker["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(
+        worker["environment"]["id"]
+    )
 
 
 def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
@@ -65,9 +73,11 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
         }
     )
     assert base.run_id == "local"
-    spec = _submit(monkeypatch, base)
-    assert spec["run_id"] != "local"
-    assert spec["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(spec["environment"]["id"])
+    run_id, worker = _submit_worker_spec(monkeypatch, base)
+    assert run_id != "local"
+    assert worker["train"]["hf_repo"] == runner.managed_hf_repo_for_environment(
+        worker["environment"]["id"]
+    )
 
 
 def test_managed_hf_repo_reuses_repo_for_same_environment():
