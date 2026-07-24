@@ -590,7 +590,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     from flash.providers.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
+    train = {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32}
 
     need = required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train)
     assert need > 40
@@ -621,22 +621,22 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     [
         (
             "max_completion_128",
-            {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64},
+            {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32},
             "A100 PCIe",
         ),
         (
             "max_completion_256",
-            {"epochs": 1, "max_completion_tokens": 256, "lora_rank": 32, "lora_alpha": 64},
+            {"epochs": 1, "max_completion_tokens": 256, "lora_rank": 32},
             "A100 PCIe",
         ),
         (
             "max_completion_512",
-            {"epochs": 1, "max_completion_tokens": 512, "lora_rank": 32, "lora_alpha": 64},
+            {"epochs": 1, "max_completion_tokens": 512, "lora_rank": 32},
             "A100 PCIe",
         ),
         (
             "max_completion_1024",
-            {"epochs": 1, "max_completion_tokens": 1024, "lora_rank": 32, "lora_alpha": 64},
+            {"epochs": 1, "max_completion_tokens": 1024, "lora_rank": 32},
             "A100 PCIe",
         ),
         (
@@ -645,9 +645,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 2048,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,
-                "lora_alpha": 64,
-            },
+                "lora_rank": 32,            },
             "A100 PCIe",
         ),
         (
@@ -656,9 +654,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 8192,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,
-                "lora_alpha": 64,
-            },
+                "lora_rank": 32,            },
             "A100 PCIe",
         ),
         (
@@ -669,9 +665,7 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 16384,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,
-                "lora_alpha": 64,
-            },
+                "lora_rank": 32,            },
             "H200",
         ),
         (
@@ -680,14 +674,12 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
                 "epochs": 1,
                 "max_context_tokens": 24576,
                 "max_completion_tokens": 128,
-                "lora_rank": 32,
-                "lora_alpha": 64,
-            },
+                "lora_rank": 32,            },
             "H200",
         ),
         (
             "group_size_8",
-            {"epochs": 1, "group_size": 8, "max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64},
+            {"epochs": 1, "group_size": 8, "max_completion_tokens": 128, "lora_rank": 32},
             "A100 PCIe",
         ),
     ],
@@ -774,7 +766,6 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
         "max_context_tokens": 8192,
         "max_completion_tokens": 128,
         "lora_rank": 32,
-        "lora_alpha": 64,
     }
 
     need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
@@ -830,7 +821,6 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             "epochs": 1,
             "max_completion_tokens": 128,
             "lora_rank": 32,
-            "lora_alpha": 64,
         },
         "recipe_default": {"epochs": 1},
         "opd_prompt_batch": {

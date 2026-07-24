@@ -152,7 +152,7 @@ def test_thinking_set_override(tmp_path):
     cfg.write_text(
         'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "sft"\n\n'
         '[environment]\nid = "github:owner/repo@main:env/environment.py"\n\n'
-        '[train]\nepochs = 1\nmax_examples = 8\nhf_repo = "owner/runs"\n'
+        '[train]\nepochs = 1\nmax_examples = 8\n'
     )
     spec = spec_from_file(str(cfg), overrides=["thinking=true"])
     assert spec.thinking is True

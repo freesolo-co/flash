@@ -17,6 +17,7 @@ from flash.opd_retry_contract import (
     opd_optimizer_start_marker_path,
     validate_opd_resume_state_metadata,
 )
+from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
@@ -91,12 +92,7 @@ def _save_status(
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state=state,
-            spec=spec.to_dict(),
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state=state, remote=remote),
         **kwargs,
     )
 

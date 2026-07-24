@@ -36,6 +36,7 @@ from flash.schema.fields import (
 )
 from flash.spec import (
     FIXED_SEED,
+    MANAGED_GPU_KEYS,
     EnvironmentSpec,
     GpuSpec,
     JobSpec,
@@ -233,14 +234,14 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
 
 
 # unknown tables are rejected loudly: a stray [grpo] table silently dropped grpo knobs and trained
-# at 16x-cost defaults. managed fields remain recognized in their canonical sections so a
-# round trip through public serialization does not fail re-validation on submit.
+# at 16x-cost defaults. platform-managed fields (run_id, model_policy; and per-section hf_repo,
+# gpu disk/volume, environment resolved_sha) are NOT accepted here: they are assigned by the control
+# plane / runner, so JobSpec.to_dict() omits them and this parser rejects a user who sets them.
 _TOP_LEVEL_KEYS = frozenset(
     {
         "model",
         "model_revision",
         "algorithm",
-        "model_policy",
         "thinking",
         "seed",
         "environment",
@@ -248,10 +249,16 @@ _TOP_LEVEL_KEYS = frozenset(
         "gpu",
         "worker_env",
         "wandb",
-        "run_id",
     }
 )
-_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec))
+# runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
+# user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
+# preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
+_GPU_KEYS = frozenset(item.name for item in dataclass_fields(GpuSpec)) - MANAGED_GPU_KEYS
+# [environment] user-authorable keys, derived from EnvironmentSpec (mirrors _GPU_KEYS) so a new field
+# is accepted automatically; resolved_sha is control-plane-pinned (see _assign_resolved_env_sha).
+_ENV_MANAGED_KEYS = frozenset({"resolved_sha"})
+_ENVIRONMENT_KEYS = frozenset(item.name for item in dataclass_fields(EnvironmentSpec)) - _ENV_MANAGED_KEYS
 TRAIN_KEY_MIN_VERSIONS = {
     item.name: str(item.metadata["introduced_in"])
     for item in dataclass_fields(TrainSpec)
@@ -326,6 +333,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
+    unknown_env = sorted(set(env_raw) - _ENVIRONMENT_KEYS)
+    if unknown_env:
+        raise ConfigError(
+            f"[environment] unknown key(s): {', '.join(unknown_env)} "
+            f"(allowed: {', '.join(sorted(_ENVIRONMENT_KEYS))})"
+        )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
     # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
@@ -360,15 +373,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"[gpu] unknown key(s): {', '.join(unknown_gpu)} "
             f"(allowed: {', '.join(sorted(_GPU_KEYS))})"
         )
-    gpu_max_retries = _section_int(gpu_raw, "gpu", "max_retries", minimum=0)
-    gpu_max_wall_seconds = _section_int(gpu_raw, "gpu", "max_wall_seconds", minimum=60)
     # cards a single training worker occupies (1..8); count > 1 provisions a multi-gpu pod.
     gpu_count = _section_int(gpu_raw, "gpu", "count", minimum=1, maximum=8)
     gpu_options = {}
-    if gpu_max_retries is not None:
-        gpu_options["max_retries"] = gpu_max_retries
-    if gpu_max_wall_seconds is not None:
-        gpu_options["max_wall_seconds"] = gpu_max_wall_seconds
     if gpu_count is not None:
         gpu_options["count"] = gpu_count
 
@@ -473,7 +480,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
             lora_rank=lora_rank,
-            lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
+            lora_alpha=2 * lora_rank,  # derived, not a user knob; always 2 x lora_rank
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),

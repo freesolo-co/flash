@@ -20,7 +20,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 8},
             "gpu": gpu,
         }
     )
@@ -480,7 +480,8 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         }
     ]
     stored = orch.get_status(public.run_id)
-    assert stored.spec["environment"]["resolved_sha"] == ""
+    # resolved_sha is platform-managed: it is stripped from the public spec, not surfaced empty.
+    assert "resolved_sha" not in stored.spec["environment"]
     assert stored.spec["model_revision"] == resolved_model_sha
     worker = stored.effective_preparation["worker_spec"]
     assert worker["environment"]["resolved_sha"] == resolved_sha
@@ -1131,7 +1132,7 @@ def test_config_gpu_fields(monkeypatch):
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")

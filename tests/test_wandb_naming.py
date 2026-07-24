@@ -21,7 +21,7 @@ def _base(**extra: object) -> dict:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
-        "train": {"hf_repo": "me/repo", "max_examples": 8},
+        "train": {"max_examples": 8},
     }
     cfg.update(extra)
     return cfg
@@ -106,7 +106,6 @@ def _toml(tmp_path) -> str:
         'id = "github:owner/repo@main:some-env/environment.py"\n'
         "[train]\n"
         "max_examples = 8\n"
-        'hf_repo = "me/repo"\n'
     )
     return str(cfg)
 

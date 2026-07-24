@@ -142,7 +142,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
             "environment": {"id": "owner/env"},
             "train": {
                 "epochs": 1,
-                "hf_repo": "user/ignored",
                 "max_examples": 1,
                 "temperature": 0,
                 "stop_sequences": [],
@@ -153,7 +152,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
     )
     authored = {
         "epochs",
-        "hf_repo",
         "max_examples",
         "temperature",
         "stop_sequences",
@@ -167,7 +165,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
     assert set(full["train"]) > authored
     assert sparse["train"] == {
         "epochs": 1,
-        "hf_repo": "",
         "max_examples": 1,
         "temperature": 0.0,
         "stop_sequences": (),
