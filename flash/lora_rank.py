@@ -361,7 +361,7 @@ def _effective_train_context(
             "train.max_context_tokens / train.max_completion_tokens "
             "(GRPO rollout prompt+completion)",
         )
-    if spec.algorithm == "opd":
+    if spec.algorithm in ("opd", "opsd"):
         return (
             opd_rollout_seq_len(
                 spec.train.max_context_tokens or 0,
@@ -369,7 +369,7 @@ def _effective_train_context(
                 spec.thinking,
             ),
             "train.max_context_tokens / train.max_completion_tokens "
-            "(OPD rollout prompt+completion)",
+            f"({spec.algorithm.upper()} rollout prompt+completion)",
         )
     effective = int(spec.train.max_context_tokens or 0)
     return (effective, "train.max_context_tokens") if effective > 0 else None
