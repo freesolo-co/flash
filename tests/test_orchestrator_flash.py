@@ -38,6 +38,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "trained_eval_acc": 0.7,
                 "base_eval_acc": 0.3,
                 "cost_usd": 0.0,
+                "allocated_gpu": "RTX 4090",
                 "notes": {},
             }
 
@@ -51,7 +52,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
-            gpu=GpuSpec(type="RTX 4090"),
+            gpu=GpuSpec(type=""),
             seed=123,
         )
         status = runner.submit_job(spec, dry_run=False, background=False)
@@ -61,7 +62,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
         assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
-        assert captured["gpu"] == "RTX 4090"
+        assert captured["gpu"] == ""
         assert captured["seed"] == 123
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.

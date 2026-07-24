@@ -250,14 +250,12 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_explains_automatic_default_and_exact_pin(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
     assert "GPU allocation is automatic by default" in out
     assert "cheapest validated class" in out
-    assert 'exact_type = "<CLASS>"' in out
-    assert "[gpu] exact_type" not in out
-    assert "gpu.exact_type" not in out
+    assert 'type = "<CLASS>"' in out
     assert "don't pin" not in out
     assert "cannot pin" not in out
     assert "runpod" not in out.lower()
@@ -270,7 +268,7 @@ def _train_config(tmp_path, *, extra_train: str = ""):
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\n'
-        f'[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n{extra_train}'
+        f"[train]\nepochs = 1\nmax_examples = 2\n{extra_train}"
     )
     return path
 
@@ -332,8 +330,8 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert expected in captured.err
     assert call[2] is None
     assert call[3] is True
-    assert call[4]["authored_keys"] == ["epochs", "hf_repo", "max_examples"]
-    assert call[1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+    assert call[4]["authored_keys"] == ["epochs", "max_examples"]
+    assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
 def test_train_dry_run_sends_declared_runtime_secrets(
@@ -344,7 +342,7 @@ def test_train_dry_run_sends_declared_runtime_secrets(
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
-        '[train]\nepochs = 1\nmax_examples = 2\nhf_repo = "owner/runs"\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
     )
     monkeypatch.setenv("SERPAPI_API_KEY", "serp-secret")
 
@@ -445,7 +443,7 @@ def test_train_live_and_dry_run_send_the_same_sparse_spec(fake_client, tmp_path,
     calls = [call for call in fake_client.calls if call[0] == "create_run"]
 
     assert calls[0][1] == calls[1][1]
-    assert calls[0][1]["train"] == {"epochs": 1, "hf_repo": "", "max_examples": 2}
+    assert calls[0][1]["train"] == {"epochs": 1, "max_examples": 2}
     assert calls[0][3] is True
     assert calls[0][4] is not None
     assert calls[1][3] is False
@@ -878,7 +876,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "how to actually improve a model with Flash" in training_text
     assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
     assert "## Common Flash issues and mitigations" in training_text
-    assert "Trying to pin managed infrastructure" in training_text
+    assert "GPU selection is not what you expected" in training_text
     assert "response_text.thinking" in training_text
     assert "Qwen3.5 thinking multi-turn SFT" in training_text
     assert "longest shared token prefix" in training_text
@@ -1045,7 +1043,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(id="owner/env"),
     )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.54"]
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo>=0.2.60"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(

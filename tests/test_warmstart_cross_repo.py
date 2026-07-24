@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import flash.engine.worker as W
+from tests._helpers.runner import provisioned_status
 
 _REVISION = "a" * 40
 
@@ -172,7 +173,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = R.RunStatus(run_id="source-run", state="done", spec=source.to_dict())
+    source_status = provisioned_status(R, source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -242,7 +243,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = R.RunStatus(run_id="source-run", state="done", spec=source.to_dict())
+    source_status = provisioned_status(R, source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -275,7 +276,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = R.RunStatus(run_id="source-run", state="done", spec=source.to_dict())
+    source_status = provisioned_status(R, source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",

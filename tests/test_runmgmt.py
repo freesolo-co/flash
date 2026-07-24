@@ -8,6 +8,8 @@ import tempfile
 
 import pytest
 
+from tests._helpers.runner import provisioned_status
+
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
@@ -186,7 +188,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
             model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
-            gpu=GpuSpec(type="RTX 4090"),
+            gpu=GpuSpec(type=""),
         )
     )
 
@@ -583,7 +585,7 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
         model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=2),
-        gpu=GpuSpec(type="RTX 4090"),
+        gpu=GpuSpec(type=""),
     )
     runner._save_status(
         runner.RunStatus(
@@ -628,7 +630,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         run_id="attempt-sequence",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_retries=1),
+        gpu=GpuSpec(type="", max_retries=1),
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -699,7 +701,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
         run_id="pre-handle-attempt",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_retries=1),
+        gpu=GpuSpec(type="", max_retries=1),
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -764,15 +766,10 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
         run_id="wall-budget",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_wall_seconds=200, max_retries=1),
+        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -851,15 +848,10 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
         run_id="retry-deadline-minimum",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_wall_seconds=200, max_retries=1),
+        gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -1443,12 +1435,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
         gpu=GpuSpec(max_wall_seconds=60),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=99.0,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=99.0),
         _run_deadline_at=159.0,
         _next_attempt=0,
     )
@@ -1475,12 +1462,7 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
         gpu=GpuSpec(max_wall_seconds=200),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="provisioning",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
+        provisioned_status(runner, spec, state="provisioning", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -1530,13 +1512,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         code_prefix="code/revision",
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=300.0,
         _next_attempt=2,
     )
@@ -1556,9 +1532,6 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        runner, "_resolve_init_from_adapter", lambda public_spec, **_kwargs: public_spec
-    )
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
@@ -1593,13 +1566,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -1672,13 +1639,7 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -1766,10 +1727,10 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         gpu=GpuSpec(max_wall_seconds=120),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
+        provisioned_status(
+            runner,
+            spec,
             state="running",
-            spec=spec.to_dict(),
             created_at=100.0,
             remote=_runpod_remote("endpoint-old", "job-old", attempt=0),
         ),
@@ -1833,13 +1794,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     )
     remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            created_at=100.0,
-            remote=remote,
-        ),
+        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
@@ -2124,12 +2079,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         gpu=GpuSpec(max_wall_seconds=120),
     )
     runner._save_status(
-        runner.RunStatus(
-            run_id=spec.run_id,
-            state="provisioning",
-            spec=spec.to_dict(),
-            created_at=10.0,
-        ),
+        provisioned_status(runner, spec, state="provisioning", created_at=10.0),
         _run_deadline_at=130.0,
         _next_attempt=0,
     )
@@ -2344,7 +2294,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         run_id=f"terminal-handle-race-{cleanup_confirmed}",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_retries=2),
+        gpu=GpuSpec(type="", max_retries=2),
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
@@ -2432,7 +2382,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
         run_id="terminal-handle-race-two-remotes",
         model="Qwen/Qwen3.5-4B",
         algorithm="sft",
-        gpu=GpuSpec(type="RTX 4090", max_retries=0),
+        gpu=GpuSpec(type="", max_retries=0),
     )
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
