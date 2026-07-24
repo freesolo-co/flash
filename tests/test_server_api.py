@@ -29,7 +29,7 @@ SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
+    "train": {"epochs": 1, "max_examples": 1},
     "gpu": {},
 }
 
@@ -756,7 +756,11 @@ def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+    # lora_alpha is platform-derived (2x rank) and stripped from the public spec; the resolved
+    # warm-start source alpha is persisted in the internal worker-spec carrier.
+    assert "lora_alpha" not in resp.json()["spec"]["train"]
+    status = runner.get_status(resp.json()["run_id"])
+    assert status.effective_preparation["worker_spec"]["train"]["lora_alpha"] == 32
 
 
 def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(api, monkeypatch):
@@ -780,7 +784,8 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
             "train": {**SPEC["train"], "init_from_adapter": "source-run"},
         }
     ).to_dict()
-    assert normalized["train"]["lora_alpha"] == 64
+    # lora_alpha is platform-derived and stripped from the public spec; a normalized spec omits it.
+    assert "lora_alpha" not in normalized["train"]
 
     resp = api.post(
         "/v1/runs",
@@ -789,7 +794,9 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["spec"]["train"]["lora_alpha"] == 32
+    assert "lora_alpha" not in resp.json()["spec"]["train"]
+    status = runner.get_status(resp.json()["run_id"])
+    assert status.effective_preparation["worker_spec"]["train"]["lora_alpha"] == 32
 
 
 def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
@@ -831,10 +838,9 @@ def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert resp.json()["detail"] == (
-        "train.lora_alpha=64 does not match the train.init_from_adapter source adapter "
-        "lora_alpha=32; omit train.lora_alpha because source adapter alpha metadata is authoritative"
-    )
+    # lora_alpha is a platform-managed field (always 2x rank); the user parser rejects it outright,
+    # so an explicit value is refused before any warm-start alpha-conflict check runs.
+    assert "[train] unknown key(s): lora_alpha" in resp.json()["detail"]
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
@@ -3074,7 +3080,8 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     status = runner.get_status(run_id)
     status.state = "done"
     status.spec["gpu"]["type"] = "H200"
-    status.effective_preparation = None
+    # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
+    # and stripped from the public spec, so deploy resolves them from effective_preparation.
     runner._save_status(status)
     seen: dict = {}
 
@@ -4295,6 +4302,13 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
             state="provisioning",
             spec=spec.to_dict(),
             created_at=created_at,
+            # run_id is platform-managed and stripped from the public spec; a provisioned run always
+            # carries the internal worker-spec carrier, which is where recovery resolves its identity.
+            effective_preparation={
+                "worker_spec": spec.to_internal_dict(),
+                "adapter_identity": None,
+                "preparation_digest": None,
+            },
         ),
         _run_deadline_at=deadline,
         _next_attempt=0,
@@ -5636,8 +5650,9 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     key = _login()
     run_id = _finished_run(api, key)
     # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
-    # only the control plane (operator token) can read the source — read it back from the run.
-    src_repo = runner.get_status(run_id).spec["train"]["hf_repo"]
+    # only the control plane (operator token) can read the source. hf_repo is platform-managed and
+    # stripped from the public spec, so read it back from the internal worker-spec carrier.
+    src_repo = runner.get_status(run_id).effective_preparation["worker_spec"]["train"]["hf_repo"]
 
     seen: dict = {}
 

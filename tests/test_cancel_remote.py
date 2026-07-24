@@ -17,6 +17,7 @@ import pytest
 
 import flash.providers.runpod.train as ftrain
 from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
+from tests._helpers.runner import provisioned_status
 
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
@@ -198,7 +199,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
             "run_id": "flash-9-feedface",
         }
     )
-    st = orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+    st = provisioned_status(orch, spec, state="running")
     orch._save_status(st)
 
     calls = {}
@@ -579,14 +580,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
     remote = {**_remote("endpoint-exact", "job-exact", 7), "seed": 42}
-    orch._save_status(
-        orch.RunStatus(
-            run_id=spec.run_id,
-            state="running",
-            spec=spec.to_dict(),
-            remote=remote,
-        )
-    )
+    orch._save_status(provisioned_status(orch, spec, state="running", remote=remote))
     events = []
 
     class Provider:
@@ -800,12 +794,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     from flash.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
-    st = orch.RunStatus(
-        run_id=spec.run_id,
-        state="running",
-        spec=spec.to_dict(),
-        remote=_remote("ep-1", "job-1", 0),
-    )
+    st = provisioned_status(orch, spec, state="running", remote=_remote("ep-1", "job-1", 0))
     orch._save_status(st)
 
     training_calls = {"n": 0}
