@@ -713,6 +713,24 @@ _FLASH_BRIDGE_TRANSPORT_ATTEMPTS = 3
 _FLASH_PERMANENT_TEACHER_EXIT = 86
 _FLASH_TRANSIENT_TEACHER_EXIT = 87
 
+# per-run teacher skip accounting (parity with TRL _score_one + the step-loop under-run gate): a
+# transient per-sample scoring failure is skipped-and-counted so one flaky teacher call cannot abort
+# the whole run; the terminal gate turns only a transient-caused signal shortfall into a retry.
+# steps_with_signal/steps_total are recorded per optimizer step from teacher coverage.
+_flash_opd_teacher_stats = {
+    "new_transient": 0,
+    "no_signal": 0,
+    "steps_total": 0,
+    "steps_with_signal": 0,
+}
+
+
+# transient teacher failure on a skippable per-sample scoring request: skip the sample and let the
+# run continue instead of aborting. only raised when the caller passes skippable=True.
+class _FlashTeacherSkip(RuntimeError):
+    pass
+
+
 if _FLASH_OPD_KL_COEF <= 0:
     raise RuntimeError("FLASH_OPENRLHF_OPD_KL_COEF must be positive")
 if _FLASH_OPD_MAX_ATTEMPTS <= 0:
@@ -802,7 +820,7 @@ def _flash_post_teacher_once(payload):
     return result
 
 
-def _flash_post_teacher(payload):
+def _flash_post_teacher(payload, skippable=False):
     for attempt in range(_FLASH_BRIDGE_TRANSPORT_ATTEMPTS):
         try:
             return _flash_post_teacher_once(payload)
@@ -810,12 +828,16 @@ def _flash_post_teacher(payload):
             if error.retry_transport and attempt + 1 < _FLASH_BRIDGE_TRANSPORT_ATTEMPTS:
                 time.sleep(0.25 * (attempt + 1))
                 continue
-            exit_code = (
-                _FLASH_PERMANENT_TEACHER_EXIT
-                if error.classification == "permanent"
-                else _FLASH_TRANSIENT_TEACHER_EXIT
-            )
-            os._exit(exit_code)
+            if error.classification == "permanent":
+                # bad key / model id / malformed: abort the run now, never burn the whole run.
+                os._exit(_FLASH_PERMANENT_TEACHER_EXIT)
+            if skippable:
+                # transient failure on a per-sample scoring request: skip this sample and let the
+                # run continue (TRL _score_one skip semantics). the terminal under-run gate turns a
+                # transient-caused signal shortfall into a retry.
+                raise _FlashTeacherSkip(str(error)) from error
+            # transient failure on a control-plane request (metrics/checkpoint): retry the whole run.
+            os._exit(_FLASH_TRANSIENT_TEACHER_EXIT)
     raise AssertionError("unreachable flash OPD bridge retry state")
 
 
@@ -856,15 +878,27 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
             images=None,
         )
         start, end = output["action_ranges"][0]
-        result = await asyncio.to_thread(
-            _flash_post_teacher,
-            {
-                "label": attempt_label,
-                "prompt_length": start,
-                "sequence_ids": output["observation_tokens"][:end],
-                "terminated": not bool(output.get("truncated", False)),
-            },
-        )
+        try:
+            result = await asyncio.to_thread(
+                _flash_post_teacher,
+                {
+                    "label": attempt_label,
+                    "prompt_length": start,
+                    "sequence_ids": output["observation_tokens"][:end],
+                    "terminated": not bool(output.get("truncated", False)),
+                },
+                skippable=True,
+            )
+        except _FlashTeacherSkip as skip:
+            # transient teacher flap on this sample: count it and resample this rollout. a transient
+            # attempt is treated like a no-signal attempt, never a whole-run abort.
+            _flash_opd_teacher_stats["new_transient"] += 1
+            print(
+                f"[opd] teacher score transient failure, resampling rollout "
+                f"{attempt + 1}/{_FLASH_OPD_MAX_ATTEMPTS}: {skip}",
+                flush=True,
+            )
+            continue
         output["label"] = attempt_label
         output["reward"] = 0.0
         output["scores"] = 0.0
@@ -874,6 +908,21 @@ async def _flash_opd_execute(self, prompt, label, sampling_params, max_length, h
         output["teacher_coverage"] = float(result.get("coverage", 0.0))
         if int(result.get("signal_count", 0)) > 0:
             return output
+    # every attempt produced no aligned teacher signal (genuine no-signal, or a transient flap on the
+    # final attempt): drop the rollout from the optimizer update. when the final attempt was skipped
+    # before the teacher fields were set, synthesize an all-no-signal payload sized exactly like
+    # _encode_action_metadata (action_length = prompt_length + response_length - 1).
+    if "teacher_signal_mask" not in output:
+        start, end = output["action_ranges"][0]
+        action_length = start + (end - start) - 1
+        output["label"] = attempt_label
+        output["reward"] = 0.0
+        output["scores"] = 0.0
+        output["teacher_group_ids"] = [-1] * action_length
+        output["teacher_logsums"] = [0.0] * action_length
+        output["teacher_signal_mask"] = [False] * action_length
+        output["teacher_coverage"] = 0.0
+    _flash_opd_teacher_stats["no_signal"] += 1
     print(
         f"flash OPD produced no aligned teacher signal after {_FLASH_OPD_MAX_ATTEMPTS} rollout attempts; "
         "dropping the rollout from the optimizer update",
@@ -1037,12 +1086,19 @@ def _flash_metric_scalar(logs, *names):
 def _flash_save_logs_and_checkpoints(self, global_step, logs_dict=None, client_states=None):
     global_step = int(global_step)
     logs = logs_dict or {}
+    step_coverage = _flash_metric_scalar(logs, "teacher_coverage")
+    # per-optimizer-step signal accounting: a step with zero teacher coverage delivered no aligned
+    # signal (every rollout was dropped). the terminal gate classifies a coverage shortfall as a
+    # transient (retriable) or deterministic outcome.
+    _flash_opd_teacher_stats["steps_total"] += 1
+    if step_coverage > 0:
+        _flash_opd_teacher_stats["steps_with_signal"] += 1
     _flash_post_teacher(
         {
             "metrics": {
                 "step": global_step,
                 "loss": _flash_metric_scalar(logs, "distillation_loss", "policy_loss"),
-                "coverage": _flash_metric_scalar(logs, "teacher_coverage"),
+                "coverage": step_coverage,
             }
         }
     )
@@ -1087,7 +1143,27 @@ def _flash_ppo_fit(self, *args, **kwargs):
     if warmstart and not global_step and not load_enabled and not already_synced:
         self.broadcast_to_vllm()
         self._flash_warmstart_broadcast_done = True
-    return _original_ppo_fit(self, *args, **kwargs)
+    result = _original_ppo_fit(self, *args, **kwargs)
+    # terminal under-run classification (parity with TRL's post-loop guard). rank 0 checks whether
+    # every optimizer step landed on aligned teacher signal. a coverage shortfall that involved a NEW
+    # transient teacher failure this attempt is retriable infra -> exit transient so the platform
+    # retries the whole run (bounded by max_retries); a shortfall with no transient failure is a
+    # deterministic shortfall the run genuinely could not align, and it completes on the signal it
+    # delivered rather than looping.
+    stats = _flash_opd_teacher_stats
+    if self.strategy.is_rank_0() and stats["steps_with_signal"] < stats["steps_total"]:
+        summary = (
+            f"steps_with_signal={stats['steps_with_signal']}/{stats['steps_total']} "
+            f"new_transient={stats['new_transient']} no_signal_drops={stats['no_signal']}"
+        )
+        if stats["new_transient"] > 0:
+            print(f"flash OPD teacher signal shortfall is transient (retrying run): {summary}", flush=True)
+            os._exit(_FLASH_TRANSIENT_TEACHER_EXIT)
+        print(
+            f"flash OPD teacher signal shortfall is deterministic (completing on delivered signal): {summary}",
+            flush=True,
+        )
+    return result
 
 
 _FlashPPOTrainerRuntime.fit = _flash_ppo_fit
