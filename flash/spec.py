@@ -346,6 +346,10 @@ class JobSpec:
     thinking: bool = False
     wandb: WandbSpec = field(default_factory=WandbSpec)
     model_revision: str = ""
+    # optional flash project id (the org-scoped grouping shown in the dashboard);
+    # empty means the run is ungrouped. the control plane forwards it to the
+    # platform, which writes it to flash_training_runs.project_id.
+    project: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
@@ -481,6 +485,7 @@ class JobSpec:
             thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
             seed=parse_seed(data.get("seed", FIXED_SEED)),
+            project=str(data.get("project") or ""),
         )
 
     @classmethod
