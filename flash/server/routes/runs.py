@@ -28,7 +28,6 @@ from flash.server._deps import (
     readable_run,
     require_key,
 )
-from flash.spec import JobSpec
 
 _LOG = logging.getLogger("flash.server.runs")
 
@@ -286,7 +285,14 @@ def run_worker_output(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     status = readable_run(run_id, key, x_freesolo_org_id)
-    return {"run_id": run_id, "worker": _app._worker_artifacts(JobSpec.from_dict(status.spec))}
+    # hf_repo + run_id (adapter prefix) are platform-managed and stripped from the public spec;
+    # the worker artifact repo lives under the internal carrier (see _internal_spec_from_status).
+    from flash.runner import _internal_spec_from_status
+
+    return {
+        "run_id": run_id,
+        "worker": _app._worker_artifacts(_internal_spec_from_status(status)),
+    }
 
 
 @router.post("/v1/runs/{run_id}/cancel")
@@ -321,7 +327,11 @@ def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
 def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     """List a run's deployable per-step RL checkpoints."""
     status = owned_run(run_id, key)
-    spec = JobSpec.from_dict(status.spec)
+    # checkpoint listing keys off hf_repo + run_id, both platform-managed and stripped from the
+    # public spec; resolve them from the internal carrier (see _internal_spec_from_status).
+    from flash.runner import _internal_spec_from_status
+
+    spec = _internal_spec_from_status(status)
     checkpoints = _app.list_checkpoints(spec)
     with contextlib.suppress(Exception):
         from flash.server.checkpoints import register_checkpoints_best_effort

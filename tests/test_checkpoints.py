@@ -615,6 +615,9 @@ def _status(**kw):
         "run_id": "flash-ckpt-1",
         "spec": SPEC_DICT,
         "billing_context": {"org_id": "org-xyz"},
+        # a provisioned run always carries the internal worker-spec carrier; hf_repo + run_id are
+        # platform-managed and read from it (see _internal_spec_from_status).
+        "effective_preparation": {"worker_spec": SPEC_DICT},
     }
     base.update(kw)
     return SimpleNamespace(**base)
