@@ -98,8 +98,10 @@ _CHILD_ENV_PREFIXES = (
 )
 
 # openrlhf's multi-turn executor exposes action spans but collapses all turn rewards into one episode
-# scalar before advantage estimation. exact per-turn credit therefore needs an upstream experience and
-# advantage-data-model extension; keep that mode fail-closed until the backend can carry turn rewards.
+# scalar before advantage estimation. the token-aligned per-turn advantage construction is built and
+# cpu-proved byte-identical to trl in openrlhf_multiturn.build_openrlhf_perturn_advantages (parity plan
+# #11); wiring it onto live experiences rides the multi-turn executor, so per-turn credit stays
+# fail-closed behind the same multi-turn gpu gate until that live path is proved on gpu.
 
 
 class _RewardHTTPServer(ThreadingHTTPServer):
@@ -2288,8 +2290,9 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
         )
     if train_spec.credit_assignment != DEFAULT_CREDIT_ASSIGNMENT:
         raise RuntimeError(
-            "OpenRLHF GRPO per-turn credit requires action-span reward advantages that the pinned "
-            "OpenRLHF experience schema cannot express; use the TRL backend"
+            "OpenRLHF GRPO per-turn credit rides the multi-turn executor; its token-aligned advantage "
+            "construction is CPU-proved (openrlhf_multiturn.build_openrlhf_perturn_advantages) but "
+            "stays fail-closed behind the multi-turn GPU gate. Use the TRL backend for per-turn credit."
         )
     if float(RECIPE.lora.dropout) != 0.0:
         raise RuntimeError("OpenRLHF GRPO requires the managed zero LoRA dropout")

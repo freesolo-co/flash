@@ -19,21 +19,28 @@ Two halves:
 
 * :func:`build_multiturn_action_ranges` converts that per-token env mask into the
   OpenRLHF ``action_ranges`` (contiguous assistant spans) that the multi-turn ``AgentExecutor``
-  consumes, so the OpenRLHF experience trains exactly the assistant tokens TRL would, with episode
-  reward. Per-turn credit is intentionally *not* introduced here (that is the pinned-OpenRLHF
-  data-model change in parity plan #11); this path uses TRL's default episode reward.
+  consumes, so the OpenRLHF experience trains exactly the assistant tokens TRL would.
+  :func:`build_openrlhf_perturn_advantages` (parity plan #11) shifts those full-sequence
+  ``action_ranges`` into completion-local coordinates and delegates to the backend-neutral
+  group-relative math in :mod:`flash.engine.worker.perturn_credit`, so per-turn credit is
+  byte-identical to the TRL per-turn trainer given the same per-turn rewards. Selecting that mode on
+  the live executor stays fail-closed behind the multi-turn GPU gate; the default episode-reward path
+  is unchanged.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flash.engine.multiturn_rollout import (
     _dedup_seam_terminator,
     make_env_glue,
     render_message_ids,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 # Sentinel wire values kept provider-neutral and JSON-safe. The bridge only moves opaque
 # observations; these are the observation payload this driver emits.
@@ -233,6 +240,63 @@ def assemble_multiturn_rollout(
         "action_ranges": action_ranges,
         "response_mask": response_mask,
     }
+
+
+def build_openrlhf_perturn_advantages(
+    action_ranges_per_completion: list[list[tuple[int, int]]],
+    turn_rewards_per_completion: list[list[float] | None],
+    prompt_lens: list[int],
+    *,
+    num_generations: int,
+    completion_len: int,
+    episode_advantages: torch.Tensor,
+) -> torch.Tensor:
+    """Token-aligned per-turn advantages for the OpenRLHF multi-turn GRPO experience (plan #11).
+
+    The multi-turn executor records assistant ``action_ranges`` in full-sequence coordinates
+    (``prompt || action_0 || glue_0 || ...``, so a turn's span starts at ``prompt_len``), while the
+    group-relative per-turn credit math works in completion-local coordinates ``[0, completion_len)``
+    -- the response region the advantages tensor spans. This shifts every completion's assistant
+    spans by its own prompt length and delegates to
+    :func:`flash.engine.worker.perturn_credit.build_per_turn_advantages`, so the resulting
+    ``[B, completion_len]`` advantages are byte-identical to the TRL per-turn trainer given the same
+    per-turn rewards. ``turn_rewards_per_completion[i]`` is ``None`` for a completion with no per-turn
+    decomposition; such a group falls back to its episode advantage exactly as TRL does.
+    """
+    # imported lazily so this module stays torch-free at import (see module docstring); the advantage
+    # tensors only exist on the training path, where torch is present.
+    from flash.engine.worker.perturn_credit import build_per_turn_advantages
+
+    batch_size = len(action_ranges_per_completion)
+    if not (len(turn_rewards_per_completion) == len(prompt_lens) == batch_size):
+        raise ValueError("action-range, turn-reward, and prompt-length row counts must match")
+
+    completion_spans: list[list[tuple[int, int]]] = []
+    for row_index, (ranges, prompt_len) in enumerate(
+        zip(action_ranges_per_completion, prompt_lens, strict=True)
+    ):
+        base = int(prompt_len)
+        if base < 0:
+            raise ValueError(f"prompt length for row {row_index} must be non-negative")
+        shifted: list[tuple[int, int]] = []
+        for start, end in ranges:
+            local_start = int(start) - base
+            local_end = int(end) - base
+            if local_start < 0 or local_end < local_start:
+                raise ValueError(
+                    f"action range [{start}, {end}) for row {row_index} precedes its prompt "
+                    f"boundary {base}"
+                )
+            shifted.append((local_start, local_end))
+        completion_spans.append(shifted)
+
+    return build_per_turn_advantages(
+        completion_spans,
+        turn_rewards_per_completion,
+        num_generations=num_generations,
+        completion_len=completion_len,
+        episode_advantages=episode_advantages,
+    )
 
 
 def _load_openrlhf_agent_base():
