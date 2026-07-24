@@ -31,7 +31,7 @@ def test_opsd_knobs_use_paper_recipe_defaults(monkeypatch):
     knobs = opsd_mod._resolve_opsd_knobs()
 
     assert knobs.learning_rate == pytest.approx(5e-6)
-    assert knobs.rollout_temperature == pytest.approx(1.1)
+    assert knobs.temperature == pytest.approx(1.1)
     assert knobs.top_p == pytest.approx(0.95)
     assert opsd_mod._OPSD_LEARNING_RATE == pytest.approx(5e-6)
     assert opsd_mod._OPSD_MAX_GRAD_NORM == pytest.approx(0.1)
@@ -228,7 +228,7 @@ def _patch_opsd_run(monkeypatch, *, gold="worked solution: add one and one to ge
         lambda: opsd_mod.OpsdKnobs(
             epochs=1,
             learning_rate=0.1,
-            rollout_temperature=1.0,
+            temperature=1.0,
             top_p=1.0,
             max_completion=4,
             prompts_per_step=1,

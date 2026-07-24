@@ -61,7 +61,7 @@ _OPSD_MAX_GRAD_NORM = 0.1
 class OpsdKnobs:
     epochs: int
     learning_rate: float
-    rollout_temperature: float
+    temperature: float
     top_p: float
     max_completion: int
     prompts_per_step: int
@@ -88,7 +88,7 @@ def _resolve_opsd_knobs() -> OpsdKnobs:
     return OpsdKnobs(
         epochs=int(opt("epochs", defaults.num_epochs)),
         learning_rate=float(opt("learning_rate", _OPSD_LEARNING_RATE)),
-        rollout_temperature=float(opt("temperature", _OPSD_ROLLOUT_TEMPERATURE)),
+        temperature=float(opt("temperature", _OPSD_ROLLOUT_TEMPERATURE)),
         top_p=_OPSD_ROLLOUT_TOP_P,
         max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
         prompts_per_step=int(opt("batch_size", defaults.prompts_per_step)),
@@ -320,19 +320,9 @@ def run_opsd():
     lora_rank = _opd_lora_rank(
         model, getattr(_w.JOB_SPEC.train, "lora_rank", 32) if _w.JOB_SPEC else 32
     )
-    vllm_knobs = type(
-        "_RolloutKnobs",
-        (),
-        {
-            "max_completion": knobs.max_completion,
-            "temperature": knobs.rollout_temperature,
-            "prompts_per_step": prompts_per_step,
-            "stop_sequences": knobs.stop_sequences,
-        },
-    )()
     vllm_kwargs = _opd_vllm_kwargs(
         model_id,
-        vllm_knobs,
+        knobs,
         seq_cap,
         prompts_per_step=prompts_per_step,
         lora_rank=lora_rank,
@@ -342,7 +332,7 @@ def run_opsd():
         model_source=rollout_model_source,
         model_revision=model_revision,
         max_model_len=seq_cap,
-        temperature=knobs.rollout_temperature,
+        temperature=knobs.temperature,
         top_p=knobs.top_p,
         stop_sequences=knobs.stop_sequences,
         eos_token_ids=tuple(sorted(eos_ids)),
@@ -377,7 +367,7 @@ def run_opsd():
                 rollout,
                 tok,
                 prompt_ids_batch,
-                vllm_knobs,
+                knobs,
                 eos_ids,
                 max_tokens=knobs.max_completion,
                 request_seeds=request_seeds,
