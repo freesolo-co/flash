@@ -42,11 +42,9 @@ def _representative_config() -> dict:
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:my-env/environment.py", "params": {"split": "train"}},
         "train": {
-            "hf_repo": "owner/my-runs",
             "epochs": 2,
             "max_examples": 120,
             "lora_rank": 32,
-            "lora_alpha": 64,
             "learning_rate": 1e-5,
             "group_size": 8,
             "temperature": 0.9,
@@ -65,20 +63,30 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     assert spec.algorithm == "grpo"
     assert spec.environment.id == "github:owner/repo@main:my-env/environment.py"
     assert spec.environment.params == {"split": "train"}
-    # hf_repo is platform-managed: a user/backend-supplied value is ignored (left blank for the
-    # control plane to assign per run at submit), so it must NOT survive parsing.
+    # hf_repo is platform-managed: it is not user-authorable (a supplied value is rejected as an
+    # unknown [train] key), and it defaults to blank for the control plane to assign per run at
+    # submit, so it stays empty here.
     assert spec.train.hf_repo == ""
+    # lora_alpha is derived, not authored: it is fixed at 2x lora_rank.
+    assert spec.train.lora_alpha == 64
     assert spec.train.epochs == 2
     assert spec.train.max_examples == 120
     assert spec.train.group_size == 8
     assert spec.run_id == "flash-test-1"
 
 
-def test_jobspec_round_trips_through_dict() -> None:
-    """to_dict()/from_dict() must be lossless so the backend's stored config (a JobSpec
-    serialized to a dict) reconstructs the same JobSpec on the worker."""
+def test_jobspec_round_trips_through_internal_carrier() -> None:
+    """The worker payload must be lossless: the control plane submits a run by
+    serializing the spec through to_internal_dict()/to_json() (the complete carrier),
+    and the worker reconstructs the same JobSpec via from_dict(). Managed fields
+    (run_id, hf_repo, lora_alpha, ...) survive this seam.
+
+    to_dict() is the *public* view and is intentionally lossy for managed fields (it
+    strips run_id, hf_repo, ... for user-facing display), so it is not the carrier the
+    worker rehydrates from and is not asserted lossless here.
+    """
     spec = spec_from_dict(_representative_config(), run_id="flash-test-2")
-    again = JobSpec.from_dict(spec.to_dict())
+    again = JobSpec.from_dict(spec.to_internal_dict())
     assert again == spec
 
 
@@ -107,7 +115,7 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:my-env/environment.py"},
-        "train": {"hf_repo": "owner/my-runs", "epochs": 3, "max_examples": 64, "batch_size": 8},
+        "train": {"epochs": 3, "max_examples": 64, "batch_size": 8},
         "gpu": {},
     }
     spec = spec_from_dict(config, run_id="flash-sft-1")
@@ -145,7 +153,7 @@ def test_stale_local_env_path_is_rejected_at_both_layers() -> None:
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"path": "environments/local_env.py"},
-        "train": {"hf_repo": "owner/my-runs", "epochs": 1, "max_examples": 10},
+        "train": {"epochs": 1, "max_examples": 10},
         "gpu": {},
     }
     with pytest.raises(ConfigError):

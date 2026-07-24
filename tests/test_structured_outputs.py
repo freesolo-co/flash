@@ -31,7 +31,7 @@ def _raw(structured_outputs=None, algorithm="grpo", **top):
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": algorithm,
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"hf_repo": "owner/runs"},
+        "train": {},
         **top,
     }
     if algorithm == "sft":

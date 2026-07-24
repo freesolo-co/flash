@@ -186,13 +186,11 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
         "train": {
             "epochs": 1,
             "max_examples": 10,
-            "hf_repo": "owner/runs",
             "group_size": 4,
             "temperature": 0.7,
             "max_completion_tokens": 256,
@@ -285,10 +283,9 @@ def _spec_raw(ref: str) -> dict:
     return {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
-        "train": {"epochs": 1, "max_examples": 10, "hf_repo": "owner/runs", "init_from_adapter": ref},
+        "train": {"epochs": 1, "max_examples": 10, "init_from_adapter": ref},
     }
 
 
@@ -372,24 +369,24 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
 
 def test_hf_repo_is_managed_not_user_set() -> None:
     # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
-    # it server-side at submit (see runner.submit_job). It is NOT required and a user-supplied
-    # value is IGNORED — verified through both schema (server) and JobSpec.from_dict (worker).
+    # it server-side at submit (see runner.submit_job). It is not a user config key -- the schema
+    # rejects a user-supplied value outright rather than silently ignoring it.
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {"epochs": 1, "max_examples": 10},
     }
-    # absent -> fine (no longer required); left blank for the control plane to assign
+    # absent -> fine (not a user key); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
     assert spec.train.hf_repo == ""
     assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
-    # user-supplied -> ignored (the control plane overrides it at submit)
-    spec2 = spec_from_dict(
-        {**raw, "train": {"epochs": 1, "max_examples": 10, "hf_repo": "someone-else/their-repo"}},
-        run_id="hf-y",
-    )
-    assert spec2.train.hf_repo == ""
+    # user-supplied -> rejected as an unknown [train] key (managed, not user-authorable)
+    with pytest.raises(ConfigError, match="hf_repo"):
+        spec_from_dict(
+            {**raw, "train": {"epochs": 1, "max_examples": 10, "hf_repo": "someone-else/their-repo"}},
+            run_id="hf-y",
+        )
 
 
 def test_optimizer_and_batching_knobs_roundtrip() -> None:
@@ -399,11 +396,9 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
         "train": {
-            "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
             "batch_size": 16,
             "max_context_tokens": 2048,
@@ -421,25 +416,25 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         assert s.train.max_completion_tokens == 512
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
-    bare = spec_from_dict({**raw, "train": {"hf_repo": "owner/runs"}}, run_id="grpo-w")
+    bare = spec_from_dict({**raw, "train": {"max_examples": 8}}, run_id="grpo-w")
     assert bare.train.learning_rate is None
     assert bare.train.batch_size is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
-        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
+        {**raw, "train": {"max_examples": 8, "stop_sequences": "</answer>"}},
         run_id="grpo-s",
     )
     assert one.train.stop_sequences == ("</answer>",)
     assert JobSpec.from_dict(one.to_dict()).train.stop_sequences == ("</answer>",)
     # an empty string means "no stop configured" -> (), not ("",); empty list entries drop
     empty = spec_from_dict(
-        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ""}},
+        {**raw, "train": {"max_examples": 8, "stop_sequences": ""}},
         run_id="grpo-e",
     )
     assert empty.train.stop_sequences == ()
     dropped = spec_from_dict(
-        {**raw, "train": {"hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
+        {**raw, "train": {"max_examples": 8, "stop_sequences": ["x", ""]}},
         run_id="grpo-d",
     )
     assert dropped.train.stop_sequences == ("x",)
@@ -641,7 +636,6 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
     }
@@ -779,17 +773,16 @@ def test_epochs_reject_non_integer_at_parse() -> None:
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "model_policy": "allow",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
     }
     for bad in ({"epochs": 2.5}, {"epochs": -1}):
         with pytest.raises(ConfigError):
-            spec_from_dict({**base, "train": {"hf_repo": "o/r", "max_examples": 8, **bad}}, run_id="bad")
+            spec_from_dict({**base, "train": {"max_examples": 8, **bad}}, run_id="bad")
 
     # Genuine integers still parse and round-trip.
     spec = spec_from_dict(
-        {**base, "train": {"hf_repo": "o/r", "max_examples": 8, "epochs": 3}},
+        {**base, "train": {"max_examples": 8, "epochs": 3}},
         run_id="ok",
     )
     assert spec.train.epochs == 3

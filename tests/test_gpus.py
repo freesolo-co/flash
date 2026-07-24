@@ -163,7 +163,7 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8},
         "gpu": {},
     }
     assert spec_from_dict(raw, run_id="x").gpu.type == ""
@@ -203,7 +203,7 @@ def test_config_defaults_gpu_to_auto():
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8},
     }
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == ""

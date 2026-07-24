@@ -186,21 +186,6 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
                     ),
                 ) from exc
             raise
-        if (
-            spec.train.init_from_adapter
-            and schema is not None
-            and "lora_alpha" in schema["authored_keys"]
-            and spec.train.lora_alpha != prepared.worker_spec.train.lora_alpha
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"train.lora_alpha={spec.train.lora_alpha} does not match the "
-                    "train.init_from_adapter source adapter "
-                    f"lora_alpha={prepared.worker_spec.train.lora_alpha}; omit train.lora_alpha "
-                    "because source adapter alpha metadata is authoritative"
-                ),
-            )
         run_id = prepared.public_spec.run_id
         if bill_on_completion:
             _precheck_budget_or_block(
