@@ -249,6 +249,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "gpu",
         "worker_env",
         "wandb",
+        "project",
     }
 )
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.spec) are excluded from the
@@ -308,6 +309,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(model_revision_raw, str):
         raise ConfigError("model_revision must be a string")
     model_revision = model_revision_raw.strip()
+    project_raw = raw.get("project", "")
+    if not isinstance(project_raw, str):
+        raise ConfigError("project must be a string (the project id from your dashboard)")
+    project = project_raw.strip()
 
     try:
         algorithm = normalize_algorithm(raw.get("algorithm"))
@@ -533,6 +538,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         model_policy=model_policy,
         thinking=thinking,
         wandb=wandb_spec,
+        project=project,
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
