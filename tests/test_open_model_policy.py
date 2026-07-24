@@ -75,11 +75,11 @@ def test_spec_model_policy_default_catalog():
     assert spec.model_policy == "catalog"
 
 
-def test_spec_user_model_policy_is_ignored():
-    # model_policy is not a user knob: managed runs always use the curated catalog, so a
-    # user-supplied "allow" in the config is ignored (the policy stays "catalog").
-    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
-    assert spec.model_policy == "catalog"
+def test_spec_user_model_policy_is_rejected():
+    # model_policy is not a user knob: managed runs always use the curated catalog, so a user who
+    # sets it in the config is rejected loudly rather than having their value silently dropped.
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_policy"):
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
 
 
 def test_spec_unlisted_model_under_catalog_policy_fails():

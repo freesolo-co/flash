@@ -85,7 +85,9 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             }
         )
         status = runner.submit_job(spec, dry_run=True)
-        assert status.spec["gpu"]["disk_gb"] == 160
+        # disk_gb is platform-managed: stripped from the public status.spec, read the sizing the
+        # worker executes from the effective-preparation worker spec.
+        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 160
         # explicit larger user value wins
         spec_big = JobSpec.from_dict(
             {
@@ -97,4 +99,4 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             }
         )
         status = runner.submit_job(spec_big, dry_run=True)
-        assert status.spec["gpu"]["disk_gb"] == 200
+        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 200
