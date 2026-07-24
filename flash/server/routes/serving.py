@@ -926,9 +926,9 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 ),
             )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
-            run_id, spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
+            run_id, effective_spec, status, payload.get("step"), action="deploy", enforce_state=not dry_run
         )
-        if not dry_run and not spec.train.hf_repo:
+        if not dry_run and not effective_spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -961,7 +961,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         deploy_kwargs = {
             "run_id": run_id,
             "model": spec.model,
-            "hf_repo": spec.train.hf_repo,
+            "hf_repo": effective_spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
             "dry_run": dry_run,
             "lora_rank": effective_spec.train.lora_rank,
@@ -1091,7 +1091,11 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
 
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
-        if not spec.train.hf_repo:
+        try:
+            effective_spec = effective_spec_from_status(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not effective_spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1100,12 +1104,12 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 ),
             )
         checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
-            run_id, spec, status, payload.get("step"), action="export", enforce_state=True
+            run_id, effective_spec, status, payload.get("step"), action="export", enforce_state=True
         )
         subfolder = f"{prefix}/adapter"
         try:
             url = _app.export_adapter(
-                source_repo=spec.train.hf_repo,
+                source_repo=effective_spec.train.hf_repo,
                 source_subfolder=subfolder,
                 dest_repo=repository,
                 dest_token=hf_token,
@@ -1178,6 +1182,10 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     )
     serving_model = pinned_revision or run_id
     spec = JobSpec.from_dict(status.spec)
+    try:
+        effective_spec = effective_spec_from_status(status)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     deployment_state = deployment.get("state")
     has_ready_deploy = pinned_revision is not None or ready_deployment is not None
     if pinned_revision is None and ready_deployment is not None:
@@ -1219,7 +1227,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=409,
             detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
         )
-    if not spec.train.hf_repo:
+    if not effective_spec.train.hf_repo:
         raise HTTPException(
             status_code=409,
             detail=f"run {run_id} has no [train].hf_repo; its adapter cannot be served",

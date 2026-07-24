@@ -695,7 +695,7 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
                 "model": "Qwen/Qwen3.5-4B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"epochs": 1, "max_examples": 5, "hf_repo": "owner/runs", **train_extra},
+                "train": {"epochs": 1, "max_examples": 5, **train_extra},
             },
             run_id="x",
         )
@@ -4996,7 +4996,6 @@ def test_opd_spec_json_round_trip():
                 "epochs": 25,
                 "max_examples": 8,
                 "batch_size": 8,
-                "hf_repo": "owner/runs",
             },
         },
         run_id="x",
@@ -5019,7 +5018,7 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 30, "hf_repo": "owner/runs"},
+            "train": {"epochs": 30},
         },
         run_id="x",
     )

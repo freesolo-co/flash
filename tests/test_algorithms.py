@@ -23,7 +23,7 @@ def test_opd_algorithm_accepted():
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 1, "max_examples": 10, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 10},
         },
         run_id="x",
     )
@@ -55,7 +55,7 @@ def test_opd_capability_gated_per_model():
                     "model": "test/no-opd",
                     "algorithm": "opd",
                     "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
+                    "train": {"epochs": 1, "max_examples": 1},
                 },
                 run_id="x",
             )
@@ -84,7 +84,7 @@ def test_grpo_capability_still_enforced():
                     "model": "test/sft-only",
                     "algorithm": "grpo",
                     "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
+                    "train": {"epochs": 1, "max_examples": 1},
                 },
                 run_id="x",
             )
@@ -94,7 +94,7 @@ def test_grpo_capability_still_enforced():
                 "model": "test/sft-only",
                 "algorithm": "sft",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+                "train": {"epochs": 1, "max_examples": 8},
             },
             run_id="x",
         )
@@ -110,7 +110,7 @@ def test_qwen35_9b_now_supports_grpo():
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 1},
             "gpu": {"type": "A100 PCIe"},
         },
         run_id="x",

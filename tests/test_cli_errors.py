@@ -93,7 +93,7 @@ def test_train_without_login_fails_fast():
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-                '[train]\nepochs = 1\nmax_examples = 1\nhf_repo = "owner/runs"\n'
+                '[train]\nepochs = 1\nmax_examples = 1\n'
             )
         proc = _run(["train", cfg], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -126,7 +126,7 @@ def test_dry_run_without_login_fails_fast():
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-                '[train]\nepochs = 1\nmax_examples = 1\nhf_repo = "owner/runs"\n'
+                '[train]\nepochs = 1\nmax_examples = 1\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -142,7 +142,7 @@ def test_cost_needs_no_live_pricing():
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-                '[train]\nepochs = 1\nmax_examples = 1\nhf_repo = "owner/runs"\n'
+                '[train]\nepochs = 1\nmax_examples = 1\n'
             )
         proc = _run(["train", cfg, "--cost"], env=_logged_out_env(tmp))
     assert proc.returncode == 0, proc.stdout + proc.stderr

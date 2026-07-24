@@ -254,15 +254,21 @@ class EnvironmentSpec:
 class TrainSpec:
     epochs: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     lora_rank: int = field(default=32, metadata={"introduced_in": "0.2.0"})
-    lora_alpha: int = field(default=64, metadata={"introduced_in": "0.2.0"})
+    # Derived, not a user knob: always 2 x lora_rank. No ``introduced_in`` so it is absent from
+    # TRAIN_SCHEMA_KEYS and ``[train] lora_alpha`` is rejected; spec_from_dict recomputes it from
+    # lora_rank and to_dict() omits it. The internal from_dict still round-trips the stored value so
+    # a warm-start's inherited parent alpha survives control-plane -> worker serialization.
+    lora_alpha: int = 64
     # Artifact-store adapter ref output by `flash status`:
     # ``<hf_repo>:<phase>/<run_id>``.
     init_from_adapter: str = field(default="", metadata={"introduced_in": "0.2.0"})
     # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
     # control-plane jobspec payloads; the public config schema does not accept this key.
     init_from_adapter_revision: str = ""
-    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo; user-supplied values are ignored.
-    hf_repo: str = field(default="", metadata={"introduced_in": "0.2.0"})
+    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo. Not a user config key: it has no
+    # ``introduced_in`` so it is absent from TRAIN_SCHEMA_KEYS and ``[train] hf_repo`` is rejected.
+    # JobSpec.from_dict still round-trips the control-plane-assigned value; to_dict() omits it.
+    hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -324,6 +330,16 @@ class GpuSpec:
         object.__setattr__(self, "count", _gpu_count(self.count))
 
 
+# platform-managed [gpu] fields: the runner assigns disk sizing, the shared weight-cache volume, and
+# retry/wall-clock lifecycle policy; the user never authors them. single-sourced here so the public
+# serializer (JobSpec.to_dict), the user-facing parser (flash.schema), and the runner's effective-spec
+# validator strip, reject, and exclude exactly the same set. divergence would leak a managed field
+# into the public surface or fail the submit round trip.
+MANAGED_GPU_KEYS = frozenset(
+    {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
+)
+
+
 @dataclass(frozen=True)
 class WandbSpec:
     project: str | None = None
@@ -357,12 +373,28 @@ class JobSpec:
         return "rl" if self.algorithm == "grpo" else self.algorithm
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the public/API representation of this job specification."""
+        """Return the public/API representation of this job specification.
+
+        This is the user-authorable config surface: platform-managed fields are omitted because they
+        are assigned by the control plane / runner, never by the user, and re-validating this dict
+        through the user-facing parser (the client -> server submit round trip) rejects them. The
+        control plane and worker use to_internal_dict(), which retains every field.
+        """
         data = asdict(self)
+        # server-assigned identity and internal-only policy — never authored in a config.
+        data.pop("run_id", None)
+        data.pop("model_policy", None)
         train = data["train"]
         train.pop("init_from_adapter_revision", None)
+        train.pop("hf_repo", None)  # control-plane-assigned artifact repo
+        train.pop("lora_alpha", None)  # derived (2 x lora_rank), recomputed on parse
         if train.get("init_from_adapter"):
             train.pop("lora_rank", None)
+        # runner-assigned disk sizing, shared weight-cache volume, and retry/wall-clock lifecycle.
+        gpu = data["gpu"]
+        for managed in MANAGED_GPU_KEYS:
+            gpu.pop(managed, None)
+        data["environment"].pop("resolved_sha", None)  # resolve-once env ref pin
         return data
 
     def to_internal_dict(self) -> dict[str, Any]:
@@ -439,7 +471,13 @@ class JobSpec:
             train=TrainSpec(
                 epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
-                lora_alpha=int(train.get("lora_alpha", 64)),
+                # round-trip a stored alpha (internal carrier + warm-start's inherited parent alpha);
+                # derive 2 x rank when absent (a stripped public to_dict() being reconstructed).
+                lora_alpha=(
+                    int(train["lora_alpha"])
+                    if "lora_alpha" in train
+                    else 2 * int(train.get("lora_rank", 32))
+                ),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
