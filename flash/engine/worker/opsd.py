@@ -409,6 +409,16 @@ def run_opsd():
             loss_curve.append(step_loss)
             _w.heartbeat("opsd_step", step=step + 1, loss=loss_curve[-1])
 
+        if not loss_curve:
+            # every step skipped: all student rollouts truncated on every step, so no optimizer
+            # update ran and the adapter is untrained. this only happens on a misconfigured env
+            # (e.g. max_completion_tokens far below the trace length), so fail loud instead of
+            # silently publishing an untrained adapter.
+            raise RuntimeError(
+                f"opsd trained no step across {steps} steps: every step's student rollouts "
+                "truncated before terminating (max_completion_tokens likely too low for this env)"
+            )
+
         train_wall = time.time() - train_started
         _save_adapter(model, tok, adapter_dir)
         _publish_opsd_deployable(

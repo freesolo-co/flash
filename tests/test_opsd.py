@@ -96,7 +96,7 @@ def test_opsd_forward_completion_logits_slices_shifted_completion_positions():
     assert out[0, 1, 0].item() == pytest.approx(4.0)
 
 
-def _patch_opsd_run(monkeypatch, *, gold="worked solution: add one and one to get two"):
+def _patch_opsd_run(monkeypatch, *, gold="worked solution: add one and one to get two", max_steps=1):
     torch = pytest.importorskip("torch")
     import flash.engine.worker.hf as hf_mod
     from flash.engine.worker import opsd as opsd_mod
@@ -232,7 +232,7 @@ def _patch_opsd_run(monkeypatch, *, gold="worked solution: add one and one to ge
             top_p=1.0,
             max_completion=4,
             prompts_per_step=1,
-            max_steps=1,
+            max_steps=max_steps,
             max_length=32,
             stop_sequences=(),
         ),
@@ -296,17 +296,20 @@ def test_opsd_empty_gold_fails_loudly(monkeypatch):
         opsd_mod.run_opsd()
 
 
-def test_opsd_all_truncated_step_is_skipped_not_fatal(monkeypatch):
-    # a step where every student rollout hit the max-token cap (truncated) has no naturally
-    # terminated completion to teacher-force, so opsd must skip it (opsd_step_skipped heartbeat, no
-    # optimizer update) instead of aborting. long-trace thinking envs emit occasional all-truncate
-    # steps and the paid run must survive them rather than crash near the end.
-    torch = pytest.importorskip("torch")
+def test_opsd_truncated_step_is_skipped_not_fatal(monkeypatch):
+    # a step whose student rollouts all hit the max-token cap (truncated) has no naturally
+    # terminated completion to teacher-force, so opsd skips it (opsd_step_skipped heartbeat, no
+    # optimizer update) and continues to the next step instead of aborting. long-trace thinking
+    # envs emit occasional all-truncate steps, and the paid run must survive them while still
+    # training on the steps that do terminate.
+    pytest.importorskip("torch")
     from flash.engine.worker.opd_vllm import OpdVllmOutput
 
-    opsd_mod, model, metadata, fake_rollout = _patch_opsd_run(monkeypatch)
+    opsd_mod, _model, metadata, fake_rollout = _patch_opsd_run(monkeypatch, max_steps=2)
 
-    class _TruncatingRollout(fake_rollout):
+    class _FirstStepTruncates(fake_rollout):
+        calls = 0
+
         def generate(
             self,
             prompt_ids_batch,
@@ -315,23 +318,51 @@ def test_opsd_all_truncated_step_is_skipped_not_fatal(monkeypatch):
             request_seeds=None,
             multi_modal_data_batch=None,
         ):
-            # finish_reason="length" -> _generate_many_vllm marks the record truncated=True
+            _FirstStepTruncates.calls += 1
+            # step 1 truncates (finish_reason="length" -> truncated=True, skipped); step 2 terminates
+            finish_reason = "length" if _FirstStepTruncates.calls == 1 else "stop"
+            return [
+                OpdVllmOutput([3, 4], "ab", finish_reason=finish_reason)
+                for _prompt_ids in prompt_ids_batch
+            ]
+
+    monkeypatch.setattr(opsd_mod, "OpdVllmRolloutEngine", _FirstStepTruncates)
+
+    events: list[str] = []
+    monkeypatch.setattr(opsd_mod._w, "heartbeat", lambda stage, **kwargs: events.append(stage))
+
+    opsd_mod.run_opsd()  # must not raise: the skipped step is tolerated and the next step trains
+
+    assert "opsd_step_skipped" in events  # the all-truncate step was skipped
+    assert "opsd_step" in events  # a later terminating step still trained
+    # only the terminating step contributed to the loss curve; the skipped step did not
+    assert len(metadata["notes"]["loss_curve"]) == 1
+
+
+def test_opsd_all_steps_skipped_fails_loud(monkeypatch):
+    # if every step's student rollouts truncate, no optimizer update ever runs and the adapter is
+    # untrained. opsd must fail loud rather than silently publish an untrained adapter, which would
+    # otherwise happen on a grossly misconfigured env (e.g. max_completion_tokens far too low).
+    pytest.importorskip("torch")
+    from flash.engine.worker.opd_vllm import OpdVllmOutput
+
+    opsd_mod, _model, _metadata, fake_rollout = _patch_opsd_run(monkeypatch, max_steps=2)
+
+    class _AlwaysTruncates(fake_rollout):
+        def generate(
+            self,
+            prompt_ids_batch,
+            *,
+            max_tokens,
+            request_seeds=None,
+            multi_modal_data_batch=None,
+        ):
             return [
                 OpdVllmOutput([3, 4], "ab", finish_reason="length")
                 for _prompt_ids in prompt_ids_batch
             ]
 
-    monkeypatch.setattr(opsd_mod, "OpdVllmRolloutEngine", _TruncatingRollout)
+    monkeypatch.setattr(opsd_mod, "OpdVllmRolloutEngine", _AlwaysTruncates)
 
-    events: list[str] = []
-    monkeypatch.setattr(opsd_mod._w, "heartbeat", lambda stage, **kwargs: events.append(stage))
-
-    before_lora = model.w.detach().clone()
-
-    opsd_mod.run_opsd()  # must not raise on an all-truncate step
-
-    assert "opsd_step_skipped" in events
-    # a skipped step performs no optimizer update, so the lora weights stay unchanged
-    assert torch.equal(before_lora, model.w.detach())
-    # no step contributed a loss
-    assert metadata["notes"]["loss_curve"] == []
+    with pytest.raises(RuntimeError, match="trained no step"):
+        opsd_mod.run_opsd()
