@@ -46,6 +46,9 @@ from flash.engine.structured_outputs import (
     parse_structured_outputs,
     reasoning_parser_for,
 )
+from flash.engine.structured_outputs import (
+    drop_fully_forced_groups as _drop_fully_forced_groups,
+)
 from flash.engine.vram import OPD_CE_CHUNK_SIZE, opd_completion_len
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
@@ -2230,20 +2233,6 @@ class _PreparedGkdGroups:
     token_indices: tuple[int, ...]
     group_lengths: tuple[int, ...]
     teacher_logsums: tuple[float, ...]
-
-
-def _drop_fully_forced_groups(groups, forced):
-    """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
-    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
-    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
-    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op."""
-    if not forced:
-        return groups
-    return [
-        (s_idx, tsum)
-        for (s_idx, tsum) in groups
-        if not (s_idx and all(i < len(forced) and forced[i] for i in s_idx))
-    ]
 
 
 def _prepare_gkd_groups(groups) -> _PreparedGkdGroups | None:

@@ -14,6 +14,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from flash.engine.structured_outputs import forced_from_logprobs as _forced_from_logprobs
+
 try:
     # peft writes adapter_model.safetensors, so a full /dev/shm during the weight write surfaces as
     # SafetensorError (an OSError sibling, not subclass). ships with peft in real runs; keep optional.
@@ -702,42 +704,6 @@ class OpdVllmRolloutEngine:
                 print(f"[opd] vLLM shutdown failed; continuing: {exc}")
         for adapter_root in self._adapter_roots:
             shutil.rmtree(adapter_root, ignore_errors=True)
-
-
-def _forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
-    """Per-token grammar-forced mask derived from vLLM logprobs.
-
-    A guided-decoding position is *forced* when exactly one token was grammatically legal: the
-    backend sets every other logit to -inf, so the single legal token gets logprob 0.0. With
-    ``logprobs>=2`` requested, vLLM's top-k is ``torch.topk``-based and returns a FIXED-size dict,
-    padding the surplus slot(s) with -inf entries -- so dict *length* does not distinguish forced
-    from free. Counting the finite (non -inf) logprobs does: exactly one finite entry == forced.
-    A row with ZERO finite entries (an empty/all -inf row -- a wiring anomaly, never a real forced
-    position, whose chosen token always carries a finite logprob) is treated as free, so a genuine
-    free choice is never silently dropped from the loss. Returns () when logprobs are unavailable
-    (unconstrained rollouts request none) -> the OPD loss runs unmasked, exactly as before.
-    """
-    if lps is None:
-        return ()
-    forced: list[bool] = []
-    for i in range(n_tokens):
-        # vLLM emits one logprob row per generated token, in order. If it ever returns fewer rows
-        # than tokens (a wiring anomaly -- logprobs>=2 is always requested when constrained), mask
-        # the prefix we can see and leave the unverifiable tail UNMASKED, rather than dropping the
-        # whole sample's mask and silently re-admitting the forced-position teacher signal.
-        if i >= len(lps):
-            forced.append(False)
-            continue
-        legal = sum(
-            1
-            for lp in lps[i].values()
-            if (val := getattr(lp, "logprob", lp)) is not None and val > float("-inf")
-        )
-        # Exactly one finite entry == grammar-forced. Zero finite entries is a wiring anomaly
-        # (empty/all -inf row), NOT proof of forcing, so treat it as free -- otherwise a genuine
-        # free choice gets silently dropped from the loss (parity with the missing-row branch).
-        forced.append(legal == 1)
-    return tuple(forced)
 
 
 def _normalize_output(out) -> OpdVllmOutput:

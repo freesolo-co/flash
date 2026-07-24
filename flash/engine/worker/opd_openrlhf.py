@@ -34,6 +34,7 @@ from flash.engine.steps import (
     resolve_update_horizon,
     validate_save_steps,
 )
+from flash.engine.structured_outputs import resolve_opd_structured_plan
 from flash.engine.vram import opd_rollout_concurrency
 from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.adapter import _download_adapter
@@ -2184,6 +2185,20 @@ def _warmstart_config(adapter_dir: str | None, model_id: str) -> tuple[int, int,
     return rank, alpha, target_modules
 
 
+def _openrlhf_opd_structured_gpu_verified() -> bool:
+    """Whether the OpenRLHF OPD guided-decode student rollout has been GPU-verified.
+
+    Structured/guided decoding on the OpenRLHF OPD path needs a live vLLM guided-decode engine
+    (StructuredOutputsParams on the rollout sampling params, logprobs>=2 so the forced-token mask is
+    observable, and the reasoning-parser EngineArg that defers the grammar past </think>) that only
+    exists on a GPU. The constraint is validated up front and the forced-mask/group-drop primitives
+    are shared with the TRL path and CPU-tested; this predicate flips to True only once the live
+    rollout is GPU-verified in the follow-up PR. Hardcoded (no env knob) so the mode cannot route to
+    a half-wired live loop.
+    """
+    return False
+
+
 def _resolve_single_turn_inputs() -> dict[str, Any]:
     spec = _w.JOB_SPEC
     if spec is None or spec.algorithm != "opd":
@@ -2194,8 +2209,19 @@ def _resolve_single_turn_inputs() -> dict[str, Any]:
     if getattr(env, "is_tool_env", False):
         raise RuntimeError("OpenRLHF OPD tool environments are unsupported; use the TRL backend")
     train_spec = spec.train
-    if train_spec.structured_outputs:
-        raise RuntimeError("OpenRLHF OPD structured outputs are deferred; use the TRL backend")
+    # Validate any structured-outputs constraint up front (a corrupt payload fails loud here rather
+    # than silently training unconstrained). The forced-mask/group-drop correctness primitives are
+    # shared with the TRL path and CPU-tested; the live guided-decode rollout (StructuredOutputsParams
+    # injection + logprobs>=2 + the reasoning-parser EngineArg) needs a GPU, so it stays fail-closed
+    # behind _openrlhf_opd_structured_gpu_verified() until that path is GPU-verified.
+    structured_plan = resolve_opd_structured_plan(
+        train_spec.structured_outputs, thinking=bool(_w.THINKING)
+    )
+    if structured_plan is not None and not _openrlhf_opd_structured_gpu_verified():
+        raise RuntimeError(
+            "OpenRLHF OPD structured outputs are deferred pending GPU verification of the "
+            "guided-decode rollout; use the TRL backend"
+        )
 
     from flash.multimodal import record_has_images
 

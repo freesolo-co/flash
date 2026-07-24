@@ -10,6 +10,7 @@ stays CPU-importable.
 from __future__ import annotations
 
 import json
+from typing import NamedTuple
 
 # The vLLM StructuredOutputsParams constraint fields Flash supports. Single source of truth: the
 # schema-time normalizer (schema/fields.py) imports this so the two layers can never drift.
@@ -78,3 +79,82 @@ def describe_structured_outputs(spec: dict) -> str:
     # Defensive default: validated specs always carry a constraint key (parse_structured_outputs
     # guarantees it), so this is unreachable in practice — it just keeps the return type total.
     return "unconstrained"
+
+
+def forced_from_logprobs(lps, n_tokens: int) -> tuple[bool, ...]:
+    """Per-token grammar-forced mask derived from vLLM logprobs.
+
+    A guided-decoding position is *forced* when exactly one token was grammatically legal: the
+    backend sets every other logit to -inf, so the single legal token gets logprob 0.0. With
+    ``logprobs>=2`` requested, vLLM's top-k is ``torch.topk``-based and returns a FIXED-size dict,
+    padding the surplus slot(s) with -inf entries -- so dict *length* does not distinguish forced
+    from free. Counting the finite (non -inf) logprobs does: exactly one finite entry == forced.
+    A row with ZERO finite entries (an empty/all -inf row -- a wiring anomaly, never a real forced
+    position, whose chosen token always carries a finite logprob) is treated as free, so a genuine
+    free choice is never silently dropped from the loss. Returns () when logprobs are unavailable
+    (unconstrained rollouts request none) -> the OPD loss runs unmasked, exactly as before.
+
+    Shared by the TRL colocated OPD path (opd_vllm.py) and the OpenRLHF OPD rollout so both derive
+    the forced mask identically.
+    """
+    if lps is None:
+        return ()
+    forced: list[bool] = []
+    for i in range(n_tokens):
+        # vLLM emits one logprob row per generated token, in order. If it ever returns fewer rows
+        # than tokens (a wiring anomaly -- logprobs>=2 is always requested when constrained), mask
+        # the prefix we can see and leave the unverifiable tail UNMASKED, rather than dropping the
+        # whole sample's mask and silently re-admitting the forced-position teacher signal.
+        if i >= len(lps):
+            forced.append(False)
+            continue
+        legal = sum(
+            1
+            for lp in lps[i].values()
+            if (val := getattr(lp, "logprob", lp)) is not None and val > float("-inf")
+        )
+        # Exactly one finite entry == grammar-forced. Zero finite entries is a wiring anomaly
+        # (empty/all -inf row), NOT proof of forcing, so treat it as free -- otherwise a genuine
+        # free choice gets silently dropped from the loss (parity with the missing-row branch).
+        forced.append(legal == 1)
+    return tuple(forced)
+
+
+def drop_fully_forced_groups(groups, forced):
+    """Remove alignment groups whose student tokens were ALL grammar-forced: the student had no
+    choice there, so the teacher's (unconstrained) logprob over that span is spurious signal.
+    Dropping the whole ``(student_idx, teacher_logsum)`` tuple keeps both sides of the reverse-KL
+    balanced. ``forced`` is parallel to the student tokens (== completion_ids); empty -> no-op.
+
+    Shared by the TRL colocated OPD path (opd.py) and the OpenRLHF OPD alignment bridge so both
+    exclude fully-forced groups identically.
+    """
+    if not forced:
+        return groups
+    return [
+        (s_idx, tsum)
+        for (s_idx, tsum) in groups
+        if not (s_idx and all(i < len(forced) and forced[i] for i in s_idx))
+    ]
+
+
+class OpdStructuredPlan(NamedTuple):
+    """Validated structured-outputs plan for one OPD student rollout engine."""
+
+    constraint: dict  # StructuredOutputsParams kwargs (one CONSTRAINT_KEYS entry plus options)
+    reasoning_parser: str | None  # EngineArgs.reasoning_parser that defers the grammar past </think>
+
+
+def resolve_opd_structured_plan(spec_json: str | None, *, thinking: bool) -> OpdStructuredPlan | None:
+    """Validate a TrainSpec.structured_outputs payload for an OPD student rollout.
+
+    Returns None when unconstrained (""/None), or a validated OpdStructuredPlan carrying the
+    StructuredOutputsParams kwargs and the reasoning-parser that defers the grammar past </think>.
+    Raises ValueError on a corrupt payload — callers fail loud on a wiring bug rather than silently
+    training unconstrained. Pure/CPU: the live guided-decode rollout that consumes the plan needs a
+    GPU, but building and validating the plan does not, so every caller stays CPU-importable.
+    """
+    spec = parse_structured_outputs(spec_json)
+    if spec is None:
+        return None
+    return OpdStructuredPlan(spec, reasoning_parser_for(thinking=thinking, structured_outputs=spec))
