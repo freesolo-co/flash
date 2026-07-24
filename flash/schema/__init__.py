@@ -56,7 +56,7 @@ _ADAPTER_REVISION_RE = re.compile(
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd|opsd)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -287,10 +287,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
-        if {"grpo", "sft", "opd"} & set(unknown):
+        if {"grpo", "sft", "opd", "opsd"} & set(unknown):
             hint = (
-                " - GRPO/SFT/opd knobs (group_size, batch_size, max_completion_tokens, ...) "
-                "belong under [train], not a [grpo]/[sft]/[opd] table"
+                " - algorithm knobs (group_size, batch_size, max_completion_tokens, ...) "
+                "belong under [train], not a per-algorithm table"
             )
         noun = "section(s)" if any(isinstance(raw[key], dict) for key in unknown) else "key(s)"
         raise ConfigError(
@@ -322,6 +322,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
+    # opsd is a reasoning-reconstruction objective: the student samples on-policy and must derive the
+    # privileged answer's reasoning itself, so it is only meaningful in thinking mode. reject nonthink
+    # opsd up front (default thinking is off), before any model resolution or gpu sizing.
+    if algorithm == "opsd" and not thinking:
+        raise ConfigError(
+            "opsd requires thinking = true: on-policy self-distillation trains the student to "
+            "reconstruct the reasoning that reaches a privileged answer, so it runs only in "
+            "reasoning mode. set `thinking = true` and use a thinking-capable model."
+        )
 
     # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
@@ -571,6 +580,21 @@ def _validate_grpo(spec: JobSpec) -> None:
         )
 
 
+def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
+    if not spec.train.max_context_tokens:
+        return
+    from flash.engine.vram import opd_completion_len
+
+    max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
+    if spec.train.max_context_tokens - max_completion < 1:
+        raise ConfigError(
+            f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "
+            f"after max_completion_tokens ({max_completion}) for {algorithm}; set "
+            "max_context_tokens > max_completion_tokens. Rejected at parse time so an invalid "
+            "budget fails before a GPU worker is provisioned."
+        )
+
+
 def _validate_opd(spec: JobSpec) -> None:
     """validate opd-specific training constraints."""
     if spec.train.kl_penalty_coef == 0.0:
@@ -578,30 +602,25 @@ def _validate_opd(spec: JobSpec) -> None:
             "[train] kl_penalty_coef must be > 0 for opd because it scales the gkd "
             "distillation objective; omit it to use the default 1.0 or set a positive value"
         )
-    if spec.train.max_context_tokens:
-        # Mirror run_opd's prompt-budget guard at PARSE time: a context budget that leaves no room
-        # for any prompt after the completion budget is rejected here, BEFORE a paid worker is
-        # provisioned (wait_for_gpu + model prefetch + tokenizer/adapter load), instead of failing
-        # deterministically only after GPU setup. max_completion resolves exactly as the worker does:
-        # explicit [train] max_completion_tokens, else the recipe thinking/non-thinking default.
-        from flash.engine.vram import opd_completion_len
-
-        max_completion = opd_completion_len(spec.train.max_completion_tokens, spec.thinking)
-        if spec.train.max_context_tokens - max_completion < 1:
-            raise ConfigError(
-                f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "
-                f"after max_completion_tokens ({max_completion}) for opd; set "
-                f"max_context_tokens > max_completion_tokens. Rejected at parse time so an "
-                f"invalid budget fails before a GPU worker is provisioned."
-            )
-
-        # short hybrid-mamba contexts are safe because the worker compares vllm's derived scheduler
-        # budget with the catalogued block size and supplies an explicit floor only when required.
+    _validate_on_policy_prompt_budget(spec, "opd")
 
 
-# Each algorithm's spec-level contract lives in ONE validator, dispatched by name so a new algorithm
-# adds a function + a map entry rather than another scattered ``if spec.algorithm == ...`` block.
-_ALGO_VALIDATORS = {"sft": _validate_sft, "grpo": _validate_grpo, "opd": _validate_opd}
+def _validate_opsd(spec: JobSpec) -> None:
+    """validate phase-1 opsd training constraints."""
+    if spec.train.group_size not in (None, 1):
+        raise ConfigError("opsd samples exactly one on-policy rollout per prompt; group_size must be 1")
+    if spec.train.teacher_model:
+        raise ConfigError("opsd uses the local frozen base teacher; train.teacher_model is not supported")
+    _validate_on_policy_prompt_budget(spec, "opsd")
+
+
+# each algorithm's spec-level contract lives in one validator, dispatched by name.
+_ALGO_VALIDATORS = {
+    "sft": _validate_sft,
+    "grpo": _validate_grpo,
+    "opd": _validate_opd,
+    "opsd": _validate_opsd,
+}
 
 
 def _validate_spec(spec: JobSpec) -> None:
