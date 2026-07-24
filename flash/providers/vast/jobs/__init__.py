@@ -128,7 +128,7 @@ def usable_offers(
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     limit: int = 256,
     max_wall_seconds: float = 0,
-    exact_type: str = "",
+    gpu_type: str = "",
     deadline_at: float | None = None,
 ) -> list[VastOffer]:
     """Verified-datacenter offers able to run the job, cheapest first.
@@ -144,9 +144,9 @@ def usable_offers(
     min_duration = (
         max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
     )
-    exact_info = GPU_INFO.get(exact_type) if exact_type else None
-    if exact_type and exact_info is None:
-        raise ValueError(f"unknown exact Vast GPU class {exact_type!r}")
+    exact_info = GPU_INFO.get(gpu_type) if gpu_type else None
+    if gpu_type and exact_info is None:
+        raise ValueError(f"unknown exact Vast GPU class {gpu_type!r}")
     # Seed an exact search only with spellings that will attest as this class on the box (the ambiguous
     # vast_name itself is always kept and disambiguated by the max_vram_mb ceiling below); a cross-
     # architecture capacity alias would rent a board that live-device attestation then rejects.
@@ -183,7 +183,7 @@ def usable_offers(
             or r.get("verification") != "verified"
             # Exact class gate: the server-side gpu_ram filter only carries slack, so re-check nominal VRAM.
             or info.vram_gb < min_vram_gb
-            or (exact_type and gpu != exact_type)
+            or (gpu_type and gpu != gpu_type)
             or float(r.get("reliability2") or 0) < RELIABILITY_FLOOR
             or float(r.get("disk_space") or 0) < float(disk_gb)
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
@@ -414,11 +414,8 @@ def deploy_and_submit(
                             _effective_disk_gb(spec),
                             exclude_machine_ids={o.machine_id for o in tried},
                             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
-                            # Mirror the initial submit search: narrow to exact aliases ONLY on the user's
-                            # hard pin. Inferring exact_type from ``allowed`` forced an exact refresh for a
-                            # non-exact run (its offers are pre-filtered to one canonical class), dropping the
-                            # fungible cross-architecture capacity the first broad search had matched.
-                            exact_type=spec.gpu.exact_type,
+                            # the transient attempt spec always carries the concrete allocated class.
+                            gpu_type=spec.gpu.type,
                             **deadline_kwargs(usable_offers, absolute_deadline),
                         )
                         if o.gpu in allowed
@@ -646,10 +643,8 @@ def submit_run_vast(
             info.vram_gb,
             _effective_disk_gb(spec),
             max_wall_seconds=float(getattr(spec.gpu, "max_wall_seconds", 0) or 0),
-            # Narrow to attestation-safe exact aliases ONLY when the user hard-pinned the class.
-            # A non-exact run (exact_type == "") keeps the broad fungible search so cross-architecture
-            # capacity (e.g. 40GB "A100 PCIE" as A100 SXM 40GB) still counts, matching soft verify_gpu.
-            exact_type=spec.gpu.exact_type,
+            # the transient attempt spec always carries the concrete allocated class.
+            gpu_type=spec.gpu.type,
             **deadline_kwargs(usable_offers, absolute_deadline),
         )
         if o.gpu == spec.gpu.type

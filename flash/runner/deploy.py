@@ -591,9 +591,9 @@ def _resume_after_confirmed_teardown(
         _spec_with_remaining_wall,
         _update,
         _verified_opd_next_attempt,
-        effective_spec_from_status,
         flash_code_prefix,
         get_status,
+        reallocation_spec_from_status,
     )
 
     if int(worker_spec.gpu.max_retries) == 0:
@@ -617,7 +617,7 @@ def _resume_after_confirmed_teardown(
         _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         print(f"attach: {run_id} {exc}", file=log)
         return get_status(run_id)
-    worker_spec = effective_spec_from_status(get_status(run_id), verify_source=True)
+    worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
@@ -971,8 +971,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    public_spec = JobSpec.from_dict(status.spec)
-    worker_spec = public_spec
+    # Seed from the lossy public view so the except/finally handlers always have a spec, then
+    # upgrade to the authoritative worker spec (real run_id + managed fields) inside the try.
+    worker_spec = JobSpec.from_dict(status.spec)
     persisted_remote = dict(status.remote)
     next_attempt = 0
     code_prefix = None
@@ -1150,7 +1151,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             res.metrics.setdefault("allocated_gpu", allocated_gpu)
         if not _adopt_completed_attempt(
             run_id,
-            public_spec,
+            worker_spec,
             persisted_remote,
             res.metrics,
             log=log,

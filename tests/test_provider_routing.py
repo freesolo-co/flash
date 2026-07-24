@@ -20,7 +20,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+            "train": {"epochs": 1, "max_examples": 8},
             "gpu": gpu,
         }
     )
@@ -87,7 +87,7 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
     import flash.providers as providers
 
     persisted = []
-    spec = _spec(exact_type="H200")
+    spec = _spec(type="H200")
     monkeypatch.setattr(providers, "available_providers", lambda: ("lambda", "vast"))
     monkeypatch.setattr(orch, "_save_status", lambda *args, **kwargs: persisted.append(args))
 
@@ -126,7 +126,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-    spec = _spec(provider="runpod", exact_type="RTX 4090")
+    spec = _spec(provider="runpod", type="RTX 4090")
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(
         spec,
@@ -138,10 +138,23 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
     assert captured["gpu_type"] == "RTX 4090"
     assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
     assert captured["allocate_kwargs"]["provider"] == "runpod"
-    assert captured["allocate_kwargs"]["exact_type"] == "RTX 4090"
+    assert captured["allocate_kwargs"]["gpu_type"] == "RTX 4090"
     remote = orch.get_status(spec.run_id).remote
     assert remote["provider"] == "runpod"
     assert remote["allocated_gpu"] == "RTX 4090"
+
+
+def test_auto_gpu_effective_spec_is_transient_and_keeps_base_auto(orch) -> None:
+    base = _spec(type="")
+
+    first_attempt = orch._spec_with_gpu(base, "RTX 4090")
+    second_attempt = orch._spec_with_gpu(base, "H100")
+
+    assert base.gpu.type == ""
+    assert first_attempt.gpu.type == "RTX 4090"
+    assert second_attempt.gpu.type == "H100"
+    assert first_attempt is not base
+    assert second_attempt is not base
 
 
 def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
@@ -467,7 +480,8 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
         }
     ]
     stored = orch.get_status(public.run_id)
-    assert stored.spec["environment"]["resolved_sha"] == ""
+    # resolved_sha is platform-managed: it is stripped from the public spec, not surfaced empty.
+    assert "resolved_sha" not in stored.spec["environment"]
     assert stored.spec["model_revision"] == resolved_model_sha
     worker = stored.effective_preparation["worker_spec"]
     assert worker["environment"]["resolved_sha"] == resolved_sha
@@ -1118,12 +1132,12 @@ def test_config_gpu_fields(monkeypatch):
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "train": {"epochs": 1, "max_examples": 8, "hf_repo": "owner/runs"},
+        "train": {"epochs": 1, "max_examples": 8},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.type == "RTX 4090"
+    assert spec.gpu.type == ""
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.type == "RTX 4090"
+    assert again.gpu.type == ""
     spec = spec_from_dict({**base, "gpu": {"type": "A100 SXM"}}, run_id="x")
-    assert spec.gpu.type == "RTX 4090"
+    assert spec.gpu.type == "A100 SXM"

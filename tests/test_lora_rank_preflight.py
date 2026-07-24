@@ -21,7 +21,10 @@ from flash.schema import spec_from_dict
 _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
-def _spec(*, rank: int = 16, alpha: int = 32, model: str = "Qwen/Qwen3.5-4B"):
+def _spec(*, rank: int = 16, model: str = "Qwen/Qwen3.5-4B"):
+    # lora_alpha is platform-derived (always 2 x lora_rank) and not a user key, so the child
+    # spec only carries lora_rank; the adapter-side alpha the preflight inspects comes from the
+    # loaded adapter_config.json, independent of the child spec.
     spec = spec_from_dict(
         {
             "model": model,
@@ -31,7 +34,6 @@ def _spec(*, rank: int = 16, alpha: int = 32, model: str = "Qwen/Qwen3.5-4B"):
                 "epochs": 1,
                 "max_examples": 8,
                 "lora_rank": rank,
-                "lora_alpha": alpha,
             },
         }
     )
@@ -61,7 +63,7 @@ def test_rank_and_alpha_use_maximum_pattern_values():
 
 def test_preflight_accepts_child_rank_and_alpha_mismatches():
     metadata = preflight_init_adapter_lora_rank(
-        _spec(rank=8, alpha=16),
+        _spec(rank=8),
         config_loader=lambda _ref, _token, _revision: _config(r=64, lora_alpha=128),
     )
     assert metadata is not None

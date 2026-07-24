@@ -295,10 +295,10 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         market_wall_s = float(config.max_wall_seconds)
     else:
         market_wall_s = 0.0
-    if config.exact_type:
-        # exact_type is provisioned at LAUNCH through allocate (disk-aware, live rate). quote the same
-        # path for BOTH auto and a pinned provider so the estimate matches the actual launch rate, and a
-        # disk floor lifts the quote off the wrong class. provider="" lets allocate pick when unpinned.
+    if config.gpu_type:
+        # gpu_type is provisioned at launch through allocate (disk-aware, live rate). quote the same
+        # path with either an automatic or pinned provider so the estimate matches the actual launch rate,
+        # and a disk floor lifts the quote off the wrong class.
         from flash.providers.allocator import allocate
 
         allocation = allocate(
@@ -309,7 +309,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             max_wall_seconds=market_wall_s,
             disk_gb=config.disk_gb,
             provider=("" if config.provider == "auto" else config.provider),
-            exact_type=config.exact_type,
+            gpu_type=config.gpu_type,
             model_revision=config.model_revision,
         )
         gpu = allocation.gpu
@@ -327,7 +327,7 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
             provider=quote_provider,
             max_wall_seconds=market_wall_s,
             min_vram_gb=need,
-            exact_type="",  # this branch is only reached when exact_type is empty
+            gpu_type="",  # this branch is only reached when gpu_type is empty
         )
 
     setup = setup_seconds(config)

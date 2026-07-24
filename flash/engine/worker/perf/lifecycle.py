@@ -127,19 +127,19 @@ def _gpu_mismatch_reason(
     return "; ".join(reasons) or None
 
 
-def verify_gpu(requested_gpu: str | None, *, exact_type: str = "") -> None:
+def verify_gpu(requested_gpu: str | None, *, gpu_type: str = "") -> None:
     """Assert the live GPU satisfies the requested class and optional exact identity."""
-    if not requested_gpu and not exact_type:
+    if not requested_gpu and not gpu_type:
         return
     import torch
 
     live_name = "?"
     with contextlib.suppress(Exception):
         live_name = torch.cuda.get_device_name(0)
-    if exact_type:
+    if gpu_type:
         from flash.providers.base import canonical_gpu
 
-        requested_canonical = canonical_gpu(exact_type)
+        requested_canonical = canonical_gpu(gpu_type)
         try:
             observed_canonical = canonical_gpu(live_name)
         except Exception:
@@ -154,7 +154,7 @@ def verify_gpu(requested_gpu: str | None, *, exact_type: str = "") -> None:
         # requested_gpu hint (which may name a larger class and false-reject this correct card). this
         # keeps the live vram/driver/capability safety net for the pinned card, so a same-named but
         # under-provisioned card (e.g. a mig slice, or a too-old host driver) is still caught.
-        requested_gpu = exact_type
+        requested_gpu = gpu_type
 
     live_cap = None
     live_vram_gb = None
@@ -192,7 +192,7 @@ def _nvml_alive() -> bool:
         return False
 
 
-def wait_for_gpu(requested_gpu: str | None = None, *, exact_type: str = ""):
+def wait_for_gpu(requested_gpu: str | None = None, *, gpu_type: str = ""):
     """Poll until CUDA is live; raise RetriableInfraError if the host NVML is dead or it never readies."""
     import time as _t
 
@@ -205,7 +205,7 @@ def wait_for_gpu(requested_gpu: str | None = None, *, exact_type: str = ""):
                 _ = torch.zeros(8, device="cuda") + 1
                 torch.cuda.synchronize()
                 print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
-                verify_gpu(requested_gpu, exact_type=exact_type)
+                verify_gpu(requested_gpu, gpu_type=gpu_type)
                 return True
             last = "cuda not available"
         except RetriableInfraError:

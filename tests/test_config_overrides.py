@@ -11,8 +11,8 @@ BASE = (
     'model = "Qwen/Qwen3.5-4B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-    '[train]\nepochs = 1\nmax_examples = 100\nhf_repo = "owner/runs"\n'
-    '[gpu]\ntype = "RTX 5090"\nmax_retries = 6\nmax_wall_seconds = 7200\n'
+    '[train]\nepochs = 1\nmax_examples = 100\n'
+    '[gpu]\ntype = "B200"\n'
 )
 
 
@@ -33,19 +33,14 @@ def test_set_overrides_scalar_and_list():
             run_id="x",
             overrides=[
                 "train.epochs=3",
-                "gpu.type=RTX 4090",
-                "gpu.max_retries=0",
+                "gpu.type=H100",
                 "train.stop_sequences=[STOP1,STOP2]",
             ],
         )
         assert spec.train.epochs == 3
         assert spec.train.stop_sequences == ("STOP1", "STOP2")
-        assert spec.gpu.max_retries == 0
-        assert spec.gpu.max_wall_seconds == 7200
-        # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
-        # resolves the cheapest fitting VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB
-        # A100 PCIe @ $1.39, the cheapest validated class that fits), not the override.
-        assert spec.gpu.type == "A100 PCIe"
+        # gpu.type overrides hard-pin the requested active validated class.
+        assert spec.gpu.type == "H100"
 
 
 def test_composed_config_deep_merge():
@@ -56,19 +51,15 @@ def test_composed_config_deep_merge():
         override = _write(
             tmp,
             "prod.toml",
-            '[train]\nmax_examples = 250\n[gpu]\ntype = "RTX 4090"\nmax_retries = 9\nmax_wall_seconds = 3600\n',
+            '[train]\nmax_examples = 250\n[gpu]\ntype = "H100"\n',
         )
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert (
             spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
         )  # untouched key preserved
-        assert spec.gpu.max_retries == 9
-        assert spec.gpu.max_wall_seconds == 3600
-        # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
-        # VALIDATED class for the model (4B GRPO ~35 GB -> the 80 GB A100 PCIe @ $1.39), regardless
-        # of the composed gpu.type.
-        assert spec.gpu.type == "A100 PCIe"
+        # the merged gpu.type remains the authoritative hard pin.
+        assert spec.gpu.type == "H100"
 
 
 def test_authored_train_keys_follow_composed_config() -> None:
@@ -88,7 +79,6 @@ def test_authored_train_keys_follow_composed_config() -> None:
         {
             "epochs",
             "max_examples",
-            "hf_repo",
             "teacher_model",
             "temperature",
             "stop_sequences",

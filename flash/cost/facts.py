@@ -60,7 +60,7 @@ def gpu_hourly_usd(
     provider: str | None = None,
     max_wall_seconds: float = 0.0,
     min_vram_gb: int = 0,
-    exact_type: str = "",
+    gpu_type: str = "",
 ) -> float:
     """Representative $/hr for a class, on ``provider`` when given.
 
@@ -91,7 +91,7 @@ def gpu_hourly_usd(
             name,
             max_wall_seconds=max_wall_seconds,
             min_vram_gb=min_vram_gb,
-            exact_type=exact_type,
+            gpu_type=gpu_type,
         )
     return info.hourly_usd
 
