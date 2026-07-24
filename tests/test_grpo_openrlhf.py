@@ -1103,6 +1103,94 @@ def test_reward_bridge_keeps_samples_with_their_generation_step():
     assert [sample["generated_at_step"] for sample in step_8] == [8, 8]
 
 
+def _score_and_finalize(bridge, label, *, neutralize=False):
+    response = grpo_openrlhf.post_reward_request(
+        bridge.url,
+        {"query": [f"promptc{label}"], "prompts": ["prompt"], "labels": [label]},
+    )
+    record_id = int(response["extra_logs"]["__flash_reward_record_id"][0])
+    grpo_openrlhf.post_reward_request(
+        bridge.record_url, {"record_id": record_id, "neutralize": neutralize}
+    )
+
+
+def test_reward_bridge_drain_reward_metrics_aggregates_step_mean_and_breakdown():
+    scores = {
+        0: grpo_openrlhf.RewardResult(1.0, 1.0, {"format": 1.0, "success": 0.0}),
+        1: grpo_openrlhf.RewardResult(3.0, 3.0, {"format": 0.0, "success": 1.0}),
+    }
+
+    def score(label, _completion, _prompt):
+        return scores[label]
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=2, first_step=1, token="metrics-token"
+    ) as bridge:
+        _score_and_finalize(bridge, 0)
+        _score_and_finalize(bridge, 1)
+        metrics = bridge.drain_reward_metrics(1)
+        redrained = bridge.drain_reward_metrics(1)
+
+    assert metrics == {"reward": 2.0, "reward_metrics": {"format": 0.5, "success": 0.5}}
+    # draining is one-shot: the step's accumulators are cleared
+    assert redrained == {}
+
+
+def test_reward_bridge_drain_reward_metrics_matches_trl_named_semantics():
+    from flash.engine.worker.heartbeat import _bounded_reward_metrics
+    from flash.engine.worker.rl import _mean_named_reward_metrics
+
+    breakdowns = [
+        {"format": 1.0, "success": 0.0},
+        {"format": 0.0, "success": 1.0},
+        {"format": 0.5, "success": 0.5},
+    ]
+    labelled = {
+        index: grpo_openrlhf.RewardResult(float(index), float(index), breakdown)
+        for index, breakdown in enumerate(breakdowns)
+    }
+
+    def score(label, _completion, _prompt):
+        return labelled[label]
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=3, first_step=2, token="parity-token"
+    ) as bridge:
+        for label in range(3):
+            _score_and_finalize(bridge, label)
+        metrics = bridge.drain_reward_metrics(2)
+
+    expected = _bounded_reward_metrics(_mean_named_reward_metrics(breakdowns))
+    assert metrics["reward_metrics"] == expected
+
+
+def test_reward_bridge_drain_reward_metrics_counts_neutralized_in_denominator():
+    def score(label, _completion, _prompt):
+        return grpo_openrlhf.RewardResult(4.0, 4.0, {"format": 1.0})
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=2, first_step=1, token="neutral-metrics-token"
+    ) as bridge:
+        _score_and_finalize(bridge, 0)
+        _score_and_finalize(bridge, 1, neutralize=True)
+        metrics = bridge.drain_reward_metrics(1)
+
+    # the neutralized completion contributes reward 0.0 to the step mean (matches bridge.rewards)...
+    assert metrics["reward"] == 2.0
+    # ...its breakdown is dropped, but still counts in the denominator (TRL semantics): 1.0 / 2
+    assert metrics["reward_metrics"] == {"format": 0.5}
+
+
+def test_reward_bridge_drain_reward_metrics_blank_for_unscored_step():
+    def score(_label, _completion, _prompt):
+        return grpo_openrlhf.RewardResult(1.0, 1.0, {})
+
+    with grpo_openrlhf.RewardBridge(
+        score, samples_per_step=1, first_step=1, token="blank-metrics-token"
+    ) as bridge:
+        assert bridge.drain_reward_metrics(99) == {}
+
+
 def test_reward_bridge_rejects_bad_auth_and_scoring_failures():
     def fail(_label, _completion, _prompt):
         raise RuntimeError("environment unavailable")

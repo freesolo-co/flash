@@ -33,7 +33,7 @@ from flash.engine.steps import (
 )
 from flash.engine.structured_outputs import parse_structured_outputs, reasoning_parser_for
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.heartbeat import liveness_heartbeat
+from flash.engine.worker.heartbeat import _bounded_reward_metrics, liveness_heartbeat
 from flash.engine.worker.hf import _deployable_adapter_on_hf
 from flash.engine.worker.openrlhf_common import (
     export_openrlhf_adapter,
@@ -482,6 +482,12 @@ class RewardBridge:
         self._samples: dict[int, list[tuple[str, str, float]]] = {}
         self._sample_record_ids: dict[int, list[int]] = {}
         self._pending_records: dict[int, tuple[int, int]] = {}
+        # per-step reward + named-breakdown accumulators for the rl_step reward heartbeat.
+        # uncapped (unlike _samples): every completion contributes to the step's reward mean/std
+        # and per-function breakdown, matching TRL's per-step reward telemetry.
+        self._step_rewards: dict[int, list[float]] = {}
+        self._step_breakdowns: dict[int, list[dict[str, float] | None]] = {}
+        self._record_step_pos: dict[int, tuple[int, int]] = {}
         self._next_record_id = 0
         self._samples_per_step = int(samples_per_step)
         self._sample_step = int(first_step)
@@ -585,6 +591,11 @@ class RewardBridge:
             del samples[:-64]
             del sample_record_ids[:-64]
             self._pending_records[record_id] = (reward_index, sample_step)
+            step_rewards = self._step_rewards.setdefault(sample_step, [])
+            step_breakdowns = self._step_breakdowns.setdefault(sample_step, [])
+            step_rewards.append(float(result.reward))
+            step_breakdowns.append(dict(result.extra_logs))
+            self._record_step_pos[record_id] = (sample_step, len(step_rewards) - 1)
             self._samples_in_step += 1
             if self._samples_in_step == self._samples_per_step:
                 self._sample_step += 1
@@ -612,6 +623,13 @@ class RewardBridge:
             if not neutralize:
                 return
             self._rewards[reward_index] = 0.0
+            step_pos = self._record_step_pos.get(record_id)
+            if step_pos is not None:
+                metric_step, metric_index = step_pos
+                step_rewards = self._step_rewards.get(metric_step)
+                if step_rewards is not None and metric_index < len(step_rewards):
+                    step_rewards[metric_index] = 0.0
+                    self._step_breakdowns[metric_step][metric_index] = None
             sample_record_ids = self._sample_record_ids.get(sample_step, [])
             if record_id not in sample_record_ids:
                 return
@@ -630,6 +648,52 @@ class RewardBridge:
             samples = self._samples.pop(generated_at_step, [])
             self._sample_record_ids.pop(generated_at_step, None)
         return select_rollout_samples(samples, generated_at_step=generated_at_step)
+
+    def drain_reward_metrics(self, generated_at_step: int) -> dict[str, Any]:
+        """Aggregate a completed step's rewards into the rl_step reward-heartbeat fields.
+
+        Restores the per-step reward telemetry the TRL path streams via its reward heartbeat:
+        the mean reward for this step (the reward curve) and the mean per-function breakdown
+        (``reward_metrics`` -- the named metrics TRAINING.md tells users to judge on). The named
+        aggregation matches rl._mean_named_reward_metrics + _bounded_reward_metrics exactly.
+        Returns an empty dict when the step scored nothing. reward_std / reward_last and the
+        training-internal metrics (kl, entropy, grad_norm, completion length) are NOT emitted here:
+        the former have TRL-internal / cross-step semantics, the latter live inside the OpenRLHF
+        child and need child-log parsing -- a separate telemetry concern.
+        """
+        generated_at_step = int(generated_at_step)
+        with self._stats_lock:
+            rewards = self._step_rewards.pop(generated_at_step, [])
+            breakdowns = self._step_breakdowns.pop(generated_at_step, [])
+            self._record_step_pos = {
+                record_id: position
+                for record_id, position in self._record_step_pos.items()
+                if position[0] != generated_at_step
+            }
+        if not rewards:
+            return {}
+        fields: dict[str, Any] = {"reward": sum(rewards) / len(rewards)}
+        # denominator is the full completion count (including neutralized/None breakdowns), so a
+        # scoring outage dilutes the named means exactly as TRL's _mean_named_reward_metrics does.
+        denominator = len(breakdowns)
+        totals: dict[str, float] = {}
+        for breakdown in breakdowns:
+            if not isinstance(breakdown, dict):
+                continue
+            for name, value in breakdown.items():
+                try:
+                    score = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(score):
+                    totals[name] = totals.get(name, 0.0) + score
+        if denominator:
+            named = _bounded_reward_metrics(
+                {name: total / denominator for name, total in totals.items()}
+            )
+            if named:
+                fields["reward_metrics"] = named
+        return fields
 
     @property
     def call_count(self) -> int:
@@ -2663,11 +2727,13 @@ def run_rl_openrlhf() -> None:
                 + json.dumps(sampled_completions, separators=(",", ":")),
                 flush=True,
             )
+            reward_fields = bridge.drain_reward_metrics(step)
             committed = _w.heartbeat(
                 "rl_step",
                 step=step,
                 sampled_completions=sampled_completions,
                 force=not sent_first_sample_heartbeat[0],
+                **reward_fields,
             )
             if committed:
                 sent_first_sample_heartbeat[0] = True
