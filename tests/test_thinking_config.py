@@ -103,6 +103,41 @@ def test_thinking_must_be_boolean():
     assert "boolean" in str(ei.value)
 
 
+def test_opsd_requires_thinking_true():
+    # opsd only distills reasoning-reconstruction, so a nonthink opsd run is rejected pre-flight.
+    # the gate fires before model resolution, so any model exercises it.
+    with pytest.raises(ConfigError) as ei:
+        spec_from_dict(_raw(algorithm="opsd", thinking=False))
+    msg = str(ei.value)
+    assert "opsd" in msg and "thinking = true" in msg
+
+
+def test_opsd_rejects_default_off_thinking():
+    # thinking defaults OFF; an opsd config that simply omits the flag must still be rejected.
+    with pytest.raises(ConfigError) as ei:
+        spec_from_dict(_raw(algorithm="opsd"))
+    assert "opsd requires thinking = true" in str(ei.value)
+
+
+def test_opsd_allows_thinking_true(monkeypatch):
+    # opsd + thinking=true passes the gate. stub the resolver + provisional GPU sizing so the test
+    # does not depend on which catalog model currently lists opsd (and avoids the network path).
+    info = ModelInfo(
+        id="acme/reasoner-4b",
+        display_name="acme reasoner",
+        params="4B",
+        params_b=4.0,
+        algos=("sft", "grpo", "opd", "opsd"),
+        min_vram_gb=24,
+        thinking="hybrid",
+    )
+    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
+    spec = spec_from_dict(_raw(model="acme/reasoner-4b", algorithm="opsd", thinking=True))
+    assert spec.thinking is True
+    assert spec.algorithm == "opsd"
+
+
 def test_thinking_roundtrips_through_dict():
     spec = spec_from_dict(_raw(thinking=True))
     spec2 = JobSpec.from_dict(spec.to_dict())

@@ -40,6 +40,8 @@ def test_opsd_algorithm_accepted_and_normalized():
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "OPSD",
+            # opsd runs only in reasoning mode; thinking = true is now required by the config gate.
+            "thinking": True,
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 10, "hf_repo": "owner/runs"},
         },

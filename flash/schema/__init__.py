@@ -310,6 +310,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     thinking = raw.get("thinking", False)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
+    # opsd is a reasoning-reconstruction objective: the student samples on-policy and must derive the
+    # privileged answer's reasoning itself, so it is only meaningful in thinking mode. reject nonthink
+    # opsd up front (default thinking is off), before any model resolution or gpu sizing.
+    if algorithm == "opsd" and not thinking:
+        raise ConfigError(
+            "opsd requires thinking = true: on-policy self-distillation trains the student to "
+            "reconstruct the reasoning that reaches a privileged answer, so it runs only in "
+            "reasoning mode. set `thinking = true` and use a thinking-capable model."
+        )
 
     # Use `is None` not `or {}`: a present-but-non-dict value (e.g. `environment = false`) must hit the type check.
     env_raw = raw.get("environment")
