@@ -226,6 +226,19 @@ def _prompt_pool_fingerprint(prompts: list[_PromptRecord]) -> str:
     return digest.hexdigest()
 
 
+def _group_granularity(student_tokens, groups) -> float:
+    """Mean student-tokens-per-alignment-group; a real alignment-health signal where coverage is not.
+
+    Coverage stays ~1.0 even for a degenerate collapsed alignment, so it cannot flag that failure
+    mode. Byte-identical to TRL opd.py: n_align (student tokens carrying content) divided by the
+    group count, and 0.0 when the sample produced no alignment groups.
+    """
+    if not groups:
+        return 0.0
+    n_align = sum(1 for st in student_tokens if st.end > st.start)
+    return n_align / len(groups)
+
+
 class _TeacherHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -286,6 +299,7 @@ class TeacherAlignmentBridge:
             "samples_seen": int(state.get("samples_seen", 0)),
             "no_signal_resamples": int(state.get("no_signal_resamples", 0)),
             "teacher_echo_deduped": int(state.get("teacher_echo_deduped", 0)),
+            "group_granularity_sum": float(state.get("group_granularity_sum", 0.0)),
         }
         bridge = self
 
@@ -502,10 +516,12 @@ class TeacherAlignmentBridge:
             if indices
         ]
         coverage = groupwise_coverage(groups, student_tokens)
+        group_granularity = _group_granularity(student_tokens, groups)
         with self._stats_lock:
             self._stats["teacher_ok"] += 1
             self._stats["teacher_input_tokens"] += prompt_length + len(student_ids)
             self._stats["coverage_sum"] += coverage
+            self._stats["group_granularity_sum"] += group_granularity
             if groups:
                 self._stats["aligned_sequences"] += 1
             else:
@@ -1895,6 +1911,7 @@ def _checkpoint_state(
         "teacher_error": int(accounting["teacher_error"]),
         "no_signal_resamples": int(accounting["no_signal_resamples"]),
         "teacher_echo_deduped": int(accounting["teacher_echo_deduped"]),
+        "group_granularity_sum": float(accounting["group_granularity_sum"]),
         "no_signal_skipped_steps": 0,
         "episodes_seen": int(accounting["samples_seen"]),
         "mt_turn_records": 0,
@@ -2611,6 +2628,14 @@ def run_opd_openrlhf() -> None:
             "kl_penalty_coef": inputs["kl_penalty_coef"],
             "loss_curve": loss_curve,
             "mean_coverage": float(accounting["coverage_sum"]) / aligned if aligned else 0.0,
+            # real alignment-health signal (mean student-tokens-per-group); mean_coverage stays ~1.0
+            # even for a degenerate collapsed alignment, so it cannot flag that failure mode. the
+            # denominator is teacher_ok (samples scored), matching how group_granularity_sum accrues.
+            "mean_align_granularity": (
+                float(accounting["group_granularity_sum"]) / int(accounting["teacher_ok"])
+                if int(accounting["teacher_ok"])
+                else 0.0
+            ),
             "truncated_rollouts": int(accounting["truncated_rollouts"]),
             "teacher_input_tokens": int(accounting["teacher_input_tokens"]),
             "teacher_ok": int(accounting["teacher_ok"]),

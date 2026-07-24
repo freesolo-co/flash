@@ -643,6 +643,7 @@ def test_checkpoint_state_is_valid_full_resume_sidecar():
             "samples_seen": 20,
             "no_signal_resamples": 2,
             "teacher_echo_deduped": 3,
+            "group_granularity_sum": 22.5,
         },
         loss_curve=[0.4, 0.3],
         coverage_curve=[0.7, 0.8],
@@ -655,6 +656,7 @@ def test_checkpoint_state_is_valid_full_resume_sidecar():
     assert state["coverage_curve"] == [0.7, 0.8]
     assert state["skip_counts"] == {"empty_alignment": 2}
     assert state["teacher_echo_deduped"] == 3
+    assert state["group_granularity_sum"] == 22.5
 
 
 def test_teacher_bridge_runs_checkpoint_callback_before_reply():
@@ -2096,3 +2098,59 @@ def test_run_opd_rejects_unknown_backend(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not a known opd backend"):
         opd.run_opd()
+
+
+def _stok(start, end):
+    from flash.engine.worker.tokenizer_align import StudentToken
+
+    return StudentToken(token_id=0, start=start, end=end)
+
+
+def test_group_granularity_matches_trl_formula():
+    # mean student-tokens-per-group == n_align (tokens carrying content) / len(groups), byte-identical
+    # to TRL opd.py group_granularity. three content tokens over three groups -> 1.0.
+    toks = [_stok(0, 1), _stok(1, 2), _stok(2, 3)]
+    groups = [([0], 0.0), ([1], 0.0), ([2], 0.0)]
+    assert opd_openrlhf._group_granularity(toks, groups) == 1.0
+    # a degenerate collapsed alignment folds the same three content tokens into ONE group -> 3.0.
+    # coverage would stay ~1.0 here, so only granularity flags the collapse.
+    assert opd_openrlhf._group_granularity(toks, [([0, 1, 2], 0.0)]) == 3.0
+    # empty-content tokens (start == end) are not counted toward n_align.
+    mixed = [_stok(0, 1), _stok(1, 1), _stok(1, 2)]
+    assert opd_openrlhf._group_granularity(mixed, [([0], 0.0), ([2], 0.0)]) == 1.0
+    # no alignment groups -> 0.0 (an unaligned sample drags the per-sample mean toward zero).
+    assert opd_openrlhf._group_granularity(toks, []) == 0.0
+
+
+def test_bridge_group_granularity_backward_compat_default():
+    # a resume state written before this field simply restores group_granularity_sum to 0.0; a state
+    # carrying it restores the value, so mean_align_granularity survives resume without a schema bump.
+    assert _dedup_bridge(_CountingTeacher()).snapshot()["group_granularity_sum"] == 0.0
+    resumed = opd_openrlhf.TeacherAlignmentBridge(
+        prompts=[
+            opd_openrlhf._PromptRecord(
+                messages=[{"role": "user", "content": "question"}],
+                prompt_ids=(10, 11),
+                rendered="P:",
+            )
+        ],
+        tokenizer=_Tokenizer(),
+        teacher=_CountingTeacher(),
+        thinking_prefill="",
+        eos_token_ids=frozenset({2}),
+        stop_sequences=(),
+        token="test-token",
+        initial_state={"group_granularity_sum": 5.0},
+    )
+    assert resumed.snapshot()["group_granularity_sum"] == 5.0
+
+
+def test_bridge_accumulates_group_granularity_on_aligned_sample():
+    # scoring an aligned completion accrues positive granularity that flows through snapshot(), so the
+    # parent emits mean_align_granularity = group_granularity_sum / teacher_ok.
+    teacher = _CountingTeacher()
+    with _dedup_bridge(teacher) as bridge:
+        _post_completion(bridge, [10, 11, 20, 21, 2], rollout_ordinal=0)
+        snap = bridge.snapshot()
+    assert snap["teacher_ok"] == 1
+    assert snap["group_granularity_sum"] > 0.0
