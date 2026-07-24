@@ -166,3 +166,119 @@ def build_multiturn_action_ranges(
         ranges.append((start, end))
         cursor = end + (int(glue_lens[i]) if i < len(glue_lens) else 0)
     return ranges
+
+
+# --- child-side executor (parity plan #8b) ---------------------------------------------
+# The OpenRLHF ``MultiTurnAgentExecutor`` re-tokenizes each env ``observation_text`` (agent.py),
+# which would drift from the token-exact inter-turn glue the parent bridge already decided. To keep
+# the stream byte-identical to TRL/SFT/OPD, Flash drives the loop through a token-exact executor that
+# appends the bridge's glue *token ids* verbatim and records assistant ``action_ranges``. Live
+# generation (colocated ``llm_engine``) + the HTTP bridge client are GPU-path only; the mask
+# assembly below is pure and CPU-proved.
+
+_MT_TOKENS = _OBS_TOKENS
+_MT_ENV_MASK = _OBS_ENV_MASK
+
+
+def build_response_mask(total_len: int, action_ranges: list[tuple[int, int]]) -> list[int]:
+    """Per-token response mask over the flat rollout stream (1 = assistant/trainable, 0 = prompt or
+    inter-turn env glue/observation).
+
+    Mirrors OpenRLHF ``samples_generator`` (``action_mask[start:end] = 1`` for each action range)
+    *before* its ``[1:]`` learner shift, so the trained tokens are exactly the assistant spans
+    :func:`build_multiturn_action_ranges` emits — i.e. TRL's per-token ``env_mask`` 1-spans.
+    """
+    n = int(total_len)
+    if n < 0:
+        raise ValueError("total_len must be non-negative")
+    mask = [0] * n
+    for start, end in action_ranges:
+        s = max(0, int(start))
+        e = min(n, int(end))
+        for i in range(s, e):
+            mask[i] = 1
+    return mask
+
+
+def assemble_multiturn_rollout(
+    prompt_ids: list[int],
+    turns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble one finished multi-turn episode into the OpenRLHF sample shape (token-exact).
+
+    ``turns`` is the ordered per-turn record the executor collects: each ``{"action_ids": [...],
+    "glue_ids": [...]}`` where ``glue_ids`` is the post-turn inter-turn glue (empty on the final
+    turn). Returns ``token_ids`` (prompt || action_0 || glue_0 || action_1 || ...), ``action_ranges``
+    (assistant spans), and ``response_mask`` (1 on those spans). This is the exact stream and mask
+    OpenRLHF would build from this executor's ``action_ranges``; it never re-tokenizes, so it stays
+    byte-identical to the parent bridge / TRL glue.
+    """
+    token_ids: list[int] = list(prompt_ids)
+    per_turn_action_lens: list[int] = []
+    glue_lens: list[int] = []
+    for i, turn in enumerate(turns):
+        action_ids = [int(t) for t in turn["action_ids"]]
+        per_turn_action_lens.append(len(action_ids))
+        token_ids.extend(action_ids)
+        glue_ids = [int(t) for t in (turn.get("glue_ids") or [])]
+        if i < len(turns) - 1:
+            glue_lens.append(len(glue_ids))
+            token_ids.extend(glue_ids)
+        elif glue_ids:
+            raise ValueError("the final multi-turn turn must not carry inter-turn glue")
+    action_ranges = build_multiturn_action_ranges(len(prompt_ids), per_turn_action_lens, glue_lens)
+    response_mask = build_response_mask(len(token_ids), action_ranges)
+    return {
+        "token_ids": token_ids,
+        "action_ranges": action_ranges,
+        "response_mask": response_mask,
+    }
+
+
+def _load_openrlhf_agent_base():
+    """Lazily import the OpenRLHF agent primitives (present only in the cu13 child image)."""
+    from openrlhf.utils.agent import AgentInstanceBase, MultiTurnAgentExecutor
+
+    return AgentInstanceBase, MultiTurnAgentExecutor
+
+
+class FlashBridgeAgentInstance:
+    """Child-side :class:`~openrlhf.utils.agent.AgentInstanceBase` that drives one Flash multi-turn
+    episode through the authenticated localhost session bridge (parity #7).
+
+    It holds only a bridge *client* + session id/lease — never the environment itself — so no env
+    implementation or secret is serialized into the Ray rollout actor. ``reset`` opens a bridge
+    session and returns the initial prompt observation; ``step`` posts the assistant turn and returns
+    the env's token-exact glue observation + done + episode reward. The concrete OpenRLHF base is
+    mixed in by :func:`flash_multiturn_agent_instance_cls` so this module imports without OpenRLHF.
+    """
+
+    def __init__(self, bridge_client: Any) -> None:
+        self._bridge = bridge_client
+        self._session: str | None = None
+        self._lease: str | None = None
+
+    async def reset(self, states: dict, **kwargs) -> dict:
+        opened = self._bridge.reset(states)
+        self._session = opened["session_id"]
+        self._lease = opened["lease"]
+        return {_MT_TOKENS: list(opened[_MT_TOKENS])}
+
+    async def step(self, state_dict: dict, **kwargs) -> dict:
+        action = state_dict["action"]
+        obs, done, reward = self._bridge.step(self._session, self._lease, action)
+        return {
+            "environment_feedback": {
+                _MT_TOKENS: list(obs.get(_MT_TOKENS, [])),
+                _MT_ENV_MASK: list(obs.get(_MT_ENV_MASK, [])),
+            },
+            "done": bool(done),
+            "rewards": reward,
+            "scores": reward,
+        }
+
+
+def flash_multiturn_agent_instance_cls():
+    """Return ``FlashBridgeAgentInstance`` as a concrete ``AgentInstanceBase`` subclass (child only)."""
+    agent_base, _ = _load_openrlhf_agent_base()
+    return type("FlashBridgeAgentInstance", (FlashBridgeAgentInstance, agent_base), {})

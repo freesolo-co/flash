@@ -908,6 +908,36 @@ def test_resolve_single_turn_inputs_rejects_unpublished_periodic_saves(monkeypat
         grpo_openrlhf._resolve_single_turn_inputs()
 
 
+def test_multiturn_stays_fail_closed_until_gpu_response_mask_smoke(monkeypatch):
+    # parity plan #8b: the CPU response-mask assembly is proved byte-identical to TRL in
+    # tests/test_openrlhf_multiturn.py, but the live executor is unverified on GPU, so multi-turn
+    # must not be routable through the single-turn builder yet.
+    _install_resolve_inputs_fakes(monkeypatch)
+
+    class _MultiTurnEnv:
+        multi_turn = True
+        is_tool_env = False
+
+    monkeypatch.setattr(grpo_openrlhf._w, "require_active_env", lambda: _MultiTurnEnv())
+    assert grpo_openrlhf._openrlhf_multiturn_gpu_verified() is False
+    with pytest.raises(RuntimeError, match="GPU response-mask smoke"):
+        grpo_openrlhf._resolve_single_turn_inputs()
+
+
+def test_resolve_single_turn_inputs_rejects_tool_env(monkeypatch):
+    # native tool environments remain hard fail-closed here (parity plan #9), independent of the
+    # multi-turn gate above.
+    _install_resolve_inputs_fakes(monkeypatch)
+
+    class _ToolEnv:
+        multi_turn = False
+        is_tool_env = True
+
+    monkeypatch.setattr(grpo_openrlhf._w, "require_active_env", lambda: _ToolEnv())
+    with pytest.raises(RuntimeError, match="single-turn non-tool environments only"):
+        grpo_openrlhf._resolve_single_turn_inputs()
+
+
 def test_dr_grpo_fixed_length_normalization_matches_trl_formula():
     losses = [[1.0, 2.0, 100.0], [3.0, 4.0, 5.0]]
     masks = [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]

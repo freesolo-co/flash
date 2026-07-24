@@ -2248,14 +2248,32 @@ def _publish_openrlhf_checkpoint(
     return step
 
 
+def _openrlhf_multiturn_gpu_verified() -> bool:
+    """Whether multi-turn GRPO may be selected on OpenRLHF.
+
+    Stays ``False`` until the preregistered GPU response-mask smoke (parity ladder step 4) has proved
+    the live executor's per-token response mask matches TRL on a real rollout. The CPU response-mask
+    assembly is already proved byte-identical to TRL in ``tests/test_openrlhf_multiturn.py`` (parity
+    plan #8b); the live colocated-``llm_engine`` generation loop and this gate flip land together in
+    the follow-up GPU PR. There is deliberately no env knob: multi-turn cannot be routed to a
+    half-wired executor before that proof exists, so it can only ever run through the TRL backend
+    today.
+    """
+    return False
+
+
 def _resolve_single_turn_inputs() -> dict[str, Any]:
     spec = _w.JOB_SPEC
     if spec is None or spec.algorithm != "grpo":
         raise RuntimeError("OpenRLHF GRPO requires a GRPO JobSpec")
     env = _w.require_active_env()
-    if getattr(env, "multi_turn", False) or getattr(env, "is_tool_env", False):
+    if getattr(env, "is_tool_env", False) or (
+        getattr(env, "multi_turn", False) and not _openrlhf_multiturn_gpu_verified()
+    ):
         raise RuntimeError(
-            "OpenRLHF GRPO foundation supports single-turn non-tool environments only"
+            "OpenRLHF GRPO foundation supports single-turn non-tool environments only; multi-turn "
+            "stays fail-closed until the parity plan #8b GPU response-mask smoke passes (the "
+            "CPU-proved child executor is flash.engine.worker.openrlhf_multiturn)"
         )
 
     train_spec = spec.train
