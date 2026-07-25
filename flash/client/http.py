@@ -360,10 +360,17 @@ class ApiClient:
         *,
         name: str,
         package_b64: str,
+        project_id: str | None = None,
         progress: ProgressCallback | None = None,
     ) -> dict:
-        """Upload a packaged Freesolo environment to the managed Environments Hub."""
+        """Upload a packaged Freesolo environment to the managed Environments Hub.
+
+        ``project_id`` groups the environment under one of the org's projects. Omit it and the
+        env keeps whatever project it is already in, or lands in the org's Default on a first
+        publish — so a republish never has to restate a grouping set from the dashboard."""
         body = {"name": name, "package_b64": package_b64}
+        if project_id:
+            body["project_id"] = project_id
         return self._request("POST", "/v1/envs", body=body, timeout=1800.0, progress=progress)
 
     def delete_env(self, env_id: str) -> dict:
