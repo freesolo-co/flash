@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import render
+from . import render, traces
 from .training_doc import TRAINING_MD
 
 _STARTER_ENV_PY = '''\
@@ -224,6 +224,47 @@ _REASONING_OPTIONS = [
 ]
 
 
+_SKIP_TRACES = ""  # sentinel option value: scaffold the starter rows instead of importing
+
+
+def _traces_dataset(args) -> str | None:
+    """JSONL exported from a project's traces, or None to use the starter rows.
+
+    Traces are offered as a head start, never a requirement: the prompt only appears on a terminal
+    when a stored API key turns up projects, and any failure past that point falls back to the
+    starter dataset with a warning, so `env setup` still scaffolds a working environment offline."""
+    if not _setup_interactive(args):
+        return None
+    projects = traces.offer_projects()
+    if not projects:
+        return None
+    options = traces.project_options(projects)
+    options.append((_SKIP_TRACES, "start from scratch", "a tiny starter dataset you edit"))
+    project_id = render.select("Start from a project's traces?", options, default=len(options) - 1)
+    if project_id == _SKIP_TRACES:
+        return None
+    try:
+        exported = traces.fetch_records(project_id)
+    except Exception as exc:  # any export failure falls back to the starter rows
+        _warn(f"could not export traces from {project_id} ({exc}); using the starter dataset")
+        return None
+    records = exported.get("records") or []
+    if not records:
+        _warn(
+            f"no exportable traces in {project_id}. Traces need a recorded request and response "
+            "to become training rows; using the starter dataset"
+        )
+        return None
+    skipped = int(exported.get("skipped") or 0)
+    detail = f" ({skipped} skipped)" if skipped else ""
+    print(render.ok(f"exported {len(records)} rows from your traces{detail}"))
+    return traces.records_to_jsonl(records)
+
+
+def _warn(msg: str) -> None:
+    print(render.warn(msg) if render.styled() else f"warning: {msg}", file=sys.stderr)
+
+
 def _setup_interactive(args) -> bool:
     """Whether to ask the setup questions interactively.
 
@@ -244,6 +285,10 @@ def _setup_interactive(args) -> bool:
 def cmd_env_setup(args) -> int:
     starter_env = Path("environment.py")
     dataset = Path("dataset/train.jsonl")
+    # Offer the user's own traces as the training rows. Only when the dataset is still missing:
+    # an existing one is never overwritten, so importing into it would be a silently discarded
+    # download. Asked first because it is the data question the rest of the scaffold wraps.
+    traces_jsonl = None if dataset.exists() else _traces_dataset(args)
     # An existing environment.py is the authoritative signal for which turn mode this
     # scaffold already uses (the dataset is plain JSONL with no reliable mode marker).
     # Anchor to it so a re-run never leaves a single-turn env beside a multi-turn
@@ -311,11 +356,21 @@ def cmd_env_setup(args) -> int:
         reasoning = False
 
     env_py = _STARTER_ENV_MULTITURN_PY if multi_turn else _STARTER_ENV_PY
-    dataset_jsonl = _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
+    dataset_jsonl = traces_jsonl or (
+        _STARTER_DATASET_MULTITURN_JSONL if multi_turn else _STARTER_DATASET_JSONL
+    )
     Path("configs").mkdir(exist_ok=True)
     Path("dataset").mkdir(exist_ok=True)
     if not dataset.exists():
         dataset.write_text(dataset_jsonl)
+    # `max_examples` caps the rows a run trains on, so it tracks the dataset actually written:
+    # the 2 starter rows, or every row exported from the user's traces.
+    example_rows = dataset_jsonl.count("\n")
+    max_examples_line = (
+        f"max_examples = {example_rows}  # rows to train on; "
+        f"{'exported from your traces' if traces_jsonl else 'the starter dataset has 2'}"
+        f"{'' if traces_jsonl else ' (raise as your dataset grows)'}\n"
+    )
     if not starter_env.exists():
         starter_env.write_text(env_py)
     env_comment = (
@@ -351,7 +406,7 @@ def cmd_env_setup(args) -> int:
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
-            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
+            f"{max_examples_line}"
             f"{rl_reasoning_train}"
             "lora_rank = 32\n"
             "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
@@ -369,7 +424,7 @@ def cmd_env_setup(args) -> int:
             f"{env_comment}"
             "[train]\n"
             "epochs = 1\n"
-            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
+            f"{max_examples_line}"
             "lora_rank = 32\n"
             f"{sft_reasoning_note}"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
@@ -397,7 +452,7 @@ def cmd_env_setup(args) -> int:
             'id = ""\n\n'
             "[train]\n"
             "epochs = 1\n"
-            "max_examples = 2  # rows to train on; the starter dataset has 2 (raise as your dataset grows)\n"
+            f"{max_examples_line}"
             "lora_rank = 32\n"
             '# teacher_model = "glm-5.2"   # teacher to distil from: glm-5.2 (default) |\n'
             "#                             # deepseek-v4-pro | kimi-k2.6 (key stays managed)\n"
