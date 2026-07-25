@@ -42,6 +42,7 @@ from flash.cli.commands import (  # noqa: F401
 from flash.cli.env_setup import cmd_env_setup
 from flash.cli.env_test import cmd_env_test
 from flash.cli.envpush import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.traces import DEFAULT_EXPORT_PATH, cmd_traces_export
 
 # Themed `flash --help` catalog. Groups are ordered along the training workflow; each row's
 # summary is the short one-liner the themed grid shows (the verbose per-command text stays on
@@ -72,6 +73,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("env push", "upload a local environment"),
             ("env pull", "download a published environment or file"),
             ("env delete", "delete a published environment"),
+            ("traces export", "turn a project's traces into a dataset"),
         ],
     ),
     (
@@ -327,6 +329,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="skip the confirmation prompt",
     )
     env_delete.set_defaults(func=cmd_env_delete)
+
+    traces = sub.add_parser("traces", help="work with traces recorded by the freesolo SDK")
+    traces_sub = traces.add_subparsers(dest="traces_cmd", required=True)
+    traces_export = traces_sub.add_parser(
+        "export",
+        help="export a project's traces as an environment dataset",
+        description=(
+            "export a project's recorded traces as freesolo environment records, ready to train on"
+        ),
+    )
+    traces_export.add_argument(
+        "--project",
+        help="project id to export from; omit to pick one from your projects",
+    )
+    traces_export.add_argument(
+        "-o",
+        "--output",
+        help=f"output JSONL file; defaults to {DEFAULT_EXPORT_PATH}",
+    )
+    traces_export.add_argument(
+        "-f", "--force", action="store_true", help="overwrite existing output"
+    )
+    traces_export.set_defaults(func=cmd_traces_export)
 
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
