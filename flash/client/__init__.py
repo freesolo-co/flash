@@ -7,6 +7,8 @@ from .http import (
     ClientError,
     RequestTimeoutError,
     client_from_config,
+    export_trace_records,
+    list_trace_projects,
     verify_freesolo_key,
 )
 
@@ -16,6 +18,8 @@ __all__ = [
     "ClientError",
     "RequestTimeoutError",
     "client_from_config",
+    "export_trace_records",
+    "list_trace_projects",
     "load_credentials",
     "save_credentials",
     "verify_freesolo_key",
