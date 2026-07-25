@@ -27,6 +27,25 @@ from flash.spec import GpuSpec, JobSpec, TrainSpec
 _RUNPOD_FINGERPRINT = "rpk-0123456789ab"
 
 
+def _oversized_model_info():
+    """A synthetic catalog entry too large for the shared cache.
+
+    Sized off WEIGHT_CACHE_VOLUME_GB so it stays oversized if the volume grows again — the real
+    catalog now fits entirely, so the size gate needs a stand-in to stay covered.
+    """
+    from flash import runner
+    from flash.catalog import ModelInfo
+
+    return ModelInfo(
+        id="test/oversized",
+        display_name="oversized",
+        params="huge",
+        algos=("sft",),
+        min_vram_gb=80,
+        params_b=float(runner.WEIGHT_CACHE_VOLUME_GB),  # peak = 4x params_b GB >> the volume
+    )
+
+
 def _vol_spec(name="flash-weights", gb=100, **gpu):
     return JobSpec(
         model="m",
@@ -518,7 +537,7 @@ def test_assign_weight_cache_attaches_to_catalog_run():
 
     out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r", model_policy="catalog"))
     assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB == 100
+    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_weight_cache_default_policy_attaches():
@@ -604,13 +623,14 @@ def test_assign_weight_cache_does_not_override_existing():
 
 
 def test_assign_weight_cache_skips_oversized_catalog_model():
-    # SIZE GATE: the 35B MoE's ~70 GB checkpoint (peak ~140 GB with Xet temp) can't fit the fixed
-    # 100 GB shared cache. Attaching it would redirect HF_HOME onto the undersized mount and overflow
-    # mid-download — so the run is left cache-less and downloads to the (200 GB) container disk.
+    # SIZE GATE: a model whose peak download footprint exceeds the shared cache must NOT be
+    # attached — that would redirect the base-model download onto an undersized mount and overflow
+    # mid-download. It is left cache-less and downloads to the container disk instead. Every model
+    # in the current catalog fits (see test_every_catalog_model_fits_the_weight_cache), so the gate
+    # is exercised with a synthetic oversized entry rather than a real one.
     from flash import runner
-    from flash.catalog import MODELS
 
-    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    info = _oversized_model_info()
     out = runner._assign_weight_cache_volume(
         JobSpec(model=info.id, run_id="r", model_policy="catalog"), info
     )
@@ -619,12 +639,12 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
 
 def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_model():
     # SIZE GATE re-applies to a pre-set SHARED-cache name: a programmatic/stale catalog spec that
-    # already pinned ``flash-weights`` for the 35B MoE must NOT bypass the gate via the "honor an
-    # existing volume" no-op and redirect HF_HOME onto the undersized mount. It's stripped cache-less.
+    # already pinned ``flash-weights`` for an oversized model must NOT bypass the gate via the
+    # "honor an existing volume" no-op and redirect the download onto the undersized mount. It is
+    # stripped cache-less.
     from flash import runner
-    from flash.catalog import MODELS
 
-    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    info = _oversized_model_info()
     spec = JobSpec.from_dict(
         {
             "model": info.id,
@@ -701,17 +721,23 @@ def test_assign_weight_cache_attaches_fitting_catalog_model():
 
 def test_fits_weight_cache_is_size_based():
     from flash import runner
+
+    # Oversized models are still excluded: the gate is a size check, not "always true".
+    assert not runner._fits_weight_cache(_oversized_model_info())
+
+
+def test_every_catalog_model_fits_the_weight_cache():
+    # The largest models have the slowest cold downloads, so they are exactly the ones the cache
+    # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
+    # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
+    from flash import runner
     from flash.catalog import MODELS
 
-    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-27B"])
-    assert not runner._fits_weight_cache(MODELS["Qwen/Qwen3.6-35B-A3B"])
-    for mid in (
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-9B",
-    ):
-        assert runner._fits_weight_cache(MODELS[mid]), mid
+    for mid, info in MODELS.items():
+        assert runner._fits_weight_cache(info), (
+            f"{mid} ({info.params_b}B) no longer fits the "
+            f"{runner.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
+        )
 
 
 def test_submit_job_assigns_weight_cache(monkeypatch):
@@ -734,7 +760,7 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         status = runner.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"
-    assert gpu["network_volume_gb"] == 100
+    assert gpu["network_volume_gb"] == runner.WEIGHT_CACHE_VOLUME_GB
     # and it must NOT leak into the public spec
     assert "network_volume" not in status.spec["gpu"]
 
@@ -936,11 +962,10 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     # non-fitting model only overflows the fixed mount). Mirrors the submit path's _fits_weight_cache.
     assert ids == {mid for mid, info in MODELS.items() if _fits_weight_cache(info)}
     assert ids <= set(MODELS)
-    # oversized checkpoints must be excluded from the default warm set.
-    assert "Qwen/Qwen3.6-27B" in MODELS
-    assert "Qwen/Qwen3.6-27B" not in ids
-    assert "Qwen/Qwen3.6-35B-A3B" in MODELS
-    assert "Qwen/Qwen3.6-35B-A3B" not in ids
+    # The whole catalog fits the 200 GB volume, so the large checkpoints — the ones with the
+    # slowest cold downloads — are warmed too.
+    assert "Qwen/Qwen3.6-27B" in ids
+    assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 
 def test_preload_branch_passes_explicit_cache_dir(monkeypatch):

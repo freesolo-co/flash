@@ -625,7 +625,9 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 
 
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
-WEIGHT_CACHE_VOLUME_GB = 100
+# 200 GB so the whole catalog fits: at the 2x peak factor below, 100 GB excluded the 27B (108 GB
+# peak) and 35B (140 GB peak) models -- exactly the ones whose cold download costs the most.
+WEIGHT_CACHE_VOLUME_GB = 200
 # Peak footprint ~= 2x bf16 download (checkpoint + Xet temp); must fit the fixed cache volume.
 _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
