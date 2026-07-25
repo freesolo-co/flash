@@ -5143,6 +5143,56 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
     assert "is_new" not in seen
 
 
+def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
+    """A publish naming a project forwards it to the platform metadata mirror."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.environment_registry as registry_mod
+    import flash.server.envs as envs_mod
+
+    monkeypatch.setattr(
+        envs_mod, "publish_package", lambda *, package_b64, name, key: "key-1/e"
+    )
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        registry_mod,
+        "record_published_environment",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for nm, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("environment.py", b"def load_environment(**kwargs): return None\n"),
+        ):
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "e", "package_b64": pkg, "project_id": "proj-1"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert recorded[0]["project_id"] == "proj-1"
+
+    # a publish with no project forwards None, so the mirror leaves the grouping alone.
+    recorded.clear()
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "e", "package_b64": pkg},
+    )
+    assert resp.status_code == 200, resp.text
+    assert recorded[0]["project_id"] is None
+
+
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
     reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
