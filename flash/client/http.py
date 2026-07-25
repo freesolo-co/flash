@@ -34,6 +34,8 @@ class ApiError(ClientError):
 
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
+FREESOLO_TRACE_PROJECTS_PATH = "/api/traces/projects"
+FREESOLO_TRACES_EXPORT_PATH = "/api/traces/export"
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -95,6 +97,60 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
             "check your network connection and FREESOLO_BASE_URL"
         ) from exc
+
+
+def _freesolo_get(path: str, api_key: str, base_url: str | None = None, timeout: float = 60.0):
+    """GET a freesolo backend endpoint with the user's API key, returning parsed JSON.
+
+    Traces live on the freesolo backend (FREESOLO_BASE_URL), not on the Flash control plane that
+    ApiClient targets, so these reads go direct rather than through ApiClient."""
+    base = freesolo_base_url(base_url)
+    req = urllib.request.Request(
+        f"{base}{path}",
+        method="GET",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ClientError(
+                "freesolo rejected this API key — run `flash login` with a valid key "
+                "(or set FREESOLO_API_KEY)"
+            ) from exc
+        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+    except urllib.error.URLError as exc:
+        raise ClientError(
+            f"cannot reach the freesolo backend at {base} ({exc.reason}); "
+            "check your network connection and FREESOLO_BASE_URL"
+        ) from exc
+    return json.loads(raw) if raw else {}
+
+
+def list_trace_projects(api_key: str, base_url: str | None = None) -> list[dict[str, Any]]:
+    """Projects in the caller's org that traces can be exported from."""
+    payload = _freesolo_get(FREESOLO_TRACE_PROJECTS_PATH, api_key, base_url)
+    projects = payload.get("projects")
+    return projects if isinstance(projects, list) else []
+
+
+def export_trace_records(
+    project_id: str,
+    api_key: str,
+    base_url: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Freesolo environment records converted from a project's traces.
+
+    Returns ``{"records": [{"input", "output"}, ...], "traces": N, "skipped": N}``. The conversion
+    runs server-side, matching what the web app's trace export downloads."""
+    query = {"project_id": project_id}
+    if limit is not None:
+        query["limit"] = str(int(limit))
+    path = f"{FREESOLO_TRACES_EXPORT_PATH}?{urllib.parse.urlencode(query)}"
+    # a whole project's traces can be a large read; give it room beyond the default.
+    return _freesolo_get(path, api_key, base_url, timeout=300.0)
 
 
 class _ProgressReader:
