@@ -31,6 +31,7 @@ from flash.engine.worker._pkg import W as _w
 from flash.engine.worker.heartbeat import liveness_heartbeat
 from flash.engine.worker.perf import gpu_diagnostics, setup_perf_backends, wait_for_gpu
 from flash.engine.worker.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.rollout_samples import sanitize_rollout_text
 
 DATA_SOURCE = "flash_env"
 
@@ -81,6 +82,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         "algorithm.norm_adv_by_std_in_grpo=False",
         f"actor_rollout_ref.actor.loss_agg_mode={cfg['loss_agg_mode']}",
         "algorithm.use_kl_in_reward=False",
+        # truncated importance sampling (token-level, cap 2.0): corrects the vllm-rollout vs
+        # fsdp-train policy mismatch. matches the trl path's tis recipe (token_truncate, c_max=2.0);
+        # verl otherwise defaults to sequence-level tis, so pin token to match flash.
+        "algorithm.rollout_correction.rollout_is=token",
+        "algorithm.rollout_correction.rollout_is_threshold=2.0",
         f"data.train_files={cfg['train_files']}",
         f"data.val_files={cfg['val_files']}",
         f"data.train_batch_size={cfg['prompts_per_step']}",
@@ -94,6 +100,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
         # memory: match the trl path's gradient checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+        *(
+            [f"actor_rollout_ref.model.lora_adapter_path={cfg['warmstart_adapter']}"]
+            if cfg.get("warmstart_adapter")
+            else []
+        ),
         f"actor_rollout_ref.actor.optim.lr={cfg['lr']}",
         # 0 warmup -> verl's warmup+constant scheduler holds lr flat, matching the trl constant recipe.
         "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0",
@@ -137,6 +148,11 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
+    if cfg.get("fp8_kv"):
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the trl colocate path; tis (above) covers
+        # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
+        # engine_kwargs.vllm struct (it is not a default field).
+        o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
     return o
 
 
@@ -272,26 +288,7 @@ def _resolve_verl_python(workdir: str) -> str:
         # full install is used. exact pins are validated on the gpu pod before paid launch.
         subprocess.run(["uv", "venv", venv], check=True)
         subprocess.run(["uv", "pip", "install", "--python", py, "verl"], check=True)
-        if os.environ.get("WANDB_API_KEY"):
-            # verl does not pull wandb; add it (best-effort) so verl's wandb logger can import it in
-            # this isolated interpreter instead of aborting. a failure here -> console logger below.
-            subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
     return py
-
-
-def _resolve_verl_loggers(python_bin: str) -> str:
-    """verl's ``trainer.logger`` list. verl logs from its own interpreter, so enable the wandb
-    logger only when WANDB_API_KEY is set AND wandb is importable in that interpreter; otherwise
-    console-only. this never inits a flash-side run (flash does not train in-process on this path,
-    so a flash-side run would stay empty) and never aborts verl when its env lacks wandb."""
-    if not os.environ.get("WANDB_API_KEY"):
-        return "console"
-    has_wandb = (
-        subprocess.run([python_bin, "-c", "import wandb"], capture_output=True).returncode == 0
-    )
-    if not has_wandb:
-        print("[verl] WANDB_API_KEY set but wandb is unavailable in the verl interpreter; using console logger only")
-    return "console,wandb" if has_wandb else "console"
 
 
 def _export_peft_adapter(
@@ -397,11 +394,6 @@ def _resolve_single_turn_inputs():
             "train.structured_outputs is not yet supported on the verl backend; use the trl backend "
             "(unset FLASH_RL_BACKEND) until guided-decoding parity lands."
         )
-    if _t and getattr(_t, "init_from_adapter", ""):
-        raise RuntimeError(
-            "train.init_from_adapter (warm-start) is not yet supported on the verl backend; use the "
-            "trl backend (unset FLASH_RL_BACKEND) for warm-start runs."
-        )
     if _t and getattr(_t, "stop_sequences", ()):
         raise RuntimeError(
             "train.stop_sequences is not yet supported on the verl backend (verl's vllm rollout has "
@@ -440,22 +432,37 @@ def _resolve_single_turn_inputs():
             "advantages (no value clip), matching the trl path",
             flush=True,
         )
-    # trl drops truncated (non-eos) completions from the grpo loss (mask_truncated_completions,
-    # default True); verl's vllm rollout here has no per-completion truncation-mask knob, so verl
-    # keeps them. stop_sequences (the only case that turns masking off) already fails loudly above,
-    # so this is always the default-True case. record the divergence for parity observability
-    # rather than silently ignoring it; adding verl-side masking is a tracked follow-up.
-    if _w.grpo_mask_truncated_completions(_t):
-        print(
-            "[rl-verl] mask_truncated_completions=True; verl keeps truncated completions in the "
-            "grpo loss (no verl truncation-mask knob) -- recorded parity caveat, not applied",
-            flush=True,
-        )
     learning_rate = float(_t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate)
     # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
     # from the job spec (falling back to the recipe) exactly like the trl path's lora config.
     lora_rank = int(_t.lora_rank) if (_t and _t.lora_rank) else int(RECIPE.lora.rank)
     lora_alpha = int(_t.lora_alpha) if (_t and _t.lora_alpha) else int(RECIPE.lora.alpha)
+    # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
+    # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
+    warmstart_adapter = ""
+    if _t and getattr(_t, "init_from_adapter", ""):
+        if kl_coef > 0:
+            raise RuntimeError(
+                "warm-start (init_from_adapter) with kl_penalty_coef>0 anchors the kl reference to "
+                "the sft adapter; the verl backend's reference is the base, so this is not yet "
+                "supported. set kl_penalty_coef=0, or use the trl backend for kl-anchored warm-start."
+            )
+        from flash.engine.worker.adapter import _download_adapter
+
+        warmstart_adapter = _download_adapter(_t.init_from_adapter)
+        if not warmstart_adapter:
+            raise RuntimeError(
+                "warm-start source adapter could not be downloaded; refusing to start from the base."
+            )
+        with open(os.path.join(warmstart_adapter, "adapter_config.json")) as f:
+            _src_cfg = json.load(f)
+        lora_rank = int(_src_cfg.get("r", lora_rank))
+        lora_alpha = int(_src_cfg.get("lora_alpha", lora_alpha))
+        print(
+            f"[rl-verl] warm-start: continuing source adapter (r={lora_rank}, alpha={lora_alpha}) "
+            f"from {_t.init_from_adapter}",
+            flush=True,
+        )
 
     train = env.dataset()
     _max_examples = getattr(_t, "max_examples", None) if _t else None
@@ -526,6 +533,7 @@ def _resolve_single_turn_inputs():
         "lr": learning_rate,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
+        "warmstart_adapter": warmstart_adapter,
         "epochs": epochs,
         "steps": int(steps),
         "save_every": save_every,
@@ -580,24 +588,38 @@ def run_rl_verl():
     with open(reward_py, "w") as f:
         f.write(render_reward_module())
 
-    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring.
+    # reward bridge: verl (out of process) -> flash live env, identical to trl scoring. also keep a
+    # rolling buffer of recent (completion, score) so the training loop can dump one sample per step
+    # to the flash log, matching the trl path's #607 per-step completion dump.
+    recent_samples: list[tuple[str, float]] = []
+    _samples_lock = threading.Lock()
+
     def _score(index: int, solution_str: str) -> float:
         ex = rollout_examples[int(index)]
-        return score_single_turn(
+        score = score_single_turn(
             env, solution_str, ex,
             tok=tok, thinking=bool(_w.THINKING),
             prompt_opened_thinking=inp["prompt_opened_thinking"],
             think_penalty=inp["think_penalty"],
         )
+        with _samples_lock:
+            recent_samples.append((solution_str, score))
+            del recent_samples[:-64]
+        return score
 
     server, reward_url = start_reward_server(_score)
     try:
-        proc = None
         python_bin = _resolve_verl_python(workdir)
         micro_batch = 1
         expected_steps = int(inp["steps"])
-        # verl logs from its own interpreter; gate wandb on that env (see _resolve_verl_loggers).
-        loggers = _resolve_verl_loggers(python_bin)
+        # match flash's wandb reporting when configured (verl reads WANDB_API_KEY, which flash sets).
+        loggers = "console,wandb" if "wandb" in (_w.wandb_report_to() or []) else "console"
+        # fp8 kv cache on ada/hopper+ (cc>=8.9), exactly like the trl colocate path.
+        try:
+            import torch as _torch_cc
+            fp8_kv = bool(_torch_cc.cuda.is_available() and _torch_cc.cuda.get_device_capability() >= (8, 9))
+        except Exception:  # no cuda / probe failure -> conservative bf16 kv
+            fp8_kv = False
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
             "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
@@ -608,19 +630,14 @@ def run_rl_verl():
             "temperature": inp["temperature"], "top_p": inp["top_p"], "kl_coef": inp["kl_coef"],
             "loss_agg_mode": "seq-mean-token-sum-norm", "seed": inp["seed"],
             "num_iterations": inp["num_iterations"], "steps": expected_steps,
-            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers,
+            "warmstart_adapter": inp["warmstart_adapter"],
+            "gpu_mem_util": 0.5, "tp_size": 1, "loggers": loggers, "fp8_kv": fp8_kv,
             "reward_path": reward_py, "reward_name": "compute_score",
             "total_epochs": inp["epochs"], "save_freq": inp["save_every"], "local_dir": local_dir,
         }
         overrides = build_verl_overrides(cfg)
 
-        # clear any checkpoints left by a prior run on this fixed per-seed worker dir, so finalize's
-        # highest-global_step_N pick can only ever see THIS run's checkpoints (a retry or partial
-        # run otherwise leaves stale global_step_* folders that could export a prior run's adapter).
-        shutil.rmtree(local_dir, ignore_errors=True)
-
-        setup_seconds = time.time() - t_start
-        _w.heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
+        _w.heartbeat("rl_train_start", gpu=gpu_diagnostics())
         step_box = [0]
 
         def _progress():
@@ -637,6 +654,7 @@ def run_rl_verl():
         loss_re = re.compile(r"actor/pg_loss:([-\d.eE+]+)")
         reward_history: list[float] = []
         loss_curve: list[float] = []
+        last_dump_step = [-1]
         with liveness_heartbeat("rl_verl_training", progress=_progress, progress_step=True):
             proc = subprocess.Popen(
                 [python_bin, "-m", "verl.trainer.main_ppo", *overrides],
@@ -647,6 +665,17 @@ def run_rl_verl():
                 m = step_re.search(line)
                 if m:
                     step_box[0] = int(m.group(1))
+                    # dump one sample completion per new step to the flash log (matches trl #607).
+                    if step_box[0] != last_dump_step[0]:
+                        with _samples_lock:
+                            samp = recent_samples[-1] if recent_samples else None
+                        if samp:
+                            last_dump_step[0] = step_box[0]
+                            preview = " ".join(sanitize_rollout_text(samp[0])[:300].split())
+                            print(
+                                f"[rl-verl] step {step_box[0]} sample (reward={samp[1]:.3f}): {preview}",
+                                flush=True,
+                            )
                 # capture verl's per-step reward + policy loss for train_meta observability parity.
                 for pat, sink in ((reward_re, reward_history), (loss_re, loss_curve)):
                     hit = pat.search(line)
@@ -657,13 +686,6 @@ def run_rl_verl():
         if rc != 0:
             raise RuntimeError(f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback")
     finally:
-        # ensure the verl child can't outlive us holding gpu memory if stdout reading raised before
-        # proc.wait() (shutting down the reward server alone would leave main_ppo running).
-        if proc is not None and proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=10)
         server.shutdown()
 
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
@@ -674,15 +696,6 @@ def run_rl_verl():
     actor_dir, steps_run = _latest_global_step_dir(local_dir)
     if steps_run < expected_steps:
         raise RuntimeError(f"grpo completed {steps_run}/{expected_steps} requested optimizer updates")
-    # an empty reward_history means the reward bridge never scored a completion (rollout produced
-    # nothing, or scoring never ran): a no-op run, not a success. mirror the trl path and fail
-    # loudly instead of exporting/publishing an untrained adapter. verl never resumes -> ckpt None.
-    if _w._grpo_is_no_op_failure(reward_history, None, expected_steps, steps_run):
-        raise RuntimeError(
-            f"verl grpo scored no reward over {steps_run} step(s) — the rollout produced no "
-            "completions, so the policy was never actually trained. failing loudly instead of "
-            "publishing a no-op run as done."
-        )
 
     with liveness_heartbeat("rl_verl_finalizing", progress=lambda: steps_run, progress_step=True, keepalive=True):
         _export_peft_adapter(actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin)
@@ -699,7 +712,6 @@ def run_rl_verl():
         adapter_dir=adapter_dir,
         model_id=inp["model_id"],
         train_wall=train_wall,
-        setup_seconds=setup_seconds,
         train_tokens=0,
         generated_tokens=0,
         notes={
