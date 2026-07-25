@@ -295,6 +295,10 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Freesolo environment name to publish or update",
     )
+    env_push.add_argument(
+        "--project",
+        help="project id to group the environment under; omit to keep its current project",
+    )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 
