@@ -95,6 +95,11 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"gpu.count": 9}, "gpu.count must be between 1 and 8"),
         ({"gpu.count": True}, "gpu.count must be an integer"),
         ({"gpu.count": "two"}, "gpu.count must be an integer"),
+        # `project` (the dashboard grouping id) must be a plain string: a table/array/number is a
+        # clean 400, never a 500. Empty/whitespace stays allowed (means "ungrouped", tested below).
+        ({"project": ["p"]}, "project must be a string"),
+        ({"project": 5}, "project must be a string"),
+        ({"project": {"id": "p"}}, "project must be a string"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
@@ -154,6 +159,20 @@ def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
     assert per_turn.train.credit_assignment == "per_turn"
     assert per_turn.to_dict()["train"]["credit_assignment"] == "per_turn"
     assert JobSpec.from_json(per_turn.to_json()).train.credit_assignment == "per_turn"
+
+
+def test_project_id_parses_strips_and_roundtrips() -> None:
+    # the flash `project` toml field is the dashboard grouping id: it parses to a trimmed
+    # string, defaults to "" (ungrouped) when omitted, and must survive the control-plane ->
+    # worker JobSpec boundary so run_registry can report it as projectId.
+    assert spec_from_dict(_raw()).project == ""
+    assert spec_from_dict(_raw(project="   ")).project == ""
+
+    grouped = spec_from_dict(_raw(project="  proj-123  "))
+    assert grouped.project == "proj-123"
+    assert grouped.to_dict()["project"] == "proj-123"
+    assert JobSpec.from_dict(grouped.to_dict()).project == "proj-123"
+    assert JobSpec.from_json(grouped.to_json()).project == "proj-123"
 
 
 @pytest.mark.parametrize("invalid", ["per_step", 1])
