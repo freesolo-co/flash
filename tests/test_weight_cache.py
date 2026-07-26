@@ -4005,3 +4005,46 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     preload._grow_existing_cache_volumes({"flash-weights-us-ca-2": 250})
 
     assert tried == ["k1", "k2"]
+
+
+def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkeypatch):
+    """Regression: growing must never be the reason a launchable deploy is rejected.
+
+    _deploy_once re-checks require_create_allowance AFTER the grow, so a fixed budget spent out of a
+    deadline that only just clears the 60s minimum drops it under -- turning best-effort
+    reconciliation into a hard deploy failure. The grow must yield the allowance back.
+    """
+    from flash import runner
+    from flash.providers._deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod import jobs
+
+    calls = []
+    monkeypatch.setattr(
+        jobs.runpod_api,
+        "grow_network_volumes_for_key",
+        lambda key, wanted, **kw: calls.append(kw) or {},
+    )
+    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
+
+    # only 10s of slack above the allowance: the full budget would overrun it
+    tight = time.time() + CREATE_ALLOWANCE_S + 10.0
+    before = time.time()
+    jobs.grow_weight_cache_volumes(spec, "k", tight)
+    assert calls, "a deploy with room to spare should still reconcile"
+    assert calls[0]["deadline_at"] <= tight - CREATE_ALLOWANCE_S + 1.0
+    assert calls[0]["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+
+    # no slack at all: skip entirely rather than eat into the allowance
+    calls.clear()
+    jobs.grow_weight_cache_volumes(spec, "k", time.time() + CREATE_ALLOWANCE_S)
+    assert calls == []
+
+
+def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
+    """The deadline must actually reach the helper, not just be honoured once it does."""
+    import inspect
+
+    from flash.providers.runpod import jobs
+
+    src = inspect.getsource(jobs.deploy_train_endpoint)
+    assert "grow_weight_cache_volumes(spec, owning_key, deadline_at)" in src

@@ -18,6 +18,7 @@ from flash._logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._deadline import (
+    CREATE_ALLOWANCE_S,
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
@@ -74,10 +75,11 @@ __all__ = [
     "weight_cache_volumes",
 ]
 
-# Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed budget
+# Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed ceiling
 # rather than a share of the run deadline. An unreachable account would otherwise burn retries and
-# backoff against the same clock the launch needs, leaving less than the 60s create allowance and
-# failing a deploy the healthy owning account could have served.
+# backoff against the same clock the launch needs, leaving less than the create allowance and
+# failing a deploy the healthy owning account could have served. Under a deadline the effective
+# budget is this OR whatever is left above the create allowance, whichever is smaller.
 WEIGHT_CACHE_GROW_BUDGET_S = 20.0
 
 TERMINAL_OK = {"COMPLETED"}
@@ -144,7 +146,7 @@ def weight_cache_volumes(spec) -> list:
     ]
 
 
-def grow_weight_cache_volumes(spec, key: str) -> None:
+def grow_weight_cache_volumes(spec, key: str, deadline_at: float | None = None) -> None:
     """Raise this account's already-provisioned shared-cache volumes to the managed size.
 
     A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
@@ -157,9 +159,11 @@ def grow_weight_cache_volumes(spec, key: str) -> None:
     only that account's volumes are the ones about to be attached.
 
     Best-effort by design: a volume that cannot be grown still gets attached, which is no worse than
-    not trying, so this must never fail a deploy. It also takes a short fixed budget rather than the
-    run deadline -- an unreachable account must not spend the launch allowance the deploy still
-    needs.
+    not trying, so this must never fail a deploy. It takes a short fixed budget rather than the run
+    deadline, and under ``deadline_at`` it additionally yields whatever the create allowance needs:
+    the deploy re-checks that allowance after this returns, so spending into it would turn a
+    best-effort reconciliation into the reason an otherwise-launchable deploy is rejected. Time it
+    cannot have, it skips.
     """
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
 
@@ -172,9 +176,15 @@ def grow_weight_cache_volumes(spec, key: str) -> None:
     }
     if not wanted:
         return
+    budget = WEIGHT_CACHE_GROW_BUDGET_S
+    if deadline_at is not None:
+        budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
+    if budget <= 0:
+        logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
+        return
     try:
         grown = runpod_api.grow_network_volumes_for_key(
-            key, wanted, deadline_at=time.time() + WEIGHT_CACHE_GROW_BUDGET_S
+            key, wanted, deadline_at=time.time() + budget
         )
     except Exception as exc:
         logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
@@ -466,7 +476,8 @@ def deploy_train_endpoint(
             # Reconcile before attaching: a volume provisioned under an older, smaller managed size
             # is returned as-is by the SDK, so without this an ordinary training job mounts the
             # stale size and a model the new size admits fails with "Disk quota exceeded".
-            grow_weight_cache_volumes(spec, owning_key)
+            # Deadline-aware: the create allowance is re-checked below, so this yields to it.
+            grow_weight_cache_volumes(spec, owning_key, deadline_at)
             # Re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(override if override is not None else weight_cache_endpoint_kwargs(spec))
