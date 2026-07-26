@@ -413,11 +413,7 @@ def _resolve_single_turn_inputs():
             "train.save_at_steps is not yet supported on the verl backend (verl saves on a fixed "
             "save_freq interval, not arbitrary steps); use the trl backend for it."
         )
-    if model_revision:
-        raise RuntimeError(
-            "model_revision pinning is not yet supported on the verl backend (verl loads the model "
-            "at its default revision); use the trl backend for revision-pinned runs."
-        )
+
     # entropy_quantile drives trl GRPOTrainer's internal top-entropy token masking (top_entropy_quantile);
     # verl has no equivalent, so honoring the flash default (1.0 = no masking) is fine but any customer
     # value < 1.0 must fail loud rather than train without the requested masking (silent drift).
@@ -580,8 +576,16 @@ def run_rl_verl():
     # cache the base model before launching verl, then run verl fully offline so its vllm /
     # transformers never hit hf's (rate-limited) api. flash already owns model prefetch; the verl
     # subprocess simply reuses that cache.
+    model_path_for_verl = inp["model_id"]
     if inp["model_revision"]:
         _w.prefetch_model(inp["model_id"], revision=inp["model_revision"])
+        # verl resolves model.path offline against the HF cache; a bare repo id would pick the
+        # cached "main" ref, not the pin. hand verl the pinned revision's snapshot dir instead.
+        from huggingface_hub import snapshot_download as _snap
+
+        model_path_for_verl = _snap(
+            inp["model_id"], revision=inp["model_revision"], local_files_only=True
+        )
     else:
         _w.prefetch_model(inp["model_id"])
 
@@ -648,7 +652,7 @@ def run_rl_verl():
             fp8_kv = False
         cfg = {
             "train_files": train_pq, "val_files": val_pq,
-            "model_id": inp["model_id"], "lora_rank": inp["lora_rank"],
+            "model_id": model_path_for_verl, "lora_rank": inp["lora_rank"],
             "lora_alpha": inp["lora_alpha"], "target_modules": "all-linear",
             "lr": inp["lr"], "group_size": inp["group_size"],
             "prompts_per_step": inp["prompts_per_step"], "micro_batch": micro_batch,

@@ -259,3 +259,15 @@ def test_build_verl_overrides_enable_fused_linear_ce():
     o = rl_verl.build_verl_overrides(_overrides_cfg())
     assert "actor_rollout_ref.model.use_fused_kernels=True" in o
     assert "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in o
+
+
+def test_model_revision_resolves_pinned_snapshot_for_verl():
+    # model_revision no longer fails closed: prefetch pins the revision and verl gets the pinned
+    # snapshot dir as model.path (a bare repo id would resolve the cached "main" ref offline).
+    import inspect
+
+    resolver_src = inspect.getsource(rl_verl._resolve_single_turn_inputs)
+    assert "model_revision pinning is not yet supported" not in resolver_src
+    run_src = inspect.getsource(rl_verl.run_rl_verl)
+    assert "local_files_only=True" in run_src
+    assert 'revision=inp["model_revision"]' in run_src
