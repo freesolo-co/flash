@@ -284,7 +284,38 @@ def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
 
 
 _LAMBDA_PRELOAD_GPU = "A10"
+# Cheapest-first fallback ladder for warming. A10 alone reaches only the regions that happen to stock
+# it, which left most of the fleet permanently cold: the filesystem exists in every region, but the
+# warm path could never launch a box there, so those regions were never warmed even once. Preload only
+# downloads weights, so any class works and the cheapest that a region actually stocks is the right one.
+# Ordered by Lambda list price (see lambdalabs/pricing.py); an explicit --gpu skips the ladder entirely.
+_LAMBDA_PRELOAD_GPU_LADDER = ("A10", "A100 SXM 40GB", "H100", "B200")
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
+
+
+def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> list:
+    """One launch candidate per Lambda region, using the cheapest class that region actually stocks.
+
+    An explicit ``gpu`` pins the class and is never second-guessed. Otherwise each class in the ladder
+    is asked which regions have capacity, cheapest first, and a region is claimed by the first class
+    that can reach it -- so a region with no A10 is still warmed on A100/H100/B200 instead of being
+    silently skipped. Capacity is a live, per-region property, so this is a lookup and not a constant.
+    """
+    classes = [gpu] if gpu else list(_LAMBDA_PRELOAD_GPU_LADDER)
+    claimed: set = set()
+    targets: list = []
+    for cls in classes:
+        try:
+            candidates = lambda_jobs.usable_instances(cls)
+        except Exception as exc:
+            logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
+            continue
+        for c in candidates:
+            if c.region in claimed:
+                continue
+            claimed.add(c.region)
+            targets.append(c)
+    return targets
 
 
 def _ensure_status_repo(token: str | None) -> None:
@@ -310,12 +341,20 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
 def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
                               timeout_s: int, poll_interval_s: float) -> dict:
     """Launch a download-only preload instance pinned to ``candidate``'s region, poll its status
-    marker, then ALWAYS terminate. One region failing never aborts the others."""
+    marker, then ALWAYS terminate. One region failing never aborts the others.
+
+    ``gpu`` is per-region: the ladder claims each region with the cheapest class that stocks it, so a
+    fleet-wide warm is normally a mix. Every result carries the class that warmed that region.
+    """
     region = getattr(candidate, "region", "?")
     effective_s = max(60, int(timeout_s))
     # Embed reap deadline in the run_id so orphan sweep can free the box if this driver process dies.
     reap_deadline = int(time.time()) + effective_s
     run_id = preload_instance_run_id("lambda", region, reap_deadline, uuid.uuid4().hex[:6])
+
+    def _result(status: str, **extra) -> dict:
+        return {"provider": "lambda", "region": region, "gpu": gpu, "status": status, **extra}
+
     spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
     prefix = f"{spec.phase}/{run_id}"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
@@ -337,7 +376,7 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
                 deadline_at=deadline,
             )
         except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
-            return {"provider": "lambda", "region": region, "status": "error", "error": f"launch: {exc}"}
+            return _result("error", error=f"launch: {exc}")
         logger.info("warm lambda/%s: launched preload (%d models)", region, len(models))
         text = None
         while time.time() < deadline:
@@ -357,25 +396,22 @@ def _warm_one_lambda_instance(lambda_jobs, candidate, models: list, gpu: str,
                     fail = {}
                 if fail.get("ok") is True:
                     bad = fail.get("error") or fail.get("failed")
-                    return {"provider": "lambda", "region": region,
-                            "status": "partial" if bad else "ok", "result": fail}
+                    return _result("partial" if bad else "ok", result=fail)
                 if not fail.get("ok", True):
                     # Completion file is authoritative: a partial run writes it before the fail marker,
                     # so re-check once before reporting early death.
                     text = reader(force=True)
                     if text:
                         break
-                    return {"provider": "lambda", "region": region, "status": "error",
-                            "error": f"box failed early: {fail.get('error') or 'see boot log'}"}
+                    return _result("error", error=f"box failed early: {fail.get('error') or 'see boot log'}")
             time.sleep(max(5.0, poll_interval_s))
         if not text:
-            return {"provider": "lambda", "region": region, "status": "timeout"}
+            return _result("timeout")
         result = json.loads(text)
         bad = result.get("error") or result.get("failed")
-        return {"provider": "lambda", "region": region,
-                "status": "partial" if bad else "ok", "result": result}
+        return _result("partial" if bad else "ok", result=result)
     except Exception as exc:
-        return {"provider": "lambda", "region": region, "status": "error", "error": str(exc)}
+        return _result("error", error=str(exc))
     finally:
         with contextlib.suppress(Exception):
             lambda_jobs.terminate_run_instances(run_id)
@@ -390,19 +426,13 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
 
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
-    gpu = gpu or _LAMBDA_PRELOAD_GPU
-    try:
-        candidates = lambda_jobs.usable_instances(gpu)
-    except Exception as exc:
-        logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", gpu, exc)
-        candidates = []
-    seen_regions: set = set()
-    targets: list = []
-    for c in candidates:
-        if c.region in seen_regions:
-            continue
-        seen_regions.add(c.region)
-        targets.append(c)
+    targets = _lambda_warm_targets(lambda_jobs, gpu)
+    if targets:
+        logger.info(
+            "warm lambda: %d region(s) -> %s", len(targets),
+            ", ".join(f"{getattr(c, 'region', '?')}={getattr(c, 'gpu', None) or _LAMBDA_PRELOAD_GPU}"
+                      for c in targets),
+        )
     if not targets:
         logger.warning("warm: no Lambda capacity right now (nothing to warm)")
         return []
@@ -415,11 +445,18 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
             "with write access before warming (refusing to launch paid GPUs that can't report)."
         ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # The class comes from the candidate, not the caller: the ladder may have claimed each region
+        # with a different one, and the spec must match the box actually being launched.
         futs = [
-            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models, gpu, timeout_s, poll_interval_s)
+            ex.submit(_warm_one_lambda_instance, lambda_jobs, c, models,
+                      getattr(c, "gpu", None) or _LAMBDA_PRELOAD_GPU, timeout_s, poll_interval_s)
             for c in targets
         ]
-        return [f.result() for f in as_completed(futs)]
+        results = [f.result() for f in as_completed(futs)]
+    starved = sorted({r["region"] for r in results if r.get("status") == "error"})
+    if starved:
+        logger.warning("warm lambda: %d region(s) did not warm: %s", len(starved), ", ".join(starved))
+    return results
 
 
 def provision_lambda_filesystems(name: str | None = None) -> list[str]:

@@ -2076,8 +2076,8 @@ def test_warm_instances_no_capacity_returns_empty(monkeypatch):
     assert preload.warm_instances(models=["a/b"]) == []
 
 
-def test_warm_instances_uses_managed_lambda_default_gpu(monkeypatch):
-    """With no --gpu override, Lambda warming uses the managed A10 default."""
+def test_warm_instances_uses_managed_lambda_gpu_ladder(monkeypatch):
+    """With no --gpu override, Lambda warming walks the managed ladder cheapest-first."""
     import importlib
 
     from flash.providers.lambdalabs import jobs as lj
@@ -2085,17 +2085,112 @@ def test_warm_instances_uses_managed_lambda_default_gpu(monkeypatch):
 
     monkeypatch.setenv("FLASH_PRELOAD_INSTANCE_GPU", "H100")
     importlib.reload(preload)
-    seen = {}
+    asked = []
 
     def capture_gpu(gpu):
-        seen["lambda"] = gpu
+        asked.append(gpu)
         return []
 
     monkeypatch.setattr(lj, "usable_instances", capture_gpu)
     preload.warm_instances(models=["a/b"])
 
-    assert seen == {"lambda": "A10"}
+    # Cheapest first, and the env var is NOT a way to redirect the managed default.
+    assert asked == ["A10", "A100 SXM 40GB", "H100", "B200"]
+    assert preload._LAMBDA_PRELOAD_GPU_LADDER == ("A10", "A100 SXM 40GB", "H100", "B200")
     assert preload._LAMBDA_PRELOAD_GPU == "A10"
+
+
+def test_lambda_ladder_is_ordered_cheapest_first():
+    """The ladder must stay price-ordered: a warm is a pure download, so paying more never buys speed.
+
+    Guards against someone appending a class without checking where it lands on price.
+    """
+    from flash.providers.lambdalabs.pricing import _STATIC_RATES
+    from flash.providers.runpod import preload
+
+    rates = [_STATIC_RATES[c] for c in preload._LAMBDA_PRELOAD_GPU_LADDER]
+    assert rates == sorted(rates), f"ladder must be cheapest-first, got {rates}"
+
+
+def _stocked(**by_class):
+    """usable_instances stub: map each GPU class to the regions that stock it right now."""
+    return lambda gpu: [
+        types.SimpleNamespace(region=r, gpu=gpu) for r in by_class.get(gpu.replace(" ", "_"), [])
+    ]
+
+
+def test_lambda_ladder_reaches_regions_the_cheapest_class_cannot(monkeypatch):
+    """The whole point: a region with no A10 is still warmed, on the cheapest class that stocks it.
+
+    Regression for the fleet-wide gap where 8 of 10 provisioned filesystems were never warmed because
+    A10 -- the only class the warm path ever asked for -- had capacity in just 2 regions.
+    """
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        lj,
+        "usable_instances",
+        _stocked(
+            A10=["us-east-1"],
+            # us-east-1 is stocked here too, but A10 already claimed it
+            A100_SXM_40GB=["us-east-1", "asia-south-1"],
+            H100=["us-west-3"],
+            B200=[],
+        ),
+    )
+    targets = preload._lambda_warm_targets(lj, None)
+
+    assert [(t.region, t.gpu) for t in targets] == [
+        ("us-east-1", "A10"),  # cheapest class wins a contested region
+        ("asia-south-1", "A100 SXM 40GB"),  # unreachable on A10 alone
+        ("us-west-3", "H100"),  # only H100 stocks it
+    ]
+
+
+def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
+    """One class's API call failing must not strand the regions a later class could still warm."""
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    def flaky(gpu):
+        if gpu == "A10":
+            raise RuntimeError("instance-types API down")
+        return [types.SimpleNamespace(region="asia-south-1", gpu=gpu)] if gpu == "H100" else []
+
+    monkeypatch.setattr(lj, "usable_instances", flaky)
+    targets = preload._lambda_warm_targets(lj, None)
+
+    assert [(t.region, t.gpu) for t in targets] == [("asia-south-1", "H100")]
+
+
+def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
+    """An explicit --gpu is an operator decision: never silently widened to other classes."""
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    asked = []
+
+    def capture(gpu):
+        asked.append(gpu)
+        return [types.SimpleNamespace(region="us-east-1", gpu=gpu)]
+
+    monkeypatch.setattr(lj, "usable_instances", capture)
+    targets = preload._lambda_warm_targets(lj, "B200")
+
+    assert asked == ["B200"]  # ladder not walked
+    assert [(t.region, t.gpu) for t in targets] == [("us-east-1", "B200")]
+
+
+def test_warm_result_reports_the_gpu_that_warmed_each_region(monkeypatch):
+    """A mixed-class fleet warm is unreadable unless each result says which class it used."""
+    preload, lj, _launched, _terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
+    )
+    monkeypatch.setattr(lj, "usable_instances", _stocked(H100=["asia-south-1"]))
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert [(r["region"], r["gpu"], r["status"]) for r in res] == [("asia-south-1", "H100", "ok")]
 
 
 def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
