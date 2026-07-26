@@ -20,7 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._logging import configure_logging, get_logger
-from flash.providers._deadline import deadline_kwargs
+from flash.providers._deadline import deadline_kwargs, remaining_seconds
 from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
 from flash.providers.base import UnreconciledCreateError
@@ -663,11 +663,28 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
     try:
         # Settle the filesystem before any class runs, so every per-attempt ensure_filesystem inside
         # the launcher only ever reuses and can never reach the non-idempotent create path.
+        pre_check_started = time.time()
         fs_state = _ensure_region_filesystem(region, deadline)
+        pre_check_s = time.time() - pre_check_started
         if fs_state == "doubtful":
             # Launching now would let the launcher's own listing miss and create a duplicate that is
             # billed forever. A region left cold this cycle just downloads on first use.
             return _result("error", error="filesystem unconfirmed; skipped to avoid a duplicate create")
+        # The filesystem pre-check above spends real wall time against the same deadline the launcher
+        # gets. If it consumed enough that no class can clear the provider's 60s create allowance,
+        # every class below would raise that allowance error from launch_and_submit, be caught as a
+        # launch failure, and walk the ladder to pricier classes -- reporting "no capacity" for
+        # classes whose capacity was never tested. Stop and name what actually ran out.
+        #
+        # Measured against the budget the pre-check STARTED with, not an absolute floor: effective_s
+        # itself floors at 60, so a short --timeout-s legitimately leaves under 60s without anything
+        # having been stolen. Only a pre-check that ate into the allowance is a misreport risk.
+        if pre_check_s >= 1.0 and remaining_seconds(deadline) < 60.0:
+            return _result(
+                "error",
+                error="filesystem pre-check consumed the launch deadline; no class was tried "
+                      "(raise --timeout-s)",
+            )
         spec = launch_err = None
         for cand in candidates:
             # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
@@ -1011,6 +1028,12 @@ def main(argv: list[str] | None = None) -> int:
             # bare traceback would hide which regions are now warm. The run is reported as
             # unfinished at the end instead of as a clean sweep.
             results, incomplete = exc.results, str(exc)
+        except RuntimeError as exc:
+            # A total planning outage or an unusable status repo aborts before any launch, so there
+            # is nothing paid to report. Exit non-zero with the message instead of a traceback: this
+            # is an operator-actionable condition (Lambda down, HF_TOKEN missing), not a crash.
+            print(f"0 regions warmed — {exc}")
+            return 1
         if not results:
             if incomplete:
                 print(f"0 regions warmed — {incomplete}")

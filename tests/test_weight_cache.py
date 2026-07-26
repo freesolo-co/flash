@@ -2913,6 +2913,51 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
         preload.warm_instances(models=["a/b"])
 
 
+def test_warm_instances_cli_reports_planning_outage_without_traceback(monkeypatch):
+    """A total planning outage / unusable status repo raises bare RuntimeError from warm_instances.
+    The CLI must turn that into a message and exit 1, not an unhandled traceback: both conditions are
+    operator-actionable (Lambda down, HF_TOKEN missing), and a traceback buries the reason."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        preload,
+        "warm_instances",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("could not determine Lambda capacity")),
+    )
+    assert preload.main(["--warm-instances"]) == 1
+
+
+def test_region_skipped_when_precheck_eats_the_launch_allowance(monkeypatch):
+    """The filesystem pre-check spends the same deadline the launcher gets. If it leaves under the
+    60s provider create allowance, launch_and_submit would raise that allowance error for EVERY
+    class, get caught as a launch failure, and walk the ladder to pricier classes -- reporting
+    "no capacity" for classes never actually tested. The region must stop and say what ran out."""
+    from flash.providers.runpod import preload
+
+    # A slow pre-check that returns "listed" but burns the wall clock getting there.
+    def slow_precheck(region, deadline):
+        clock["now"] += 120.0
+        return "listed"
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload, "_ensure_region_filesystem", slow_precheck)
+    # Nothing left for a create once the pre-check has taken its share.
+    monkeypatch.setattr(preload, "remaining_seconds", lambda deadline: 5.0)
+
+    jobs_mod = types.SimpleNamespace(
+        launch_and_submit=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not try any class with the allowance already spent")
+        ),
+        terminate_run_instances=lambda run_id: None,
+    )
+    result = preload._warm_one_lambda_instance(
+        jobs_mod, [_cand("us-east-1"), _cand("us-east-1", gpu="H100")], ["a/b"], 5, 0.0
+    )
+    assert result["status"] == "error"
+    assert "launch deadline" in result["error"]
+
+
 def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
     """No provider capacity -> documented no-op: warm returns [] and must NOT require the status repo
     (else an empty warm on an unconfigured / at-capacity host would hard-fail on a missing HF_TOKEN)."""
