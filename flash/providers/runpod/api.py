@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any
 
+from flash._logging import get_logger
+from flash.providers._deadline import remaining_seconds
 from flash.providers._http import RestClient, is_not_found
 from flash.providers.runpod import keys as _keys
+
+logger = get_logger(__name__)
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
@@ -159,6 +164,76 @@ def endpoint_health_for_fingerprint(
         _key_for_fingerprint(fingerprint),
         deadline_at=deadline_at,
     )
+
+
+def grow_network_volumes_for_key(
+    key: str,
+    wanted: dict[str, int],
+    *,
+    deadline_at: float | None = None,
+) -> dict[str, int]:
+    """Raise every already-provisioned volume in ``wanted`` ({name: gb}) to its target size.
+
+    Creating a NetworkVolume only sizes it on the CREATE. The SDK matches an existing volume by
+    name+datacenter and returns it untouched, so a volume provisioned at an older, smaller size stays
+    at that size forever and a later "size" bump is silently a no-op: the attach succeeds and the
+    download then fails with "Disk quota exceeded". Growing is the only way to reconcile the fleet.
+
+    Returns {name: new_size} for the volumes actually grown. Volumes already at or above target are
+    left alone; RunPod rejects a shrink, so only under-sized ones are touched.
+
+    Volumes are independent, so one that cannot be grown -- concurrently deleted, momentarily
+    unmodifiable -- only skips itself. Aborting the loop would leave every later datacenter's volume
+    unreconciled, and a run placed in one of those would still hit "Disk quota exceeded".
+
+    Skipping itself is not enough on its own, though: a PATCH that times out or 5xxes spends real
+    time inside its own retries, and handing every PATCH the same shared deadline lets the first
+    under-sized volume consume all of it. Every later one then fails its deadline check immediately
+    and the loop reconciles nothing -- the same fleet-wide gap as aborting, reached by a slower
+    route. So each PATCH gets an equal share of what is LEFT, recomputed per volume: a stalling
+    volume can spend only its own share, and time a fast one does not use flows to the volumes
+    behind it.
+    """
+    out = _CLIENT.request_with_retries_for_key(
+        key, f"{REST_BASE}/networkvolumes", retries=2, deadline_at=deadline_at
+    )
+    vols = out if isinstance(out, list) else (out or {}).get("networkVolumes", []) or []
+    grown: dict[str, int] = {}
+    pending = []
+    for vol in vols:
+        name, vol_id = vol.get("name"), vol.get("id")
+        target = wanted.get(name)
+        if not name or not vol_id or target is None:
+            continue
+        try:
+            current = int(vol.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if current >= int(target):
+            continue  # already at or above target; RunPod rejects a shrink
+        pending.append((name, vol_id, int(target)))
+    for position, (name, vol_id, target) in enumerate(pending):
+        patch_deadline = deadline_at
+        if deadline_at is not None:
+            left = remaining_seconds(deadline_at)
+            if left <= 0:
+                logger.warning("weight cache: out of time before %s; leaving it as-is", name)
+                continue
+            patch_deadline = time.time() + left / max(1, len(pending) - position)
+        try:
+            _CLIENT.request_with_retries_for_key(
+                key,
+                f"{REST_BASE}/networkvolumes/{vol_id}",
+                method="PATCH",
+                body={"size": target},
+                retries=2,
+                deadline_at=patch_deadline,
+            )
+        except Exception as exc:
+            logger.warning("weight cache: could not grow %s (%s); leaving it as-is", name, exc)
+            continue
+        grown[name] = target
+    return grown
 
 
 def submit_job(
