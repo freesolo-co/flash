@@ -27,7 +27,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._logging import configure_logging, get_logger
-from flash.providers._deadline import deadline_kwargs, remaining_seconds
+from flash.providers._deadline import deadline_kwargs
 from flash.providers._hf_artifacts import make_hf_text_reader
 from flash.providers._poll import preload_instance_run_id
 from flash.providers.base import UnreconciledCreateError
@@ -61,15 +61,22 @@ _HF_HOME = "/runpod-volume/hf-cache"
 _PRELOAD_GPU = "RTX 4090"
 _TERMINAL_OK = {"COMPLETED"}
 _TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
-# Only a QUEUED job can be starved. Any other nonterminal status means RunPod already handed the job
-# to a worker, so a zero-worker health reading there is a health-reporting artifact, not starvation --
-# and acting on it would delete the endpoint mid-download.
+# Only a QUEUED job can be starved. Any other KNOWN status means RunPod already handed the job to a
+# worker, so a zero-worker health reading there is a health-reporting artifact, not starvation -- and
+# acting on it would delete the endpoint mid-download. Statuses outside these sets are not evidence
+# in either direction: they are treated as unknown rather than as proof the job left the queue.
 _QUEUED = "IN_QUEUE"
+_RUNNING = {"IN_PROGRESS"}
 # Not every storage DC stocks every GPU class -- US-KS-2/US-MO-2/US-NC-2/US-NE-1/US-WA-1 carry no
 # RTX 4090 at all. A preload pinned to a class the DC cannot serve never allocates a worker: the job
 # just sits queued until the timeout, so the DC stays silently cold and we pay for the wait. Give up
 # on a DC once it has held a queued job this long with no worker in any state.
 _NO_CAPACITY_GRACE_S = 420.0
+# A worker that RunPod allocated and then marked unhealthy is a broken image, not a cold DC, and no
+# amount of waiting fixes it. Without its own timer that case reads as "capacity found" forever and
+# holds a paid endpoint for the whole _PRELOAD_TIMEOUT_S. Matches poll_job's unhealthy_grace_s, which
+# calls the same condition a failed image pull and retries on a fresh endpoint.
+_UNHEALTHY_GRACE_S = 240.0
 
 
 class NoCapacityError(RuntimeError):
@@ -84,23 +91,12 @@ class NoCapacityError(RuntimeError):
 _PRELOAD_TIMEOUT_S = 5400
 
 
-def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool | None:
-    """True once a datacenter has actually given us a box, in any state it can then be in.
+def _worker_counts(endpoint_id: str, key_fingerprint: str, deadline: float) -> dict | None:
+    """Per-state worker counts for the endpoint, or None when health could not be read.
 
-    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
-    - ``unhealthy`` -- allocated, then the image failed to start. ``jobs.py`` reads this as a failed
-      image pull and retries on a fresh endpoint, so counting it as "no capacity" would blame the
-      datacenter for a broken image and tell the operator to change GPU class, which cannot help.
-
-    ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
-    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
-    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
-    make a preload sit the full timeout on a datacenter that will never run it.
-
-    Returns None when health could not be read. That is deliberately NOT False: the caller escalates
-    a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
-    merely unreachable would look identical to a starved datacenter and could kill a download that is
-    running fine. Unknown must stay unknown -- only a positive "no workers" answer is evidence.
+    None is deliberately not an empty dict: an empty dict is a positive "this endpoint has no
+    workers" answer, which the caller escalates into NoCapacityError and an endpoint teardown. A
+    health API that is merely unreachable must never look like that.
     """
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
@@ -112,10 +108,48 @@ def _has_worker(endpoint_id: str, key_fingerprint: str, deadline: float) -> bool
         return None
     if health is None:
         return None
-    workers = health.get("workers") or {}
-    return any(
-        int(workers.get(k) or 0) > 0
-        for k in ("initializing", "ready", "running", "idle", "unhealthy")
+    return health.get("workers") or {}
+
+
+def _any_worker(workers: dict | None, *states: str) -> bool:
+    return any(int((workers or {}).get(state) or 0) > 0 for state in states)
+
+
+def _has_worker(workers: dict | None) -> bool | None:
+    """True once a datacenter has actually given us a box, in any state it can then be in.
+
+    - ``initializing`` / ``ready`` / ``running`` / ``idle`` -- allocated and fine
+    - ``unhealthy`` -- allocated, then the image failed to start. ``jobs.py`` reads this as a failed
+      image pull and retries on a fresh endpoint, so counting it as "no capacity" would blame the
+      datacenter for a broken image and tell the operator to change GPU class, which cannot help.
+      ``_only_unhealthy_workers`` is what separates that case out on its own timer.
+
+    ``throttled`` is deliberately NOT counted. ``jobs.py`` classifies a sustained throttled worker as
+    ``no_capacity`` ("retrying on the next-best GPU"), which is exactly the condition this poller
+    exists to catch: RunPod is not scheduling the pinned class here. Treating it as capacity would
+    make a preload sit the full timeout on a datacenter that will never run it.
+
+    Returns None when health could not be read. That is deliberately NOT False: the caller escalates
+    a sustained False into NoCapacityError and tears the endpoint down, so a health endpoint that is
+    merely unreachable would look identical to a starved datacenter and could kill a download that is
+    running fine. Unknown must stay unknown -- only a positive "no workers" answer is evidence.
+    """
+    if workers is None:
+        return None
+    return _any_worker(workers, "initializing", "ready", "running", "idle", "unhealthy")
+
+
+def _only_unhealthy_workers(workers: dict | None) -> bool:
+    """True when every box this datacenter gave us failed to start.
+
+    Same predicate ``poll_job`` runs while IN_QUEUE: unhealthy with nothing usable and nothing still
+    coming up. A box that is initializing may yet come good, and one that is ready/running/idle
+    already has, so neither is a broken image.
+    """
+    if not workers:
+        return False
+    return _any_worker(workers, "unhealthy") and not _any_worker(
+        workers, "initializing", "ready", "running", "idle"
     )
 
 
@@ -138,6 +172,33 @@ def catalog_model_ids() -> list[str]:
     fitting = [(mid, info) for mid, info in MODELS.items() if _fits_weight_cache(info)]
     fitting.sort(key=lambda pair: (-(pair[1].params_b or 0.0), pair[0]))
     return [mid for mid, _ in fitting]
+
+
+def _grow_existing_cache_volumes(wanted: dict[str, int], deadline_at: float) -> None:
+    """Raise any already-provisioned cache volume in ``wanted`` to the managed size, fleet-wide.
+
+    A NetworkVolume is only sized on CREATE: the SDK matches an existing volume by name+datacenter
+    and hands it back untouched, so every volume provisioned before a size bump stays at the old
+    size and the bump is a silent no-op. The warm then attaches an under-sized mount and the
+    download dies with "Disk quota exceeded" -- the exact failure the bump was meant to fix.
+
+    Best-effort, and deliberately so: it runs against every account in the pool because the volume
+    may belong to any of them, and a warm on a healthy account must not be blocked by a bad key.
+    A volume that cannot be grown still gets attached, which is no worse than not trying.
+    """
+    from flash.providers.runpod import keys as rp_keys
+
+    for i, key in enumerate(rp_keys.keys()):
+        try:
+            grown = runpod_api.grow_network_volumes_for_key(key, wanted, deadline_at=deadline_at)
+        except Exception as exc:
+            logger.warning(
+                "weight cache: could not grow volume(s) on RunPod account %d (%s); attaching as-is",
+                i, exc,
+            )
+            continue
+        for name, size in sorted(grown.items()):
+            logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
 
 
 def _preload_one_dc(
@@ -168,6 +229,7 @@ def _preload_one_dc(
     key_fingerprint = None
     deadline_at = time.time() + timeout_s
     try:
+        _grow_existing_cache_volumes({vol_name: WEIGHT_CACHE_VOLUME_GB}, deadline_at)
         endpoint_id, _name, key_fingerprint = deploy_train_endpoint(
             gpu,
             execution_timeout_ms=timeout_s * 1000,
@@ -221,11 +283,12 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = time.time() + timeout_s
-    # Grace is measured over an UNBROKEN run of confirmed zero-worker readings, so it starts at the
-    # first such reading rather than at launch. Timing it from launch would let an unreadable health
-    # API age the timer silently, and the first definite False after that would fire instantly --
+    # Both graces are measured over an UNBROKEN run of confirmed readings, so each starts at its
+    # first such reading rather than at launch. Timing from launch would let an unreadable health
+    # API age a timer silently, and the first definite reading after that would fire instantly --
     # deleting an endpoint whose download may be progressing.
     starved_since: float | None = None
+    unhealthy_since: float | None = None
     while time.time() < deadline:
         st = runpod_api.job_status(
             endpoint_id,
@@ -234,13 +297,22 @@ def _poll_until_done(
             deadline_at=deadline,
         )
         status = (st or {}).get("status")
-        if status != _QUEUED:
-            # Leaving the queue breaks the run. A job that reached IN_PROGRESS was allocated a
-            # worker, so if it is later re-queued after an interruption it must serve a FRESH grace
-            # window: carrying the old anchor forward would charge the whole running interval to
-            # starvation and the first zero-worker reading after the re-queue would delete an
-            # endpoint that never actually waited on capacity.
-            starved_since = None
+        # Only a status that PROVES the job left the queue breaks the run. `!= _QUEUED` would also
+        # match None and any unrecognized string, so one flaky or empty job_status response would
+        # reset the grace window and keep NoCapacityError from ever firing -- the DC would stay
+        # silently cold for the full timeout, which is the failure this poller exists to catch.
+        # An unknown status is unknown: it proves nothing either way, so it leaves both anchors as
+        # they are and the next definite reading decides.
+        left_queue = status is not None and (
+            status in _TERMINAL_OK or status in _TERMINAL_FAIL or status in _RUNNING
+        )
+        if left_queue:
+            # A job that reached IN_PROGRESS was allocated a worker, so if it is later re-queued
+            # after an interruption it must serve a FRESH grace window: carrying the old anchor
+            # forward would charge the whole running interval to starvation and the first
+            # zero-worker reading after the re-queue would delete an endpoint that never actually
+            # waited on capacity. Same reasoning as poll_job clearing its in-queue timers.
+            starved_since = unhealthy_since = None
         # Restricted to IN_QUEUE: any other nonterminal status proves a worker was allocated, so
         # zero-worker health then is a reporting artifact and never evidence of a starved DC.
         #
@@ -248,10 +320,11 @@ def _poll_until_done(
         # sighting. A box that is reported and then reclaimed while the job is still queued would
         # otherwise suppress all later probes, and because the job never leaves the queue nothing
         # would ever clear the latch -- the preload would burn the full timeout on a datacenter that
-        # had lost the worker. The grace anchor below, not the probe, is what keeps a transient
-        # zero-worker blip from tearing down a healthy endpoint.
-        else:
-            worker_state = _has_worker(endpoint_id, key_fingerprint, deadline)
+        # had lost the worker. The grace anchors below, not the probe, are what keep a transient
+        # blip from tearing down a healthy endpoint.
+        elif status == _QUEUED:
+            workers = _worker_counts(endpoint_id, key_fingerprint, deadline)
+            worker_state = _has_worker(workers)
             if worker_state is False:
                 # Only a definite "no workers" starts or continues the run. None means health was
                 # unreadable, and treating that as starvation would delete the endpoint out from
@@ -265,6 +338,19 @@ def _poll_until_done(
             else:
                 # Unknown or a worker seen: the run of confirmed-starved readings is broken.
                 starved_since = None
+            # A box that was allocated and then died counts as capacity above, so without this it
+            # clears the starvation timer every poll and the preload holds a paid endpoint for the
+            # whole timeout before reporting a bare TimeoutError. The image is broken; say so.
+            if _only_unhealthy_workers(workers):
+                unhealthy_since = time.time() if unhealthy_since is None else unhealthy_since
+                if time.time() - unhealthy_since >= _UNHEALTHY_GRACE_S:
+                    raise RuntimeError(
+                        f"preload job {job_id} sat queued {_UNHEALTHY_GRACE_S:.0f}s with every "
+                        "worker unhealthy: the worker image failed to start (likely a failed image "
+                        "pull), which no datacenter or GPU class can fix"
+                    )
+            else:
+                unhealthy_since = None
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:
@@ -432,6 +518,12 @@ _LAMBDA_PLANNING_BUDGET_S = 180.0
 # planning budget is already spent, so it must not extend the pre-launch phase by another
 # retry-and-backoff cycle. Losing it only costs a summary line.
 _LAMBDA_SNAPSHOT_BUDGET_S = 30.0
+# Also separate, and for a stronger reason: the per-region filesystem pre-check must not be charged
+# to the run deadline the launch and poll get. Sharing one deadline made a slow pre-check both eat
+# into the provider's 60s create allowance (so classes reported "no capacity" untested) and end the
+# driver's poll before the instance wall cap it is watching. Its own budget bounds a hung Lambda
+# without taking anything from the warm.
+_FS_PRECHECK_BUDGET_S = 120.0
 _PRELOAD_STATUS_REPO = "Freesolo-Co/flash-weight-preload"
 
 
@@ -659,39 +751,34 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
     region = getattr(candidates[0], "region", "?")
     gpu = getattr(candidates[0], "gpu", None) or _LAMBDA_PRELOAD_GPU
     effective_s = max(60, int(timeout_s))
-    # Embed reap deadline in the run_id so orphan sweep can free the box if this driver process dies.
-    reap_deadline = int(time.time()) + effective_s
-    run_id = preload_instance_run_id("lambda", region, reap_deadline, uuid.uuid4().hex[:6])
+    run_id = None
 
     def _result(status: str, **extra) -> dict:
         return {"provider": "lambda", "region": region, "gpu": gpu, "status": status, **extra}
 
-    deadline = time.time() + effective_s
     try:
         # Settle the filesystem before any class runs, so every per-attempt ensure_filesystem inside
         # the launcher only ever reuses and can never reach the non-idempotent create path.
-        pre_check_started = time.time()
-        fs_state = _ensure_region_filesystem(region, deadline)
-        pre_check_s = time.time() - pre_check_started
+        #
+        # On its OWN budget, not the launch/poll one. Charging it to the run deadline while the
+        # instance wall cap and the reap deadline still got the full effective_s made the driver
+        # give up before the box it is watching, so a warm that was still downloading was reported
+        # as timed out. It also silently ate into the provider's 60s create allowance: a pre-check
+        # that left less than that made every class in the ladder fail the allowance check inside
+        # launch_and_submit, and the region reported "no capacity" for classes never actually tried.
+        fs_state = _ensure_region_filesystem(region, time.time() + _FS_PRECHECK_BUDGET_S)
         if fs_state == "doubtful":
             # Launching now would let the launcher's own listing miss and create a duplicate that is
             # billed forever. A region left cold this cycle just downloads on first use.
             return _result("error", error="filesystem unconfirmed; skipped to avoid a duplicate create")
-        # The filesystem pre-check above spends real wall time against the same deadline the launcher
-        # gets. If it consumed enough that no class can clear the provider's 60s create allowance,
-        # every class below would raise that allowance error from launch_and_submit, be caught as a
-        # launch failure, and walk the ladder to pricier classes -- reporting "no capacity" for
-        # classes whose capacity was never tested. Stop and name what actually ran out.
-        #
-        # Measured against the budget the pre-check STARTED with, not an absolute floor: effective_s
-        # itself floors at 60, so a short --timeout-s legitimately leaves under 60s without anything
-        # having been stolen. Only a pre-check that ate into the allowance is a misreport risk.
-        if pre_check_s >= 1.0 and remaining_seconds(deadline) < 60.0:
-            return _result(
-                "error",
-                error="filesystem pre-check consumed the launch deadline; no class was tried "
-                      "(raise --timeout-s)",
-            )
+        # One anchor for everything downstream: the driver's poll deadline, the reap deadline
+        # embedded in the run_id, and the instance's own wall cap all start here and all run for
+        # effective_s, so no clock is ahead of another.
+        deadline = time.time() + effective_s
+        # Embed reap deadline in the run_id so orphan sweep can free the box if this driver dies.
+        run_id = preload_instance_run_id(
+            "lambda", region, int(deadline), uuid.uuid4().hex[:6]
+        )
         spec = launch_err = None
         for cand in candidates:
             # Rebuild per class: the spec carries the GPU, so reusing the cheap one's spec would
@@ -773,8 +860,12 @@ def _warm_one_lambda_instance(lambda_jobs, candidates: list, models: list,
     except Exception as exc:
         return _result("error", error=str(exc))
     finally:
-        with contextlib.suppress(Exception):
-            lambda_jobs.terminate_run_instances(run_id)
+        # None means the pre-check returned or raised before a run_id existed, so no launch was ever
+        # attempted and there is nothing to reap. Sweeping on None would be a terminate call with no
+        # run to scope it to.
+        if run_id is not None:
+            with contextlib.suppress(Exception):
+                lambda_jobs.terminate_run_instances(run_id)
 
 
 def warm_instances(models: list | None = None, gpu: str | None = None,

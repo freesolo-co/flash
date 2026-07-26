@@ -161,6 +161,50 @@ def endpoint_health_for_fingerprint(
     )
 
 
+def grow_network_volumes_for_key(
+    key: str,
+    wanted: dict[str, int],
+    *,
+    deadline_at: float | None = None,
+) -> dict[str, int]:
+    """Raise every already-provisioned volume in ``wanted`` ({name: gb}) to its target size.
+
+    Creating a NetworkVolume only sizes it on the CREATE. The SDK matches an existing volume by
+    name+datacenter and returns it untouched, so a volume provisioned at an older, smaller size stays
+    at that size forever and a later "size" bump is silently a no-op: the attach succeeds and the
+    download then fails with "Disk quota exceeded". Growing is the only way to reconcile the fleet.
+
+    Returns {name: new_size} for the volumes actually grown. Volumes already at or above target are
+    left alone; RunPod rejects a shrink, so only under-sized ones are touched.
+    """
+    out = _CLIENT.request_with_retries_for_key(
+        key, f"{REST_BASE}/networkvolumes", retries=2, deadline_at=deadline_at
+    )
+    vols = out if isinstance(out, list) else (out or {}).get("networkVolumes", []) or []
+    grown: dict[str, int] = {}
+    for vol in vols:
+        name, vol_id = vol.get("name"), vol.get("id")
+        target = wanted.get(name)
+        if not name or not vol_id or target is None:
+            continue
+        try:
+            current = int(vol.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if current >= int(target):
+            continue
+        _CLIENT.request_with_retries_for_key(
+            key,
+            f"{REST_BASE}/networkvolumes/{vol_id}",
+            method="PATCH",
+            body={"size": int(target)},
+            retries=2,
+            deadline_at=deadline_at,
+        )
+        grown[name] = int(target)
+    return grown
+
+
 def submit_job(
     endpoint_id: str,
     input_payload: dict,

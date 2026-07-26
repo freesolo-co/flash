@@ -697,7 +697,12 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
         return spec
     attach = is_catalog and (info is None or _fits_weight_cache(info))
-    if attach == (existing == WEIGHT_CACHE_VOLUME_NAME):
+    pinned = existing == WEIGHT_CACHE_VOLUME_NAME
+    # An already-pinned spec is only "correct" if it also carries the CURRENT managed size. A stale
+    # or internally-round-tripped spec can hold the shared name at a previous, smaller size; taking
+    # the no-op return there would deploy an undersized volume for models this size now admits.
+    sized = getattr(spec.gpu, "network_volume_gb", None) == WEIGHT_CACHE_VOLUME_GB
+    if attach == pinned and (sized or not attach):
         return spec
     d = spec.to_internal_dict()
     if attach:

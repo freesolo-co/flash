@@ -121,9 +121,16 @@ def weight_cache_volumes(spec) -> list:
         return []
     from runpod_flash import NetworkVolume
 
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
     from flash.spec import _volume_gb
 
-    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", 100))
+    # The shared cache is platform-managed, so its size comes from the managed constant rather than
+    # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
+    # and honoring that would create (or attach) an undersized volume. Custom volumes are the
+    # caller's to size, so those keep the spec value.
+    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", WEIGHT_CACHE_VOLUME_GB))
+    if str(base) == WEIGHT_CACHE_VOLUME_NAME:
+        size = max(size, WEIGHT_CACHE_VOLUME_GB)
     return [
         NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
         for dc in dcs
