@@ -682,6 +682,18 @@ def write_base_model_provenance(adapter_dir: str, model_id: str, model_revision:
         json.dump(payload, fh, indent=2, sort_keys=True)
 
 
+def _snapshot_has_weights(snapshot_dir: str) -> bool:
+    """True when a downloaded snapshot contains at least one model weight file."""
+    weight_suffixes = (".safetensors", ".bin")
+    try:
+        for name in os.listdir(snapshot_dir):
+            if name.endswith(weight_suffixes) and "adapter" not in name:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def prefetch_model(model_id: str, revision: str = "") -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
@@ -700,12 +712,30 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     ):
         def _download() -> None:
             _require_hf_deadline_allowance()
-            snapshot_download(
+            local_path = snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,
                 ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
                 **model_revision_kwargs(revision),
             )
+            # a shared-volume snapshot can be stale/partial (e.g. a serving preload that only
+            # warmed configs): snapshot_download returns it as a cache hit without weights, and
+            # the trainer then fails offline with "no pytorch_model.bin or model.safetensors".
+            # validate weights exist before trusting the hit; one forced re-download repairs it.
+            if not _snapshot_has_weights(local_path):
+                print(f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading")
+                local_path = snapshot_download(
+                    repo_id=model_id,
+                    cache_dir=shared_hub,
+                    ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+                    force_download=True,
+                    **model_revision_kwargs(revision),
+                )
+                if not _snapshot_has_weights(local_path):
+                    raise RuntimeError(
+                        f"model snapshot for {model_id} has no weight files even after a forced "
+                        "re-download; the repo layout is unsupported or the cache volume is corrupt"
+                    )
             if shared_hub:
                 _link_base_model_into_ephemeral_cache(model_id, shared_hub)
 
