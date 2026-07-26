@@ -320,8 +320,8 @@ def _poll_until_done(
         # match None and any unrecognized string, so one flaky or empty job_status response would
         # reset the grace window and keep NoCapacityError from ever firing -- the DC would stay
         # silently cold for the full timeout, which is the failure this poller exists to catch.
-        # An unknown status is unknown: it proves nothing either way, so it leaves both anchors as
-        # they are and the next definite reading decides.
+        # An unknown status is unknown: it proves nothing either way, so it neither resets the
+        # anchors nor is charged against them, and the next definite reading decides.
         left_queue = status is not None and (
             status in _TERMINAL_OK or status in _TERMINAL_FAIL or status in _RUNNING
         )
@@ -369,6 +369,15 @@ def _poll_until_done(
                     f"job {job_id} sat queued {_THROTTLED_GRACE_S:.0f}s with every worker throttled "
                     "and none usable: RunPod is not scheduling the requested GPU class here"
                 )
+        else:
+            # Status unreadable. Neither branch above ran, so without this the armed anchors keep
+            # aging on wall time the poller could not see -- and a run that ended and was re-queued
+            # inside that blackout would be torn down on its first queued reading, on a grace it
+            # never actually served. Hold the confirmed duration; the gap itself proves nothing.
+            now = time.time()
+            starved.unknown(now)
+            unhealthy.unknown(now)
+            throttled.unknown(now)
         if status in _TERMINAL_OK:
             output = (st or {}).get("output")
             if not output:

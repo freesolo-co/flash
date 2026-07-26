@@ -3900,6 +3900,78 @@ def test_a_running_job_still_clears_the_starvation_grace(monkeypatch):
     assert out == {"preloaded": ["m1"]}
 
 
+def test_a_status_blackout_is_not_charged_to_the_starvation_grace(monkeypatch):
+    """Time the poller could not observe must not age an armed timer.
+
+    An unreadable job_status matches neither the left-queue branch nor the queued one, so the anchor
+    used to keep aging on wall time while nothing was being confirmed. If the job ran and was
+    re-queued inside that blackout -- which is exactly the transition the blackout hides -- the next
+    queued reading fired instantly and tore down an endpoint whose current starvation run had only
+    just begun.
+
+    The job here is queued for 60s, dark for 300s, then queued again, against a 100s grace. Only the
+    confirmed 60s+ may be charged, so the run must survive the first reading after the blackout.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    # 2 confirmed queued polls, a long unreadable gap, then queued again and done
+    statuses = iter(["IN_QUEUE", "IN_QUEUE", None, None, "IN_QUEUE", "COMPLETED"])
+    gaps = iter([0.0, 60.0, 150.0, 150.0, 10.0, 10.0])
+
+    def _status(*_a, **_k):
+        clock["now"] += next(gaps)
+        return {"status": next(statuses), "output": {"preloaded": ["m1"]}}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(
+        preload.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: {"workers": {}},  # confirmed zero workers on every queued poll
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+    monkeypatch.setattr(preload, "decode_output", lambda out: out)
+
+    out = preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+    assert out == {"preloaded": ["m1"]}
+
+
+def test_a_blackout_only_pauses_the_grace_and_never_restarts_it(monkeypatch):
+    """The pause must not become a reset: a genuinely starved DC still has to fail.
+
+    Holding the confirmed duration is the fix; discarding it would be the older bug in a new place,
+    letting one flaky response per grace window keep a dead datacenter alive for the full timeout.
+    Confirmed queued time accumulates across blackouts here and must still expire the timer.
+    """
+    from flash.providers import weight_cache_preload as preload
+
+    clock = {"now": 1000.0}
+    # every confirmed queued poll is separated by an unreadable one, so a reset-on-unknown rule
+    # would never let the anchor survive long enough to fire
+    statuses = iter(["IN_QUEUE", None] * 60)
+
+    def _status(*_a, **_k):
+        status = next(statuses)
+        # charge the elapsed time to the intervals that END at a confirmed reading; the blackouts
+        # themselves are instantaneous, so only genuinely confirmed queued time accumulates
+        if status == preload._QUEUED:
+            clock["now"] += 40.0
+        return {"status": status}
+
+    monkeypatch.setattr(preload.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(preload.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(preload.runpod_api, "job_status", _status)
+    monkeypatch.setattr(
+        preload.runpod_api, "endpoint_health_for_fingerprint", lambda *a, **k: {"workers": {}}
+    )
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 100.0)
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=0.0)
+
+
 def test_a_throttled_worker_is_not_a_broken_image(monkeypatch):
     """unhealthy + throttled is capacity contention, NOT a failed image pull.
 

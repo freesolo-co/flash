@@ -724,11 +724,19 @@ def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
 
 @dataclass
 class GraceTimer:
-    """Grace timer: arms on first active poll, expires after ``grace`` seconds of continuous active state."""
+    """Grace timer: arms on first active poll, expires after ``grace`` seconds of continuous active state.
+
+    ``since`` is the EFFECTIVE arm time, not the literal one: ``unknown`` shifts it forward by
+    intervals the caller could not observe, so ``now - since`` is always the time the state was
+    confirmed to hold rather than the wall time since arming. Clearing ``since`` is still a complete
+    reset -- ``seen`` only bounds the next unknown gap and means nothing while the timer is disarmed.
+    """
 
     since: float | None = None
+    seen: float | None = None
 
     def expired(self, active: bool, now: float, grace: float) -> bool:
+        self.seen = now
         if not active:
             self.since = None
             return False
@@ -736,6 +744,18 @@ class GraceTimer:
             self.since = now  # first poll the state held -> arm, but never fail on the same poll
             return False
         return now - self.since > grace
+
+    def unknown(self, now: float) -> None:
+        """A reading that proves nothing either way: hold the confirmed duration, drop the blind gap.
+
+        Resetting would let one flaky response restart the window every time, so a state that really
+        is stuck never fires. Charging the gap is the opposite failure: the reading that would have
+        cleared the anchor is exactly what a blackout hides, so the first definite reading after it
+        expires a timer whose current run had only just begun.
+        """
+        if self.since is not None and self.seen is not None:
+            self.since += now - self.seen
+        self.seen = now
 
 
 def poll_job(
