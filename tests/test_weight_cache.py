@@ -2407,6 +2407,43 @@ def test_poll_restarts_the_grace_window_after_a_requeue(monkeypatch):
     assert clock["t"] > preload._NO_CAPACITY_GRACE_S
 
 
+def test_poll_rechecks_health_after_a_requeue_loses_the_worker(monkeypatch):
+    """The worker latch is per queued interval: a requeue with no worker must still be caught.
+
+    Regression: saw_worker latched true forever on the first healthy reading, so a job that was
+    allocated a worker, started, was interrupted, and returned to IN_QUEUE with the worker gone
+    skipped every later health probe. The starvation window then never ran and the preload sat out
+    the full 5400s timeout instead of reporting the DC as out of capacity.
+    """
+    from flash.providers.runpod import preload
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(preload.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(preload.time, "sleep", lambda *_: clock.__setitem__("t", clock["t"] + 60.0))
+    # queued with a worker, runs, then is re-queued for good with the worker gone.
+    seq = iter(["IN_QUEUE", "IN_PROGRESS"])
+    monkeypatch.setattr(
+        preload.runpod_api, "job_status", lambda *a, **k: {"status": next(seq, "IN_QUEUE")}
+    )
+    # healthy on the first probe (latching the old bug), zero on every probe after the requeue
+    probes = {"n": 0}
+
+    def _health(*_a, **_k):
+        probes["n"] += 1
+        alive = 1 if probes["n"] == 1 else 0
+        return {"workers": {"initializing": alive, "ready": 0, "running": 0, "idle": 0}}
+
+    monkeypatch.setattr(preload.runpod_api, "endpoint_health_for_fingerprint", _health)
+    monkeypatch.setattr(preload, "_NO_CAPACITY_GRACE_S", 30.0)  # one sleep outruns it
+
+    with pytest.raises(preload.NoCapacityError):
+        preload._poll_until_done("ep", "job", "fp", timeout_s=5400, poll_interval_s=1.0)
+    # health was probed again AFTER the requeue rather than skipped by a stale latch
+    assert probes["n"] > 1
+    # and it gave up in the grace window instead of burning the full timeout
+    assert clock["t"] < 5400
+
+
 def test_has_worker_treats_health_failure_as_unknown(monkeypatch):
     """Health is a hint: an API error must not be read as 'no capacity' and kill a live download.
 
