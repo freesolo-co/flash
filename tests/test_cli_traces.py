@@ -23,20 +23,34 @@ _RECORDS = [
     {"input": "What is 2 + 2?", "output": "4"},
     {"input": "What is 3 + 5?", "output": "8"},
 ]
+# the same traces as prompts: the reply-less third call survives here.
+_PROMPTS = [
+    {"input": "What is 2 + 2?"},
+    {"input": "What is 3 + 5?"},
+    {"input": "What is 9 + 1?"},
+]
+_RAW = [{"id": "trace-1", "model": "gpt-4o-mini", "spans": [{"id": "span-1"}]}]
 
 
 @pytest.fixture
 def fake_traces(monkeypatch):
     """Stub the freesolo traces client; records what each command asked for."""
-    calls: dict[str, list] = {"projects": [], "records": []}
+    calls: dict[str, list] = {"projects": [], "records": [], "formats": []}
 
     def list_projects(api_key, base_url=None):
         calls["projects"].append(api_key)
         return _PROJECTS
 
-    def export_records(project_id, api_key, base_url=None, limit=None):
+    def export_records(project_id, api_key, base_url=None, limit=None, export_format=None):
         calls["records"].append(project_id)
-        return {"records": _RECORDS, "traces": 3, "skipped": 1}
+        calls["formats"].append(export_format)
+        if export_format == traces.PROMPTS_FORMAT:
+            # prompts keep the reply-less call that records drops, so this shape
+            # yields more rows and skips nothing.
+            return {"records": _PROMPTS, "traces": 3, "skipped": 0, "format": export_format}
+        if export_format == traces.RAW_FORMAT:
+            return {"records": _RAW, "traces": 3, "skipped": 0, "format": export_format}
+        return {"records": _RECORDS, "traces": 3, "skipped": 1, "format": "records"}
 
     monkeypatch.setattr(traces, "list_trace_projects", list_projects)
     monkeypatch.setattr(traces, "export_trace_records", export_records)
@@ -274,3 +288,74 @@ def test_project_options_label_by_name_and_skip_id_less_rows() -> None:
         ("proj-1", "support triage"),
         ("proj-2", "docs qa"),
     ]
+
+
+def test_traces_export_defaults_to_env_records(fake_traces, monkeypatch, tmp_path) -> None:
+    """No --format keeps the shape every existing caller already gets."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 0
+
+    assert fake_traces["formats"] == [traces.RECORDS_FORMAT]
+
+
+def test_traces_export_prompts_shape_keeps_reply_less_calls(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """GRPO samples its own completions, so a call with no reply is still a prompt."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "prompts"]) == 0
+
+    rows = _rows(tmp_path / "dataset/train.jsonl")
+    assert rows == _PROMPTS
+    # every row is prompt-only: a gold completion here would be the wrong shape.
+    assert all(set(row) == {"input"} for row in rows)
+    assert fake_traces["formats"] == [traces.PROMPTS_FORMAT]
+    printed = capsys.readouterr().out
+    assert "exported 3 prompts to dataset/train.jsonl" in printed
+    # nothing was skipped, so no skip note should appear.
+    assert "skipped" not in printed
+
+
+def test_traces_export_raw_shape_is_not_called_training_rows(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """Raw rows are for taking away; calling them training rows would mislead."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["traces", "export", "--project", "proj-1", "--format", "raw"]) == 0
+
+    assert _rows(tmp_path / "dataset/train.jsonl") == _RAW
+    assert fake_traces["formats"] == [traces.RAW_FORMAT]
+    printed = capsys.readouterr().out
+    assert "exported 1 traces to dataset/train.jsonl" in printed
+    assert "training rows" not in printed
+
+
+def test_traces_export_rejects_an_algorithm_as_a_format(fake_traces, monkeypatch, tmp_path) -> None:
+    """SFT and GRPO read the same records file, so they are not formats."""
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["traces", "export", "--project", "proj-1", "--format", "sft"])
+
+    # argparse rejects an out-of-choices value before any request is made.
+    assert exit_info.value.code == 2
+    assert fake_traces["formats"] == []
+
+
+def test_traces_export_empty_records_points_at_the_prompts_shape(
+    fake_traces, monkeypatch, tmp_path, capsys
+) -> None:
+    """A project whose calls have no replies is still exportable as prompts."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": [], "traces": 2, "skipped": 2, "format": "records"},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+
+    assert "--format prompts" in capsys.readouterr().err
