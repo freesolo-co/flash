@@ -427,6 +427,33 @@ def test_traces_export_default_records_works_against_a_format_blind_backend(
     assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
 
 
+def test_traces_export_refuses_an_explicit_mismatch_on_the_default_format(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Regression: the default request skipped the check entirely, so a backend that explicitly
+    answered `raw` had its trace rows written to dataset/train.jsonl as if they were environment
+    records. That path is auto-selected as a run's dataset_path, so a later `env push` + `train`
+    would feed spans to a run that cannot read them.
+
+    A MISSING format still means records -- that is what a format-blind backend returns, and the
+    test above pins it -- but an explicit label is the backend stating what it actually converted,
+    and any value other than the one asked for must be refused whichever format was requested.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(traces, "load_credentials", lambda: ("https://flash", "fs-key"))
+    monkeypatch.setattr(
+        traces,
+        "export_trace_records",
+        lambda *a, **k: {"records": _RAW, "traces": 2, "skipped": 0, "format": "raw"},
+    )
+
+    assert cli.main(["traces", "export", "--project", "proj-1"]) == 1
+
+    assert "did not honour --format records" in capsys.readouterr().err
+    # nothing may be written when the shape could not be trusted
+    assert not (tmp_path / "dataset/train.jsonl").exists()
+
+
 def test_raw_export_stays_off_the_training_dataset_path(fake_traces, monkeypatch, tmp_path) -> None:
     """dataset/train.jsonl is auto-selected as a run's dataset_path, and raw rows
     are not trainable, so raw must default somewhere else."""

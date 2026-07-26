@@ -177,15 +177,20 @@ def cmd_traces_export(args) -> int:
 
     exported = fetch_records(project_id, api_key, export_format)
 
-    # a backend predating format support ignores the query param and returns
-    # ordinary records. writing those out under the requested name would label
-    # {input, output} rows as prompts or raw -- for raw, an incomplete backup
-    # reported as success. only non-default requests can be mislabelled this way.
-    returned_format = exported.get("format")
-    if export_format != RECORDS_FORMAT and returned_format != export_format:
+    # a backend predating format support ignores the query param and reports no
+    # format at all, so a missing one is read as the records it must have sent.
+    # an explicit label is the backend telling us what it actually converted, and
+    # any value other than the one asked for means the rows are not what the
+    # caller requested -- writing them out would label {input, output} rows as
+    # prompts or raw, or land raw traces in dataset/train.jsonl as if they were
+    # environment records, where a later `env push` + `train` would feed them to a
+    # run that cannot read them. that mislabelling is possible in either
+    # direction, so the check cannot be skipped for the default format.
+    returned_format = exported.get("format") or RECORDS_FORMAT
+    if returned_format != export_format:
         raise ClientError(
             f"the freesolo backend did not honour --format {export_format} "
-            f"(it returned {returned_format or RECORDS_FORMAT}). It may predate format "
+            f"(it returned {returned_format}). It may predate format "
             "support -- check FREESOLO_BASE_URL or upgrade the backend"
         )
 
